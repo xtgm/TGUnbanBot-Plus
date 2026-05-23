@@ -95,14 +95,44 @@
 
 ## 环境变量
 
-Worker 启动时会检查以下变量，缺失会直接返回错误：
+> **配置优先级**：环境变量 > `_worker.js` 顶部 `=可修改=` 区段的硬编码默认值。
+> 也就是说，你既可以直接改源码顶部默认值，也可以在 Cloudflare 后台填环境变量临时覆盖；两者同时存在时**环境变量胜出**。
 
-| 变量名 | 必需 | 说明 |
+### 必填（缺失会返回 500）
+
+| 变量名 | 说明 |
+| --- | --- |
+| `TOKEN` | 初始化入口密钥。访问 `https://你的Worker域名/{TOKEN}` 注册 Webhook + 注册命令；访问 `https://你的Worker域名/{TOKEN}/migrate` 触发 KV → D1 迁移。建议用随机长字符串。 |
+| `BOT_TOKEN` | Telegram Bot Token，从 [@BotFather](https://t.me/BotFather) 取。 |
+| `GROUP_ID` | 目标 Telegram 群组 ID，支持逗号分隔多群组。例如 `-1001234567890` 或 `-1001234567890,-1009876543210`。第一个群作为「主群」，二次审核提醒等会发到主群。 |
+
+### 可选（不填则使用源码顶部默认值）
+
+| 变量名 | 默认 | 说明 |
 | --- | --- | --- |
-| `TOKEN` | 是 | 初始化入口密钥。访问 `https://你的Worker域名/TOKEN` 时设置 Webhook 与机器人命令；访问 `https://你的Worker域名/TOKEN/migrate` 触发 KV → D1 迁移。建议使用随机长字符串。 |
-| `BOT_TOKEN` | 是 | Telegram Bot Token。 |
-| `GROUP_ID` | 是 | 目标 Telegram 群组 ID，支持逗号分隔多群组。例如 `-1001234567890` 或 `-1001234567890,-1009876543210`。第一个群作为「主群」，二次审核提醒等会发到主群。 |
-| `SUPER_ADMINS` | 否 | 超级管理员 TGID 白名单，逗号分隔。例如 `123456,789012`。仅这些用户能点击「✅ 同意（一键代发）」按钮。未配置时按钮存在但无人能点。 |
+| `SUPER_ADMINS` | 空 | 超级管理员 TGID 白名单，逗号分隔，例如 `123456,789012`。仅这些用户能点击「✅ 同意（一键代发）」按钮。未配置时按钮存在但无人能点（安全默认）。 |
+| `SELF_UNBAN_KEYWORD` | `我不是广告狗，我是误封的，希望可以解封。` | 自助解封确认整句。用户必须**完整逐字粘贴**才会触发解封流程。 |
+| `SELF_UNBAN_PROMPT` | 见源码 | `/start` `/unban` 命令收到时返回的欢迎/检查清单。支持 HTML 子集。占位符：`{userId}` `{title}` `{keyword}` 会自动替换。 |
+| `SELF_UNBAN_APPROVED` | 见源码 | 用户输入正确确认句、解封请求被同意时回复的提示。占位符：`{username}`（主群 @用户名 或主群 ID）。 |
+| `BLACKLIST_PAGE_LIMIT` | `30` | `/blacklist` 命令单次最多展示多少条（按时间倒序，最新在前）。值必须是正整数。 |
+| `BLACKLIST_REASON_LABELS` | 见源码 | `/blacklist` 列表中"原因"字段的中文映射，**JSON 字符串**形式。例：`{"spam":"群内举报","manual":"管理员添加","manual_ban":"自动同步"}`。非法 JSON 时自动回退默认。 |
+| `GKY_BANLIST_ENDPOINT` | `https://gkybot.gmeow.cc/banlist` | GKY 封禁记录查询后端。改动者请确保返回 HTML 与 `parseBanlistHTML` 兼容。 |
+
+### 关于源码顶部 `=可修改=` 区段
+
+`_worker.js` 文件最顶部有一段被 `=可修改=` 与 `=结束=` 标注的常量区，包含上述全部可选项的默认值。如果你不想用环境变量、希望直接改源码，**只改这一段**即可，其它代码无需触碰。
+
+```js
+// =可修改= 项目内置文案与参数
+// 优先级：环境变量 > 这里的硬编码默认值
+const DEFAULT_SELF_UNBAN_KEYWORD = '我不是广告狗，我是误封的，希望可以解封。';
+const DEFAULT_SELF_UNBAN_PROMPT = `...`;
+const DEFAULT_SELF_UNBAN_APPROVED = `...`;
+const DEFAULT_BLACKLIST_PAGE_LIMIT = 30;
+const DEFAULT_BLACKLIST_REASON_LABELS = { spam: '...', manual: '...', manual_ban: '...' };
+const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
+// =结束=
+```
 
 ## 存储绑定（择一或都绑）
 
@@ -160,6 +190,13 @@ wrangler secret put TOKEN
 wrangler secret put BOT_TOKEN
 wrangler secret put GROUP_ID
 wrangler secret put SUPER_ADMINS    # 可选
+# 以下全部可选；不填则使用 _worker.js 顶部 =可修改= 区段的默认值
+# wrangler secret put SELF_UNBAN_KEYWORD
+# wrangler secret put SELF_UNBAN_PROMPT
+# wrangler secret put SELF_UNBAN_APPROVED
+# wrangler secret put BLACKLIST_PAGE_LIMIT
+# wrangler secret put BLACKLIST_REASON_LABELS
+# wrangler secret put GKY_BANLIST_ENDPOINT
 ```
 
 也可以在 Cloudflare Dashboard 的 Worker 设置页中添加同名变量。

@@ -1,3 +1,62 @@
+// =============================================================================
+// =可修改= 项目内置文案与参数
+// 优先级：环境变量 > 这里的硬编码默认值
+// 也就是说：这里改了立刻生效；如果 Cloudflare 后台同名环境变量也填了，则环境变量胜出。
+// =============================================================================
+
+// 1) 自助解封确认整句。用户必须**完整逐字粘贴**才会触发解封流程。
+//    环境变量名：SELF_UNBAN_KEYWORD
+const DEFAULT_SELF_UNBAN_KEYWORD = '我不是广告狗，我是误封的，希望可以解封。';
+
+// 2) /unban、/start 命令收到时返回的欢迎/检查清单。
+//    支持 HTML 子集（<b>、换行等）。占位符：{userId}、{title}、{keyword}。
+//    {keyword} 会自动填入当前生效的 SELF_UNBAN_KEYWORD（来自环境变量或默认值）。
+//    环境变量名：SELF_UNBAN_PROMPT
+const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>{title}</b> 的 自助解封机器人
+
+🔍 <b>请自行检查以下内容：</b>
+
+1️⃣ 用户名是否包含广告内容？
+2️⃣ 个人签名是否包含广告内容或链接？
+3️⃣ 是否讨论了政治、NSFW、引战、嘲讽等内容？
+
+✅ <b>如果你确定没有违反以上内容，请输入以下内容：</b>
+	<code>{keyword}</code>`;
+
+// 3) 用户输入正确确认句、解封请求被同意时回复的提示。
+//    占位符：{username}（主群 @用户名 或主群 ID）。
+//    环境变量名：SELF_UNBAN_APPROVED
+const DEFAULT_SELF_UNBAN_APPROVED = `✅ 已同意给予解封\n\n请点击 {username} 返回群组\n\n⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`;
+
+// 4) /blacklist 命令单次最多展示多少条（按时间倒序，最新在前）。
+//    环境变量名：BLACKLIST_PAGE_LIMIT （要求是正整数）
+const DEFAULT_BLACKLIST_PAGE_LIMIT = 30;
+
+// 5) /blacklist 列表中"原因"字段的中文映射。
+//    内置三种：spam（/spam 举报）、manual（/ban 手动添加）、manual_ban（chat_member 自动同步）。
+//    环境变量名：BLACKLIST_REASON_LABELS （要求是 JSON 字符串，例如 {"spam":"群内举报"}）
+const DEFAULT_BLACKLIST_REASON_LABELS = {
+	spam: '群内 /spam 举报',
+	manual: '管理员手动添加',
+	manual_ban: '管理员手动封禁（自动同步）'
+};
+
+// 6) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
+//    环境变量名：GKY_BANLIST_ENDPOINT
+const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
+
+// =============================================================================
+// =结束= 普通使用者一般无需修改下方任何内容
+// =============================================================================
+
+// 运行期生效的可配置项（每次请求开始时由 loadRequiredConfig 写入）
+let SELF_UNBAN_KEYWORD;
+let SELF_UNBAN_PROMPT;
+let SELF_UNBAN_APPROVED;
+let BLACKLIST_PAGE_LIMIT;
+let BLACKLIST_REASON_LABELS;
+let GKY_BANLIST_ENDPOINT;
+
 // Telegram Bot Token
 let BOT_TOKEN;
 // 主群组ID（GROUP_IDS 的第一项，用于发送二次审核提醒、缓存群组信息等"主群行为"）
@@ -26,6 +85,12 @@ export default {
 			GROUP_IDS = config.GROUP_IDS;
 			GROUP_ID = config.GROUP_ID;
 			SUPER_ADMINS = config.SUPER_ADMINS;
+			SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
+			SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
+			SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
+			BLACKLIST_PAGE_LIMIT = config.BLACKLIST_PAGE_LIMIT;
+			BLACKLIST_REASON_LABELS = config.BLACKLIST_REASON_LABELS;
+			GKY_BANLIST_ENDPOINT = config.GKY_BANLIST_ENDPOINT;
 		} catch (error) {
 			return jsonResponse({
 				success: false,
@@ -118,12 +183,50 @@ function loadRequiredConfig(env) {
 		)]
 		: [];
 
+	// 顶部 6 项可配置文案/参数：环境变量优先，否则用内置默认值
+	const pickStr = (envVal, fallback) => {
+		if (envVal === undefined || envVal === null) return fallback;
+		const s = String(envVal);
+		return s === '' ? fallback : s;
+	};
+
+	const selfUnbanKeyword = pickStr(env.SELF_UNBAN_KEYWORD, DEFAULT_SELF_UNBAN_KEYWORD);
+	const selfUnbanPrompt = pickStr(env.SELF_UNBAN_PROMPT, DEFAULT_SELF_UNBAN_PROMPT);
+	const selfUnbanApproved = pickStr(env.SELF_UNBAN_APPROVED, DEFAULT_SELF_UNBAN_APPROVED);
+
+	let blacklistPageLimit = DEFAULT_BLACKLIST_PAGE_LIMIT;
+	if (env.BLACKLIST_PAGE_LIMIT !== undefined && env.BLACKLIST_PAGE_LIMIT !== null && String(env.BLACKLIST_PAGE_LIMIT).trim() !== '') {
+		const n = parseInt(String(env.BLACKLIST_PAGE_LIMIT).trim(), 10);
+		if (Number.isFinite(n) && n > 0) blacklistPageLimit = n;
+	}
+
+	let blacklistReasonLabels = DEFAULT_BLACKLIST_REASON_LABELS;
+	if (env.BLACKLIST_REASON_LABELS !== undefined && env.BLACKLIST_REASON_LABELS !== null && String(env.BLACKLIST_REASON_LABELS).trim() !== '') {
+		try {
+			const parsed = JSON.parse(String(env.BLACKLIST_REASON_LABELS));
+			if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+				blacklistReasonLabels = parsed;
+			}
+		} catch (_) {
+			// 解析失败时保持默认，不抛异常以免阻塞启动
+			console.error('BLACKLIST_REASON_LABELS 不是合法 JSON，已回退默认值');
+		}
+	}
+
+	const gkyEndpoint = pickStr(env.GKY_BANLIST_ENDPOINT, DEFAULT_GKY_BANLIST_ENDPOINT);
+
 	return {
 		TOKEN: String(env.TOKEN).trim(),
 		BOT_TOKEN: String(env.BOT_TOKEN).trim(),
 		GROUP_IDS: uniqueGroupIds,
 		GROUP_ID: uniqueGroupIds[0],
-		SUPER_ADMINS: superAdmins
+		SUPER_ADMINS: superAdmins,
+		SELF_UNBAN_KEYWORD: selfUnbanKeyword,
+		SELF_UNBAN_PROMPT: selfUnbanPrompt,
+		SELF_UNBAN_APPROVED: selfUnbanApproved,
+		BLACKLIST_PAGE_LIMIT: blacklistPageLimit,
+		BLACKLIST_REASON_LABELS: blacklistReasonLabels,
+		GKY_BANLIST_ENDPOINT: gkyEndpoint
 	};
 }
 
@@ -475,14 +578,14 @@ async function handleMigrate(env) {
 
 // 渲染黑名单为 HTML 文本（用于 /blacklist 命令展示）
 function renderBlacklist(blacklist, options = {}) {
-	const limit = options.limit ?? 30;
+	const limit = options.limit ?? BLACKLIST_PAGE_LIMIT;
 	const total = blacklist.length;
 
 	if (total === 0) {
 		return '📋 <b>当前黑名单</b>\n\n（空）';
 	}
 
-	const reasonLabels = { spam: '群内 /spam 举报', manual: '管理员手动添加' };
+	const reasonLabels = BLACKLIST_REASON_LABELS;
 	const visible = blacklist.slice(-limit).reverse(); // 最近添加的排前面
 
 	let lines = [`📋 <b>当前黑名单</b>（共 ${total} 条${total > limit ? `，仅显示最近 ${limit} 条` : ''}）`, ''];
@@ -1124,21 +1227,15 @@ async function handleMessage(message, env) {
 		}
 
 		const groupInfo = await getGroupInfo();
-		const welcomeMessage = `🤖 <b>亲爱的 ${userId}</b>，我是 <b>${groupInfo.title}</b> 的 自助解封机器人
-
-🔍 <b>请自行检查以下内容：</b>
-
-1️⃣ 用户名是否包含广告内容？
-2️⃣ 个人签名是否包含广告内容或链接？
-3️⃣ 是否讨论了政治、NSFW、引战、嘲讽等内容？
-
-✅ <b>如果你确定没有违反以上内容，请输入以下内容：</b>
-	<code>我不是广告狗，我是误封的，希望可以解封。</code>`;
+		const welcomeMessage = SELF_UNBAN_PROMPT
+			.replaceAll('{userId}', String(userId))
+			.replaceAll('{title}', groupInfo.title)
+			.replaceAll('{keyword}', SELF_UNBAN_KEYWORD);
 
 		await sendTelegramMessage(chatId, welcomeMessage);
 	}
 	// 检查用户回复是否完全匹配提示语，禁止夹带其它内容
-	else if (text && text.trim() === '我不是广告狗，我是误封的，希望可以解封。') {
+	else if (text && text.trim() === SELF_UNBAN_KEYWORD) {
 		// KV 异常时保持放行策略：checkBlacklist 内部出错会返回 isBlacklisted=false
 		const blacklistCheck = await checkBlacklist(userId, env);
 		if (blacklistCheck.isBlacklisted) {
@@ -1148,7 +1245,7 @@ async function handleMessage(message, env) {
 
 		// 发送确认消息
 		const groupInfo = await getGroupInfo();
-		await sendTelegramMessage(chatId, `✅ 已同意给予解封\n\n请点击 ${groupInfo.username} 返回群组\n\n⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`);
+		await sendTelegramMessage(chatId, SELF_UNBAN_APPROVED.replaceAll('{username}', groupInfo.username));
 
 		// 遍历所有配置群组，按用户在每个群的状态分别尝试解封/解禁
 		const perGroupResults = [];
@@ -1621,7 +1718,7 @@ async function handleBanlist(chatId) {
 	}
 
 	// 访问原始的 banlist API
-	const targetUrl = `https://gkybot.gmeow.cc/banlist?tgid=${chatId}`;
+	const targetUrl = `${GKY_BANLIST_ENDPOINT}?tgid=${chatId}`;
 	const response = await fetch(targetUrl);
 	const html = await response.text();
 
