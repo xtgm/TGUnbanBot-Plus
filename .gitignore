@@ -1,0 +1,17 @@
+# Wrangler 本地缓存
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# Node
+node_modules/
+package-lock.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
