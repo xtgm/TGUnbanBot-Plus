@@ -110,7 +110,7 @@
 
 | 变量名 | 默认 | 说明 |
 | --- | --- | --- |
-| `SUPER_ADMINS` | 空 | 超级管理员 TGID 白名单，逗号分隔，例如 `123456,789012`。仅这些用户能点击「✅ 同意（一键代发）」按钮。未配置时按钮存在但无人能点（安全默认）。 |
+| `SUPER_ADMINS` | 空数组 | 超级管理员 TGID 白名单，环境变量为字符串形式，**逗号分隔多个**，例如 `123456,789012`。仅这些用户能点击「✅ 同意（一键代发）」按钮。未配置时按钮存在但无人能点（安全默认）。也可在 `_worker.js` 顶部 `DEFAULT_SUPER_ADMINS` 数组中硬编码。 |
 | `SELF_UNBAN_KEYWORD` | `我不是广告狗，我是误封的，希望可以解封。` | 自助解封确认整句。用户必须**完整逐字粘贴**才会触发解封流程。 |
 | `SELF_UNBAN_PROMPT` | 见源码 | `/start` `/unban` 命令收到时返回的欢迎/检查清单。支持 HTML 子集。占位符：`{userId}` `{title}` `{keyword}` 会自动替换。 |
 | `SELF_UNBAN_APPROVED` | 见源码 | 用户输入正确确认句、解封请求被同意时回复的提示。占位符：`{username}`（主群 @用户名 或主群 ID）。 |
@@ -131,6 +131,7 @@ const DEFAULT_SELF_UNBAN_APPROVED = `...`;
 const DEFAULT_BLACKLIST_PAGE_LIMIT = 30;
 const DEFAULT_BLACKLIST_REASON_LABELS = { spam: '...', manual: '...', manual_ban: '...' };
 const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
+const DEFAULT_SUPER_ADMINS = ['123456', '789012'];   // 数组形式，多个 TGID
 // =结束=
 ```
 

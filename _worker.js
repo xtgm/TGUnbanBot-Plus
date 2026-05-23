@@ -45,6 +45,16 @@ const DEFAULT_BLACKLIST_REASON_LABELS = {
 //    环境变量名：GKY_BANLIST_ENDPOINT
 const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
 
+// 7) 超级管理员 TGID 白名单。**仅这些用户**能点击「✅ 同意（一键代发）」按钮，
+//    普通群管理员看到按钮但点击会被拒绝。支持多个 TGID。
+//    环境变量名：SUPER_ADMINS （字符串形式，逗号分隔）
+//    例：'123456,789012'
+//    硬编码这里写数组形式，留空数组表示默认无超管（按钮存在但无人能点，安全默认）。
+const DEFAULT_SUPER_ADMINS = [
+	// '123456789',
+	// '987654321',
+];
+
 // =============================================================================
 // =结束= 普通使用者一般无需修改下方任何内容
 // =============================================================================
@@ -173,15 +183,20 @@ function loadRequiredConfig(env) {
 	// 去重，保持顺序
 	const uniqueGroupIds = [...new Set(groupIds)];
 
-	// SUPER_ADMINS 可选，逗号分隔 TGID
-	const superAdmins = env.SUPER_ADMINS
-		? [...new Set(
-			String(env.SUPER_ADMINS)
-				.split(',')
-				.map((id) => id.trim())
+	// SUPER_ADMINS 可选：环境变量优先（字符串，逗号分隔）；否则用顶部 DEFAULT_SUPER_ADMINS（数组）
+	const sanitizeAdmins = (list) =>
+		[...new Set(
+			(list || [])
+				.map((id) => String(id).trim())
 				.filter((id) => /^\d+$/.test(id))
-		)]
-		: [];
+		)];
+
+	let superAdmins;
+	if (env.SUPER_ADMINS !== undefined && env.SUPER_ADMINS !== null && String(env.SUPER_ADMINS).trim() !== '') {
+		superAdmins = sanitizeAdmins(String(env.SUPER_ADMINS).split(','));
+	} else {
+		superAdmins = sanitizeAdmins(DEFAULT_SUPER_ADMINS);
+	}
 
 	// 顶部 6 项可配置文案/参数：环境变量优先，否则用内置默认值
 	const pickStr = (envVal, fallback) => {
