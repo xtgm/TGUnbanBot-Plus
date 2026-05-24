@@ -117,6 +117,9 @@ export default {
 		} else if (request.method === 'GET' && path === `${TOKEN}/migrate`) {
 			// 存量 KV 黑名单一次性迁移到 D1（用 TOKEN 保护，防止外部触发）
 			return await handleMigrate(env);
+		} else if (request.method === 'GET' && path === `${TOKEN}/export`) {
+			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
+			return await handleExport(env, url);
 		} else if (request.method === 'POST') {
 			// 如果是 Telegram Webhook 请求
 			if (path === '') {
@@ -702,6 +705,145 @@ async function handleMigrate(env) {
 		console.error('迁移失败:', error);
 		return jsonResponse({ 成功: false, 错误: error.message }, 500);
 	}
+}
+
+// 黑名单导出接口（受 TOKEN 保护）
+// 数据源选择：D1 优先（D1 不可用时回退 KV），与 getBlacklist 一致
+// 输出格式：
+//   ?format=json → application/json，触发浏览器下载
+//   ?format=csv  → text/csv，UTF-8 + BOM，Excel 可直接打开
+//   其它/默认    → HTML 表格，浏览器直接查看
+async function handleExport(env, url) {
+	if (!env.KV && !env.DB) {
+		return new Response('❌ 未绑定 KV 或 D1 存储空间', { status: 400 });
+	}
+
+	let blacklist;
+	try {
+		blacklist = await getBlacklist(env);
+	} catch (error) {
+		console.error('导出读取黑名单失败:', error);
+		return new Response('❌ 读取黑名单失败: ' + error.message, { status: 500 });
+	}
+
+	// 时间倒序：最新的在前
+	const sorted = [...blacklist].sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')));
+	const format = (url.searchParams.get('format') || '').toLowerCase();
+	const ts = new Date().toISOString().replace(/[:.]/g, '-');
+
+	if (format === 'json') {
+		return new Response(JSON.stringify(sorted, null, 2), {
+			headers: {
+				'Content-Type': 'application/json; charset=UTF-8',
+				'Content-Disposition': `attachment; filename="blacklist-${ts}.json"`,
+				'Cache-Control': 'no-store'
+			}
+		});
+	}
+
+	if (format === 'csv') {
+		const csvEscape = (v) => {
+			const s = v === null || v === undefined ? '' : String(v);
+			return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+		};
+		const lines = ['id,reason,by,at'];
+		for (const e of sorted) {
+			lines.push([csvEscape(e.id), csvEscape(e.reason), csvEscape(e.by), csvEscape(e.at)].join(','));
+		}
+		// UTF-8 BOM 让 Excel 自动识别中文不乱码
+		const body = '\uFEFF' + lines.join('\r\n');
+		return new Response(body, {
+			headers: {
+				'Content-Type': 'text/csv; charset=UTF-8',
+				'Content-Disposition': `attachment; filename="blacklist-${ts}.csv"`,
+				'Cache-Control': 'no-store'
+			}
+		});
+	}
+
+	// 默认：HTML 视图
+	const dataSource = env.DB ? 'D1（权威）' : 'KV';
+	const reasonLabels = BLACKLIST_REASON_LABELS || {};
+	const rows = sorted.map((e, i) => {
+		const reasonText = e.reason ? (reasonLabels[e.reason] || e.reason) : '—';
+		return `<tr>
+			<td class="num">${i + 1}</td>
+			<td class="id"><code>${escapeHtml(e.id)}</code></td>
+			<td>${escapeHtml(reasonText)}</td>
+			<td>${e.by ? `<code>${escapeHtml(e.by)}</code>` : '—'}</td>
+			<td class="at">${escapeHtml(e.at || '—')}</td>
+		</tr>`;
+	}).join('');
+
+	const downloadBase = url.pathname; // /{TOKEN}/export
+	const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>黑名单导出 — TGUnbanBot-Plus</title>
+<style>
+	* { box-sizing: border-box; }
+	body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; background: #f5f7fa; color: #1f2937; }
+	.wrap { max-width: 1100px; margin: 0 auto; }
+	h1 { margin: 0 0 8px; font-size: 22px; }
+	.meta { color: #6b7280; font-size: 14px; margin-bottom: 16px; }
+	.bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+	.btn { display: inline-block; padding: 8px 14px; border-radius: 6px; text-decoration: none; font-size: 14px; border: 1px solid #d1d5db; background: #fff; color: #1f2937; }
+	.btn:hover { background: #f3f4f6; }
+	.btn.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+	.btn.primary:hover { background: #1d4ed8; }
+	.box { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }
+	table { width: 100%; border-collapse: collapse; font-size: 14px; }
+	th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
+	th { background: #f9fafb; font-weight: 600; color: #374151; position: sticky; top: 0; }
+	tr:last-child td { border-bottom: none; }
+	td.num { color: #9ca3af; width: 50px; }
+	td.id, td.at { white-space: nowrap; }
+	code { background: #f3f4f6; padding: 1px 6px; border-radius: 4px; font-size: 13px; }
+	.empty { padding: 40px; text-align: center; color: #9ca3af; }
+	.search { padding: 10px 14px; background: #fff; border-bottom: 1px solid #e5e7eb; }
+	.search input { width: 100%; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+	<h1>🚫 黑名单导出</h1>
+	<div class="meta">数据源：${dataSource} ｜ 总计：<b>${sorted.length}</b> 条 ｜ 生成时间：${escapeHtml(new Date().toISOString())}</div>
+	<div class="bar">
+		<a class="btn primary" href="${downloadBase}">📋 网页查看</a>
+		<a class="btn" href="${downloadBase}?format=json">⬇️ 下载 JSON</a>
+		<a class="btn" href="${downloadBase}?format=csv">⬇️ 下载 CSV (Excel)</a>
+	</div>
+	<div class="box">
+		${sorted.length === 0 ? '<div class="empty">黑名单为空</div>' : `
+		<div class="search"><input id="q" type="text" placeholder="🔍 输入 TGID / 原因 / 操作人 过滤..." autocomplete="off"></div>
+		<table>
+			<thead><tr><th>#</th><th>TGID</th><th>原因</th><th>操作人</th><th>时间</th></tr></thead>
+			<tbody id="tb">${rows}</tbody>
+		</table>`}
+	</div>
+</div>
+${sorted.length === 0 ? '' : `<script>
+	const q = document.getElementById('q');
+	const tb = document.getElementById('tb');
+	const rows = Array.from(tb.querySelectorAll('tr'));
+	q.addEventListener('input', () => {
+		const k = q.value.trim().toLowerCase();
+		for (const r of rows) {
+			r.style.display = !k || r.textContent.toLowerCase().includes(k) ? '' : 'none';
+		}
+	});
+</script>`}
+</body>
+</html>`;
+
+	return new Response(html, {
+		headers: {
+			'Content-Type': 'text/html; charset=UTF-8',
+			'Cache-Control': 'no-store'
+		}
+	});
 }
 
 // 渲染黑名单为 HTML 文本（用于 /blacklist 命令展示）

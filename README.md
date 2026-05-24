@@ -30,6 +30,7 @@
 - **D1 + KV 双后端支持**：在原 KV 之外新增 Cloudflare D1 数据库支持。绑定 D1 时以 D1 为权威、KV 自动镜像；只绑定其中一个也能跑；提供一次性迁移入口 `/{TOKEN}/migrate` 把存量 KV 数据导入 D1。
 - **`/blacklist` 命令**：管理员私聊查看当前黑名单（最多 30 条）。
 - **`/ban` `/unban` 支持批量**：单次最多 50 个 TGID，分隔符兼容半角逗号 / 全角逗号 / 空格 / 换行；单条用法完全保持原样。
+- **黑名单导出接口**：`GET /{TOKEN}/export` 浏览器直接看 HTML 表格（带搜索过滤），`?format=json` / `?format=csv` 下载完整数据，CSV 自带 BOM 让 Excel 不乱码。
 - **`chat_member` 事件订阅**：管理员手动封/解封时机器人自动同步 KV/D1 黑名单。
 - **`callback_query` 按钮交互**：二次审核结果带「✅ 同意（一键代发）」按钮，超级管理员一键代发 GKYbotSave 指令到目标群，无需复制粘贴。
 - **超级管理员权限分级**：新增可选 `SUPER_ADMINS` 环境变量。普通群管理员能用所有命令但不能点按钮，按钮仅限超管使用，避免群内多名管理员误操作。
@@ -80,6 +81,8 @@
 .
 ├── _worker.js       # Worker 主程序
 ├── wrangler.toml    # Cloudflare Wrangler 配置
+├── test_batch.mjs   # 批量 /ban /unban 离线测试（47 项）
+├── test_export.mjs  # 导出接口离线测试（40 项）
 ├── README.md
 └── LICENSE
 ```
@@ -109,7 +112,7 @@
 
 | 变量名 | 说明 |
 | --- | --- |
-| `TOKEN` | 初始化入口密钥。访问 `https://你的Worker域名/{TOKEN}` 注册 Webhook + 注册命令；访问 `https://你的Worker域名/{TOKEN}/migrate` 触发 KV → D1 迁移。建议用随机长字符串。 |
+| `TOKEN` | 初始化入口密钥。访问 `https://你的Worker域名/{TOKEN}` 注册 Webhook + 注册命令；访问 `https://你的Worker域名/{TOKEN}/migrate` 触发 KV → D1 迁移；访问 `https://你的Worker域名/{TOKEN}/export` 导出黑名单。建议用随机长字符串。 |
 | `BOT_TOKEN` | Telegram Bot Token，从 [@BotFather](https://t.me/BotFather) 取。 |
 | `GROUP_ID` | 目标 Telegram 群组 ID，支持逗号分隔多群组（半角 `,` 与全角 `，` 都兼容）。例如 `-1001234567890` 或 `-1001234567890,-1009876543210`。第一个群作为「主群」，二次审核提醒等会发到主群。 |
 
@@ -321,6 +324,36 @@ GET /{TOKEN}/migrate
 
 把 KV 黑名单全量幂等导入 D1，并把 KV 镜像更新为 D1 全表。要求同时绑定 KV 和 D1。
 
+### 黑名单导出（受 TOKEN 保护）
+
+```http
+GET /{TOKEN}/export                 # 默认：HTML 表格，浏览器直接看
+GET /{TOKEN}/export?format=json     # 下载 JSON 文件（带 attachment 头）
+GET /{TOKEN}/export?format=csv      # 下载 CSV 文件（含 UTF-8 BOM，Excel 中文不乱码）
+```
+
+**特点**：
+
+- **数据源自动选择**：有 D1 用 D1，没 D1 用 KV，逻辑与 `getBlacklist` 一致
+- **HTML 视图**：表格 + 顶部下载按钮 + 实时搜索框（按 TGID / 原因 / 操作人过滤）
+- **时间倒序**：最新封禁的排在最前面
+- **文件名带时间戳**：`blacklist-2026-05-24T10-00-00-000Z.json`
+- **TOKEN 保护**：URL 必须带正确的 TOKEN，路由不匹配返回 405
+- **HTML 注入防护**：所有用户输入字段都通过 `escapeHtml` 转义
+
+**示例**：
+
+```bash
+# 浏览器直接打开看表格
+open https://你的Worker域名/你的TOKEN/export
+
+# 命令行下载 JSON 备份
+curl -o blacklist.json "https://你的Worker域名/你的TOKEN/export?format=json"
+
+# 下载 CSV 给运营/财务
+curl -o blacklist.csv "https://你的Worker域名/你的TOKEN/export?format=csv"
+```
+
 ## 常见问题
 
 ### Q1：访问 `/{TOKEN}` 返回 500，或部署后 Webhook 不工作
@@ -416,6 +449,29 @@ GET /{TOKEN}/migrate
 2. 分隔符随便用：半角 `,` / 全角 `，` / 空格 / 换行 都可以混用，便于从其它表格 / 聊天记录直接粘贴。
 3. 批量过程中重复 ID 会自动去重，已在黑名单的会单独标记，不会让整批失败。
 4. KV+D1 双绑场景下，整批写完只镜像一次 KV，节省写入额度。
+
+### Q12：`/{TOKEN}/export` 接口怎么用，安不安全
+
+**原因**：原项目没有导出接口，本项目新增 `GET /{TOKEN}/export`，支持浏览器查看 / JSON 下载 / CSV 下载（Excel 友好）。
+**安全性**：
+
+1. 受 `TOKEN` 保护，URL 必须带正确 TOKEN，否则路由不匹配返回 405。和 `/{TOKEN}/migrate` 同等防护级别。
+2. 所有用户输入字段（TGID / 原因 / 操作人 / 时间）通过 `escapeHtml` 转义，HTML 视图无注入风险。
+3. `Cache-Control: no-store` 头确保中间代理不会缓存敏感数据。
+
+**使用方式**：
+
+| 场景 | URL |
+| --- | --- |
+| 浏览器查看（带搜索过滤） | `/{TOKEN}/export` |
+| 下载 JSON 备份 | `/{TOKEN}/export?format=json` |
+| 下载 CSV 给 Excel | `/{TOKEN}/export?format=csv` |
+
+**注意**：
+
+1. TOKEN 不要泄漏（同时也是 webhook 初始化密钥），泄漏即等于黑名单可被任何人查看下载。
+2. 数据源自动选：有 D1 用 D1，没 D1 用 KV，与 `/blacklist` 命令一致。
+3. 导出量不受 `BLACKLIST_PAGE_LIMIT` 限制 — 那是 `/blacklist` 命令的展示上限，导出永远全量返回。
 
 ## License
 
