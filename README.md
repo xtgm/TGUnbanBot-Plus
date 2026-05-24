@@ -314,15 +314,91 @@ GET /{TOKEN}/migrate
 
 把 KV 黑名单全量幂等导入 D1，并把 KV 镜像更新为 D1 全表。要求同时绑定 KV 和 D1。
 
-## 注意事项
+## 常见问题
 
-- `TOKEN` 不是 Telegram Bot Token，而是初始化入口密钥。
-- `GROUP_ID` 必须包含机器人所在的目标群组 ID，多群组用逗号分隔。
-- 初始化入口 `/{TOKEN}` 同时支持 GET 和 POST。
-- Telegram Webhook 订阅 `message` / `chat_member` / `callback_query`。
-- GKY 封禁记录查询依赖外部服务 `https://gkybot.gmeow.cc/banlist`，外部不可用时查询会失败。
-- `wrangler.toml` 中设置了 `keep_vars = true`，部署时保留 Cloudflare Dashboard 中已有的环境变量。
-- KV/D1 全局黑名单是**永久封禁**，自助解封流程第一道闸即拒绝；机器人不会从全局黑名单中清除任何人，必须由管理员显式 `/unban` 处理。
+### Q1：访问 `/{TOKEN}` 返回 500，或部署后 Webhook 不工作
+
+**原因**：环境变量 `TOKEN` / `BOT_TOKEN` / `GROUP_ID` 三项缺一不可，缺失会直接返回 500。
+**解决**：
+
+1. 用 `wrangler secret list` 或在 Cloudflare Dashboard 检查三项变量是否都填了。
+2. `TOKEN` 不是 Telegram Bot Token，而是你自定义的初始化入口密钥（建议随机长字符串）。
+3. `BOT_TOKEN` 才是 [@BotFather](https://t.me/BotFather) 给的 Token。
+4. `GROUP_ID` 必须是机器人所在的目标群组 ID（负数，例如 `-1001234567890`）。
+
+### Q2：用户在私聊发了正确确认句却没被解封
+
+**原因**：本项目要求**完整逐字粘贴**才放行，多/少标点、夹带任何字符都会被拒绝（用于阻止广告号绕过）。
+**解决**：
+
+1. 用户必须直接复制 `<code>` 标签里的整句，不能手打。
+2. 若你修改了 `SELF_UNBAN_KEYWORD`，欢迎语里的 `<code>` 提示语会自动同步，但用户必须用**当前生效的整句**，不是旧的。
+3. 检查用户是否在 KV/D1 全局黑名单（这是永久封禁，第一道闸就被拦下，必须由管理员手动 `/unban` 才能解除）。
+
+### Q3：机器人收不到群里管理员手动封/解封的同步信号
+
+**原因**：`chat_member` 事件需要机器人**本身是群管理员**才能收到。
+**解决**：
+
+1. 把机器人设为目标群组的管理员。
+2. 重新访问 `https://你的Worker域名/{TOKEN}` 让机器人重新订阅 webhook。
+3. 检查 Cloudflare Worker 日志：每次有 `chat_member` 事件时会打印 `[chat_member] 同步加黑/移黑` 日志。
+
+### Q4：超级管理员点了「✅ 同意（一键代发）」按钮被拒
+
+**原因**：当前点击者不在 `SUPER_ADMINS` 白名单中。`SUPER_ADMINS` 的优先级是「环境变量 > 顶部 `DEFAULT_SUPER_ADMINS` 数组」。
+**解决**：
+
+1. 检查 `SUPER_ADMINS` 环境变量是否填了点击者的 TGID（多个用逗号分隔，例如 `123456,789012`）。
+2. 或者改 `_worker.js` 顶部 `DEFAULT_SUPER_ADMINS` 数组并重新部署。
+3. 注意：环境变量一旦填写就**完全覆盖**硬编码默认值，不会合并。
+4. 普通群管理员看到按钮但无法点击属于正常行为，他们应该用「📋 点击复制 ... 代码」按钮手动粘贴。
+
+### Q5：从原项目升级过来后，老的 KV 黑名单数据没出现在 D1
+
+**原因**：D1 表结构由代码自动创建，但**存量数据不会自动迁移**。
+**解决**：浏览器访问 `https://你的Worker域名/{TOKEN}/migrate` 触发一次性迁移，幂等可重复触发。要求同时绑定 KV 和 D1。
+
+### Q6：`/banlist?tgid=...` 返回失败或无数据
+
+**原因**：`/banlist` 依赖外部服务 `https://gkybot.gmeow.cc/banlist`，外部不可用时查询会失败。
+**解决**：
+
+1. 等外部服务恢复，或换一个 GKY 兼容的后端：设置 `GKY_BANLIST_ENDPOINT` 环境变量。
+2. 注意：如果换后端，新后端返回的 HTML 必须与 `parseBanlistHTML` 的正则匹配，否则即使联通也解析不出。
+
+### Q7：修改了 `_worker.js` 顶部的 `DEFAULT_*` 默认值，但没生效
+
+**原因**：环境变量优先级高于顶部硬编码。如果 Cloudflare 后台已经填了同名环境变量，会覆盖你改的源码。
+**解决**：
+
+1. 检查 Cloudflare Dashboard 是否填了同名环境变量。
+2. 如果填了，要么删掉环境变量、要么直接修改环境变量的值（环境变量更方便）。
+3. 修改源码后必须 `wrangler deploy` 重新部署才生效。
+
+### Q8：管理员命令（`/ban` `/spam` `/check` `/blacklist`）没反应
+
+**原因**：管理员鉴权策略是「调用者必须是任一配置群（GROUP_ID 列表中的任意一个）的管理员」。
+**解决**：
+
+1. 确认你是 `GROUP_ID` 中至少一个群的管理员或群主。
+2. `/ban` `/unban` `/blacklist` 必须**私聊机器人**发送（群里发不会响应）。
+3. `/spam` `/check` 必须在配置群内**回复某条消息**才生效。
+4. 检查 Worker 日志中的「权限状态: xxx」行，能看到机器人查到的你当前角色。
+
+### Q9：部署后环境变量被意外重置
+
+**原因**：默认情况下 `wrangler deploy` 会用本地 `wrangler.toml` 覆盖远端配置。
+**解决**：本项目 `wrangler.toml` 里已设置 `keep_vars = true`，部署时会保留 Cloudflare Dashboard 中已有的环境变量。如果你 fork 后改了这个配置，记得改回来。
+
+### Q10：自助解封通过后，用户为什么还是不能在群里发言
+
+**原因**：本机器人解封流程只调用 Telegram 的 `unbanChatMember` / `restrictChatMember`，恢复账号在群里的「能否发言」状态。但有些场景仍可能受限：
+
+1. 用户没重新加入群组（`kicked` 状态解封后用户需要重新点链接加群）。
+2. 用户被其它机器人/反垃圾系统单独标记限言（与本机器人无关）。
+3. 用户在 GKY 全局黑名单中 — 这种情况会触发主群二次审核提醒，需要管理员处理 GKY 那边的封禁。
+4. 用户在 KV/D1 本项目的全局黑名单中 — 这个永远拦在第一道闸，必须管理员 `/unban` 才能放行。
 
 ## License
 
