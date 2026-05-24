@@ -170,9 +170,9 @@ function loadRequiredConfig(env) {
 		throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
 	}
 
-	// GROUP_ID 支持逗号分隔多群组，第一个作为主群
+	// GROUP_ID 支持逗号分隔多群组，第一个作为主群（同时兼容半角 , 与全角 ，）
 	const groupIds = String(env.GROUP_ID)
-		.split(',')
+		.split(/[,，]/)
 		.map((id) => id.trim())
 		.filter((id) => id !== '');
 
@@ -183,7 +183,7 @@ function loadRequiredConfig(env) {
 	// 去重，保持顺序
 	const uniqueGroupIds = [...new Set(groupIds)];
 
-	// SUPER_ADMINS 可选：环境变量优先（字符串，逗号分隔）；否则用顶部 DEFAULT_SUPER_ADMINS（数组）
+	// SUPER_ADMINS 可选：环境变量优先（字符串，逗号分隔，半角 , 与全角 ， 都兼容）；否则用顶部 DEFAULT_SUPER_ADMINS（数组）
 	const sanitizeAdmins = (list) =>
 		[...new Set(
 			(list || [])
@@ -193,7 +193,7 @@ function loadRequiredConfig(env) {
 
 	let superAdmins;
 	if (env.SUPER_ADMINS !== undefined && env.SUPER_ADMINS !== null && String(env.SUPER_ADMINS).trim() !== '') {
-		superAdmins = sanitizeAdmins(String(env.SUPER_ADMINS).split(','));
+		superAdmins = sanitizeAdmins(String(env.SUPER_ADMINS).split(/[,，]/));
 	} else {
 		superAdmins = sanitizeAdmins(DEFAULT_SUPER_ADMINS);
 	}
