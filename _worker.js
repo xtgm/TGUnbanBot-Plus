@@ -378,6 +378,31 @@ function normalizeBlacklist(raw) {
 	return out;
 }
 
+// 批量 /ban /unban 上限（工程上限，非业务文案，不暴露环境变量）
+const BATCH_LIMIT = 50;
+
+// 解析批量 TGID 字符串：半角逗号 / 全角逗号 / 空格 / 换行 都当分隔符；去空、去重、分类
+// 返回 { valid: ['123', '456'], invalid: ['abc'] }
+function parseBatchTgids(raw) {
+	const tokens = String(raw || '')
+		.split(/[,，\s]+/)
+		.map((s) => s.trim())
+		.filter((s) => s !== '');
+	const valid = [];
+	const invalid = [];
+	const seen = new Set();
+	for (const t of tokens) {
+		if (!/^\d+$/.test(t)) {
+			invalid.push(t);
+			continue;
+		}
+		if (seen.has(t)) continue;
+		seen.add(t);
+		valid.push(t);
+	}
+	return { valid, invalid };
+}
+
 // 读取并归一化黑名单
 // === D1 工具函数 ===
 // 首次访问 D1 时建表（幂等），避免人工建表步骤
@@ -465,10 +490,10 @@ async function checkBlacklist(userId, env) {
 	}
 }
 
-// 添加用户到黑名单
+// 添加用户到黑名单（核心实现，不调 mirrorToKV，供批量场景串行调用后统一镜像）
 // options: { reason, by } —— reason 是封禁原因，by 是操作人 TGID
-// 写入策略：D1 / KV 任一存在即可写入；都绑定时 D1 为权威，写完后镜像到 KV
-async function addToBlacklist(userId, env, options = {}) {
+// 写入策略：D1 / KV 任一存在即可写入；都绑定时 D1 为权威，调用方负责镜像到 KV
+async function addToBlacklistCore(userId, env, options = {}) {
 	if (!env.KV && !env.DB) {
 		return { success: false, message: '❌ 未绑定 KV 或 D1 存储空间' };
 	}
@@ -494,7 +519,6 @@ async function addToBlacklist(userId, env, options = {}) {
 				.prepare('INSERT INTO blacklist (id, reason, by_user, at) VALUES (?, ?, ?, ?)')
 				.bind(userIdStr, reason, by, at)
 				.run();
-			await mirrorToKV(env);
 		} else {
 			// 路径 B：仅 KV
 			const blacklist = await getBlacklist(env);
@@ -512,8 +536,17 @@ async function addToBlacklist(userId, env, options = {}) {
 	}
 }
 
-// 从黑名单中移除用户
-async function removeFromBlacklist(userId, env) {
+// 添加用户到黑名单（薄包装）：Core + 单次镜像。保持现有所有调用点签名/语义不变
+async function addToBlacklist(userId, env, options = {}) {
+	const result = await addToBlacklistCore(userId, env, options);
+	if (result.success && env.DB && env.KV) {
+		await mirrorToKV(env);
+	}
+	return result;
+}
+
+// 从黑名单中移除用户（核心实现，不调 mirrorToKV）
+async function removeFromBlacklistCore(userId, env) {
 	if (!env.KV && !env.DB) {
 		return { success: false, message: '❌ 未绑定 KV 或 D1 存储空间' };
 	}
@@ -532,7 +565,6 @@ async function removeFromBlacklist(userId, env) {
 			if (!changed) {
 				return { success: false, message: '⚠️ 该用户不在黑名单中' };
 			}
-			await mirrorToKV(env);
 		} else {
 			// 路径 B：仅 KV
 			const blacklist = await getBlacklist(env);
@@ -548,6 +580,87 @@ async function removeFromBlacklist(userId, env) {
 		console.error('移除黑名单时出错:', error);
 		return { success: false, message: '❌ 移除黑名单失败: ' + error.message };
 	}
+}
+
+// 从黑名单中移除用户（薄包装）：Core + 单次镜像
+async function removeFromBlacklist(userId, env) {
+	const result = await removeFromBlacklistCore(userId, env);
+	if (result.success && env.DB && env.KV) {
+		await mirrorToKV(env);
+	}
+	return result;
+}
+
+// 批量添加：串行写 D1，最后只镜像 1 次到 KV，节省 N-1 次 KV 写入
+async function addManyToBlacklist(ids, env, options = {}) {
+	const results = { success: [], exists: [], failed: [] };
+	for (const id of ids) {
+		const r = await addToBlacklistCore(id, env, options);
+		if (r.success) {
+			results.success.push(id);
+		} else if (r.message && r.message.includes('已在黑名单')) {
+			results.exists.push(id);
+		} else {
+			results.failed.push({ id, msg: r.message || '失败' });
+		}
+	}
+	if (env.DB && env.KV && results.success.length > 0) {
+		await mirrorToKV(env);
+	}
+	return results;
+}
+
+// 批量移除
+async function removeManyFromBlacklist(ids, env) {
+	const results = { success: [], notFound: [], failed: [] };
+	for (const id of ids) {
+		const r = await removeFromBlacklistCore(id, env);
+		if (r.success) {
+			results.success.push(id);
+		} else if (r.message && r.message.includes('不在黑名单')) {
+			results.notFound.push(id);
+		} else {
+			results.failed.push({ id, msg: r.message || '失败' });
+		}
+	}
+	if (env.DB && env.KV && results.success.length > 0) {
+		await mirrorToKV(env);
+	}
+	return results;
+}
+
+// 渲染批量添加结果
+function renderBatchAddResult(results, invalid) {
+	const lines = ['✅ <b>批量添加完成</b>', ''];
+	lines.push(`✅ 成功: ${results.success.length}`);
+	if (results.exists.length) lines.push(`⚠️ 已存在: ${results.exists.length}`);
+	if (invalid.length) lines.push(`❌ 格式错误: ${invalid.length}`);
+	if (results.failed.length) lines.push(`❌ 失败: ${results.failed.length}`);
+
+	lines.push('', '<b>详情</b>:');
+	for (const id of results.success) lines.push(`✅ <code>${id}</code> 已加入`);
+	for (const id of results.exists) lines.push(`⚠️ <code>${id}</code> 已存在`);
+	for (const id of invalid) lines.push(`❌ <code>${escapeHtml(id)}</code> 格式错误`);
+	for (const f of results.failed) lines.push(`❌ <code>${f.id}</code> ${escapeHtml(f.msg)}`);
+
+	return lines.join('\n');
+}
+
+// 渲染批量移除结果
+function renderBatchRemoveResult(results, invalid) {
+	const lines = ['✅ <b>批量移除完成</b>', ''];
+	lines.push(`✅ 成功: ${results.success.length}`);
+	if (results.notFound.length) lines.push(`⚠️ 不在黑名单: ${results.notFound.length}`);
+	if (invalid.length) lines.push(`❌ 格式错误: ${invalid.length}`);
+	if (results.failed.length) lines.push(`❌ 失败: ${results.failed.length}`);
+
+	lines.push('', '<b>详情</b>:');
+	for (const id of results.success) lines.push(`✅ <code>${id}</code> 已移除`);
+	for (const id of results.notFound) lines.push(`⚠️ <code>${id}</code> 不在黑名单`);
+	for (const id of invalid) lines.push(`❌ <code>${escapeHtml(id)}</code> 格式错误`);
+	for (const f of results.failed) lines.push(`❌ <code>${f.id}</code> ${escapeHtml(f.msg)}`);
+
+	return lines.join('\n');
 }
 
 // 一次性把 KV 黑名单迁移到 D1（INSERT OR IGNORE，幂等）
@@ -1168,7 +1281,7 @@ async function handleMessage(message, env) {
 		return;
 	}
 
-	// 处理 /ban 命令 - 添加用户到黑名单
+	// 处理 /ban 命令 - 添加用户到黑名单（支持批量）
 	if (text && text.startsWith('/ban ')) {
 		// 检查是否是私聊
 		if (message.chat.type !== 'private') {
@@ -1182,31 +1295,45 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-		// 提取要封禁的用户ID
-		const parts = text.split(' ');
-		if (parts.length < 2) {
-			await sendTelegramMessage(chatId, '❌ 使用方法: <code>/ban 用户ID</code>');
+		// 提取参数（支持单个 / 批量；分隔符见 parseBatchTgids）
+		const rawArg = text.slice(5);
+		const { valid, invalid } = parseBatchTgids(rawArg);
+
+		if (valid.length === 0 && invalid.length === 0) {
+			await sendTelegramMessage(
+				chatId,
+				`❌ 使用方法：<code>/ban 用户ID</code> 或 <code>/ban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`
+			);
+			return;
+		}
+		if (valid.length > BATCH_LIMIT) {
+			await sendTelegramMessage(
+				chatId,
+				`❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`
+			);
 			return;
 		}
 
-		const targetUserId = parts[1].trim();
-		if (!/^\d+$/.test(targetUserId)) {
-			await sendTelegramMessage(chatId, '❌ 用户ID必须是数字');
+		// 单条且无格式错误：走原路径，输出与之前完全一致（向后兼容）
+		if (valid.length === 1 && invalid.length === 0) {
+			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: userId });
+			await sendTelegramMessage(chatId, result.message);
 			return;
 		}
 
-		// 添加到黑名单
-		const result = await addToBlacklist(targetUserId, env, { reason: 'manual', by: userId });
-		await sendTelegramMessage(chatId, result.message);
+		// 批量：汇总 + 详情
+		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: userId });
+		await sendTelegramMessage(chatId, renderBatchAddResult(results, invalid));
 		return;
 	}
 
-	// 处理 /unban 命令 - 从黑名单移除或显示欢迎消息
+	// 处理 /unban 命令 - 从黑名单移除或显示欢迎消息（支持批量）
 	if (text && text.startsWith('/unban')) {
-		const parts = text.split(' ');
-		
+		const head = text.split(' ')[0];
+		const rest = text.slice(head.length); // 保留参数原貌（含前导空格）
+
 		// 如果有参数，处理黑名单移除
-		if (parts.length > 1 && parts[1].trim()) {
+		if (rest.trim()) {
 			// 检查是否是私聊
 			if (message.chat.type !== 'private') {
 				return; // 非私聊不予回复
@@ -1219,15 +1346,33 @@ async function handleMessage(message, env) {
 				return;
 			}
 
-			const targetUserId = parts[1].trim();
-			if (!/^\d+$/.test(targetUserId)) {
-				await sendTelegramMessage(chatId, '❌ 用户ID必须是数字');
+			const { valid, invalid } = parseBatchTgids(rest);
+
+			if (valid.length === 0 && invalid.length === 0) {
+				await sendTelegramMessage(
+					chatId,
+					`❌ 使用方法：<code>/unban 用户ID</code> 或 <code>/unban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`
+				);
+				return;
+			}
+			if (valid.length > BATCH_LIMIT) {
+				await sendTelegramMessage(
+					chatId,
+					`❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`
+				);
 				return;
 			}
 
-			// 从黑名单移除
-			const result = await removeFromBlacklist(targetUserId, env);
-			await sendTelegramMessage(chatId, result.message);
+			// 单条且无格式错误：走原路径
+			if (valid.length === 1 && invalid.length === 0) {
+				const result = await removeFromBlacklist(valid[0], env);
+				await sendTelegramMessage(chatId, result.message);
+				return;
+			}
+
+			// 批量
+			const results = await removeManyFromBlacklist(valid, env);
+			await sendTelegramMessage(chatId, renderBatchRemoveResult(results, invalid));
 			return;
 		}
 	}
