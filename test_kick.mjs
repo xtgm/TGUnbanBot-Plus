@@ -134,14 +134,20 @@ function assert(name, cond, detail) {
 function resetCalls() { apiCalls.length = 0; }
 function callsOf(method) { return apiCalls.filter((c) => c.method === method); }
 
-// ---------- [1] /spam 触发:加黑 + 全群踢 + 删消息 ----------
-console.log('\n[1] /spam 触发:加黑 + 全群踢 + 删消息');
+// ---------- [1] /spam 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊详情 ----------
+console.log('\n[1] /spam 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊详情');
 {
 	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 	sandbox.fetch = makeFetchMock({
 		// /spam 流程会调:
 		// - getChatMember (admin 校验) - 让发送者是管理员
 		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChat: (b) => {
+			const id = String(b.chat_id);
+			const titles = { '-1001': '主群', '-1002': '副群' };
+			return { ok: true, result: { id: Number(b.chat_id), title: titles[id] || `群${id}`, type: 'supergroup' } };
+		},
 		banChatMember: () => ({ ok: true, result: true }),
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 999 } }),
@@ -162,7 +168,7 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 删消息');
 	const env = { ...baseEnv, KV: makeFakeKV([]) };
 	const res = await handler.fetch(
 		new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }),
-		env
+		env, fakeCtx
 	);
 	assert('webhook 返回 OK', res.status === 200);
 
@@ -176,9 +182,66 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 删消息');
 	assert('两个群 ID 都被覆盖', JSON.stringify(banGroups) === JSON.stringify(['-1001', '-1002']), `实际 ${JSON.stringify(banGroups)}`);
 
 	const delCalls = callsOf('deleteMessage');
-	assert('deleteMessage 调用 1 次', delCalls.length === 1);
-	assert('删除的是被回复消息 msgId=50', delCalls[0].body.message_id === 50);
-	assert('删除发生在举报群 -1001', delCalls[0].body.chat_id === -1001);
+	// 至少 1 次:删除被回复的 msgId=50 那条;闪屏撤回是否调用取决于 ctx 是否同步执行
+	const realDelCalls = delCalls.filter((c) => c.body.message_id === 50);
+	assert('删除被回复消息 msgId=50 至少 1 次', realDelCalls.length >= 1, `实际 ${realDelCalls.length}`);
+	assert('删除发生在举报群 -1001', realDelCalls[0].body.chat_id === -1001);
+
+	// 新断言:/spam 现在走 replyToAdmin 双通道
+	const sendCalls = callsOf('sendMessage');
+	const groupSends = sendCalls.filter((c) => String(c.body.chat_id) === '-1001');
+	const dmSends = sendCalls.filter((c) => String(c.body.chat_id) === '999');
+	assert('群内闪屏 sendMessage 至少 1 次', groupSends.length >= 1);
+	assert('闪屏含"已加黑"', groupSends[0].body.text.includes('已加黑'));
+	assert('私聊详情 sendMessage 1 次', dmSends.length === 1);
+	assert('私聊详情含"添加到黑名单"', dmSends[0].body.text.includes('添加到黑名单'));
+	assert('私聊详情含群名"主群"', dmSends[0].body.text.includes('主群'));
+}
+
+// ---------- [1b] /spam bot 不是管理员 + 删消息失败:错误翻译 ----------
+console.log('\n[1b] /spam 错误翻译:CHAT_ADMIN_REQUIRED + 删消息失败');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
+		// 模拟 -1002 群里 bot 不是管理员
+		banChatMember: (b) => {
+			if (String(b.chat_id) === '-1002') {
+				return { ok: false, error_code: 400, description: 'Bad Request: CHAT_ADMIN_REQUIRED' };
+			}
+			return { ok: true, result: true };
+		},
+		// 模拟删消息失败(消息超过 48 小时)
+		deleteMessage: () => ({ ok: false, error_code: 400, description: "Bad Request: message can't be deleted" }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+
+	const update = {
+		message: {
+			message_id: 200,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 999, is_bot: false },
+			text: '/spam',
+			reply_to_message: {
+				message_id: 60,
+				from: { id: 7777, is_bot: false },
+			},
+		},
+	};
+	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	await handler.fetch(
+		new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }),
+		env, fakeCtx
+	);
+
+	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('私聊详情存在', !!dmSend);
+	assert('详情含 CHAT_ADMIN_REQUIRED 中文翻译"bot 必须是群管理员"', dmSend.body.text.includes('bot 必须是群管理员'));
+	assert('详情含建议"封禁用户"和"删除消息"', dmSend.body.text.includes('封禁用户') && dmSend.body.text.includes('删除消息'));
+	assert('详情含删消息失败"该消息无法删除"', dmSend.body.text.includes('该消息无法删除'));
+	assert('详情含建议"超过 48 小时"', dmSend.body.text.includes('48'));
 }
 
 // ---------- [2] /ban 单条:加黑 + 全群踢 ----------

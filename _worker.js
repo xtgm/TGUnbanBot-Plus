@@ -617,6 +617,23 @@ function translateTelegramError(description) {
 	const desc = String(description);
 	const lower = desc.toLowerCase();
 
+	// 更具体的错误码先匹配（Telegram 有时同时携带多个特征）
+	if (lower.includes('chat_admin_required')) {
+		return { 中文: 'bot 必须是群管理员', 建议: '把 bot 设为群管理员，并打开"封禁用户"和"删除消息"权限' };
+	}
+	if (lower.includes("message can't be deleted") || lower.includes("can't be deleted for everyone")) {
+		return { 中文: '该消息无法删除', 建议: '消息可能超过 48 小时或不属于 bot 可删除范围；可手动删除' };
+	}
+	if (lower.includes('message to delete not found')) {
+		return { 中文: '消息已不存在', 建议: '消息可能已被其他人删除，无需操作' };
+	}
+	if (lower.includes('user is not a member') || lower.includes('user_not_participant')) {
+		return { 中文: '用户已不在群中', 建议: '该用户已离群或被踢，本次踢人请求实际无影响' };
+	}
+	if (lower.includes('peer_id_invalid') || lower.includes('chat_id_invalid')) {
+		return { 中文: '群 ID 无效', 建议: '检查 GROUP_ID 环境变量配置，群组 ID 应为负数（如 -1001234567890）' };
+	}
+
 	if (lower.includes('not enough rights') || lower.includes('not enough privileges')) {
 		return { 中文: 'bot 权限不足', 建议: '把 bot 设为群管理员，并打开"封禁用户"权限' };
 	}
@@ -1584,10 +1601,26 @@ async function handleMessage(message, env, ctx) {
 
 			const lines = [`✅ 已将用户 ${linkedUserId} 添加到黑名单`];
 			lines.push(await renderBanResultsDetail(banResults));
-			lines.push(delResult.ok ? '🗑️ 已删除被回复的垃圾消息' : `⚠️ 删除消息失败：${escapeHtml(delResult.error || '未知')}`);
-			await sendTelegramMessage(chatId, lines.join('\n'));
+			if (delResult.ok) {
+				lines.push('🗑️ 已删除被回复的垃圾消息');
+			} else {
+				const { 中文, 建议 } = translateTelegramError(delResult.error);
+				lines.push(`⚠️ 删除消息失败:${escapeHtml(中文)}\n   建议:${escapeHtml(建议)}`);
+			}
+
+			await replyToAdmin(message, ctx, {
+				flashText: `✅ 已加黑 ${linkedUserId}`,
+				detailText: lines.join('\n'),
+				isInGroup: true
+			});
 		} else {
-			await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${linkedUserId}`);
+			// 写库失败(已存在 / 未绑存储等)— 也走双通道
+			const plainMsg = result.message.replace(/<[^>]+>/g, '');
+			await replyToAdmin(message, ctx, {
+				flashText: `⚠️ ${linkedUserId}: ${escapeHtml(plainMsg)}`,
+				detailText: `${result.message}\nTG ID: ${linkedUserId}`,
+				isInGroup: true
+			});
 		}
 		return;
 	}
