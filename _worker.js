@@ -142,7 +142,7 @@ export default {
 
 				// 分发：普通消息 / 群成员状态变更 / 按钮回调
 				if (update.message) {
-					await handleMessage(update.message, env);
+					await handleMessage(update.message, env, ctx);
 				} else if (update.chat_member) {
 					await handleChatMemberUpdate(update.chat_member, env);
 				} else if (update.callback_query) {
@@ -616,6 +616,33 @@ function renderBanResults(banResults) {
 	if (okCount === total) return `🚫 已从全部 ${total} 个群踢出`;
 	if (okCount === 0) return `⚠️ 全部 ${total} 个群踢人失败（请检查 bot 是否为群管理员）`;
 	return `🚫 已踢出 ${okCount}/${total} 个群（${total - okCount} 个失败）`;
+}
+
+// 双通道回执：群内场景发闪屏 + 私聊管理员发详情；私聊场景直接发详情
+// 私聊投递失败（管理员从未 /start 过 bot）时，群里追加一条闪屏说明
+async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup }) {
+	const chatId = message.chat.id;
+	const adminId = message.from.id;
+
+	if (!isInGroup) {
+		await sendTelegramMessage(chatId, detailText);
+		return;
+	}
+
+	// 群内：先发闪屏给所有人看
+	await sendFlashMessage(chatId, flashText, ctx);
+
+	// 再尝试私聊管理员发完整详情
+	const dm = await sendTelegramMessage(adminId, detailText);
+	if (!dm?.ok) {
+		const startLink = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}?start=hi` : 'https://t.me';
+		await sendFlashMessage(
+			chatId,
+			`⚠️ 详情已尝试私聊管理员，如未收到请先 <a href="${startLink}">私聊机器人发 /start</a> 一次`,
+			ctx,
+			8000
+		);
+	}
 }
 
 // 批量添加：串行写 D1，最后只镜像 1 次到 KV，节省 N-1 次 KV 写入
@@ -1420,7 +1447,7 @@ async function handleCallbackQuery(cb, env) {
 	}
 }
 
-async function handleMessage(message, env) {
+async function handleMessage(message, env, ctx) {
 	if (await handleNewChatMemberBots(message)) {
 		return;
 	}
@@ -1568,17 +1595,17 @@ async function handleMessage(message, env) {
 		return;
 	}
 
-	// 处理 /ban 命令 - 添加用户到黑名单（支持批量）
+	// 处理 /ban 命令 - 添加用户到黑名单（支持批量、群内/私聊双场景）
 	if (text && text.startsWith('/ban ')) {
-		// 检查是否是私聊
-		if (message.chat.type !== 'private') {
-			return; // 非私聊不予回复
-		}
+		const isInGroup = message.chat.type !== 'private';
 
 		// 检查是否是群组管理员
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
-			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+			}
 			return;
 		}
 
@@ -1587,35 +1614,42 @@ async function handleMessage(message, env) {
 		const { valid, invalid } = parseBatchTgids(rawArg);
 
 		if (valid.length === 0 && invalid.length === 0) {
-			await sendTelegramMessage(
-				chatId,
-				`❌ 使用方法：<code>/ban 用户ID</code> 或 <code>/ban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`
-			);
+			const usageText = `❌ 使用方法：<code>/ban 用户ID</code> 或 <code>/ban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
+			if (isInGroup) {
+				await sendFlashMessage(chatId, usageText, ctx);
+			} else {
+				await sendTelegramMessage(chatId, usageText);
+			}
 			return;
 		}
 		if (valid.length > BATCH_LIMIT) {
-			await sendTelegramMessage(
-				chatId,
-				`❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`
-			);
+			const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
+			if (isInGroup) {
+				await sendFlashMessage(chatId, limitText, ctx);
+			} else {
+				await sendTelegramMessage(chatId, limitText);
+			}
 			return;
 		}
 
-		// 单条且无格式错误：走原路径，输出与之前完全一致（向后兼容）
+		// 单条且无格式错误
 		if (valid.length === 1 && invalid.length === 0) {
 			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: userId });
-			let reply = result.message;
+			let detailReply = result.message;
+			let flashText;
 			if (result.success) {
 				const banResults = await banUserFromAllGroups(valid[0]);
-				reply += '\n' + renderBanResults(banResults);
+				detailReply += '\n' + renderBanResults(banResults);
+				flashText = `✅ 已加黑 <code>${valid[0]}</code>`;
+			} else {
+				flashText = `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
 			}
-			await sendTelegramMessage(chatId, reply);
+			await replyToAdmin(message, ctx, { flashText, detailText: detailReply, isInGroup });
 			return;
 		}
 
-		// 批量：汇总 + 详情 + 每个成功用户的踢人结果
+		// 批量
 		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: userId });
-		// 对加黑成功的用户逐一全群踢
 		const banSummary = { success: results.success.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
 		for (const id of results.success) {
 			const banResults = await banUserFromAllGroups(id);
@@ -1624,56 +1658,74 @@ async function handleMessage(message, env) {
 			else if (okCount === 0) banSummary.banFailedAll += 1;
 			else banSummary.banPartial += 1;
 		}
-		await sendTelegramMessage(chatId, renderBatchAddResult(results, invalid, banSummary));
+		const failedCount = invalid.length + results.failed.length;
+		const flashText = `✅ 批量加黑：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+		await replyToAdmin(message, ctx, {
+			flashText,
+			detailText: renderBatchAddResult(results, invalid, banSummary),
+			isInGroup
+		});
 		return;
 	}
 
-	// 处理 /unban 命令 - 从黑名单移除或显示欢迎消息（支持批量）
+	// 处理 /unban 命令 - 从黑名单移除或显示欢迎消息（支持批量、群内/私聊双场景）
 	if (text && text.startsWith('/unban')) {
 		const head = text.split(' ')[0];
 		const rest = text.slice(head.length); // 保留参数原貌（含前导空格）
 
 		// 如果有参数，处理黑名单移除
 		if (rest.trim()) {
-			// 检查是否是私聊
-			if (message.chat.type !== 'private') {
-				return; // 非私聊不予回复
-			}
+			const isInGroup = message.chat.type !== 'private';
 
 			// 检查是否是群组管理员
 			const isAdmin = await checkIfUserIsAdmin(userId);
 			if (!isAdmin) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+				if (!isInGroup) {
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+				}
 				return;
 			}
 
 			const { valid, invalid } = parseBatchTgids(rest);
 
 			if (valid.length === 0 && invalid.length === 0) {
-				await sendTelegramMessage(
-					chatId,
-					`❌ 使用方法：<code>/unban 用户ID</code> 或 <code>/unban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`
-				);
+				const usageText = `❌ 使用方法：<code>/unban 用户ID</code> 或 <code>/unban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
+				if (isInGroup) {
+					await sendFlashMessage(chatId, usageText, ctx);
+				} else {
+					await sendTelegramMessage(chatId, usageText);
+				}
 				return;
 			}
 			if (valid.length > BATCH_LIMIT) {
-				await sendTelegramMessage(
-					chatId,
-					`❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`
-				);
+				const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
+				if (isInGroup) {
+					await sendFlashMessage(chatId, limitText, ctx);
+				} else {
+					await sendTelegramMessage(chatId, limitText);
+				}
 				return;
 			}
 
-			// 单条且无格式错误：走原路径
+			// 单条且无格式错误
 			if (valid.length === 1 && invalid.length === 0) {
 				const result = await removeFromBlacklist(valid[0], env);
-				await sendTelegramMessage(chatId, result.message);
+				const flashText = result.success
+					? `✅ 已移黑 <code>${valid[0]}</code>`
+					: `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
+				await replyToAdmin(message, ctx, { flashText, detailText: result.message, isInGroup });
 				return;
 			}
 
 			// 批量
 			const results = await removeManyFromBlacklist(valid, env);
-			await sendTelegramMessage(chatId, renderBatchRemoveResult(results, invalid));
+			const failedCount = invalid.length + results.failed.length;
+			const flashText = `✅ 批量移黑：成功 ${results.success.length}${results.notFound.length ? ` / 不在黑名单 ${results.notFound.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+			await replyToAdmin(message, ctx, {
+				flashText,
+				detailText: renderBatchRemoveResult(results, invalid),
+				isInGroup
+			});
 			return;
 		}
 	}
@@ -1909,6 +1961,20 @@ async function deleteMessage(chatId, messageId) {
 		console.error(`[deleteMessage] chat=${chatId} msg=${messageId} 异常:`, error);
 		return { ok: false, error: error.message };
 	}
+}
+
+// 发一条群内闪屏提示，ttlMs 毫秒后自动撤回
+// ctx 是 Cloudflare Worker 的 ExecutionContext；ctx.waitUntil 让 Worker 在响应返回后继续等
+// ctx 缺失（比如离线测试或非 Worker 环境）则退化为只发不撤回
+async function sendFlashMessage(chatId, text, ctx, ttlMs = 5000) {
+	const result = await sendTelegramMessage(chatId, text);
+	const messageId = result?.result?.message_id;
+	if (!messageId || !ctx || typeof ctx.waitUntil !== 'function') return result;
+	ctx.waitUntil((async () => {
+		await new Promise((r) => setTimeout(r, ttlMs));
+		await deleteMessage(chatId, messageId);
+	})());
+	return result;
 }
 
 async function unbanUser(userId, groupId = GROUP_ID) {

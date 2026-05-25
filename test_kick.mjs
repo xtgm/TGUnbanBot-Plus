@@ -393,6 +393,230 @@ console.log('\n[9] /purge 错误 TOKEN');
 	assert('错误 TOKEN 返回 405', res.status === 405);
 }
 
+// ---------- [10] 群内 /ban 单条:加黑 + 全群踢 + 闪屏 + 私聊详情 ----------
+console.log('\n[10] 群内 /ban 单条');
+{
+	resetCalls();
+	const ctxCalls = [];
+	const fakeCtx = {
+		passThroughOnException: () => {},
+		waitUntil: (p) => {
+			ctxCalls.push('waitUntil');
+			// 让 setTimeout 立刻执行(不阻塞测试)
+			Promise.resolve(p).catch(() => {});
+		}
+	};
+	// 重写 handler.fetch 调用方式 — 直接调内部 handleMessage 不行因为没暴露
+	// 改用 webhook,但要能传 ctx,所以模拟 fetch(request, env, ctx)
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: Math.floor(Math.random() * 1e6) } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const update = {
+		message: {
+			message_id: 700,
+			chat: { id: -1001, type: 'supergroup' }, // 群内
+			from: { id: 999, is_bot: false }, // 管理员
+			text: '/ban 123',
+		},
+	};
+	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('用户 123 已加黑', blacklist.some((e) => e.id === '123'));
+
+	const banCalls = callsOf('banChatMember');
+	assert('banChatMember 调用 2 次（两个群）', banCalls.length === 2);
+
+	const sendCalls = callsOf('sendMessage');
+	// 期望 2 条 sendMessage:1 群内闪屏 + 1 私聊详情
+	assert('sendMessage 调用 2 次（闪屏 + 私聊详情）', sendCalls.length === 2, `实际 ${sendCalls.length}`);
+
+	const groupSend = sendCalls.find((c) => String(c.body.chat_id) === '-1001');
+	const dmSend = sendCalls.find((c) => String(c.body.chat_id) === '999');
+	assert('群内闪屏发到 -1001', !!groupSend);
+	assert('闪屏文本是简短确认', groupSend.body.text.includes('已加黑'));
+	assert('私聊发到管理员 999', !!dmSend);
+	assert('私聊含 banChatMember 详情', dmSend.body.text.includes('已从全部'));
+
+	assert('ctx.waitUntil 至少调用 1 次（用于撤回闪屏）', ctxCalls.length >= 1);
+}
+
+// ---------- [11] 群内 /ban 批量 ----------
+console.log('\n[11] 群内 /ban 批量');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 555 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const update = {
+		message: {
+			message_id: 800,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 999, is_bot: false },
+			text: '/ban 100,200,300',
+		},
+	};
+	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('3 个用户全部加黑', blacklist.length === 3);
+
+	// 3 用户 × 2 群 = 6 次 ban
+	assert('banChatMember 调用 6 次', callsOf('banChatMember').length === 6);
+
+	const sendCalls = callsOf('sendMessage');
+	assert('sendMessage 调用 2 次（闪屏+私聊详情）', sendCalls.length === 2);
+	const dmSend = sendCalls.find((c) => String(c.body.chat_id) === '999');
+	assert('私聊详情含批量结果', dmSend.body.text.includes('批量添加完成'));
+	assert('私聊详情含每个用户', dmSend.body.text.includes('100') && dmSend.body.text.includes('200') && dmSend.body.text.includes('300'));
+}
+
+// ---------- [12] 群内 /unban 单条 ----------
+console.log('\n[12] 群内 /unban 单条');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		sendMessage: () => ({ ok: true, result: { message_id: 666 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const update = {
+		message: {
+			message_id: 900,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 999, is_bot: false },
+			text: '/unban 8888',
+		},
+	};
+	const env = {
+		...baseEnv,
+		KV: makeFakeKV([{ id: '8888', reason: 'spam', by: '999', at: '2026-05-01T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('8888 已从黑名单移除', !blacklist.some((e) => e.id === '8888'));
+
+	// /unban 不调 banChatMember
+	assert('banChatMember 没调用', callsOf('banChatMember').length === 0);
+
+	const sendCalls = callsOf('sendMessage');
+	assert('sendMessage 调用 2 次（闪屏+私聊）', sendCalls.length === 2);
+	const groupSend = sendCalls.find((c) => String(c.body.chat_id) === '-1001');
+	assert('群内闪屏含"已移黑"', groupSend.body.text.includes('已移黑'));
+}
+
+// ---------- [13] 私聊 /ban 单条:行为不变(向后兼容) ----------
+console.log('\n[13] 私聊 /ban 单条向后兼容');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 777 } }),
+	});
+
+	const update = {
+		message: {
+			message_id: 1000,
+			chat: { id: 999, type: 'private' }, // 私聊
+			from: { id: 999, is_bot: false },
+			text: '/ban 123',
+		},
+	};
+	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	// 私聊场景:只发 1 次详情,不发闪屏
+	const sendCalls = callsOf('sendMessage');
+	assert('私聊场景 sendMessage 只调用 1 次', sendCalls.length === 1, `实际 ${sendCalls.length}`);
+	assert('回执直接发到私聊 999', String(sendCalls[0].body.chat_id) === '999');
+	// 私聊场景不应触发闪屏自删
+	assert('deleteMessage 没被调用（无闪屏需要撤回）', callsOf('deleteMessage').length === 0);
+}
+
+// ---------- [14] 群内非管理员发 /ban:静默忽略 ----------
+console.log('\n[14] 群内非管理员发 /ban 静默忽略');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		// 让发送者不是管理员
+		getChatMember: () => ({ ok: true, result: { status: 'member', user: { id: 0 } } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 888 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const update = {
+		message: {
+			message_id: 1100,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 5555, is_bot: false }, // 普通用户
+			text: '/ban 123',
+		},
+	};
+	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('未加黑（无权）', blacklist.length === 0);
+	assert('banChatMember 未调用', callsOf('banChatMember').length === 0);
+	assert('sendMessage 未调用（群内静默）', callsOf('sendMessage').length === 0);
+}
+
+// ---------- [15] 群内 /ban 私聊投递失败 → 群里追加提示 ----------
+console.log('\n[15] 私聊投递失败追加群内提示');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	let dmAttempts = 0;
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: (b) => {
+			// 私聊（chat_id 正数 = 用户）失败,群发(负数)成功
+			if (Number(b.chat_id) > 0) {
+				dmAttempts++;
+				return { ok: false, error_code: 403, description: 'Forbidden: bot was blocked by the user' };
+			}
+			return { ok: true, result: { message_id: 999 } };
+		},
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const update = {
+		message: {
+			message_id: 1200,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 999, is_bot: false },
+			text: '/ban 123',
+		},
+	};
+	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	assert('尝试私聊管理员', dmAttempts === 1);
+	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
+	// 期望群里发了 2 次:闪屏成功提示 + 私聊失败追加提示
+	assert('群里发了 2 次（闪屏 + 私聊失败提示）', groupSends.length === 2, `实际 ${groupSends.length}`);
+	assert('第二条群内消息含"私聊机器人"提示', groupSends[1].body.text.includes('私聊机器人'));
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);
