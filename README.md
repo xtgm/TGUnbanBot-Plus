@@ -31,6 +31,7 @@
 - **`/blacklist` 命令**：管理员私聊查看当前黑名单（最多 30 条）。
 - **`/ban` `/unban` 支持批量**：单次最多 50 个 TGID，分隔符兼容半角逗号 / 全角逗号 / 空格 / 换行；单条用法完全保持原样。
 - **黑名单导出接口**：`GET /{TOKEN}/export` 浏览器直接看 HTML 表格（带搜索过滤），`?format=json` / `?format=csv` 下载完整数据，CSV 自带 BOM 让 Excel 不乱码。
+- **全局黑名单真踢人闭环**：`/ban` `/spam` 加黑后会**立即遍历所有 GROUP_IDS 把人踢出群**（之前只写库不踢人）；`/spam` 还会删除被回复的垃圾消息；黑名单用户在群里发言会被实时拦截删消息+踢人；被人拉回群也会立即被踢回去；新增 `/{TOKEN}/purge` 一次性清扫存量数据。
 - **`chat_member` 事件订阅**：管理员手动封/解封时机器人自动同步 KV/D1 黑名单。
 - **`callback_query` 按钮交互**：二次审核结果带「✅ 同意（一键代发）」按钮，超级管理员一键代发 GKYbotSave 指令到目标群，无需复制粘贴。
 - **超级管理员权限分级**：新增可选 `SUPER_ADMINS` 环境变量。普通群管理员能用所有命令但不能点按钮，按钮仅限超管使用，避免群内多名管理员误操作。
@@ -51,9 +52,9 @@
 
 | 命令 | 使用位置 | 说明 |
 | --- | --- | --- |
-| `/ban 用户ID` | 私聊 | 加入 KV/D1 黑名单（reason=manual）。**支持批量**：`/ban 123,456,789`（半角 / 全角逗号 / 空格 / 换行均可，单次最多 50 个） |
+| `/ban 用户ID` | 私聊 | 加入 KV/D1 黑名单（reason=manual）+ **遍历所有 GROUP_IDS 真踢出群**。**支持批量**：`/ban 123,456,789`（半角 / 全角逗号 / 空格 / 换行均可，单次最多 50 个） |
 | `/unban 用户ID` | 私聊 | 从 KV/D1 黑名单移除。**支持批量**：`/unban 123,456,789`（同上分隔符与上限） |
-| `/spam` | 群内回复 | 把被回复用户加入 KV/D1 黑名单（reason=spam） |
+| `/spam` | 群内回复 | 把被回复用户加入 KV/D1 黑名单（reason=spam）+ **遍历所有 GROUP_IDS 真踢出群** + **删除被回复的垃圾消息** |
 | `/check` | 群内回复 | 查询被回复用户的 GKY 封禁记录，返回带按钮的二次审核 |
 | `/blacklist` | 私聊 | 查看当前 KV/D1 黑名单（最多显示 30 条） |
 | `/start check_用户ID` | 私聊深链 | 二次审核入口，由机器人自动生成链接 |
@@ -74,6 +75,8 @@
   - ❌ 不触发：新加入的是普通用户（非机器人）
   - 用途：防止有人偷偷把广告 / 拉群 / 转发类机器人拉进群里发广告，争取时间让群主决定是否踢掉
 - **管理员手动操作同步**：群管理员手动 ban/unban 操作时，机器人通过 `chat_member` 事件自动同步 KV/D1 黑名单（被踢即加黑、解禁即移黑）。
+- **黑名单用户群消息拦截**：已在 KV/D1 全局黑名单的用户，在任一配置群发言时机器人会**实时删除消息并踢出群**。管理员豁免（避免误加黑导致管理员被踢）。
+- **黑名单用户复入群拦截**：已在黑名单的用户被人拉回群 / 自己加回群时（`chat_member` 事件 status 变为 member），机器人会**立即把他再踢出去**，无需人工介入。
 
 ## 项目结构
 
@@ -83,6 +86,7 @@
 ├── wrangler.toml    # Cloudflare Wrangler 配置
 ├── test_batch.mjs   # 批量 /ban /unban 离线测试（47 项）
 ├── test_export.mjs  # 导出接口离线测试（40 项）
+├── test_kick.mjs    # 真踢人闭环离线测试（31 项）
 ├── README.md
 └── LICENSE
 ```
@@ -112,7 +116,7 @@
 
 | 变量名 | 说明 |
 | --- | --- |
-| `TOKEN` | 初始化入口密钥。访问 `https://你的Worker域名/{TOKEN}` 注册 Webhook + 注册命令；访问 `https://你的Worker域名/{TOKEN}/migrate` 触发 KV → D1 迁移；访问 `https://你的Worker域名/{TOKEN}/export` 导出黑名单。建议用随机长字符串。 |
+| `TOKEN` | 初始化入口密钥。访问 `https://你的Worker域名/{TOKEN}` 注册 Webhook + 注册命令；访问 `https://你的Worker域名/{TOKEN}/migrate` 触发 KV → D1 迁移；访问 `https://你的Worker域名/{TOKEN}/export` 导出黑名单；访问 `https://你的Worker域名/{TOKEN}/purge` 一次性清扫存量黑名单仍在群里的人。建议用随机长字符串。 |
 | `BOT_TOKEN` | Telegram Bot Token，从 [@BotFather](https://t.me/BotFather) 取。 |
 | `GROUP_ID` | 目标 Telegram 群组 ID，支持逗号分隔多群组（半角 `,` 与全角 `，` 都兼容）。例如 `-1001234567890` 或 `-1001234567890,-1009876543210`。第一个群作为「主群」，二次审核提醒等会发到主群。 |
 
@@ -354,6 +358,31 @@ curl -o blacklist.json "https://你的Worker域名/你的TOKEN/export?format=jso
 curl -o blacklist.csv "https://你的Worker域名/你的TOKEN/export?format=csv"
 ```
 
+### 一次性清扫入口（受 TOKEN 保护）
+
+```http
+GET /{TOKEN}/purge
+```
+
+扫描当前 KV/D1 黑名单 × 所有 `GROUP_IDS`，对每个**仍在群里**的人调 `banChatMember` 真踢出群。Telegram 状态为 `kicked` / `left` 的会跳过。返回 JSON 详情：
+
+```json
+{
+  "成功": true,
+  "黑名单总数": 33,
+  "配置群组数": 2,
+  "已踢出": 5,
+  "不在群": 60,
+  "失败": 1,
+  "详情": [
+    { "用户ID": "123", "群ID": "-1001234567890", "旧状态": "member", "结果": "已踢" },
+    { "用户ID": "456", "群ID": "-1001234567890", "旧状态": "member", "结果": "失败", "错误": "Bad Request: not enough rights to restrict/unrestrict chat member" }
+  ]
+}
+```
+
+**用途**：当你从原项目升级（原项目只写黑名单不踢人）或修复了 bot 权限后，跑一遍 `/purge` 把所有早期"加黑了但还在群里"的用户清扫掉。幂等可重复触发。
+
 ## 常见问题
 
 ### Q1：访问 `/{TOKEN}` 返回 500，或部署后 Webhook 不工作
@@ -472,6 +501,25 @@ curl -o blacklist.csv "https://你的Worker域名/你的TOKEN/export?format=csv"
 1. TOKEN 不要泄漏（同时也是 webhook 初始化密钥），泄漏即等于黑名单可被任何人查看下载。
 2. 数据源自动选：有 D1 用 D1，没 D1 用 KV，与 `/blacklist` 命令一致。
 3. 导出量不受 `BLACKLIST_PAGE_LIMIT` 限制 — 那是 `/blacklist` 命令的展示上限，导出永远全量返回。
+
+### Q13：`/ban` `/spam` 显示"全部群踢人失败"怎么办
+
+**原因**：踢人需要 bot 在目标群拥有"封禁用户"权限。bot 不是群管理员，或者管理员权限里关闭了"封禁用户"开关时，Telegram 会拒绝 `banChatMember` 请求。
+**解决**：
+
+1. 进入目标群组 → 群设置 → 管理员 → 找到本机器人 → 打开"封禁用户"权限。
+2. 确认开关：**封禁用户（Ban Users）**、**删除消息（Delete Messages）** 这两项必须打开。
+3. 改完后无需重启 Worker，下次触发 `/ban` `/spam` 立即生效。
+4. 如果想清扫之前因权限不足"加黑了但没踢"的存量用户：浏览器访问 `https://你的Worker域名/{TOKEN}/purge` 一次性扫描清扫。
+
+### Q14：黑名单用户的旧消息怎么办，会被自动删吗
+
+**原因**：本项目调用的 `banChatMember` API 带 `revoke_messages: true`，Telegram 会**自动撤回该用户最近 48 小时**内在该群发的所有消息。这是 Telegram 平台规则，48 小时之外的消息**无法撤回**。
+**解决**：
+
+1. 自动撤回 48 小时内消息已是 Telegram 上限，本项目无法做更多。
+2. 如需删除更早的消息，只能群管理员手动逐条删，或群管理员用 Telegram 客户端的"清除全部消息"功能（针对单个用户）。
+3. `/spam` 命令额外删除被回复那条具体的垃圾消息，不受 48 小时限制（因为是按 `message_id` 直接删）。
 
 ## License
 

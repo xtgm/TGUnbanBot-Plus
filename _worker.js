@@ -120,6 +120,9 @@ export default {
 		} else if (request.method === 'GET' && path === `${TOKEN}/export`) {
 			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
 			return await handleExport(env, url);
+		} else if (request.method === 'GET' && path === `${TOKEN}/purge`) {
+			// 一次性清扫：把仍在群里的黑名单用户全部踢出（受 TOKEN 保护）
+			return await handlePurge(env);
 		} else if (request.method === 'POST') {
 			// 如果是 Telegram Webhook 请求
 			if (path === '') {
@@ -594,6 +597,27 @@ async function removeFromBlacklist(userId, env) {
 	return result;
 }
 
+// 把用户从所有配置群踢出，逐群结果数组返回
+// bot 不在群 / 没权限单群失败不影响其它群；串行避免 Telegram API 限流
+// 返回 [{ groupId, ok, error }]
+async function banUserFromAllGroups(userId) {
+	const results = [];
+	for (const groupId of GROUP_IDS) {
+		const r = await banUserFromGroup(groupId, userId);
+		results.push({ groupId, ok: r.ok, error: r.error });
+	}
+	return results;
+}
+
+// 渲染单个用户多群踢人结果为简短 HTML 文案
+function renderBanResults(banResults) {
+	const okCount = banResults.filter((r) => r.ok).length;
+	const total = banResults.length;
+	if (okCount === total) return `🚫 已从全部 ${total} 个群踢出`;
+	if (okCount === 0) return `⚠️ 全部 ${total} 个群踢人失败（请检查 bot 是否为群管理员）`;
+	return `🚫 已踢出 ${okCount}/${total} 个群（${total - okCount} 个失败）`;
+}
+
 // 批量添加：串行写 D1，最后只镜像 1 次到 KV，节省 N-1 次 KV 写入
 async function addManyToBlacklist(ids, env, options = {}) {
 	const results = { success: [], exists: [], failed: [] };
@@ -633,12 +657,21 @@ async function removeManyFromBlacklist(ids, env) {
 }
 
 // 渲染批量添加结果
-function renderBatchAddResult(results, invalid) {
+// banSummary（可选）：{ success, banOkAll, banPartial, banFailedAll }
+//   表示对每个加黑成功的用户做"全群踢"后的统计：完全成功 / 部分成功 / 全部失败
+function renderBatchAddResult(results, invalid, banSummary) {
 	const lines = ['✅ <b>批量添加完成</b>', ''];
 	lines.push(`✅ 成功: ${results.success.length}`);
 	if (results.exists.length) lines.push(`⚠️ 已存在: ${results.exists.length}`);
 	if (invalid.length) lines.push(`❌ 格式错误: ${invalid.length}`);
 	if (results.failed.length) lines.push(`❌ 失败: ${results.failed.length}`);
+
+	if (banSummary && banSummary.success > 0) {
+		lines.push('', '<b>踢人结果</b>:');
+		lines.push(`🚫 全群踢出成功: ${banSummary.banOkAll}`);
+		if (banSummary.banPartial) lines.push(`⚠️ 部分群踢出: ${banSummary.banPartial}`);
+		if (banSummary.banFailedAll) lines.push(`❌ 全部群失败: ${banSummary.banFailedAll}（请检查 bot 是否为群管理员）`);
+	}
 
 	lines.push('', '<b>详情</b>:');
 	for (const id of results.success) lines.push(`✅ <code>${id}</code> 已加入`);
@@ -844,6 +877,64 @@ ${sorted.length === 0 ? '' : `<script>
 			'Cache-Control': 'no-store'
 		}
 	});
+}
+
+// 一次性清扫：扫描当前黑名单 × 所有 GROUP_IDS,把仍在群里的人全部踢出
+// 受 TOKEN 保护（与 /migrate /export 同等防护级别）
+// 串行执行避免 Telegram API 限流，先 checkUserStatus 跳过已离群/已踢的用户
+async function handlePurge(env) {
+	if (!env.KV && !env.DB) {
+		return jsonResponse({ 成功: false, 错误: '未绑定 KV 或 D1 存储空间' }, 400);
+	}
+	if (!Array.isArray(GROUP_IDS) || GROUP_IDS.length === 0) {
+		return jsonResponse({ 成功: false, 错误: 'GROUP_IDS 未配置' }, 400);
+	}
+
+	let blacklist;
+	try {
+		blacklist = await getBlacklist(env);
+	} catch (error) {
+		return jsonResponse({ 成功: false, 错误: '读取黑名单失败: ' + error.message }, 500);
+	}
+
+	const summary = {
+		黑名单总数: blacklist.length,
+		配置群组数: GROUP_IDS.length,
+		已踢出: 0,
+		不在群: 0,
+		失败: 0,
+		详情: []
+	};
+
+	for (const entry of blacklist) {
+		for (const groupId of GROUP_IDS) {
+			let status = null;
+			try {
+				const statusResult = await checkUserStatus(entry.id, groupId);
+				status = statusResult?.result?.status ?? null;
+			} catch (error) {
+				console.error(`[purge] checkUserStatus 失败 user=${entry.id} group=${groupId}:`, error.message);
+				summary.失败 += 1;
+				summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 结果: '查询状态失败', 错误: error.message });
+				continue;
+			}
+			// 已踢出 / 已离开 → 跳过；left/kicked 是 Telegram 返回的"非群成员"状态
+			if (status === 'kicked' || status === 'left' || status === null) {
+				summary.不在群 += 1;
+				continue;
+			}
+			const r = await banUserFromGroup(groupId, entry.id);
+			if (r.ok) {
+				summary.已踢出 += 1;
+				summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 旧状态: status, 结果: '已踢' });
+			} else {
+				summary.失败 += 1;
+				summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 旧状态: status, 结果: '失败', 错误: r.error });
+			}
+		}
+	}
+
+	return jsonResponse({ 成功: true, ...summary });
 }
 
 // 渲染黑名单为 HTML 文本（用于 /blacklist 命令展示）
@@ -1152,15 +1243,40 @@ async function handleChatMemberUpdate(chatMember, env) {
 	const targetIdStr = String(targetUser.id);
 	const fromIdStr = String(fromUser.id);
 
+	// 跳过：被操作用户是机器人（不要把别的机器人加入黑名单 / 误踢）
+	if (targetUser.is_bot) return;
+
+	// 复入群拦截：用户从非成员状态变为 member/restricted（被拉进群、点链接加群、unban 后自加回）
+	// 先于"操作人 === 用户本人"检查，因为自加群时 from === target，会被后面跳过逻辑拦掉
+	const oldStatusEarly = oldMember.status;
+	const newStatusEarly = newMember.status;
+	const enteredGroup =
+		(newStatusEarly === 'member' || newStatusEarly === 'restricted') &&
+		oldStatusEarly !== 'member' &&
+		oldStatusEarly !== 'restricted' &&
+		oldStatusEarly !== 'administrator' &&
+		oldStatusEarly !== 'creator';
+	if (enteredGroup) {
+		const blacklistCheck = await checkBlacklist(targetIdStr, env);
+		if (blacklistCheck.isBlacklisted) {
+			const banResult = await banUserFromGroup(chat.id, targetIdStr);
+			console.log('[chat_member] 黑名单用户复入群，立即踢回:', JSON.stringify({
+				群ID: chat.id,
+				用户ID: targetIdStr,
+				旧状态: oldStatusEarly,
+				新状态: newStatusEarly,
+				踢人结果: banResult.ok ? '成功' : `失败:${banResult.error}`
+			}));
+			return; // 已处理，不再走后面"管理员操作同步"分支
+		}
+	}
+
 	// 跳过：操作人是被操作用户本人（用户自愿 leave 不算管理员动作）
 	if (targetIdStr === fromIdStr) return;
 
 	// 跳过：操作人是机器人自己（避免与自助解封形成循环）
 	const selfBotId = await getBotId();
 	if (selfBotId && fromIdStr === String(selfBotId)) return;
-
-	// 跳过：被操作用户是机器人（不要把别的机器人加入黑名单）
-	if (targetUser.is_bot) return;
 
 	const oldStatus = oldMember.status;
 	const newStatus = newMember.status;
@@ -1319,6 +1435,27 @@ async function handleMessage(message, env) {
 	const text = message.text;
 	const username = message.from.username || message.from.first_name || '用户';
 
+	// 黑名单兜底：已黑用户在配置群里发言 → 删消息 + 立即踢出
+	// 排除 bot 自身 / 私聊 / 群管理员（避免误伤误加黑的管理员）
+	// 命令命中后 return，不进入后续命令分发
+	if (
+		isConfiguredGroup(chatId) &&
+		message.from &&
+		!message.from.is_bot
+	) {
+		const blacklistCheck = await checkBlacklist(userId, env);
+		if (blacklistCheck.isBlacklisted) {
+			// 双保险：管理员豁免，避免误加黑导致管理员被踢
+			const isAdmin = await checkIfUserIsAdmin(userId);
+			if (!isAdmin) {
+				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+踢人`);
+				await deleteMessage(chatId, message.message_id);
+				await banUserFromGroup(chatId, userId);
+				return;
+			}
+		}
+	}
+
 	// 处理配置群组内管理员回复 /spam - 添加被回复用户到黑名单
 	if (isSpamCommand(text)) {
 		if (!isConfiguredGroup(chatId)) {
@@ -1340,7 +1477,15 @@ async function handleMessage(message, env) {
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success) {
-			await sendTelegramMessage(chatId, `✅ 已将用户 ${linkedUserId} 添加到黑名单`);
+			// 加黑成功 → 全群踢人 + 删除被回复的垃圾消息
+			const banResults = await banUserFromAllGroups(repliedUserId);
+			const repliedMsgId = message.reply_to_message.message_id;
+			const delResult = await deleteMessage(chatId, repliedMsgId);
+
+			const lines = [`✅ 已将用户 ${linkedUserId} 添加到黑名单`];
+			lines.push(renderBanResults(banResults));
+			lines.push(delResult.ok ? '🗑️ 已删除被回复的垃圾消息' : `⚠️ 删除消息失败：${escapeHtml(delResult.error || '未知')}`);
+			await sendTelegramMessage(chatId, lines.join('\n'));
 		} else {
 			await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${linkedUserId}`);
 		}
@@ -1459,13 +1604,27 @@ async function handleMessage(message, env) {
 		// 单条且无格式错误：走原路径，输出与之前完全一致（向后兼容）
 		if (valid.length === 1 && invalid.length === 0) {
 			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: userId });
-			await sendTelegramMessage(chatId, result.message);
+			let reply = result.message;
+			if (result.success) {
+				const banResults = await banUserFromAllGroups(valid[0]);
+				reply += '\n' + renderBanResults(banResults);
+			}
+			await sendTelegramMessage(chatId, reply);
 			return;
 		}
 
-		// 批量：汇总 + 详情
+		// 批量：汇总 + 详情 + 每个成功用户的踢人结果
 		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: userId });
-		await sendTelegramMessage(chatId, renderBatchAddResult(results, invalid));
+		// 对加黑成功的用户逐一全群踢
+		const banSummary = { success: results.success.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
+		for (const id of results.success) {
+			const banResults = await banUserFromAllGroups(id);
+			const okCount = banResults.filter((r) => r.ok).length;
+			if (okCount === banResults.length) banSummary.banOkAll += 1;
+			else if (okCount === 0) banSummary.banFailedAll += 1;
+			else banSummary.banPartial += 1;
+		}
+		await sendTelegramMessage(chatId, renderBatchAddResult(results, invalid, banSummary));
 		return;
 	}
 
@@ -1696,6 +1855,60 @@ async function muteChatMember(chatId, userId) {
 	console.log(`Muted user ${userId} in chat ${chatId}, response: ${JSON.stringify(result)}`);
 
 	return result;
+}
+
+// 把用户踢出群（Telegram banChatMember API）
+// revoke_messages: true → 同时撤回该用户在群里的最近 48 小时内消息（Telegram 上限）
+// 返回 { ok: bool, error?: string }；bot 没权限/不在群时返回 ok=false 但不抛异常
+async function banUserFromGroup(chatId, userId) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`;
+	const body = {
+		chat_id: chatId,
+		user_id: Number(userId),
+		revoke_messages: true
+	};
+
+	try {
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		console.log(`[banChatMember] chat=${chatId} user=${userId} ok=${result.ok}${result.description ? ' desc=' + result.description : ''}`);
+		if (!response.ok || !result.ok) {
+			return { ok: false, error: result.description || `HTTP ${response.status}` };
+		}
+		return { ok: true };
+	} catch (error) {
+		console.error(`[banChatMember] chat=${chatId} user=${userId} 异常:`, error);
+		return { ok: false, error: error.message };
+	}
+}
+
+// 删除单条消息（Telegram deleteMessage API）
+// bot 必须有 can_delete_messages 权限；私聊只能删自己发的消息
+// 返回 { ok: bool, error?: string }
+async function deleteMessage(chatId, messageId) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`;
+	const body = { chat_id: chatId, message_id: messageId };
+
+	try {
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		console.log(`[deleteMessage] chat=${chatId} msg=${messageId} ok=${result.ok}${result.description ? ' desc=' + result.description : ''}`);
+		if (!response.ok || !result.ok) {
+			return { ok: false, error: result.description || `HTTP ${response.status}` };
+		}
+		return { ok: true };
+	} catch (error) {
+		console.error(`[deleteMessage] chat=${chatId} msg=${messageId} 异常:`, error);
+		return { ok: false, error: error.message };
+	}
 }
 
 async function unbanUser(userId, groupId = GROUP_ID) {
