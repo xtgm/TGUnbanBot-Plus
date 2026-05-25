@@ -610,6 +610,79 @@ async function banUserFromAllGroups(userId) {
 }
 
 // 渲染单个用户多群踢人结果为简短 HTML 文案
+// 把 Telegram API 的英文错误描述翻译成中文 + 解决建议
+// description 是 banChatMember/deleteMessage 等 API 在失败时返回的 description 字段
+function translateTelegramError(description) {
+	if (!description) return { 中文: '未知错误', 建议: '查看 Worker 日志获取详情' };
+	const desc = String(description);
+	const lower = desc.toLowerCase();
+
+	if (lower.includes('not enough rights') || lower.includes('not enough privileges')) {
+		return { 中文: 'bot 权限不足', 建议: '把 bot 设为群管理员，并打开"封禁用户"权限' };
+	}
+	if (lower.includes('bot is not a member') || lower.includes('chat not found')) {
+		return { 中文: 'bot 不在该群', 建议: '请重新把 bot 拉进该群并设为管理员' };
+	}
+	if (lower.includes("can't restrict self") || lower.includes('user is an administrator')) {
+		return { 中文: '目标用户是群管理员', 建议: '先在群里降级或撤销该用户的管理员身份再踢' };
+	}
+	if (lower.includes('user not found')) {
+		return { 中文: '用户不存在', 建议: '确认 TGID 是否正确，或该用户从未与 Telegram 交互' };
+	}
+	if (lower.includes('participant_id_invalid') || lower.includes('user_id_invalid')) {
+		return { 中文: '用户 ID 无效', 建议: '检查 TGID 格式是否为纯数字' };
+	}
+	if (lower.includes('forbidden') && lower.includes('blocked')) {
+		return { 中文: '用户拉黑了 bot', 建议: '此情况无影响，踢人仍会执行' };
+	}
+	if (lower.includes('flood') || lower.includes('too many requests')) {
+		return { 中文: 'Telegram 限流', 建议: '稍后重试，或减小批量大小' };
+	}
+	// 兜底：原文返回
+	return { 中文: desc, 建议: '查看 Worker 日志和 Telegram 文档' };
+}
+
+// 渲染单用户全群踢人结果(详细版)：包含群名、群ID、失败原因和建议
+// banResults: [{ groupId, ok, error }] 来自 banUserFromAllGroups
+// 返回多行 HTML 文案，每行一个群的具体结果
+async function renderBanResultsDetail(banResults) {
+	const okCount = banResults.filter((r) => r.ok).length;
+	const total = banResults.length;
+	const lines = [];
+
+	if (okCount === total) {
+		lines.push(`🚫 <b>已从全部 ${total} 个群踢出</b>`);
+	} else if (okCount === 0) {
+		lines.push(`⚠️ <b>全部 ${total} 个群踢人失败</b>`);
+	} else {
+		lines.push(`🚫 <b>已踢出 ${okCount}/${total} 个群</b>（${total - okCount} 个失败）`);
+	}
+
+	// 并行拉群名（最多 GROUP_IDS.length 个，串行也无所谓但并行更快）
+	const detailLines = await Promise.all(
+		banResults.map(async (r) => {
+			let title = '未知群名';
+			try {
+				const info = await getChatInfoFromId(r.groupId);
+				if (info?.title) title = info.title;
+			} catch (e) {
+				// 拉群名失败不影响主流程
+			}
+			const safeTitle = escapeHtml(title);
+			const safeId = escapeHtml(String(r.groupId));
+			if (r.ok) {
+				return `  ✅ <b>${safeTitle}</b> <code>${safeId}</code>`;
+			}
+			const { 中文, 建议 } = translateTelegramError(r.error);
+			return `  ❌ <b>${safeTitle}</b> <code>${safeId}</code>\n     原因：${escapeHtml(中文)}\n     建议：${escapeHtml(建议)}`;
+		})
+	);
+
+	lines.push('', ...detailLines);
+	return lines.join('\n');
+}
+
+// 简短版（用于群内闪屏，不能太长）
 function renderBanResults(banResults) {
 	const okCount = banResults.filter((r) => r.ok).length;
 	const total = banResults.length;
@@ -1510,7 +1583,7 @@ async function handleMessage(message, env, ctx) {
 			const delResult = await deleteMessage(chatId, repliedMsgId);
 
 			const lines = [`✅ 已将用户 ${linkedUserId} 添加到黑名单`];
-			lines.push(renderBanResults(banResults));
+			lines.push(await renderBanResultsDetail(banResults));
 			lines.push(delResult.ok ? '🗑️ 已删除被回复的垃圾消息' : `⚠️ 删除消息失败：${escapeHtml(delResult.error || '未知')}`);
 			await sendTelegramMessage(chatId, lines.join('\n'));
 		} else {
@@ -1639,8 +1712,8 @@ async function handleMessage(message, env, ctx) {
 			let flashText;
 			if (result.success) {
 				const banResults = await banUserFromAllGroups(valid[0]);
-				detailReply += '\n' + renderBanResults(banResults);
-				flashText = `✅ 已加黑 <code>${valid[0]}</code>`;
+				detailReply += '\n\n' + (await renderBanResultsDetail(banResults));
+				flashText = `✅ 已加黑 <code>${valid[0]}</code>\n` + renderBanResults(banResults);
 			} else {
 				flashText = `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
 			}
@@ -1651,18 +1724,32 @@ async function handleMessage(message, env, ctx) {
 		// 批量
 		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: userId });
 		const banSummary = { success: results.success.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
+		// 收集每个用户的逐群结果,用于在 detail 末尾渲染明细
+		const perUserBanResults = []; // [{ userId, banResults }]
 		for (const id of results.success) {
 			const banResults = await banUserFromAllGroups(id);
 			const okCount = banResults.filter((r) => r.ok).length;
 			if (okCount === banResults.length) banSummary.banOkAll += 1;
 			else if (okCount === 0) banSummary.banFailedAll += 1;
 			else banSummary.banPartial += 1;
+			perUserBanResults.push({ userId: id, banResults });
 		}
 		const failedCount = invalid.length + results.failed.length;
 		const flashText = `✅ 批量加黑：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+		// 详细 detailText：批量汇总 + 每个用户的逐群明细
+		const baseDetail = renderBatchAddResult(results, invalid, banSummary);
+		let fullDetail = baseDetail;
+		if (perUserBanResults.length > 0) {
+			const perUserDetailLines = ['', '<b>逐用户踢人明细</b>:'];
+			for (const { userId: uid, banResults } of perUserBanResults) {
+				perUserDetailLines.push('', `<b>用户 <code>${uid}</code></b>`);
+				perUserDetailLines.push(await renderBanResultsDetail(banResults));
+			}
+			fullDetail += '\n' + perUserDetailLines.join('\n');
+		}
 		await replyToAdmin(message, ctx, {
 			flashText,
-			detailText: renderBatchAddResult(results, invalid, banSummary),
+			detailText: fullDetail,
 			isInGroup
 		});
 		return;

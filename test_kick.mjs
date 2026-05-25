@@ -410,6 +410,11 @@ console.log('\n[10] 群内 /ban 单条');
 	// 改用 webhook,但要能传 ctx,所以模拟 fetch(request, env, ctx)
 	sandbox.fetch = makeFetchMock({
 		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChat: (b) => {
+			const id = String(b.chat_id);
+			const titles = { '-1001': '主群-技术交流', '-1002': '副群-公告' };
+			return { ok: true, result: { id: Number(b.chat_id), title: titles[id] || `群${id}`, type: 'supergroup' } };
+		},
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: Math.floor(Math.random() * 1e6) } }),
 		deleteMessage: () => ({ ok: true, result: true }),
@@ -441,9 +446,53 @@ console.log('\n[10] 群内 /ban 单条');
 	assert('群内闪屏发到 -1001', !!groupSend);
 	assert('闪屏文本是简短确认', groupSend.body.text.includes('已加黑'));
 	assert('私聊发到管理员 999', !!dmSend);
-	assert('私聊含 banChatMember 详情', dmSend.body.text.includes('已从全部'));
+	assert('私聊含汇总头', dmSend.body.text.includes('已从全部'));
+	assert('私聊详情含群名 主群-技术交流', dmSend.body.text.includes('主群-技术交流'));
+	assert('私聊详情含群名 副群-公告', dmSend.body.text.includes('副群-公告'));
+	assert('私聊详情含群 ID -1001', dmSend.body.text.includes('-1001'));
+	assert('私聊详情含群 ID -1002', dmSend.body.text.includes('-1002'));
 
 	assert('ctx.waitUntil 至少调用 1 次（用于撤回闪屏）', ctxCalls.length >= 1);
+}
+
+// ---------- [10b] 群内 /ban 单条 + 部分群失败:友好错误翻译 ----------
+console.log('\n[10b] 群内 /ban 单条 + 部分群失败');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
+		// -1001 成功,-1002 返回权限不足
+		banChatMember: (b) => {
+			if (String(b.chat_id) === '-1002') {
+				return { ok: false, error_code: 400, description: 'Bad Request: not enough rights to restrict/unrestrict chat member' };
+			}
+			return { ok: true, result: true };
+		},
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const update = {
+		message: {
+			message_id: 750,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 999, is_bot: false },
+			text: '/ban 456',
+		},
+	};
+	// 关键:让伪 fetch 看到 banChatMember 的失败响应作为 200
+	// 因为 makeFetchMock 默认包成 { ok: true, status: 200 } —— 但 result.ok 才是 Telegram 的 ok
+	// 所以这里 result.ok 是 false,banUserFromGroup 应该读取 result.description 走 translate
+	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('部分失败:私聊回执存在', !!dmSend);
+	assert('部分失败:汇总显示踢出 1/2', dmSend.body.text.includes('1/2'));
+	assert('部分失败:含友好原因（权限不足）', dmSend.body.text.includes('权限不足'));
+	assert('部分失败:含建议（封禁用户）', dmSend.body.text.includes('封禁用户'));
 }
 
 // ---------- [11] 群内 /ban 批量 ----------
@@ -453,6 +502,7 @@ console.log('\n[11] 群内 /ban 批量');
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 	sandbox.fetch = makeFetchMock({
 		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `测试群${b.chat_id}`, type: 'supergroup' } }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 555 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
@@ -480,6 +530,8 @@ console.log('\n[11] 群内 /ban 批量');
 	const dmSend = sendCalls.find((c) => String(c.body.chat_id) === '999');
 	assert('私聊详情含批量结果', dmSend.body.text.includes('批量添加完成'));
 	assert('私聊详情含每个用户', dmSend.body.text.includes('100') && dmSend.body.text.includes('200') && dmSend.body.text.includes('300'));
+	assert('私聊详情含逐用户明细', dmSend.body.text.includes('逐用户踢人明细'));
+	assert('私聊详情含群名', dmSend.body.text.includes('测试群-1001') && dmSend.body.text.includes('测试群-1002'));
 }
 
 // ---------- [12] 群内 /unban 单条 ----------
