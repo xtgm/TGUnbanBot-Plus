@@ -2182,40 +2182,57 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 }
 
 // 检查用户是否是任一配置群组的管理员
+// 检查用户是否是任一配置群组的管理员 / 超级管理员
+// 权限层级（高 → 低）:超级管理员 > 群管理员 > 普通用户
+// 超级管理员（SUPER_ADMINS 名单）拥有"群管理员"的所有命令权限,且额外拥有"一键解封按钮"权限
+// 这里直接把 super 当成 admin,所以 SUPER_ADMINS 用户即使不是任何群的成员也能使用 /ban /unban /spam 等命令
+//
+// 用 getChatAdministrators 拉群管理员列表本地匹配，比 getChatMember 更稳:
+// - 不要求 bot 是该群管理员（仅要求 bot 在群里）
+// - 不受 50+ 人群组限制
+// - 不受匿名/隐藏管理员模式干扰
+// 单群查询失败不阻塞后续群；任一群命中即返回 true。
 async function checkIfUserIsAdmin(userId) {
+	const userIdStr = String(userId);
+
+	// 超级管理员直接放行（最高权限,优先于群管理员检查）
+	if (isSuperAdmin(userIdStr)) {
+		console.log(`[管理员鉴权] 用户 ${userId} 是超级管理员 ✅`);
+		return true;
+	}
+
+	const summary = [];
+
 	for (const groupId of GROUP_IDS) {
 		try {
-			const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`;
-			const body = {
-				chat_id: groupId,
-				user_id: userId
-			};
-
+			const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`;
 			const response = await fetch(url, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify(body)
+				body: JSON.stringify({ chat_id: groupId }),
 			});
-
 			const result = await response.json();
 
-			if (!response.ok) {
-				console.error(`检查管理员权限失败 (group ${groupId}):`, result);
+			if (!response.ok || !result.ok || !Array.isArray(result.result)) {
+				summary.push(`群${groupId}:查询失败(${result.description || `HTTP ${response.status}`})`);
 				continue;
 			}
 
-			const status = result.result.status;
-			const isAdmin = status === 'creator' || status === 'administrator';
-
-			console.log(`用户 ${userId} 在群 ${groupId} 的权限状态: ${status}, 是否为管理员: ${isAdmin}`);
-
-			if (isAdmin) {
+			const adminCount = result.result.length;
+			const hit = result.result.find((m) => m.user && String(m.user.id) === userIdStr);
+			if (hit) {
+				console.log(`[管理员鉴权] 用户 ${userId} 在群 ${groupId} 是 ${hit.status} ✅`);
+				console.log(`[管理员鉴权] 总结: ${[...summary, `群${groupId}:命中(${hit.status})`].join('; ')}`);
 				return true;
 			}
+			summary.push(`群${groupId}:不在 ${adminCount} 个 admin 中`);
 		} catch (error) {
-			console.error(`检查管理员权限时出错 (group ${groupId}):`, error);
+			summary.push(`群${groupId}:异常(${error.message})`);
+			console.error(`[管理员鉴权] 群 ${groupId} 异常:`, error);
 		}
 	}
+
+	console.log(`[管理员鉴权] 用户 ${userId} 未命中。总结: ${summary.join('; ')}`);
 	return false;
 }
 

@@ -142,7 +142,7 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊
 	sandbox.fetch = makeFetchMock({
 		// /spam 流程会调:
 		// - getChatMember (admin 校验) - 让发送者是管理员
-		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		getChat: (b) => {
 			const id = String(b.chat_id);
 			const titles = { '-1001': '主群', '-1002': '副群' };
@@ -204,7 +204,7 @@ console.log('\n[1b] /spam 错误翻译:CHAT_ADMIN_REQUIRED + 删消息失败');
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 	sandbox.fetch = makeFetchMock({
-		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
 		// 模拟 -1002 群里 bot 不是管理员
 		banChatMember: (b) => {
@@ -249,7 +249,7 @@ console.log('\n[2] /ban 123（单条）:加黑 + 全群踢');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
-		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 999 } }),
 	});
@@ -278,7 +278,7 @@ console.log('\n[3] /ban 100,200,300（批量）');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
-		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 999 } }),
 	});
@@ -305,7 +305,7 @@ console.log('\n[4] 黑名单用户在群里发言 → 删消息 + 踢人');
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
 		// 黑名单用户不是管理员，让 getChatMember 返回 member
-		getChatMember: () => ({ ok: true, result: { status: 'member', user: { id: 0 } } }),
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 1 }, status: 'creator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		deleteMessage: () => ({ ok: true, result: true }),
 	});
@@ -335,8 +335,8 @@ console.log('\n[5] 管理员豁免：误加黑的管理员发言不会被踢');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
-		// 这个用户在多个群是管理员
-		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		// 这个用户 7777 是某个群的管理员，应被豁免不踢
+		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 7777 }, status: 'administrator' }, { user: { id: 999 }, status: 'creator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		deleteMessage: () => ({ ok: true, result: true }),
 	});
@@ -472,7 +472,7 @@ console.log('\n[10] 群内 /ban 单条');
 	// 重写 handler.fetch 调用方式 — 直接调内部 handleMessage 不行因为没暴露
 	// 改用 webhook,但要能传 ctx,所以模拟 fetch(request, env, ctx)
 	sandbox.fetch = makeFetchMock({
-		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		getChat: (b) => {
 			const id = String(b.chat_id);
 			const titles = { '-1001': '主群-技术交流', '-1002': '副群-公告' };
@@ -524,7 +524,7 @@ console.log('\n[10b] 群内 /ban 单条 + 部分群失败');
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 	sandbox.fetch = makeFetchMock({
-		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
 		// -1001 成功,-1002 返回权限不足
 		banChatMember: (b) => {
@@ -564,7 +564,7 @@ console.log('\n[11] 群内 /ban 批量');
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 	sandbox.fetch = makeFetchMock({
-		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `测试群${b.chat_id}`, type: 'supergroup' } }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 555 } }),
@@ -603,7 +603,7 @@ console.log('\n[12] 群内 /unban 单条');
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 	sandbox.fetch = makeFetchMock({
-		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 666 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
 	});
@@ -640,7 +640,7 @@ console.log('\n[13] 私聊 /ban 单条向后兼容');
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 	sandbox.fetch = makeFetchMock({
-		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 777 } }),
 	});
@@ -671,7 +671,7 @@ console.log('\n[14] 群内非管理员发 /ban 静默忽略');
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 	sandbox.fetch = makeFetchMock({
 		// 让发送者不是管理员
-		getChatMember: () => ({ ok: true, result: { status: 'member', user: { id: 0 } } }),
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 1 }, status: 'creator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 888 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
@@ -701,7 +701,7 @@ console.log('\n[15] 私聊投递失败追加群内提示');
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 	let dmAttempts = 0;
 	sandbox.fetch = makeFetchMock({
-		getChatMember: (b) => ({ ok: true, result: { status: 'administrator', user: { id: b.user_id } } }),
+		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: (b) => {
 			// 私聊（chat_id 正数 = 用户）失败,群发(负数)成功
@@ -730,6 +730,116 @@ console.log('\n[15] 私聊投递失败追加群内提示');
 	// 期望群里发了 2 次:闪屏成功提示 + 私聊失败追加提示
 	assert('群里发了 2 次（闪屏 + 私聊失败提示）', groupSends.length === 2, `实际 ${groupSends.length}`);
 	assert('第二条群内消息含"私聊机器人"提示', groupSends[1].body.text.includes('私聊机器人'));
+}
+
+// ---------- [16] 群管理员只在某一个群是 admin → 应能用所有命令 ----------
+console.log('\n[16] 群管理员只在 GROUP_IDS 第二个群是 admin');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		// 用户 6666 不在群 -1001 的 admin 列表里,但在群 -1002 是 administrator
+		getChatAdministrators: (b) => {
+			if (String(b.chat_id) === '-1001') return { ok: true, result: [{ user: { id: 1 }, status: 'creator' }] };
+			if (String(b.chat_id) === '-1002') return { ok: true, result: [{ user: { id: 6666 }, status: 'administrator' }] };
+		},
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const update = {
+		message: {
+			message_id: 1,
+			chat: { id: -1001, type: 'supergroup' }, // 在群 -1001 发命令
+			from: { id: 6666, is_bot: false },       // 但 6666 是群 -1002 的 admin
+			text: '/ban 555',
+		},
+	};
+	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('用户在第二个群是 admin → /ban 触发,加黑成功', blacklist.length === 1 && blacklist[0].id === '555');
+	assert('全群踢人 banChatMember 调用 2 次', callsOf('banChatMember').length === 2);
+}
+
+// ---------- [17] 普通用户不是任何群的 admin → 静默忽略 ----------
+console.log('\n[17] 全 miss:普通用户发 /ban 静默');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 1 }, status: 'creator' }] }), // 不含 6666
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const update = {
+		message: {
+			message_id: 1,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 6666, is_bot: false }, // 普通用户
+			text: '/ban 555',
+		},
+	};
+	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('普通用户 → /ban 不触发,黑名单为空', blacklist.length === 0);
+	assert('未调 banChatMember', callsOf('banChatMember').length === 0);
+	assert('群内静默,无 sendMessage', callsOf('sendMessage').length === 0);
+}
+
+// ---------- [18] 部分群 getChatAdministrators 失败,但其它群命中 → 仍生效 ----------
+console.log('\n[18] 单群查询失败不阻塞:其它群命中仍有效');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: (b) => {
+			if (String(b.chat_id) === '-1001') return { ok: false, error_code: 400, description: 'Bad Request: chat not found' };
+			if (String(b.chat_id) === '-1002') return { ok: true, result: [{ user: { id: 7777 }, status: 'creator' }] };
+		},
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const update = {
+		message: {
+			message_id: 1,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 7777, is_bot: false },
+			text: '/ban 555',
+		},
+	};
+	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('单群失败不阻塞 → /ban 仍触发', blacklist.length === 1);
+}
+
+// ---------- [19] SUPER_ADMINS 用户即使不在任何群也能用所有命令 ----------
+console.log('\n[19] SUPER_ADMINS 直接放行');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	// 模拟:SUPER_ADMINS = ['11111'](通过 env 注入), 用户 11111 不在任何群的 admin 列表
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 1 }, status: 'creator' }] }), // 11111 不在
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const update = {
+		message: {
+			message_id: 1,
+			chat: { id: 11111, type: 'private' }, // 私聊
+			from: { id: 11111, is_bot: false },
+			text: '/ban 555',
+		},
+	};
+	// 关键:把 SUPER_ADMINS 注入 env
+	const env = { ...baseEnv, SUPER_ADMINS: '11111', KV: makeFakeKV([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('SUPER_ADMINS 即使不在群里也能用 /ban', blacklist.length === 1 && blacklist[0].id === '555');
+	// 不应该调 getChatAdministrators(super 短路返回 true)
+	assert('SUPER_ADMINS 路径短路:不查群 admin 列表', callsOf('getChatAdministrators').length === 0);
 }
 
 // ---------- 总结 ----------
