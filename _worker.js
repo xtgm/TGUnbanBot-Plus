@@ -1199,6 +1199,24 @@ function formatUserMention(user) {
 	return `<a href="tg://user?id=${user.id}">${escapeHtml(displayName)}</a>`;
 }
 
+// 按 TGID 拉用户信息(遍历配置群,任一群命中即返回名字 mention + TGID)
+// 失败/没在任何群里时,返回纯 TGID code
+async function formatTargetByTgid(tgid) {
+	const idStr = String(tgid);
+	for (const groupId of GROUP_IDS) {
+		try {
+			const result = await checkUserStatus(idStr, groupId);
+			const user = result?.result?.user;
+			if (user && user.id) {
+				return `${formatUserMention(user)} <code>${escapeHtml(idStr)}</code>`;
+			}
+		} catch (_) {
+			// 单群失败继续下一个
+		}
+	}
+	return `<code>${escapeHtml(idStr)}</code>`;
+}
+
 async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	const banlistResult = await handleBanlist(tgidToCheck);
 	const banlistData = JSON.parse(banlistResult);
@@ -1481,6 +1499,20 @@ async function handleChatMemberUpdate(chatMember, env) {
 	}
 }
 
+// 把 Telegram 的成员状态(英文)翻译成中文标签,带 emoji 直观显示
+// 参考: https://core.telegram.org/bots/api#chatmember
+function translateMemberStatus(status) {
+	const map = {
+		creator: '👑 群主',
+		administrator: '🛡️ 管理员',
+		member: '👤 普通成员',
+		restricted: '🔇 被限制(禁言/限权)',
+		left: '🚪 已离群',
+		kicked: '🚫 已踢出/已封禁',
+	};
+	return map[status] || `❔ ${status || '未知'}`;
+}
+
 // 主人审计通知:群内管理员手动 ban/unban 时,把事件发给主人
 // 已豁免:OWNER_ID 未配置 / 操作人就是主人本人
 async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newStatus) {
@@ -1497,13 +1529,24 @@ async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newSta
 		? formatUserMention(targetUser)
 		: `<code>${escapeHtml(String(targetUser?.id || '未知'))}</code>`;
 
+	// 拉群名(失败时退回 ID 显示)
+	let groupLabel = `<code>${escapeHtml(String(chatMember.chat.id))}</code>`;
+	try {
+		const info = await getChatInfoFromId(chatMember.chat.id);
+		if (info?.title) {
+			groupLabel = `<b>${escapeHtml(info.title)}</b> <code>${escapeHtml(String(chatMember.chat.id))}</code>`;
+		}
+	} catch (_) {
+		// 拉群名失败不影响通知主流程
+	}
+
 	const auditText =
 		`🔔 <b>${escapeHtml(role)}操作通知</b>\n` +
 		`🎬 操作:群内手动 ${escapeHtml(action)}\n` +
 		`👤 操作人:${operator}（${escapeHtml(role)}）\n` +
 		`🎯 目标用户:${target}\n` +
-		`📍 群:<code>${escapeHtml(String(chatMember.chat.id))}</code>\n` +
-		`📋 状态变更:${escapeHtml(oldStatus)} → ${escapeHtml(newStatus)}`;
+		`📍 群:${groupLabel}\n` +
+		`📋 状态变更:${translateMemberStatus(oldStatus)} → ${translateMemberStatus(newStatus)}`;
 
 	const dm = await sendTelegramMessage(OWNER_ID, auditText);
 	if (!dm?.ok) {
@@ -1625,11 +1668,19 @@ async function handleCallbackQuery(cb, env) {
 			if (OWNER_ID && String(fromUser.id) !== OWNER_ID) {
 				const operator = formatUserMention(fromUser) || `<code>${escapeHtml(String(fromUser.id))}</code>`;
 				const role = classifyOperatorRole(fromUser.id, '超级管理员');
+				// 拉目标群名
+				let dispatchGroupLabel = `<code>${escapeHtml(String(dispatchChatId))}</code>`;
+				try {
+					const info = await getChatInfoFromId(dispatchChatId);
+					if (info?.title) {
+						dispatchGroupLabel = `<b>${escapeHtml(info.title)}</b> <code>${escapeHtml(String(dispatchChatId))}</code>`;
+					}
+				} catch (_) {}
 				const auditText = `🔔 <b>${escapeHtml(role)}操作通知</b>\n` +
 					`🎬 操作:一键解封代发\n` +
 					`👤 操作人:${operator}（${escapeHtml(role)}）\n` +
 					`🎯 目标用户:<code>${escapeHtml(String(tgid))}</code>\n` +
-					`📍 目标群:<code>${escapeHtml(String(dispatchChatId))}</code>\n` +
+					`📍 目标群:${dispatchGroupLabel}\n` +
 					`✅ 已代发 GKYbotSave 指令`;
 				const dmOwner = await sendTelegramMessage(OWNER_ID, auditText);
 				if (!dmOwner?.ok) {
@@ -1708,8 +1759,13 @@ async function handleMessage(message, env, ctx) {
 			const repliedMsgId = message.reply_to_message.message_id;
 			const delResult = await deleteMessage(chatId, repliedMsgId);
 
-			const lines = [`✅ 已将用户 ${linkedUserId} 添加到黑名单`];
-			lines.push(await renderBanResultsDetail(banResults));
+			const lines = [
+				`🎬 操作:举报加黑(/spam)`,
+				`🎯 目标用户:${linkedUserId} <code>${escapeHtml(String(repliedUserId))}</code>`,
+				'',
+				`✅ 已将用户 ${linkedUserId} 添加到黑名单`,
+				await renderBanResultsDetail(banResults),
+			];
 			if (delResult.ok) {
 				lines.push('🗑️ 已删除被回复的垃圾消息');
 			} else {
@@ -1723,11 +1779,20 @@ async function handleMessage(message, env, ctx) {
 				isInGroup: true
 			});
 		} else {
-			// 写库失败(已存在 / 未绑存储等)— 也走双通道
+			// 写库失败(已存在 / 未绑存储等)— 也走双通道,字段齐全
 			const plainMsg = result.message.replace(/<[^>]+>/g, '');
+			const failLines = [
+				`🎬 操作:举报加黑(/spam)`,
+				`🎯 目标用户:${linkedUserId} <code>${escapeHtml(String(repliedUserId))}</code>`,
+				'',
+				result.message,
+			];
+			if (result.message && result.message.includes('已在黑名单')) {
+				failLines.push('⚠️ <b>该用户已在黑名单中,请勿重复添加</b>');
+			}
 			await replyToAdmin(message, ctx, {
 				flashText: `⚠️ ${linkedUserId}: ${escapeHtml(plainMsg)}`,
-				detailText: `${result.message}\nTG ID: ${linkedUserId}`,
+				detailText: failLines.join('\n'),
 				isInGroup: true
 			});
 		}
@@ -1850,16 +1915,28 @@ async function handleMessage(message, env, ctx) {
 		// 单条且无格式错误
 		if (valid.length === 1 && invalid.length === 0) {
 			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: userId });
-			let detailReply = result.message;
+			// 统一详情格式:无论成功失败都展示完整字段
+			const targetMention = await formatTargetByTgid(valid[0]);
+			const lines = [
+				`🎬 操作:加入黑名单`,
+				`🎯 目标用户:${targetMention}`,
+			];
 			let flashText;
 			if (result.success) {
 				const banResults = await banUserFromAllGroups(valid[0]);
-				detailReply += '\n\n' + (await renderBanResultsDetail(banResults));
+				lines.push('');
+				lines.push(await renderBanResultsDetail(banResults));
 				flashText = `✅ 已加黑 <code>${valid[0]}</code>\n` + renderBanResults(banResults);
 			} else {
+				// 失败(已存在/未绑存储等)→ 追加原因
+				lines.push('');
+				lines.push(result.message);
+				if (result.message && result.message.includes('已在黑名单')) {
+					lines.push('⚠️ <b>该用户已在黑名单中,请勿重复添加</b>');
+				}
 				flashText = `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
 			}
-			await replyToAdmin(message, ctx, { flashText, detailText: detailReply, isInGroup });
+			await replyToAdmin(message, ctx, { flashText, detailText: lines.join('\n'), isInGroup });
 			return;
 		}
 
@@ -1939,10 +2016,20 @@ async function handleMessage(message, env, ctx) {
 			// 单条且无格式错误
 			if (valid.length === 1 && invalid.length === 0) {
 				const result = await removeFromBlacklist(valid[0], env);
+				const targetMention = await formatTargetByTgid(valid[0]);
+				const lines = [
+					`🎬 操作:移出黑名单`,
+					`🎯 目标用户:${targetMention}`,
+					'',
+					result.message,
+				];
+				if (!result.success && result.message && result.message.includes('不在黑名单')) {
+					lines.push('ℹ️ <b>该用户原本就不在黑名单,无需移除</b>');
+				}
 				const flashText = result.success
 					? `✅ 已移黑 <code>${valid[0]}</code>`
 					: `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
-				await replyToAdmin(message, ctx, { flashText, detailText: result.message, isInGroup });
+				await replyToAdmin(message, ctx, { flashText, detailText: lines.join('\n'), isInGroup });
 				return;
 			}
 

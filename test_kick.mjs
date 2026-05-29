@@ -976,7 +976,53 @@ console.log('\n[24] chat_member 手动 ban:主人收审计');
 	assert('审计含"群内手动 加黑"', ownerDm.body.text.includes('群内手动 加黑'));
 	assert('审计含操作人"台风"', ownerDm.body.text.includes('台风'));
 	assert('审计含目标"广告号"', ownerDm.body.text.includes('广告号'));
-	assert('审计含状态变更"member → kicked"', ownerDm.body.text.includes('member') && ownerDm.body.text.includes('kicked'));
+	// 状态变更已翻译为中文
+	assert('审计含中文状态"普通成员"', ownerDm.body.text.includes('普通成员'));
+	assert('审计含中文状态"已踢出"', ownerDm.body.text.includes('已踢出'));
+}
+
+// ---------- [25] 重复添加已黑用户:字段齐全 + "已在黑名单"提示 ----------
+console.log('\n[25] 重复加黑同一用户:详情字段齐全');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 7777 }, status: 'administrator' }] }),
+		// 拉群名 + 拉用户名,都给个像样的返回
+		getChat: (b) => {
+			const id = String(b.chat_id);
+			if (id === '-1001') return { ok: true, result: { id: -1001, title: '主群', type: 'supergroup' } };
+			if (id === '-1002') return { ok: true, result: { id: -1002, title: '副群', type: 'supergroup' } };
+			return { ok: true, result: { id: Number(id), title: `群${id}`, type: 'supergroup' } };
+		},
+		getChatMember: (b) => {
+			// 让目标用户 12345 拉得到名字
+			if (Number(b.user_id) === 12345) {
+				return { ok: true, result: { status: 'kicked', user: { id: 12345, first_name: '广告号' } } };
+			}
+			return { ok: true, result: { status: 'member', user: { id: Number(b.user_id) } } };
+		},
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const update = {
+		message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '台风' }, text: '/ban 12345' },
+	};
+	// 关键:KV 已经有 12345 → addToBlacklist 返回失败"已在黑名单"
+	const env = {
+		TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999',
+		KV: makeFakeKV([{ id: '12345', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('主人收到通知', !!ownerDm);
+	assert('字段:操作含"加入黑名单"', ownerDm.body.text.includes('加入黑名单'));
+	assert('字段:目标用户名"广告号"', ownerDm.body.text.includes('广告号'));
+	assert('字段:目标用户ID 12345', ownerDm.body.text.includes('12345'));
+	assert('字段:操作人"台风"', ownerDm.body.text.includes('台风'));
+	assert('失败提示:含"已在黑名单"', ownerDm.body.text.includes('已在黑名单'));
+	assert('失败提示:含"请勿重复添加"', ownerDm.body.text.includes('请勿重复添加'));
 }
 
 // ---------- 总结 ----------
