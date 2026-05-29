@@ -39,7 +39,8 @@ const DEFAULT_BLACKLIST_REASON_LABELS = {
 	spam: '群内 /spam 举报',
 	manual: '管理员手动添加',
 	manual_ban: '管理员手动封禁（自动同步）',
-	ad_auto: '🤖 广告自动检测'
+	ad_auto: '🤖 广告自动检测',
+	ad_learn: '🤖 上报学习'
 };
 
 // 6) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
@@ -97,6 +98,11 @@ const RECOMMENDED_AD_KEYWORDS = {
 const AD_KW_KEY = 'ad_keywords_custom';
 // 广告学习样本(指纹)KV key
 const AD_SAMPLES_KEY = 'ad_samples';
+// 最近消息缓存 KV key(供 /learnlast 学习被 GKY 删掉的广告)
+const RECENT_MSG_KEY = 'recent_messages';
+// 消息缓存开关与容量(默认开,只缓存"疑似广告"消息以省 KV 写入)
+const DEFAULT_MSG_CACHE_ENABLED = true;
+const DEFAULT_MSG_CACHE_SIZE = 50;
 
 // 关键词提取停用词表(过滤常见无害中文4字组,避免误学成广告词)
 // 字符串拆分写法避免明文特征
@@ -136,6 +142,9 @@ let AD_KEYWORDS_SPAM = [];
 let AD_KEYWORDS_FRAUD = [];
 // 广告学习样本指纹(运行期从 KV 加载)
 let AD_SAMPLE_FINGERPRINTS = [];
+// 消息缓存配置
+let MSG_CACHE_ENABLED = true;
+let MSG_CACHE_SIZE = 50;
 // 机器人用户名缓存
 let BOT_USERNAME = null;
 let BOT_ID = null;
@@ -166,6 +175,8 @@ export default {
 			AD_KEYWORDS_PORN = config.AD_KEYWORDS_PORN;
 			AD_KEYWORDS_SPAM = config.AD_KEYWORDS_SPAM;
 			AD_KEYWORDS_FRAUD = config.AD_KEYWORDS_FRAUD;
+			MSG_CACHE_ENABLED = config.MSG_CACHE_ENABLED;
+			MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
 			SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
 			SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
 			SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
@@ -337,6 +348,13 @@ function loadRequiredConfig(env) {
 	const adCheckBio = parseBool(env.AD_CHECK_BIO, DEFAULT_AD_CHECK_BIO);
 	const adKeywords = parseList(env.AD_KEYWORDS);     // 环境变量追加
 	const adWhitelist = parseList(env.AD_WHITELIST);
+	// 消息缓存配置
+	const msgCacheEnabled = parseBool(env.MSG_CACHE_ENABLED, DEFAULT_MSG_CACHE_ENABLED);
+	let msgCacheSize = DEFAULT_MSG_CACHE_SIZE;
+	if (env.MSG_CACHE_SIZE !== undefined && env.MSG_CACHE_SIZE !== null && String(env.MSG_CACHE_SIZE).trim() !== '') {
+		const n = parseInt(String(env.MSG_CACHE_SIZE).trim(), 10);
+		if (Number.isInteger(n) && n > 0 && n <= 500) msgCacheSize = n;
+	}
 	// 词库统一小写化(检测时也小写比对)
 	const lower = (arr) => (arr || []).map((s) => String(s).toLowerCase());
 
@@ -356,6 +374,8 @@ function loadRequiredConfig(env) {
 		AD_KEYWORDS_PORN: lower(DEFAULT_AD_KEYWORDS_PORN),
 		AD_KEYWORDS_SPAM: lower(DEFAULT_AD_KEYWORDS_SPAM),
 		AD_KEYWORDS_FRAUD: lower(DEFAULT_AD_KEYWORDS_FRAUD),
+		MSG_CACHE_ENABLED: msgCacheEnabled,
+		MSG_CACHE_SIZE: msgCacheSize,
 		SELF_UNBAN_KEYWORD: selfUnbanKeyword,
 		SELF_UNBAN_PROMPT: selfUnbanPrompt,
 		SELF_UNBAN_APPROVED: selfUnbanApproved,
@@ -1799,6 +1819,51 @@ async function learnAdSample(env, learnText) {
 	return { ok: true, fingerprint: fp, fpAdded: added, addedKeywords, sampleCount: data2?.count || 0 };
 }
 
+// ===== 最近消息缓存(供 /learnlast 学习被删的广告)=====
+
+// 预筛:是否"疑似广告"消息(只缓存这些,省 KV 写入)
+function looksLikeAdCandidate(message) {
+	const text = (message.text || message.caption || '').trim();
+	if (!text) return false;
+	const urls = collectUrls(message);
+	if (urls.length > 0) return true;                 // 含链接
+	if (/@[a-zA-Z][\w]{3,}/.test(text)) return true;  // @用户名提及(引流)
+	if (/\d{5,}/.test(text)) return true;             // 长数字串(电话/金额)
+	if (text.length >= 15) return true;               // 较长文本
+	return false;
+}
+
+// 读最近消息缓存
+async function loadRecentMessages(env) {
+	if (!env.KV) return [];
+	try {
+		const raw = await env.KV.get(RECENT_MSG_KEY, { type: 'json' });
+		if (raw && Array.isArray(raw.items)) return raw.items;
+	} catch (error) {
+		console.error('[消息缓存] 读 KV 失败:', error);
+	}
+	return [];
+}
+
+// 缓存一条消息(环形,保留最近 MSG_CACHE_SIZE 条)
+async function cacheRecentMessage(env, message) {
+	if (!env.KV) return;
+	try {
+		const items = await loadRecentMessages(env);
+		items.push({
+			mid: message.message_id,
+			text: (message.text || message.caption || '').slice(0, 500),
+			fromId: String(message.from?.id || ''),
+			fromName: [message.from?.first_name, message.from?.last_name].filter(Boolean).join(' ') || message.from?.username || '',
+			at: new Date().toISOString(),
+		});
+		const trimmed = items.slice(-MSG_CACHE_SIZE);
+		await env.KV.put(RECENT_MSG_KEY, JSON.stringify({ items: trimmed, updatedAt: new Date().toISOString() }));
+	} catch (error) {
+		console.error('[消息缓存] 写 KV 失败:', error);
+	}
+}
+
 // 收集消息里所有 URL(entities + caption_entities 里的 url / text_link)
 function collectUrls(message) {
 	const urls = [];
@@ -2065,6 +2130,20 @@ async function handleMessage(message, env, ctx) {
 	const userId = message.from.id;
 	const text = message.text;
 	const username = message.from.username || message.from.first_name || '用户';
+
+	// 缓存"疑似广告"群消息(供 /learnlast 学习被 GKY 删掉的广告);ctx.waitUntil 异步不阻塞
+	if (
+		MSG_CACHE_ENABLED && env.KV && isConfiguredGroup(chatId) &&
+		message.from && !message.from.is_bot &&
+		!(text && text.startsWith('/')) &&
+		looksLikeAdCandidate(message)
+	) {
+		if (ctx && typeof ctx.waitUntil === 'function') {
+			ctx.waitUntil(cacheRecentMessage(env, message));
+		} else {
+			await cacheRecentMessage(env, message);
+		}
+	}
 
 	// 黑名单兜底：已黑用户在配置群里发言 → 删消息 + 立即踢出
 	// 排除 bot 自身 / 私聊 / 群管理员（避免误伤误加黑的管理员）
@@ -2489,6 +2568,84 @@ async function handleMessage(message, env, ctx) {
 			await replyToAdmin(message, ctx, {
 				flashText: saved.ok ? '✅ 已清空学习样本' : `❌ 失败:${saved.error}`,
 				detailText: saved.ok ? '🎬 操作:清空全部学习样本\n📊 样本库已归零' : `❌ 写入失败:${escapeHtml(saved.error || '未知')}`,
+				isInGroup,
+			});
+			return;
+		}
+		return;
+	}
+
+	// ===== /learn 粘贴学习 + /learnlast 缓存学习(仅主人)=====
+	// 解决"GKY 已删消息无法回复 /spam"
+	if (text && /^\/(learn|learnlast)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		const isOwner = OWNER_ID && String(userId) === OWNER_ID;
+		if (!isOwner) {
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n上报学习仅限主人(OWNER_ID)使用。');
+			}
+			return;
+		}
+		if (!env.KV) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 KV 存储空间,无法学习。');
+			return;
+		}
+
+		const head = text.trim().split(/\s+/)[0].replace(/@.*$/, '').toLowerCase();
+		const rest = text.trim().slice(text.trim().indexOf(head) + head.length).trim();
+
+		// /learn <文本> —— 主人直接粘贴广告文本学习
+		if (head === '/learn') {
+			if (!rest) {
+				await sendTelegramMessage(chatId, '用法:<code>/learn 广告文本</code>\n直接粘贴广告文字即可学习(不需要回复消息)。\n例:<code>/learn 世界杯红单推荐 天天收米 日赚3千</code>');
+				return;
+			}
+			const learn = await learnAdSample(env, rest);
+			const lines = ['📖 <b>已学习广告样本</b>'];
+			lines.push(learn.fpAdded ? '✅ 指纹已入库(以后相同广告自动秒杀)' : 'ℹ️ 指纹已存在,未重复入库');
+			if (learn.addedKeywords.length > 0) {
+				lines.push(`🔑 提取关键词:${learn.addedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
+			}
+			lines.push(`📊 当前样本库共 ${learn.sampleCount} 条`);
+			await replyToAdmin(message, ctx, {
+				flashText: '📖 已学习广告样本',
+				detailText: lines.join('\n'),
+				isInGroup,
+			});
+			return;
+		}
+
+		// /learnlast [N] —— 学习最近 N 条疑似广告(被 GKY 删的也在缓存里)+ 加黑 + 全群踢
+		if (head === '/learnlast') {
+			let n = 1;
+			if (/^\d+$/.test(rest)) n = Math.max(1, Math.min(20, parseInt(rest, 10)));
+			const items = await loadRecentMessages(env);
+			if (items.length === 0) {
+				await sendTelegramMessage(chatId, 'ℹ️ 最近没有缓存到疑似广告消息。\n(只缓存含链接/@提及/长数字/长文本的群消息)');
+				return;
+			}
+			const targets = items.slice(-n).reverse(); // 最近的在前
+			const lines = [`📖 <b>学习最近 ${targets.length} 条疑似广告</b>`, ''];
+			for (const it of targets) {
+				const learn = await learnAdSample(env, it.text);
+				lines.push(`📝 <code>${escapeHtml(it.text.slice(0, 60))}</code>`);
+				lines.push(learn.fpAdded ? '  ✅ 指纹已入库' : '  ℹ️ 指纹已存在');
+				if (learn.addedKeywords.length > 0) {
+					lines.push(`  🔑 ${learn.addedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
+				}
+				// 加黑 + 全群踢发送者
+				if (it.fromId && /^\d+$/.test(it.fromId)) {
+					await addToBlacklist(it.fromId, env, { reason: 'ad_learn', by: String(userId) });
+					const banResults = await banUserFromAllGroups(it.fromId);
+					const okCount = banResults.filter((r) => r.ok).length;
+					lines.push(`  🚫 已加黑+踢 <code>${escapeHtml(it.fromId)}</code>(${escapeHtml(it.fromName || '')})— ${okCount}/${banResults.length} 群`);
+				}
+				lines.push('');
+			}
+			lines.push('学错了?用 <code>/delsample 关键词</code> 删样本、<code>/unban TGID</code> 解封。');
+			await replyToAdmin(message, ctx, {
+				flashText: `📖 已学习 ${targets.length} 条`,
+				detailText: lines.join('\n'),
 				isInGroup,
 			});
 			return;
