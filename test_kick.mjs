@@ -1366,6 +1366,47 @@ console.log('\n[43] 非主人 /addword 被拒');
 	assert('非主人 → 收到权限不足提示', !!dm && dm.body.text.includes('权限不足'));
 }
 
+// ---------- [44] emoji 走 KV:KV 配 emoji + 1个金融词 → 达阈值 ----------
+console.log('\n[44] emoji 经 KV 加载参与评分');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	// finance:[出u](+2) + emoji 密度≥3(+1) = 3 ≥ 阈值
+	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: ['出u'], porn: [], spam: [], fraud: [], general: [], whitelist: [], emoji: ['🔥', '💰', '❤️'] }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88044, is_bot: false, first_name: '路人' }, text: '出u🔥💰❤️价格好' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('emoji 经 KV 加载参与评分 → 命中', bl.some((e) => e.id === '88044'));
+}
+
+// ---------- [45] emoji 默认空:仅 emoji 无 KV 配 → 不计分不误杀 ----------
+console.log('\n[45] emoji 默认空不误杀');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]); // 完全空词库
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 一堆 emoji 但无词库配置 → 不该被杀(emoji 默认空)
+	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88045, is_bot: false, first_name: '开心' }, text: '今天好开心🔥💰❤️😍🎉' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('emoji 默认空 → 纯 emoji 不误杀', !bl.some((e) => e.id === '88045'));
+	assert('emoji 默认空 → 不删消息', callsOf('deleteMessage').length === 0);
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);

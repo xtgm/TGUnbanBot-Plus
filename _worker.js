@@ -79,8 +79,9 @@ const DEFAULT_AD_KEYWORDS_FINANCE = [];
 const DEFAULT_AD_KEYWORDS_PORN = [];
 const DEFAULT_AD_KEYWORDS_SPAM = [];
 const DEFAULT_AD_KEYWORDS_FRAUD = [];
-//    高危 emoji(诱导符,密度 ≥3 个 加 1 分)— 非敏感词,保留明文
-const DEFAULT_AD_RISK_EMOJI = ['🔥', '💰', '❤️', '😍', '💋', '🍑', '👙', '💴', '🤑', '🉐', '❗', '💎'];
+//    高危 emoji(诱导符,密度 ≥3 个 加 1 分)— 默认清空,通过 KV 命令热更新管理
+//    /addword emoji 🔥 💰 加 | /importdefault 一键导入推荐 emoji
+const DEFAULT_AD_RISK_EMOJI = [];
 
 // =============================================================================
 // =结束= 普通使用者一般无需修改下方任何内容
@@ -93,6 +94,7 @@ const RECOMMENDED_AD_KEYWORDS = {
 	porn: ['约' + '炮', '萝' + '莉', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '资源' + '群', '萝' + '控'],
 	spam: ['加' + '我', '加' + '微', '加' + 'v', '私' + '聊', '进' + '群', '拉' + '你', '详情' + '看', 'dd' + '我', '添加' + '好友', '发送' + '信息'],
 	fraud: ['假' + '钞', '假' + '币', '高' + '仿', '办' + '证', '代开' + '发票', '黑客' + '接单', '改' + '分', '网' + '赚', '菠' + '菜', '交流' + '群'],
+	emoji: ['🔥', '💰', '❤️', '😍', '💋', '🍑', '👙', '💴', '🤑', '🉐', '❗', '💎'],
 };
 
 // 广告词库 KV key
@@ -1672,6 +1674,9 @@ async function mergeAdKeywordsFromKV(env) {
 	AD_KEYWORDS_FRAUD = [...new Set([...AD_KEYWORDS_FRAUD, ...norm(kv.fraud)])];
 	AD_KEYWORDS = [...new Set([...AD_KEYWORDS, ...norm(kv.general)])];
 	AD_WHITELIST = [...new Set([...AD_WHITELIST, ...norm(kv.whitelist)])];
+	// emoji 不做小写化(emoji 无大小写),只去空去重
+	const rawEmoji = (Array.isArray(kv.emoji) ? kv.emoji : []).map((s) => String(s)).filter(Boolean);
+	AD_RISK_EMOJI = [...new Set([...AD_RISK_EMOJI, ...rawEmoji])];
 }
 
 // 把词库对象写回 KV
@@ -1686,7 +1691,7 @@ async function saveAdKeywordsToKV(env, data) {
 	}
 }
 
-// 读取 KV 词库,空则返回标准空结构(6 个分类)
+// 读取 KV 词库,空则返回标准空结构(7 个分类)
 async function getAdKeywordsRaw(env) {
 	const kv = await loadAdKeywordsFromKV(env);
 	return {
@@ -1696,6 +1701,7 @@ async function getAdKeywordsRaw(env) {
 		fraud: Array.isArray(kv?.fraud) ? kv.fraud : [],
 		general: Array.isArray(kv?.general) ? kv.general : [],
 		whitelist: Array.isArray(kv?.whitelist) ? kv.whitelist : [],
+		emoji: Array.isArray(kv?.emoji) ? kv.emoji : [],
 	};
 }
 
@@ -2172,6 +2178,7 @@ async function handleMessage(message, env, ctx) {
 				['诈骗 fraud', kw.fraud],
 				['自定义 general', kw.general],
 				['白名单 whitelist', kw.whitelist],
+				['高危emoji emoji', kw.emoji],
 			];
 			const lines = ['📚 <b>广告词库(KV 存储)</b>', ''];
 			let total = 0;
@@ -2195,7 +2202,7 @@ async function handleMessage(message, env, ctx) {
 		if (head === '/importdefault') {
 			const kw = await getAdKeywordsRaw(env);
 			let added = 0;
-			for (const cat of ['finance', 'porn', 'spam', 'fraud']) {
+			for (const cat of ['finance', 'porn', 'spam', 'fraud', 'emoji']) {
 				const before = new Set(kw[cat].map((w) => String(w).toLowerCase()));
 				for (const w of (RECOMMENDED_AD_KEYWORDS[cat] || [])) {
 					const lw = String(w).toLowerCase();
@@ -2216,22 +2223,25 @@ async function handleMessage(message, env, ctx) {
 		// /addword [分类] <词...> —— 加词(分类可选,默认 general)
 		if (head === '/addword') {
 			if (!rest) {
-				await sendTelegramMessage(chatId, '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/spam/fraud/general/whitelist(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>');
+				await sendTelegramMessage(chatId, '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/spam/fraud/general/whitelist/emoji(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>\n例:<code>/addword emoji 🔥 💰</code>');
 				return;
 			}
-			const validCats = ['finance', 'porn', 'spam', 'fraud', 'general', 'whitelist'];
+			const validCats = ['finance', 'porn', 'spam', 'fraud', 'general', 'whitelist', 'emoji'];
 			const tokens = rest.split(/[\s,，]+/).filter(Boolean);
 			let cat = 'general';
 			if (validCats.includes(tokens[0].toLowerCase())) {
 				cat = tokens.shift().toLowerCase();
 			}
-			const words = [...new Set(tokens.map((w) => w.toLowerCase()))];
+			// emoji 分类不做小写化(emoji 无大小写),其它分类小写化
+			const words = cat === 'emoji'
+				? [...new Set(tokens)]
+				: [...new Set(tokens.map((w) => w.toLowerCase()))];
 			if (words.length === 0) {
 				await sendTelegramMessage(chatId, '❌ 没有提供有效的词。');
 				return;
 			}
 			const kw = await getAdKeywordsRaw(env);
-			const existing = new Set(kw[cat].map((w) => String(w).toLowerCase()));
+			const existing = new Set(kw[cat].map((w) => cat === 'emoji' ? String(w) : String(w).toLowerCase()));
 			const newAdded = [];
 			for (const w of words) {
 				if (!existing.has(w)) { kw[cat].push(w); existing.add(w); newAdded.push(w); }
