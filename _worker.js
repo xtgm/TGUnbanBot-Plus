@@ -1514,11 +1514,19 @@ function translateMemberStatus(status) {
 }
 
 // 主人审计通知:群内管理员手动 ban/unban 时,把事件发给主人
-// 已豁免:OWNER_ID 未配置 / 操作人就是主人本人
+// 已豁免:OWNER_ID 未配置 / 操作人就是主人本人 / 操作人是机器人(其它 bot 的操作不通知)
 async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newStatus) {
 	if (!OWNER_ID) return;
 	const fromIdStr = String(chatMember.from?.id || '');
 	if (fromIdStr === OWNER_ID) return;
+
+	// 过滤机器人操作:只通知真人管理员的操作
+	// 例外:GroupAnonymousBot(1087968824)是"匿名管理员"——真人开了匿名,仍需通知
+	const ANON_ADMIN_BOT = '1087968824';
+	if (chatMember.from?.is_bot && fromIdStr !== ANON_ADMIN_BOT) {
+		console.log(`[审计通知] 跳过机器人操作:${fromIdStr}（${chatMember.from?.first_name || ''}）`);
+		return;
+	}
 
 	const operator = chatMember.from
 		? formatUserMention(chatMember.from)

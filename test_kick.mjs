@@ -1025,6 +1025,55 @@ console.log('\n[25] 重复加黑同一用户:详情字段齐全');
 	assert('失败提示:含"请勿重复添加"', ownerDm.body.text.includes('请勿重复添加'));
 }
 
+// ---------- [26] 机器人操作 chat_member → 不通知主人 ----------
+console.log('\n[26] 机器人(其它bot)手动操作:不通知主人');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const cmUpdate = {
+		chat_member: {
+			chat: { id: -1001, type: 'supergroup', title: '主群' },
+			from: { id: 5566001122, is_bot: true, first_name: 'nmBot' }, // 操作人是机器人
+			old_chat_member: { user: { id: 5555 }, status: 'member' },
+			new_chat_member: { user: { id: 5555, first_name: 'Spammer' }, status: 'kicked' },
+			date: Math.floor(Date.now() / 1000),
+		},
+	};
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cmUpdate) }), env);
+
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('机器人操作 → 主人不收通知', !ownerDm);
+}
+
+// ---------- [27] 匿名管理员(GroupAnonymousBot)操作 → 仍通知主人 ----------
+console.log('\n[27] 匿名管理员操作:仍通知主人');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const cmUpdate = {
+		chat_member: {
+			chat: { id: -1001, type: 'supergroup', title: '主群' },
+			// 1087968824 = GroupAnonymousBot,真人开了匿名管理身份
+			from: { id: 1087968824, is_bot: true, first_name: 'Group' },
+			old_chat_member: { user: { id: 6666 }, status: 'member' },
+			new_chat_member: { user: { id: 6666, first_name: '广告' }, status: 'kicked' },
+			date: Math.floor(Date.now() / 1000),
+		},
+	};
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cmUpdate) }), env);
+
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('匿名管理员操作 → 主人仍收通知', !!ownerDm);
+	assert('通知含目标"广告"', ownerDm.body.text.includes('广告'));
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);
