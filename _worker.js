@@ -1785,10 +1785,12 @@ async function handleMessage(message, env, ctx) {
 				`🎬 操作:举报加黑(/spam)`,
 				`🎯 目标用户:${linkedUserId} <code>${escapeHtml(String(repliedUserId))}</code>`,
 				'',
-				result.message,
 			];
 			if (result.message && result.message.includes('已在黑名单')) {
+				// "已在黑名单"场景:用更友好的提示替代原文案,避免重复
 				failLines.push('⚠️ <b>该用户已在黑名单中,请勿重复添加</b>');
+			} else {
+				failLines.push(result.message);
 			}
 			await replyToAdmin(message, ctx, {
 				flashText: `⚠️ ${linkedUserId}: ${escapeHtml(plainMsg)}`,
@@ -1930,9 +1932,11 @@ async function handleMessage(message, env, ctx) {
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
 				lines.push('');
-				lines.push(result.message);
 				if (result.message && result.message.includes('已在黑名单')) {
+					// "已在黑名单"场景:用更友好的提示替代,避免与原文案重复
 					lines.push('⚠️ <b>该用户已在黑名单中,请勿重复添加</b>');
+				} else {
+					lines.push(result.message);
 				}
 				flashText = `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
 			}
@@ -2021,10 +2025,12 @@ async function handleMessage(message, env, ctx) {
 					`🎬 操作:移出黑名单`,
 					`🎯 目标用户:${targetMention}`,
 					'',
-					result.message,
 				];
 				if (!result.success && result.message && result.message.includes('不在黑名单')) {
+					// "不在黑名单"场景:用更友好的提示替代,避免与原文案重复
 					lines.push('ℹ️ <b>该用户原本就不在黑名单,无需移除</b>');
+				} else {
+					lines.push(result.message);
 				}
 				const flashText = result.success
 					? `✅ 已移黑 <code>${valid[0]}</code>`
