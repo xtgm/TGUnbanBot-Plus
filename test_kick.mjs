@@ -122,6 +122,7 @@ const baseEnv = {
 	TOKEN,
 	BOT_TOKEN: '0:fake',
 	GROUP_ID: '-1001,-1002', // 两个配置群
+	OWNER_ID: '999', // 主人=测试用户 999,使现有"私聊发到 999"断言保持有效(走"你自己"分支)
 };
 
 // ---------- 测试工具 ----------
@@ -694,8 +695,8 @@ console.log('\n[14] 群内非管理员发 /ban 静默忽略');
 	assert('sendMessage 未调用（群内静默）', callsOf('sendMessage').length === 0);
 }
 
-// ---------- [15] 群内 /ban 私聊投递失败 → 群里追加提示 ----------
-console.log('\n[15] 私聊投递失败追加群内提示');
+// ---------- [15] 私聊主人投递失败 → 仅记日志,不追加群内提示 ----------
+console.log('\n[15] 私聊主人投递失败仅日志');
 {
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
@@ -704,7 +705,7 @@ console.log('\n[15] 私聊投递失败追加群内提示');
 		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: (b) => {
-			// 私聊（chat_id 正数 = 用户）失败,群发(负数)成功
+			// 私聊（chat_id 正数 = 用户)失败,群发(负数)成功
 			if (Number(b.chat_id) > 0) {
 				dmAttempts++;
 				return { ok: false, error_code: 403, description: 'Forbidden: bot was blocked by the user' };
@@ -725,11 +726,11 @@ console.log('\n[15] 私聊投递失败追加群内提示');
 	const env = { ...baseEnv, KV: makeFakeKV([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
-	assert('尝试私聊管理员', dmAttempts === 1);
+	assert('尝试私聊主人', dmAttempts === 1);
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	// 期望群里发了 2 次:闪屏成功提示 + 私聊失败追加提示
-	assert('群里发了 2 次（闪屏 + 私聊失败提示）', groupSends.length === 2, `实际 ${groupSends.length}`);
-	assert('第二条群内消息含"私聊机器人"提示', groupSends[1].body.text.includes('私聊机器人'));
+	// 新行为:私聊失败时,群里只发"闪屏成功提示",不再追加"私聊机器人"二次提示
+	assert('群里仅发 1 次（仅闪屏,不追加二次提示）', groupSends.length === 1, `实际 ${groupSends.length}`);
+	assert('闪屏文本含"已加黑"', groupSends[0].body.text.includes('已加黑'));
 }
 
 // ---------- [16] 群管理员只在某一个群是 admin → 应能用所有命令 ----------
@@ -840,6 +841,142 @@ console.log('\n[19] SUPER_ADMINS 直接放行');
 	assert('SUPER_ADMINS 即使不在群里也能用 /ban', blacklist.length === 1 && blacklist[0].id === '555');
 	// 不应该调 getChatAdministrators(super 短路返回 true)
 	assert('SUPER_ADMINS 路径短路:不查群 admin 列表', callsOf('getChatAdministrators').length === 0);
+}
+
+// ===== 主人审计通知系统专项测试([20]-[24]) =====
+
+// ---------- [20] OWNER_ID 未配置 → 不发任何私聊 ----------
+console.log('\n[20] OWNER_ID 未配置:仅群闪屏,无私聊');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const update = {
+		message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/ban 555' },
+	};
+	// 关键:不传 OWNER_ID
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', KV: makeFakeKV([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const dmSends = callsOf('sendMessage').filter((c) => Number(c.body.chat_id) > 0);
+	assert('OWNER_ID 未配置时无任何私聊', dmSends.length === 0);
+	const groupSends = callsOf('sendMessage').filter((c) => Number(c.body.chat_id) < 0);
+	assert('群闪屏仍然发出', groupSends.length === 1);
+}
+
+// ---------- [21] OWNER_ID 已配置 + 主人=触发者 → 含"你自己" ----------
+console.log('\n[21] 主人=触发者:详情含"你自己"');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const update = {
+		message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/ban 555' },
+	};
+	// OWNER_ID = 999(就是触发者)
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('主人收到私聊详情', !!dmSend);
+	assert('详情含"你自己"标记', dmSend.body.text.includes('你自己'));
+	assert('详情含"主人操作通知"标题', dmSend.body.text.includes('主人操作通知'));
+}
+
+// ---------- [22] OWNER_ID 已配置 + 触发者非主人 → 主人收审计,触发者不收 ----------
+console.log('\n[22] 群管理员触发:主人收审计,触发者零私信');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		// 7777 是群管理员
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 7777 }, status: 'administrator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const update = {
+		message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '台风' }, text: '/ban 555' },
+	};
+	// OWNER_ID = 999(主人) ≠ 触发者 7777
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	const triggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
+	assert('主人 999 收到审计通知', !!ownerDm);
+	assert('触发者 7777 完全不收私信', !triggerDm);
+	assert('审计含"群管理员操作通知"标题', ownerDm.body.text.includes('群管理员操作通知'));
+	assert('审计含操作人名"台风"', ownerDm.body.text.includes('台风'));
+	assert('审计含角色标签"群管理员"', ownerDm.body.text.includes('群管理员'));
+	assert('审计含"群内"来源标记', ownerDm.body.text.includes('群内'));
+	assert('审计含完整详情(踢人结果)', ownerDm.body.text.includes('已从全部'));
+}
+
+// ---------- [23] 一键解封按钮 → 主人收到独立审计通知 ----------
+console.log('\n[23] 一键解封按钮:主人收审计');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		editMessageText: () => ({ ok: true, result: true }),
+		editMessageReplyMarkup: () => ({ ok: true, result: true }),
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+	});
+	const cbUpdate = {
+		callback_query: {
+			id: 'cb-1',
+			from: { id: 8888, is_bot: false, first_name: '某超管' },
+			message: { message_id: 100, chat: { id: -1001, type: 'supergroup' }, text: 'GKY二次审核内容' },
+			data: 'gky:a:55555:-1001',
+		},
+	};
+	// OWNER_ID = 999, SUPER_ADMINS 含 8888 才能让按钮通过权限校验
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', SUPER_ADMINS: '8888,999', KV: makeFakeKV([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cbUpdate) }), env);
+
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('主人 999 收到一键解封审计', !!ownerDm);
+	assert('审计含"超级管理员操作通知"', ownerDm.body.text.includes('超级管理员操作通知'));
+	assert('审计含"一键解封代发"', ownerDm.body.text.includes('一键解封代发'));
+	assert('审计含操作人名"某超管"', ownerDm.body.text.includes('某超管'));
+	assert('审计含目标用户 55555', ownerDm.body.text.includes('55555'));
+}
+
+// ---------- [24] chat_member 手动 ban → 主人收审计 ----------
+console.log('\n[24] chat_member 手动 ban:主人收审计');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const cmUpdate = {
+		chat_member: {
+			chat: { id: -1001, type: 'supergroup', title: '主群' },
+			from: { id: 7777, is_bot: false, first_name: '台风' },
+			old_chat_member: { user: { id: 5555 }, status: 'member' },
+			new_chat_member: { user: { id: 5555, first_name: '广告号' }, status: 'kicked' },
+			date: Math.floor(Date.now() / 1000),
+		},
+	};
+	// OWNER_ID = 999, 触发者 7777 ≠ 主人
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cmUpdate) }), env);
+
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('主人 999 收到 chat_member 审计', !!ownerDm);
+	assert('审计含"群管理员操作通知"', ownerDm.body.text.includes('群管理员操作通知'));
+	assert('审计含"群内手动 加黑"', ownerDm.body.text.includes('群内手动 加黑'));
+	assert('审计含操作人"台风"', ownerDm.body.text.includes('台风'));
+	assert('审计含目标"广告号"', ownerDm.body.text.includes('广告号'));
+	assert('审计含状态变更"member → kicked"', ownerDm.body.text.includes('member') && ownerDm.body.text.includes('kicked'));
 }
 
 // ---------- 总结 ----------
