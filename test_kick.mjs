@@ -1366,29 +1366,29 @@ console.log('\n[43] 非主人 /addword 被拒');
 	assert('非主人 → 收到权限不足提示', !!dm && dm.body.text.includes('权限不足'));
 }
 
-// ---------- [44] emoji 走 KV:KV 配 emoji + 1个金融词 → 达阈值 ----------
-console.log('\n[44] emoji 经 KV 加载参与评分');
+// ---------- [44] emoji 永不参与评分:大量 emoji + 单个金融词 → 不达阈值不误杀 ----------
+console.log('\n[44] emoji 不计分,表情包不误杀');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
-		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
 		banChatMember: () => ({ ok: true, result: true }),
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
 	const kv = makeFakeKV([]);
-	// finance:[出u](+2) + emoji 密度≥3(+1) = 3 ≥ 阈值
-	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: ['出u'], porn: [], spam: [], fraud: [], general: [], whitelist: [], emoji: ['🔥', '💰', '❤️'] }));
+	// 即使配了 emoji 分类也不影响(已移除 emoji 评分);finance 单个词 +2 < 阈值3
+	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: ['出u'], porn: [], spam: [], fraud: [], general: [], whitelist: [] }));
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
-	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88044, is_bot: false, first_name: '路人' }, text: '出u🔥💰❤️价格好' } };
+	// 单个金融词 + 一堆 emoji:emoji 不加分,只 +2 < 3 → 不杀
+	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88044, is_bot: false, first_name: '路人' }, text: '想了解出u🔥💰❤️😍🎉' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
 	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('emoji 经 KV 加载参与评分 → 命中', bl.some((e) => e.id === '88044'));
+	assert('emoji 不计分:单词+emoji 不达阈值 → 不杀', !bl.some((e) => e.id === '88044'));
 }
 
-// ---------- [45] emoji 默认空:仅 emoji 无 KV 配 → 不计分不误杀 ----------
-console.log('\n[45] emoji 默认空不误杀');
+// ---------- [45] 纯表情包/纯 emoji 消息 → 永不被杀 ----------
+console.log('\n[45] 纯 emoji 消息不误杀');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
@@ -1397,14 +1397,15 @@ console.log('\n[45] emoji 默认空不误杀');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]); // 完全空词库
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: ['出u'], porn: ['看片'], spam: [], fraud: ['假钞'], general: [], whitelist: [] }));
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
-	// 一堆 emoji 但无词库配置 → 不该被杀(emoji 默认空)
-	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88045, is_bot: false, first_name: '开心' }, text: '今天好开心🔥💰❤️😍🎉' } };
+	// 一堆 emoji 但无任何广告词 → 不该被杀
+	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88045, is_bot: false, first_name: '开心' }, text: '今天好开心🔥💰❤️😍🎉🎊✨🥳' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
 	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('emoji 默认空 → 纯 emoji 不误杀', !bl.some((e) => e.id === '88045'));
-	assert('emoji 默认空 → 不删消息', callsOf('deleteMessage').length === 0);
+	assert('纯 emoji → 不误杀', !bl.some((e) => e.id === '88045'));
+	assert('纯 emoji → 不删消息', callsOf('deleteMessage').length === 0);
 }
 
 // ---------- 总结 ----------

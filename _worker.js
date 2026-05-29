@@ -79,9 +79,6 @@ const DEFAULT_AD_KEYWORDS_FINANCE = [];
 const DEFAULT_AD_KEYWORDS_PORN = [];
 const DEFAULT_AD_KEYWORDS_SPAM = [];
 const DEFAULT_AD_KEYWORDS_FRAUD = [];
-//    高危 emoji(诱导符,密度 ≥3 个 加 1 分)— 默认清空,通过 KV 命令热更新管理
-//    /addword emoji 🔥 💰 加 | /importdefault 一键导入推荐 emoji
-const DEFAULT_AD_RISK_EMOJI = [];
 
 // =============================================================================
 // =结束= 普通使用者一般无需修改下方任何内容
@@ -94,7 +91,6 @@ const RECOMMENDED_AD_KEYWORDS = {
 	porn: ['约' + '炮', '萝' + '莉', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '资源' + '群', '萝' + '控'],
 	spam: ['加' + '我', '加' + '微', '加' + 'v', '私' + '聊', '进' + '群', '拉' + '你', '详情' + '看', 'dd' + '我', '添加' + '好友', '发送' + '信息'],
 	fraud: ['假' + '钞', '假' + '币', '高' + '仿', '办' + '证', '代开' + '发票', '黑客' + '接单', '改' + '分', '网' + '赚', '菠' + '菜', '交流' + '群'],
-	emoji: ['🔥', '💰', '❤️', '😍', '💋', '🍑', '👙', '💴', '🤑', '🉐', '❗', '💎'],
 };
 
 // 广告词库 KV key
@@ -128,7 +124,6 @@ let AD_KEYWORDS_FINANCE = [];
 let AD_KEYWORDS_PORN = [];
 let AD_KEYWORDS_SPAM = [];
 let AD_KEYWORDS_FRAUD = [];
-let AD_RISK_EMOJI = [];
 // 机器人用户名缓存
 let BOT_USERNAME = null;
 let BOT_ID = null;
@@ -159,7 +154,6 @@ export default {
 			AD_KEYWORDS_PORN = config.AD_KEYWORDS_PORN;
 			AD_KEYWORDS_SPAM = config.AD_KEYWORDS_SPAM;
 			AD_KEYWORDS_FRAUD = config.AD_KEYWORDS_FRAUD;
-			AD_RISK_EMOJI = config.AD_RISK_EMOJI;
 			SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
 			SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
 			SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
@@ -350,7 +344,6 @@ function loadRequiredConfig(env) {
 		AD_KEYWORDS_PORN: lower(DEFAULT_AD_KEYWORDS_PORN),
 		AD_KEYWORDS_SPAM: lower(DEFAULT_AD_KEYWORDS_SPAM),
 		AD_KEYWORDS_FRAUD: lower(DEFAULT_AD_KEYWORDS_FRAUD),
-		AD_RISK_EMOJI: DEFAULT_AD_RISK_EMOJI,
 		SELF_UNBAN_KEYWORD: selfUnbanKeyword,
 		SELF_UNBAN_PROMPT: selfUnbanPrompt,
 		SELF_UNBAN_APPROVED: selfUnbanApproved,
@@ -1674,9 +1667,6 @@ async function mergeAdKeywordsFromKV(env) {
 	AD_KEYWORDS_FRAUD = [...new Set([...AD_KEYWORDS_FRAUD, ...norm(kv.fraud)])];
 	AD_KEYWORDS = [...new Set([...AD_KEYWORDS, ...norm(kv.general)])];
 	AD_WHITELIST = [...new Set([...AD_WHITELIST, ...norm(kv.whitelist)])];
-	// emoji 不做小写化(emoji 无大小写),只去空去重
-	const rawEmoji = (Array.isArray(kv.emoji) ? kv.emoji : []).map((s) => String(s)).filter(Boolean);
-	AD_RISK_EMOJI = [...new Set([...AD_RISK_EMOJI, ...rawEmoji])];
 }
 
 // 把词库对象写回 KV
@@ -1691,7 +1681,7 @@ async function saveAdKeywordsToKV(env, data) {
 	}
 }
 
-// 读取 KV 词库,空则返回标准空结构(7 个分类)
+// 读取 KV 词库,空则返回标准空结构(6 个分类)
 async function getAdKeywordsRaw(env) {
 	const kv = await loadAdKeywordsFromKV(env);
 	return {
@@ -1701,7 +1691,6 @@ async function getAdKeywordsRaw(env) {
 		fraud: Array.isArray(kv?.fraud) ? kv.fraud : [],
 		general: Array.isArray(kv?.general) ? kv.general : [],
 		whitelist: Array.isArray(kv?.whitelist) ? kv.whitelist : [],
-		emoji: Array.isArray(kv?.emoji) ? kv.emoji : [],
 	};
 }
 
@@ -1762,10 +1751,6 @@ function detectAd(message) {
 	for (const w of AD_KEYWORDS_SPAM) if (w && scoringText.includes(w)) { score += 1; hits.push(`引流:${w}`); }
 	for (const w of AD_KEYWORDS_FRAUD) if (w && scoringText.includes(w)) { score += 2; hits.push(`诈骗:${w}`); }
 	for (const w of AD_KEYWORDS) if (w && scoringText.includes(w)) { score += 2; hits.push(`自定义:${w}`); }
-
-	// 高危 emoji 密度 ≥3
-	const emojiCount = AD_RISK_EMOJI.reduce((n, e) => n + (fullText.split(e).length - 1), 0);
-	if (emojiCount >= 3) { score += 1; hits.push(`emoji密度${emojiCount}`); }
 
 	// 纯链接刷屏:有外链 + 文本很短
 	if (urls.length > 0 && fullText.length < 20) { score += 1; hits.push('短文本+链接'); }
@@ -2178,7 +2163,6 @@ async function handleMessage(message, env, ctx) {
 				['诈骗 fraud', kw.fraud],
 				['自定义 general', kw.general],
 				['白名单 whitelist', kw.whitelist],
-				['高危emoji emoji', kw.emoji],
 			];
 			const lines = ['📚 <b>广告词库(KV 存储)</b>', ''];
 			let total = 0;
@@ -2202,7 +2186,7 @@ async function handleMessage(message, env, ctx) {
 		if (head === '/importdefault') {
 			const kw = await getAdKeywordsRaw(env);
 			let added = 0;
-			for (const cat of ['finance', 'porn', 'spam', 'fraud', 'emoji']) {
+			for (const cat of ['finance', 'porn', 'spam', 'fraud']) {
 				const before = new Set(kw[cat].map((w) => String(w).toLowerCase()));
 				for (const w of (RECOMMENDED_AD_KEYWORDS[cat] || [])) {
 					const lw = String(w).toLowerCase();
@@ -2223,25 +2207,22 @@ async function handleMessage(message, env, ctx) {
 		// /addword [分类] <词...> —— 加词(分类可选,默认 general)
 		if (head === '/addword') {
 			if (!rest) {
-				await sendTelegramMessage(chatId, '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/spam/fraud/general/whitelist/emoji(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>\n例:<code>/addword emoji 🔥 💰</code>');
+				await sendTelegramMessage(chatId, '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/spam/fraud/general/whitelist(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>');
 				return;
 			}
-			const validCats = ['finance', 'porn', 'spam', 'fraud', 'general', 'whitelist', 'emoji'];
+			const validCats = ['finance', 'porn', 'spam', 'fraud', 'general', 'whitelist'];
 			const tokens = rest.split(/[\s,，]+/).filter(Boolean);
 			let cat = 'general';
 			if (validCats.includes(tokens[0].toLowerCase())) {
 				cat = tokens.shift().toLowerCase();
 			}
-			// emoji 分类不做小写化(emoji 无大小写),其它分类小写化
-			const words = cat === 'emoji'
-				? [...new Set(tokens)]
-				: [...new Set(tokens.map((w) => w.toLowerCase()))];
+			const words = [...new Set(tokens.map((w) => w.toLowerCase()))];
 			if (words.length === 0) {
 				await sendTelegramMessage(chatId, '❌ 没有提供有效的词。');
 				return;
 			}
 			const kw = await getAdKeywordsRaw(env);
-			const existing = new Set(kw[cat].map((w) => cat === 'emoji' ? String(w) : String(w).toLowerCase()));
+			const existing = new Set(kw[cat].map((w) => String(w).toLowerCase()));
 			const newAdded = [];
 			for (const w of words) {
 				if (!existing.has(w)) { kw[cat].push(w); existing.add(w); newAdded.push(w); }
