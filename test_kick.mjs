@@ -1076,10 +1076,25 @@ console.log('\n[27] 匿名管理员操作:仍通知主人');
 
 // ===== 广告自动检测专项测试([28]-[37]) =====
 // 共用的 mock + env 构造
+// 广告词库种子(对应代码里 RECOMMENDED_AD_KEYWORDS,测试用明文即可)
+const AD_KW_SEED = {
+	finance: ['usdt', 'u商', '承兑', '刷单', '日入', '出u', '接u', '搬砖', '套利', '包网', '价格拉满'],
+	porn: ['约炮', '萝莉', '福利姬', '看片', '裸聊', '乱伦', '不雅视频', '色色', '免费看', '资源群'],
+	spam: ['加我', '加微', '加v', '私聊', '进群', '拉你', '详情看', '添加好友', '发送信息'],
+	fraud: ['假钞', '假币', '高仿', '办证', '代开发票', '黑客接单', '网赚', '菠菜', '交流群'],
+	general: [],
+	whitelist: [],
+};
+// 构造一个已预置广告词库的 fake KV
+function makeAdKV(extra = {}) {
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_keywords_custom', JSON.stringify({ ...AD_KW_SEED, ...extra }));
+	return kv;
+}
 const adEnv = (extra = {}) => ({
 	TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999',
 	AD_FILTER_ENABLED: 'true',
-	KV: makeFakeKV([]),
+	KV: makeAdKV(),
 	...extra,
 });
 const adFetchMock = () => makeFetchMock({
@@ -1228,6 +1243,127 @@ console.log('\n[37] 主人收到广告拦截通知');
 	assert('通知含"广告自动拦截"', ownerDm.body.text.includes('广告自动拦截'));
 	assert('通知含判定依据', ownerDm.body.text.includes('判定依据'));
 	assert('通知含内容预览', ownerDm.body.text.includes('内容预览'));
+}
+
+// ===== 广告词库热更新命令测试([38]-[43]) =====
+
+// ---------- [38] 主人 /addword 写入 KV ----------
+console.log('\n[38] 主人 /addword 写入 KV');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]); // 空词库
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 主人私聊发 /addword fraud 杀猪盘
+	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/addword fraud 杀猪盘 刷信誉' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const stored = JSON.parse(kv._store.get('ad_keywords_custom') || '{}');
+	assert('/addword 写入 fraud 分类', stored.fraud && stored.fraud.includes('杀猪盘') && stored.fraud.includes('刷信誉'));
+	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('主人收到回执', !!dm && dm.body.text.includes('杀猪盘'));
+}
+
+// ---------- [39] /addword 加的词能命中后续广告 ----------
+console.log('\n[39] /addword 后该词能命中');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	// KV 里预置 general:[杀猪盘](权重 +2,但阈值 3,需要两个词。这里加两个 general 词凑分)
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: [], porn: [], spam: [], fraud: ['杀猪盘', '刷信誉'], general: [], whitelist: [] }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 普通成员发含两个 fraud 词(各+2=4 ≥ 3)
+	const update = { message: { message_id: 2, chat: { id: -1001, type: 'supergroup' }, from: { id: 88002, is_bot: false, first_name: '路人' }, text: '专业杀猪盘刷信誉' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('KV 自定义词命中 → 加黑', bl.some((e) => e.id === '88002'));
+	assert('KV 自定义词命中 → 踢人', callsOf('banChatMember').length === 2);
+}
+
+// ---------- [40] /delword 删词后不再命中 ----------
+console.log('\n[40] /delword 删词');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: ['usdt'], porn: [], spam: [], fraud: ['杀猪盘'], general: [], whitelist: [] }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/delword 杀猪盘' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const stored = JSON.parse(kv._store.get('ad_keywords_custom') || '{}');
+	assert('/delword 从 fraud 删除杀猪盘', !stored.fraud.includes('杀猪盘'));
+	assert('/delword 不影响其它词 usdt', stored.finance.includes('usdt'));
+}
+
+// ---------- [41] /listwords 展示 ----------
+console.log('\n[41] /listwords 展示');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: ['usdt'], porn: [], spam: [], fraud: ['假钞'], general: [], whitelist: ['白词'] }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/listwords' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('/listwords 私聊回执', !!dm);
+	assert('展示含 usdt', dm.body.text.includes('usdt'));
+	assert('展示含假钞', dm.body.text.includes('假钞'));
+	assert('展示含白名单词', dm.body.text.includes('白词'));
+}
+
+// ---------- [42] /importdefault 导入推荐词库 ----------
+console.log('\n[42] /importdefault 导入');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]); // 空词库
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/importdefault' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const stored = JSON.parse(kv._store.get('ad_keywords_custom') || '{}');
+	assert('/importdefault 写入 finance 词', stored.finance && stored.finance.length > 0);
+	assert('/importdefault 写入 fraud 词', stored.fraud && stored.fraud.length > 0);
+	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('主人收到导入回执', !!dm && dm.body.text.includes('导入'));
+}
+
+// ---------- [43] 非主人用 /addword 被拒 ----------
+console.log('\n[43] 非主人 /addword 被拒');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		// 7777 是群管理员但不是主人
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 7777 }, status: 'administrator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 群管理员 7777 私聊发 /addword
+	const update = { message: { message_id: 1, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/addword fraud 测试' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const stored = kv._store.get('ad_keywords_custom');
+	assert('非主人 → 词库未被修改', !stored);
+	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
+	assert('非主人 → 收到权限不足提示', !!dm && dm.body.text.includes('权限不足'));
 }
 
 // ---------- 总结 ----------

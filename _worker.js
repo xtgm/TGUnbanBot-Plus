@@ -72,17 +72,31 @@ const DEFAULT_AD_FILTER_ENABLED = false;
 const DEFAULT_AD_SCORE_THRESHOLD = 3;
 //    是否检测用户 bio(需额外调 getChat,只能拿到已与 bot 交互过用户的 bio,群里陌生用户拿不到)
 const DEFAULT_AD_CHECK_BIO = false;
-//    分类词库(命中加权:金融+2 / 色情+2 / 引流+1 / 诈骗+2)
-const DEFAULT_AD_KEYWORDS_FINANCE = ['usdt', 'u商', '承兑', '刷单', '日入', '出u', '接u', '搬砖', '套利', '包网', '跑分', '水房', '料子', '拉满', '价格拉满'];
-const DEFAULT_AD_KEYWORDS_PORN = ['约炮', '萝莉', '福利姬', '看片', '裸聊', '乱伦', '不雅视频', '色色', '开车', '一夜情', '免费看', '资源群', '萝控'];
-const DEFAULT_AD_KEYWORDS_SPAM = ['加我', '加微', '加v', '私聊', '进群', '拉你', '详情看', 'dd我', '滴滴我', '添加好友', '发送信息'];
-const DEFAULT_AD_KEYWORDS_FRAUD = ['假钞', '假币', '高仿', '办证', '代开发票', '黑客接单', '改分', '网赚', '菠菜', '交流群'];
-//    高危 emoji(诱导符,密度 ≥3 个 加 1 分)
+//    分类词库默认留空(隐私:GitHub 代码零敏感词)。词库改存 KV,用主人命令热更新:
+//    /importdefault 一键导入推荐词库 | /addword 加词 | /delword 删词 | /listwords 查看
+//    命中加权:金融+2 / 色情+2 / 引流+1 / 诈骗+2
+const DEFAULT_AD_KEYWORDS_FINANCE = [];
+const DEFAULT_AD_KEYWORDS_PORN = [];
+const DEFAULT_AD_KEYWORDS_SPAM = [];
+const DEFAULT_AD_KEYWORDS_FRAUD = [];
+//    高危 emoji(诱导符,密度 ≥3 个 加 1 分)— 非敏感词,保留明文
 const DEFAULT_AD_RISK_EMOJI = ['🔥', '💰', '❤️', '😍', '💋', '🍑', '👙', '💴', '🤑', '🉐', '❗', '💎'];
 
 // =============================================================================
 // =结束= 普通使用者一般无需修改下方任何内容
 // =============================================================================
+
+// 推荐广告词库种子(字符串拆分写法,避免 GitHub 公开仓库出现完整敏感词)
+// 仅在主人执行 /importdefault 时一次性写入 KV,不默认生效
+const RECOMMENDED_AD_KEYWORDS = {
+	finance: ['us' + 'dt', 'u' + '商', '承' + '兑', '刷' + '单', '日' + '入', '出' + 'u', '接' + 'u', '搬' + '砖', '套' + '利', '包' + '网', '跑' + '分', '水' + '房', '料' + '子', '价格' + '拉满'],
+	porn: ['约' + '炮', '萝' + '莉', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '资源' + '群', '萝' + '控'],
+	spam: ['加' + '我', '加' + '微', '加' + 'v', '私' + '聊', '进' + '群', '拉' + '你', '详情' + '看', 'dd' + '我', '添加' + '好友', '发送' + '信息'],
+	fraud: ['假' + '钞', '假' + '币', '高' + '仿', '办' + '证', '代开' + '发票', '黑客' + '接单', '改' + '分', '网' + '赚', '菠' + '菜', '交流' + '群'],
+};
+
+// 广告词库 KV key
+const AD_KW_KEY = 'ad_keywords_custom';
 
 // 运行期生效的可配置项（每次请求开始时由 loadRequiredConfig 写入）
 let SELF_UNBAN_KEYWORD;
@@ -1634,6 +1648,57 @@ async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newSta
 
 // ===== 广告自动检测 =====
 
+// 从 KV 读自定义广告词库(分类对象),空/出错返回 null
+async function loadAdKeywordsFromKV(env) {
+	if (!env.KV) return null;
+	try {
+		const raw = await env.KV.get(AD_KW_KEY, { type: 'json' });
+		if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw;
+	} catch (error) {
+		console.error('[广告词库] 读 KV 失败:', error);
+	}
+	return null;
+}
+
+// 把 KV 自定义词库 merge 到运行期模块级变量(在 detectAd 之前调用)
+// fetch 入口每请求已把 AD_KEYWORDS_* 重置为基线(DEFAULT 空 / 环境变量),这里 push 叠加安全
+async function mergeAdKeywordsFromKV(env) {
+	const kv = await loadAdKeywordsFromKV(env);
+	if (!kv) return;
+	const norm = (a) => (Array.isArray(a) ? a : []).map((s) => String(s).toLowerCase()).filter(Boolean);
+	AD_KEYWORDS_FINANCE = [...new Set([...AD_KEYWORDS_FINANCE, ...norm(kv.finance)])];
+	AD_KEYWORDS_PORN = [...new Set([...AD_KEYWORDS_PORN, ...norm(kv.porn)])];
+	AD_KEYWORDS_SPAM = [...new Set([...AD_KEYWORDS_SPAM, ...norm(kv.spam)])];
+	AD_KEYWORDS_FRAUD = [...new Set([...AD_KEYWORDS_FRAUD, ...norm(kv.fraud)])];
+	AD_KEYWORDS = [...new Set([...AD_KEYWORDS, ...norm(kv.general)])];
+	AD_WHITELIST = [...new Set([...AD_WHITELIST, ...norm(kv.whitelist)])];
+}
+
+// 把词库对象写回 KV
+async function saveAdKeywordsToKV(env, data) {
+	if (!env.KV) return { ok: false, error: '未绑定 KV 存储空间' };
+	try {
+		await env.KV.put(AD_KW_KEY, JSON.stringify(data));
+		return { ok: true };
+	} catch (error) {
+		console.error('[广告词库] 写 KV 失败:', error);
+		return { ok: false, error: error.message };
+	}
+}
+
+// 读取 KV 词库,空则返回标准空结构(6 个分类)
+async function getAdKeywordsRaw(env) {
+	const kv = await loadAdKeywordsFromKV(env);
+	return {
+		finance: Array.isArray(kv?.finance) ? kv.finance : [],
+		porn: Array.isArray(kv?.porn) ? kv.porn : [],
+		spam: Array.isArray(kv?.spam) ? kv.spam : [],
+		fraud: Array.isArray(kv?.fraud) ? kv.fraud : [],
+		general: Array.isArray(kv?.general) ? kv.general : [],
+		whitelist: Array.isArray(kv?.whitelist) ? kv.whitelist : [],
+	};
+}
+
 // 收集消息里所有 URL(entities + caption_entities 里的 url / text_link)
 function collectUrls(message) {
 	const urls = [];
@@ -1917,6 +1982,8 @@ async function handleMessage(message, env, ctx) {
 	// 广告自动检测：普通成员发的疑似广告 → 删消息 + 加黑 + 全群踢 + 通知主人
 	// 在黑名单拦截之后、命令分发之前；管理员豁免
 	if (AD_FILTER_ENABLED && isConfiguredGroup(chatId) && message.from && !message.from.is_bot) {
+		// 先把 KV 自定义词库 merge 进来(detectAd 之前)
+		await mergeAdKeywordsFromKV(env);
 		const adResult = detectAd(message);
 		if (adResult.isAd) {
 			const isAdmin = await checkIfUserIsAdmin(userId);
@@ -2072,6 +2139,139 @@ async function handleMessage(message, env, ctx) {
 
 		const blacklist = await getBlacklist(env);
 		await sendTelegramMessage(chatId, renderBlacklist(blacklist));
+		return;
+	}
+
+	// ===== 广告词库热更新命令(仅主人 OWNER_ID 可用)=====
+	// /addword /delword /listwords /importdefault
+	if (text && /^\/(addword|delword|listwords|importdefault)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		const isOwner = OWNER_ID && String(userId) === OWNER_ID;
+		if (!isOwner) {
+			// 仅主人可用;非主人在私聊提示,群内静默(避免泄漏命令存在)
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告词库管理仅限主人(OWNER_ID)使用。');
+			}
+			return;
+		}
+		if (!env.KV) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 KV 存储空间,无法管理广告词库。');
+			return;
+		}
+
+		const head = text.trim().split(/\s+/)[0].replace(/@.*$/, '').toLowerCase();
+		const rest = text.trim().slice(text.trim().indexOf(head) + head.length).trim();
+
+		// /listwords —— 查看当前词库
+		if (head === '/listwords') {
+			const kw = await getAdKeywordsRaw(env);
+			const cats = [
+				['金融 finance', kw.finance],
+				['色情 porn', kw.porn],
+				['引流 spam', kw.spam],
+				['诈骗 fraud', kw.fraud],
+				['自定义 general', kw.general],
+				['白名单 whitelist', kw.whitelist],
+			];
+			const lines = ['📚 <b>广告词库(KV 存储)</b>', ''];
+			let total = 0;
+			for (const [label, arr] of cats) {
+				total += arr.length;
+				lines.push(`<b>${label}</b>（${arr.length}）`);
+				lines.push(arr.length ? arr.map((w) => `<code>${escapeHtml(w)}</code>`).join('、') : '（空）');
+				lines.push('');
+			}
+			lines.push(`共 ${total} 个词。空词库时仅强特征(t.me邀请链接/国际电话号)生效。`);
+			lines.push('用 <code>/importdefault</code> 一键导入推荐词库。');
+			await replyToAdmin(message, ctx, {
+				flashText: `📚 词库共 ${total} 个词`,
+				detailText: lines.join('\n'),
+				isInGroup,
+			});
+			return;
+		}
+
+		// /importdefault —— 导入推荐词库(与现有 KV 词库合并去重)
+		if (head === '/importdefault') {
+			const kw = await getAdKeywordsRaw(env);
+			let added = 0;
+			for (const cat of ['finance', 'porn', 'spam', 'fraud']) {
+				const before = new Set(kw[cat].map((w) => String(w).toLowerCase()));
+				for (const w of (RECOMMENDED_AD_KEYWORDS[cat] || [])) {
+					const lw = String(w).toLowerCase();
+					if (!before.has(lw)) { kw[cat].push(w); before.add(lw); added++; }
+				}
+			}
+			const saved = await saveAdKeywordsToKV(env, kw);
+			await replyToAdmin(message, ctx, {
+				flashText: saved.ok ? `✅ 已导入推荐词库(新增 ${added} 个)` : `❌ 导入失败:${saved.error}`,
+				detailText: saved.ok
+					? `🎬 操作:导入推荐广告词库\n📈 新增 ${added} 个词(已去重)\n用 /listwords 查看完整词库。`
+					: `❌ 导入失败:${escapeHtml(saved.error || '未知')}`,
+				isInGroup,
+			});
+			return;
+		}
+
+		// /addword [分类] <词...> —— 加词(分类可选,默认 general)
+		if (head === '/addword') {
+			if (!rest) {
+				await sendTelegramMessage(chatId, '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/spam/fraud/general/whitelist(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>');
+				return;
+			}
+			const validCats = ['finance', 'porn', 'spam', 'fraud', 'general', 'whitelist'];
+			const tokens = rest.split(/[\s,，]+/).filter(Boolean);
+			let cat = 'general';
+			if (validCats.includes(tokens[0].toLowerCase())) {
+				cat = tokens.shift().toLowerCase();
+			}
+			const words = [...new Set(tokens.map((w) => w.toLowerCase()))];
+			if (words.length === 0) {
+				await sendTelegramMessage(chatId, '❌ 没有提供有效的词。');
+				return;
+			}
+			const kw = await getAdKeywordsRaw(env);
+			const existing = new Set(kw[cat].map((w) => String(w).toLowerCase()));
+			const newAdded = [];
+			for (const w of words) {
+				if (!existing.has(w)) { kw[cat].push(w); existing.add(w); newAdded.push(w); }
+			}
+			const saved = await saveAdKeywordsToKV(env, kw);
+			await replyToAdmin(message, ctx, {
+				flashText: saved.ok ? `✅ 已加 ${newAdded.length} 个词到 ${cat}` : `❌ 失败:${saved.error}`,
+				detailText: saved.ok
+					? `🎬 操作:添加广告词\n📂 分类:${cat}\n➕ 新增:${newAdded.map((w) => `<code>${escapeHtml(w)}</code>`).join('、') || '(全部已存在)'}`
+					: `❌ 写入失败:${escapeHtml(saved.error || '未知')}`,
+				isInGroup,
+			});
+			return;
+		}
+
+		// /delword <词...> —— 从所有分类删除
+		if (head === '/delword') {
+			if (!rest) {
+				await sendTelegramMessage(chatId, '用法:<code>/delword 词1 词2 ...</code>(从所有分类中删除)');
+				return;
+			}
+			const words = [...new Set(rest.split(/[\s,，]+/).filter(Boolean).map((w) => w.toLowerCase()))];
+			const kw = await getAdKeywordsRaw(env);
+			const removed = [];
+			for (const cat of Object.keys(kw)) {
+				kw[cat] = kw[cat].filter((w) => {
+					if (words.includes(String(w).toLowerCase())) { removed.push(w); return false; }
+					return true;
+				});
+			}
+			const saved = await saveAdKeywordsToKV(env, kw);
+			await replyToAdmin(message, ctx, {
+				flashText: saved.ok ? `✅ 已删除 ${removed.length} 个词` : `❌ 失败:${saved.error}`,
+				detailText: saved.ok
+					? `🎬 操作:删除广告词\n➖ 已删:${removed.length ? removed.map((w) => `<code>${escapeHtml(w)}</code>`).join('、') : '(词库中无匹配)'}`
+					: `❌ 写入失败:${escapeHtml(saved.error || '未知')}`,
+				isInGroup,
+			});
+			return;
+		}
 		return;
 	}
 
