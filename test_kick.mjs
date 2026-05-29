@@ -1074,6 +1074,162 @@ console.log('\n[27] 匿名管理员操作:仍通知主人');
 	assert('通知含目标"广告"', ownerDm.body.text.includes('广告'));
 }
 
+// ===== 广告自动检测专项测试([28]-[37]) =====
+// 共用的 mock + env 构造
+const adEnv = (extra = {}) => ({
+	TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999',
+	AD_FILTER_ENABLED: 'true',
+	KV: makeFakeKV([]),
+	...extra,
+});
+const adFetchMock = () => makeFetchMock({
+	// 普通成员(非管理员):admin 列表不含发广告的人
+	getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+	getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+	banChatMember: () => ({ ok: true, result: true }),
+	deleteMessage: () => ({ ok: true, result: true }),
+	sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+});
+const adMsg = (over = {}) => ({
+	message: {
+		message_id: 1,
+		chat: { id: -1001, type: 'supergroup' },
+		from: { id: 88001, is_bot: false, first_name: '路人' },
+		text: '',
+		...over,
+	},
+});
+const fakeCtxAd = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+
+// ---------- [28] 强特征 t.me/+ 邀请链接 → 删黑踢 ----------
+console.log('\n[28] 强特征 t.me 邀请链接');
+{
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	const env = adEnv();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '进群看资源 https://t.me/+VvUVmr4ON8A4MjU9' })) }), env, fakeCtxAd);
+	assert('t.me邀请链接 → 删消息', callsOf('deleteMessage').length >= 1);
+	assert('t.me邀请链接 → 全群踢(2群)', callsOf('banChatMember').length === 2);
+	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('t.me邀请链接 → 加黑 reason=ad_auto', bl.some((e) => e.id === '88001' && e.reason === 'ad_auto'));
+}
+
+// ---------- [29] 强特征 国际电话号 → 删黑踢 ----------
+console.log('\n[29] 强特征 国际电话号');
+{
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	const env = adEnv();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '假钞交流群 快递面交都可 +1 484 842 6117' })) }), env, fakeCtxAd);
+	assert('电话号 → 删消息', callsOf('deleteMessage').length >= 1);
+	assert('电话号 → 全群踢', callsOf('banChatMember').length === 2);
+}
+
+// ---------- [30] 金融广告评分达阈值 ----------
+console.log('\n[30] 金融广告评分(出u+承兑)');
+{
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	const env = adEnv();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '专业出u承兑,日入过万' })) }), env, fakeCtxAd);
+	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('金融广告 → 加黑', bl.some((e) => e.id === '88001'));
+	assert('金融广告 → 踢人', callsOf('banChatMember').length === 2);
+}
+
+// ---------- [31] 色情广告评分达阈值 ----------
+console.log('\n[31] 色情广告评分');
+{
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	const env = adEnv();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '免费看片 约炮资源群' })) }), env, fakeCtxAd);
+	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('色情广告 → 加黑', bl.some((e) => e.id === '88001'));
+}
+
+// ---------- [32] 用户名是广告词 → 删黑踢 ----------
+console.log('\n[32] 用户名是广告词');
+{
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	const env = adEnv();
+	// 文本无害,但 first_name 含 usdt+承兑
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ from: { id: 88001, is_bot: false, first_name: '爆u承兑usdt项目' }, text: '大家好' })) }), env, fakeCtxAd);
+	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('用户名广告 → 加黑', bl.some((e) => e.id === '88001'));
+}
+
+// ---------- [33] 单个 usdt 不达阈值 → 不误杀 ----------
+console.log('\n[33] 单词 usdt 不误杀');
+{
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	const env = adEnv();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '请问 usdt 怎么提现到银行卡' })) }), env, fakeCtxAd);
+	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('单词 usdt(+2 < 阈值3)→ 不加黑', !bl.some((e) => e.id === '88001'));
+	assert('单词 usdt → 不删消息', callsOf('deleteMessage').length === 0);
+	assert('单词 usdt → 不踢', callsOf('banChatMember').length === 0);
+}
+
+// ---------- [34] 白名单命中 → 不计分不杀 ----------
+console.log('\n[34] 白名单命中不杀');
+{
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	// 把 usdt 和 承兑 加白名单 → 即使两个都出现也不计分
+	const env = adEnv({ AD_WHITELIST: 'usdt,承兑' });
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '我想了解 usdt 承兑的流程' })) }), env, fakeCtxAd);
+	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('白名单词 → 不加黑', !bl.some((e) => e.id === '88001'));
+}
+
+// ---------- [35] 管理员发广告 → 豁免 ----------
+console.log('\n[35] 管理员发广告豁免');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		// 88001 是管理员
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 88001 }, status: 'administrator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const env = adEnv();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '出u承兑日入过万 +1 484 842 6117' })) }), env, fakeCtxAd);
+	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('管理员发广告 → 不加黑(豁免)', !bl.some((e) => e.id === '88001'));
+	assert('管理员发广告 → 不删消息', callsOf('deleteMessage').length === 0);
+}
+
+// ---------- [36] AD_FILTER_ENABLED=false → 完全不检测 ----------
+console.log('\n[36] 开关关闭不检测');
+{
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) }; // 不设 AD_FILTER_ENABLED
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '出u承兑 +1 484 842 6117 t.me/+abc' })) }), env, fakeCtxAd);
+	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	assert('开关关 → 不加黑', !bl.some((e) => e.id === '88001'));
+	assert('开关关 → 不删消息', callsOf('deleteMessage').length === 0);
+}
+
+// ---------- [37] 主人收到广告拦截通知 ----------
+console.log('\n[37] 主人收到广告拦截通知');
+{
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	const env = adEnv();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '假钞交流群 +1 484 842 6117' })) }), env, fakeCtxAd);
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('主人收到广告拦截通知', !!ownerDm);
+	assert('通知含"广告自动拦截"', ownerDm.body.text.includes('广告自动拦截'));
+	assert('通知含判定依据', ownerDm.body.text.includes('判定依据'));
+	assert('通知含内容预览', ownerDm.body.text.includes('内容预览'));
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);

@@ -38,7 +38,8 @@ const DEFAULT_BLACKLIST_PAGE_LIMIT = 30;
 const DEFAULT_BLACKLIST_REASON_LABELS = {
 	spam: '群内 /spam 举报',
 	manual: '管理员手动添加',
-	manual_ban: '管理员手动封禁（自动同步）'
+	manual_ban: '管理员手动封禁（自动同步）',
+	ad_auto: '🤖 广告自动检测'
 };
 
 // 6) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
@@ -63,6 +64,22 @@ const DEFAULT_SUPER_ADMINS = [
 //    填了 OWNER_ID 但主人从未私聊过 bot → 通知会投递失败,Worker 日志可见
 const DEFAULT_OWNER_ID = '';
 
+// 9) 广告自动检测(多维度评分 + 强特征直杀),命中 → 删消息 + 加黑 + 全群踢 + 通知主人
+//    优先级:环境变量 > 这里的硬编码默认值
+//    AD_FILTER_ENABLED 默认 false,需显式设环境变量 'true' 才启用(避免刚部署误伤)
+const DEFAULT_AD_FILTER_ENABLED = false;
+//    评分阈值:各维度加权分总和 ≥ 阈值即判广告(强特征绕过评分直接判定)
+const DEFAULT_AD_SCORE_THRESHOLD = 3;
+//    是否检测用户 bio(需额外调 getChat,只能拿到已与 bot 交互过用户的 bio,群里陌生用户拿不到)
+const DEFAULT_AD_CHECK_BIO = false;
+//    分类词库(命中加权:金融+2 / 色情+2 / 引流+1 / 诈骗+2)
+const DEFAULT_AD_KEYWORDS_FINANCE = ['usdt', 'u商', '承兑', '刷单', '日入', '出u', '接u', '搬砖', '套利', '包网', '跑分', '水房', '料子', '拉满', '价格拉满'];
+const DEFAULT_AD_KEYWORDS_PORN = ['约炮', '萝莉', '福利姬', '看片', '裸聊', '乱伦', '不雅视频', '色色', '开车', '一夜情', '免费看', '资源群', '萝控'];
+const DEFAULT_AD_KEYWORDS_SPAM = ['加我', '加微', '加v', '私聊', '进群', '拉你', '详情看', 'dd我', '滴滴我', '添加好友', '发送信息'];
+const DEFAULT_AD_KEYWORDS_FRAUD = ['假钞', '假币', '高仿', '办证', '代开发票', '黑客接单', '改分', '网赚', '菠菜', '交流群'];
+//    高危 emoji(诱导符,密度 ≥3 个 加 1 分)
+const DEFAULT_AD_RISK_EMOJI = ['🔥', '💰', '❤️', '😍', '💋', '🍑', '👙', '💴', '🤑', '🉐', '❗', '💎'];
+
 // =============================================================================
 // =结束= 普通使用者一般无需修改下方任何内容
 // =============================================================================
@@ -85,6 +102,17 @@ let GROUP_IDS = [];
 let SUPER_ADMINS = [];
 // 主人 TGID(项目所有者),用于全局审计通知。空字符串 = 未配置,禁用通知
 let OWNER_ID = '';
+// 广告检测运行期配置
+let AD_FILTER_ENABLED = false;
+let AD_SCORE_THRESHOLD = 3;
+let AD_CHECK_BIO = false;
+let AD_KEYWORDS = [];          // 环境变量追加的自定义广告词
+let AD_WHITELIST = [];         // 白名单词(命中不计分)
+let AD_KEYWORDS_FINANCE = [];
+let AD_KEYWORDS_PORN = [];
+let AD_KEYWORDS_SPAM = [];
+let AD_KEYWORDS_FRAUD = [];
+let AD_RISK_EMOJI = [];
 // 机器人用户名缓存
 let BOT_USERNAME = null;
 let BOT_ID = null;
@@ -106,6 +134,16 @@ export default {
 			GROUP_ID = config.GROUP_ID;
 			SUPER_ADMINS = config.SUPER_ADMINS;
 			OWNER_ID = config.OWNER_ID;
+			AD_FILTER_ENABLED = config.AD_FILTER_ENABLED;
+			AD_SCORE_THRESHOLD = config.AD_SCORE_THRESHOLD;
+			AD_CHECK_BIO = config.AD_CHECK_BIO;
+			AD_KEYWORDS = config.AD_KEYWORDS;
+			AD_WHITELIST = config.AD_WHITELIST;
+			AD_KEYWORDS_FINANCE = config.AD_KEYWORDS_FINANCE;
+			AD_KEYWORDS_PORN = config.AD_KEYWORDS_PORN;
+			AD_KEYWORDS_SPAM = config.AD_KEYWORDS_SPAM;
+			AD_KEYWORDS_FRAUD = config.AD_KEYWORDS_FRAUD;
+			AD_RISK_EMOJI = config.AD_RISK_EMOJI;
 			SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
 			SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
 			SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
@@ -258,6 +296,28 @@ function loadRequiredConfig(env) {
 
 	const gkyEndpoint = pickStr(env.GKY_BANLIST_ENDPOINT, DEFAULT_GKY_BANLIST_ENDPOINT);
 
+	// ===== 广告检测配置 =====
+	const parseBool = (v, dflt) => {
+		if (v === undefined || v === null || String(v).trim() === '') return dflt;
+		return String(v).trim().toLowerCase() === 'true';
+	};
+	const parseList = (v) =>
+		[...new Set(
+			String(v || '').split(/[,，]/).map((s) => s.trim().toLowerCase()).filter(Boolean)
+		)];
+
+	const adFilterEnabled = parseBool(env.AD_FILTER_ENABLED, DEFAULT_AD_FILTER_ENABLED);
+	let adScoreThreshold = DEFAULT_AD_SCORE_THRESHOLD;
+	if (env.AD_SCORE_THRESHOLD !== undefined && env.AD_SCORE_THRESHOLD !== null && String(env.AD_SCORE_THRESHOLD).trim() !== '') {
+		const n = parseInt(String(env.AD_SCORE_THRESHOLD).trim(), 10);
+		if (Number.isInteger(n) && n > 0) adScoreThreshold = n;
+	}
+	const adCheckBio = parseBool(env.AD_CHECK_BIO, DEFAULT_AD_CHECK_BIO);
+	const adKeywords = parseList(env.AD_KEYWORDS);     // 环境变量追加
+	const adWhitelist = parseList(env.AD_WHITELIST);
+	// 词库统一小写化(检测时也小写比对)
+	const lower = (arr) => (arr || []).map((s) => String(s).toLowerCase());
+
 	return {
 		TOKEN: String(env.TOKEN).trim(),
 		BOT_TOKEN: String(env.BOT_TOKEN).trim(),
@@ -265,6 +325,16 @@ function loadRequiredConfig(env) {
 		GROUP_ID: uniqueGroupIds[0],
 		SUPER_ADMINS: superAdmins,
 		OWNER_ID: ownerId,
+		AD_FILTER_ENABLED: adFilterEnabled,
+		AD_SCORE_THRESHOLD: adScoreThreshold,
+		AD_CHECK_BIO: adCheckBio,
+		AD_KEYWORDS: adKeywords,
+		AD_WHITELIST: adWhitelist,
+		AD_KEYWORDS_FINANCE: lower(DEFAULT_AD_KEYWORDS_FINANCE),
+		AD_KEYWORDS_PORN: lower(DEFAULT_AD_KEYWORDS_PORN),
+		AD_KEYWORDS_SPAM: lower(DEFAULT_AD_KEYWORDS_SPAM),
+		AD_KEYWORDS_FRAUD: lower(DEFAULT_AD_KEYWORDS_FRAUD),
+		AD_RISK_EMOJI: DEFAULT_AD_RISK_EMOJI,
 		SELF_UNBAN_KEYWORD: selfUnbanKeyword,
 		SELF_UNBAN_PROMPT: selfUnbanPrompt,
 		SELF_UNBAN_APPROVED: selfUnbanApproved,
@@ -1562,6 +1632,109 @@ async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newSta
 	}
 }
 
+// ===== 广告自动检测 =====
+
+// 收集消息里所有 URL(entities + caption_entities 里的 url / text_link)
+function collectUrls(message) {
+	const urls = [];
+	const ents = [...(message.entities || []), ...(message.caption_entities || [])];
+	const base = message.text || message.caption || '';
+	for (const e of ents) {
+		if (e.type === 'text_link' && e.url) {
+			urls.push(e.url);
+		} else if (e.type === 'url' && typeof e.offset === 'number') {
+			urls.push(base.substring(e.offset, e.offset + e.length));
+		}
+	}
+	return urls;
+}
+
+// 广告检测(多维度评分 + 强特征直杀)
+// 返回 { isAd, score, hits: string[], strong: string|null }
+function detectAd(message) {
+	if (!AD_FILTER_ENABLED) return { isAd: false, score: 0, hits: [], strong: null };
+
+	const textParts = [
+		message.text,
+		message.caption,
+		message.from?.first_name,
+		message.from?.last_name,
+		message.from?.username,
+	].filter(Boolean);
+	const fullText = textParts.join(' ').toLowerCase();
+	const hits = [];
+
+	// 白名单:把白名单词从计分文本里挖掉(命中也不计分)
+	let scoringText = fullText;
+	for (const w of AD_WHITELIST) {
+		if (w) scoringText = scoringText.split(w).join('');
+	}
+
+	const urls = collectUrls(message);
+
+	// 强特征 1:t.me / telegram.me 私有群邀请链接
+	const inviteLink = /t\.me\/\+|t\.me\/joinchat\/|telegram\.me\/\+/i;
+	if (inviteLink.test(fullText) || urls.some((u) => inviteLink.test(u))) {
+		return { isAd: true, score: 99, hits: ['t.me邀请链接'], strong: 't.me邀请链接' };
+	}
+
+	// 强特征 2:国际电话号(+国家码 区号 号码)
+	const phonePattern = /\+\d{1,3}[\s-]?\d{2,4}[\s-]?\d{3,4}[\s-]?\d{2,4}/;
+	if (phonePattern.test(fullText)) {
+		return { isAd: true, score: 99, hits: ['国际电话号'], strong: '国际电话号' };
+	}
+
+	// 加权评分
+	let score = 0;
+	for (const w of AD_KEYWORDS_FINANCE) if (w && scoringText.includes(w)) { score += 2; hits.push(`金融:${w}`); }
+	for (const w of AD_KEYWORDS_PORN) if (w && scoringText.includes(w)) { score += 2; hits.push(`色情:${w}`); }
+	for (const w of AD_KEYWORDS_SPAM) if (w && scoringText.includes(w)) { score += 1; hits.push(`引流:${w}`); }
+	for (const w of AD_KEYWORDS_FRAUD) if (w && scoringText.includes(w)) { score += 2; hits.push(`诈骗:${w}`); }
+	for (const w of AD_KEYWORDS) if (w && scoringText.includes(w)) { score += 2; hits.push(`自定义:${w}`); }
+
+	// 高危 emoji 密度 ≥3
+	const emojiCount = AD_RISK_EMOJI.reduce((n, e) => n + (fullText.split(e).length - 1), 0);
+	if (emojiCount >= 3) { score += 1; hits.push(`emoji密度${emojiCount}`); }
+
+	// 纯链接刷屏:有外链 + 文本很短
+	if (urls.length > 0 && fullText.length < 20) { score += 1; hits.push('短文本+链接'); }
+
+	return { isAd: score >= AD_SCORE_THRESHOLD, score, hits, strong: null };
+}
+
+// 广告拦截后通知主人
+async function notifyOwnerAdDetection(message, adResult, banResults) {
+	if (!OWNER_ID) return;
+	const fromUser = message.from;
+	const operator = formatUserMention(fromUser) || `<code>${escapeHtml(String(fromUser?.id || '未知'))}</code>`;
+	const preview = escapeHtml((message.text || message.caption || '(无文本)').slice(0, 100));
+	const reason = adResult.strong
+		? `强特征命中:${adResult.strong}`
+		: `评分 ${adResult.score}（${adResult.hits.slice(0, 6).join('、')}）`;
+
+	// 拉群名
+	let groupLabel = `<code>${escapeHtml(String(message.chat.id))}</code>`;
+	try {
+		const info = await getChatInfoFromId(message.chat.id);
+		if (info?.title) groupLabel = `<b>${escapeHtml(info.title)}</b> <code>${escapeHtml(String(message.chat.id))}</code>`;
+	} catch (_) {}
+
+	const lines = [
+		`🤖 <b>广告自动拦截</b>`,
+		`🎬 操作:自动删消息 + 加黑 + 全群踢`,
+		`👤 广告账号:${operator} <code>${escapeHtml(String(fromUser?.id || '未知'))}</code>`,
+		`📍 触发群:${groupLabel}`,
+		`🔍 判定依据:${escapeHtml(reason)}`,
+		`📝 内容预览:${preview}`,
+		'',
+		await renderBanResultsDetail(banResults),
+	];
+	const dm = await sendTelegramMessage(OWNER_ID, lines.join('\n'));
+	if (!dm?.ok) {
+		console.error(`[广告检测] 通知主人失败:${dm?.description || '未知'}`);
+	}
+}
+
 // 应答 callback_query，让前端按钮停止 loading 并可选弹出提示气泡
 async function answerCallbackQuery(callbackQueryId, text, showAlert = false) {
 	try {
@@ -1736,6 +1909,23 @@ async function handleMessage(message, env, ctx) {
 				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+踢人`);
 				await deleteMessage(chatId, message.message_id);
 				await banUserFromGroup(chatId, userId);
+				return;
+			}
+		}
+	}
+
+	// 广告自动检测：普通成员发的疑似广告 → 删消息 + 加黑 + 全群踢 + 通知主人
+	// 在黑名单拦截之后、命令分发之前；管理员豁免
+	if (AD_FILTER_ENABLED && isConfiguredGroup(chatId) && message.from && !message.from.is_bot) {
+		const adResult = detectAd(message);
+		if (adResult.isAd) {
+			const isAdmin = await checkIfUserIsAdmin(userId);
+			if (!isAdmin) {
+				console.log(`[广告检测] 命中 用户=${userId} 群=${chatId} 分数=${adResult.score} 特征=${adResult.hits.join('/')}`);
+				await deleteMessage(chatId, message.message_id);
+				await addToBlacklist(userId, env, { reason: 'ad_auto', by: 'system' });
+				const banResults = await banUserFromAllGroups(userId);
+				await notifyOwnerAdDetection(message, adResult, banResults);
 				return;
 			}
 		}
