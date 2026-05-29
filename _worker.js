@@ -95,6 +95,16 @@ const RECOMMENDED_AD_KEYWORDS = {
 
 // 广告词库 KV key
 const AD_KW_KEY = 'ad_keywords_custom';
+// 广告学习样本(指纹)KV key
+const AD_SAMPLES_KEY = 'ad_samples';
+
+// 关键词提取停用词表(过滤常见无害中文4字组,避免误学成广告词)
+// 字符串拆分写法避免明文特征
+const AD_STOPWORDS = [
+	'大' + '家好', '请' + '问一下', '怎' + '么样', '谢' + '谢大家', '有' + '没有人',
+	'是' + '不是', '可' + '以吗', '在' + '不在', '什' + '么意思', '哈' + '哈哈哈',
+	'早' + '上好', '晚' + '上好', '不' + '客气', '没' + '关系',
+];
 
 // 运行期生效的可配置项（每次请求开始时由 loadRequiredConfig 写入）
 let SELF_UNBAN_KEYWORD;
@@ -124,6 +134,8 @@ let AD_KEYWORDS_FINANCE = [];
 let AD_KEYWORDS_PORN = [];
 let AD_KEYWORDS_SPAM = [];
 let AD_KEYWORDS_FRAUD = [];
+// 广告学习样本指纹(运行期从 KV 加载)
+let AD_SAMPLE_FINGERPRINTS = [];
 // 机器人用户名缓存
 let BOT_USERNAME = null;
 let BOT_ID = null;
@@ -1694,6 +1706,99 @@ async function getAdKeywordsRaw(env) {
 	};
 }
 
+// ===== 广告学习样本(/spam 上报 → 指纹入库 → 精准查杀)=====
+
+// 归一化:把文本"洗"成标准指纹,抓"加空格/标点/全半角"变体
+function normalizeForFingerprint(text) {
+	try {
+		return String(text || '')
+			.normalize('NFKC')             // 全角半角归一
+			.toLowerCase()
+			.replace(/\s+/g, '')           // 去所有空白
+			.replace(/[\p{P}\p{S}]/gu, ''); // 去标点和符号(含 emoji)
+	} catch (_) {
+		// 老环境不支持 \p{} → 退化:只去空白
+		return String(text || '').toLowerCase().replace(/\s+/g, '');
+	}
+}
+
+// 从广告文本提取特征词组(加入词库 general 分类,抓变体)
+function extractAdKeywords(text) {
+	const norm = String(text || '').toLowerCase();
+	const segments = [];
+	for (const m of norm.matchAll(/[一-龥]{4,12}/g)) segments.push(m[0]); // 中文 ≥4 字
+	for (const m of norm.matchAll(/[a-z0-9]{5,20}/g)) segments.push(m[0]);        // 英数 ≥5
+	return [...new Set(segments)]
+		.filter((s) => !AD_STOPWORDS.includes(s))
+		.slice(0, 5);
+}
+
+// 从 KV 读样本(返回 { fingerprints: [], count, updatedAt })
+async function loadAdSamplesFromKV(env) {
+	if (!env.KV) return null;
+	try {
+		const raw = await env.KV.get(AD_SAMPLES_KEY, { type: 'json' });
+		if (raw && Array.isArray(raw.fingerprints)) return raw;
+	} catch (error) {
+		console.error('[广告样本] 读 KV 失败:', error);
+	}
+	return null;
+}
+
+// 写样本回 KV
+async function saveAdSamplesToKV(env, data) {
+	if (!env.KV) return { ok: false, error: '未绑定 KV 存储空间' };
+	try {
+		await env.KV.put(AD_SAMPLES_KEY, JSON.stringify(data));
+		return { ok: true };
+	} catch (error) {
+		console.error('[广告样本] 写 KV 失败:', error);
+		return { ok: false, error: error.message };
+	}
+}
+
+// 把样本指纹 merge 到运行期变量(handleMessage 入口调用)
+async function mergeAdSamplesFromKV(env) {
+	const data = await loadAdSamplesFromKV(env);
+	if (data && Array.isArray(data.fingerprints)) {
+		AD_SAMPLE_FINGERPRINTS = data.fingerprints.filter(Boolean);
+	}
+}
+
+// 学习一条广告样本:写指纹 + 自动提取的关键词进词库 general
+// 返回 { ok, fingerprint, addedKeywords, sampleCount }
+async function learnAdSample(env, learnText) {
+	const fp = normalizeForFingerprint(learnText);
+	const kws = extractAdKeywords(learnText);
+
+	// 1) 写指纹(去重)
+	let added = false;
+	if (fp && fp.length >= 6) {
+		const data = (await loadAdSamplesFromKV(env)) || { fingerprints: [], count: 0 };
+		if (!data.fingerprints.includes(fp)) {
+			data.fingerprints.push(fp);
+			data.count = data.fingerprints.length;
+			data.updatedAt = new Date().toISOString();
+			await saveAdSamplesToKV(env, data);
+			added = true;
+		}
+	}
+
+	// 2) 提取的关键词写进词库 general(去重)
+	const addedKeywords = [];
+	if (kws.length > 0) {
+		const kw = await getAdKeywordsRaw(env);
+		const existing = new Set(kw.general.map((w) => String(w).toLowerCase()));
+		for (const w of kws) {
+			if (!existing.has(w)) { kw.general.push(w); existing.add(w); addedKeywords.push(w); }
+		}
+		if (addedKeywords.length > 0) await saveAdKeywordsToKV(env, kw);
+	}
+
+	const data2 = await loadAdSamplesFromKV(env);
+	return { ok: true, fingerprint: fp, fpAdded: added, addedKeywords, sampleCount: data2?.count || 0 };
+}
+
 // 收集消息里所有 URL(entities + caption_entities 里的 url / text_link)
 function collectUrls(message) {
 	const urls = [];
@@ -1742,6 +1847,18 @@ function detectAd(message) {
 	const phonePattern = /\+\d{1,3}[\s-]?\d{2,4}[\s-]?\d{3,4}[\s-]?\d{2,4}/;
 	if (phonePattern.test(fullText)) {
 		return { isAd: true, score: 99, hits: ['国际电话号'], strong: '国际电话号' };
+	}
+
+	// 强特征 3:学习样本指纹精确匹配(/spam 上报过的广告)
+	// 归一化后 完全相等 / 互为子串 即命中;太短(<6)不匹配,避免误杀
+	const normMsg = normalizeForFingerprint(fullText);
+	if (normMsg.length >= 6 && AD_SAMPLE_FINGERPRINTS.length > 0) {
+		for (const fp of AD_SAMPLE_FINGERPRINTS) {
+			if (!fp || fp.length < 6) continue;
+			if (normMsg === fp || normMsg.includes(fp) || fp.includes(normMsg)) {
+				return { isAd: true, score: 99, hits: ['学习样本匹配'], strong: '学习样本' };
+			}
+		}
 	}
 
 	// 加权评分
@@ -1975,6 +2092,7 @@ async function handleMessage(message, env, ctx) {
 	if (AD_FILTER_ENABLED && isConfiguredGroup(chatId) && message.from && !message.from.is_bot) {
 		// 先把 KV 自定义词库 merge 进来(detectAd 之前)
 		await mergeAdKeywordsFromKV(env);
+		await mergeAdSamplesFromKV(env);
 		const adResult = detectAd(message);
 		if (adResult.isAd) {
 			const isAdmin = await checkIfUserIsAdmin(userId);
@@ -2027,6 +2145,26 @@ async function handleMessage(message, env, ctx) {
 			} else {
 				const { 中文, 建议 } = translateTelegramError(delResult.error);
 				lines.push(`⚠️ 删除消息失败:${escapeHtml(中文)}\n   建议:${escapeHtml(建议)}`);
+			}
+
+			// 仅主人 /spam → 学习样本(指纹入库 + 自动提取关键词进词库)
+			const isOwnerSpam = OWNER_ID && String(userId) === OWNER_ID;
+			if (isOwnerSpam && env.KV) {
+				const r = message.reply_to_message;
+				const learnText = [
+					r.text, r.caption,
+					r.from?.first_name, r.from?.last_name, r.from?.username,
+				].filter(Boolean).join(' ');
+				if (learnText.trim()) {
+					const learn = await learnAdSample(env, learnText);
+					const learnLines = ['', '📖 <b>已学习此广告样本</b>'];
+					learnLines.push(learn.fpAdded ? '✅ 指纹已入库(以后相同广告自动秒杀)' : 'ℹ️ 指纹已存在,未重复入库');
+					if (learn.addedKeywords.length > 0) {
+						learnLines.push(`🔑 提取关键词:${learn.addedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
+					}
+					learnLines.push(`📊 当前样本库共 ${learn.sampleCount} 条`);
+					lines.push(...learnLines);
+				}
 			}
 
 			await replyToAdmin(message, ctx, {
@@ -2259,6 +2397,98 @@ async function handleMessage(message, env, ctx) {
 				detailText: saved.ok
 					? `🎬 操作:删除广告词\n➖ 已删:${removed.length ? removed.map((w) => `<code>${escapeHtml(w)}</code>`).join('、') : '(词库中无匹配)'}`
 					: `❌ 写入失败:${escapeHtml(saved.error || '未知')}`,
+				isInGroup,
+			});
+			return;
+		}
+		return;
+	}
+
+	// ===== 广告学习样本管理命令(仅主人 OWNER_ID)=====
+	// /listsamples /delsample /clearsamples
+	if (text && /^\/(listsamples|delsample|clearsamples)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		const isOwner = OWNER_ID && String(userId) === OWNER_ID;
+		if (!isOwner) {
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告样本管理仅限主人(OWNER_ID)使用。');
+			}
+			return;
+		}
+		if (!env.KV) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 KV 存储空间,无法管理学习样本。');
+			return;
+		}
+
+		const head = text.trim().split(/\s+/)[0].replace(/@.*$/, '').toLowerCase();
+		const rest = text.trim().slice(text.trim().indexOf(head) + head.length).trim();
+		const data = (await loadAdSamplesFromKV(env)) || { fingerprints: [], count: 0 };
+
+		// /listsamples —— 查看已学习样本
+		if (head === '/listsamples') {
+			const fps = data.fingerprints || [];
+			const lines = [`📖 <b>广告学习样本</b>(共 ${fps.length} 条)`, ''];
+			if (fps.length === 0) {
+				lines.push('(空)主人回复广告消息发 <code>/spam</code> 即可学习。');
+			} else {
+				// 最多展示最近 50 条,避免消息超长
+				const show = fps.slice(-50);
+				show.forEach((fp, i) => {
+					lines.push(`${fps.length - show.length + i + 1}. <code>${escapeHtml(fp.slice(0, 60))}</code>`);
+				});
+				if (fps.length > 50) lines.unshift(`(仅显示最近 50 条)`);
+			}
+			lines.push('', '删除:<code>/delsample 序号</code> 或 <code>/delsample 关键词</code>');
+			await replyToAdmin(message, ctx, {
+				flashText: `📖 样本库 ${fps.length} 条`,
+				detailText: lines.join('\n'),
+				isInGroup,
+			});
+			return;
+		}
+
+		// /delsample <序号|关键词> —— 删除样本
+		if (head === '/delsample') {
+			if (!rest) {
+				await sendTelegramMessage(chatId, '用法:<code>/delsample 序号</code>(见 /listsamples)或 <code>/delsample 关键词</code>');
+				return;
+			}
+			const fps = data.fingerprints || [];
+			let removed = [];
+			const idx = parseInt(rest, 10);
+			if (/^\d+$/.test(rest) && idx >= 1 && idx <= fps.length) {
+				removed = fps.splice(idx - 1, 1);
+			} else {
+				// 按关键词匹配删除(包含即删)
+				const kw = normalizeForFingerprint(rest);
+				data.fingerprints = fps.filter((fp) => {
+					if (kw && fp.includes(kw)) { removed.push(fp); return false; }
+					return true;
+				});
+			}
+			data.count = data.fingerprints.length;
+			data.updatedAt = new Date().toISOString();
+			const saved = await saveAdSamplesToKV(env, data);
+			await replyToAdmin(message, ctx, {
+				flashText: saved.ok ? `✅ 已删除 ${removed.length} 条样本` : `❌ 失败:${saved.error}`,
+				detailText: saved.ok
+					? `🎬 操作:删除学习样本\n➖ 已删 ${removed.length} 条\n📊 剩余 ${data.count} 条`
+					: `❌ 写入失败:${escapeHtml(saved.error || '未知')}`,
+				isInGroup,
+			});
+			return;
+		}
+
+		// /clearsamples —— 清空所有样本(二次确认)
+		if (head === '/clearsamples') {
+			if (rest.trim().toLowerCase() !== 'confirm') {
+				await sendTelegramMessage(chatId, `⚠️ 这将清空全部 ${data.count || 0} 条学习样本,不可恢复。\n确认请发送:<code>/clearsamples confirm</code>`);
+				return;
+			}
+			const saved = await saveAdSamplesToKV(env, { fingerprints: [], count: 0, updatedAt: new Date().toISOString() });
+			await replyToAdmin(message, ctx, {
+				flashText: saved.ok ? '✅ 已清空学习样本' : `❌ 失败:${saved.error}`,
+				detailText: saved.ok ? '🎬 操作:清空全部学习样本\n📊 样本库已归零' : `❌ 写入失败:${escapeHtml(saved.error || '未知')}`,
 				isInGroup,
 			});
 			return;

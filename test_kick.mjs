@@ -1077,6 +1077,14 @@ console.log('\n[27] 匿名管理员操作:仍通知主人');
 // ===== 广告自动检测专项测试([28]-[37]) =====
 // 共用的 mock + env 构造
 // 广告词库种子(对应代码里 RECOMMENDED_AD_KEYWORDS,测试用明文即可)
+// 测试用归一化(与 worker 里 normalizeForFingerprint 保持一致)
+function normalizeFp(text) {
+	try {
+		return String(text || '').normalize('NFKC').toLowerCase().replace(/\s+/g, '').replace(/[\p{P}\p{S}]/gu, '');
+	} catch (_) {
+		return String(text || '').toLowerCase().replace(/\s+/g, '');
+	}
+}
 const AD_KW_SEED = {
 	finance: ['usdt', 'u商', '承兑', '刷单', '日入', '出u', '接u', '搬砖', '套利', '包网', '价格拉满'],
 	porn: ['约炮', '萝莉', '福利姬', '看片', '裸聊', '乱伦', '不雅视频', '色色', '免费看', '资源群'],
@@ -1406,6 +1414,220 @@ console.log('\n[45] 纯 emoji 消息不误杀');
 	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
 	assert('纯 emoji → 不误杀', !bl.some((e) => e.id === '88045'));
 	assert('纯 emoji → 不删消息', callsOf('deleteMessage').length === 0);
+}
+
+// ===== /spam 上报学习 → 精准查杀测试([46]-[55]) =====
+
+// ---------- [46] 主人 /spam → 样本入库 ----------
+console.log('\n[46] 主人 /spam 学习样本');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 主人在群里回复一条广告发 /spam
+	const update = { message: {
+		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false, first_name: '主人' },
+		text: '/spam',
+		reply_to_message: { message_id: 50, from: { id: 88100, is_bot: false, first_name: '广告号' }, text: '专业承兑出u日入过万快来咨询' },
+	} };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const samples = JSON.parse(kv._store.get('ad_samples') || '{"fingerprints":[]}');
+	assert('主人 /spam → 指纹入库', samples.fingerprints.length === 1);
+	assert('指纹是归一化后的广告文本', samples.fingerprints[0].includes('专业承兑出u日入过万'));
+	const kw = JSON.parse(kv._store.get('ad_keywords_custom') || '{"general":[]}');
+	assert('提取的关键词进 general', kw.general && kw.general.length > 0);
+}
+
+// ---------- [47] 普通管理员 /spam → 不学习 ----------
+console.log('\n[47] 普通管理员 /spam 不学习');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		// 7777 是群管理员但不是主人(主人是 999)
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 7777 }, status: 'administrator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const update = { message: {
+		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '管理员' },
+		text: '/spam',
+		reply_to_message: { message_id: 50, from: { id: 88101, is_bot: false }, text: '某广告内容' },
+	} };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const samples = kv._store.get('ad_samples');
+	assert('普通管理员 /spam → 不入库样本', !samples);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('普通管理员 /spam → 仍加黑(行为不变)', bl.some((e) => e.id === '88101'));
+}
+
+// ---------- [48] 学习后相同广告再发 → 指纹秒杀 ----------
+console.log('\n[48] 学习后相同广告秒杀');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	// 预置一条学习指纹(归一化后的)
+	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('专业承兑出u日入过万快来咨询')], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 普通成员发完全相同的广告
+	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88102, is_bot: false, first_name: '路人' }, text: '专业承兑出u日入过万快来咨询' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('相同广告 → 指纹命中加黑', bl.some((e) => e.id === '88102'));
+	assert('相同广告 → 全群踢', callsOf('banChatMember').length === 2);
+	assert('相同广告 → 删消息', callsOf('deleteMessage').length >= 1);
+}
+
+// ---------- [49] 加空格/标点变体 → 归一化后仍命中 ----------
+console.log('\n[49] 加空格标点变体仍命中');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('专业承兑出u日入过万')], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 加了空格、标点、emoji 的变体
+	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88103, is_bot: false }, text: '专业 承兑、出u!日入,过万🔥' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('加空格标点变体 → 归一化后命中', bl.some((e) => e.id === '88103'));
+}
+
+// ---------- [50] 含广告的更长消息 → 子串匹配 ----------
+console.log('\n[50] 子串匹配');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('承兑出u日入过万')], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 广告嵌进更长的消息
+	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88104, is_bot: false }, text: '大家好我这里专业承兑出u日入过万有需要的私聊' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('更长消息含广告 → 子串命中', bl.some((e) => e.id === '88104'));
+}
+
+// ---------- [51] 太短消息(<6)不触发指纹,防误杀 ----------
+console.log('\n[51] 太短消息不触发指纹');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	// 一条极短指纹(理论上不该存在,因为 learn 限制 ≥6,但测防御)
+	kv._store.set('ad_samples', JSON.stringify({ fingerprints: ['abc'], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88105, is_bot: false }, text: 'abc好' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('短指纹(<6)不触发匹配 → 不误杀', !bl.some((e) => e.id === '88105'));
+}
+
+// ---------- [52] /listsamples 展示 ----------
+console.log('\n[52] /listsamples 展示');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_samples', JSON.stringify({ fingerprints: ['承兑出u日入过万', '看片约炮资源群'], count: 2 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/listsamples' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('/listsamples 回执', !!dm);
+	assert('展示样本数 2', dm.body.text.includes('共 2 条'));
+	assert('展示样本内容', dm.body.text.includes('承兑出u日入过万'));
+}
+
+// ---------- [53] /delsample 按序号删 ----------
+console.log('\n[53] /delsample 删样本');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_samples', JSON.stringify({ fingerprints: ['样本甲一二三四', '样本乙一二三四'], count: 2 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/delsample 1' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const samples = JSON.parse(kv._store.get('ad_samples') || '{"fingerprints":[]}');
+	assert('/delsample 1 删掉第一条', samples.fingerprints.length === 1 && samples.fingerprints[0] === '样本乙一二三四');
+}
+
+// ---------- [54] /clearsamples 二次确认 ----------
+console.log('\n[54] /clearsamples 二次确认');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_samples', JSON.stringify({ fingerprints: ['样本一二三四', '样本五六七八'], count: 2 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 第一次不带 confirm → 不清空
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/clearsamples' } }) }), env, fakeCtxAd);
+	let samples = JSON.parse(kv._store.get('ad_samples') || '{"fingerprints":[]}');
+	assert('/clearsamples 无 confirm → 不清空', samples.fingerprints.length === 2);
+	// 带 confirm → 清空
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/clearsamples confirm' } }) }), env, fakeCtxAd);
+	samples = JSON.parse(kv._store.get('ad_samples') || '{"fingerprints":[]}');
+	assert('/clearsamples confirm → 清空', samples.fingerprints.length === 0);
+}
+
+// ---------- [55] 非主人用 /listsamples 被拒 ----------
+console.log('\n[55] 非主人样本命令被拒');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 7777 }, status: 'administrator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const update = { message: { message_id: 1, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/listsamples' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
+	assert('非主人 /listsamples → 权限不足', !!dm && dm.body.text.includes('权限不足'));
 }
 
 // ---------- 总结 ----------
