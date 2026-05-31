@@ -100,9 +100,20 @@ const AD_KW_KEY = 'ad_keywords_custom';
 const AD_SAMPLES_KEY = 'ad_samples';
 // 最近消息缓存 KV key(供 /learnlast 学习被 GKY 删掉的广告)
 const RECENT_MSG_KEY = 'recent_messages';
+// /recent 冻结快照 KV key(供 /learnlast 按固定序号引用,根治序号漂移)
+// /recent 时把当时的疑似广告列表冻结存这里;/learnlast 只从这份快照读,
+// 所以即使期间有新消息进来挤动实时缓存,主人私聊里看到的序号也永远对得上同一条。
+const LEARN_SNAPSHOT_KEY = 'learn_snapshot';
 // 消息缓存开关与容量(默认开,只缓存"疑似广告"消息以省 KV 写入)
 const DEFAULT_MSG_CACHE_ENABLED = true;
 const DEFAULT_MSG_CACHE_SIZE = 50;
+
+// 学习样本指纹匹配阈值(根因修复:防止学短广告后误杀正常人)
+//   完全相等:归一化后 ≥ 此长度即允许"精确秒杀"(保留"相同广告一定抓"的能力)
+const SAMPLE_FP_EXACT_MIN = 6;
+//   子串包含:只有指纹和消息双方都 ≥ 此长度,才允许互为子串判定为广告。
+//   短广告(<16字)只能走完全相等,绝不会因子串包含炸到含这几个字的正常长消息。
+const SAMPLE_FP_SUBSTR_MIN = 16;
 
 // 关键词提取停用词表(过滤常见无害中文4字组,避免误学成广告词)
 // 字符串拆分写法避免明文特征
@@ -1785,15 +1796,17 @@ async function mergeAdSamplesFromKV(env) {
 	}
 }
 
-// 学习一条广告样本:写指纹 + 自动提取的关键词进词库 general
-// 返回 { ok, fingerprint, addedKeywords, sampleCount }
+// 学习一条广告样本:只写整句指纹入库(不再自动污染词库)
+// 根因修复:旧版会把自动提取的词写进 general(+2 分),导致正常消息分数虚高被误杀。
+//   现在只写指纹;提取的候选词仅作为"建议"返回,由主人自行决定是否 /addword,绝不自动入库。
+// 返回 { ok, fingerprint, fpAdded, suggestedKeywords, sampleCount }
 async function learnAdSample(env, learnText) {
 	const fp = normalizeForFingerprint(learnText);
-	const kws = extractAdKeywords(learnText);
+	const suggestedKeywords = extractAdKeywords(learnText); // 仅建议,不写库
 
-	// 1) 写指纹(去重)
+	// 写指纹(去重)
 	let added = false;
-	if (fp && fp.length >= 6) {
+	if (fp && fp.length >= SAMPLE_FP_EXACT_MIN) {
 		const data = (await loadAdSamplesFromKV(env)) || { fingerprints: [], count: 0 };
 		if (!data.fingerprints.includes(fp)) {
 			data.fingerprints.push(fp);
@@ -1802,21 +1815,45 @@ async function learnAdSample(env, learnText) {
 			await saveAdSamplesToKV(env, data);
 			added = true;
 		}
+		return { ok: true, fingerprint: fp, fpAdded: added, suggestedKeywords, sampleCount: data.count };
 	}
 
-	// 2) 提取的关键词写进词库 general(去重)
-	const addedKeywords = [];
-	if (kws.length > 0) {
-		const kw = await getAdKeywordsRaw(env);
-		const existing = new Set(kw.general.map((w) => String(w).toLowerCase()));
-		for (const w of kws) {
-			if (!existing.has(w)) { kw.general.push(w); existing.add(w); addedKeywords.push(w); }
-		}
-		if (addedKeywords.length > 0) await saveAdKeywordsToKV(env, kw);
-	}
+	// 指纹太短未入库,仍返回当前样本数
+	const cur = await loadAdSamplesFromKV(env);
+	return { ok: true, fingerprint: fp, fpAdded: false, suggestedKeywords, sampleCount: cur?.count || 0 };
+}
 
-	const data2 = await loadAdSamplesFromKV(env);
-	return { ok: true, fingerprint: fp, fpAdded: added, addedKeywords, sampleCount: data2?.count || 0 };
+// ===== /recent 冻结快照(供 /learnlast 按固定序号引用,根治序号漂移)=====
+// /recent 把当时的疑似广告列表(已按上下文过滤+排序)冻结写入 KV;
+// /learnlast 只从这份快照读,所以期间实时缓存被新消息挤动也不影响主人看到的序号。
+
+// 写入快照:items 是已排序好的数组(序号 1 = items[0]),scope/at 仅作展示与排错
+async function saveLearnSnapshot(env, items, meta = {}) {
+	if (!env.KV) return { ok: false, error: '未绑定 KV 存储空间' };
+	try {
+		await env.KV.put(LEARN_SNAPSHOT_KEY, JSON.stringify({
+			items: items || [],
+			scope: meta.scope || '',
+			byChatId: meta.byChatId || '',
+			at: new Date().toISOString(),
+		}));
+		return { ok: true };
+	} catch (error) {
+		console.error('[学习快照] 写 KV 失败:', error);
+		return { ok: false, error: error.message };
+	}
+}
+
+// 读取快照,返回 { items: [], scope, byChatId, at } 或 null
+async function loadLearnSnapshot(env) {
+	if (!env.KV) return null;
+	try {
+		const raw = await env.KV.get(LEARN_SNAPSHOT_KEY, { type: 'json' });
+		if (raw && Array.isArray(raw.items)) return raw;
+	} catch (error) {
+		console.error('[学习快照] 读 KV 失败:', error);
+	}
+	return null;
 }
 
 // ===== 最近消息缓存(供 /learnlast 学习被删的广告)=====
@@ -1845,6 +1882,18 @@ async function loadRecentMessages(env) {
 	return [];
 }
 
+// 按上下文过滤缓存:群内发 → 只看当前群;私聊发 → 全部群
+// 返回"最新在前"的数组(序号 1 = 最新)
+function filterMessagesByContext(items, message) {
+	const isInGroup = message.chat.type !== 'private';
+	let list = items;
+	if (isInGroup) {
+		const cid = String(message.chat.id);
+		list = items.filter((it) => String(it.chatId) === cid);
+	}
+	return [...list].reverse(); // 最新在前
+}
+
 // 缓存一条消息(环形,保留最近 MSG_CACHE_SIZE 条)
 async function cacheRecentMessage(env, message) {
 	if (!env.KV) return;
@@ -1852,6 +1901,8 @@ async function cacheRecentMessage(env, message) {
 		const items = await loadRecentMessages(env);
 		items.push({
 			mid: message.message_id,
+			chatId: String(message.chat.id),
+			chatTitle: message.chat.title || '',
 			text: (message.text || message.caption || '').slice(0, 500),
 			fromId: String(message.from?.id || ''),
 			fromName: [message.from?.first_name, message.from?.last_name].filter(Boolean).join(' ') || message.from?.username || '',
@@ -1892,6 +1943,9 @@ function detectAd(message) {
 		message.from?.username,
 	].filter(Boolean);
 	const fullText = textParts.join(' ').toLowerCase();
+	// 仅正文(text+caption),用于学习样本指纹比对 —— 与 /spam /learn /learnlast 学习入口口径一致,
+	// 不混入发送者用户名,保证"同一条广告不同人发"也能精确命中。
+	const bodyText = [message.text, message.caption].filter(Boolean).join(' ').toLowerCase();
 	const hits = [];
 
 	// 白名单:把白名单词从计分文本里挖掉(命中也不计分)
@@ -1914,14 +1968,23 @@ function detectAd(message) {
 		return { isAd: true, score: 99, hits: ['国际电话号'], strong: '国际电话号' };
 	}
 
-	// 强特征 3:学习样本指纹精确匹配(/spam 上报过的广告)
-	// 归一化后 完全相等 / 互为子串 即命中;太短(<6)不匹配,避免误杀
-	const normMsg = normalizeForFingerprint(fullText);
-	if (normMsg.length >= 6 && AD_SAMPLE_FINGERPRINTS.length > 0) {
+	// 强特征 3:学习样本指纹匹配(/spam /learn /learnlast 上报过的广告)
+	// 分级匹配(根因修复,防止学短广告后误杀正常人):
+	//   ① 完全相等:归一化后 ≥ SAMPLE_FP_EXACT_MIN(6)即命中 → 保留"相同广告精确秒杀"
+	//   ② 子串包含:仅当指纹和消息双方都 ≥ SAMPLE_FP_SUBSTR_MIN(16)才允许互为子串
+	//      → 短广告(<16)只能走完全相等,不会因子串炸到"碰巧含这几个字"的正常长消息
+	const normMsg = normalizeForFingerprint(bodyText);
+	if (normMsg.length >= SAMPLE_FP_EXACT_MIN && AD_SAMPLE_FINGERPRINTS.length > 0) {
 		for (const fp of AD_SAMPLE_FINGERPRINTS) {
-			if (!fp || fp.length < 6) continue;
-			if (normMsg === fp || normMsg.includes(fp) || fp.includes(normMsg)) {
-				return { isAd: true, score: 99, hits: ['学习样本匹配'], strong: '学习样本' };
+			if (!fp || fp.length < SAMPLE_FP_EXACT_MIN) continue;
+			// 完全相等:任意 ≥6 长度都判定
+			if (normMsg === fp) {
+				return { isAd: true, score: 99, hits: ['学习样本精确匹配'], strong: '学习样本(精确)' };
+			}
+			// 子串包含:双方都 ≥16 字才允许,避免短指纹误杀
+			if (normMsg.length >= SAMPLE_FP_SUBSTR_MIN && fp.length >= SAMPLE_FP_SUBSTR_MIN &&
+				(normMsg.includes(fp) || fp.includes(normMsg))) {
+				return { isAd: true, score: 99, hits: ['学习样本变体匹配'], strong: '学习样本(变体)' };
 			}
 		}
 	}
@@ -2226,20 +2289,19 @@ async function handleMessage(message, env, ctx) {
 				lines.push(`⚠️ 删除消息失败:${escapeHtml(中文)}\n   建议:${escapeHtml(建议)}`);
 			}
 
-			// 仅主人 /spam → 学习样本(指纹入库 + 自动提取关键词进词库)
+			// 仅主人 /spam → 学习样本(只写整句指纹入库,不污染词库)
 			const isOwnerSpam = OWNER_ID && String(userId) === OWNER_ID;
 			if (isOwnerSpam && env.KV) {
 				const r = message.reply_to_message;
-				const learnText = [
-					r.text, r.caption,
-					r.from?.first_name, r.from?.last_name, r.from?.username,
-				].filter(Boolean).join(' ');
+				// 指纹只取正文(text+caption),不混入用户名,保证跨发送者精确命中
+				const learnText = [r.text, r.caption].filter(Boolean).join(' ');
 				if (learnText.trim()) {
 					const learn = await learnAdSample(env, learnText);
 					const learnLines = ['', '📖 <b>已学习此广告样本</b>'];
 					learnLines.push(learn.fpAdded ? '✅ 指纹已入库(以后相同广告自动秒杀)' : 'ℹ️ 指纹已存在,未重复入库');
-					if (learn.addedKeywords.length > 0) {
-						learnLines.push(`🔑 提取关键词:${learn.addedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
+					if (learn.suggestedKeywords.length > 0) {
+						learnLines.push(`💡 建议词(不会自动入库,需手动加):${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
+						learnLines.push(`   要加进词库请发:<code>/addword general ${escapeHtml(learn.suggestedKeywords.join(' '))}</code>`);
 					}
 					learnLines.push(`📊 当前样本库共 ${learn.sampleCount} 条`);
 					lines.push(...learnLines);
@@ -2347,6 +2409,52 @@ async function handleMessage(message, env, ctx) {
 
 		const blacklist = await getBlacklist(env);
 		await sendTelegramMessage(chatId, renderBlacklist(blacklist));
+		return;
+	}
+
+	// ===== /help 主人专属帮助(展开全部隐藏指令)=====
+	// 仅主人(OWNER_ID)可用。非主人:群内静默、私聊提示权限不足,绝不泄漏隐藏指令的存在。
+	if (text && /^\/help(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		const isOwner = OWNER_ID && String(userId) === OWNER_ID;
+		if (!isOwner) {
+			// 群内完全静默(连"权限不足"都不发,避免暴露命令存在);私聊也不暴露隐藏指令
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人(OWNER_ID)使用。');
+			}
+			return;
+		}
+		// 隐藏指令仅在私聊展开(群内不回,避免其他成员看到指令清单)
+		if (isInGroup) {
+			await sendFlashMessage(chatId, 'ℹ️ 请私聊我发送 /help 查看主人专属指令。', ctx, 6000);
+			return;
+		}
+		const helpLines = [
+			'🔐 <b>主人专属隐藏指令</b>(仅 OWNER_ID 可用,其他人无任何反应)',
+			'',
+			'<b>━━ 广告词库热更新(私聊)━━</b>',
+			'<code>/importdefault</code> 一键导入推荐词库(金融/色情/引流/诈骗)',
+			'<code>/addword [分类] 词1 词2</code> 加词。分类:finance/porn/spam/fraud/general/whitelist,默认 general',
+			'<code>/delword 词1 词2</code> 从所有分类删词',
+			'<code>/listwords</code> 查看当前 KV 词库全部内容',
+			'',
+			'<b>━━ 广告样本学习(两步私聊复核)━━</b>',
+			'<code>/spam</code>(群内回复广告)主人版额外学习指纹(只入库,不污染词库)',
+			'<code>/learn 广告文本</code> 直接粘贴文字学习指纹(只入库,不踢人)',
+			'<code>/recent [N]</code> 拉取疑似广告并冻结快照,带序号推到私聊(群/私聊均可,最多50条)',
+			'<code>/learnlast 序号</code> <b>仅私聊</b>,按快照序号学指纹(只入库,不踢人)。如 /learnlast 1,3',
+			'',
+			'<b>━━ 样本库管理(私聊)━━</b>',
+			'<code>/listsamples</code> 查看已学指纹(最近50条+总数)',
+			'<code>/delsample 序号|关键词</code> 删样本',
+			'<code>/clearsamples confirm</code> 清空全部样本',
+			'',
+			'<b>━━ 说明 ━━</b>',
+			'• 以上指令对普通用户/群管理员/超级管理员<b>完全无反应</b>,只有主人能用',
+			'• 学习一律<b>只入库不踢人</b>;要踢发广告的人,用回执里给的 TGID 发 <code>/ban TGID</code>',
+			'• 学习只写整句指纹,<b>不再自动往词库加词</b>(避免误杀正常消息);建议词需你手动 /addword',
+		];
+		await sendTelegramMessage(chatId, helpLines.join('\n'));
 		return;
 	}
 
@@ -2575,9 +2683,9 @@ async function handleMessage(message, env, ctx) {
 		return;
 	}
 
-	// ===== /learn 粘贴学习 + /learnlast 缓存学习(仅主人)=====
+	// ===== /learn 粘贴学习 + /recent 看缓存 + /learnlast 按序号学(仅主人)=====
 	// 解决"GKY 已删消息无法回复 /spam"
-	if (text && /^\/(learn|learnlast)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+	if (text && /^\/(learn|learnlast|recent)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
 		const isOwner = OWNER_ID && String(userId) === OWNER_ID;
 		if (!isOwner) {
@@ -2594,7 +2702,7 @@ async function handleMessage(message, env, ctx) {
 		const head = text.trim().split(/\s+/)[0].replace(/@.*$/, '').toLowerCase();
 		const rest = text.trim().slice(text.trim().indexOf(head) + head.length).trim();
 
-		// /learn <文本> —— 主人直接粘贴广告文本学习
+		// /learn <文本> —— 主人直接粘贴广告文本学习(只学指纹入库,不踢人)
 		if (head === '/learn') {
 			if (!rest) {
 				await sendTelegramMessage(chatId, '用法:<code>/learn 广告文本</code>\n直接粘贴广告文字即可学习(不需要回复消息)。\n例:<code>/learn 世界杯红单推荐 天天收米 日赚3千</code>');
@@ -2603,8 +2711,9 @@ async function handleMessage(message, env, ctx) {
 			const learn = await learnAdSample(env, rest);
 			const lines = ['📖 <b>已学习广告样本</b>'];
 			lines.push(learn.fpAdded ? '✅ 指纹已入库(以后相同广告自动秒杀)' : 'ℹ️ 指纹已存在,未重复入库');
-			if (learn.addedKeywords.length > 0) {
-				lines.push(`🔑 提取关键词:${learn.addedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
+			if (learn.suggestedKeywords.length > 0) {
+				lines.push(`💡 建议词(不会自动入库,需手动加):${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
+				lines.push(`   要加进词库请发:<code>/addword general ${escapeHtml(learn.suggestedKeywords.join(' '))}</code>`);
 			}
 			lines.push(`📊 当前样本库共 ${learn.sampleCount} 条`);
 			await replyToAdmin(message, ctx, {
@@ -2615,39 +2724,89 @@ async function handleMessage(message, env, ctx) {
 			return;
 		}
 
-		// /learnlast [N] —— 学习最近 N 条疑似广告(被 GKY 删的也在缓存里)+ 加黑 + 全群踢
-		if (head === '/learnlast') {
-			let n = 1;
-			if (/^\d+$/.test(rest)) n = Math.max(1, Math.min(20, parseInt(rest, 10)));
-			const items = await loadRecentMessages(env);
-			if (items.length === 0) {
-				await sendTelegramMessage(chatId, 'ℹ️ 最近没有缓存到疑似广告消息。\n(只缓存含链接/@提及/长数字/长文本的群消息)');
+		// /recent [N] —— 读取疑似广告缓存并【冻结成快照】,再把带序号列表推到主人私聊
+		// 群内=当前群,私聊=全部群。冻结后 /learnlast 按这份快照的固定序号学,序号永不漂移。
+		if (head === '/recent') {
+			let n = 50;
+			if (/^\d+$/.test(rest)) n = Math.max(1, Math.min(50, parseInt(rest, 10)));
+			const all = await loadRecentMessages(env);
+			const list = filterMessagesByContext(all, message).slice(0, n); // 最新在前,最多 50 条
+			const scopeLabel = isInGroup ? '本群' : '全部群';
+			if (list.length === 0) {
+				await sendTelegramMessage(chatId, `ℹ️ ${scopeLabel}最近没有缓存到疑似广告消息。\n(只缓存含链接/@提及/长数字/长文本的群消息)`);
 				return;
 			}
-			const targets = items.slice(-n).reverse(); // 最近的在前
-			const lines = [`📖 <b>学习最近 ${targets.length} 条疑似广告</b>`, ''];
-			for (const it of targets) {
-				const learn = await learnAdSample(env, it.text);
-				lines.push(`📝 <code>${escapeHtml(it.text.slice(0, 60))}</code>`);
-				lines.push(learn.fpAdded ? '  ✅ 指纹已入库' : '  ℹ️ 指纹已存在');
-				if (learn.addedKeywords.length > 0) {
-					lines.push(`  🔑 ${learn.addedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
-				}
-				// 加黑 + 全群踢发送者
-				if (it.fromId && /^\d+$/.test(it.fromId)) {
-					await addToBlacklist(it.fromId, env, { reason: 'ad_learn', by: String(userId) });
-					const banResults = await banUserFromAllGroups(it.fromId);
-					const okCount = banResults.filter((r) => r.ok).length;
-					lines.push(`  🚫 已加黑+踢 <code>${escapeHtml(it.fromId)}</code>(${escapeHtml(it.fromName || '')})— ${okCount}/${banResults.length} 群`);
-				}
-				lines.push('');
-			}
-			lines.push('学错了?用 <code>/delsample 关键词</code> 删样本、<code>/unban TGID</code> 解封。');
+			// 冻结快照:序号 1..N 对应 list[0..N-1],/learnlast 只认这份
+			await saveLearnSnapshot(env, list, { scope: scopeLabel, byChatId: String(chatId) });
+			const lines = [`📋 <b>疑似广告快照</b>(${scopeLabel} ${list.length} 条,已冻结)`, ''];
+			list.forEach((it, i) => {
+				const who = `${escapeHtml(it.fromName || '')}(<code>${escapeHtml(it.fromId || '?')}</code>)`;
+				const grp = isInGroup ? '' : ` [${escapeHtml(it.chatTitle || it.chatId || '?')}]`;
+				lines.push(`${i + 1}. <code>${escapeHtml((it.text || '').slice(0, 50))}</code>`);
+				lines.push(`   — ${who}${grp}`);
+			});
+			lines.push('', '✅ <b>请私聊我</b>核对后学习(群内不能学习):');
+			lines.push('学指定条:<code>/learnlast 序号</code>(如 <code>/learnlast 2</code>)');
+			lines.push('学多条:<code>/learnlast 1,3</code>');
+			lines.push('⚠️ 学习只入库不踢人;要踢发广告的人请复制上面 TGID 发 <code>/ban TGID</code>');
 			await replyToAdmin(message, ctx, {
-				flashText: `📖 已学习 ${targets.length} 条`,
+				flashText: `📋 ${scopeLabel}快照 ${list.length} 条已推送私聊`,
 				detailText: lines.join('\n'),
 				isInGroup,
 			});
+			return;
+		}
+
+		// /learnlast [序号|序号列表] —— 【仅私聊】按 /recent 冻结快照的序号学习(只入库,不踢人)
+		if (head === '/learnlast') {
+			// 强制私聊:群内禁止学习(防手忙脚乱点错序号误伤),闪屏引导到私聊
+			if (isInGroup) {
+				await sendFlashMessage(chatId, '⚠️ 学习请私聊我操作。群内只能用 /recent 拉取快照。', ctx, 8000);
+				return;
+			}
+			// 从冻结快照读(不再读实时缓存,序号永不漂移)
+			const snap = await loadLearnSnapshot(env);
+			const list = snap?.items || [];
+			if (list.length === 0) {
+				await sendTelegramMessage(chatId, 'ℹ️ 没有可用的快照。\n请先在群里(或私聊)发 <code>/recent</code> 拉取疑似广告列表,再回来 <code>/learnlast 序号</code>。');
+				return;
+			}
+			// 解析序号:无参=[1];"2"=[2];"1,3"=[1,3]
+			let indices = [1];
+			if (rest) {
+				indices = rest.split(/[,，\s]+/).map((s) => parseInt(s, 10)).filter((x) => Number.isInteger(x) && x >= 1);
+				if (indices.length === 0) indices = [1];
+			}
+			indices = [...new Set(indices)].filter((x) => x <= list.length);
+			if (indices.length === 0) {
+				await sendTelegramMessage(chatId, `❌ 序号超出范围。当前快照共 ${list.length} 条,发 <code>/recent</code> 重新查看序号。`);
+				return;
+			}
+			const scopeLabel = snap?.scope || '';
+			const lines = [`📖 <b>学习 ${indices.length} 条(序号 ${indices.join(',')}${scopeLabel ? ' · ' + escapeHtml(scopeLabel) : ''})</b>`, ''];
+			const kickHints = [];
+			for (const idx of indices) {
+				const it = list[idx - 1];
+				if (!it) continue;
+				const learn = await learnAdSample(env, it.text);
+				lines.push(`${idx}. <code>${escapeHtml((it.text || '').slice(0, 60))}</code>`);
+				lines.push(learn.fpAdded ? '  ✅ 指纹已入库' : '  ℹ️ 指纹已存在');
+				if (learn.suggestedKeywords.length > 0) {
+					lines.push(`  💡 建议词:${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
+				}
+				// 只学不踢:显示发送者 TGID 供主人决定是否手动 /ban
+				if (it.fromId && /^\d+$/.test(it.fromId)) {
+					lines.push(`  👤 发送者:<code>${escapeHtml(it.fromId)}</code>(${escapeHtml(it.fromName || '')})`);
+					kickHints.push(it.fromId);
+				}
+				lines.push('');
+			}
+			if (kickHints.length > 0) {
+				lines.push(`🚫 要踢发广告的人:<code>/ban ${[...new Set(kickHints)].join(',')}</code>`);
+			}
+			lines.push('学错了?用 <code>/delsample 关键词</code> 删样本。');
+			await sendTelegramMessage(chatId, lines.join('\n'));
+			// 主人自己操作,无需再给自己发审计副本(私聊已收到上面这条);若触发者非主人已在入口被拦
 			return;
 		}
 		return;
