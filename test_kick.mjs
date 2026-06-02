@@ -2286,10 +2286,11 @@ console.log('\n[80] 发言人身份引流检测');
 	});
 	let kv = makeFakeKV([]);
 	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 名字仅含 t.me 链接但无广告词(如双向bot @xxxBot、个人频道)→ 不该误杀(关键防误杀)
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90001, is_bot: false, first_name: '频道 t.me/qewrvetrhe' }, text: 'chat 主 gpt 页 plus 已经稳了13天' } }) }), env, fakeCtxAd);
 	let bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('名字含t.me → 加黑', bl.some((e) => e.id === '90001'));
-	assert('名字含t.me → 删消息', callsOf('deleteMessage').length >= 1);
+	assert('名字仅含t.me无广告词 → 不杀(防误杀双向bot/频道)', !bl.some((e) => e.id === '90001'));
+	assert('名字仅含t.me无广告词 → 不删消息', callsOf('deleteMessage').length === 0);
 
 	// ② 名字含卡网类身份词(需先导入或默认内置)→ 直接杀
 	resetCalls();
@@ -2325,7 +2326,33 @@ console.log('\n[80] 发言人身份引流检测');
 	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', AD_CHECK_BIO: 'true', KV: kv };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90004, is_bot: false, first_name: '小明' }, text: '大家好' } }) }), env, fakeCtxAd);
 	bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('简介bio带卡网链接(开关开) → 加黑', bl.some((e) => e.id === '90004'));
+	assert('简介bio含卡网广告词(开关开) → 加黑', bl.some((e) => e.id === '90004'));
+
+	// ④b 关键防误杀:简介是双向bot/技术讨论/github(有链接@但无广告词)→ 绝不杀
+	const benignBios = {
+		'90010': '私信请联系 @meindmBot,直接私信者拉黑举报一套送走',  // 双向bot(截图19)
+		'90011': '私聊点这里 https://t.me/Sndjcbw_bot 点这',          // 双向bot链接(截图20)
+		'90012': 'github.com/someone 全栈开发,欢迎交流',              // 技术 github
+		'90013': '我的频道 t.me/my_tech_channel 分享编程',            // 个人频道
+	};
+	for (const [uid, bio] of Object.entries(benignBios)) {
+		resetCalls();
+		const kvb = makeFakeKV([]);
+		sandbox.fetch = makeFetchMock({
+			getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+			getChat: (b) => {
+				if (String(b.chat_id) === uid) return { ok: true, result: { id: Number(uid), type: 'private', bio } };
+				return { ok: true, result: { id: Number(b.chat_id), title: '群', type: 'supergroup' } };
+			},
+			banChatMember: () => ({ ok: true, result: true }),
+			deleteMessage: () => ({ ok: true, result: true }),
+			sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		});
+		const envb = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', AD_CHECK_BIO: 'true', KV: kvb };
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: Number(uid), is_bot: false, first_name: '正常用户' }, text: '现在有人用V2rayN吗' } }) }), envb, fakeCtxAd);
+		const blb = JSON.parse(kvb._store.get('blacklist') || '[]');
+		assert(`简介含链接/@bot无广告词(${uid}) → 不误杀`, !blb.some((e) => e.id === uid));
+	}
 
 	// ⑤ AD_CHECK_BIO 显式关闭:有同样bio也不查不杀
 	resetCalls();
