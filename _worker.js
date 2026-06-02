@@ -71,10 +71,6 @@ const DEFAULT_OWNER_ID = '';
 const DEFAULT_AD_FILTER_ENABLED = false;
 //    评分阈值:各维度加权分总和 ≥ 阈值即判广告(强特征绕过评分直接判定)
 const DEFAULT_AD_SCORE_THRESHOLD = 3;
-//    是否检测发言人 bio(getChat 拉简介,命中网址/t.me/卡网等引流特征即处置)。
-//    默认开启;带 KV 缓存,同一用户短期不重复查,降低 API 成本。
-//    限制:Telegram 只返回公开 username 或与 bot 交互过用户的 bio,陌生人 bio 可能拿不到(尽力而为)。
-const DEFAULT_AD_CHECK_BIO = true;
 //    分类词库默认留空(隐私:GitHub 代码零敏感词)。词库改存 KV,用主人命令热更新:
 //    /importdefault 一键导入推荐词库 | /addword 加词 | /delword 删词 | /listwords 查看
 //    命中加权:金融+2 / 色情+2 / 引流+1 / 诈骗+2
@@ -90,25 +86,19 @@ const DEFAULT_AD_KEYWORDS_FRAUD = [];
 // 推荐广告词库种子(字符串拆分写法,避免 GitHub 公开仓库出现完整敏感词)
 // 仅在主人执行 /importdefault 时一次性写入 KV,不默认生效
 const RECOMMENDED_AD_KEYWORDS = {
-	finance: ['us' + 'dt', 'u' + '商', '承' + '兑', '刷' + '单', '日' + '入', '出' + 'u', '接' + 'u', '搬' + '砖', '套' + '利', '包' + '网', '跑' + '分', '水' + '房', '料' + '子', '价格' + '拉满'],
-	porn: ['约' + '炮', '萝' + '莉', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '资源' + '群', '萝' + '控'],
-	spam: ['加' + '我', '加' + '微', '加' + 'v', '私' + '聊', '进' + '群', '拉' + '你', '详情' + '看', 'dd' + '我', '添加' + '好友', '发送' + '信息'],
-	fraud: ['假' + '钞', '假' + '币', '高' + '仿', '办' + '证', '代开' + '发票', '黑客' + '接单', '改' + '分', '网' + '赚', '菠' + '菜', '交流' + '群'],
-	// identity:只用于检测发言人"名字/简介",不碰正文。卖号/接码/卡网/色情/赌博露骨话术。
+	finance: ['us' + 'dt', 'u' + '商', '承' + '兑', '刷' + '单', '日' + '入', '出' + 'u', '接' + 'u', '搬' + '砖', '套' + '利', '包' + '网', '跑' + '分', '水' + '房', '料' + '子'],
+	porn: ['约' + '炮', '萝' + '莉', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '萝' + '控'],
+	spam: [],
+	fraud: ['假' + '钞', '假' + '币', '代开' + '发票', '黑客' + '接单', '网' + '赚', '菠' + '菜'],
+	// identity:只用于检测发言人"名字/简介",不碰正文。色情/赌博露骨话术。
 	//   注意:只放正常用户绝不会用的露骨词,不放链接/@/域名(那些会误杀双向bot/技术讨论)。
-	identity: ['卡' + '网', '发' + '卡', '代' + '充', '号' + '商', '出' + '号', '卖' + '号', '收' + '号',
-		'批发' + '号', '车' + '队', '上' + '车', '接' + '码', '接码' + '平台', '自助' + '下单',
-		'低价' + '充', '账号' + '出售', '成' + '品号', '老' + '号', '直' + '登号',
-		'出租' + '淫妻', '淫' + '妻', '性' + '奴', '约' + '炮', '裸' + '聊', '楼' + '凤',
-		'上门' + '服务', '特殊' + '服务', '援' + '交', '菠' + '菜', '博' + '彩', '六' + '合彩', '网' + '赌'],
+	identity: ['出租' + '淫妻', '淫' + '妻', '性' + '奴', '约' + '炮', '裸' + '聊', '楼' + '凤',
+		'小' + '姐', '上门' + '服务', '特殊' + '服务', '援' + '交', '菠' + '菜', '博' + '彩',
+		'赌' + '场', '六' + '合彩', '时时' + '彩', '网' + '赌'],
 };
 
 // 广告词库 KV key
 const AD_KW_KEY = 'ad_keywords_custom';
-// 用户 bio 缓存 KV key 前缀(每个用户单独一条,带过期)。降低 getChat 调用频率。
-const BIO_CACHE_PREFIX = 'bio_cache_';
-// bio 缓存有效期(秒)。同一用户此时间内不重复调 getChat。
-const BIO_CACHE_TTL = 6 * 3600;
 // 广告学习样本(指纹)KV key
 const AD_SAMPLES_KEY = 'ad_samples';
 // 最近消息缓存 KV key(供 /learnlast 学习被 GKY 删掉的广告)
@@ -124,9 +114,6 @@ const DEFAULT_MSG_CACHE_SIZE = 50;
 // 学习样本指纹匹配阈值(根因修复:防止学短广告后误杀正常人)
 //   完全相等:归一化后 ≥ 此长度即允许"精确秒杀"(保留"相同广告一定抓"的能力)
 const SAMPLE_FP_EXACT_MIN = 6;
-//   子串包含:只有指纹和消息双方都 ≥ 此长度,才允许互为子串判定为广告。
-//   短广告(<16字)只能走完全相等,绝不会因子串包含炸到含这几个字的正常长消息。
-const SAMPLE_FP_SUBSTR_MIN = 16;
 
 // ===== 链接识别(区分正常链接 vs 广告链接,防止链接误判)=====
 // 正常域名白名单 KV key(主人可用 /addword whitelist <域名> 热更新)
@@ -144,26 +131,12 @@ const DEFAULT_URL_WHITELIST = [
 	'bilibili.com', 'zhihu.com', 'juejin.cn', 'csdn.net', 'segmentfault.com',
 ];
 // 可疑域名:命中这些(短链 / 群组邀请类)单独加分,因为常被广告用来藏落地页。
-// 注意:t.me/+ 邀请链接已由"强特征1"单独直杀,这里只覆盖短链等。
-const SUSPICIOUS_URL_DOMAINS = [
-	'bit.ly', 'tinyurl.com', 'is.gd', 't.cn', 'dwz.cn', 'suo.yt',
-	'cutt.ly', 'rebrand.ly', 's.id', 'v.gd', 'shorturl.at', 'b23.tv',
-];
+const SUSPICIOUS_URL_DOMAINS = [];
 
-// 身份广告词:只用于检测"发言人名字/简介"(不碰消息正文),命中即判广告。
-// 【判定唯一依据】正常用户名字/简介不会出现这些露骨词;链接/@bot/域名一律不算广告(防误杀)。
-// 主人可用 /addword identity <词> 热更新追加(走 KV 的 identity 分类)。
-const DEFAULT_IDENTITY_SPAM_WORDS = [
-	// 卖号/卡网/接码类
-	'卡' + '网', '发' + '卡', '代' + '充', '自助' + '下单', '低价' + '充', '号' + '商',
-	'出' + '号', '卖' + '号', '收' + '号', '批' + '发号', '车' + '队', '上' + '车', '接' + '码',
-	// 色情类(露骨,正常简介不会有)
-	'出租' + '淫妻', '淫' + '妻', '性' + '奴', '约' + '炮', '裸' + '聊', '一夜' + '情',
-	'楼' + '凤', '小' + '姐', '上门' + '服务', '特殊' + '服务', '援' + '交',
-	// 赌博类
-	'菠' + '菜', '博' + '彩', '赌' + '场', '六' + '合彩', '时时' + '彩', '网' + '赌',
-];
-// 运行期身份广告词(内置 + KV 热更新合并)
+// 身份广告词:通过 /importdefault 或 /addword identity 写入 KV 管理。
+// GitHub 代码零明文敏感词,所有词库由部署者自行导入。
+const DEFAULT_IDENTITY_SPAM_WORDS = [];
+// 运行期身份广告词(KV 热更新加载)
 let IDENTITY_SPAM_WORDS = [...DEFAULT_IDENTITY_SPAM_WORDS];
 
 // 关键词提取停用词表(过滤常见无害中文4字组,避免误学成广告词)
@@ -195,7 +168,6 @@ let OWNER_ID = '';
 // 广告检测运行期配置
 let AD_FILTER_ENABLED = false;
 let AD_SCORE_THRESHOLD = 3;
-let AD_CHECK_BIO = false;
 let AD_KEYWORDS = [];          // 环境变量追加的自定义广告词
 let AD_WHITELIST = [];         // 白名单词(命中不计分)
 let AD_KEYWORDS_FINANCE = [];
@@ -233,7 +205,6 @@ export default {
 			OWNER_ID = config.OWNER_ID;
 			AD_FILTER_ENABLED = config.AD_FILTER_ENABLED;
 			AD_SCORE_THRESHOLD = config.AD_SCORE_THRESHOLD;
-			AD_CHECK_BIO = config.AD_CHECK_BIO;
 			AD_KEYWORDS = config.AD_KEYWORDS;
 			AD_WHITELIST = config.AD_WHITELIST;
 			AD_KEYWORDS_FINANCE = config.AD_KEYWORDS_FINANCE;
@@ -410,7 +381,6 @@ function loadRequiredConfig(env) {
 		const n = parseInt(String(env.AD_SCORE_THRESHOLD).trim(), 10);
 		if (Number.isInteger(n) && n > 0) adScoreThreshold = n;
 	}
-	const adCheckBio = parseBool(env.AD_CHECK_BIO, DEFAULT_AD_CHECK_BIO);
 	const adKeywords = parseList(env.AD_KEYWORDS);     // 环境变量追加
 	const adWhitelist = parseList(env.AD_WHITELIST);
 	// 消息缓存配置
@@ -432,7 +402,6 @@ function loadRequiredConfig(env) {
 		OWNER_ID: ownerId,
 		AD_FILTER_ENABLED: adFilterEnabled,
 		AD_SCORE_THRESHOLD: adScoreThreshold,
-		AD_CHECK_BIO: adCheckBio,
 		AD_KEYWORDS: adKeywords,
 		AD_WHITELIST: adWhitelist,
 		AD_KEYWORDS_FINANCE: lower(DEFAULT_AD_KEYWORDS_FINANCE),
@@ -2078,41 +2047,6 @@ function detectIdentitySpam(identityText) {
 	return hits;
 }
 
-// 拉取某用户的简介 bio(用 getChat),带 KV 缓存降低 API 频率。拿不到/失败返回空字符串,不报错。
-// Telegram 限制:只有公开 username 用户或与 bot 交互过的用户能拿到 bio,纯陌生人可能为空。
-// 缓存:同一用户 BIO_CACHE_TTL(默认6h)内不重复调 getChat;命中(含空 bio)都缓存,避免反复打。
-async function getUserBio(userId, env) {
-	const cacheKey = `${BIO_CACHE_PREFIX}${userId}`;
-	// 先查缓存
-	if (env?.KV) {
-		try {
-			const cached = await env.KV.get(cacheKey);
-			if (cached !== null) return cached; // 空字符串也是有效缓存(代表"查过,无bio")
-		} catch (_) {}
-	}
-	let bio = '';
-	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChat`;
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ chat_id: userId }),
-		});
-		const result = await response.json();
-		if (response.ok && result.ok && result.result) {
-			bio = String(result.result.bio || '');
-		}
-	} catch (error) {
-		console.error('[bio检测] getChat 失败:', error);
-	}
-	// 写缓存(带过期)
-	if (env?.KV) {
-		try {
-			await env.KV.put(cacheKey, bio, { expirationTtl: BIO_CACHE_TTL });
-		} catch (_) {}
-	}
-	return bio;
-}
 
 // 广告检测(多维度评分 + 强特征直杀)
 // 返回 { isAd, score, hits: string[], strong: string|null }
@@ -2154,58 +2088,16 @@ async function detectAd(message, env) {
 	if (nameHits.length > 0) {
 		return { isAd: true, score: 99, hits: ['发言人名字引流:' + nameHits.join('/')], strong: '发言人名字含广告' };
 	}
-	// 简介 bio 检测(仅 AD_CHECK_BIO 开启时,getChat 拉 bio,带 KV 缓存;拿不到不报错)
-	if (AD_CHECK_BIO && message.from?.id) {
-		const bio = await getUserBio(message.from.id, env);
-		const bioHits = detectIdentitySpam(bio);
-		if (bioHits.length > 0) {
-			console.log(`[bio检测] 命中 用户=${message.from.id} 特征=${bioHits.join('/')} bio预览=${bio.slice(0, 60)}`);
-			return { isAd: true, score: 99, hits: ['发言人简介引流:' + bioHits.join('/')], strong: '发言人简介含广告' };
-		}
-	}
 
-	// 强特征 1:t.me / telegram.me 私有群邀请链接
-	const inviteLink = /t\.me\/\+|t\.me\/joinchat\/|telegram\.me\/\+/i;
-	if (inviteLink.test(fullText) || urls.some((u) => inviteLink.test(u))) {
-		return { isAd: true, score: 99, hits: ['t.me邀请链接'], strong: 't.me邀请链接' };
-	}
 
-	// 强特征 2:国际电话号(+国家码 区号 号码)。fullText 已含名片电话。
-	//   只认带 + 的国际号,且排除 +86 中国号,避免误杀正常分享的本地号码名片。
-	//   用 matchAll 取出所有候选号,只要存在一个非 +86 的才判广告。
-	const phonePattern = /\+\d{1,3}[\s-]?\d{2,4}[\s-]?\d{3,4}[\s-]?\d{2,4}/g;
-	let isIntlPhone = false;
-	for (const m of fullText.matchAll(phonePattern)) {
-		const digits = m[0].replace(/[^\d+]/g, '');
-		if (!digits.startsWith('+86')) { isIntlPhone = true; break; }
-	}
-	if (isIntlPhone) {
-		return { isAd: true, score: 99, hits: ['国际电话号'], strong: '国际电话号' };
-	}
-
-	// 强特征 3:学习样本指纹匹配(/spam /learn /learnlast 上报过的广告)
-	// 分级匹配(根因修复,防止学短广告后误杀正常人):
-	//   ① 完全相等:归一化后 ≥ SAMPLE_FP_EXACT_MIN(6)即命中 → 保留"相同广告精确秒杀"
-	//   ② 子串包含:仅当指纹和消息双方都 ≥ SAMPLE_FP_SUBSTR_MIN(16)才允许互为子串
-	//      → 短广告(<16)只能走完全相等,不会因子串炸到"碰巧含这几个字"的正常长消息
-	// 链接防误判:消息本身是【纯白名单链接】时跳过样本匹配(github 等正常链接绝不因学过的样本被杀);
-	//   含 URL 的指纹/消息只允许【完全相等】命中,关闭子串,防止同域名前缀连带误杀
-	//   (如学过 github.com/abc 后,github.com/abc/x 不会被子串命中)。
+	// 强特征 1:学习样本指纹精确匹配(/spam /learn /learnlast 上报过的广告)
+	//   归一化后完全相等才命中,不做子串包含(避免误杀正常长消息)
 	const normMsg = normalizeForFingerprint(bodyText);
-	const msgHasUrl = urls.length > 0;
 	if (!urlsAllWhite && normMsg.length >= SAMPLE_FP_EXACT_MIN && AD_SAMPLE_FINGERPRINTS.length > 0) {
 		for (const fp of AD_SAMPLE_FINGERPRINTS) {
 			if (!fp || fp.length < SAMPLE_FP_EXACT_MIN) continue;
-			// 完全相等:任意 ≥6 长度都判定
 			if (normMsg === fp) {
 				return { isAd: true, score: 99, hits: ['学习样本精确匹配'], strong: '学习样本(精确)' };
-			}
-			// 子串包含:双方都 ≥16 字才允许;且消息或指纹任一含 URL 时禁用子串(只认完全相等)
-			const fpHasUrl = fp.includes('http');
-			if (!msgHasUrl && !fpHasUrl &&
-				normMsg.length >= SAMPLE_FP_SUBSTR_MIN && fp.length >= SAMPLE_FP_SUBSTR_MIN &&
-				(normMsg.includes(fp) || fp.includes(normMsg))) {
-				return { isAd: true, score: 99, hits: ['学习样本变体匹配'], strong: '学习样本(变体)' };
 			}
 		}
 	}

@@ -1127,30 +1127,6 @@ const adMsg = (over = {}) => ({
 });
 const fakeCtxAd = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 
-// ---------- [28] 强特征 t.me/+ 邀请链接 → 删黑踢 ----------
-console.log('\n[28] 强特征 t.me 邀请链接');
-{
-	resetCalls();
-	sandbox.fetch = adFetchMock();
-	const env = adEnv();
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '进群看资源 https://t.me/+VvUVmr4ON8A4MjU9' })) }), env, fakeCtxAd);
-	assert('t.me邀请链接 → 删消息', callsOf('deleteMessage').length >= 1);
-	assert('t.me邀请链接 → 全群踢(2群)', callsOf('banChatMember').length === 2);
-	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
-	assert('t.me邀请链接 → 加黑 reason=ad_auto', bl.some((e) => e.id === '88001' && e.reason === 'ad_auto'));
-}
-
-// ---------- [29] 强特征 国际电话号 → 删黑踢 ----------
-console.log('\n[29] 强特征 国际电话号');
-{
-	resetCalls();
-	sandbox.fetch = adFetchMock();
-	const env = adEnv();
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '假钞交流群 快递面交都可 +1 484 842 6117' })) }), env, fakeCtxAd);
-	assert('电话号 → 删消息', callsOf('deleteMessage').length >= 1);
-	assert('电话号 → 全群踢', callsOf('banChatMember').length === 2);
-}
-
 // ---------- [30] 金融广告评分达阈值 ----------
 console.log('\n[30] 金融广告评分(出u+承兑)');
 {
@@ -1517,28 +1493,6 @@ console.log('\n[49] 加空格标点变体仍命中');
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
 	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
 	assert('加空格标点变体 → 归一化后命中', bl.some((e) => e.id === '88103'));
-}
-
-// ---------- [50] 含广告的更长消息 → 子串匹配 ----------
-console.log('\n[50] 子串匹配');
-{
-	resetCalls();
-	sandbox.fetch = makeFetchMock({
-		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
-		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
-		banChatMember: () => ({ ok: true, result: true }),
-		deleteMessage: () => ({ ok: true, result: true }),
-		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
-	});
-	const kv = makeFakeKV([]);
-	// 指纹必须 ≥16 归一化字符才允许子串匹配(根因修复:短指纹只走精确相等,防误杀)
-	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('专业承兑出u日入过万快来咨询加微')], count: 1 }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
-	// 广告嵌进更长的消息(指纹和消息都 ≥16 字)
-	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88104, is_bot: false }, text: '大家好我这里专业承兑出u日入过万快来咨询加微有需要的私聊' } };
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('长广告(≥16)含于更长消息 → 子串命中', bl.some((e) => e.id === '88104'));
 }
 
 // ---------- [51] 太短消息(<6)不触发指纹,防误杀 ----------
@@ -1935,27 +1889,6 @@ console.log('\n[69] URL 样本不子串扩散');
 	assert('完全相同的广告链接 → 仍精确命中加黑', bl.some((e) => e.id === '88302'));
 }
 
-// ---------- [70] 可疑短链 + 广告词 → 加分判定 ----------
-console.log('\n[70] 可疑短链加分');
-{
-	resetCalls();
-	sandbox.fetch = makeFetchMock({
-		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
-		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
-		banChatMember: () => ({ ok: true, result: true }),
-		deleteMessage: () => ({ ok: true, result: true }),
-		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
-	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
-	// 可疑短链(+2) + 一个引流词(+1)= 3 ≥ 阈值
-	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88303, is_bot: false }, text: '加我 https://bit.ly/xyz123', entities: [{ type: 'url', offset: 3, length: 21 }] } };
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('可疑短链+引流词 → 判广告加黑', bl.some((e) => e.id === '88303'));
-}
-
 // ---------- [71] /addword whitelist 加域名 → 该域名链接放行 ----------
 console.log('\n[71] 域名白名单热更新');
 {
@@ -1981,31 +1914,6 @@ console.log('\n[71] 域名白名单热更新');
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
 	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
 	assert('白名单域名链接 → 不被杀(即便等于样本)', !bl.some((e) => e.id === '88304'));
-}
-
-// ---------- [72] 名片广告(含国际电话号)→ 强特征直杀 ----------
-console.log('\n[72] 名片广告国际电话直杀');
-{
-	resetCalls();
-	sandbox.fetch = makeFetchMock({
-		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
-		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
-		banChatMember: () => ({ ok: true, result: true }),
-		deleteMessage: () => ({ ok: true, result: true }),
-		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
-	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
-	// 复现截图:名片显示名"假钞交流群",电话 +1 870 337 4069,无 text
-	const update = { message: {
-		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88400, is_bot: false, first_name: 'Ahsvs' },
-		contact: { phone_number: '+1 870 337 4069', first_name: '假钞交流群', vcard: '' },
-	} };
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('名片国际电话 → 加黑', bl.some((e) => e.id === '88400'));
-	assert('名片国际电话 → 全群踢(2群)', callsOf('banChatMember').length === 2);
-	assert('名片国际电话 → 删消息', callsOf('deleteMessage').length >= 1);
 }
 
 // ---------- [73] 名片广告(本地号+敏感词)→ 词库+名片分叠加判定 ----------
@@ -2292,13 +2200,14 @@ console.log('\n[80] 发言人身份引流检测');
 	assert('名字仅含t.me无广告词 → 不杀(防误杀双向bot/频道)', !bl.some((e) => e.id === '90001'));
 	assert('名字仅含t.me无广告词 → 不删消息', callsOf('deleteMessage').length === 0);
 
-	// ② 名字含卡网类身份词(需先导入或默认内置)→ 直接杀
+	// ② 名字含色情/赌博类身份词 → 直接杀
 	resetCalls();
 	kv = makeFakeKV([]);
+	kv._store.set('ad_keywords_custom', JSON.stringify({ identity: ['约炮', '裸聊'] }));
 	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90002, is_bot: false, first_name: 'GPT账号车队上车' }, text: '正常发言内容' } }) }), env, fakeCtxAd);
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90002, is_bot: false, first_name: '约炮资源裸聊' }, text: '正常发言内容' } }) }), env, fakeCtxAd);
 	bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('名字含身份广告词(车队) → 加黑', bl.some((e) => e.id === '90002'));
+	assert('名字含身份广告词(约炮) → 加黑', bl.some((e) => e.id === '90002'));
 
 	// ③ 正常名字 + 正文聊 chatgpt/发t.me链接 → 不杀(关键防误杀:不碰正文)
 	resetCalls();
@@ -2308,99 +2217,11 @@ console.log('\n[80] 发言人身份引流检测');
 	bl = JSON.parse(kv._store.get('blacklist') || '[]');
 	assert('正常名字+正文聊chatgpt发链接 → 不杀(不碰正文)', !bl.some((e) => e.id === '90003'));
 	assert('正常名字+正文 → 不删消息', callsOf('deleteMessage').length === 0);
-
-	// ④ AD_CHECK_BIO 开启:名字正常但简介bio带卡网 → 杀
-	resetCalls();
-	kv = makeFakeKV([]);
-	sandbox.fetch = makeFetchMock({
-		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
-		getChat: (b) => {
-			// 查的是发言人 90004 的 bio
-			if (String(b.chat_id) === '90004') return { ok: true, result: { id: 90004, type: 'private', bio: '卡网:https://pay.ldxp.cn/shop/x 频道:t.me/abc' } };
-			return { ok: true, result: { id: Number(b.chat_id), title: '群', type: 'supergroup' } };
-		},
-		banChatMember: () => ({ ok: true, result: true }),
-		deleteMessage: () => ({ ok: true, result: true }),
-		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
-	});
-	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', AD_CHECK_BIO: 'true', KV: kv };
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90004, is_bot: false, first_name: '小明' }, text: '大家好' } }) }), env, fakeCtxAd);
-	bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('简介bio含卡网广告词(开关开) → 加黑', bl.some((e) => e.id === '90004'));
-
-	// ④b 关键防误杀:简介是双向bot/技术讨论/github(有链接@但无广告词)→ 绝不杀
-	const benignBios = {
-		'90010': '私信请联系 @meindmBot,直接私信者拉黑举报一套送走',  // 双向bot(截图19)
-		'90011': '私聊点这里 https://t.me/Sndjcbw_bot 点这',          // 双向bot链接(截图20)
-		'90012': 'github.com/someone 全栈开发,欢迎交流',              // 技术 github
-		'90013': '我的频道 t.me/my_tech_channel 分享编程',            // 个人频道
-	};
-	for (const [uid, bio] of Object.entries(benignBios)) {
-		resetCalls();
-		const kvb = makeFakeKV([]);
-		sandbox.fetch = makeFetchMock({
-			getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
-			getChat: (b) => {
-				if (String(b.chat_id) === uid) return { ok: true, result: { id: Number(uid), type: 'private', bio } };
-				return { ok: true, result: { id: Number(b.chat_id), title: '群', type: 'supergroup' } };
-			},
-			banChatMember: () => ({ ok: true, result: true }),
-			deleteMessage: () => ({ ok: true, result: true }),
-			sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
-		});
-		const envb = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', AD_CHECK_BIO: 'true', KV: kvb };
-		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: Number(uid), is_bot: false, first_name: '正常用户' }, text: '现在有人用V2rayN吗' } }) }), envb, fakeCtxAd);
-		const blb = JSON.parse(kvb._store.get('blacklist') || '[]');
-		assert(`简介含链接/@bot无广告词(${uid}) → 不误杀`, !blb.some((e) => e.id === uid));
-	}
-
-	// ⑤ AD_CHECK_BIO 显式关闭:有同样bio也不查不杀
-	resetCalls();
-	kv = makeFakeKV([]);
-	sandbox.fetch = makeFetchMock({
-		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
-		getChat: (b) => {
-			if (String(b.chat_id) === '90005') return { ok: true, result: { id: 90005, type: 'private', bio: '卡网 t.me/abc' } };
-			return { ok: true, result: { id: Number(b.chat_id), title: '群', type: 'supergroup' } };
-		},
-		banChatMember: () => ({ ok: true, result: true }),
-		deleteMessage: () => ({ ok: true, result: true }),
-		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
-	});
-	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', AD_CHECK_BIO: 'false', KV: kv };
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90005, is_bot: false, first_name: '小红' }, text: '大家好' } }) }), env, fakeCtxAd);
-	bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('AD_CHECK_BIO=false → 不查bio即便bio是广告也不杀', !bl.some((e) => e.id === '90005'));
 }
 
-// ---------- [81] bio缓存 + 默认开启 + identity词库导入 ----------
-console.log('\n[81] bio缓存/默认开启/词库导入');
+// ---------- [81] identity词库导入 ----------
+console.log('\n[81] identity词库导入');
 {
-	// ① bio 缓存:同一用户第二条消息不再重复调 getChat
-	resetCalls();
-	let getChatCount = 0;
-	const kv = makeFakeKV([]);
-	sandbox.fetch = async function (url, init) {
-		const u = String(url);
-		if (u.includes('api.telegram.org')) {
-			const method = u.split('/').pop();
-			const body = init && init.body ? JSON.parse(init.body) : null;
-			apiCalls.push({ method, body });
-			if (method === 'getChatAdministrators') return { ok: true, status: 200, async json() { return { ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }; } };
-			if (method === 'getChat') {
-				if (body && String(body.chat_id) === '91001') { getChatCount++; return { ok: true, status: 200, async json() { return { ok: true, result: { id: 91001, type: 'private', bio: '正常简介无广告' } }; } }; }
-				return { ok: true, status: 200, async json() { return { ok: true, result: { id: Number(body.chat_id), title: '群' } }; } };
-			}
-			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
-		}
-		throw new Error('Unexpected fetch: ' + u);
-	};
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', AD_CHECK_BIO: 'true', KV: kv };
-	const mk = (mid) => ({ message: { message_id: mid, chat: { id: -1001, type: 'supergroup' }, from: { id: 91001, is_bot: false, first_name: '正常人' }, text: '发言' + mid } });
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(mk(1)) }), env, fakeCtxAd);
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(mk(2)) }), env, fakeCtxAd);
-	assert('bio缓存 → 同一用户第二条不重复调getChat(只1次)', getChatCount === 1);
-
 	// ② identity 词库 importdefault 导入
 	resetCalls();
 	const kv2 = makeFakeKV([]);
