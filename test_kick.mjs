@@ -2169,6 +2169,58 @@ console.log('\n[77] 一键代发回查解封结果');
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cbUpdate2) }), env2);
 	const opDms2 = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
 	assert('GKY仍有记录 → 提示稍后 /check 复查', opDms2.some((c) => c.body.text.includes('/check')));
+	assert('回查提示带具体 TGID(可复制)', opDms2.some((c) => c.body.text.includes('/check 55555')));
+}
+
+// ---------- [78] /check TGID 私聊直查 ----------
+console.log('\n[78] /check TGID 私聊直查');
+{
+	// 自定义 fetch:管理员鉴权 + GKY 端点
+	function makeCheckFetch(banlistText, adminIds) {
+		return async function (url, init) {
+			const u = String(url);
+			if (u.includes('api.telegram.org')) {
+				const method = u.split('/').pop();
+				const body = init && init.body ? JSON.parse(init.body) : null;
+				apiCalls.push({ method, body });
+				if (method === 'getChatAdministrators') {
+					return { ok: true, status: 200, async json() { return { ok: true, result: adminIds.map((id) => ({ user: { id }, status: 'administrator' })) }; } };
+				}
+				if (method === 'getChatMember') {
+					return { ok: true, status: 200, async json() { return { ok: true, result: { user: { id: 993005028, first_name: 'DB' }, status: 'member' } }; } };
+				}
+				return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
+			}
+			if (u.includes('banlist')) {
+				return { ok: true, status: 200, async text() { return banlistText; } };
+			}
+			throw new Error('Unexpected fetch: ' + u);
+		};
+	}
+
+	// ① 主人私聊 /check 993005028 → 返回查询结果(无记录)
+	resetCalls();
+	sandbox.fetch = makeCheckFetch('This TG account has no ban record', [999]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', SUPER_ADMINS: '999', KV: makeFakeKV([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/check 993005028' } }) }), env, fakeCtxAd);
+	let dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
+	assert('私聊 /check TGID → 有响应', dm.length > 0);
+	assert('私聊 /check TGID → 返回查询结果', dm.some((c) => c.body.text.includes('993005028')));
+	assert('私聊 /check TGID → 含"没有封禁记录"', dm.some((c) => c.body.text.includes('没有封禁记录')));
+
+	// ② 非管理员私聊 /check TGID → 权限不足
+	resetCalls();
+	sandbox.fetch = makeCheckFetch('This TG account has no ban record', [999]); // 5555 不在 admin
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: 5555, type: 'private' }, from: { id: 5555, is_bot: false }, text: '/check 993005028' } }) }), env, fakeCtxAd);
+	dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '5555');
+	assert('非管理员私聊 /check TGID → 权限不足', dm.some((c) => c.body.text.includes('权限不足')));
+
+	// ③ 私聊 /check 无参数 → 提示正确用法
+	resetCalls();
+	sandbox.fetch = makeCheckFetch('This TG account has no ban record', [999]);
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 3, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/check' } }) }), env, fakeCtxAd);
+	dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
+	assert('私聊 /check 无参数 → 提示用 /check TGID', dm.some((c) => c.body.text.includes('/check TGID')));
 }
 
 // ---------- 总结 ----------

@@ -468,7 +468,7 @@ async function handleInitialization(request) {
 				{ command: "unban", description: "开始自助解封" },
 				{ command: "ban", description: "添加用户到黑名单 (管理员)" },
 				{ command: "spam", description: "回复消息添加用户到黑名单 (管理员)" },
-				{ command: "check", description: "回复消息查询封禁状态 (管理员)" },
+				{ command: "check", description: "查询封禁状态:回复消息 或 /check TGID (管理员)" },
 				{ command: "blacklist", description: "查看当前黑名单 (管理员)" }
 			]
 		};
@@ -2220,13 +2220,14 @@ async function editMessageReplyMarkup(chatId, messageId, replyMarkup) {
 //   cleared=false → 仍有记录(GKY 可能还在处理)或查询失败,提示稍后 /check 复查
 async function verifyUnbanResult(tgid, targetLabel) {
 	const who = targetLabel || `<code>${escapeHtml(String(tgid))}</code>`;
+	const recheckHint = `请稍后用 <code>/check ${escapeHtml(String(tgid))}</code> 复查(私聊我直接发即可)。`;
 	try {
 		const raw = await handleBanlist(String(tgid));
 		const data = JSON.parse(raw);
 		if (!data.success) {
 			return {
 				cleared: false,
-				text: `⚠️ <b>解封结果待确认</b>\n👤 用户:${who}\n查询暂时失败(${escapeHtml(data.error || '未知')})。\n请稍后用 <code>/check</code> 复查。`,
+				text: `⚠️ <b>解封结果待确认</b>\n👤 用户:${who}\n查询暂时失败(${escapeHtml(data.error || '未知')})。\n${recheckHint}`,
 			};
 		}
 		if (!data.banned) {
@@ -2238,13 +2239,13 @@ async function verifyUnbanResult(tgid, targetLabel) {
 		// 仍有记录:GKY 可能还没处理完,给兜底复查提示
 		let line = `⚠️ <b>仍显示有封禁记录</b>\n👤 用户:${who}\nTGID:<code>${escapeHtml(String(tgid))}</code>\n`;
 		if (data.reason) line += `封禁原因:${escapeHtml(String(data.reason))}\n`;
-		line += `\nGKY 可能仍在处理,请过几秒用 <code>/check</code> 复查确认。`;
+		line += `\nGKY 可能仍在处理,${recheckHint}`;
 		return { cleared: false, text: line };
 	} catch (error) {
 		console.error('[解封回查] 失败:', error);
 		return {
 			cleared: false,
-			text: `⚠️ <b>解封结果待确认</b>\n👤 用户:${who}\n回查异常,请稍后用 <code>/check</code> 复查。`,
+			text: `⚠️ <b>解封结果待确认</b>\n👤 用户:${who}\n回查异常,${recheckHint}`,
 		};
 	}
 }
@@ -2526,20 +2527,48 @@ async function handleMessage(message, env, ctx) {
 		return;
 	}
 
-	// 处理配置群组内管理员回复 /check - 查询被回复用户封禁状态
+	// 处理 /check 命令查询封禁状态。两种用法:
+	//   ① 群内回复某条消息发 /check —— 查被回复用户(原有)
+	//   ② /check <TGID> —— 私聊或群内带参数直接查指定 TGID(新增,配合一键代发回查复查)
 	if (isCheckCommand(text)) {
-		if (!isConfiguredGroup(chatId)) {
+		// 解析参数:/check 后面跟的纯数字 TGID
+		const checkArg = text.trim().replace(/^\/check(?:@[^\s]+)?\s*/i, '').trim();
+		const hasTgidArg = /^\d+$/.test(checkArg);
+
+		// 鉴权:必须是任一配置群管理员(私聊也能用,checkIfUserIsAdmin 与当前 chatId 无关)
+		const isAdmin = await checkIfUserIsAdmin(userId);
+
+		if (hasTgidArg) {
+			// 带 TGID 参数:私聊 / 群内均可
+			if (!isAdmin) {
+				if (message.chat.type === 'private') {
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+				}
+				return;
+			}
+			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${escapeHtml(checkArg)}</code> 的封禁状态...`);
+			const response = await buildBanlistCheckResponse(checkArg, {
+				includeReviewAction: true,
+				actionInCurrentChat: isConfiguredGroup(chatId),
+			});
+			await sendTelegramMessage(chatId, response.text, response.replyMarkup);
 			return;
 		}
 
-		const isAdmin = await checkIfUserIsAdmin(userId);
+		// 无参数:沿用原"群内回复消息"用法
+		if (!isConfiguredGroup(chatId)) {
+			// 私聊无参数 → 提示正确用法
+			if (message.chat.type === 'private') {
+				await sendTelegramMessage(chatId, 'ℹ️ 私聊查询请用:<code>/check TGID</code>\n例:<code>/check 993005028</code>\n群内可回复某条消息发 <code>/check</code> 查该用户。');
+			}
+			return;
+		}
 		if (!isAdmin) {
 			return;
 		}
-
 		const repliedUser = message.reply_to_message?.from;
 		if (!repliedUser?.id) {
-			await sendTelegramMessage(chatId, '❌ 请回复要查询封禁状态的用户消息后再发送 <code>/check</code>');
+			await sendTelegramMessage(chatId, '❌ 请回复要查询封禁状态的用户消息后再发送 <code>/check</code>，或用 <code>/check TGID</code> 直接查。');
 			return;
 		}
 
