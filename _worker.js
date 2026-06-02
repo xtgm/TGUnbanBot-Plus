@@ -2408,6 +2408,22 @@ async function handleMessage(message, env, ctx) {
 	const text = message.text;
 	const username = message.from.username || message.from.first_name || '用户';
 
+	// 诊断日志:配置群里收到名片(contact)时,打印完整结构(尤其 vcard),供排查名片广告漏检。
+	// 只在名片消息触发,极轻量;贴 Worker 日志即可看清 Telegram 实际传了什么字段。
+	if (isConfiguredGroup(chatId) && message.contact) {
+		try {
+			console.log('[名片诊断] contact 结构:', JSON.stringify({
+				from: message.from?.id,
+				first_name: message.contact.first_name,
+				last_name: message.contact.last_name,
+				phone_number: message.contact.phone_number,
+				user_id: message.contact.user_id,
+				vcard: message.contact.vcard || '(无 vcard)',
+				entities: message.entities || null,
+			}));
+		} catch (_) {}
+	}
+
 	// 缓存"疑似广告"群消息(供 /learnlast 学习被 GKY 删掉的广告);ctx.waitUntil 异步不阻塞
 	if (
 		MSG_CACHE_ENABLED && env.KV && isConfiguredGroup(chatId) &&
