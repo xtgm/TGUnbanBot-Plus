@@ -2223,6 +2223,55 @@ console.log('\n[78] /check TGID 私聊直查');
 	assert('私聊 /check 无参数 → 提示用 /check TGID', dm.some((c) => c.body.text.includes('/check TGID')));
 }
 
+// ---------- [79] 一键代发警告:目标群无GKYbot + 原群封禁 ----------
+console.log('\n[79] 代发有效性警告');
+{
+	// 通用 fetch:可配置 banlist 返回 + 目标群管理员列表(是否含GKYbot)
+	function makeWarnFetch({ banlist, admins }) {
+		return async function (url, init) {
+			const u = String(url);
+			if (u.includes('api.telegram.org')) {
+				const method = u.split('/').pop();
+				const body = init && init.body ? JSON.parse(init.body) : null;
+				apiCalls.push({ method, body });
+				if (method === 'getChatAdministrators') {
+					return { ok: true, status: 200, async json() { return { ok: true, result: admins }; } };
+				}
+				if (method === 'getChatMember') return { ok: true, status: 200, async json() { return { ok: true, result: { user: { id: 55555, first_name: 'U' }, status: 'member' } }; } };
+				if (method === 'getChat') return { ok: true, status: 200, async json() { return { ok: true, result: { id: -1001, title: '群', type: 'supergroup' } }; } };
+				return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
+			}
+			if (u.includes('banlist')) {
+				return { ok: true, status: 200, async text() { return banlist; } };
+			}
+			throw new Error('Unexpected fetch: ' + u);
+		};
+	}
+	const cb = (id) => ({ callback_query: { id, from: { id: 8888, is_bot: false, first_name: '超管' }, message: { message_id: 100, chat: { id: -1001, type: 'supergroup' }, text: '审核' }, data: 'gky:a:55555:-1001' } });
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', SUPER_ADMINS: '8888,999', KV: makeFakeKV([]) };
+
+	// ① 目标群无 GKYbot(管理员里只有普通bot)→ 警告"未发现 GKYbot"
+	resetCalls();
+	sandbox.fetch = makeWarnFetch({ banlist: 'This TG account has no ban record', admins: [{ user: { id: 8888, is_bot: false }, status: 'creator' }, { user: { id: 111, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' }] });
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb('w1')) }), env);
+	let dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
+	assert('目标群无GKYbot → 警告未发现GKYbot', dm.some((c) => c.body.text.includes('未发现 GKYbot')));
+
+	// ② 目标群有 GKYbot(username 含 GKY)→ 无该警告
+	resetCalls();
+	sandbox.fetch = makeWarnFetch({ banlist: 'This TG account has no ban record', admins: [{ user: { id: 8888, is_bot: false }, status: 'creator' }, { user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' }] });
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb('w2')) }), env);
+	dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
+	assert('目标群有GKYbot → 无"未发现GKYbot"警告', !dm.some((c) => c.body.text.includes('未发现 GKYbot')));
+
+	// ③ 原群封禁(ChatID 非配置群)→ 警告"属于原群"
+	resetCalls();
+	sandbox.fetch = makeWarnFetch({ banlist: '<strong>TGID:</strong> 55555<br><strong>ChatID:</strong> -1009999999<br><strong>Reason:</strong> SpamGP<br>', admins: [{ user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' }] });
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb('w3')) }), env);
+	dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
+	assert('原群封禁 → 警告属于原群', dm.some((c) => c.body.text.includes('属于原群')));
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);

@@ -1415,6 +1415,11 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	const copyText = `GKYbotSave\n${banlistData.tgid}`;
 	// 代发目标群：黑名单记录在配置群内 → 该群；否则 → 主群（保留"添加白名单"需在主群发的语义）
 	const dispatchChatId = isConfiguredGroup(banlistData.chatId) ? banlistData.chatId : GROUP_ID;
+	// 原群封禁前置提示:封禁记录的 ChatID 不在配置群内 → GKY 解封是"按原群定位"的,
+	// 发到全解群很可能无效。提前告知,避免点了按钮才发现"显示已代发、实际没生效"。
+	if (banlistData.chatId && !isConfiguredGroup(String(banlistData.chatId))) {
+		responseMessage += `\n\n⚠️ <b>注意</b>:此封禁属于原群 <code>${escapeHtml(String(banlistData.chatId))}</code>,不在你的配置群内。GKYbotSave 发到本群<b>很可能无效</b>,建议用 GKY 官方网页(banlist 页面的「解鎖 Unban」按钮)解封。`;
+	}
 	if (options.actionInCurrentChat) {
 		responseMessage += `\n若同意 <b>${黑白名单}</b>，超级管理员可点击下方按钮一键代发，或复制代码手动发送 👇`;
 	} else {
@@ -2322,6 +2327,23 @@ async function handleCallbackQuery(cb, env, ctx) {
 			}
 			console.log('[callback_query] 代发成功:', JSON.stringify({ 操作人: fromUser.id, TGID: tgid, 目标群: dispatchChatId }));
 
+			// 组装"代发有效性"警告:① 目标群是否真有 GKYbot ② 封禁是否属于非配置的原群
+			const warnLines = [];
+			// ① GKYbot 在场检测(目标群管理员里有没有 username 含 GKY 的 bot)
+			const gkyCheck = await groupHasGKYBot(dispatchChatId);
+			if (gkyCheck.checked && !gkyCheck.found) {
+				warnLines.push('⚠️ <b>目标群未发现 GKYbot</b>:这条 GKYbotSave 指令可能<b>无人处理</b>(显示已代发≠已生效)。请确认 GKYbot 在该群且为管理员。');
+			}
+			// ② 原群封禁检测:封禁记录的 ChatID 不在你的配置群内 → GKY 解封是"按原群定位"的,
+			//    发到全解群很可能无效(GKY 那条记录属于原群,本群 GKYbot 没有它)。
+			try {
+				const raw0 = await handleBanlist(String(tgid));
+				const d0 = JSON.parse(raw0);
+				if (d0.success && d0.banned && d0.chatId && !isConfiguredGroup(String(d0.chatId))) {
+					warnLines.push(`⚠️ <b>此封禁属于原群</b> <code>${escapeHtml(String(d0.chatId))}</code>(不在你的配置群内)。GKYbotSave 发到本群<b>很可能无效</b>,建议用 GKY 官方网页解封(banlist 页面的「解鎖 Unban」按钮),或确认你的 bot 与 GKYbot 都在该原群。`);
+				}
+			} catch (_) {}
+
 			// 回查解封结果并发到操作人私聊(+ 主人):先发"正在确认",再补发回查结果。
 			// 用户原来看不到"到底加白成功没有",这里给一个明确确认。
 			const targetLabel = await formatTargetByTgid(tgid);
@@ -2330,11 +2352,12 @@ async function handleCallbackQuery(cb, env, ctx) {
 			await sendTelegramMessage(fromUser.id, pendingText);
 			// 立即回查(GKY 若还没处理完会提示稍后 /check 复查)
 			const verify = await verifyUnbanResult(tgid, targetLabel);
-			await sendTelegramMessage(fromUser.id, verify.text);
+			const warnBlock = warnLines.length ? '\n\n' + warnLines.join('\n') : '';
+			await sendTelegramMessage(fromUser.id, verify.text + warnBlock);
 			// 主人也收一份(操作人不是主人时),便于全局审计
 			if (OWNER_ID && String(fromUser.id) !== OWNER_ID) {
 				const opMention = formatUserMention(fromUser) || `<code>${escapeHtml(String(fromUser.id))}</code>`;
-				await sendTelegramMessage(OWNER_ID, `🔔 <b>一键解封回查</b>\n操作人:${opMention}\n\n${verify.text}`);
+				await sendTelegramMessage(OWNER_ID, `🔔 <b>一键解封回查</b>\n操作人:${opMention}\n\n${verify.text}${warnBlock}`);
 			}
 
 			// 主人审计通知:操作人不是主人时,把"一键解封"事件发给主人
@@ -3592,6 +3615,32 @@ async function checkIfUserIsAdmin(userId) {
 
 	console.log(`[管理员鉴权] 用户 ${userId} 未命中。总结: ${summary.join('; ')}`);
 	return false;
+}
+
+// 检测目标群管理员里是否有 GKYbot(username 含 GKY,覆盖 GKYxxxxBot 双bot变体)。
+// 返回 { checked: bool, found: bool }。checked=false 表示查询失败(无法确认,按"未知"处理)。
+// 注意:GKY 要执行删封必须是管理员,所以查管理员列表足够可靠;非管理员的 bot API 列不出。
+async function groupHasGKYBot(chatId) {
+	try {
+		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`;
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: chatId }),
+		});
+		const result = await response.json();
+		if (!response.ok || !result.ok || !Array.isArray(result.result)) {
+			return { checked: false, found: false };
+		}
+		const found = result.result.some((m) => {
+			const u = m?.user;
+			return u && u.is_bot && typeof u.username === 'string' && /gky/i.test(u.username);
+		});
+		return { checked: true, found };
+	} catch (error) {
+		console.error('[GKYbot检测] 查询失败:', error);
+		return { checked: false, found: false };
+	}
 }
 
 // 获取机器人用户名
