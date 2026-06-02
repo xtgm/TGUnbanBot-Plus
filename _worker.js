@@ -137,6 +137,16 @@ const SUSPICIOUS_URL_DOMAINS = [
 	'cutt.ly', 'rebrand.ly', 's.id', 'v.gd', 'shorturl.at', 'b23.tv',
 ];
 
+// 身份广告词:只用于检测"发言人名字/简介"(不碰消息正文),命中即判广告。
+// 这些词正常用户的名字/简介不会出现,放在身份里就是引流/卖号话术。
+// 主人可用 /addword identity <词> 热更新追加(走 KV 的 identity 分类)。
+const DEFAULT_IDENTITY_SPAM_WORDS = [
+	'卡' + '网', '发' + '卡', '代' + '充', '自助' + '下单', '低价' + '充', '号' + '商',
+	'出' + '号', '卖' + '号', '收' + '号', '批' + '发号', '车' + '队', '上' + '车',
+];
+// 运行期身份广告词(内置 + KV 热更新合并)
+let IDENTITY_SPAM_WORDS = [...DEFAULT_IDENTITY_SPAM_WORDS];
+
 // 关键词提取停用词表(过滤常见无害中文4字组,避免误学成广告词)
 // 字符串拆分写法避免明文特征
 const AD_STOPWORDS = [
@@ -1731,8 +1741,9 @@ async function loadAdKeywordsFromKV(env) {
 // 把 KV 自定义词库 merge 到运行期模块级变量(在 detectAd 之前调用)
 // fetch 入口每请求已把 AD_KEYWORDS_* 重置为基线(DEFAULT 空 / 环境变量),这里 push 叠加安全
 async function mergeAdKeywordsFromKV(env) {
-	// 先把域名白名单重置为内置默认(无论 KV 是否有数据,正常域名白名单都生效)
+	// 先把域名白名单、身份广告词重置为内置默认(无论 KV 是否有数据都生效)
 	URL_WHITELIST = [...DEFAULT_URL_WHITELIST];
+	IDENTITY_SPAM_WORDS = [...DEFAULT_IDENTITY_SPAM_WORDS];
 	const kv = await loadAdKeywordsFromKV(env);
 	if (!kv) return;
 	const norm = (a) => (Array.isArray(a) ? a : []).map((s) => String(s).toLowerCase()).filter(Boolean);
@@ -1741,6 +1752,8 @@ async function mergeAdKeywordsFromKV(env) {
 	AD_KEYWORDS_SPAM = [...new Set([...AD_KEYWORDS_SPAM, ...norm(kv.spam)])];
 	AD_KEYWORDS_FRAUD = [...new Set([...AD_KEYWORDS_FRAUD, ...norm(kv.fraud)])];
 	AD_KEYWORDS = [...new Set([...AD_KEYWORDS, ...norm(kv.general)])];
+	// identity 分类:只用于发言人名字/简介检测(不碰正文)
+	IDENTITY_SPAM_WORDS = [...new Set([...IDENTITY_SPAM_WORDS, ...norm(kv.identity)])];
 	// whitelist 分类:像域名的项(含 . 且无空格)进 URL_WHITELIST(正常链接放行);
 	//   其余当作"命中不计分"的关键词白名单(原语义保留)。
 	//   所以主人 /addword whitelist github.com 既能加域名,也能加普通白名单词,自动分流。
@@ -1772,6 +1785,7 @@ async function getAdKeywordsRaw(env) {
 		spam: Array.isArray(kv?.spam) ? kv.spam : [],
 		fraud: Array.isArray(kv?.fraud) ? kv.fraud : [],
 		general: Array.isArray(kv?.general) ? kv.general : [],
+		identity: Array.isArray(kv?.identity) ? kv.identity : [],
 		whitelist: Array.isArray(kv?.whitelist) ? kv.whitelist : [],
 	};
 }
@@ -2027,9 +2041,52 @@ function getContactText(message) {
 	return parts.join(' ');
 }
 
+// 检测"发言人身份"(名字/用户名/简介)里的引流广告特征。
+// 只作用于身份字段,不碰消息正文 —— 所以群里正常聊 chatgpt/分享 t.me 链接都不受影响,
+// 只有"名字或简介本身是广告"(如 сЛuВы Со ВпucoК / 卡网:pay.ldxp.cn / t.me/xxx 频道)的人才命中。
+// 返回命中的特征数组(空数组=没命中)。
+function detectIdentitySpam(identityText) {
+	const t = String(identityText || '');
+	if (!t.trim()) return [];
+	const hits = [];
+	// 任意网址(http/https)
+	if (/https?:\/\/[^\s]+/i.test(t)) hits.push('身份含网址');
+	// t.me / telegram.me 链接(名字/简介里出现即引流,公开频道也算)
+	if (/t\.me\/[a-z0-9_+]/i.test(t) || /telegram\.me\/[a-z0-9_+]/i.test(t)) hits.push('身份含t.me链接');
+	// 裸域名形式的引流(xxx.cn/xxx.com/xxx.shop 等带路径或明显域名)
+	if (/[a-z0-9-]+\.(?:cn|com|net|shop|xyz|top|vip|cc|me|io|app)\b/i.test(t.toLowerCase())) hits.push('身份含域名');
+	// @用户名提及(@xxxbot 或 @频道),名字/简介里出现是典型引流
+	if (/@[a-z][a-z0-9_]{3,}/i.test(t)) hits.push('身份含@提及');
+	// 身份广告关键词(卡网/发卡/代充/接码站点话术),与正文词库分开,只查身份
+	for (const w of IDENTITY_SPAM_WORDS) {
+		if (w && t.toLowerCase().includes(w)) hits.push(`身份广告词:${w}`);
+	}
+	return hits;
+}
+
+// 拉取某用户的简介 bio(用 getChat)。拿不到/失败返回空字符串,不报错。
+// Telegram 限制:只有公开 username 用户或与 bot 交互过的用户能拿到 bio,纯陌生人可能为空。
+async function getUserBio(userId) {
+	try {
+		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChat`;
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: userId }),
+		});
+		const result = await response.json();
+		if (response.ok && result.ok && result.result) {
+			return String(result.result.bio || '');
+		}
+	} catch (error) {
+		console.error('[bio检测] getChat 失败:', error);
+	}
+	return '';
+}
+
 // 广告检测(多维度评分 + 强特征直杀)
 // 返回 { isAd, score, hits: string[], strong: string|null }
-function detectAd(message) {
+async function detectAd(message) {
 	if (!AD_FILTER_ENABLED) return { isAd: false, score: 0, hits: [], strong: null };
 
 	const contactText = getContactText(message); // 名片广告内容(名字/电话/vcard)
@@ -2057,6 +2114,24 @@ function detectAd(message) {
 	// 链接分级:纯白名单链接(github/google等)放行;含可疑短链单独加分
 	const urlsAllWhite = allUrlsWhitelisted(urls);
 	const urlsSuspicious = hasSuspiciousUrl(urls);
+
+	// 强特征 0:发言人身份(名字/用户名)含引流特征 → 直接判广告。
+	//   只查身份字段,不碰正文,所以正常人聊 chatgpt/发 t.me 链接都不受影响。
+	//   抓"名字本身是广告"的号(如 сЛuВы Со ВпucoК、名字里塞 t.me/网址/卡网)。
+	const identityName = [message.from?.first_name, message.from?.last_name, message.from?.username]
+		.filter(Boolean).join(' ');
+	const nameHits = detectIdentitySpam(identityName);
+	if (nameHits.length > 0) {
+		return { isAd: true, score: 99, hits: ['发言人名字引流:' + nameHits.join('/')], strong: '发言人名字含广告' };
+	}
+	// 简介 bio 检测(仅 AD_CHECK_BIO 开启时,getChat 拉 bio;拿不到不报错)
+	if (AD_CHECK_BIO && message.from?.id) {
+		const bio = await getUserBio(message.from.id);
+		const bioHits = detectIdentitySpam(bio);
+		if (bioHits.length > 0) {
+			return { isAd: true, score: 99, hits: ['发言人简介引流:' + bioHits.join('/')], strong: '发言人简介含广告' };
+		}
+	}
 
 	// 强特征 1:t.me / telegram.me 私有群邀请链接
 	const inviteLink = /t\.me\/\+|t\.me\/joinchat\/|telegram\.me\/\+/i;
@@ -2465,7 +2540,7 @@ async function handleMessage(message, env, ctx) {
 		// 先把 KV 自定义词库 merge 进来(detectAd 之前)
 		await mergeAdKeywordsFromKV(env);
 		await mergeAdSamplesFromKV(env);
-		const adResult = detectAd(message);
+		const adResult = await detectAd(message);
 		if (adResult.isAd) {
 			const isAdmin = await checkIfUserIsAdmin(userId);
 			if (!isAdmin) {
@@ -2692,8 +2767,9 @@ async function handleMessage(message, env, ctx) {
 			'',
 			'<b>━━ 广告词库热更新(私聊)━━</b>',
 			'<code>/importdefault</code> 一键导入推荐词库(金融/色情/引流/诈骗)',
-			'<code>/addword [分类] 词1 词2</code> 加词。分类:finance/porn/spam/fraud/general/whitelist,默认 general',
+			'<code>/addword [分类] 词1 词2</code> 加词。分类:finance/porn/spam/fraud/general/identity/whitelist,默认 general',
 			'<code>/addword whitelist example.com</code> 加正常域名白名单(该域名链接永不被杀)',
+			'<code>/addword identity 卡网 车队</code> 加身份引流词(只查发言人名字/简介,不碰正文)',
 			'<code>/delword 词1 词2</code> 从所有分类删词',
 			'<code>/listwords</code> 查看当前 KV 词库全部内容',
 			'',
@@ -2747,6 +2823,7 @@ async function handleMessage(message, env, ctx) {
 				['引流 spam', kw.spam],
 				['诈骗 fraud', kw.fraud],
 				['自定义 general', kw.general],
+				['身份引流 identity(只查名字/简介)', kw.identity],
 				['白名单 whitelist', kw.whitelist],
 			];
 			const lines = ['📚 <b>广告词库(KV 存储)</b>', ''];
@@ -2792,10 +2869,10 @@ async function handleMessage(message, env, ctx) {
 		// /addword [分类] <词...> —— 加词(分类可选,默认 general)
 		if (head === '/addword') {
 			if (!rest) {
-				await sendTelegramMessage(chatId, '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/spam/fraud/general/whitelist(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>');
+				await sendTelegramMessage(chatId, '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/spam/fraud/general/identity/whitelist(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>\nidentity=只查发言人名字/简介的引流词(如 卡网 发卡 车队)');
 				return;
 			}
-			const validCats = ['finance', 'porn', 'spam', 'fraud', 'general', 'whitelist'];
+			const validCats = ['finance', 'porn', 'spam', 'fraud', 'general', 'identity', 'whitelist'];
 			const tokens = rest.split(/[\s,，]+/).filter(Boolean);
 			let cat = 'general';
 			if (validCats.includes(tokens[0].toLowerCase())) {

@@ -2272,6 +2272,70 @@ console.log('\n[79] 代发有效性警告');
 	assert('原群封禁 → 警告属于原群', dm.some((c) => c.body.text.includes('属于原群')));
 }
 
+// ---------- [80] 发言人身份(名字/简介)引流检测 ----------
+console.log('\n[80] 发言人身份引流检测');
+{
+	// ① 名字含 t.me 链接 → 直接杀
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	let kv = makeFakeKV([]);
+	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90001, is_bot: false, first_name: '频道 t.me/qewrvetrhe' }, text: 'chat 主 gpt 页 plus 已经稳了13天' } }) }), env, fakeCtxAd);
+	let bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('名字含t.me → 加黑', bl.some((e) => e.id === '90001'));
+	assert('名字含t.me → 删消息', callsOf('deleteMessage').length >= 1);
+
+	// ② 名字含卡网类身份词(需先导入或默认内置)→ 直接杀
+	resetCalls();
+	kv = makeFakeKV([]);
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90002, is_bot: false, first_name: 'GPT账号车队上车' }, text: '正常发言内容' } }) }), env, fakeCtxAd);
+	bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('名字含身份广告词(车队) → 加黑', bl.some((e) => e.id === '90002'));
+
+	// ③ 正常名字 + 正文聊 chatgpt/发t.me链接 → 不杀(关键防误杀:不碰正文)
+	resetCalls();
+	kv = makeFakeKV([]);
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90003, is_bot: false, first_name: '张三' }, text: '我觉得 chatgpt plus 很好用,频道 https://t.me/openai 推荐看看' } }) }), env, fakeCtxAd);
+	bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('正常名字+正文聊chatgpt发链接 → 不杀(不碰正文)', !bl.some((e) => e.id === '90003'));
+	assert('正常名字+正文 → 不删消息', callsOf('deleteMessage').length === 0);
+
+	// ④ AD_CHECK_BIO 开启:名字正常但简介bio带卡网 → 杀
+	resetCalls();
+	kv = makeFakeKV([]);
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => {
+			// 查的是发言人 90004 的 bio
+			if (String(b.chat_id) === '90004') return { ok: true, result: { id: 90004, type: 'private', bio: '卡网:https://pay.ldxp.cn/shop/x 频道:t.me/abc' } };
+			return { ok: true, result: { id: Number(b.chat_id), title: '群', type: 'supergroup' } };
+		},
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', AD_CHECK_BIO: 'true', KV: kv };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90004, is_bot: false, first_name: '小明' }, text: '大家好' } }) }), env, fakeCtxAd);
+	bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('简介bio带卡网链接(开关开) → 加黑', bl.some((e) => e.id === '90004'));
+
+	// ⑤ AD_CHECK_BIO 关闭:同样的bio → 不查不杀(默认行为)
+	resetCalls();
+	kv = makeFakeKV([]);
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90005, is_bot: false, first_name: '小红' }, text: '大家好' } }) }), env, fakeCtxAd);
+	bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('bio检测关闭 → 不查bio不误杀', !bl.some((e) => e.id === '90005'));
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);
