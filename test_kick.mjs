@@ -1980,6 +1980,80 @@ console.log('\n[71] 域名白名单热更新');
 	assert('白名单域名链接 → 不被杀(即便等于样本)', !bl.some((e) => e.id === '88304'));
 }
 
+// ---------- [72] 名片广告(含国际电话号)→ 强特征直杀 ----------
+console.log('\n[72] 名片广告国际电话直杀');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 复现截图:名片显示名"假钞交流群",电话 +1 870 337 4069,无 text
+	const update = { message: {
+		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88400, is_bot: false, first_name: 'Ahsvs' },
+		contact: { phone_number: '+1 870 337 4069', first_name: '假钞交流群', vcard: '' },
+	} };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('名片国际电话 → 加黑', bl.some((e) => e.id === '88400'));
+	assert('名片国际电话 → 全群踢(2群)', callsOf('banChatMember').length === 2);
+	assert('名片国际电话 → 删消息', callsOf('deleteMessage').length >= 1);
+}
+
+// ---------- [73] 名片广告(本地号+敏感词)→ 词库+名片分叠加判定 ----------
+console.log('\n[73] 名片敏感词叠加判定');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED)); // 含 fraud:假钞
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 名片名字含"假钞"(fraud +2)+ 名片本身(+1)= 3 ≥ 阈值;电话用中国号不触发强特征
+	const update = { message: {
+		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88401, is_bot: false, first_name: 'X' },
+		contact: { phone_number: '+86 138 0013 8000', first_name: '假钞交流群', vcard: '' },
+	} };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('名片敏感词+86号 → 词库叠加判广告加黑', bl.some((e) => e.id === '88401'));
+}
+
+// ---------- [74] 正常名片(本地号,无敏感词)→ 不误杀 ----------
+console.log('\n[74] 正常名片不误杀');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 正常用户分享一个本地联系人:名字无敏感词、中国号 → 只有名片+1分,不达阈值3
+	const update = { message: {
+		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88402, is_bot: false, first_name: '小明' },
+		contact: { phone_number: '+86 138 0013 8000', first_name: '张三', last_name: '', vcard: '' },
+	} };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('正常本地名片 → 不加黑(不误杀)', !bl.some((e) => e.id === '88402'));
+	assert('正常本地名片 → 不删消息', callsOf('deleteMessage').length === 0);
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);

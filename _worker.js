@@ -1894,6 +1894,8 @@ async function loadLearnSnapshot(env) {
 
 // 预筛:是否"疑似广告"消息(只缓存这些,省 KV 写入)
 function looksLikeAdCandidate(message) {
+	// 名片(分享联系人)直接算疑似广告候选 —— 名片广告无 text,但内容藏在 contact 里
+	if (message.contact) return true;
 	const text = (message.text || message.caption || '').trim();
 	if (!text) return false;
 	const urls = collectUrls(message);
@@ -1933,11 +1935,13 @@ async function cacheRecentMessage(env, message) {
 	if (!env.KV) return;
 	try {
 		const items = await loadRecentMessages(env);
+		// 名片消息无 text,把名片内容(名字/电话/vcard)作为可学习文本缓存
+		const cacheText = (message.text || message.caption || getContactText(message) || '').slice(0, 500);
 		items.push({
 			mid: message.message_id,
 			chatId: String(message.chat.id),
 			chatTitle: message.chat.title || '',
-			text: (message.text || message.caption || '').slice(0, 500),
+			text: cacheText,
 			fromId: String(message.from?.id || ''),
 			fromName: [message.from?.first_name, message.from?.last_name].filter(Boolean).join(' ') || message.from?.username || '',
 			at: new Date().toISOString(),
@@ -2008,22 +2012,34 @@ function hasSuspiciousUrl(urls) {
 	return hosts.some((h) => SUSPICIOUS_URL_DOMAINS.some((d) => hostMatchesDomain(h, d)));
 }
 
+// 提取联系人名片(contact)里的全部可读文本,供广告检测。
+// 名片广告把内容藏在名片显示名/电话/vcard 里(如名字"假钞交流群"+电话"+1 870..."),
+// 普通 text/caption 是空的,不提取就漏检。
+function getContactText(message) {
+	const c = message.contact;
+	if (!c) return '';
+	const parts = [c.first_name, c.last_name, c.phone_number, c.vcard].filter(Boolean);
+	return parts.join(' ');
+}
+
 // 广告检测(多维度评分 + 强特征直杀)
 // 返回 { isAd, score, hits: string[], strong: string|null }
 function detectAd(message) {
 	if (!AD_FILTER_ENABLED) return { isAd: false, score: 0, hits: [], strong: null };
 
+	const contactText = getContactText(message); // 名片广告内容(名字/电话/vcard)
 	const textParts = [
 		message.text,
 		message.caption,
 		message.from?.first_name,
 		message.from?.last_name,
 		message.from?.username,
+		contactText,
 	].filter(Boolean);
 	const fullText = textParts.join(' ').toLowerCase();
-	// 仅正文(text+caption),用于学习样本指纹比对 —— 与 /spam /learn /learnlast 学习入口口径一致,
-	// 不混入发送者用户名,保证"同一条广告不同人发"也能精确命中。
-	const bodyText = [message.text, message.caption].filter(Boolean).join(' ').toLowerCase();
+	// 仅正文(text+caption+名片内容),用于学习样本指纹比对 —— 与 /spam /learn /learnlast 学习入口口径一致,
+	// 不混入发送者用户名,保证"同一条广告不同人发"也能精确命中。名片广告也能被 /spam 学习指纹。
+	const bodyText = [message.text, message.caption, contactText].filter(Boolean).join(' ').toLowerCase();
 	const hits = [];
 
 	// 白名单:把白名单词从计分文本里挖掉(命中也不计分)
@@ -2043,9 +2059,16 @@ function detectAd(message) {
 		return { isAd: true, score: 99, hits: ['t.me邀请链接'], strong: 't.me邀请链接' };
 	}
 
-	// 强特征 2:国际电话号(+国家码 区号 号码)
-	const phonePattern = /\+\d{1,3}[\s-]?\d{2,4}[\s-]?\d{3,4}[\s-]?\d{2,4}/;
-	if (phonePattern.test(fullText)) {
+	// 强特征 2:国际电话号(+国家码 区号 号码)。fullText 已含名片电话。
+	//   只认带 + 的国际号,且排除 +86 中国号,避免误杀正常分享的本地号码名片。
+	//   用 matchAll 取出所有候选号,只要存在一个非 +86 的才判广告。
+	const phonePattern = /\+\d{1,3}[\s-]?\d{2,4}[\s-]?\d{3,4}[\s-]?\d{2,4}/g;
+	let isIntlPhone = false;
+	for (const m of fullText.matchAll(phonePattern)) {
+		const digits = m[0].replace(/[^\d+]/g, '');
+		if (!digits.startsWith('+86')) { isIntlPhone = true; break; }
+	}
+	if (isIntlPhone) {
 		return { isAd: true, score: 99, hits: ['国际电话号'], strong: '国际电话号' };
 	}
 
@@ -2087,6 +2110,10 @@ function detectAd(message) {
 	// 可疑短链(bit.ly 等)单独加分:常被广告用来藏落地页
 	if (urlsSuspicious) { score += 2; hits.push('可疑短链'); }
 
+	// 名片(分享联系人)+1 分:名片是常见引流载体,但正常用户也会分享,只 +1 需配合词库,
+	//   避免误杀正常分享。带敏感词的名片(如"假钞交流群")靠词库+名片分叠加达阈值被杀。
+	if (message.contact) { score += 1; hits.push('联系人名片'); }
+
 	// 纯链接刷屏:有外链 + 文本很短。纯白名单链接(github等)不算,避免误杀正常分享。
 	if (!urlsAllWhite && urls.length > 0 && fullText.length < 20) { score += 1; hits.push('短文本+链接'); }
 
@@ -2098,7 +2125,7 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 	if (!OWNER_ID) return;
 	const fromUser = message.from;
 	const operator = formatUserMention(fromUser) || `<code>${escapeHtml(String(fromUser?.id || '未知'))}</code>`;
-	const preview = escapeHtml((message.text || message.caption || '(无文本)').slice(0, 100));
+	const preview = escapeHtml((message.text || message.caption || (message.contact ? '[名片] ' + getContactText(message) : '') || '(无文本)').slice(0, 100));
 	const reason = adResult.strong
 		? `强特征命中:${adResult.strong}`
 		: `评分 ${adResult.score}（${adResult.hits.slice(0, 6).join('、')}）`;
