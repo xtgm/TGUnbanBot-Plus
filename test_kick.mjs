@@ -942,12 +942,15 @@ console.log('\n[23] 一键解封按钮:主人收审计');
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', SUPER_ADMINS: '8888,999', KV: makeFakeKV([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cbUpdate) }), env);
 
-	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('主人 999 收到一键解封审计', !!ownerDm);
-	assert('审计含"超级管理员操作通知"', ownerDm.body.text.includes('超级管理员操作通知'));
-	assert('审计含"一键解封代发"', ownerDm.body.text.includes('一键解封代发'));
-	assert('审计含操作人名"某超管"', ownerDm.body.text.includes('某超管'));
-	assert('审计含目标用户 55555', ownerDm.body.text.includes('55555'));
+	const ownerDms = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
+	assert('主人 999 收到一键解封审计', ownerDms.length > 0);
+	const auditDm = ownerDms.find((c) => c.body.text.includes('操作通知')) || ownerDms[ownerDms.length - 1];
+	assert('审计含"超级管理员操作通知"', auditDm.body.text.includes('超级管理员操作通知'));
+	assert('审计含"一键解封代发"', auditDm.body.text.includes('一键解封代发'));
+	assert('审计含操作人名"某超管"', auditDm.body.text.includes('某超管'));
+	assert('审计含目标用户 55555', auditDm.body.text.includes('55555'));
+	// 新增:回查解封结果消息也应发给主人(含"解封"字样)
+	assert('主人收到解封回查结果', ownerDms.some((c) => c.body.text.includes('解封') || c.body.text.includes('封禁记录')));
 }
 
 // ---------- [24] chat_member 手动 ban → 主人收审计 ----------
@@ -2103,6 +2106,69 @@ console.log('\n[76] 正常名字名片不误杀');
 	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
 	assert('正常名字名片 → 不加黑(不误杀)', !bl.some((e) => e.id === '88501'));
 	assert('正常名字名片 → 不删消息', callsOf('deleteMessage').length === 0);
+}
+
+// ---------- [77] 一键代发后回查解封结果 ----------
+console.log('\n[77] 一键代发回查解封结果');
+{
+	// ① GKY 已无记录 → 提示"解封成功"
+	resetCalls();
+	sandbox.fetch = async function (url, init) {
+		const u = String(url);
+		if (u.includes('api.telegram.org')) {
+			const method = u.split('/').pop();
+			const body = init && init.body ? JSON.parse(init.body) : null;
+			apiCalls.push({ method, body });
+			if (method === 'getChatMember') return { ok: true, status: 200, async json() { return { ok: true, result: { user: { id: 55555, first_name: '某用户' }, status: 'member' } }; } };
+			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
+		}
+		// GKY banlist 端点:返回"无记录"
+		if (u.includes('banlist')) {
+			return { ok: true, status: 200, async text() { return 'This TG account has no ban record'; } };
+		}
+		throw new Error('Unexpected fetch: ' + u);
+	};
+	const cbUpdate = {
+		callback_query: {
+			id: 'cb-77a', from: { id: 8888, is_bot: false, first_name: '某超管' },
+			message: { message_id: 100, chat: { id: -1001, type: 'supergroup' }, text: 'GKY二次审核' },
+			data: 'gky:a:55555:-1001',
+		},
+	};
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', SUPER_ADMINS: '8888,999', KV: makeFakeKV([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cbUpdate) }), env);
+	const opDms = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
+	assert('代发后 → 操作人收到"正在确认"', opDms.some((c) => c.body.text.includes('正在确认')));
+	assert('GKY无记录 → 提示"解封成功"', opDms.some((c) => c.body.text.includes('解封成功')));
+
+	// ② GKY 仍有记录 → 提示稍后 /check 复查
+	resetCalls();
+	sandbox.fetch = async function (url, init) {
+		const u = String(url);
+		if (u.includes('api.telegram.org')) {
+			const method = u.split('/').pop();
+			const body = init && init.body ? JSON.parse(init.body) : null;
+			apiCalls.push({ method, body });
+			if (method === 'getChatMember') return { ok: true, status: 200, async json() { return { ok: true, result: { user: { id: 55555, first_name: '某用户' }, status: 'member' } }; } };
+			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
+		}
+		if (u.includes('banlist')) {
+			// 返回"有记录"的 HTML
+			return { ok: true, status: 200, async text() { return '<strong>TGID:</strong> 55555<br><strong>ChatID:</strong> -1001<br><strong>Reason:</strong> 广告<br>'; } };
+		}
+		throw new Error('Unexpected fetch: ' + u);
+	};
+	const cbUpdate2 = {
+		callback_query: {
+			id: 'cb-77b', from: { id: 8888, is_bot: false, first_name: '某超管' },
+			message: { message_id: 101, chat: { id: -1001, type: 'supergroup' }, text: 'GKY二次审核' },
+			data: 'gky:a:55555:-1001',
+		},
+	};
+	const env2 = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', SUPER_ADMINS: '8888,999', KV: makeFakeKV([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cbUpdate2) }), env2);
+	const opDms2 = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
+	assert('GKY仍有记录 → 提示稍后 /check 复查', opDms2.some((c) => c.body.text.includes('/check')));
 }
 
 // ---------- 总结 ----------

@@ -264,7 +264,7 @@ export default {
 				} else if (update.chat_member) {
 					await handleChatMemberUpdate(update.chat_member, env);
 				} else if (update.callback_query) {
-					await handleCallbackQuery(update.callback_query, env);
+					await handleCallbackQuery(update.callback_query, env, ctx);
 				} else {
 					console.log('[Telegram更新] 跳过：当前代码仅处理 message/chat_member/callback_query。');
 				}
@@ -2214,8 +2214,43 @@ async function editMessageReplyMarkup(chatId, messageId, replyMarkup) {
 	}
 }
 
+// 回查一键代发 GKYbotSave 后的解封结果:查 TGID 最新封禁状态,生成确认文案。
+// 返回 { cleared: bool, text: string }
+//   cleared=true  → GKY 已无该用户封禁记录(解封/加白成功)
+//   cleared=false → 仍有记录(GKY 可能还在处理)或查询失败,提示稍后 /check 复查
+async function verifyUnbanResult(tgid, targetLabel) {
+	const who = targetLabel || `<code>${escapeHtml(String(tgid))}</code>`;
+	try {
+		const raw = await handleBanlist(String(tgid));
+		const data = JSON.parse(raw);
+		if (!data.success) {
+			return {
+				cleared: false,
+				text: `⚠️ <b>解封结果待确认</b>\n👤 用户:${who}\n查询暂时失败(${escapeHtml(data.error || '未知')})。\n请稍后用 <code>/check</code> 复查。`,
+			};
+		}
+		if (!data.banned) {
+			return {
+				cleared: true,
+				text: `✅ <b>解封成功</b>\n👤 用户:${who}\nTGID:<code>${escapeHtml(String(tgid))}</code>\n已确认 GKY 无封禁记录(已移出黑名单/加白)。`,
+			};
+		}
+		// 仍有记录:GKY 可能还没处理完,给兜底复查提示
+		let line = `⚠️ <b>仍显示有封禁记录</b>\n👤 用户:${who}\nTGID:<code>${escapeHtml(String(tgid))}</code>\n`;
+		if (data.reason) line += `封禁原因:${escapeHtml(String(data.reason))}\n`;
+		line += `\nGKY 可能仍在处理,请过几秒用 <code>/check</code> 复查确认。`;
+		return { cleared: false, text: line };
+	} catch (error) {
+		console.error('[解封回查] 失败:', error);
+		return {
+			cleared: false,
+			text: `⚠️ <b>解封结果待确认</b>\n👤 用户:${who}\n回查异常,请稍后用 <code>/check</code> 复查。`,
+		};
+	}
+}
+
 // 处理 callback_query：当前仅支持 gky:a:{tgid}:{chatId} 一键代发 GKYbotSave
-async function handleCallbackQuery(cb, env) {
+async function handleCallbackQuery(cb, env, ctx) {
 	if (!cb) return;
 	const data = cb.data || '';
 	const fromUser = cb.from;
@@ -2285,6 +2320,21 @@ async function handleCallbackQuery(cb, env) {
 				await editMessageReplyMarkup(message.chat.id, message.message_id, { inline_keyboard: [] });
 			}
 			console.log('[callback_query] 代发成功:', JSON.stringify({ 操作人: fromUser.id, TGID: tgid, 目标群: dispatchChatId }));
+
+			// 回查解封结果并发到操作人私聊(+ 主人):先发"正在确认",再补发回查结果。
+			// 用户原来看不到"到底加白成功没有",这里给一个明确确认。
+			const targetLabel = await formatTargetByTgid(tgid);
+			const pendingText = `⏳ <b>已代发 GKYbotSave</b>\n👤 用户:${targetLabel}\nTGID:<code>${escapeHtml(String(tgid))}</code>\n正在确认解封结果…`;
+			// 发给操作人本人(点按钮的超管/主人)
+			await sendTelegramMessage(fromUser.id, pendingText);
+			// 立即回查(GKY 若还没处理完会提示稍后 /check 复查)
+			const verify = await verifyUnbanResult(tgid, targetLabel);
+			await sendTelegramMessage(fromUser.id, verify.text);
+			// 主人也收一份(操作人不是主人时),便于全局审计
+			if (OWNER_ID && String(fromUser.id) !== OWNER_ID) {
+				const opMention = formatUserMention(fromUser) || `<code>${escapeHtml(String(fromUser.id))}</code>`;
+				await sendTelegramMessage(OWNER_ID, `🔔 <b>一键解封回查</b>\n操作人:${opMention}\n\n${verify.text}`);
+			}
 
 			// 主人审计通知:操作人不是主人时,把"一键解封"事件发给主人
 			if (OWNER_ID && String(fromUser.id) !== OWNER_ID) {
