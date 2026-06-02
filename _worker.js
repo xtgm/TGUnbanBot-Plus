@@ -115,6 +115,28 @@ const SAMPLE_FP_EXACT_MIN = 6;
 //   短广告(<16字)只能走完全相等,绝不会因子串包含炸到含这几个字的正常长消息。
 const SAMPLE_FP_SUBSTR_MIN = 16;
 
+// ===== 链接识别(区分正常链接 vs 广告链接,防止链接误判)=====
+// 正常域名白名单 KV key(主人可用 /addword whitelist <域名> 热更新)
+const DOMAIN_WHITELIST_KEY = 'domain_whitelist';
+// 内置正常域名白名单:命中这些域名的链接【不计分、不参与样本子串匹配】,正常链接绝不误杀。
+// 匹配规则:消息里链接的主机名 等于白名单项 或 是其子域名(如 gist.github.com 命中 github.com)。
+// 主人想加自己的域名:私聊 /addword whitelist example.com(复用白名单分类,改完即时生效不用重部署)。
+const DEFAULT_URL_WHITELIST = [
+	'github.com', 'githubusercontent.com', 'gitlab.com', 'gitee.com',
+	'google.com', 'youtube.com', 'youtu.be', 'wikipedia.org',
+	'stackoverflow.com', 'stackexchange.com', 'npmjs.com', 'pypi.org',
+	'cloudflare.com', 'developers.cloudflare.com', 'workers.dev',
+	'microsoft.com', 'apple.com', 'mozilla.org', 'docker.com',
+	'twitter.com', 'x.com', 'reddit.com', 'medium.com',
+	'bilibili.com', 'zhihu.com', 'juejin.cn', 'csdn.net', 'segmentfault.com',
+];
+// 可疑域名:命中这些(短链 / 群组邀请类)单独加分,因为常被广告用来藏落地页。
+// 注意:t.me/+ 邀请链接已由"强特征1"单独直杀,这里只覆盖短链等。
+const SUSPICIOUS_URL_DOMAINS = [
+	'bit.ly', 'tinyurl.com', 'is.gd', 't.cn', 'dwz.cn', 'suo.yt',
+	'cutt.ly', 'rebrand.ly', 's.id', 'v.gd', 'shorturl.at', 'b23.tv',
+];
+
 // 关键词提取停用词表(过滤常见无害中文4字组,避免误学成广告词)
 // 字符串拆分写法避免明文特征
 const AD_STOPWORDS = [
@@ -153,6 +175,9 @@ let AD_KEYWORDS_SPAM = [];
 let AD_KEYWORDS_FRAUD = [];
 // 广告学习样本指纹(运行期从 KV 加载)
 let AD_SAMPLE_FINGERPRINTS = [];
+// 正常域名白名单(内置 + KV 热更新,运行期合并;命中的链接不计分、不参与样本子串匹配)
+// 初始即为内置默认值,保证 merge 未执行(如 KV 未绑定)时正常域名白名单仍生效
+let URL_WHITELIST = [...DEFAULT_URL_WHITELIST];
 // 消息缓存配置
 let MSG_CACHE_ENABLED = true;
 let MSG_CACHE_SIZE = 50;
@@ -1701,6 +1726,8 @@ async function loadAdKeywordsFromKV(env) {
 // 把 KV 自定义词库 merge 到运行期模块级变量(在 detectAd 之前调用)
 // fetch 入口每请求已把 AD_KEYWORDS_* 重置为基线(DEFAULT 空 / 环境变量),这里 push 叠加安全
 async function mergeAdKeywordsFromKV(env) {
+	// 先把域名白名单重置为内置默认(无论 KV 是否有数据,正常域名白名单都生效)
+	URL_WHITELIST = [...DEFAULT_URL_WHITELIST];
 	const kv = await loadAdKeywordsFromKV(env);
 	if (!kv) return;
 	const norm = (a) => (Array.isArray(a) ? a : []).map((s) => String(s).toLowerCase()).filter(Boolean);
@@ -1709,7 +1736,14 @@ async function mergeAdKeywordsFromKV(env) {
 	AD_KEYWORDS_SPAM = [...new Set([...AD_KEYWORDS_SPAM, ...norm(kv.spam)])];
 	AD_KEYWORDS_FRAUD = [...new Set([...AD_KEYWORDS_FRAUD, ...norm(kv.fraud)])];
 	AD_KEYWORDS = [...new Set([...AD_KEYWORDS, ...norm(kv.general)])];
-	AD_WHITELIST = [...new Set([...AD_WHITELIST, ...norm(kv.whitelist)])];
+	// whitelist 分类:像域名的项(含 . 且无空格)进 URL_WHITELIST(正常链接放行);
+	//   其余当作"命中不计分"的关键词白名单(原语义保留)。
+	//   所以主人 /addword whitelist github.com 既能加域名,也能加普通白名单词,自动分流。
+	const wlAll = norm(kv.whitelist);
+	const wlDomains = wlAll.filter((w) => /^[a-z0-9.-]+\.[a-z]{2,}$/.test(w));
+	const wlWords = wlAll.filter((w) => !wlDomains.includes(w));
+	URL_WHITELIST = [...new Set([...URL_WHITELIST, ...wlDomains])];
+	AD_WHITELIST = [...new Set([...AD_WHITELIST, ...wlWords])];
 }
 
 // 把词库对象写回 KV
@@ -1927,7 +1961,51 @@ function collectUrls(message) {
 			urls.push(base.substring(e.offset, e.offset + e.length));
 		}
 	}
+	// 兜底:正则从原文再抓一遍裸 URL(有些纯文本链接 Telegram 不一定给 entity)
+	const reUrl = /https?:\/\/[^\s<>"')]+/gi;
+	for (const m of base.matchAll(reUrl)) {
+		if (!urls.includes(m[0])) urls.push(m[0]);
+	}
 	return urls;
+}
+
+// 从一批 URL 中提取主机名(小写,去 www. 前缀)。解析失败的 URL 跳过。
+function extractHostnames(urls) {
+	const hosts = [];
+	for (const u of urls) {
+		let host = '';
+		try {
+			host = new URL(u).hostname.toLowerCase();
+		} catch (_) {
+			// URL() 解析失败(如缺协议),用正则兜底抓 host
+			const m = String(u).match(/^(?:https?:\/\/)?([^/\s:?#]+)/i);
+			host = m ? m[1].toLowerCase() : '';
+		}
+		if (host.startsWith('www.')) host = host.slice(4);
+		if (host) hosts.push(host);
+	}
+	return hosts;
+}
+
+// 主机名是否命中某个白名单域名(等于 或 是其子域名)。
+// 例:host=gist.github.com,wl=github.com → true(子域名);host=evilgithub.com → false(防伪造)
+function hostMatchesDomain(host, domain) {
+	if (!host || !domain) return false;
+	return host === domain || host.endsWith('.' + domain);
+}
+
+// 这批 URL 是否【全部】命中正常域名白名单(只要有一个不在白名单,就不算"纯白名单链接")
+function allUrlsWhitelisted(urls) {
+	if (urls.length === 0) return false;
+	const hosts = extractHostnames(urls);
+	if (hosts.length === 0) return false;
+	return hosts.every((h) => URL_WHITELIST.some((d) => hostMatchesDomain(h, d)));
+}
+
+// 这批 URL 是否含可疑短链域名
+function hasSuspiciousUrl(urls) {
+	const hosts = extractHostnames(urls);
+	return hosts.some((h) => SUSPICIOUS_URL_DOMAINS.some((d) => hostMatchesDomain(h, d)));
 }
 
 // 广告检测(多维度评分 + 强特征直杀)
@@ -1955,6 +2033,9 @@ function detectAd(message) {
 	}
 
 	const urls = collectUrls(message);
+	// 链接分级:纯白名单链接(github/google等)放行;含可疑短链单独加分
+	const urlsAllWhite = allUrlsWhitelisted(urls);
+	const urlsSuspicious = hasSuspiciousUrl(urls);
 
 	// 强特征 1:t.me / telegram.me 私有群邀请链接
 	const inviteLink = /t\.me\/\+|t\.me\/joinchat\/|telegram\.me\/\+/i;
@@ -1973,16 +2054,22 @@ function detectAd(message) {
 	//   ① 完全相等:归一化后 ≥ SAMPLE_FP_EXACT_MIN(6)即命中 → 保留"相同广告精确秒杀"
 	//   ② 子串包含:仅当指纹和消息双方都 ≥ SAMPLE_FP_SUBSTR_MIN(16)才允许互为子串
 	//      → 短广告(<16)只能走完全相等,不会因子串炸到"碰巧含这几个字"的正常长消息
+	// 链接防误判:消息本身是【纯白名单链接】时跳过样本匹配(github 等正常链接绝不因学过的样本被杀);
+	//   含 URL 的指纹/消息只允许【完全相等】命中,关闭子串,防止同域名前缀连带误杀
+	//   (如学过 github.com/abc 后,github.com/abc/x 不会被子串命中)。
 	const normMsg = normalizeForFingerprint(bodyText);
-	if (normMsg.length >= SAMPLE_FP_EXACT_MIN && AD_SAMPLE_FINGERPRINTS.length > 0) {
+	const msgHasUrl = urls.length > 0;
+	if (!urlsAllWhite && normMsg.length >= SAMPLE_FP_EXACT_MIN && AD_SAMPLE_FINGERPRINTS.length > 0) {
 		for (const fp of AD_SAMPLE_FINGERPRINTS) {
 			if (!fp || fp.length < SAMPLE_FP_EXACT_MIN) continue;
 			// 完全相等:任意 ≥6 长度都判定
 			if (normMsg === fp) {
 				return { isAd: true, score: 99, hits: ['学习样本精确匹配'], strong: '学习样本(精确)' };
 			}
-			// 子串包含:双方都 ≥16 字才允许,避免短指纹误杀
-			if (normMsg.length >= SAMPLE_FP_SUBSTR_MIN && fp.length >= SAMPLE_FP_SUBSTR_MIN &&
+			// 子串包含:双方都 ≥16 字才允许;且消息或指纹任一含 URL 时禁用子串(只认完全相等)
+			const fpHasUrl = fp.includes('http');
+			if (!msgHasUrl && !fpHasUrl &&
+				normMsg.length >= SAMPLE_FP_SUBSTR_MIN && fp.length >= SAMPLE_FP_SUBSTR_MIN &&
 				(normMsg.includes(fp) || fp.includes(normMsg))) {
 				return { isAd: true, score: 99, hits: ['学习样本变体匹配'], strong: '学习样本(变体)' };
 			}
@@ -1997,8 +2084,11 @@ function detectAd(message) {
 	for (const w of AD_KEYWORDS_FRAUD) if (w && scoringText.includes(w)) { score += 2; hits.push(`诈骗:${w}`); }
 	for (const w of AD_KEYWORDS) if (w && scoringText.includes(w)) { score += 2; hits.push(`自定义:${w}`); }
 
-	// 纯链接刷屏:有外链 + 文本很短
-	if (urls.length > 0 && fullText.length < 20) { score += 1; hits.push('短文本+链接'); }
+	// 可疑短链(bit.ly 等)单独加分:常被广告用来藏落地页
+	if (urlsSuspicious) { score += 2; hits.push('可疑短链'); }
+
+	// 纯链接刷屏:有外链 + 文本很短。纯白名单链接(github等)不算,避免误杀正常分享。
+	if (!urlsAllWhite && urls.length > 0 && fullText.length < 20) { score += 1; hits.push('短文本+链接'); }
 
 	return { isAd: score >= AD_SCORE_THRESHOLD, score, hits, strong: null };
 }
@@ -2435,6 +2525,7 @@ async function handleMessage(message, env, ctx) {
 			'<b>━━ 广告词库热更新(私聊)━━</b>',
 			'<code>/importdefault</code> 一键导入推荐词库(金融/色情/引流/诈骗)',
 			'<code>/addword [分类] 词1 词2</code> 加词。分类:finance/porn/spam/fraud/general/whitelist,默认 general',
+			'<code>/addword whitelist example.com</code> 加正常域名白名单(该域名链接永不被杀)',
 			'<code>/delword 词1 词2</code> 从所有分类删词',
 			'<code>/listwords</code> 查看当前 KV 词库全部内容',
 			'',
@@ -2453,6 +2544,7 @@ async function handleMessage(message, env, ctx) {
 			'• 以上指令对普通用户/群管理员/超级管理员<b>完全无反应</b>,只有主人能用',
 			'• 学习一律<b>只入库不踢人</b>;要踢发广告的人,用回执里给的 TGID 发 <code>/ban TGID</code>',
 			'• 学习只写整句指纹,<b>不再自动往词库加词</b>(避免误杀正常消息);建议词需你手动 /addword',
+			'• <b>链接识别</b>:github/google 等正常域名链接永不被杀;含链接的样本只精确匹配不扩散;可疑短链(bit.ly等)才加分',
 		];
 		await sendTelegramMessage(chatId, helpLines.join('\n'));
 		return;

@@ -1879,6 +1879,107 @@ console.log('\n[67] /help 主人专属');
 	assert('非主人 /help → 不泄漏隐藏指令', !!dm && !dm.body.text.includes('learnlast'));
 }
 
+// ---------- [68] 正常域名链接(github)不被杀,即便学过同域名样本 ----------
+console.log('\n[68] 正常域名链接不误杀');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	// 故意预置一条 github 链接样本(模拟之前误学),且与待测消息完全相同
+	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('https://github.com/jacobax/snippets')], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88300, is_bot: false }, text: 'https://github.com/jacobax/snippets', entities: [{ type: 'url', offset: 0, length: 35 }] } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('github 正常链接 → 不加黑(白名单放行)', !bl.some((e) => e.id === '88300'));
+	assert('github 正常链接 → 不删消息', callsOf('deleteMessage').length === 0);
+}
+
+// ---------- [69] 含 URL 样本只精确匹配,同域名其它路径不被子串误杀 ----------
+console.log('\n[69] URL 样本不子串扩散');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	// 学过一条【非白名单】域名链接广告
+	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('http://spam-shop.xyz/abc')], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 同域名不同路径(更长)→ 旧版会被子串命中,新版不该被杀
+	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88301, is_bot: false }, text: 'http://spam-shop.xyz/abc/page/normal-content-here', entities: [{ type: 'url', offset: 0, length: 49 }] } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	let bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('同域名不同路径 → 不被子串误杀', !bl.some((e) => e.id === '88301'));
+	// 完全相同的那条 → 仍应精确命中
+	resetCalls();
+	const kv2 = makeFakeKV([]);
+	kv2._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('http://spam-shop.xyz/abc')], count: 1 }));
+	const env2 = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv2 };
+	const upd2 = { message: { message_id: 2, chat: { id: -1001, type: 'supergroup' }, from: { id: 88302, is_bot: false }, text: 'http://spam-shop.xyz/abc', entities: [{ type: 'url', offset: 0, length: 24 }] } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(upd2) }), env2, fakeCtxAd);
+	bl = JSON.parse(kv2._store.get('blacklist') || '[]');
+	assert('完全相同的广告链接 → 仍精确命中加黑', bl.some((e) => e.id === '88302'));
+}
+
+// ---------- [70] 可疑短链 + 广告词 → 加分判定 ----------
+console.log('\n[70] 可疑短链加分');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 可疑短链(+2) + 一个引流词(+1)= 3 ≥ 阈值
+	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88303, is_bot: false }, text: '加我 https://bit.ly/xyz123', entities: [{ type: 'url', offset: 3, length: 21 }] } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('可疑短链+引流词 → 判广告加黑', bl.some((e) => e.id === '88303'));
+}
+
+// ---------- [71] /addword whitelist 加域名 → 该域名链接放行 ----------
+console.log('\n[71] 域名白名单热更新');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	// 先学一条该域名的样本(模拟误学),再把域名加进白名单
+	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('https://myblog.example/post1')], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 主人私聊把 myblog.example 加进白名单
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/addword whitelist myblog.example' } }) }), env, fakeCtxAd);
+	const kw = JSON.parse(kv._store.get('ad_keywords_custom') || '{}');
+	assert('/addword whitelist 域名 → 写入 whitelist', (kw.whitelist || []).includes('myblog.example'));
+	// 普通成员发该域名链接(即便完全等于样本)→ 因白名单放行
+	resetCalls();
+	const update = { message: { message_id: 2, chat: { id: -1001, type: 'supergroup' }, from: { id: 88304, is_bot: false }, text: 'https://myblog.example/post1', entities: [{ type: 'url', offset: 0, length: 28 }] } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('白名单域名链接 → 不被杀(即便等于样本)', !bl.some((e) => e.id === '88304'));
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);
