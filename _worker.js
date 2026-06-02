@@ -71,8 +71,10 @@ const DEFAULT_OWNER_ID = '';
 const DEFAULT_AD_FILTER_ENABLED = false;
 //    评分阈值:各维度加权分总和 ≥ 阈值即判广告(强特征绕过评分直接判定)
 const DEFAULT_AD_SCORE_THRESHOLD = 3;
-//    是否检测用户 bio(需额外调 getChat,只能拿到已与 bot 交互过用户的 bio,群里陌生用户拿不到)
-const DEFAULT_AD_CHECK_BIO = false;
+//    是否检测发言人 bio(getChat 拉简介,命中网址/t.me/卡网等引流特征即处置)。
+//    默认开启;带 KV 缓存,同一用户短期不重复查,降低 API 成本。
+//    限制:Telegram 只返回公开 username 或与 bot 交互过用户的 bio,陌生人 bio 可能拿不到(尽力而为)。
+const DEFAULT_AD_CHECK_BIO = true;
 //    分类词库默认留空(隐私:GitHub 代码零敏感词)。词库改存 KV,用主人命令热更新:
 //    /importdefault 一键导入推荐词库 | /addword 加词 | /delword 删词 | /listwords 查看
 //    命中加权:金融+2 / 色情+2 / 引流+1 / 诈骗+2
@@ -92,10 +94,18 @@ const RECOMMENDED_AD_KEYWORDS = {
 	porn: ['约' + '炮', '萝' + '莉', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '资源' + '群', '萝' + '控'],
 	spam: ['加' + '我', '加' + '微', '加' + 'v', '私' + '聊', '进' + '群', '拉' + '你', '详情' + '看', 'dd' + '我', '添加' + '好友', '发送' + '信息'],
 	fraud: ['假' + '钞', '假' + '币', '高' + '仿', '办' + '证', '代开' + '发票', '黑客' + '接单', '改' + '分', '网' + '赚', '菠' + '菜', '交流' + '群'],
+	// identity:只用于检测发言人"名字/简介",不碰正文。卖号/接码/卡网/车队类引流话术。
+	identity: ['卡' + '网', '发' + '卡', '代' + '充', '号' + '商', '出' + '号', '卖' + '号', '收' + '号',
+		'批发' + '号', '车' + '队', '上' + '车', '接' + '码', '接码' + '平台', '自助' + '下单',
+		'低价' + '充', '账号' + '出售', '成' + '品号', '老' + '号', '直' + '登号', '小' + '号'],
 };
 
 // 广告词库 KV key
 const AD_KW_KEY = 'ad_keywords_custom';
+// 用户 bio 缓存 KV key 前缀(每个用户单独一条,带过期)。降低 getChat 调用频率。
+const BIO_CACHE_PREFIX = 'bio_cache_';
+// bio 缓存有效期(秒)。同一用户此时间内不重复调 getChat。
+const BIO_CACHE_TTL = 6 * 3600;
 // 广告学习样本(指纹)KV key
 const AD_SAMPLES_KEY = 'ad_samples';
 // 最近消息缓存 KV key(供 /learnlast 学习被 GKY 删掉的广告)
@@ -2064,9 +2074,19 @@ function detectIdentitySpam(identityText) {
 	return hits;
 }
 
-// 拉取某用户的简介 bio(用 getChat)。拿不到/失败返回空字符串,不报错。
+// 拉取某用户的简介 bio(用 getChat),带 KV 缓存降低 API 频率。拿不到/失败返回空字符串,不报错。
 // Telegram 限制:只有公开 username 用户或与 bot 交互过的用户能拿到 bio,纯陌生人可能为空。
-async function getUserBio(userId) {
+// 缓存:同一用户 BIO_CACHE_TTL(默认6h)内不重复调 getChat;命中(含空 bio)都缓存,避免反复打。
+async function getUserBio(userId, env) {
+	const cacheKey = `${BIO_CACHE_PREFIX}${userId}`;
+	// 先查缓存
+	if (env?.KV) {
+		try {
+			const cached = await env.KV.get(cacheKey);
+			if (cached !== null) return cached; // 空字符串也是有效缓存(代表"查过,无bio")
+		} catch (_) {}
+	}
+	let bio = '';
 	try {
 		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChat`;
 		const response = await fetch(url, {
@@ -2076,17 +2096,23 @@ async function getUserBio(userId) {
 		});
 		const result = await response.json();
 		if (response.ok && result.ok && result.result) {
-			return String(result.result.bio || '');
+			bio = String(result.result.bio || '');
 		}
 	} catch (error) {
 		console.error('[bio检测] getChat 失败:', error);
 	}
-	return '';
+	// 写缓存(带过期)
+	if (env?.KV) {
+		try {
+			await env.KV.put(cacheKey, bio, { expirationTtl: BIO_CACHE_TTL });
+		} catch (_) {}
+	}
+	return bio;
 }
 
 // 广告检测(多维度评分 + 强特征直杀)
 // 返回 { isAd, score, hits: string[], strong: string|null }
-async function detectAd(message) {
+async function detectAd(message, env) {
 	if (!AD_FILTER_ENABLED) return { isAd: false, score: 0, hits: [], strong: null };
 
 	const contactText = getContactText(message); // 名片广告内容(名字/电话/vcard)
@@ -2124,11 +2150,12 @@ async function detectAd(message) {
 	if (nameHits.length > 0) {
 		return { isAd: true, score: 99, hits: ['发言人名字引流:' + nameHits.join('/')], strong: '发言人名字含广告' };
 	}
-	// 简介 bio 检测(仅 AD_CHECK_BIO 开启时,getChat 拉 bio;拿不到不报错)
+	// 简介 bio 检测(仅 AD_CHECK_BIO 开启时,getChat 拉 bio,带 KV 缓存;拿不到不报错)
 	if (AD_CHECK_BIO && message.from?.id) {
-		const bio = await getUserBio(message.from.id);
+		const bio = await getUserBio(message.from.id, env);
 		const bioHits = detectIdentitySpam(bio);
 		if (bioHits.length > 0) {
+			console.log(`[bio检测] 命中 用户=${message.from.id} 特征=${bioHits.join('/')} bio预览=${bio.slice(0, 60)}`);
 			return { isAd: true, score: 99, hits: ['发言人简介引流:' + bioHits.join('/')], strong: '发言人简介含广告' };
 		}
 	}
@@ -2540,7 +2567,7 @@ async function handleMessage(message, env, ctx) {
 		// 先把 KV 自定义词库 merge 进来(detectAd 之前)
 		await mergeAdKeywordsFromKV(env);
 		await mergeAdSamplesFromKV(env);
-		const adResult = await detectAd(message);
+		const adResult = await detectAd(message, env);
 		if (adResult.isAd) {
 			const isAdmin = await checkIfUserIsAdmin(userId);
 			if (!isAdmin) {
@@ -2766,7 +2793,7 @@ async function handleMessage(message, env, ctx) {
 			'🔐 <b>主人专属隐藏指令</b>(仅 OWNER_ID 可用,其他人无任何反应)',
 			'',
 			'<b>━━ 广告词库热更新(私聊)━━</b>',
-			'<code>/importdefault</code> 一键导入推荐词库(金融/色情/引流/诈骗)',
+			'<code>/importdefault</code> 一键导入推荐词库(金融/色情/引流/诈骗/身份引流)',
 			'<code>/addword [分类] 词1 词2</code> 加词。分类:finance/porn/spam/fraud/general/identity/whitelist,默认 general',
 			'<code>/addword whitelist example.com</code> 加正常域名白名单(该域名链接永不被杀)',
 			'<code>/addword identity 卡网 车队</code> 加身份引流词(只查发言人名字/简介,不碰正文)',
@@ -2848,7 +2875,7 @@ async function handleMessage(message, env, ctx) {
 		if (head === '/importdefault') {
 			const kw = await getAdKeywordsRaw(env);
 			let added = 0;
-			for (const cat of ['finance', 'porn', 'spam', 'fraud']) {
+			for (const cat of ['finance', 'porn', 'spam', 'fraud', 'identity']) {
 				const before = new Set(kw[cat].map((w) => String(w).toLowerCase()));
 				for (const w of (RECOMMENDED_AD_KEYWORDS[cat] || [])) {
 					const lw = String(w).toLowerCase();

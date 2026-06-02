@@ -2327,13 +2327,64 @@ console.log('\n[80] 发言人身份引流检测');
 	bl = JSON.parse(kv._store.get('blacklist') || '[]');
 	assert('简介bio带卡网链接(开关开) → 加黑', bl.some((e) => e.id === '90004'));
 
-	// ⑤ AD_CHECK_BIO 关闭:同样的bio → 不查不杀(默认行为)
+	// ⑤ AD_CHECK_BIO 显式关闭:有同样bio也不查不杀
 	resetCalls();
 	kv = makeFakeKV([]);
-	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => {
+			if (String(b.chat_id) === '90005') return { ok: true, result: { id: 90005, type: 'private', bio: '卡网 t.me/abc' } };
+			return { ok: true, result: { id: Number(b.chat_id), title: '群', type: 'supergroup' } };
+		},
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', AD_CHECK_BIO: 'false', KV: kv };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90005, is_bot: false, first_name: '小红' }, text: '大家好' } }) }), env, fakeCtxAd);
 	bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('bio检测关闭 → 不查bio不误杀', !bl.some((e) => e.id === '90005'));
+	assert('AD_CHECK_BIO=false → 不查bio即便bio是广告也不杀', !bl.some((e) => e.id === '90005'));
+}
+
+// ---------- [81] bio缓存 + 默认开启 + identity词库导入 ----------
+console.log('\n[81] bio缓存/默认开启/词库导入');
+{
+	// ① bio 缓存:同一用户第二条消息不再重复调 getChat
+	resetCalls();
+	let getChatCount = 0;
+	const kv = makeFakeKV([]);
+	sandbox.fetch = async function (url, init) {
+		const u = String(url);
+		if (u.includes('api.telegram.org')) {
+			const method = u.split('/').pop();
+			const body = init && init.body ? JSON.parse(init.body) : null;
+			apiCalls.push({ method, body });
+			if (method === 'getChatAdministrators') return { ok: true, status: 200, async json() { return { ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }; } };
+			if (method === 'getChat') {
+				if (body && String(body.chat_id) === '91001') { getChatCount++; return { ok: true, status: 200, async json() { return { ok: true, result: { id: 91001, type: 'private', bio: '正常简介无广告' } }; } }; }
+				return { ok: true, status: 200, async json() { return { ok: true, result: { id: Number(body.chat_id), title: '群' } }; } };
+			}
+			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
+		}
+		throw new Error('Unexpected fetch: ' + u);
+	};
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', AD_CHECK_BIO: 'true', KV: kv };
+	const mk = (mid) => ({ message: { message_id: mid, chat: { id: -1001, type: 'supergroup' }, from: { id: 91001, is_bot: false, first_name: '正常人' }, text: '发言' + mid } });
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(mk(1)) }), env, fakeCtxAd);
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(mk(2)) }), env, fakeCtxAd);
+	assert('bio缓存 → 同一用户第二条不重复调getChat(只1次)', getChatCount === 1);
+
+	// ② identity 词库 importdefault 导入
+	resetCalls();
+	const kv2 = makeFakeKV([]);
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const env2 = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: kv2 };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/importdefault' } }) }), env2, fakeCtxAd);
+	const kwStore = JSON.parse(kv2._store.get('ad_keywords_custom') || '{}');
+	assert('importdefault → identity 分类有词', Array.isArray(kwStore.identity) && kwStore.identity.length > 0);
 }
 
 // ---------- 总结 ----------
