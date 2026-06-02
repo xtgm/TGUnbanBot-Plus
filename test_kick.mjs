@@ -2054,6 +2054,57 @@ console.log('\n[74] 正常名片不误杀');
 	assert('正常本地名片 → 不删消息', callsOf('deleteMessage').length === 0);
 }
 
+// ---------- [75] 名片名字含敏感词 → 直接秒杀(即便无电话/中国号) ----------
+console.log('\n[75] 名片名字敏感词直接杀');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED)); // 含 fraud:假钞
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 名片名字"假钞交流群",电话用中国号(不触发国际号强特征)→ 靠名字命中词库直接杀
+	const update = { message: {
+		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88500, is_bot: false, first_name: 'A' },
+		contact: { phone_number: '+86 138 0013 8000', first_name: '假钞交流群', vcard: '' },
+	} };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('名片名字含敏感词 → 直接加黑', bl.some((e) => e.id === '88500'));
+	assert('名片名字含敏感词 → 全群踢', callsOf('banChatMember').length === 2);
+	assert('名片名字含敏感词 → 删消息', callsOf('deleteMessage').length >= 1);
+}
+
+// ---------- [76] 名片名字正常(无敏感词)+ 中国号 → 不误杀 ----------
+console.log('\n[76] 正常名字名片不误杀');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const kv = makeFakeKV([]);
+	kv._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// 正常名字 + 中国号 → 名字不命中词库,只 +1 名片分,不达阈值
+	const update = { message: {
+		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88501, is_bot: false, first_name: '小红' },
+		contact: { phone_number: '+86 139 0013 9000', first_name: '李四', last_name: '王', vcard: '' },
+	} };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	assert('正常名字名片 → 不加黑(不误杀)', !bl.some((e) => e.id === '88501'));
+	assert('正常名字名片 → 不删消息', callsOf('deleteMessage').length === 0);
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);

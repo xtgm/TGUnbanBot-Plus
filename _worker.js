@@ -2099,6 +2099,29 @@ function detectAd(message) {
 		}
 	}
 
+	// 强特征 4:名片显示名命中词库 → 直接判广告秒杀(实现"名字带广告就杀")
+	//   原理:正常用户的名片显示名(张三/小明/John)几乎不可能含"假钞/承兑/约炮"这类词,
+	//   所以名片名字一旦命中任意分类词,直接判定,不必凑分。误杀面极低。
+	//   注意:只针对【名片显示名】,不针对普通聊天文本(那个仍走加权评分,避免正常聊天误杀)。
+	if (message.contact) {
+		const contactName = [message.contact.first_name, message.contact.last_name]
+			.filter(Boolean).join(' ').toLowerCase();
+		if (contactName) {
+			// 白名单词先挖掉,避免特定话题群误伤
+			let nameForScan = contactName;
+			for (const w of AD_WHITELIST) if (w) nameForScan = nameForScan.split(w).join('');
+			const allAdWords = [
+				...AD_KEYWORDS_FINANCE, ...AD_KEYWORDS_PORN, ...AD_KEYWORDS_SPAM,
+				...AD_KEYWORDS_FRAUD, ...AD_KEYWORDS,
+			];
+			for (const w of allAdWords) {
+				if (w && nameForScan.includes(w)) {
+					return { isAd: true, score: 99, hits: [`名片名字命中:${w}`], strong: '名片名字含广告词' };
+				}
+			}
+		}
+	}
+
 	// 加权评分
 	let score = 0;
 	for (const w of AD_KEYWORDS_FINANCE) if (w && scoringText.includes(w)) { score += 2; hits.push(`金融:${w}`); }
