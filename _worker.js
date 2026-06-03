@@ -986,15 +986,22 @@ async function handleMigrate(env) {
 		const items = normalizeBlacklist(raw);
 
 		let inserted = 0;
-		let skipped = 0;
-		for (const entry of items) {
-			const result = await env.DB
-				.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at) VALUES (?, ?, ?, ?)')
-				.bind(entry.id, entry.reason, entry.by, entry.at)
-				.run();
-			const changed = result?.meta?.changes ?? result?.changes ?? 0;
-			if (changed) inserted++;
-			else skipped++;
+		let skipped = items.length;
+		if (items.length > 0) {
+			const stmts = items.map(entry =>
+				env.DB.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at) VALUES (?, ?, ?, ?)')
+					.bind(entry.id, entry.reason, entry.by, entry.at)
+			);
+			const batchSize = 40;
+			for (let i = 0; i < stmts.length; i += batchSize) {
+				const batch = stmts.slice(i, i + batchSize);
+				const results = await env.DB.batch(batch);
+				for (const r of results) {
+					const changed = r?.meta?.changes ?? 0;
+					if (changed) inserted++;
+				}
+			}
+			skipped = items.length - inserted;
 		}
 
 		// 迁移广告词库
