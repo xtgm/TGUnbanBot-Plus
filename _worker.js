@@ -985,17 +985,16 @@ async function handleMigrate(env) {
 		const raw = await env.KV.get('blacklist', { type: 'json' });
 		const items = normalizeBlacklist(raw);
 
-		// 用单条 SQL 多行 VALUES 批量插入（1 条 SQL = 1 次 D1 调用，不受 50 次限制）
+		// 使用 env.DB.batch() — 单次 HTTP 调用提交所有语句（不受 50 次子请求限制）
 		let inserted = 0;
-		const chunkSize = 20;
-		for (let i = 0; i < items.length; i += chunkSize) {
-			const chunk = items.slice(i, i + chunkSize);
-			const placeholders = chunk.map(() => '(?, ?, ?, ?)').join(', ');
-			const values = chunk.flatMap(e => [e.id, e.reason, e.by, e.at]);
-			const result = await env.DB.prepare(`INSERT OR IGNORE INTO blacklist (id, reason, by_user, at) VALUES ${placeholders}`)
-				.bind(...values)
-				.run();
-			inserted += result?.meta?.changes ?? 0;
+		if (items.length > 0) {
+			const stmts = items.map(e =>
+				env.DB.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at) VALUES (?, ?, ?, ?)').bind(e.id, e.reason, e.by, e.at)
+			);
+			const results = await env.DB.batch(stmts);
+			for (const r of results) {
+				if ((r?.meta?.changes ?? 0) > 0) inserted++;
+			}
 		}
 
 		// 迁移广告词库
