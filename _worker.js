@@ -2267,26 +2267,26 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
 	}
 }
 
-// 黑名单用户通过自助解封成功移出黑名单时通知主人
-async function notifyOwnerBlacklistSelfUnban(fromUser, blacklistInfo) {
+// 用户完成自助解封时通知主人（所有自助解封都通知）
+async function notifyOwnerSelfUnban(fromUser, perGroupResults) {
 	if (!OWNER_ID) return;
 	const target = fromUser
 		? formatUserMention(fromUser)
 		: '<code>未知</code>';
 	const targetId = String(fromUser?.id || '未知');
 
-	const entry = blacklistInfo?.entry;
-	const reason = translateBlacklistReason(entry?.reason);
-	const operator = translateBlacklistOperator(entry?.by);
+	const resultSummary = perGroupResults
+		.map(r => r.replace(/<[^>]+>/g, ''))
+		.join('\n');
 
 	const lines = [
-		`✅ <b>黑名单用户自助解封</b>`,
+		`📬 <b>用户自助解封</b>`,
 		`👤 用户:${target} <code>${escapeHtml(targetId)}</code>`,
-		`📋 原加黑方式:${reason}`,
-		`🔧 原加黑操作人:${operator}`,
 		'',
-		`该用户已自动移出黑名单并完成自助解封。`,
-		`如需重新加黑: <code>/ban ${escapeHtml(targetId)}</code>`,
+		`📋 各群解封结果:`,
+		escapeHtml(resultSummary),
+		'',
+		`如确认是广告，请执行: <code>/ban ${escapeHtml(targetId)}</code>`,
 	];
 
 	const dm = await sendTelegramMessage(OWNER_ID, lines.join('\n'));
@@ -3400,7 +3400,6 @@ async function handleMessage(message, env, ctx) {
 			}
 			// ad_auto / manual_ban 允许自助解封，先自动移出黑名单
 			await removeFromBlacklist(userId, env);
-			await notifyOwnerBlacklistSelfUnban(message.from, blacklistCheck);
 		}
 		const groupInfo = await getGroupInfo();
 		await sendTelegramMessage(chatId, SELF_UNBAN_APPROVED.replaceAll('{username}', groupInfo.username));
@@ -3457,6 +3456,9 @@ async function handleMessage(message, env, ctx) {
 		}
 
 		await sendTelegramMessage(chatId, perGroupResults.join('\n'));
+
+		// 通知主人：有用户完成了自助解封
+		await notifyOwnerSelfUnban(message.from, perGroupResults);
 
 		// 检查用户是否在 GKY 封禁黑名单中（全局判定，提醒发到主群）
 		try {
