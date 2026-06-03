@@ -2267,6 +2267,34 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
 	}
 }
 
+// 黑名单用户通过自助解封成功移出黑名单时通知主人
+async function notifyOwnerBlacklistSelfUnban(fromUser, blacklistInfo) {
+	if (!OWNER_ID) return;
+	const target = fromUser
+		? formatUserMention(fromUser)
+		: '<code>未知</code>';
+	const targetId = String(fromUser?.id || '未知');
+
+	const entry = blacklistInfo?.entry;
+	const reason = translateBlacklistReason(entry?.reason);
+	const operator = translateBlacklistOperator(entry?.by);
+
+	const lines = [
+		`✅ <b>黑名单用户自助解封</b>`,
+		`👤 用户:${target} <code>${escapeHtml(targetId)}</code>`,
+		`📋 原加黑方式:${reason}`,
+		`🔧 原加黑操作人:${operator}`,
+		'',
+		`该用户已自动移出黑名单并完成自助解封。`,
+		`如需重新加黑: <code>/ban ${escapeHtml(targetId)}</code>`,
+	];
+
+	const dm = await sendTelegramMessage(OWNER_ID, lines.join('\n'));
+	if (!dm?.ok) {
+		console.error(`[自助解封通知] 通知主人失败:${dm?.description || '未知'}`);
+	}
+}
+
 // 应答 callback_query，让前端按钮停止 loading 并可选弹出提示气泡
 async function answerCallbackQuery(callbackQueryId, text, showAlert = false) {
 	try {
@@ -3341,9 +3369,14 @@ async function handleMessage(message, env, ctx) {
 		// 检查黑名单
 		const blacklistCheck = await checkBlacklist(userId, env);
 		if (blacklistCheck.isBlacklisted) {
-			await sendTelegramMessage(chatId, blacklistCheck.message);
-			await notifyOwnerBlacklistAppeal(message.from, blacklistCheck);
-			return;
+			const reason = blacklistCheck.entry?.reason;
+			if (reason === 'manual' || reason === 'spam') {
+				await sendTelegramMessage(chatId, blacklistCheck.message);
+				await notifyOwnerBlacklistAppeal(message.from, blacklistCheck);
+				return;
+			}
+			// ad_auto / manual_ban 允许自助解封，先自动移出黑名单
+			await removeFromBlacklist(userId, env);
 		}
 
 		const groupInfo = await getGroupInfo();
@@ -3359,12 +3392,16 @@ async function handleMessage(message, env, ctx) {
 		// KV 异常时保持放行策略：checkBlacklist 内部出错会返回 isBlacklisted=false
 		const blacklistCheck = await checkBlacklist(userId, env);
 		if (blacklistCheck.isBlacklisted) {
-			await sendTelegramMessage(chatId, blacklistCheck.message);
-			await notifyOwnerBlacklistAppeal(message.from, blacklistCheck);
-			return;
+			const reason = blacklistCheck.entry?.reason;
+			if (reason === 'manual' || reason === 'spam') {
+				await sendTelegramMessage(chatId, blacklistCheck.message);
+				await notifyOwnerBlacklistAppeal(message.from, blacklistCheck);
+				return;
+			}
+			// ad_auto / manual_ban 允许自助解封，先自动移出黑名单
+			await removeFromBlacklist(userId, env);
+			await notifyOwnerBlacklistSelfUnban(message.from, blacklistCheck);
 		}
-
-		// 发送确认消息
 		const groupInfo = await getGroupInfo();
 		await sendTelegramMessage(chatId, SELF_UNBAN_APPROVED.replaceAll('{username}', groupInfo.username));
 
