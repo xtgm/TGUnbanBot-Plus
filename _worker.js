@@ -987,7 +987,7 @@ async function handleMigrate(env) {
 
 		// 用单条 SQL 多行 VALUES 批量插入（1 条 SQL = 1 次 D1 调用，不受 50 次限制）
 		let inserted = 0;
-		const chunkSize = 50;
+		const chunkSize = 20;
 		for (let i = 0; i < items.length; i += chunkSize) {
 			const chunk = items.slice(i, i + chunkSize);
 			const placeholders = chunk.map(() => '(?, ?, ?, ?)').join(', ');
