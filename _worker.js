@@ -234,7 +234,7 @@ export default {
 			});;
 		} else if (request.method === 'GET' && path === `${TOKEN}/migrate`) {
 			// 存量 KV 黑名单一次性迁移到 D1（用 TOKEN 保护，防止外部触发）
-			return await handleMigrate(env);
+			return await handleMigrate(env, url);
 		} else if (request.method === 'GET' && path === `${TOKEN}/export`) {
 			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
 			return await handleExport(env, url);
@@ -972,7 +972,7 @@ function renderBatchRemoveResult(results, invalid) {
 }
 
 // 一次性把 KV 黑名单迁移到 D1（INSERT OR IGNORE，幂等）
-async function handleMigrate(env) {
+async function handleMigrate(env, url) {
 	if (!env.DB) {
 		return jsonResponse({ 成功: false, 错误: '未绑定 D1（binding=DB）' }, 400);
 	}
@@ -982,56 +982,71 @@ async function handleMigrate(env) {
 
 	try {
 		await ensureD1Table(env);
+		const page = parseInt(url.searchParams.get('page') || '0', 10);
+		const pageSize = 20;
+
+		// 第一页：迁移广告词库 + 学习样本 + 前 20 条黑名单
+		// 后续页：每次 20 条黑名单
 		const raw = await env.KV.get('blacklist', { type: 'json' });
 		const items = normalizeBlacklist(raw);
+		const totalPages = Math.ceil(items.length / pageSize) || 1;
+		const start = page * pageSize;
+		const chunk = items.slice(start, start + pageSize);
 
 		let inserted = 0;
-		let skipped = items.length;
-		if (items.length > 0) {
-			const stmts = items.map(entry =>
-				env.DB.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at) VALUES (?, ?, ?, ?)')
-					.bind(entry.id, entry.reason, entry.by, entry.at)
+		if (chunk.length > 0) {
+			const results = await env.DB.batch(
+				chunk.map(entry =>
+					env.DB.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at) VALUES (?, ?, ?, ?)')
+						.bind(entry.id, entry.reason, entry.by, entry.at)
+				)
 			);
-			const batchSize = 40;
-			for (let i = 0; i < stmts.length; i += batchSize) {
-				const batch = stmts.slice(i, i + batchSize);
-				const results = await env.DB.batch(batch);
-				for (const r of results) {
-					const changed = r?.meta?.changes ?? 0;
-					if (changed) inserted++;
-				}
+			for (const r of results) {
+				if ((r?.meta?.changes ?? 0) > 0) inserted++;
 			}
-			skipped = items.length - inserted;
 		}
 
-		// 迁移广告词库
-		let kwMigrated = false;
-		try {
-			const kwRaw = await env.KV.get('ad_keywords_custom', { type: 'json' });
-			if (kwRaw && typeof kwRaw === 'object') {
-				await env.DB.prepare('INSERT OR REPLACE INTO ad_keywords (id, data, updated_at) VALUES (1, ?, ?)')
-					.bind(JSON.stringify(kwRaw), new Date().toISOString()).run();
-				kwMigrated = true;
-			}
-		} catch (e) { console.error('迁移广告词库失败:', e); }
+		// 仅第一页迁移词库和样本
+		let kwMigrated = '跳过(非首页)';
+		let samplesMigrated = '跳过(非首页)';
+		if (page === 0) {
+			try {
+				const kwRaw = await env.KV.get('ad_keywords_custom', { type: 'json' });
+				if (kwRaw && typeof kwRaw === 'object') {
+					await env.DB.prepare('INSERT OR REPLACE INTO ad_keywords (id, data, updated_at) VALUES (1, ?, ?)')
+						.bind(JSON.stringify(kwRaw), new Date().toISOString()).run();
+					kwMigrated = '已迁移';
+				} else { kwMigrated = 'KV无数据'; }
+			} catch (e) { kwMigrated = '失败:' + e.message; }
 
-		// 迁移学习样本
-		let samplesMigrated = false;
-		try {
-			const samplesRaw = await env.KV.get('ad_samples', { type: 'json' });
-			if (samplesRaw && Array.isArray(samplesRaw.fingerprints)) {
-				await env.DB.prepare('INSERT OR REPLACE INTO ad_samples (id, data, updated_at) VALUES (1, ?, ?)')
-					.bind(JSON.stringify(samplesRaw), new Date().toISOString()).run();
-				samplesMigrated = true;
-			}
-		} catch (e) { console.error('迁移学习样本失败:', e); }
+			try {
+				const samplesRaw = await env.KV.get('ad_samples', { type: 'json' });
+				if (samplesRaw && Array.isArray(samplesRaw.fingerprints)) {
+					await env.DB.prepare('INSERT OR REPLACE INTO ad_samples (id, data, updated_at) VALUES (1, ?, ?)')
+						.bind(JSON.stringify(samplesRaw), new Date().toISOString()).run();
+					samplesMigrated = '已迁移';
+				} else { samplesMigrated = 'KV无数据'; }
+			} catch (e) { samplesMigrated = '失败:' + e.message; }
+		}
 
-		return jsonResponse({
+		const hasNext = start + pageSize < items.length;
+		const result = {
 			成功: true,
-			黑名单: { KV源条数: items.length, D1新增: inserted, D1已存在: skipped },
-			广告词库: kwMigrated ? '已迁移' : 'KV无数据或已迁移',
-			学习样本: samplesMigrated ? '已迁移' : 'KV无数据或已迁移'
-		});
+			当前页: page,
+			总页数: totalPages,
+			黑名单总数: items.length,
+			本页写入: inserted,
+			本页跳过: chunk.length - inserted,
+			广告词库: kwMigrated,
+			学习样本: samplesMigrated,
+		};
+		if (hasNext) {
+			result.下一页 = `/${TOKEN}/migrate?page=${page + 1}`;
+			result.提示 = '请继续访问下一页完成全部迁移';
+		} else {
+			result.提示 = '全部迁移完成！可以删除 KV 绑定了';
+		}
+		return jsonResponse(result);
 	} catch (error) {
 		console.error('迁移失败:', error);
 		return jsonResponse({ 成功: false, 错误: error.message }, 500);
