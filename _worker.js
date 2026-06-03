@@ -976,7 +976,7 @@ async function handleMigrate(env) {
 	if (!env.DB) {
 		return jsonResponse({ 成功: false, 错误: '未绑定 D1（binding=DB）' }, 400);
 	}
-	if (!env.DB) {
+	if (!env.KV) {
 		return jsonResponse({ 成功: false, 错误: '未绑定 KV，无源数据可迁移' }, 400);
 	}
 
@@ -997,13 +997,33 @@ async function handleMigrate(env) {
 			else skipped++;
 		}
 
-		// 迁移完成
+		// 迁移广告词库
+		let kwMigrated = false;
+		try {
+			const kwRaw = await env.KV.get('ad_keywords_custom', { type: 'json' });
+			if (kwRaw && typeof kwRaw === 'object') {
+				await env.DB.prepare('INSERT OR REPLACE INTO ad_keywords (id, data, updated_at) VALUES (1, ?, ?)')
+					.bind(JSON.stringify(kwRaw), new Date().toISOString()).run();
+				kwMigrated = true;
+			}
+		} catch (e) { console.error('迁移广告词库失败:', e); }
+
+		// 迁移学习样本
+		let samplesMigrated = false;
+		try {
+			const samplesRaw = await env.KV.get('ad_samples', { type: 'json' });
+			if (samplesRaw && Array.isArray(samplesRaw.fingerprints)) {
+				await env.DB.prepare('INSERT OR REPLACE INTO ad_samples (id, data, updated_at) VALUES (1, ?, ?)')
+					.bind(JSON.stringify(samplesRaw), new Date().toISOString()).run();
+				samplesMigrated = true;
+			}
+		} catch (e) { console.error('迁移学习样本失败:', e); }
 
 		return jsonResponse({
 			成功: true,
-			KV源条数: items.length,
-			D1新增: inserted,
-			D1已存在: skipped
+			黑名单: { KV源条数: items.length, D1新增: inserted, D1已存在: skipped },
+			广告词库: kwMigrated ? '已迁移' : 'KV无数据或已迁移',
+			学习样本: samplesMigrated ? '已迁移' : 'KV无数据或已迁移'
 		});
 	} catch (error) {
 		console.error('迁移失败:', error);
