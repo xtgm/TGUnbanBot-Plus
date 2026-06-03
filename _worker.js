@@ -234,7 +234,7 @@ export default {
 			});;
 		} else if (request.method === 'GET' && path === `${TOKEN}/migrate`) {
 			// 存量 KV 黑名单一次性迁移到 D1（用 TOKEN 保护，防止外部触发）
-			return await handleMigrate(env, url);
+			return await handleMigrate(env, url, TOKEN);
 		} else if (request.method === 'GET' && path === `${TOKEN}/export`) {
 			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
 			return await handleExport(env, url);
@@ -972,7 +972,7 @@ function renderBatchRemoveResult(results, invalid) {
 }
 
 // 一次性把 KV 黑名单迁移到 D1（INSERT OR IGNORE，幂等）
-async function handleMigrate(env, url) {
+async function handleMigrate(env, url, TOKEN) {
 	if (!env.DB) {
 		return jsonResponse({ 成功: false, 错误: '未绑定 D1（binding=DB）' }, 400);
 	}
