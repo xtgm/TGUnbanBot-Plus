@@ -2179,6 +2179,26 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 	}
 }
 
+// 将黑名单 reason 代码翻译为中文详细说明
+function translateBlacklistReason(reason) {
+	const map = {
+		manual_ban: '群管理员手动封禁（Telegram原生操作）',
+		manual: '/ban 指令加黑',
+		spam: '/spam 引用回复加黑',
+		ad_auto: '广告自动检测加黑',
+	};
+	return map[reason] || reason || '未知';
+}
+
+// 将加黑操作人 ID 翻译为角色标签
+function translateBlacklistOperator(byId) {
+	if (!byId) return '未知';
+	if (byId === 'system') return '🤖 系统自动';
+	if (byId === OWNER_ID) return `👑 主人 <code>${escapeHtml(byId)}</code>`;
+	if (SUPER_ADMINS.includes(byId)) return `🛡️ 超级管理员 <code>${escapeHtml(byId)}</code>`;
+	return `👤 群管理员 <code>${escapeHtml(byId)}</code>`;
+}
+
 // 黑名单自动拦截通知主人（复入群拦截 / 发言拦截时调用）
 async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklistInfo, banResult) {
 	if (!OWNER_ID) return;
@@ -2193,16 +2213,19 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 		if (info?.title) groupLabel = `<b>${escapeHtml(info.title)}</b> <code>${escapeHtml(String(chat.id))}</code>`;
 	} catch (_) {}
 
-	const reason = blacklistInfo?.entry?.reason
-		? escapeHtml(blacklistInfo.entry.reason)
-		: '未知';
+	const entry = blacklistInfo?.entry;
+	const reason = translateBlacklistReason(entry?.reason);
+	const operator = translateBlacklistOperator(entry?.by);
+	const addedAt = entry?.at ? escapeHtml(entry.at) : '未知';
 
 	const lines = [
 		`🚫 <b>黑名单自动拦截</b>`,
 		`🎬 动作:${escapeHtml(action)}`,
 		`👤 用户:${target} <code>${escapeHtml(targetId)}</code>`,
 		`📍 群:${groupLabel}`,
-		`📋 原加黑原因:${reason}`,
+		`📋 加黑方式:${reason}`,
+		`🔧 加黑操作人:${operator}`,
+		`🕐 加黑时间:${addedAt}`,
 	];
 	if (banResult && !banResult.ok) {
 		lines.push(`⚠️ 踢人结果:失败 - ${escapeHtml(banResult.error || '未知')}`);
@@ -2221,18 +2244,18 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
 		? formatUserMention(fromUser)
 		: '<code>未知</code>';
 	const targetId = String(fromUser?.id || '未知');
-	const reason = blacklistInfo?.entry?.reason
-		? escapeHtml(blacklistInfo.entry.reason)
-		: '未知';
-	const addedBy = blacklistInfo?.entry?.by
-		? `<code>${escapeHtml(String(blacklistInfo.entry.by))}</code>`
-		: '未知';
+
+	const entry = blacklistInfo?.entry;
+	const reason = translateBlacklistReason(entry?.reason);
+	const operator = translateBlacklistOperator(entry?.by);
+	const addedAt = entry?.at ? escapeHtml(entry.at) : '未知';
 
 	const lines = [
 		`📢 <b>黑名单用户申诉</b>`,
 		`👤 用户:${target} <code>${escapeHtml(targetId)}</code>`,
-		`📋 原加黑原因:${reason}`,
-		`🔧 加黑操作人:${addedBy}`,
+		`📋 加黑方式:${reason}`,
+		`🔧 加黑操作人:${operator}`,
+		`🕐 加黑时间:${addedAt}`,
 		'',
 		`该用户正尝试自助解封但被黑名单阻止。`,
 		`如确认误封，请执行: <code>/unban ${escapeHtml(targetId)}</code>`,
