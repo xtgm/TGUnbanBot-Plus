@@ -2191,12 +2191,34 @@ function translateBlacklistReason(reason) {
 }
 
 // 将加黑操作人 ID 翻译为角色标签
-function translateBlacklistOperator(byId) {
+async function translateBlacklistOperator(byId) {
 	if (!byId) return '未知';
 	if (byId === 'system') return '🤖 系统自动';
-	if (byId === OWNER_ID) return `👑 主人 <code>${escapeHtml(byId)}</code>`;
-	if (SUPER_ADMINS.includes(byId)) return `🛡️ 超级管理员 <code>${escapeHtml(byId)}</code>`;
-	return `👤 群管理员 <code>${escapeHtml(byId)}</code>`;
+
+	let roleTag = '👤 群管理员';
+	if (byId === OWNER_ID) roleTag = '👑 主人';
+	else if (SUPER_ADMINS.includes(byId)) roleTag = '🛡️ 超级管理员';
+
+	// 尝试查询操作人名字和类型
+	try {
+		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChat`;
+		const resp = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: byId })
+		});
+		const data = await resp.json();
+		if (data.ok && data.result) {
+			const r = data.result;
+			const name = r.first_name || r.title || '';
+			const uname = r.username ? ` (@${r.username})` : '';
+			const botTag = r.type === 'private' && r.is_bot ? ' [Bot]' : '';
+			if (r.is_bot) roleTag = '🤖 Bot';
+			return `${roleTag} ${escapeHtml(name)}${escapeHtml(uname)}${botTag} <code>${escapeHtml(byId)}</code>`;
+		}
+	} catch (_) {}
+
+	return `${roleTag} <code>${escapeHtml(byId)}</code>`;
 }
 
 // 黑名单自动拦截通知主人（复入群拦截 / 发言拦截时调用）
@@ -2215,7 +2237,7 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 
 	const entry = blacklistInfo?.entry;
 	const reason = translateBlacklistReason(entry?.reason);
-	const operator = translateBlacklistOperator(entry?.by);
+	const operator = await translateBlacklistOperator(entry?.by);
 	const addedAt = entry?.at ? escapeHtml(entry.at) : '未知';
 
 	const lines = [
@@ -2247,7 +2269,7 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
 
 	const entry = blacklistInfo?.entry;
 	const reason = translateBlacklistReason(entry?.reason);
-	const operator = translateBlacklistOperator(entry?.by);
+	const operator = await translateBlacklistOperator(entry?.by);
 	const addedAt = entry?.at ? escapeHtml(entry.at) : '未知';
 
 	const lines = [
