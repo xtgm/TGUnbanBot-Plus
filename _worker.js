@@ -2201,10 +2201,11 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 // 将黑名单 reason 代码翻译为中文详细说明
 function translateBlacklistReason(reason) {
 	const map = {
-		manual_ban: '群管理员手动封禁（Telegram原生操作）',
-		manual: '/ban 指令加黑',
-		spam: '/spam 引用回复加黑',
+		manual_ban: '群管理员手动封禁（Telegram原生操作，自动同步）',
+		manual: '管理员 /ban 指令加黑',
+		spam: '管理员 /spam 引用回复加黑',
 		ad_auto: '广告自动检测加黑',
+		ad_learn: '上报学习加黑',
 	};
 	return map[reason] || reason || '未知';
 }
