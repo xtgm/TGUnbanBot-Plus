@@ -1582,6 +1582,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 				新状态: newStatusEarly,
 				踢人结果: banResult.ok ? '成功' : `失败:${banResult.error}`
 			}));
+			await notifyOwnerBlacklistIntercept(targetUser, chat, '复入群拦截', blacklistCheck, banResult);
 			return; // 已处理，不再走后面"管理员操作同步"分支
 		}
 	}
@@ -2178,6 +2179,71 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 	}
 }
 
+// 黑名单自动拦截通知主人（复入群拦截 / 发言拦截时调用）
+async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklistInfo, banResult) {
+	if (!OWNER_ID) return;
+	const target = targetUser
+		? formatUserMention(targetUser)
+		: '<code>未知</code>';
+	const targetId = String(targetUser?.id || '未知');
+
+	let groupLabel = `<code>${escapeHtml(String(chat.id))}</code>`;
+	try {
+		const info = await getChatInfoFromId(chat.id);
+		if (info?.title) groupLabel = `<b>${escapeHtml(info.title)}</b> <code>${escapeHtml(String(chat.id))}</code>`;
+	} catch (_) {}
+
+	const reason = blacklistInfo?.entry?.reason
+		? escapeHtml(blacklistInfo.entry.reason)
+		: '未知';
+
+	const lines = [
+		`🚫 <b>黑名单自动拦截</b>`,
+		`🎬 动作:${escapeHtml(action)}`,
+		`👤 用户:${target} <code>${escapeHtml(targetId)}</code>`,
+		`📍 群:${groupLabel}`,
+		`📋 原加黑原因:${reason}`,
+	];
+	if (banResult && !banResult.ok) {
+		lines.push(`⚠️ 踢人结果:失败 - ${escapeHtml(banResult.error || '未知')}`);
+	}
+
+	const dm = await sendTelegramMessage(OWNER_ID, lines.join('\n'));
+	if (!dm?.ok) {
+		console.error(`[黑名单拦截通知] 通知主人失败:${dm?.description || '未知'}`);
+	}
+}
+
+// 黑名单用户尝试自助解封时通知主人（申诉提醒）
+async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
+	if (!OWNER_ID) return;
+	const target = fromUser
+		? formatUserMention(fromUser)
+		: '<code>未知</code>';
+	const targetId = String(fromUser?.id || '未知');
+	const reason = blacklistInfo?.entry?.reason
+		? escapeHtml(blacklistInfo.entry.reason)
+		: '未知';
+	const addedBy = blacklistInfo?.entry?.by
+		? `<code>${escapeHtml(String(blacklistInfo.entry.by))}</code>`
+		: '未知';
+
+	const lines = [
+		`📢 <b>黑名单用户申诉</b>`,
+		`👤 用户:${target} <code>${escapeHtml(targetId)}</code>`,
+		`📋 原加黑原因:${reason}`,
+		`🔧 加黑操作人:${addedBy}`,
+		'',
+		`该用户正尝试自助解封但被黑名单阻止。`,
+		`如确认误封，请执行: <code>/unban ${escapeHtml(targetId)}</code>`,
+	];
+
+	const dm = await sendTelegramMessage(OWNER_ID, lines.join('\n'));
+	if (!dm?.ok) {
+		console.error(`[黑名单申诉通知] 通知主人失败:${dm?.description || '未知'}`);
+	}
+}
+
 // 应答 callback_query，让前端按钮停止 loading 并可选弹出提示气泡
 async function answerCallbackQuery(callbackQueryId, text, showAlert = false) {
 	try {
@@ -2451,6 +2517,7 @@ async function handleMessage(message, env, ctx) {
 				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+踢人`);
 				await deleteMessage(chatId, message.message_id);
 				await banUserFromGroup(chatId, userId);
+				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, null);
 				return;
 			}
 		}
@@ -3252,6 +3319,7 @@ async function handleMessage(message, env, ctx) {
 		const blacklistCheck = await checkBlacklist(userId, env);
 		if (blacklistCheck.isBlacklisted) {
 			await sendTelegramMessage(chatId, blacklistCheck.message);
+			await notifyOwnerBlacklistAppeal(message.from, blacklistCheck);
 			return;
 		}
 
@@ -3269,6 +3337,7 @@ async function handleMessage(message, env, ctx) {
 		const blacklistCheck = await checkBlacklist(userId, env);
 		if (blacklistCheck.isBlacklisted) {
 			await sendTelegramMessage(chatId, blacklistCheck.message);
+			await notifyOwnerBlacklistAppeal(message.from, blacklistCheck);
 			return;
 		}
 
