@@ -1335,18 +1335,36 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	const banlistResult = await handleBanlist(tgidToCheck);
 	const banlistData = JSON.parse(banlistResult);
 
+	// 同时查询本地 D1 黑名单
+	let localBlacklistInfo = '';
+	if (options.env) {
+		const localCheck = await checkBlacklist(tgidToCheck, options.env);
+		if (localCheck.isBlacklisted) {
+			const entry = localCheck.entry;
+			const reason = translateBlacklistReason(entry?.reason);
+			const operator = await translateBlacklistOperator(entry?.by);
+			const addedAt = entry?.at || '未知';
+			localBlacklistInfo = `\n🚫 <b>本地黑名单:在黑名单中</b>\n` +
+				`├ 加黑方式:${reason}\n` +
+				`├ 操作人:${operator}\n` +
+				`└ 时间:${escapeHtml(addedAt)}\n`;
+		} else {
+			localBlacklistInfo = `\n✅ <b>本地黑名单:不在黑名单中</b>\n`;
+		}
+	}
+
 	if (!banlistData.success) {
 		return {
-			text: `❌ <b>查询失败</b>\n\n${escapeHtml(banlistData.error || '未知错误')}`
+			text: `❌ <b>查询失败</b>\n\n${escapeHtml(banlistData.error || '未知错误')}${localBlacklistInfo}`
 		};
 	}
 
 	if (!banlistData.banned) {
-		let responseMessage = `✅ <b>查询结果</b>\n\nTGID <code>${escapeHtml(tgidToCheck)}</code> 没有封禁记录。`;
+		let responseMessage = `✅ <b>查询结果</b>\n\nTGID <code>${escapeHtml(tgidToCheck)}</code> 没有 GKY 封禁记录。`;
 		if (options.targetUser) {
-			responseMessage = `✅ <b>查询结果</b>\n\n用户 ${formatUserMention(options.targetUser) || `<code>${escapeHtml(tgidToCheck)}</code>`} 没有封禁记录。\nTGID: <code>${escapeHtml(tgidToCheck)}</code>`;
+			responseMessage = `✅ <b>查询结果</b>\n\n用户 ${formatUserMention(options.targetUser) || `<code>${escapeHtml(tgidToCheck)}</code>`} 没有 GKY 封禁记录。\nTGID: <code>${escapeHtml(tgidToCheck)}</code>`;
 		}
-
+		responseMessage += localBlacklistInfo;
 		return { text: responseMessage };
 	}
 
@@ -1373,6 +1391,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	if (banlistData.recordedDate) responseMessage += `📅 <b>封禁日期:</b> ${escapeHtml(banlistData.recordedDate)}\n`;
 	if (banlistData.reason) responseMessage += `⚠️ <b>封禁原因:</b> ${escapeHtml(banlistData.reason)}\n`;
 	if (banlistData.info) responseMessage += `\n📝 <b>封禁内容:</b>\n<tg-spoiler>${escapeHtml(banlistData.info)}</tg-spoiler>\n`;
+	responseMessage += localBlacklistInfo;
 
 	if (!options.includeReviewAction) {
 		return { text: responseMessage };
@@ -2726,6 +2745,7 @@ async function handleMessage(message, env, ctx) {
 			const response = await buildBanlistCheckResponse(checkArg, {
 				includeReviewAction: true,
 				actionInCurrentChat: isConfiguredGroup(chatId),
+				env,
 			});
 			await sendTelegramMessage(chatId, response.text, response.replyMarkup);
 			return;
@@ -2753,7 +2773,8 @@ async function handleMessage(message, env, ctx) {
 		const response = await buildBanlistCheckResponse(tgidToCheck, {
 			targetUser: repliedUser,
 			includeReviewAction: true,
-			actionInCurrentChat: true
+			actionInCurrentChat: true,
+			env,
 		});
 		await sendTelegramMessage(chatId, response.text, response.replyMarkup);
 		return;
@@ -2776,7 +2797,7 @@ async function handleMessage(message, env, ctx) {
 			// 提取 TGID
 			const tgidToCheck = parts[1].replace('check_', '');
 			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
-			const response = await buildBanlistCheckResponse(tgidToCheck, { includeReviewAction: true });
+			const response = await buildBanlistCheckResponse(tgidToCheck, { includeReviewAction: true, env });
 			await sendTelegramMessage(chatId, response.text, response.replyMarkup);
 
 			return;
