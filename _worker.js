@@ -584,7 +584,13 @@ let D1_INITED = false;
 async function ensureD1Table(env) {
 	if (!env.DB || D1_INITED) return;
 	try {
-		await env.DB.exec('CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT)');
+		await env.DB.exec(`
+			CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT);
+			CREATE TABLE IF NOT EXISTS ad_keywords (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
+			CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
+			CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);
+			CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
+		`);
 		D1_INITED = true;
 	} catch (error) {
 		console.error('D1 建表失败:', error);
@@ -603,43 +609,23 @@ async function readD1Blacklist(env) {
 	}));
 }
 
-// 把 D1 全表镜像到 KV（写入侧用，保证 KV 永远是 D1 的镜像）
-async function mirrorToKV(env) {
-	if (!env.KV) return;
-	try {
-		const list = env.DB ? await readD1Blacklist(env) : null;
-		if (list) {
-			await env.KV.put('blacklist', JSON.stringify(list));
-		}
-	} catch (error) {
-		console.error('镜像 D1 到 KV 失败:', error);
-	}
-}
 
 // === 黑名单读写接口 ===
-// 优先级：D1 → KV → 空数组
+// 仅走 D1
 async function getBlacklist(env) {
 	if (env.DB) {
 		try {
 			return await readD1Blacklist(env);
 		} catch (error) {
-			console.error('读 D1 黑名单失败，回退到 KV:', error);
-		}
-	}
-	if (env.KV) {
-		try {
-			const raw = await env.KV.get('blacklist', { type: 'json' });
-			return normalizeBlacklist(raw);
-		} catch (error) {
-			console.error('读 KV 黑名单失败:', error);
+			console.error('读 D1 黑名单失败:', error);
 		}
 	}
 	return [];
 }
 
-// 检查用户是否在黑名单中（KV/D1 任一绑定即可）
+// 检查用户是否在黑名单中
 async function checkBlacklist(userId, env) {
-	if (!env.KV && !env.DB) {
+	if (!env.DB) {
 		return { isBlacklisted: false, message: null };
 	}
 
@@ -664,12 +650,10 @@ async function checkBlacklist(userId, env) {
 	}
 }
 
-// 添加用户到黑名单（核心实现，不调 mirrorToKV，供批量场景串行调用后统一镜像）
-// options: { reason, by } —— reason 是封禁原因，by 是操作人 TGID
-// 写入策略：D1 / KV 任一存在即可写入；都绑定时 D1 为权威，调用方负责镜像到 KV
+// 添加用户到黑名单（核心实现）
 async function addToBlacklistCore(userId, env, options = {}) {
-	if (!env.KV && !env.DB) {
-		return { success: false, message: '❌ 未绑定 KV 或 D1 存储空间' };
+	if (!env.DB) {
+		return { success: false, message: '❌ 未绑定 D1 存储空间' };
 	}
 
 	const userIdStr = String(userId);
@@ -678,30 +662,18 @@ async function addToBlacklistCore(userId, env, options = {}) {
 	const at = new Date().toISOString();
 
 	try {
-		// 路径 A：有 D1，以 D1 为权威
-		if (env.DB) {
-			await ensureD1Table(env);
-			// SQLite 没有原子性的"返回是否插入"机制，先 SELECT 再 INSERT
-			const existing = await env.DB
-				.prepare('SELECT id FROM blacklist WHERE id = ?')
-				.bind(userIdStr)
-				.first();
-			if (existing) {
-				return { success: false, message: '⚠️ 该用户已在黑名单中' };
-			}
-			await env.DB
-				.prepare('INSERT INTO blacklist (id, reason, by_user, at) VALUES (?, ?, ?, ?)')
-				.bind(userIdStr, reason, by, at)
-				.run();
-		} else {
-			// 路径 B：仅 KV
-			const blacklist = await getBlacklist(env);
-			if (blacklist.some((entry) => entry.id === userIdStr)) {
-				return { success: false, message: '⚠️ 该用户已在黑名单中' };
-			}
-			blacklist.push({ id: userIdStr, reason, by, at });
-			await env.KV.put('blacklist', JSON.stringify(blacklist));
+		await ensureD1Table(env);
+		const existing = await env.DB
+			.prepare('SELECT id FROM blacklist WHERE id = ?')
+			.bind(userIdStr)
+			.first();
+		if (existing) {
+			return { success: false, message: '⚠️ 该用户已在黑名单中' };
 		}
+		await env.DB
+			.prepare('INSERT INTO blacklist (id, reason, by_user, at) VALUES (?, ?, ?, ?)')
+			.bind(userIdStr, reason, by, at)
+			.run();
 
 		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 添加到黑名单` };
 	} catch (error) {
@@ -710,43 +682,29 @@ async function addToBlacklistCore(userId, env, options = {}) {
 	}
 }
 
-// 添加用户到黑名单（薄包装）：Core + 单次镜像。保持现有所有调用点签名/语义不变
+// 添加用户到黑名单（薄包装）
 async function addToBlacklist(userId, env, options = {}) {
 	const result = await addToBlacklistCore(userId, env, options);
-	if (result.success && env.DB && env.KV) {
-		await mirrorToKV(env);
-	}
 	return result;
 }
 
-// 从黑名单中移除用户（核心实现，不调 mirrorToKV）
+// 从黑名单中移除用户（核心实现）
 async function removeFromBlacklistCore(userId, env) {
-	if (!env.KV && !env.DB) {
-		return { success: false, message: '❌ 未绑定 KV 或 D1 存储空间' };
+	if (!env.DB) {
+		return { success: false, message: '❌ 未绑定 D1 存储空间' };
 	}
 
 	const userIdStr = String(userId);
 
 	try {
-		// 路径 A：有 D1
-		if (env.DB) {
-			await ensureD1Table(env);
-			const result = await env.DB
-				.prepare('DELETE FROM blacklist WHERE id = ?')
-				.bind(userIdStr)
-				.run();
-			const changed = result?.meta?.changes ?? result?.changes ?? 0;
-			if (!changed) {
-				return { success: false, message: '⚠️ 该用户不在黑名单中' };
-			}
-		} else {
-			// 路径 B：仅 KV
-			const blacklist = await getBlacklist(env);
-			const updated = blacklist.filter((entry) => entry.id !== userIdStr);
-			if (updated.length === blacklist.length) {
-				return { success: false, message: '⚠️ 该用户不在黑名单中' };
-			}
-			await env.KV.put('blacklist', JSON.stringify(updated));
+		await ensureD1Table(env);
+		const result = await env.DB
+			.prepare('DELETE FROM blacklist WHERE id = ?')
+			.bind(userIdStr)
+			.run();
+		const changed = result?.meta?.changes ?? result?.changes ?? 0;
+		if (!changed) {
+			return { success: false, message: '⚠️ 该用户不在黑名单中' };
 		}
 
 		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 从黑名单中移除` };
@@ -756,12 +714,9 @@ async function removeFromBlacklistCore(userId, env) {
 	}
 }
 
-// 从黑名单中移除用户（薄包装）：Core + 单次镜像
+// 从黑名单中移除用户（薄包装）
 async function removeFromBlacklist(userId, env) {
 	const result = await removeFromBlacklistCore(userId, env);
-	if (result.success && env.DB && env.KV) {
-		await mirrorToKV(env);
-	}
 	return result;
 }
 
@@ -954,9 +909,6 @@ async function addManyToBlacklist(ids, env, options = {}) {
 			results.failed.push({ id, msg: r.message || '失败' });
 		}
 	}
-	if (env.DB && env.KV && results.success.length > 0) {
-		await mirrorToKV(env);
-	}
 	return results;
 }
 
@@ -972,9 +924,6 @@ async function removeManyFromBlacklist(ids, env) {
 		} else {
 			results.failed.push({ id, msg: r.message || '失败' });
 		}
-	}
-	if (env.DB && env.KV && results.success.length > 0) {
-		await mirrorToKV(env);
 	}
 	return results;
 }
@@ -1027,7 +976,7 @@ async function handleMigrate(env) {
 	if (!env.DB) {
 		return jsonResponse({ 成功: false, 错误: '未绑定 D1（binding=DB）' }, 400);
 	}
-	if (!env.KV) {
+	if (!env.DB) {
 		return jsonResponse({ 成功: false, 错误: '未绑定 KV，无源数据可迁移' }, 400);
 	}
 
@@ -1048,8 +997,7 @@ async function handleMigrate(env) {
 			else skipped++;
 		}
 
-		// 迁移后再镜像一次，保证 KV 与 D1 完全一致
-		await mirrorToKV(env);
+		// 迁移完成
 
 		return jsonResponse({
 			成功: true,
@@ -1070,8 +1018,8 @@ async function handleMigrate(env) {
 //   ?format=csv  → text/csv，UTF-8 + BOM，Excel 可直接打开
 //   其它/默认    → HTML 表格，浏览器直接查看
 async function handleExport(env, url) {
-	if (!env.KV && !env.DB) {
-		return new Response('❌ 未绑定 KV 或 D1 存储空间', { status: 400 });
+	if (!env.DB) {
+		return new Response('❌ 未绑定 D1 存储空间', { status: 400 });
 	}
 
 	let blacklist;
@@ -1206,7 +1154,7 @@ ${sorted.length === 0 ? '' : `<script>
 // 受 TOKEN 保护（与 /migrate /export 同等防护级别）
 // 串行执行避免 Telegram API 限流，先 checkUserStatus 跳过已离群/已踢的用户
 async function handlePurge(env) {
-	if (!env.KV && !env.DB) {
+	if (!env.DB) {
 		return jsonResponse({ 成功: false, 错误: '未绑定 KV 或 D1 存储空间' }, 400);
 	}
 	if (!Array.isArray(GROUP_IDS) || GROUP_IDS.length === 0) {
@@ -1571,7 +1519,7 @@ async function handleNewChatMemberBots(message) {
 // 加黑：从其它状态 → kicked
 // 移黑：从 kicked → 任意其它状态
 async function handleChatMemberUpdate(chatMember, env) {
-	if (!chatMember || (!env.KV && !env.DB)) return;
+	if (!chatMember || (!env.DB)) return;
 
 	const chat = chatMember.chat;
 	const oldMember = chatMember.old_chat_member;
@@ -1714,14 +1662,18 @@ async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newSta
 
 // ===== 广告自动检测 =====
 
-// 从 KV 读自定义广告词库(分类对象),空/出错返回 null
+// 从 D1 读自定义广告词库(分类对象),空/出错返回 null
 async function loadAdKeywordsFromKV(env) {
-	if (!env.KV) return null;
+	if (!env.DB) return null;
 	try {
-		const raw = await env.KV.get(AD_KW_KEY, { type: 'json' });
-		if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw;
+		await ensureD1Table(env);
+		const row = await env.DB.prepare('SELECT data FROM ad_keywords WHERE id = 1').first();
+		if (row && row.data) {
+			const parsed = JSON.parse(row.data);
+			if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+		}
 	} catch (error) {
-		console.error('[广告词库] 读 KV 失败:', error);
+		console.error('[广告词库] 读 D1 失败:', error);
 	}
 	return null;
 }
@@ -1752,14 +1704,17 @@ async function mergeAdKeywordsFromKV(env) {
 	AD_WHITELIST = [...new Set([...AD_WHITELIST, ...wlWords])];
 }
 
-// 把词库对象写回 KV
+// 把词库对象写回 D1
 async function saveAdKeywordsToKV(env, data) {
-	if (!env.KV) return { ok: false, error: '未绑定 KV 存储空间' };
+	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
 	try {
-		await env.KV.put(AD_KW_KEY, JSON.stringify(data));
+		await ensureD1Table(env);
+		await env.DB.prepare('INSERT OR REPLACE INTO ad_keywords (id, data, updated_at) VALUES (1, ?, ?)')
+			.bind(JSON.stringify(data), new Date().toISOString())
+			.run();
 		return { ok: true };
 	} catch (error) {
-		console.error('[广告词库] 写 KV 失败:', error);
+		console.error('[广告词库] 写 D1 失败:', error);
 		return { ok: false, error: error.message };
 	}
 }
@@ -1805,26 +1760,33 @@ function extractAdKeywords(text) {
 		.slice(0, 5);
 }
 
-// 从 KV 读样本(返回 { fingerprints: [], count, updatedAt })
+// 从 D1 读样本(返回 { fingerprints: [], count, updatedAt })
 async function loadAdSamplesFromKV(env) {
-	if (!env.KV) return null;
+	if (!env.DB) return null;
 	try {
-		const raw = await env.KV.get(AD_SAMPLES_KEY, { type: 'json' });
-		if (raw && Array.isArray(raw.fingerprints)) return raw;
+		await ensureD1Table(env);
+		const row = await env.DB.prepare('SELECT data FROM ad_samples WHERE id = 1').first();
+		if (row && row.data) {
+			const parsed = JSON.parse(row.data);
+			if (parsed && Array.isArray(parsed.fingerprints)) return parsed;
+		}
 	} catch (error) {
-		console.error('[广告样本] 读 KV 失败:', error);
+		console.error('[广告样本] 读 D1 失败:', error);
 	}
 	return null;
 }
 
-// 写样本回 KV
+// 写样本回 D1
 async function saveAdSamplesToKV(env, data) {
-	if (!env.KV) return { ok: false, error: '未绑定 KV 存储空间' };
+	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
 	try {
-		await env.KV.put(AD_SAMPLES_KEY, JSON.stringify(data));
+		await ensureD1Table(env);
+		await env.DB.prepare('INSERT OR REPLACE INTO ad_samples (id, data, updated_at) VALUES (1, ?, ?)')
+			.bind(JSON.stringify(data), new Date().toISOString())
+			.run();
 		return { ok: true };
 	} catch (error) {
-		console.error('[广告样本] 写 KV 失败:', error);
+		console.error('[广告样本] 写 D1 失败:', error);
 		return { ok: false, error: error.message };
 	}
 }
@@ -1870,29 +1832,37 @@ async function learnAdSample(env, learnText) {
 
 // 写入快照:items 是已排序好的数组(序号 1 = items[0]),scope/at 仅作展示与排错
 async function saveLearnSnapshot(env, items, meta = {}) {
-	if (!env.KV) return { ok: false, error: '未绑定 KV 存储空间' };
+	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
 	try {
-		await env.KV.put(LEARN_SNAPSHOT_KEY, JSON.stringify({
+		await ensureD1Table(env);
+		const data = JSON.stringify({
 			items: items || [],
 			scope: meta.scope || '',
 			byChatId: meta.byChatId || '',
 			at: new Date().toISOString(),
-		}));
+		});
+		await env.DB.prepare('INSERT OR REPLACE INTO learn_snapshot (id, data, updated_at) VALUES (1, ?, ?)')
+			.bind(data, new Date().toISOString())
+			.run();
 		return { ok: true };
 	} catch (error) {
-		console.error('[学习快照] 写 KV 失败:', error);
+		console.error('[学习快照] 写 D1 失败:', error);
 		return { ok: false, error: error.message };
 	}
 }
 
 // 读取快照,返回 { items: [], scope, byChatId, at } 或 null
 async function loadLearnSnapshot(env) {
-	if (!env.KV) return null;
+	if (!env.DB) return null;
 	try {
-		const raw = await env.KV.get(LEARN_SNAPSHOT_KEY, { type: 'json' });
-		if (raw && Array.isArray(raw.items)) return raw;
+		await ensureD1Table(env);
+		const row = await env.DB.prepare('SELECT data FROM learn_snapshot WHERE id = 1').first();
+		if (row && row.data) {
+			const parsed = JSON.parse(row.data);
+			if (parsed && Array.isArray(parsed.items)) return parsed;
+		}
 	} catch (error) {
-		console.error('[学习快照] 读 KV 失败:', error);
+		console.error('[学习快照] 读 D1 失败:', error);
 	}
 	return null;
 }
@@ -1909,18 +1879,26 @@ function looksLikeAdCandidate(message) {
 	if (urls.length > 0) return true;                 // 含链接
 	if (/@[a-zA-Z][\w]{3,}/.test(text)) return true;  // @用户名提及(引流)
 	if (/\d{5,}/.test(text)) return true;             // 长数字串(电话/金额)
-	if (text.length >= 15) return true;               // 较长文本
 	return false;
 }
 
 // 读最近消息缓存
 async function loadRecentMessages(env) {
-	if (!env.KV) return [];
+	if (!env.DB) return [];
 	try {
-		const raw = await env.KV.get(RECENT_MSG_KEY, { type: 'json' });
-		if (raw && Array.isArray(raw.items)) return raw.items;
+		await ensureD1Table(env);
+		const { results } = await env.DB.prepare('SELECT mid, chat_id, chat_title, text, from_id, from_name, created_at FROM recent_messages ORDER BY id ASC').all();
+		return (results || []).map(r => ({
+			mid: r.mid,
+			chatId: r.chat_id,
+			chatTitle: r.chat_title || '',
+			text: r.text || '',
+			fromId: r.from_id || '',
+			fromName: r.from_name || '',
+			at: r.created_at || '',
+		}));
 	} catch (error) {
-		console.error('[消息缓存] 读 KV 失败:', error);
+		console.error('[消息缓存] 读 D1 失败:', error);
 	}
 	return [];
 }
@@ -1939,24 +1917,24 @@ function filterMessagesByContext(items, message) {
 
 // 缓存一条消息(环形,保留最近 MSG_CACHE_SIZE 条)
 async function cacheRecentMessage(env, message) {
-	if (!env.KV) return;
+	if (!env.DB) return;
 	try {
-		const items = await loadRecentMessages(env);
-		// 名片消息无 text,把名片内容(名字/电话/vcard)作为可学习文本缓存
+		await ensureD1Table(env);
 		const cacheText = (message.text || message.caption || getContactText(message) || '').slice(0, 500);
-		items.push({
-			mid: message.message_id,
-			chatId: String(message.chat.id),
-			chatTitle: message.chat.title || '',
-			text: cacheText,
-			fromId: String(message.from?.id || ''),
-			fromName: [message.from?.first_name, message.from?.last_name].filter(Boolean).join(' ') || message.from?.username || '',
-			at: new Date().toISOString(),
-		});
-		const trimmed = items.slice(-MSG_CACHE_SIZE);
-		await env.KV.put(RECENT_MSG_KEY, JSON.stringify({ items: trimmed, updatedAt: new Date().toISOString() }));
+		await env.DB.prepare('INSERT INTO recent_messages (mid, chat_id, chat_title, text, from_id, from_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+			.bind(
+				message.message_id,
+				String(message.chat.id),
+				message.chat.title || '',
+				cacheText,
+				String(message.from?.id || ''),
+				[message.from?.first_name, message.from?.last_name].filter(Boolean).join(' ') || message.from?.username || '',
+				new Date().toISOString()
+			)
+			.run();
+		await env.DB.prepare('DELETE FROM recent_messages WHERE id NOT IN (SELECT id FROM recent_messages ORDER BY id DESC LIMIT ?)').bind(MSG_CACHE_SIZE).run();
 	} catch (error) {
-		console.error('[消息缓存] 写 KV 失败:', error);
+		console.error('[消息缓存] 写 D1 失败:', error);
 	}
 }
 
@@ -2424,7 +2402,7 @@ async function handleMessage(message, env, ctx) {
 
 	// 缓存"疑似广告"群消息(供 /learnlast 学习被 GKY 删掉的广告);ctx.waitUntil 异步不阻塞
 	if (
-		MSG_CACHE_ENABLED && env.KV && isConfiguredGroup(chatId) &&
+		MSG_CACHE_ENABLED && env.DB && isConfiguredGroup(chatId) &&
 		message.from && !message.from.is_bot &&
 		!(text && text.startsWith('/')) &&
 		looksLikeAdCandidate(message)
@@ -2519,7 +2497,7 @@ async function handleMessage(message, env, ctx) {
 
 			// 仅主人 /spam → 学习样本(只写整句指纹入库,不污染词库)
 			const isOwnerSpam = OWNER_ID && String(userId) === OWNER_ID;
-			if (isOwnerSpam && env.KV) {
+			if (isOwnerSpam && env.DB) {
 				const r = message.reply_to_message;
 				// 指纹只取正文(text+caption),不混入用户名,保证跨发送者精确命中
 				const learnText = [r.text, r.caption].filter(Boolean).join(' ');
@@ -2658,7 +2636,7 @@ async function handleMessage(message, env, ctx) {
 			return;
 		}
 
-		if (!env.KV && !env.DB) {
+		if (!env.DB) {
 			await sendTelegramMessage(chatId, '❌ 未绑定 KV 或 D1 存储空间，无法查看黑名单。');
 			return;
 		}
@@ -2729,8 +2707,8 @@ async function handleMessage(message, env, ctx) {
 			}
 			return;
 		}
-		if (!env.KV) {
-			await sendTelegramMessage(chatId, '❌ 未绑定 KV 存储空间,无法管理广告词库。');
+		if (!env.DB) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间,无法管理广告词库。');
 			return;
 		}
 
@@ -2862,8 +2840,8 @@ async function handleMessage(message, env, ctx) {
 			}
 			return;
 		}
-		if (!env.KV) {
-			await sendTelegramMessage(chatId, '❌ 未绑定 KV 存储空间,无法管理学习样本。');
+		if (!env.DB) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间,无法管理学习样本。');
 			return;
 		}
 
@@ -2954,8 +2932,8 @@ async function handleMessage(message, env, ctx) {
 			}
 			return;
 		}
-		if (!env.KV) {
-			await sendTelegramMessage(chatId, '❌ 未绑定 KV 存储空间,无法学习。');
+		if (!env.DB) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间,无法学习。');
 			return;
 		}
 
