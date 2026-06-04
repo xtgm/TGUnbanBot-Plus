@@ -60,10 +60,10 @@ const DEFAULT_SUPER_ADMINS = [
 // 8) 主人 TGID(项目所有者),用于"主人审计通知"系统
 //    所有管理员/超管在群里使用 /ban /unban /spam 命令、点一键解封按钮、
 //    群内手动 ban/unban 时,主人会收到一份带操作人标记的私聊审计通知
-//    优先级:环境变量 OWNER_ID > 这里的 DEFAULT_OWNER_ID
-//    留空字符串 = 禁用通知系统(其他管理员仍可正常使用命令,但都没有私聊详情)
-//    填了 OWNER_ID 但主人从未私聊过 bot → 通知会投递失败,Worker 日志可见
-const DEFAULT_OWNER_ID = '';
+//    环境变量 OWNER_IDS(逗号分隔,中英文逗号均可),支持多主人,所有主人实时收到审计通知
+//    空数组 = 禁用通知系统(其他管理员仍可正常使用命令,但都没有私聊详情)
+//    填了主人ID但主人从未私聊过 bot → 该主人的通知会投递失败,Worker 日志可见
+const DEFAULT_OWNER_IDS = [];
 
 // 9) 广告自动检测(多维度评分 + 强特征直杀),命中 → 删消息 + 加黑 + 全群踢 + 通知主人
 //    优先级:环境变量 > 这里的硬编码默认值
@@ -163,8 +163,8 @@ let GROUP_ID;
 let GROUP_IDS = [];
 // 超级管理员 TGID 白名单（用于按钮交互鉴权，普通群管理员不在此列时不能点按钮）
 let SUPER_ADMINS = [];
-// 主人 TGID(项目所有者),用于全局审计通知。空字符串 = 未配置,禁用通知
-let OWNER_ID = '';
+// 主人 TGID 列表(项目所有者),用于全局审计通知。空数组 = 未配置,禁用通知
+let OWNER_IDS = [];
 // 广告检测运行期配置
 let AD_FILTER_ENABLED = false;
 let AD_SCORE_THRESHOLD = 3;
@@ -202,7 +202,7 @@ export default {
 			GROUP_IDS = config.GROUP_IDS;
 			GROUP_ID = config.GROUP_ID;
 			SUPER_ADMINS = config.SUPER_ADMINS;
-			OWNER_ID = config.OWNER_ID;
+			OWNER_IDS = config.OWNER_IDS;
 			AD_FILTER_ENABLED = config.AD_FILTER_ENABLED;
 			AD_SCORE_THRESHOLD = config.AD_SCORE_THRESHOLD;
 			AD_KEYWORDS = config.AD_KEYWORDS;
@@ -322,16 +322,16 @@ function loadRequiredConfig(env) {
 		superAdmins = sanitizeAdmins(DEFAULT_SUPER_ADMINS);
 	}
 
-	// OWNER_ID 可选：环境变量优先 > DEFAULT_OWNER_ID。空字符串 = 禁用主人通知
-	let ownerId = '';
-	const rawOwnerEnv = env.OWNER_ID;
+	// OWNER_IDS 可选：环境变量逗号分隔（中英文逗号均可），支持多主人，空 = 禁用主人通知
+	let ownerIds = [];
+	const rawOwnerEnv = env.OWNER_IDS;
 	if (rawOwnerEnv !== undefined && rawOwnerEnv !== null && String(rawOwnerEnv).trim() !== '') {
-		ownerId = String(rawOwnerEnv).trim();
+		ownerIds = sanitizeAdmins(String(rawOwnerEnv).split(/[,，]/));
 	} else {
-		ownerId = String(DEFAULT_OWNER_ID || '').trim();
+		ownerIds = sanitizeAdmins(
+			Array.isArray(DEFAULT_OWNER_IDS) ? DEFAULT_OWNER_IDS : [DEFAULT_OWNER_IDS].filter(Boolean)
+		);
 	}
-	// 校验 TGID 格式(纯数字),非法值视为未配置
-	if (!/^\d+$/.test(ownerId)) ownerId = '';
 
 	// 顶部 6 项可配置文案/参数：环境变量优先，否则用内置默认值
 	const pickStr = (envVal, fallback) => {
@@ -399,7 +399,7 @@ function loadRequiredConfig(env) {
 		GROUP_IDS: uniqueGroupIds,
 		GROUP_ID: uniqueGroupIds[0],
 		SUPER_ADMINS: superAdmins,
-		OWNER_ID: ownerId,
+		OWNER_IDS: ownerIds,
 		AD_FILTER_ENABLED: adFilterEnabled,
 		AD_SCORE_THRESHOLD: adScoreThreshold,
 		AD_KEYWORDS: adKeywords,
@@ -833,11 +833,28 @@ function renderBanResults(banResults) {
 
 // 双通道回执：群内场景发闪屏 + 私聊管理员发详情；私聊场景直接发详情
 // 私聊投递失败（管理员从未 /start 过 bot）时，群里追加一条闪屏说明
+
+function isOwner(id) {
+	return OWNER_IDS.length > 0 && OWNER_IDS.includes(String(id || ''));
+}
+
+async function notifyAllOwners(text, excludeId) {
+	if (!OWNER_IDS.length) return;
+	const excludeStr = excludeId ? String(excludeId) : '';
+	await Promise.allSettled(
+		OWNER_IDS
+			.filter(id => id !== excludeStr)
+			.map(id => sendTelegramMessage(id, text).then(r => {
+				if (!r?.ok) console.error(`[审计通知] 私聊主人${id}失败:${r?.description || '未知'}`);
+			}))
+	);
+}
+
 // 判定操作人角色,返回中文标签:主人 / 超级管理员 / 群管理员
 // 主人优先级最高;主人之外的 SUPER_ADMINS 是"超级管理员";其余按调用方传入的兜底标签(默认"管理员")
 function classifyOperatorRole(userId, fallback = '管理员') {
 	const idStr = String(userId || '');
-	if (OWNER_ID && idStr === OWNER_ID) return '主人';
+	if (isOwner(idStr)) return '主人';
 	if (isSuperAdmin(idStr)) return '超级管理员';
 	return fallback;
 }
@@ -850,31 +867,39 @@ function renderAuditNotification(operatorMention, detailText, sourceLabel, roleL
 }
 
 // 双通道回执:
-// - 群内场景:发闪屏给所有人(5 秒自动撤回) + 私聊详情**只发给主人 OWNER_ID**
-// - 私聊场景:触发者本人收一份;如果 OWNER_ID 配置了且不是触发者,主人也收一份带操作人标记的副本
+// - 群内场景:发闪屏给所有人(5 秒自动撤回) + 私聊详情发给所有主人
+// - 私聊场景:触发者本人收一份;所有主人也收一份带操作人标记的副本(触发者是主人则收"你自己"版)
 //
 // 主人通知规则:
-//   * OWNER_ID 未配置 → 跳过私聊投递,仅群闪屏
-//   * 触发者就是 OWNER_ID → 发一份带"你自己"标记的详情(避免重复)
-//   * 触发者非 OWNER_ID → 主人收带"🔔 操作人/来源"头的审计通知
+//   * OWNER_IDS 为空 → 跳过私聊投递,仅群闪屏
+//   * 触发者是某主人 → 该主人收"你自己"标记的详情,其他主人收审计通知
+//   * 触发者非主人 → 所有主人收带"🔔 操作人/来源"头的审计通知
 //   * 私聊投递失败(主人没和 bot 私聊过等) → 仅记日志,不在群里追加任何"主人"字样
 async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup }) {
 	const chatId = message.chat.id;
 	const triggerId = message.from.id;
-	const triggerIsOwner = OWNER_ID && String(triggerId) === OWNER_ID;
+	const triggerIdStr = String(triggerId);
+	const triggerIsOwner = isOwner(triggerId);
 	const operator = formatUserMention(message.from) || `<code>${escapeHtml(String(triggerId))}</code>`;
 
 	if (!isInGroup) {
 		// 私聊场景:触发者本人收原详情(向后兼容)
 		await sendTelegramMessage(chatId, detailText);
-		// 如果触发者不是主人,主人也收一份审计副本
-		if (OWNER_ID && !triggerIsOwner) {
+		// 所有主人收审计副本(触发者是主人则收"你自己"版)
+		if (OWNER_IDS.length) {
 			const role = classifyOperatorRole(triggerId, '管理员');
-			const auditText = renderAuditNotification(operator, detailText, '私聊', role);
-			const dmOwner = await sendTelegramMessage(OWNER_ID, auditText);
-			if (!dmOwner?.ok) {
-				console.error(`[审计通知] 私聊主人失败:${dmOwner?.description || '未知'}`);
-			}
+			await Promise.allSettled(OWNER_IDS.map(oid => {
+				if (oid === triggerIdStr) {
+					const selfText = `🔔 <b>主人操作通知</b>\n👤 操作人:${operator}（你自己）\n📍 来源:私聊\n\n${detailText}`;
+					return sendTelegramMessage(oid, selfText).then(r => {
+						if (!r?.ok) console.error(`[审计通知] 私聊主人${oid}失败:${r?.description || '未知'}`);
+					});
+				}
+				const auditText = renderAuditNotification(operator, detailText, '私聊', role);
+				return sendTelegramMessage(oid, auditText).then(r => {
+					if (!r?.ok) console.error(`[审计通知] 私聊主人${oid}失败:${r?.description || '未知'}`);
+				});
+			}));
 		}
 		return;
 	}
@@ -882,18 +907,17 @@ async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup }) 
 	// 群内:闪屏所有人可见(5 秒自动撤回)
 	await sendFlashMessage(chatId, flashText, ctx);
 
-	// 私聊详情:只投递给主人(如果配置了 OWNER_ID)
-	if (OWNER_ID) {
-		const auditText = triggerIsOwner
-			? `🔔 <b>主人操作通知</b>\n👤 操作人:${operator}（你自己）\n📍 来源:群内\n\n${detailText}`
-			: renderAuditNotification(operator, detailText, '群内', classifyOperatorRole(triggerId, '群管理员'));
-		const dm = await sendTelegramMessage(OWNER_ID, auditText);
-		if (!dm?.ok) {
-			console.error(`[审计通知] 私聊主人失败:${dm?.description || '未知'}`);
-			// 不在群里追加提示(避免群里其他成员看到"主人"字样,泄漏隐私)
-		}
+	// 私聊详情:投递给所有主人
+	if (OWNER_IDS.length) {
+		await Promise.allSettled(OWNER_IDS.map(oid => {
+			const auditText = (triggerIdStr === oid)
+				? `🔔 <b>主人操作通知</b>\n👤 操作人:${operator}（你自己）\n📍 来源:群内\n\n${detailText}`
+				: renderAuditNotification(operator, detailText, '群内', classifyOperatorRole(triggerId, '群管理员'));
+			return sendTelegramMessage(oid, auditText).then(r => {
+				if (!r?.ok) console.error(`[审计通知] 私聊主人${oid}失败:${r?.description || '未知'}`);
+			});
+		}));
 	}
-	// OWNER_ID 未配置 → 退化为"只发群闪屏",其他管理员/超管不收任何私聊详情
 }
 
 // 批量添加：串行写 D1，最后只镜像 1 次到 KV，节省 N-1 次 KV 写入
@@ -1652,12 +1676,12 @@ function translateMemberStatus(status) {
 	return map[status] || `❔ ${status || '未知'}`;
 }
 
-// 主人审计通知:群内管理员手动 ban/unban 时,把事件发给主人
-// 已豁免:OWNER_ID 未配置 / 操作人就是主人本人 / 操作人是机器人(其它 bot 的操作不通知)
+// 主人审计通知:群内管理员手动 ban/unban 时,把事件发给所有主人
+// 已豁免:OWNER_IDS 为空 / 操作人是主人本人(不通知自己) / 操作人是机器人(其它 bot 的操作不通知)
 async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newStatus) {
-	if (!OWNER_ID) return;
+	if (!OWNER_IDS.length) return;
 	const fromIdStr = String(chatMember.from?.id || '');
-	if (fromIdStr === OWNER_ID) return;
+	if (isOwner(fromIdStr)) return;
 
 	// 过滤机器人操作:只通知真人管理员的操作
 	// 例外:GroupAnonymousBot(1087968824)是"匿名管理员"——真人开了匿名,仍需通知
@@ -1695,10 +1719,7 @@ async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newSta
 		`📍 群:${groupLabel}\n` +
 		`📋 状态变更:${translateMemberStatus(oldStatus)} → ${translateMemberStatus(newStatus)}`;
 
-	const dm = await sendTelegramMessage(OWNER_ID, auditText);
-	if (!dm?.ok) {
-		console.error(`[审计通知] chat_member → 主人失败:${dm?.description || '未知'}`);
-	}
+	await notifyAllOwners(auditText);
 }
 
 // ===== 广告自动检测 =====
@@ -2165,9 +2186,9 @@ async function detectAd(message, env) {
 	return { isAd: score >= AD_SCORE_THRESHOLD, score, hits, strong: null };
 }
 
-// 广告拦截后通知主人
+// 广告拦截后通知所有主人
 async function notifyOwnerAdDetection(message, adResult, banResults) {
-	if (!OWNER_ID) return;
+	if (!OWNER_IDS.length) return;
 	const fromUser = message.from;
 	const operator = formatUserMention(fromUser) || `<code>${escapeHtml(String(fromUser?.id || '未知'))}</code>`;
 	const preview = escapeHtml((message.text || message.caption || (message.contact ? '[名片] ' + getContactText(message) : '') || '(无文本)').slice(0, 100));
@@ -2192,13 +2213,8 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 		'',
 		await renderBanResultsDetail(banResults),
 	];
-	const dm = await sendTelegramMessage(OWNER_ID, lines.join('\n'));
-	if (!dm?.ok) {
-		console.error(`[广告检测] 通知主人失败:${dm?.description || '未知'}`);
-	}
+	await notifyAllOwners(lines.join('\n'));
 }
-
-// 将黑名单 reason 代码翻译为中文详细说明
 function translateBlacklistReason(reason) {
 	const map = {
 		manual_ban: '群管理员手动封禁（Telegram原生操作，自动同步）',
@@ -2216,7 +2232,7 @@ async function translateBlacklistOperator(byId) {
 	if (byId === 'system') return '🤖 系统自动';
 
 	let roleTag = '👤 群管理员';
-	if (byId === OWNER_ID) roleTag = '👑 主人';
+	if (isOwner(byId)) roleTag = '👑 主人';
 	else if (SUPER_ADMINS.includes(byId)) roleTag = '🛡️ 超级管理员';
 
 	// 尝试查询操作人名字和类型
@@ -2241,9 +2257,9 @@ async function translateBlacklistOperator(byId) {
 	return `${roleTag} <code>${escapeHtml(byId)}</code>`;
 }
 
-// 黑名单自动拦截通知主人（复入群拦截 / 发言拦截时调用）
+// 黑名单自动拦截通知所有主人（复入群拦截 / 发言拦截时调用）
 async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklistInfo, banResult) {
-	if (!OWNER_ID) return;
+	if (!OWNER_IDS.length) return;
 	const target = targetUser
 		? formatUserMention(targetUser)
 		: '<code>未知</code>';
@@ -2273,15 +2289,12 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 		lines.push(`⚠️ 踢人结果:失败 - ${escapeHtml(banResult.error || '未知')}`);
 	}
 
-	const dm = await sendTelegramMessage(OWNER_ID, lines.join('\n'));
-	if (!dm?.ok) {
-		console.error(`[黑名单拦截通知] 通知主人失败:${dm?.description || '未知'}`);
-	}
+	await notifyAllOwners(lines.join('\n'));
 }
 
-// 黑名单用户尝试自助解封时通知主人（申诉提醒）
+// 黑名单用户尝试自助解封时通知所有主人（申诉提醒）
 async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
-	if (!OWNER_ID) return;
+	if (!OWNER_IDS.length) return;
 	const target = fromUser
 		? formatUserMention(fromUser)
 		: '<code>未知</code>';
@@ -2303,15 +2316,12 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
 		`如确认误封，请执行: <code>/unban ${escapeHtml(targetId)}</code>`,
 	];
 
-	const dm = await sendTelegramMessage(OWNER_ID, lines.join('\n'));
-	if (!dm?.ok) {
-		console.error(`[黑名单申诉通知] 通知主人失败:${dm?.description || '未知'}`);
-	}
+	await notifyAllOwners(lines.join('\n'));
 }
 
-// 用户完成自助解封时通知主人（所有自助解封都通知）
+// 用户完成自助解封时通知所有主人（所有自助解封都通知）
 async function notifyOwnerSelfUnban(fromUser, perGroupResults) {
-	if (!OWNER_ID) return;
+	if (!OWNER_IDS.length) return;
 	const target = fromUser
 		? formatUserMention(fromUser)
 		: '<code>未知</code>';
@@ -2331,10 +2341,7 @@ async function notifyOwnerSelfUnban(fromUser, perGroupResults) {
 		`如确认是广告，请执行: <code>/ban ${escapeHtml(targetId)}</code>`,
 	];
 
-	const dm = await sendTelegramMessage(OWNER_ID, lines.join('\n'));
-	if (!dm?.ok) {
-		console.error(`[自助解封通知] 通知主人失败:${dm?.description || '未知'}`);
-	}
+	await notifyAllOwners(lines.join('\n'));
 }
 
 // 应答 callback_query，让前端按钮停止 loading 并可选弹出提示气泡
@@ -2510,14 +2517,14 @@ async function handleCallbackQuery(cb, env, ctx) {
 			const verify = await verifyUnbanResult(tgid, targetLabel);
 			const warnBlock = warnLines.length ? '\n\n' + warnLines.join('\n') : '';
 			await sendTelegramMessage(fromUser.id, verify.text + warnBlock);
-			// 主人也收一份(操作人不是主人时),便于全局审计
-			if (OWNER_ID && String(fromUser.id) !== OWNER_ID) {
+			// 所有主人也收一份(操作人不是主人时),便于全局审计
+			if (OWNER_IDS.length && !isOwner(fromUser.id)) {
 				const opMention = formatUserMention(fromUser) || `<code>${escapeHtml(String(fromUser.id))}</code>`;
-				await sendTelegramMessage(OWNER_ID, `🔔 <b>一键解封回查</b>\n操作人:${opMention}\n\n${verify.text}${warnBlock}`);
+				await notifyAllOwners(`🔔 <b>一键解封回查</b>\n操作人:${opMention}\n\n${verify.text}${warnBlock}`);
 			}
 
-			// 主人审计通知:操作人不是主人时,把"一键解封"事件发给主人
-			if (OWNER_ID && String(fromUser.id) !== OWNER_ID) {
+			// 主人审计通知:操作人不是主人时,把"一键解封"事件发给所有主人
+			if (OWNER_IDS.length && !isOwner(fromUser.id)) {
 				const operator = formatUserMention(fromUser) || `<code>${escapeHtml(String(fromUser.id))}</code>`;
 				const role = classifyOperatorRole(fromUser.id, '超级管理员');
 				// 拉目标群名
@@ -2534,10 +2541,7 @@ async function handleCallbackQuery(cb, env, ctx) {
 					`🎯 目标用户:<code>${escapeHtml(String(tgid))}</code>\n` +
 					`📍 目标群:${dispatchGroupLabel}\n` +
 					`✅ 已代发 GKYbotSave 指令`;
-				const dmOwner = await sendTelegramMessage(OWNER_ID, auditText);
-				if (!dmOwner?.ok) {
-					console.error(`[审计通知] 一键解封 → 主人失败:${dmOwner?.description || '未知'}`);
-				}
+				await notifyAllOwners(auditText);
 			}
 		} else {
 			await answerCallbackQuery(cb.id, `❌ 代发失败: ${result.description || '未知错误'}`, true);
@@ -2677,7 +2681,7 @@ async function handleMessage(message, env, ctx) {
 			}
 
 			// 仅主人 /spam → 学习样本(只写整句指纹入库,不污染词库)
-			const isOwnerSpam = OWNER_ID && String(userId) === OWNER_ID;
+			const isOwnerSpam = isOwner(userId);
 			if (isOwnerSpam && env.DB) {
 				const r = message.reply_to_message;
 				// 指纹只取正文(text+caption),不混入用户名,保证跨发送者精确命中
@@ -2830,14 +2834,14 @@ async function handleMessage(message, env, ctx) {
 	}
 
 	// ===== /help 主人专属帮助(展开全部隐藏指令)=====
-	// 仅主人(OWNER_ID)可用。非主人:群内静默、私聊提示权限不足,绝不泄漏隐藏指令的存在。
+	// 仅主人(OWNER_IDS)可用。非主人:群内静默、私聊提示权限不足,绝不泄漏隐藏指令的存在。
 	if (text && /^\/help(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		const isOwner = OWNER_ID && String(userId) === OWNER_ID;
-		if (!isOwner) {
+		const isOwnerUser = isOwner(userId);
+		if (!isOwnerUser) {
 			// 群内完全静默(连"权限不足"都不发,避免暴露命令存在);私聊也不暴露隐藏指令
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人(OWNER_ID)使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人使用。');
 			}
 			return;
 		}
@@ -2847,7 +2851,7 @@ async function handleMessage(message, env, ctx) {
 			return;
 		}
 		const helpLines = [
-			'🔐 <b>主人专属隐藏指令</b>(仅 OWNER_ID 可用,其他人无任何反应)',
+			'🔐 <b>主人专属隐藏指令</b>(仅 OWNER_IDS 配置的主人可用,其他人无任何反应)',
 			'',
 			'<b>━━ 广告词库热更新(私聊)━━</b>',
 			'<code>/importdefault</code> 一键导入推荐词库(金融/色情/引流/诈骗/身份引流)',
@@ -2878,15 +2882,15 @@ async function handleMessage(message, env, ctx) {
 		return;
 	}
 
-	// ===== 广告词库热更新命令(仅主人 OWNER_ID 可用)=====
+	// ===== 广告词库热更新命令(仅主人可用)=====
 	// /addword /delword /listwords /importdefault
 	if (text && /^\/(addword|delword|listwords|importdefault)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		const isOwner = OWNER_ID && String(userId) === OWNER_ID;
-		if (!isOwner) {
+		const isOwnerUser = isOwner(userId);
+		if (!isOwnerUser) {
 			// 仅主人可用;非主人在私聊提示,群内静默(避免泄漏命令存在)
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告词库管理仅限主人(OWNER_ID)使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告词库管理仅限主人使用。');
 			}
 			return;
 		}
@@ -3012,14 +3016,14 @@ async function handleMessage(message, env, ctx) {
 		return;
 	}
 
-	// ===== 广告学习样本管理命令(仅主人 OWNER_ID)=====
+	// ===== 广告学习样本管理命令(仅主人可用)=====
 	// /listsamples /delsample /clearsamples
 	if (text && /^\/(listsamples|delsample|clearsamples)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		const isOwner = OWNER_ID && String(userId) === OWNER_ID;
-		if (!isOwner) {
+		const isOwnerUser = isOwner(userId);
+		if (!isOwnerUser) {
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告样本管理仅限主人(OWNER_ID)使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告样本管理仅限主人使用。');
 			}
 			return;
 		}
@@ -3108,10 +3112,10 @@ async function handleMessage(message, env, ctx) {
 	// 解决"GKY 已删消息无法回复 /spam"
 	if (text && /^\/(learn|learnlast|recent)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		const isOwner = OWNER_ID && String(userId) === OWNER_ID;
-		if (!isOwner) {
+		const isOwnerUser = isOwner(userId);
+		if (!isOwnerUser) {
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n上报学习仅限主人(OWNER_ID)使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n上报学习仅限主人使用。');
 			}
 			return;
 		}
