@@ -838,11 +838,16 @@ function isOwner(id) {
 	return OWNER_IDS.length > 0 && OWNER_IDS.includes(String(id || ''));
 }
 
-async function notifyAllOwners(text, excludeId) {
+function isPrimaryOwner(id) {
+	return OWNER_IDS.length > 0 && String(id || '') === OWNER_IDS[0];
+}
+
+async function notifyAllOwners(text, excludeId, onlyPrimary) {
 	if (!OWNER_IDS.length) return;
 	const excludeStr = excludeId ? String(excludeId) : '';
+	const targets = onlyPrimary ? [OWNER_IDS[0]] : OWNER_IDS;
 	await Promise.allSettled(
-		OWNER_IDS
+		targets
 			.filter(id => id !== excludeStr)
 			.map(id => sendTelegramMessage(id, text).then(r => {
 				if (!r?.ok) console.error(`[审计通知] 私聊主人${id}失败:${r?.description || '未知'}`);
@@ -875,20 +880,21 @@ function renderAuditNotification(operatorMention, detailText, sourceLabel, roleL
 //   * 触发者是某主人 → 该主人收"你自己"标记的详情,其他主人收审计通知
 //   * 触发者非主人 → 所有主人收带"🔔 操作人/来源"头的审计通知
 //   * 私聊投递失败(主人没和 bot 私聊过等) → 仅记日志,不在群里追加任何"主人"字样
-async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup }) {
+async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, onlyPrimary }) {
 	const chatId = message.chat.id;
 	const triggerId = message.from.id;
 	const triggerIdStr = String(triggerId);
 	const triggerIsOwner = isOwner(triggerId);
 	const operator = formatUserMention(message.from) || `<code>${escapeHtml(String(triggerId))}</code>`;
+	const targets = (onlyPrimary && OWNER_IDS.length) ? [OWNER_IDS[0]] : OWNER_IDS;
 
 	if (!isInGroup) {
 		// 私聊场景:触发者本人收原详情(向后兼容)
 		await sendTelegramMessage(chatId, detailText);
-		// 所有主人收审计副本(触发者是主人则收"你自己"版)
-		if (OWNER_IDS.length) {
+		// 主人收审计副本(触发者是主人则收"你自己"版)
+		if (targets.length) {
 			const role = classifyOperatorRole(triggerId, '管理员');
-			await Promise.allSettled(OWNER_IDS.map(oid => {
+			await Promise.allSettled(targets.map(oid => {
 				if (oid === triggerIdStr) {
 					const selfText = `🔔 <b>主人操作通知</b>\n👤 操作人:${operator}（你自己）\n📍 来源:私聊\n\n${detailText}`;
 					return sendTelegramMessage(oid, selfText).then(r => {
@@ -907,9 +913,9 @@ async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup }) 
 	// 群内:闪屏所有人可见(5 秒自动撤回)
 	await sendFlashMessage(chatId, flashText, ctx);
 
-	// 私聊详情:投递给所有主人
-	if (OWNER_IDS.length) {
-		await Promise.allSettled(OWNER_IDS.map(oid => {
+	// 私聊详情:投递给主人
+	if (targets.length) {
+		await Promise.allSettled(targets.map(oid => {
 			const auditText = (triggerIdStr === oid)
 				? `🔔 <b>主人操作通知</b>\n👤 操作人:${operator}（你自己）\n📍 来源:群内\n\n${detailText}`
 				: renderAuditNotification(operator, detailText, '群内', classifyOperatorRole(triggerId, '群管理员'));
@@ -1719,7 +1725,7 @@ async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newSta
 		`📍 群:${groupLabel}\n` +
 		`📋 状态变更:${translateMemberStatus(oldStatus)} → ${translateMemberStatus(newStatus)}`;
 
-	await notifyAllOwners(auditText);
+	await notifyAllOwners(auditText, null, true);
 }
 
 // ===== 广告自动检测 =====
@@ -2213,7 +2219,7 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 		'',
 		await renderBanResultsDetail(banResults),
 	];
-	await notifyAllOwners(lines.join('\n'));
+	await notifyAllOwners(lines.join('\n'), null, true);
 }
 function translateBlacklistReason(reason) {
 	const map = {
@@ -2289,7 +2295,7 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 		lines.push(`⚠️ 踢人结果:失败 - ${escapeHtml(banResult.error || '未知')}`);
 	}
 
-	await notifyAllOwners(lines.join('\n'));
+	await notifyAllOwners(lines.join('\n'), null, true);
 }
 
 // 黑名单用户尝试自助解封时通知所有主人（申诉提醒）
@@ -2316,7 +2322,7 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
 		`如确认误封，请执行: <code>/unban ${escapeHtml(targetId)}</code>`,
 	];
 
-	await notifyAllOwners(lines.join('\n'));
+	await notifyAllOwners(lines.join('\n'), null, true);
 }
 
 // 用户完成自助解封时通知所有主人（所有自助解封都通知）
@@ -2341,7 +2347,7 @@ async function notifyOwnerSelfUnban(fromUser, perGroupResults) {
 		`如确认是广告，请执行: <code>/ban ${escapeHtml(targetId)}</code>`,
 	];
 
-	await notifyAllOwners(lines.join('\n'));
+	await notifyAllOwners(lines.join('\n'), null, true);
 }
 
 // 应答 callback_query，让前端按钮停止 loading 并可选弹出提示气泡
@@ -2517,10 +2523,10 @@ async function handleCallbackQuery(cb, env, ctx) {
 			const verify = await verifyUnbanResult(tgid, targetLabel);
 			const warnBlock = warnLines.length ? '\n\n' + warnLines.join('\n') : '';
 			await sendTelegramMessage(fromUser.id, verify.text + warnBlock);
-			// 所有主人也收一份(操作人不是主人时),便于全局审计
+			// 全局主人收一份(操作人不是主人时),便于全局审计
 			if (OWNER_IDS.length && !isOwner(fromUser.id)) {
 				const opMention = formatUserMention(fromUser) || `<code>${escapeHtml(String(fromUser.id))}</code>`;
-				await notifyAllOwners(`🔔 <b>一键解封回查</b>\n操作人:${opMention}\n\n${verify.text}${warnBlock}`);
+				await notifyAllOwners(`🔔 <b>一键解封回查</b>\n操作人:${opMention}\n\n${verify.text}${warnBlock}`, null, true);
 			}
 
 			// 主人审计通知:操作人不是主人时,把"一键解封"事件发给所有主人
@@ -2541,7 +2547,7 @@ async function handleCallbackQuery(cb, env, ctx) {
 					`🎯 目标用户:<code>${escapeHtml(String(tgid))}</code>\n` +
 					`📍 目标群:${dispatchGroupLabel}\n` +
 					`✅ 已代发 GKYbotSave 指令`;
-				await notifyAllOwners(auditText);
+				await notifyAllOwners(auditText, null, true);
 			}
 		} else {
 			await answerCallbackQuery(cb.id, `❌ 代发失败: ${result.description || '未知错误'}`, true);
@@ -3395,7 +3401,7 @@ async function handleMessage(message, env, ctx) {
 				const flashText = result.success
 					? `✅ 已移黑 <code>${valid[0]}</code>`
 					: `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
-				await replyToAdmin(message, ctx, { flashText, detailText: lines.join('\n'), isInGroup });
+				await replyToAdmin(message, ctx, { flashText, detailText: lines.join('\n'), isInGroup, onlyPrimary: true });
 				return;
 			}
 
@@ -3406,7 +3412,8 @@ async function handleMessage(message, env, ctx) {
 			await replyToAdmin(message, ctx, {
 				flashText,
 				detailText: renderBatchRemoveResult(results, invalid),
-				isInGroup
+				isInGroup,
+				onlyPrimary: true
 			});
 			return;
 		}
