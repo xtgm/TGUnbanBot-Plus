@@ -2646,20 +2646,113 @@ async function handleMessage(message, env, ctx) {
 		}
 	}
 
-	// 处理配置群组内管理员回复 /spam - 添加被回复用户到黑名单
+	// 处理 /spam 命令 - 举报加黑（支持回复消息 + 直接输入TGID + 批量，群内/私聊双场景）
 	if (isSpamCommand(text)) {
-		if (!isConfiguredGroup(chatId)) {
-			return;
-		}
+		const isInGroup = message.chat.type !== 'private';
 
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+			}
 			return;
 		}
 
+		// 提取 /spam 后面的参数
+		const argMatch = text.trim().match(/^\/spam(?:@[^\s]+)?\s+([\s\S]+)/i);
+		const rawArg = argMatch ? argMatch[1].trim() : '';
+
+		if (rawArg) {
+			// ===== TGID 模式：直接通过 ID 封禁 =====
+			const { valid, invalid } = parseBatchTgids(rawArg);
+
+			if (valid.length === 0 && invalid.length === 0) {
+				const usageText = `❌ 使用方法：<code>/spam 用户ID</code> 或 <code>/spam 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
+				if (isInGroup) {
+					await sendFlashMessage(chatId, usageText, ctx);
+				} else {
+					await sendTelegramMessage(chatId, usageText);
+				}
+				return;
+			}
+			if (valid.length > BATCH_LIMIT) {
+				const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
+				if (isInGroup) {
+					await sendFlashMessage(chatId, limitText, ctx);
+				} else {
+					await sendTelegramMessage(chatId, limitText);
+				}
+				return;
+			}
+
+			// 单条
+			if (valid.length === 1 && invalid.length === 0) {
+				const result = await addToBlacklist(valid[0], env, { reason: 'spam', by: userId });
+				const targetMention = await formatTargetByTgid(valid[0]);
+				const lines = [
+					`🎬 操作:举报加黑(/spam)`,
+					`🎯 目标用户:${targetMention}`,
+				];
+				let flashText;
+				if (result.success) {
+					const banResults = await banUserFromAllGroups(valid[0]);
+					lines.push('');
+					lines.push(await renderBanResultsDetail(banResults));
+					flashText = `✅ 已加黑 <code>${valid[0]}</code>\n` + renderBanResults(banResults);
+				} else {
+					lines.push('');
+					if (result.message && result.message.includes('已在黑名单')) {
+						lines.push('⚠️ <b>该用户已在黑名单中,请勿重复添加</b>');
+					} else {
+						lines.push(result.message);
+					}
+					flashText = `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
+				}
+				await replyToAdmin(message, ctx, { flashText, detailText: lines.join('\n'), isInGroup });
+				return;
+			}
+
+			// 批量
+			const results = await addManyToBlacklist(valid, env, { reason: 'spam', by: userId });
+			const banSummary = { success: results.success.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
+			const perUserBanResults = [];
+			for (const id of results.success) {
+				const banResults = await banUserFromAllGroups(id);
+				const okCount = banResults.filter((r) => r.ok).length;
+				if (okCount === banResults.length) banSummary.banOkAll += 1;
+				else if (okCount === 0) banSummary.banFailedAll += 1;
+				else banSummary.banPartial += 1;
+				perUserBanResults.push({ userId: id, banResults });
+			}
+			const failedCount = invalid.length + results.failed.length;
+			const flashText = `✅ 批量加黑(/spam)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+			const baseDetail = renderBatchAddResult(results, invalid, banSummary);
+			let fullDetail = baseDetail;
+			if (perUserBanResults.length > 0) {
+				const perUserDetailLines = ['', '<b>逐用户踢人明细</b>:'];
+				for (const { userId: uid, banResults } of perUserBanResults) {
+					perUserDetailLines.push('', `<b>用户 <code>${uid}</code></b>`);
+					perUserDetailLines.push(await renderBanResultsDetail(banResults));
+				}
+				fullDetail += '\n' + perUserDetailLines.join('\n');
+			}
+			await replyToAdmin(message, ctx, {
+				flashText,
+				detailText: fullDetail,
+				isInGroup
+			});
+			return;
+		}
+
+		// ===== 回复模式：回复垃圾消息加黑（原有逻辑）=====
 		const repliedUserId = message.reply_to_message?.from?.id;
 		if (!repliedUserId) {
-			await sendTelegramMessage(chatId, '❌ 请回复要加入黑名单的用户消息后再发送 <code>/spam</code>');
+			const usageText = '❌ 使用方法：\n• 回复垃圾消息后发 <code>/spam</code>\n• 或直接 <code>/spam 用户ID</code>（支持批量：<code>/spam 123,456,789</code>）';
+			if (isInGroup) {
+				await sendFlashMessage(chatId, usageText, ctx);
+			} else {
+				await sendTelegramMessage(chatId, usageText);
+			}
 			return;
 		}
 
@@ -2708,7 +2801,7 @@ async function handleMessage(message, env, ctx) {
 			await replyToAdmin(message, ctx, {
 				flashText: `✅ 已加黑 ${linkedUserId}`,
 				detailText: lines.join('\n'),
-				isInGroup: true
+				isInGroup
 			});
 		} else {
 			// 写库失败(已存在 / 未绑存储等)— 也走双通道,字段齐全
@@ -2719,7 +2812,6 @@ async function handleMessage(message, env, ctx) {
 				'',
 			];
 			if (result.message && result.message.includes('已在黑名单')) {
-				// "已在黑名单"场景:用更友好的提示替代原文案,避免重复
 				failLines.push('⚠️ <b>该用户已在黑名单中,请勿重复添加</b>');
 			} else {
 				failLines.push(result.message);
@@ -2727,7 +2819,7 @@ async function handleMessage(message, env, ctx) {
 			await replyToAdmin(message, ctx, {
 				flashText: `⚠️ ${linkedUserId}: ${escapeHtml(plainMsg)}`,
 				detailText: failLines.join('\n'),
-				isInGroup: true
+				isInGroup
 			});
 		}
 		return;
