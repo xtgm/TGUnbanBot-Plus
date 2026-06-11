@@ -2745,7 +2745,8 @@ async function handleMessage(message, env, ctx) {
 		}
 
 		// ===== 回复模式：回复垃圾消息加黑（原有逻辑）=====
-		const repliedUserId = message.reply_to_message?.from?.id;
+		const repliedMsg = message.reply_to_message;
+		const repliedUserId = repliedMsg?.from?.id || repliedMsg?.sender_chat?.id;
 		if (!repliedUserId) {
 			const usageText = '❌ 使用方法：\n• 回复垃圾消息后发 <code>/spam</code>\n• 或直接 <code>/spam 用户ID</code>（支持批量：<code>/spam 123,456,789</code>）';
 			if (isInGroup) {
@@ -2762,7 +2763,7 @@ async function handleMessage(message, env, ctx) {
 		if (result.success) {
 			// 加黑成功 → 全群踢人 + 删除被回复的垃圾消息
 			const banResults = await banUserFromAllGroups(repliedUserId);
-			const repliedMsgId = message.reply_to_message.message_id;
+			const repliedMsgId = repliedMsg.message_id;
 			const delResult = await deleteMessage(chatId, repliedMsgId);
 
 			const lines = [
@@ -2782,7 +2783,7 @@ async function handleMessage(message, env, ctx) {
 			// 仅主人 /spam → 学习样本(只写整句指纹入库,不污染词库)
 			const isOwnerSpam = isOwner(userId);
 			if (isOwnerSpam && env.DB) {
-				const r = message.reply_to_message;
+				const r = repliedMsg;
 				// 指纹只取正文(text+caption),不混入用户名,保证跨发送者精确命中
 				const learnText = [r.text, r.caption].filter(Boolean).join(' ');
 				if (learnText.trim()) {
