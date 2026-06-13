@@ -1199,11 +1199,13 @@ function handlePurgeRunner(url) {
 	button.secondary { background: #4b5563; }
 	button:disabled { opacity: .55; cursor: not-allowed; }
 	input { width: 72px; border: 1px solid #d1d5db; border-radius: 6px; padding: 8px; }
+	a.download { display: inline-flex; align-items: center; margin-right: 10px; border-radius: 6px; padding: 9px 14px; color: white; background: #047857; text-decoration: none; font-weight: 600; }
 	.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin: 18px 0; }
 	.stat { background: white; border: 1px solid #e5e7eb; border-radius: 6px; padding: 12px; }
 	.stat b { display: block; font-size: 20px; margin-top: 4px; }
 	.progress { height: 10px; background: #e5e7eb; border-radius: 999px; overflow: hidden; }
 	.progress span { display: block; width: 0%; height: 100%; background: #2563eb; transition: width .2s ease; }
+	.downloads { margin: 18px 0; }
 	pre { white-space: pre-wrap; word-break: break-word; background: #111827; color: #e5e7eb; border-radius: 6px; padding: 14px; max-height: 420px; overflow: auto; }
 </style>
 </head>
@@ -1213,7 +1215,7 @@ function handlePurgeRunner(url) {
 	<p>页面会分批调用 JSON 清扫接口。每批默认 ${PURGE_DEFAULT_PAIR_LIMIT} 个“用户×群”组合，最大 ${PURGE_MAX_PAIR_LIMIT} 个，避免触发 Cloudflare Worker 子请求限制。</p>
 	<div class="toolbar">
 		<label>每批 <input id="limit" type="number" min="1" max="${PURGE_MAX_PAIR_LIMIT}" value="${limit}"></label>
-		<button id="start">开始</button>
+		<button id="start">继续</button>
 		<button id="pause" class="secondary" disabled>暂停</button>
 	</div>
 	<div class="stats">
@@ -1226,6 +1228,10 @@ function handlePurgeRunner(url) {
 		<div class="stat">失败<b id="failed">0</b></div>
 	</div>
 	<div class="progress" aria-label="清扫进度"><span id="bar"></span></div>
+	<div id="downloads" class="downloads" hidden>
+		<a id="downloadTxt" class="download" href="#" download>下载 TXT 报告</a>
+		<a id="downloadCsv" class="download" href="#" download>下载 CSV 明细</a>
+	</div>
 	<pre id="log"></pre>
 </main>
 <script>
@@ -1233,6 +1239,11 @@ function handlePurgeRunner(url) {
 	let nextUrl = ${jsonForInlineScript(apiUrl.toString())};
 	let running = false;
 	const totals = { kicked: 0, left: 0, failed: 0 };
+	const batches = [];
+	const details = [];
+	const startedAt = new Date();
+	let txtObjectUrl = null;
+	let csvObjectUrl = null;
 	const $ = (id) => document.getElementById(id);
 	function log(line, data) {
 		const logEl = $('log');
@@ -1253,6 +1264,18 @@ function handlePurgeRunner(url) {
 		totals.kicked += data['已踢出'] || 0;
 		totals.left += data['不在群'] || 0;
 		totals.failed += data['失败'] || 0;
+		batches.push(data);
+		for (const item of (data['详情'] || [])) {
+			details.push({
+				batch: batches.length,
+				cursor: item['游标'] ?? '',
+				userId: item['用户ID'] ?? '',
+				groupId: item['群ID'] ?? '',
+				status: item['旧状态'] ?? '',
+				result: item['结果'] ?? '',
+				error: item['错误'] ?? ''
+			});
+		}
 		$('kicked').textContent = totals.kicked;
 		$('left').textContent = totals.left;
 		$('failed').textContent = totals.failed;
@@ -1260,6 +1283,65 @@ function handlePurgeRunner(url) {
 		nextUrl = data.next_url || null;
 		updateProgress(data);
 		log('本批完成', data);
+	}
+	function csvCell(value) {
+		return '"' + String(value ?? '').replace(/"/g, '""') + '"';
+	}
+	function makeCsv() {
+		const rows = [['batch', 'cursor', 'user_id', 'group_id', 'old_status', 'result', 'error']];
+		for (const item of details) {
+			rows.push([item.batch, item.cursor, item.userId, item.groupId, item.status, item.result, item.error]);
+		}
+		return rows.map((row) => row.map(csvCell).join(',')).join('\\n') + '\\n';
+	}
+	function makeTxt(finishedAt) {
+		const last = batches[batches.length - 1] || {};
+		const lines = [
+			'黑名单清扫报告',
+			'开始时间: ' + startedAt.toISOString(),
+			'结束时间: ' + finishedAt.toISOString(),
+			'黑名单总数: ' + (last['黑名单总数'] ?? 0),
+			'配置群组数: ' + (last['配置群组数'] ?? 0),
+			'总任务数: ' + (last['总任务数'] ?? 0),
+			'已处理: ' + (last['本批结束游标'] ?? 0),
+			'已踢出: ' + totals.kicked,
+			'不在群: ' + totals.left,
+			'失败: ' + totals.failed,
+			'批次数: ' + batches.length,
+			'',
+			'批次摘要:'
+		];
+		for (const batch of batches) {
+			lines.push(
+				'#' + (lines.length - 12) +
+				' cursor ' + batch['本批开始游标'] + '-' + batch['本批结束游标'] +
+				' 已踢出=' + batch['已踢出'] +
+				' 不在群=' + batch['不在群'] +
+				' 失败=' + batch['失败']
+			);
+		}
+		if (details.length > 0) {
+			lines.push('', '明细:', JSON.stringify(details, null, 2));
+		}
+		return lines.join('\\n') + '\\n';
+	}
+	function makeDownload(name, content, type) {
+		const blob = new Blob([content], { type });
+		return URL.createObjectURL(blob);
+	}
+	function finish() {
+		const finishedAt = new Date();
+		if (txtObjectUrl) URL.revokeObjectURL(txtObjectUrl);
+		if (csvObjectUrl) URL.revokeObjectURL(csvObjectUrl);
+		const stamp = finishedAt.toISOString().replace(/[:.]/g, '-');
+		txtObjectUrl = makeDownload('purge-report-' + stamp + '.txt', makeTxt(finishedAt), 'text/plain;charset=utf-8');
+		csvObjectUrl = makeDownload('purge-details-' + stamp + '.csv', '\\ufeff' + makeCsv(), 'text/csv;charset=utf-8');
+		$('downloadTxt').href = txtObjectUrl;
+		$('downloadTxt').download = 'purge-report-' + stamp + '.txt';
+		$('downloadCsv').href = csvObjectUrl;
+		$('downloadCsv').download = 'purge-details-' + stamp + '.csv';
+		$('downloads').hidden = false;
+		log('全部完成，已生成 TXT 和 CSV 下载文件');
 	}
 	async function step() {
 		if (!running || !nextUrl) return;
@@ -1275,8 +1357,10 @@ function handlePurgeRunner(url) {
 			if (data.done || data['已完成'] || !data.next_url) {
 				running = false;
 				$('status').textContent = '已完成';
-				$('start').disabled = false;
+				$('start').textContent = '已完成';
+				$('start').disabled = true;
 				$('pause').disabled = true;
+				finish();
 				return;
 			}
 			setTimeout(step, delayMs);
@@ -1288,19 +1372,22 @@ function handlePurgeRunner(url) {
 			log('错误: ' + error.message);
 		}
 	}
-	$('start').onclick = () => {
-		if (!nextUrl) return;
+	function startRun() {
+		if (!nextUrl || running) return;
 		running = true;
 		$('start').disabled = true;
 		$('pause').disabled = false;
 		step();
-	};
+	}
+	$('start').onclick = startRun;
 	$('pause').onclick = () => {
 		running = false;
 		$('status').textContent = '已暂停';
 		$('start').disabled = false;
 		$('pause').disabled = true;
 	};
+	log('页面已打开，自动开始清扫');
+	startRun();
 </script>
 </body>
 </html>`;

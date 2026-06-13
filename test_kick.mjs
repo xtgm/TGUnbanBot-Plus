@@ -643,6 +643,9 @@ console.log('\n[8e] /{TOKEN}/purge/run 浏览器自动续跑页');
 	assert('runner 含进度数字', html.includes('id="processed"') && html.includes('id="percent"'));
 	assert('runner 含进度条', html.includes('id="bar"'));
 	assert('runner 日志自动跟随最新', html.includes('logEl.scrollTop = logEl.scrollHeight'));
+	assert('runner 自动开始', html.includes('startRun();'));
+	assert('runner 含 TXT/CSV 下载', html.includes('id="downloadTxt"') && html.includes('id="downloadCsv"'));
+	assert('runner 完成后生成文件', html.includes('function finish()') && html.includes('makeCsv()') && html.includes('makeTxt(finishedAt)'));
 	assert('runner 不调用 Telegram', apiCalls.length === 0);
 }
 
