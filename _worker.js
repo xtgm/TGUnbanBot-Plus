@@ -1202,6 +1202,8 @@ function handlePurgeRunner(url) {
 	.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin: 18px 0; }
 	.stat { background: white; border: 1px solid #e5e7eb; border-radius: 6px; padding: 12px; }
 	.stat b { display: block; font-size: 20px; margin-top: 4px; }
+	.progress { height: 10px; background: #e5e7eb; border-radius: 999px; overflow: hidden; }
+	.progress span { display: block; width: 0%; height: 100%; background: #2563eb; transition: width .2s ease; }
 	pre { white-space: pre-wrap; word-break: break-word; background: #111827; color: #e5e7eb; border-radius: 6px; padding: 14px; max-height: 420px; overflow: auto; }
 </style>
 </head>
@@ -1217,10 +1219,13 @@ function handlePurgeRunner(url) {
 	<div class="stats">
 		<div class="stat">状态<b id="status">未开始</b></div>
 		<div class="stat">游标<b id="cursor">${cursor}</b></div>
+		<div class="stat">进度<b id="processed">0 / 0</b></div>
+		<div class="stat">百分比<b id="percent">0%</b></div>
 		<div class="stat">已踢出<b id="kicked">0</b></div>
 		<div class="stat">不在群<b id="left">0</b></div>
 		<div class="stat">失败<b id="failed">0</b></div>
 	</div>
+	<div class="progress" aria-label="清扫进度"><span id="bar"></span></div>
 	<pre id="log"></pre>
 </main>
 <script>
@@ -1230,7 +1235,19 @@ function handlePurgeRunner(url) {
 	const totals = { kicked: 0, left: 0, failed: 0 };
 	const $ = (id) => document.getElementById(id);
 	function log(line, data) {
-		$('log').textContent = '[' + new Date().toLocaleTimeString() + '] ' + line + (data ? '\\n' + JSON.stringify(data, null, 2) : '') + '\\n\\n' + $('log').textContent;
+		const logEl = $('log');
+		logEl.textContent += '[' + new Date().toLocaleTimeString() + '] ' + line + (data ? '\\n' + JSON.stringify(data, null, 2) : '') + '\\n\\n';
+		logEl.scrollTop = logEl.scrollHeight;
+	}
+	function updateProgress(data) {
+		const total = Math.max(Number(data['总任务数']) || 0, 0);
+		const processed = Math.min(Math.max(Number(data['本批结束游标']) || 0, 0), total);
+		const percent = total > 0 ? Math.min(100, (processed / total) * 100) : 100;
+		const text = total > 0 ? percent.toFixed(percent >= 10 ? 1 : 2).replace(/\\.0+$/, '') + '%' : '100%';
+		$('processed').textContent = processed + ' / ' + total;
+		$('percent').textContent = text;
+		$('bar').style.width = text;
+		if (running) $('status').textContent = '运行中 ' + text;
 	}
 	function apply(data) {
 		totals.kicked += data['已踢出'] || 0;
@@ -1241,6 +1258,7 @@ function handlePurgeRunner(url) {
 		$('failed').textContent = totals.failed;
 		$('cursor').textContent = data['下批游标'] ?? data['本批结束游标'] ?? '';
 		nextUrl = data.next_url || null;
+		updateProgress(data);
 		log('本批完成', data);
 	}
 	async function step() {

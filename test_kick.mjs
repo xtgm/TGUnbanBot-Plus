@@ -640,6 +640,9 @@ console.log('\n[8e] /{TOKEN}/purge/run 浏览器自动续跑页');
 	assert('runner 是 HTML', res.headers.get('Content-Type').includes('text/html'));
 	assert('runner 含标题', html.includes('黑名单清扫'));
 	assert('runner 会调用 /purge', html.includes('/purge?limit=18'));
+	assert('runner 含进度数字', html.includes('id="processed"') && html.includes('id="percent"'));
+	assert('runner 含进度条', html.includes('id="bar"'));
+	assert('runner 日志自动跟随最新', html.includes('logEl.scrollTop = logEl.scrollHeight'));
 	assert('runner 不调用 Telegram', apiCalls.length === 0);
 }
 
