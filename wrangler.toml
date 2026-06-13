@@ -3,10 +3,6 @@ main = "_worker.js"
 compatibility_date = "2026-05-19"
 keep_vars = true
 
-#[[kv_namespaces]]
-#binding = "KV"								# 仅迁移时需要：从旧项目升级时临时绑定，迁移完成后删除
-#id = "40ff47946cdd4ade8856158cec511e3f"	# KV数据库id（迁移用）
-
 # D1 数据库（唯一存储后端，必须绑定；表结构由代码自动建立）
 #[[d1_databases]]
 #binding = "DB"								# D1 绑定名默认不可修改

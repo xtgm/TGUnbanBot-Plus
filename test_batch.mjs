@@ -2,7 +2,7 @@
 // 用 vm 加载 _worker.js 的源代码（绕开 ESM default-export 约束），
 // 然后单独驱动批量函数和解析器。
 // 验证目标：parseBatchTgids、addManyToBlacklist、removeManyFromBlacklist、
-// 渲染函数、KV 镜像次数 = 1。
+// 渲染函数、D1-only 写入与重复项处理。
 
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -89,7 +89,7 @@ const {
 	BATCH_LIMIT,
 } = sandbox.__exports;
 
-// ---------- 伪 D1 / 伪 KV ----------
+// ---------- 伪 D1 ----------
 function makeFakeDB() {
 	const rows = new Map();
 	return {
@@ -110,8 +110,11 @@ function makeFakeDB() {
 					return null;
 				},
 				async run() {
-					if (sql.startsWith('INSERT INTO blacklist')) {
+					if (sql.startsWith('INSERT OR IGNORE INTO blacklist')) {
 						const [id, reason, by, at] = bound;
+						if (rows.has(id)) {
+							return { meta: { changes: 0 } };
+						}
 						rows.set(id, { id, reason, by_user: by, at });
 						return { meta: { changes: 1 } };
 					}
@@ -129,30 +132,6 @@ function makeFakeDB() {
 				},
 			};
 			return stmt;
-		},
-	};
-}
-
-function makeFakeKV() {
-	const store = new Map();
-	let putCount = 0;
-	return {
-		_store: store,
-		get _putCount() {
-			return putCount;
-		},
-		async get(key, opts) {
-			const raw = store.get(key);
-			if (raw === undefined) return null;
-			if (opts && opts.type === 'json') return JSON.parse(raw);
-			return raw;
-		},
-		async put(key, value) {
-			putCount += 1;
-			store.set(key, value);
-		},
-		async delete(key) {
-			store.delete(key);
 		},
 	};
 }
@@ -208,45 +187,37 @@ console.log('\n[1] parseBatchTgids 解析器');
 console.log('\n[2] BATCH_LIMIT');
 assert('BATCH_LIMIT === 50', BATCH_LIMIT === 50);
 
-// ---------- 3. 单条 addToBlacklist 向后兼容（仅 KV） ----------
-console.log('\n[3] 单条添加 - 仅 KV');
+// ---------- 3. 单条 addToBlacklist（D1-only） ----------
+console.log('\n[3] 单条添加 - D1');
 {
-	const kv = makeFakeKV();
-	const env = { KV: kv };
+	const db = makeFakeDB();
+	const env = { DB: db };
 	const r = await addToBlacklist('123', env, { reason: 'manual', by: '999' });
 	assert('添加成功 success=true', r.success === true);
 	assert('消息含 已将用户', r.message.includes('已将用户'));
-	const list = JSON.parse(kv._store.get('blacklist'));
-	assert('KV 中有 1 条', list.length === 1 && list[0].id === '123');
-	assert('reason=manual', list[0].reason === 'manual');
-	assert('by=999', list[0].by === '999');
+	const row = db._rows.get('123');
+	assert('D1 中有 1 条', db._rows.size === 1 && !!row);
+	assert('reason=manual', row.reason === 'manual');
+	assert('by=999', row.by_user === '999');
 }
 
-// ---------- 4. 批量添加 - 双绑（KV+D1）镜像次数 = 1 ----------
-console.log('\n[4] 批量添加 - KV+D1 双绑，镜像次数 = 1');
+// ---------- 4. 批量添加 - D1 ----------
+console.log('\n[4] 批量添加 - D1');
 {
-	const kv = makeFakeKV();
 	const db = makeFakeDB();
-	const env = { KV: kv, DB: db };
-	const beforePut = kv._putCount;
+	const env = { DB: db };
 	const results = await addManyToBlacklist(['100', '200', '300'], env, { reason: 'manual', by: '1' });
-	const afterPut = kv._putCount;
 	assert('3 个全部成功', eq(results.success, ['100', '200', '300']));
 	assert('exists 空', results.exists.length === 0);
 	assert('failed 空', results.failed.length === 0);
 	assert('D1 有 3 条', db._rows.size === 3);
-	assert('KV put 调用次数 = 1（不是 N）', afterPut - beforePut === 1, `实际 = ${afterPut - beforePut}`);
-	const kvList = JSON.parse(kv._store.get('blacklist'));
-	assert('KV 镜像 3 条', kvList.length === 3);
-	assert('KV 与 D1 一致', kvList.map((x) => x.id).sort().join(',') === '100,200,300');
 }
 
 // ---------- 5. 批量添加 - 部分已存在 ----------
 console.log('\n[5] 批量添加 - 部分已存在');
 {
-	const kv = makeFakeKV();
 	const db = makeFakeDB();
-	const env = { KV: kv, DB: db };
+	const env = { DB: db };
 	await addManyToBlacklist(['100', '200'], env, { reason: 'manual', by: '1' });
 	const r = await addManyToBlacklist(['200', '300', '400'], env, { reason: 'manual', by: '1' });
 	assert('成功 2', r.success.length === 2);
@@ -258,17 +229,13 @@ console.log('\n[5] 批量添加 - 部分已存在');
 // ---------- 6. 批量移除 ----------
 console.log('\n[6] 批量移除');
 {
-	const kv = makeFakeKV();
 	const db = makeFakeDB();
-	const env = { KV: kv, DB: db };
+	const env = { DB: db };
 	await addManyToBlacklist(['100', '200', '300'], env, { reason: 'manual', by: '1' });
-	const beforePut = kv._putCount;
 	const r = await removeManyFromBlacklist(['100', '200', '999'], env);
-	const afterPut = kv._putCount;
 	assert('成功 2', r.success.length === 2);
 	assert('notFound 1（999）', r.notFound.length === 1 && r.notFound[0] === '999');
 	assert('failed 0', r.failed.length === 0);
-	assert('移除批量后 KV put = 1', afterPut - beforePut === 1, `实际 = ${afterPut - beforePut}`);
 	assert('D1 剩 1 条（300）', db._rows.size === 1 && db._rows.has('300'));
 }
 
@@ -295,36 +262,23 @@ console.log('\n[7] 渲染函数');
 	assert('remove：含不在黑名单', text.includes('不在黑名单'));
 }
 
-// ---------- 8. 仅 KV 单后端的批量 ----------
-console.log('\n[8] 仅 KV 后端批量');
-{
-	const kv = makeFakeKV();
-	const env = { KV: kv };
-	const r = await addManyToBlacklist(['100', '200'], env, { reason: 'manual', by: '1' });
-	assert('仅 KV 时也成功', r.success.length === 2);
-	const list = JSON.parse(kv._store.get('blacklist'));
-	assert('KV 写入 2 条', list.length === 2);
-	// 仅 KV 时不会触发 mirrorToKV（因为没有 DB），每次 addToBlacklistCore 自身写一次 KV
-	assert('仅 KV 时每条直接写 KV（put 次数 = 2）', kv._putCount === 2, `实际 = ${kv._putCount}`);
-}
-
-// ---------- 9. 仅 D1 单后端的批量 ----------
-console.log('\n[9] 仅 D1 后端批量');
+// ---------- 8. D1 单后端的批量 ----------
+console.log('\n[8] D1 后端批量');
 {
 	const db = makeFakeDB();
 	const env = { DB: db };
-	const r = await addManyToBlacklist(['100', '200'], env, { reason: 'manual', by: '1' });
-	assert('仅 D1 时也成功', r.success.length === 2);
+	const r = await addManyToBlacklist(['100', '200', '100'], env, { reason: 'manual', by: '1' });
+	assert('D1 时成功 2', r.success.length === 2);
 	assert('D1 写入 2 条', db._rows.size === 2);
 }
 
-// ---------- 10. 既无 KV 也无 D1 ----------
-console.log('\n[10] 无存储后端');
+// ---------- 9. 无 D1 ----------
+console.log('\n[9] 无 D1');
 {
 	const r = await addManyToBlacklist(['100'], {}, { reason: 'manual', by: '1' });
-	assert('无后端：success 空', r.success.length === 0);
-	assert('无后端：failed 1', r.failed.length === 1);
-	assert('无后端：消息含未绑定', r.failed[0].msg.includes('未绑定'));
+	assert('无 D1：success 空', r.success.length === 0);
+	assert('无 D1：failed 1', r.failed.length === 1);
+	assert('无 D1：消息含未绑定', r.failed[0].msg.includes('未绑定'));
 }
 
 // ---------- 总结 ----------

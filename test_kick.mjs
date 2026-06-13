@@ -64,11 +64,29 @@ vm.runInContext(stripExportDefault(src), sandbox, { filename: '_worker.js' });
 
 const handler = sandbox.__handler;
 
-// ---------- 伪 KV/D1 ----------
+// ---------- 伪 D1 ----------
 function makeFakeDB(seed = []) {
-	const rows = new Map(seed.map((r) => [String(r.id), { ...r, id: String(r.id) }]));
+	const rows = new Map(seed.map((r) => [String(r.id), { ...r, id: String(r.id), by_user: r.by_user ?? r.by ?? null }]));
+	const store = new Map();
+	let recentSeq = 1;
+	const syncBlacklist = () => {
+		store.set('blacklist', JSON.stringify([...rows.values()].map((r) => ({
+			id: String(r.id),
+			reason: r.reason ?? null,
+			by: r.by_user ?? r.by ?? null,
+			at: r.at ?? null,
+		}))));
+	};
+	syncBlacklist();
+	const getJson = (key, fallback = null) => {
+		const raw = store.get(key);
+		if (raw === undefined) return fallback;
+		return JSON.parse(raw);
+	};
+	const setJson = (key, value) => store.set(key, JSON.stringify(value));
 	return {
 		_rows: rows,
+		_store: store,
 		exec: async () => {},
 		prepare(sql) {
 			let bound = [];
@@ -79,41 +97,90 @@ function makeFakeDB(seed = []) {
 						const id = bound[0];
 						return rows.has(id) ? { id } : null;
 					}
+					if (sql.startsWith('SELECT data FROM ad_keywords')) {
+						const data = store.get('ad_keywords_custom');
+						return data ? { data } : null;
+					}
+					if (sql.startsWith('SELECT data FROM ad_samples')) {
+						const data = store.get('ad_samples');
+						return data ? { data } : null;
+					}
+					if (sql.startsWith('SELECT data FROM learn_snapshot')) {
+						const data = store.get('learn_snapshot');
+						return data ? { data } : null;
+					}
 					return null;
 				},
 				async run() {
-					if (sql.startsWith('INSERT INTO blacklist')) {
+					if (sql.startsWith('INSERT OR IGNORE INTO blacklist')) {
 						const [id, reason, by, at] = bound;
+						if (rows.has(id)) return { meta: { changes: 0 } };
 						rows.set(id, { id, reason, by_user: by, at });
+						syncBlacklist();
 						return { meta: { changes: 1 } };
 					}
 					if (sql.startsWith('DELETE FROM blacklist WHERE id = ?')) {
 						const had = rows.delete(bound[0]);
+						syncBlacklist();
 						return { meta: { changes: had ? 1 : 0 } };
+					}
+					if (sql.startsWith('INSERT OR REPLACE INTO ad_keywords')) {
+						setJson('ad_keywords_custom', JSON.parse(bound[0]));
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('INSERT OR REPLACE INTO ad_samples')) {
+						setJson('ad_samples', JSON.parse(bound[0]));
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('INSERT OR REPLACE INTO learn_snapshot')) {
+						setJson('learn_snapshot', JSON.parse(bound[0]));
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('INSERT INTO recent_messages')) {
+						const [mid, chatId, chatTitle, text, fromId, fromName, createdAt] = bound;
+						const data = getJson('recent_messages', { items: [] });
+						data.items.push({
+							id: recentSeq++,
+							mid,
+							chatId,
+							chatTitle,
+							text,
+							fromId,
+							fromName,
+							at: createdAt,
+						});
+						setJson('recent_messages', data);
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('DELETE FROM recent_messages WHERE id NOT IN')) {
+						const limit = Number(bound[0]) || 50;
+						const data = getJson('recent_messages', { items: [] });
+						data.items = [...data.items].sort((a, b) => b.id - a.id).slice(0, limit).sort((a, b) => a.id - b.id);
+						setJson('recent_messages', data);
+						return { meta: { changes: 1 } };
 					}
 					return { meta: { changes: 0 } };
 				},
 				async all() {
+					if (sql.startsWith('SELECT mid, chat_id, chat_title')) {
+						const data = getJson('recent_messages', { items: [] });
+						return {
+							results: data.items.map((it) => ({
+								id: it.id,
+								mid: it.mid,
+								chat_id: it.chatId,
+								chat_title: it.chatTitle,
+								text: it.text,
+								from_id: it.fromId,
+								from_name: it.fromName,
+								created_at: it.at,
+							}))
+						};
+					}
 					return { results: [...rows.values()] };
 				},
 			};
 		},
-	};
-}
-
-function makeFakeKV(seed) {
-	const store = new Map();
-	if (seed) store.set('blacklist', JSON.stringify(seed));
-	return {
-		_store: store,
-		async get(k, opts) {
-			const v = store.get(k);
-			if (v === undefined) return null;
-			if (opts && opts.type === 'json') return JSON.parse(v);
-			return v;
-		},
-		async put(k, v) { store.set(k, v); },
-		async delete(k) { store.delete(k); },
 	};
 }
 
@@ -122,7 +189,7 @@ const baseEnv = {
 	TOKEN,
 	BOT_TOKEN: '0:fake',
 	GROUP_ID: '-1001,-1002', // 两个配置群
-	OWNER_ID: '999', // 主人=测试用户 999,使现有"私聊发到 999"断言保持有效(走"你自己"分支)
+	OWNER_IDS: '999', // 主人=测试用户 999,使现有"私聊发到 999"断言保持有效(走"你自己"分支)
 };
 
 // ---------- 测试工具 ----------
@@ -166,14 +233,14 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊
 			},
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	const res = await handler.fetch(
 		new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }),
 		env, fakeCtx
 	);
 	assert('webhook 返回 OK', res.status === 200);
 
-	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('被举报用户 8888 已加入黑名单', blacklist.some((e) => e.id === '8888'));
 
 	const banCalls = callsOf('banChatMember');
@@ -231,7 +298,7 @@ console.log('\n[1b] /spam 错误翻译:CHAT_ADMIN_REQUIRED + 删消息失败');
 			},
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(
 		new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }),
 		env, fakeCtx
@@ -263,10 +330,10 @@ console.log('\n[2] /ban 123（单条）:加黑 + 全群踢');
 			text: '/ban 123',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env);
 
-	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('123 已加入黑名单', blacklist.some((e) => e.id === '123'));
 
 	const banCalls = callsOf('banChatMember');
@@ -292,7 +359,7 @@ console.log('\n[3] /ban 100,200,300（批量）');
 			text: '/ban 100,200,300',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env);
 
 	const banCalls = callsOf('banChatMember');
@@ -319,7 +386,7 @@ console.log('\n[4] 黑名单用户在群里发言 → 删消息 + 踢人');
 			text: '我是广告，快加我',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([{ id: '8888', reason: 'spam', by: '999', at: '2026-05-01T00:00:00Z' }]) };
+	const env = { ...baseEnv, DB: makeFakeDB([{ id: '8888', reason: 'spam', by: '999', at: '2026-05-01T00:00:00Z' }]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env);
 
 	const delCalls = callsOf('deleteMessage');
@@ -350,7 +417,7 @@ console.log('\n[5] 管理员豁免：误加黑的管理员发言不会被踢');
 			text: '正常发言',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([{ id: '7777', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' }]) };
+	const env = { ...baseEnv, DB: makeFakeDB([{ id: '7777', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' }]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env);
 
 	assert('deleteMessage 没被调用', callsOf('deleteMessage').length === 0);
@@ -373,7 +440,7 @@ console.log('\n[6] chat_member 复入群分支');
 			new_chat_member: { user: { id: 8888, is_bot: false }, status: 'member' },
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([{ id: '8888', reason: 'spam', by: '999', at: '2026-05-01T00:00:00Z' }]) };
+	const env = { ...baseEnv, DB: makeFakeDB([{ id: '8888', reason: 'spam', by: '999', at: '2026-05-01T00:00:00Z' }]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env);
 
 	const banCalls = callsOf('banChatMember');
@@ -398,7 +465,7 @@ console.log('\n[7] 非黑名单用户复入群不被踢');
 			new_chat_member: { user: { id: 5555, is_bot: false }, status: 'member' },
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env);
 
 	assert('普通用户加群不被踢', callsOf('banChatMember').length === 0);
@@ -425,7 +492,7 @@ console.log('\n[8] /{TOKEN}/purge 扫描');
 
 	const env = {
 		...baseEnv,
-		KV: makeFakeKV([
+		DB: makeFakeDB([
 			{ id: '8888', reason: 'spam', by: '999', at: '2026-05-01T00:00:00Z' },
 			{ id: '9999', reason: 'manual', by: '999', at: '2026-05-02T00:00:00Z' },
 		]),
@@ -452,7 +519,7 @@ console.log('\n[9] /purge 错误 TOKEN');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({});
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	const res = await handler.fetch(new Request('https://x.com/WRONG_TOKEN/purge'), env);
 	assert('错误 TOKEN 返回 405', res.status === 405);
 }
@@ -492,10 +559,10 @@ console.log('\n[10] 群内 /ban 单条');
 			text: '/ban 123',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
-	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('用户 123 已加黑', blacklist.some((e) => e.id === '123'));
 
 	const banCalls = callsOf('banChatMember');
@@ -549,7 +616,7 @@ console.log('\n[10b] 群内 /ban 单条 + 部分群失败');
 	// 关键:让伪 fetch 看到 banChatMember 的失败响应作为 200
 	// 因为 makeFetchMock 默认包成 { ok: true, status: 200 } —— 但 result.ok 才是 Telegram 的 ok
 	// 所以这里 result.ok 是 false,banUserFromGroup 应该读取 result.description 走 translate
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
 	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -580,10 +647,10 @@ console.log('\n[11] 群内 /ban 批量');
 			text: '/ban 100,200,300',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
-	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('3 个用户全部加黑', blacklist.length === 3);
 
 	// 3 用户 × 2 群 = 6 次 ban
@@ -619,11 +686,11 @@ console.log('\n[12] 群内 /unban 单条');
 	};
 	const env = {
 		...baseEnv,
-		KV: makeFakeKV([{ id: '8888', reason: 'spam', by: '999', at: '2026-05-01T00:00:00Z' }]),
+		DB: makeFakeDB([{ id: '8888', reason: 'spam', by: '999', at: '2026-05-01T00:00:00Z' }]),
 	};
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
-	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('8888 已从黑名单移除', !blacklist.some((e) => e.id === '8888'));
 
 	// /unban 不调 banChatMember
@@ -654,7 +721,7 @@ console.log('\n[13] 私聊 /ban 单条向后兼容');
 			text: '/ban 123',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
 	// 私聊场景:只发 1 次详情,不发闪屏
@@ -686,10 +753,10 @@ console.log('\n[14] 群内非管理员发 /ban 静默忽略');
 			text: '/ban 123',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
-	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('未加黑（无权）', blacklist.length === 0);
 	assert('banChatMember 未调用', callsOf('banChatMember').length === 0);
 	assert('sendMessage 未调用（群内静默）', callsOf('sendMessage').length === 0);
@@ -723,7 +790,7 @@ console.log('\n[15] 私聊主人投递失败仅日志');
 			text: '/ban 123',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
 	assert('尝试私聊主人', dmAttempts === 1);
@@ -755,9 +822,9 @@ console.log('\n[16] 群管理员只在 GROUP_IDS 第二个群是 admin');
 			text: '/ban 555',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
-	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('用户在第二个群是 admin → /ban 触发,加黑成功', blacklist.length === 1 && blacklist[0].id === '555');
 	assert('全群踢人 banChatMember 调用 2 次', callsOf('banChatMember').length === 2);
 }
@@ -780,9 +847,9 @@ console.log('\n[17] 全 miss:普通用户发 /ban 静默');
 			text: '/ban 555',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
-	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('普通用户 → /ban 不触发,黑名单为空', blacklist.length === 0);
 	assert('未调 banChatMember', callsOf('banChatMember').length === 0);
 	assert('群内静默,无 sendMessage', callsOf('sendMessage').length === 0);
@@ -809,9 +876,9 @@ console.log('\n[18] 单群查询失败不阻塞:其它群命中仍有效');
 			text: '/ban 555',
 		},
 	};
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
-	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('单群失败不阻塞 → /ban 仍触发', blacklist.length === 1);
 }
 
@@ -835,9 +902,9 @@ console.log('\n[19] SUPER_ADMINS 直接放行');
 		},
 	};
 	// 关键:把 SUPER_ADMINS 注入 env
-	const env = { ...baseEnv, SUPER_ADMINS: '11111', KV: makeFakeKV([]) };
+	const env = { ...baseEnv, SUPER_ADMINS: '11111', DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
-	const blacklist = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('SUPER_ADMINS 即使不在群里也能用 /ban', blacklist.length === 1 && blacklist[0].id === '555');
 	// 不应该调 getChatAdministrators(super 短路返回 true)
 	assert('SUPER_ADMINS 路径短路:不查群 admin 列表', callsOf('getChatAdministrators').length === 0);
@@ -845,8 +912,8 @@ console.log('\n[19] SUPER_ADMINS 直接放行');
 
 // ===== 主人审计通知系统专项测试([20]-[24]) =====
 
-// ---------- [20] OWNER_ID 未配置 → 不发任何私聊 ----------
-console.log('\n[20] OWNER_ID 未配置:仅群闪屏,无私聊');
+// ---------- [20] OWNER_IDS 未配置 → 不发任何私聊 ----------
+console.log('\n[20] OWNER_IDS 未配置:仅群闪屏,无私聊');
 {
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
@@ -858,17 +925,17 @@ console.log('\n[20] OWNER_ID 未配置:仅群闪屏,无私聊');
 	const update = {
 		message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/ban 555' },
 	};
-	// 关键:不传 OWNER_ID
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', KV: makeFakeKV([]) };
+	// 关键:不传 OWNER_IDS
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
 	const dmSends = callsOf('sendMessage').filter((c) => Number(c.body.chat_id) > 0);
-	assert('OWNER_ID 未配置时无任何私聊', dmSends.length === 0);
+	assert('OWNER_IDS 未配置时无任何私聊', dmSends.length === 0);
 	const groupSends = callsOf('sendMessage').filter((c) => Number(c.body.chat_id) < 0);
 	assert('群闪屏仍然发出', groupSends.length === 1);
 }
 
-// ---------- [21] OWNER_ID 已配置 + 主人=触发者 → 含"你自己" ----------
+// ---------- [21] OWNER_IDS 已配置 + 主人=触发者 → 含"你自己" ----------
 console.log('\n[21] 主人=触发者:详情含"你自己"');
 {
 	resetCalls();
@@ -881,8 +948,8 @@ console.log('\n[21] 主人=触发者:详情含"你自己"');
 	const update = {
 		message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/ban 555' },
 	};
-	// OWNER_ID = 999(就是触发者)
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) };
+	// OWNER_IDS = 999(就是触发者)
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
 	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -891,7 +958,7 @@ console.log('\n[21] 主人=触发者:详情含"你自己"');
 	assert('详情含"主人操作通知"标题', dmSend.body.text.includes('主人操作通知'));
 }
 
-// ---------- [22] OWNER_ID 已配置 + 触发者非主人 → 主人收审计,触发者不收 ----------
+// ---------- [22] OWNER_IDS 已配置 + 触发者非主人 → 主人收审计,触发者不收 ----------
 console.log('\n[22] 群管理员触发:主人收审计,触发者零私信');
 {
 	resetCalls();
@@ -905,8 +972,8 @@ console.log('\n[22] 群管理员触发:主人收审计,触发者零私信');
 	const update = {
 		message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '台风' }, text: '/ban 555' },
 	};
-	// OWNER_ID = 999(主人) ≠ 触发者 7777
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) };
+	// OWNER_IDS = 999(主人) ≠ 触发者 7777
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -916,8 +983,44 @@ console.log('\n[22] 群管理员触发:主人收审计,触发者零私信');
 	assert('审计含"群管理员操作通知"标题', ownerDm.body.text.includes('群管理员操作通知'));
 	assert('审计含操作人名"台风"', ownerDm.body.text.includes('台风'));
 	assert('审计含角色标签"群管理员"', ownerDm.body.text.includes('群管理员'));
-	assert('审计含"群内"来源标记', ownerDm.body.text.includes('群内'));
-	assert('审计含完整详情(踢人结果)', ownerDm.body.text.includes('已从全部'));
+assert('审计含"群内"来源标记', ownerDm.body.text.includes('群内'));
+assert('审计含完整详情(踢人结果)', ownerDm.body.text.includes('已从全部'));
+}
+
+// ---------- [22b] OWNER_IDS 通知范围:主人全量,副主人仅 /ban /spam 踢出通知 ----------
+console.log('\n[22b] OWNER_IDS 通知范围:主人全量,副主人仅 /ban /spam');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 7777 }, status: 'administrator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,1000', DB: makeFakeDB([]) };
+	await handler.fetch(new Request(`https://x.com/`, {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '管理员' }, text: '/ban 555' } })
+	}), env, fakeCtx);
+	let ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	let deputyDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '1000');
+	assert('/ban → 主人收到踢出通知', !!ownerDm && ownerDm.body.text.includes('已从全部'));
+	assert('/ban → 副主人收到踢出通知', !!deputyDm && deputyDm.body.text.includes('已从全部'));
+
+	resetCalls();
+	env = {
+		TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,1000',
+		DB: makeFakeDB([{ id: '555', reason: 'manual', by: '7777', at: '2026-05-01T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request(`https://x.com/`, {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 2, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '管理员' }, text: '/unban 555' } })
+	}), env, fakeCtx);
+	ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	deputyDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '1000');
+	assert('/unban → 主人收到通知', !!ownerDm && ownerDm.body.text.includes('从黑名单中移除'));
+	assert('/unban → 副主人不收到通知', !deputyDm);
 }
 
 // ---------- [23] 一键解封按钮 → 主人收到独立审计通知 ----------
@@ -938,8 +1041,8 @@ console.log('\n[23] 一键解封按钮:主人收审计');
 			data: 'gky:a:55555:-1001',
 		},
 	};
-	// OWNER_ID = 999, SUPER_ADMINS 含 8888 才能让按钮通过权限校验
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', SUPER_ADMINS: '8888,999', KV: makeFakeKV([]) };
+	// OWNER_IDS = 999, SUPER_ADMINS 含 8888 才能让按钮通过权限校验
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cbUpdate) }), env);
 
 	const ownerDms = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
@@ -969,8 +1072,8 @@ console.log('\n[24] chat_member 手动 ban:主人收审计');
 			date: Math.floor(Date.now() / 1000),
 		},
 	};
-	// OWNER_ID = 999, 触发者 7777 ≠ 主人
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) };
+	// OWNER_IDS = 999, 触发者 7777 ≠ 主人
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cmUpdate) }), env);
 
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -984,8 +1087,8 @@ console.log('\n[24] chat_member 手动 ban:主人收审计');
 	assert('审计含中文状态"已踢出"', ownerDm.body.text.includes('已踢出'));
 }
 
-// ---------- [25] 重复添加已黑用户:字段齐全 + "已在黑名单"提示 ----------
-console.log('\n[25] 重复加黑同一用户:详情字段齐全');
+// ---------- [25] 重复添加已黑用户:不报 D1 唯一约束错误,仍继续踢出 ----------
+console.log('\n[25] 重复加黑同一用户:已在黑名单仍继续踢出');
 {
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
@@ -1011,10 +1114,10 @@ console.log('\n[25] 重复加黑同一用户:详情字段齐全');
 	const update = {
 		message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '台风' }, text: '/ban 12345' },
 	};
-	// 关键:KV 已经有 12345 → addToBlacklist 返回失败"已在黑名单"
+	// 关键:D1 已经有 12345 → addToBlacklist 返回失败"已在黑名单"
 	const env = {
-		TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999',
-		KV: makeFakeKV([{ id: '12345', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' }]),
+		TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999',
+		DB: makeFakeDB([{ id: '12345', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' }]),
 	};
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
@@ -1024,8 +1127,8 @@ console.log('\n[25] 重复加黑同一用户:详情字段齐全');
 	assert('字段:目标用户名"广告号"', ownerDm.body.text.includes('广告号'));
 	assert('字段:目标用户ID 12345', ownerDm.body.text.includes('12345'));
 	assert('字段:操作人"台风"', ownerDm.body.text.includes('台风'));
-	assert('失败提示:含"已在黑名单"', ownerDm.body.text.includes('已在黑名单'));
-	assert('失败提示:含"请勿重复添加"', ownerDm.body.text.includes('请勿重复添加'));
+	assert('重复提示:含"已在黑名单"', ownerDm.body.text.includes('已在黑名单'));
+	assert('已在黑名单仍会全群踢出', callsOf('banChatMember').length === 2);
 }
 
 // ---------- [26] 机器人操作 chat_member → 不通知主人 ----------
@@ -1044,7 +1147,7 @@ console.log('\n[26] 机器人(其它bot)手动操作:不通知主人');
 			date: Math.floor(Date.now() / 1000),
 		},
 	};
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) };
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cmUpdate) }), env);
 
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -1069,7 +1172,7 @@ console.log('\n[27] 匿名管理员操作:仍通知主人');
 			date: Math.floor(Date.now() / 1000),
 		},
 	};
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) };
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cmUpdate) }), env);
 
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -1096,16 +1199,16 @@ const AD_KW_SEED = {
 	general: [],
 	whitelist: [],
 };
-// 构造一个已预置广告词库的 fake KV
-function makeAdKV(extra = {}) {
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_keywords_custom', JSON.stringify({ ...AD_KW_SEED, ...extra }));
-	return kv;
+// 构造一个已预置广告词库的 fake D1
+function makeAdD1(extra = {}) {
+	const db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify({ ...AD_KW_SEED, ...extra }));
+	return db;
 }
 const adEnv = (extra = {}) => ({
-	TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999',
+	TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999',
 	AD_FILTER_ENABLED: 'true',
-	KV: makeAdKV(),
+	DB: makeAdD1(),
 	...extra,
 });
 const adFetchMock = () => makeFetchMock({
@@ -1134,7 +1237,7 @@ console.log('\n[30] 金融广告评分(出u+承兑)');
 	sandbox.fetch = adFetchMock();
 	const env = adEnv();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '专业出u承兑,日入过万' })) }), env, fakeCtxAd);
-	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const bl = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('金融广告 → 加黑', bl.some((e) => e.id === '88001'));
 	assert('金融广告 → 踢人', callsOf('banChatMember').length === 2);
 }
@@ -1146,7 +1249,7 @@ console.log('\n[31] 色情广告评分');
 	sandbox.fetch = adFetchMock();
 	const env = adEnv();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '免费看片 约炮资源群' })) }), env, fakeCtxAd);
-	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const bl = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('色情广告 → 加黑', bl.some((e) => e.id === '88001'));
 }
 
@@ -1158,7 +1261,7 @@ console.log('\n[32] 用户名是广告词');
 	const env = adEnv();
 	// 文本无害,但 first_name 含 usdt+承兑
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ from: { id: 88001, is_bot: false, first_name: '爆u承兑usdt项目' }, text: '大家好' })) }), env, fakeCtxAd);
-	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const bl = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('用户名广告 → 加黑', bl.some((e) => e.id === '88001'));
 }
 
@@ -1169,7 +1272,7 @@ console.log('\n[33] 单词 usdt 不误杀');
 	sandbox.fetch = adFetchMock();
 	const env = adEnv();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '请问 usdt 怎么提现到银行卡' })) }), env, fakeCtxAd);
-	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const bl = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('单词 usdt(+2 < 阈值3)→ 不加黑', !bl.some((e) => e.id === '88001'));
 	assert('单词 usdt → 不删消息', callsOf('deleteMessage').length === 0);
 	assert('单词 usdt → 不踢', callsOf('banChatMember').length === 0);
@@ -1183,7 +1286,7 @@ console.log('\n[34] 白名单命中不杀');
 	// 把 usdt 和 承兑 加白名单 → 即使两个都出现也不计分
 	const env = adEnv({ AD_WHITELIST: 'usdt,承兑' });
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '我想了解 usdt 承兑的流程' })) }), env, fakeCtxAd);
-	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const bl = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('白名单词 → 不加黑', !bl.some((e) => e.id === '88001'));
 }
 
@@ -1201,7 +1304,7 @@ console.log('\n[35] 管理员发广告豁免');
 	});
 	const env = adEnv();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '出u承兑日入过万 +1 484 842 6117' })) }), env, fakeCtxAd);
-	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const bl = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('管理员发广告 → 不加黑(豁免)', !bl.some((e) => e.id === '88001'));
 	assert('管理员发广告 → 不删消息', callsOf('deleteMessage').length === 0);
 }
@@ -1211,9 +1314,9 @@ console.log('\n[36] 开关关闭不检测');
 {
 	resetCalls();
 	sandbox.fetch = adFetchMock();
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: makeFakeKV([]) }; // 不设 AD_FILTER_ENABLED
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([]) }; // 不设 AD_FILTER_ENABLED
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(adMsg({ text: '出u承兑 +1 484 842 6117 t.me/+abc' })) }), env, fakeCtxAd);
-	const bl = JSON.parse(env.KV._store.get('blacklist') || '[]');
+	const bl = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('开关关 → 不加黑', !bl.some((e) => e.id === '88001'));
 	assert('开关关 → 不删消息', callsOf('deleteMessage').length === 0);
 }
@@ -1234,20 +1337,20 @@ console.log('\n[37] 主人收到广告拦截通知');
 
 // ===== 广告词库热更新命令测试([38]-[43]) =====
 
-// ---------- [38] 主人 /addword 写入 KV ----------
-console.log('\n[38] 主人 /addword 写入 KV');
+// ---------- [38] 主人 /addword 写入 D1 ----------
+console.log('\n[38] 主人 /addword 写入 D1');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]); // 空词库
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]); // 空词库
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 主人私聊发 /addword fraud 杀猪盘
 	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/addword fraud 杀猪盘 刷信誉' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const stored = JSON.parse(kv._store.get('ad_keywords_custom') || '{}');
+	const stored = JSON.parse(db._store.get('ad_keywords_custom') || '{}');
 	assert('/addword 写入 fraud 分类', stored.fraud && stored.fraud.includes('杀猪盘') && stored.fraud.includes('刷信誉'));
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('主人收到回执', !!dm && dm.body.text.includes('杀猪盘'));
@@ -1264,16 +1367,16 @@ console.log('\n[39] /addword 后该词能命中');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	// KV 里预置 general:[杀猪盘](权重 +2,但阈值 3,需要两个词。这里加两个 general 词凑分)
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: [], porn: [], spam: [], fraud: ['杀猪盘', '刷信誉'], general: [], whitelist: [] }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	// D1 里预置 general:[杀猪盘](权重 +2,但阈值 3,需要两个词。这里加两个 general 词凑分)
+	const db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify({ finance: [], porn: [], spam: [], fraud: ['杀猪盘', '刷信誉'], general: [], whitelist: [] }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 普通成员发含两个 fraud 词(各+2=4 ≥ 3)
 	const update = { message: { message_id: 2, chat: { id: -1001, type: 'supergroup' }, from: { id: 88002, is_bot: false, first_name: '路人' }, text: '专业杀猪盘刷信誉' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
-	assert('KV 自定义词命中 → 加黑', bl.some((e) => e.id === '88002'));
-	assert('KV 自定义词命中 → 踢人', callsOf('banChatMember').length === 2);
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
+	assert('D1 自定义词命中 → 加黑', bl.some((e) => e.id === '88002'));
+	assert('D1 自定义词命中 → 踢人', callsOf('banChatMember').length === 2);
 }
 
 // ---------- [40] /delword 删词后不再命中 ----------
@@ -1284,12 +1387,12 @@ console.log('\n[40] /delword 删词');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: ['usdt'], porn: [], spam: [], fraud: ['杀猪盘'], general: [], whitelist: [] }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify({ finance: ['usdt'], porn: [], spam: [], fraud: ['杀猪盘'], general: [], whitelist: [] }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/delword 杀猪盘' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const stored = JSON.parse(kv._store.get('ad_keywords_custom') || '{}');
+	const stored = JSON.parse(db._store.get('ad_keywords_custom') || '{}');
 	assert('/delword 从 fraud 删除杀猪盘', !stored.fraud.includes('杀猪盘'));
 	assert('/delword 不影响其它词 usdt', stored.finance.includes('usdt'));
 }
@@ -1302,9 +1405,9 @@ console.log('\n[41] /listwords 展示');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: ['usdt'], porn: [], spam: [], fraud: ['假钞'], general: [], whitelist: ['白词'] }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify({ finance: ['usdt'], porn: [], spam: [], fraud: ['假钞'], general: [], whitelist: ['白词'] }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/listwords' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -1322,11 +1425,11 @@ console.log('\n[42] /importdefault 导入');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]); // 空词库
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]); // 空词库
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/importdefault' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const stored = JSON.parse(kv._store.get('ad_keywords_custom') || '{}');
+	const stored = JSON.parse(db._store.get('ad_keywords_custom') || '{}');
 	assert('/importdefault 写入 finance 词', stored.finance && stored.finance.length > 0);
 	assert('/importdefault 写入 fraud 词', stored.fraud && stored.fraud.length > 0);
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -1342,12 +1445,12 @@ console.log('\n[43] 非主人 /addword 被拒');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 7777 }, status: 'administrator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 群管理员 7777 私聊发 /addword
 	const update = { message: { message_id: 1, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/addword fraud 测试' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const stored = kv._store.get('ad_keywords_custom');
+	const stored = db._store.get('ad_keywords_custom');
 	assert('非主人 → 词库未被修改', !stored);
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
 	assert('非主人 → 收到权限不足提示', !!dm && dm.body.text.includes('权限不足'));
@@ -1363,14 +1466,14 @@ console.log('\n[44] emoji 不计分,表情包不误杀');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
+	const db = makeFakeDB([]);
 	// 即使配了 emoji 分类也不影响(已移除 emoji 评分);finance 单个词 +2 < 阈值3
-	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: ['出u'], porn: [], spam: [], fraud: [], general: [], whitelist: [] }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	db._store.set('ad_keywords_custom', JSON.stringify({ finance: ['出u'], porn: [], spam: [], fraud: [], general: [], whitelist: [] }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 单个金融词 + 一堆 emoji:emoji 不加分,只 +2 < 3 → 不杀
 	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88044, is_bot: false, first_name: '路人' }, text: '想了解出u🔥💰❤️😍🎉' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('emoji 不计分:单词+emoji 不达阈值 → 不杀', !bl.some((e) => e.id === '88044'));
 }
 
@@ -1384,13 +1487,13 @@ console.log('\n[45] 纯 emoji 消息不误杀');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_keywords_custom', JSON.stringify({ finance: ['出u'], porn: ['看片'], spam: [], fraud: ['假钞'], general: [], whitelist: [] }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify({ finance: ['出u'], porn: ['看片'], spam: [], fraud: ['假钞'], general: [], whitelist: [] }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 一堆 emoji 但无任何广告词 → 不该被杀
 	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88045, is_bot: false, first_name: '开心' }, text: '今天好开心🔥💰❤️😍🎉🎊✨🥳' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('纯 emoji → 不误杀', !bl.some((e) => e.id === '88045'));
 	assert('纯 emoji → 不删消息', callsOf('deleteMessage').length === 0);
 }
@@ -1408,8 +1511,8 @@ console.log('\n[46] 主人 /spam 学习样本');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 主人在群里回复一条广告发 /spam
 	const update = { message: {
 		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false, first_name: '主人' },
@@ -1417,10 +1520,10 @@ console.log('\n[46] 主人 /spam 学习样本');
 		reply_to_message: { message_id: 50, from: { id: 88100, is_bot: false, first_name: '广告号' }, text: '专业承兑出u日入过万快来咨询' },
 	} };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const samples = JSON.parse(kv._store.get('ad_samples') || '{"fingerprints":[]}');
+	const samples = JSON.parse(db._store.get('ad_samples') || '{"fingerprints":[]}');
 	assert('主人 /spam → 指纹入库', samples.fingerprints.length === 1);
 	assert('指纹是归一化后的广告文本', samples.fingerprints[0].includes('专业承兑出u日入过万'));
-	const kw = JSON.parse(kv._store.get('ad_keywords_custom') || '{"general":[]}');
+	const kw = JSON.parse(db._store.get('ad_keywords_custom') || '{"general":[]}');
 	assert('提取的关键词不再自动进 general（防污染）', !kw.general || kw.general.length === 0);
 }
 
@@ -1436,17 +1539,17 @@ console.log('\n[47] 普通管理员 /spam 不学习');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: {
 		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '管理员' },
 		text: '/spam',
 		reply_to_message: { message_id: 50, from: { id: 88101, is_bot: false }, text: '某广告内容' },
 	} };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const samples = kv._store.get('ad_samples');
+	const samples = db._store.get('ad_samples');
 	assert('普通管理员 /spam → 不入库样本', !samples);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('普通管理员 /spam → 仍加黑(行为不变)', bl.some((e) => e.id === '88101'));
 }
 
@@ -1461,14 +1564,14 @@ console.log('\n[48] 学习后相同广告秒杀');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
+	const db = makeFakeDB([]);
 	// 预置一条学习指纹(归一化后的)
-	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('专业承兑出u日入过万快来咨询')], count: 1 }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('专业承兑出u日入过万快来咨询')], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 普通成员发完全相同的广告
 	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88102, is_bot: false, first_name: '路人' }, text: '专业承兑出u日入过万快来咨询' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('相同广告 → 指纹命中加黑', bl.some((e) => e.id === '88102'));
 	assert('相同广告 → 全群踢', callsOf('banChatMember').length === 2);
 	assert('相同广告 → 删消息', callsOf('deleteMessage').length >= 1);
@@ -1485,13 +1588,13 @@ console.log('\n[49] 加空格标点变体仍命中');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('专业承兑出u日入过万')], count: 1 }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('专业承兑出u日入过万')], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 加了空格、标点、emoji 的变体
 	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88103, is_bot: false }, text: '专业 承兑、出u!日入,过万🔥' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('加空格标点变体 → 归一化后命中', bl.some((e) => e.id === '88103'));
 }
 
@@ -1505,13 +1608,13 @@ console.log('\n[51] 太短消息不触发指纹');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
+	const db = makeFakeDB([]);
 	// 一条极短指纹(理论上不该存在,因为 learn 限制 ≥6,但测防御)
-	kv._store.set('ad_samples', JSON.stringify({ fingerprints: ['abc'], count: 1 }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: ['abc'], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88105, is_bot: false }, text: 'abc好' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('短指纹(<6)不触发匹配 → 不误杀', !bl.some((e) => e.id === '88105'));
 }
 
@@ -1523,9 +1626,9 @@ console.log('\n[52] /listsamples 展示');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_samples', JSON.stringify({ fingerprints: ['承兑出u日入过万', '看片约炮资源群'], count: 2 }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: ['承兑出u日入过万', '看片约炮资源群'], count: 2 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/listsamples' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -1542,12 +1645,12 @@ console.log('\n[53] /delsample 删样本');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_samples', JSON.stringify({ fingerprints: ['样本甲一二三四', '样本乙一二三四'], count: 2 }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: ['样本甲一二三四', '样本乙一二三四'], count: 2 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/delsample 1' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const samples = JSON.parse(kv._store.get('ad_samples') || '{"fingerprints":[]}');
+	const samples = JSON.parse(db._store.get('ad_samples') || '{"fingerprints":[]}');
 	assert('/delsample 1 删掉第一条', samples.fingerprints.length === 1 && samples.fingerprints[0] === '样本乙一二三四');
 }
 
@@ -1559,16 +1662,16 @@ console.log('\n[54] /clearsamples 二次确认');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_samples', JSON.stringify({ fingerprints: ['样本一二三四', '样本五六七八'], count: 2 }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: ['样本一二三四', '样本五六七八'], count: 2 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 第一次不带 confirm → 不清空
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/clearsamples' } }) }), env, fakeCtxAd);
-	let samples = JSON.parse(kv._store.get('ad_samples') || '{"fingerprints":[]}');
+	let samples = JSON.parse(db._store.get('ad_samples') || '{"fingerprints":[]}');
 	assert('/clearsamples 无 confirm → 不清空', samples.fingerprints.length === 2);
 	// 带 confirm → 清空
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/clearsamples confirm' } }) }), env, fakeCtxAd);
-	samples = JSON.parse(kv._store.get('ad_samples') || '{"fingerprints":[]}');
+	samples = JSON.parse(db._store.get('ad_samples') || '{"fingerprints":[]}');
 	assert('/clearsamples confirm → 清空', samples.fingerprints.length === 0);
 }
 
@@ -1580,8 +1683,8 @@ console.log('\n[55] 非主人样本命令被拒');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 7777 }, status: 'administrator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/listsamples' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
@@ -1598,11 +1701,11 @@ console.log('\n[56] /learn 粘贴文本学习');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/learn 世界杯红单推荐天天收米日赚三千' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const samples = JSON.parse(kv._store.get('ad_samples') || '{"fingerprints":[]}');
+	const samples = JSON.parse(db._store.get('ad_samples') || '{"fingerprints":[]}');
 	assert('/learn → 指纹入库', samples.fingerprints.length === 1);
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('/learn → 回执含已学习', !!dm && dm.body.text.includes('已学习'));
@@ -1619,13 +1722,13 @@ console.log('\n[57] /learn 后广告再发命中');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 主人先 /learn
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/learn 专业出u承兑日入过万快来' } }) }), env, fakeCtxAd);
 	// 普通成员发相同广告
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: -1001, type: 'supergroup' }, from: { id: 88200, is_bot: false }, text: '专业出u承兑日入过万快来' } }) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('/learn 后相同广告 → 命中加黑', bl.some((e) => e.id === '88200'));
 }
 
@@ -1637,12 +1740,12 @@ console.log('\n[58] 疑似广告消息被缓存');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', MSG_CACHE_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', MSG_CACHE_ENABLED: 'true', DB: db };
 	// 含 @ 提及的较长消息(疑似广告),普通成员发
 	const update = { message: { message_id: 5, chat: { id: -1001, type: 'supergroup' }, from: { id: 88201, is_bot: false, first_name: '广告' }, text: '高薪兼职日结联系 @somebot 详情' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const cache = JSON.parse(kv._store.get('recent_messages') || '{"items":[]}');
+	const cache = JSON.parse(db._store.get('recent_messages') || '{"items":[]}');
 	assert('疑似广告 → 被缓存', cache.items.length === 1 && cache.items[0].fromId === '88201');
 }
 
@@ -1654,12 +1757,12 @@ console.log('\n[59] 正常短消息不缓存');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', MSG_CACHE_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', MSG_CACHE_ENABLED: 'true', DB: db };
 	// 正常短闲聊:无链接/无@/无长数字/短
 	const update = { message: { message_id: 5, chat: { id: -1001, type: 'supergroup' }, from: { id: 88202, is_bot: false }, text: '哈哈在吗' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const cache = kv._store.get('recent_messages');
+	const cache = db._store.get('recent_messages');
 	assert('正常短消息 → 不缓存', !cache);
 }
 
@@ -1673,15 +1776,15 @@ console.log('\n[60] /learnlast 学最近并加黑踢');
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
+	const db = makeFakeDB([]);
 	// 预置【冻结快照】(新行为:/learnlast 只从快照读,不读实时缓存,序号永不漂移)
-	kv._store.set('learn_snapshot', JSON.stringify({ items: [{ mid: 50, text: '假钞交流群快递面交都可', fromId: '88203', fromName: '广告号', at: '2026-05-29T00:00:00Z' }], scope: '本群' }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	db._store.set('learn_snapshot', JSON.stringify({ items: [{ mid: 50, text: '假钞交流群快递面交都可', fromId: '88203', fromName: '广告号', at: '2026-05-29T00:00:00Z' }], scope: '本群' }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/learnlast' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const samples = JSON.parse(kv._store.get('ad_samples') || '{"fingerprints":[]}');
+	const samples = JSON.parse(db._store.get('ad_samples') || '{"fingerprints":[]}');
 	assert('/learnlast → 指纹入库', samples.fingerprints.length === 1);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('/learnlast → 只学不踢:发送者不加黑', !bl.some((e) => e.id === '88203'));
 	assert('/learnlast → 只学不踢:不调 banChatMember', callsOf('banChatMember').length === 0);
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -1698,19 +1801,19 @@ console.log('\n[61] /learnlast 1,3 学多条');
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
+	const db = makeFakeDB([]);
 	// 冻结快照:序号 1=items[0]。/learnlast 1,3 学第1和第3条
-	kv._store.set('learn_snapshot', JSON.stringify({ items: [
+	db._store.set('learn_snapshot', JSON.stringify({ items: [
 		{ mid: 1, text: '广告甲一二三四五', fromId: '101', fromName: 'A', at: '2026-05-29T00:00:01Z' },
 		{ mid: 2, text: '广告乙一二三四五', fromId: '102', fromName: 'B', at: '2026-05-29T00:00:02Z' },
 		{ mid: 3, text: '广告丙一二三四五', fromId: '103', fromName: 'C', at: '2026-05-29T00:00:03Z' },
 	], scope: '本群' }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/learnlast 1,3' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const samples = JSON.parse(kv._store.get('ad_samples') || '{"fingerprints":[]}');
+	const samples = JSON.parse(db._store.get('ad_samples') || '{"fingerprints":[]}');
 	assert('/learnlast 1,3 → 学2条指纹', samples.fingerprints.length === 2);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('/learnlast 1,3 → 只学不踢:无人加黑', bl.length === 0);
 	assert('/learnlast 1,3 → 只学不踢:不调 banChatMember', callsOf('banChatMember').length === 0);
 }
@@ -1723,8 +1826,8 @@ console.log('\n[62] 快照空 /learnlast 提示');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/learnlast' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -1739,11 +1842,11 @@ console.log('\n[63] 非主人 /learn 被拒');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 7777 }, status: 'administrator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/learn 测试广告内容一二三' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const samples = kv._store.get('ad_samples');
+	const samples = db._store.get('ad_samples');
 	assert('非主人 /learn → 不入库', !samples);
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
 	assert('非主人 /learn → 权限不足', !!dm && dm.body.text.includes('权限不足'));
@@ -1757,11 +1860,11 @@ console.log('\n[64] 缓存开关关不缓存');
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', MSG_CACHE_ENABLED: 'false', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', MSG_CACHE_ENABLED: 'false', DB: db };
 	const update = { message: { message_id: 5, chat: { id: -1001, type: 'supergroup' }, from: { id: 88204, is_bot: false }, text: '高薪兼职日结联系 @somebot 详情看' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const cache = kv._store.get('recent_messages');
+	const cache = db._store.get('recent_messages');
 	assert('缓存关 → 不缓存', !cache);
 }
 
@@ -1774,17 +1877,17 @@ console.log('\n[65] /recent 冻结快照');
 		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
+	const db = makeFakeDB([]);
 	// 预置实时缓存(本群 -1001 两条)
-	kv._store.set('recent_messages', JSON.stringify({ items: [
+	db._store.set('recent_messages', JSON.stringify({ items: [
 		{ mid: 1, chatId: '-1001', text: '广告甲一二三四五六', fromId: '201', fromName: 'A', at: '2026-05-29T00:00:01Z' },
 		{ mid: 2, chatId: '-1001', text: '广告乙一二三四五六', fromId: '202', fromName: 'B', at: '2026-05-29T00:00:02Z' },
 	] }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 主人在群里发 /recent
 	const update = { message: { message_id: 9, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/recent' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const snap = JSON.parse(kv._store.get('learn_snapshot') || '{"items":[]}');
+	const snap = JSON.parse(db._store.get('learn_snapshot') || '{"items":[]}');
 	assert('/recent → 写入冻结快照', snap.items.length === 2);
 	assert('/recent → 快照序号1=最新(202)', snap.items[0].fromId === '202');
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -1801,32 +1904,32 @@ console.log('\n[66] /learnlast 群内被拒');
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('learn_snapshot', JSON.stringify({ items: [{ mid: 1, text: '广告甲一二三四五六', fromId: '301', fromName: 'A' }], scope: '本群' }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('learn_snapshot', JSON.stringify({ items: [{ mid: 1, text: '广告甲一二三四五六', fromId: '301', fromName: 'A' }], scope: '本群' }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 主人在群里发 /learnlast → 应被拒,不学不踢
 	const update = { message: { message_id: 9, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/learnlast' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const samples = kv._store.get('ad_samples');
+	const samples = db._store.get('ad_samples');
 	assert('群内 /learnlast → 不学习(强制私聊)', !samples);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('群内 /learnlast → 不加黑', bl.length === 0);
 }
 
-// ---------- [67] /help 仅主人(非主人无反应) ----------
-console.log('\n[67] /help 主人专属');
+// ---------- [67] /help 仅 OWNER_IDS(非 OWNER_IDS 无反应) ----------
+console.log('\n[67] /help OWNER_IDS 专属');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }, { user: { id: 7777 }, status: 'administrator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: kv };
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: db };
 	// 主人私聊 /help → 展开隐藏指令
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/help' } }) }), env, fakeCtxAd);
 	let dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('主人 /help → 展开隐藏指令', !!dm && dm.body.text.includes('主人专属'));
+	assert('主人 /help → 展开隐藏指令', !!dm && dm.body.text.includes('OWNER_IDS 专属'));
 	assert('主人 /help → 含 /learnlast 说明', !!dm && dm.body.text.includes('learnlast'));
 	// 群管理员(非主人)私聊 /help → 权限不足,不泄漏指令
 	resetCalls();
@@ -1847,13 +1950,13 @@ console.log('\n[68] 正常域名链接不误杀');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
+	const db = makeFakeDB([]);
 	// 故意预置一条 github 链接样本(模拟之前误学),且与待测消息完全相同
-	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('https://github.com/jacobax/snippets')], count: 1 }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('https://github.com/jacobax/snippets')], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88300, is_bot: false }, text: 'https://github.com/jacobax/snippets', entities: [{ type: 'url', offset: 0, length: 35 }] } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('github 正常链接 → 不加黑(白名单放行)', !bl.some((e) => e.id === '88300'));
 	assert('github 正常链接 → 不删消息', callsOf('deleteMessage').length === 0);
 }
@@ -1869,23 +1972,23 @@ console.log('\n[69] URL 样本不子串扩散');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
+	const db = makeFakeDB([]);
 	// 学过一条【非白名单】域名链接广告
-	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('http://spam-shop.xyz/abc')], count: 1 }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('http://spam-shop.xyz/abc')], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 同域名不同路径(更长)→ 旧版会被子串命中,新版不该被杀
 	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88301, is_bot: false }, text: 'http://spam-shop.xyz/abc/page/normal-content-here', entities: [{ type: 'url', offset: 0, length: 49 }] } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	let bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	let bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('同域名不同路径 → 不被子串误杀', !bl.some((e) => e.id === '88301'));
 	// 完全相同的那条 → 仍应精确命中
 	resetCalls();
-	const kv2 = makeFakeKV([]);
-	kv2._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('http://spam-shop.xyz/abc')], count: 1 }));
-	const env2 = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv2 };
+	const db2 = makeFakeDB([]);
+	db2._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('http://spam-shop.xyz/abc')], count: 1 }));
+	const env2 = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db2 };
 	const upd2 = { message: { message_id: 2, chat: { id: -1001, type: 'supergroup' }, from: { id: 88302, is_bot: false }, text: 'http://spam-shop.xyz/abc', entities: [{ type: 'url', offset: 0, length: 24 }] } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(upd2) }), env2, fakeCtxAd);
-	bl = JSON.parse(kv2._store.get('blacklist') || '[]');
+	bl = JSON.parse(db2._store.get('blacklist') || '[]');
 	assert('完全相同的广告链接 → 仍精确命中加黑', bl.some((e) => e.id === '88302'));
 }
 
@@ -1900,19 +2003,19 @@ console.log('\n[71] 域名白名单热更新');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
+	const db = makeFakeDB([]);
 	// 先学一条该域名的样本(模拟误学),再把域名加进白名单
-	kv._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('https://myblog.example/post1')], count: 1 }));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('https://myblog.example/post1')], count: 1 }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 主人私聊把 myblog.example 加进白名单
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/addword whitelist myblog.example' } }) }), env, fakeCtxAd);
-	const kw = JSON.parse(kv._store.get('ad_keywords_custom') || '{}');
+	const kw = JSON.parse(db._store.get('ad_keywords_custom') || '{}');
 	assert('/addword whitelist 域名 → 写入 whitelist', (kw.whitelist || []).includes('myblog.example'));
 	// 普通成员发该域名链接(即便完全等于样本)→ 因白名单放行
 	resetCalls();
 	const update = { message: { message_id: 2, chat: { id: -1001, type: 'supergroup' }, from: { id: 88304, is_bot: false }, text: 'https://myblog.example/post1', entities: [{ type: 'url', offset: 0, length: 28 }] } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('白名单域名链接 → 不被杀(即便等于样本)', !bl.some((e) => e.id === '88304'));
 }
 
@@ -1927,16 +2030,16 @@ console.log('\n[73] 名片敏感词叠加判定');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED)); // 含 fraud:假钞
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED)); // 含 fraud:假钞
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 名片名字含"假钞"(fraud +2)+ 名片本身(+1)= 3 ≥ 阈值;电话用中国号不触发强特征
 	const update = { message: {
 		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88401, is_bot: false, first_name: 'X' },
 		contact: { phone_number: '+86 138 0013 8000', first_name: '假钞交流群', vcard: '' },
 	} };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('名片敏感词+86号 → 词库叠加判广告加黑', bl.some((e) => e.id === '88401'));
 }
 
@@ -1951,16 +2054,16 @@ console.log('\n[74] 正常名片不误杀');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 正常用户分享一个本地联系人:名字无敏感词、中国号 → 只有名片+1分,不达阈值3
 	const update = { message: {
 		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88402, is_bot: false, first_name: '小明' },
 		contact: { phone_number: '+86 138 0013 8000', first_name: '张三', last_name: '', vcard: '' },
 	} };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('正常本地名片 → 不加黑(不误杀)', !bl.some((e) => e.id === '88402'));
 	assert('正常本地名片 → 不删消息', callsOf('deleteMessage').length === 0);
 }
@@ -1976,16 +2079,16 @@ console.log('\n[75] 名片名字敏感词直接杀');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED)); // 含 fraud:假钞
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED)); // 含 fraud:假钞
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 名片名字"假钞交流群",电话用中国号(不触发国际号强特征)→ 靠名字命中词库直接杀
 	const update = { message: {
 		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88500, is_bot: false, first_name: 'A' },
 		contact: { phone_number: '+86 138 0013 8000', first_name: '假钞交流群', vcard: '' },
 	} };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('名片名字含敏感词 → 直接加黑', bl.some((e) => e.id === '88500'));
 	assert('名片名字含敏感词 → 全群踢', callsOf('banChatMember').length === 2);
 	assert('名片名字含敏感词 → 删消息', callsOf('deleteMessage').length >= 1);
@@ -2002,16 +2105,16 @@ console.log('\n[76] 正常名字名片不误杀');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const kv = makeFakeKV([]);
-	kv._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	const db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify(AD_KW_SEED));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 正常名字 + 中国号 → 名字不命中词库,只 +1 名片分,不达阈值
 	const update = { message: {
 		message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88501, is_bot: false, first_name: '小红' },
 		contact: { phone_number: '+86 139 0013 9000', first_name: '李四', last_name: '王', vcard: '' },
 	} };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
-	const bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('正常名字名片 → 不加黑(不误杀)', !bl.some((e) => e.id === '88501'));
 	assert('正常名字名片 → 不删消息', callsOf('deleteMessage').length === 0);
 }
@@ -2043,7 +2146,7 @@ console.log('\n[77] 一键代发回查解封结果');
 			data: 'gky:a:55555:-1001',
 		},
 	};
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', SUPER_ADMINS: '8888,999', KV: makeFakeKV([]) };
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cbUpdate) }), env);
 	const opDms = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
 	assert('代发后 → 操作人收到"正在确认"', opDms.some((c) => c.body.text.includes('正在确认')));
@@ -2073,7 +2176,7 @@ console.log('\n[77] 一键代发回查解封结果');
 			data: 'gky:a:55555:-1001',
 		},
 	};
-	const env2 = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', SUPER_ADMINS: '8888,999', KV: makeFakeKV([]) };
+	const env2 = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cbUpdate2) }), env2);
 	const opDms2 = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
 	assert('GKY仍有记录 → 提示稍后 /check 复查', opDms2.some((c) => c.body.text.includes('/check')));
@@ -2109,12 +2212,12 @@ console.log('\n[78] /check TGID 私聊直查');
 	// ① 主人私聊 /check 993005028 → 返回查询结果(无记录)
 	resetCalls();
 	sandbox.fetch = makeCheckFetch('This TG account has no ban record', [999]);
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', SUPER_ADMINS: '999', KV: makeFakeKV([]) };
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/check 993005028' } }) }), env, fakeCtxAd);
 	let dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
 	assert('私聊 /check TGID → 有响应', dm.length > 0);
 	assert('私聊 /check TGID → 返回查询结果', dm.some((c) => c.body.text.includes('993005028')));
-	assert('私聊 /check TGID → 含"没有封禁记录"', dm.some((c) => c.body.text.includes('没有封禁记录')));
+	assert('私聊 /check TGID → 含无封禁记录', dm.some((c) => c.body.text.includes('没有 GKY 封禁记录') || c.body.text.includes('沒有封鎖記錄') || c.body.text.includes('no ban record')));
 
 	// ② 非管理员私聊 /check TGID → 权限不足
 	resetCalls();
@@ -2156,7 +2259,7 @@ console.log('\n[79] 代发有效性警告');
 		};
 	}
 	const cb = (id) => ({ callback_query: { id, from: { id: 8888, is_bot: false, first_name: '超管' }, message: { message_id: 100, chat: { id: -1001, type: 'supergroup' }, text: '审核' }, data: 'gky:a:55555:-1001' } });
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', SUPER_ADMINS: '8888,999', KV: makeFakeKV([]) };
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
 
 	// ① 目标群无 GKYbot(管理员里只有普通bot)→ 警告"未发现 GKYbot"
 	resetCalls();
@@ -2192,29 +2295,29 @@ console.log('\n[80] 发言人身份引流检测');
 		deleteMessage: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	let kv = makeFakeKV([]);
-	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	let db = makeFakeDB([]);
+	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 名字仅含 t.me 链接但无广告词(如双向bot @xxxBot、个人频道)→ 不该误杀(关键防误杀)
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90001, is_bot: false, first_name: '频道 t.me/qewrvetrhe' }, text: 'chat 主 gpt 页 plus 已经稳了13天' } }) }), env, fakeCtxAd);
-	let bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	let bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('名字仅含t.me无广告词 → 不杀(防误杀双向bot/频道)', !bl.some((e) => e.id === '90001'));
 	assert('名字仅含t.me无广告词 → 不删消息', callsOf('deleteMessage').length === 0);
 
 	// ② 名字含色情/赌博类身份词 → 直接杀
 	resetCalls();
-	kv = makeFakeKV([]);
-	kv._store.set('ad_keywords_custom', JSON.stringify({ identity: ['约炮', '裸聊'] }));
-	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify({ identity: ['约炮', '裸聊'] }));
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90002, is_bot: false, first_name: '约炮资源裸聊' }, text: '正常发言内容' } }) }), env, fakeCtxAd);
-	bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('名字含身份广告词(约炮) → 加黑', bl.some((e) => e.id === '90002'));
 
 	// ③ 正常名字 + 正文聊 chatgpt/发t.me链接 → 不杀(关键防误杀:不碰正文)
 	resetCalls();
-	kv = makeFakeKV([]);
-	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', AD_FILTER_ENABLED: 'true', KV: kv };
+	db = makeFakeDB([]);
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 90003, is_bot: false, first_name: '张三' }, text: '我觉得 chatgpt plus 很好用,频道 https://t.me/openai 推荐看看' } }) }), env, fakeCtxAd);
-	bl = JSON.parse(kv._store.get('blacklist') || '[]');
+	bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('正常名字+正文聊chatgpt发链接 → 不杀(不碰正文)', !bl.some((e) => e.id === '90003'));
 	assert('正常名字+正文 → 不删消息', callsOf('deleteMessage').length === 0);
 }
@@ -2224,14 +2327,14 @@ console.log('\n[81] identity词库导入');
 {
 	// ② identity 词库 importdefault 导入
 	resetCalls();
-	const kv2 = makeFakeKV([]);
+	const db2 = makeFakeDB([]);
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const env2 = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_ID: '999', KV: kv2 };
+	const env2 = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: db2 };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/importdefault' } }) }), env2, fakeCtxAd);
-	const kwStore = JSON.parse(kv2._store.get('ad_keywords_custom') || '{}');
+	const kwStore = JSON.parse(db2._store.get('ad_keywords_custom') || '{}');
 	assert('importdefault → identity 分类有词', Array.isArray(kwStore.identity) && kwStore.identity.length > 0);
 }
 

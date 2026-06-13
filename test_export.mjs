@@ -1,5 +1,5 @@
 // /{TOKEN}/export 端到端离线测试
-// 直接 import _worker.js 的 default fetch handler，用伪 KV/D1 驱动
+// 直接 import _worker.js 的 default fetch handler，用伪 D1 驱动
 
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -39,7 +39,7 @@ vm.runInContext(stripped, sandbox, { filename: '_worker.js' });
 
 const handler = sandbox.__handler;
 
-// ---------- 伪 KV / D1 ----------
+// ---------- 伪 D1 ----------
 function makeFakeDB(seed = []) {
 	const rows = new Map(seed.map((r) => [r.id, { ...r }]));
 	return {
@@ -72,22 +72,6 @@ function makeFakeDB(seed = []) {
 	};
 }
 
-function makeFakeKV(seed) {
-	const store = new Map();
-	if (seed) store.set('blacklist', JSON.stringify(seed));
-	return {
-		_store: store,
-		async get(key, opts) {
-			const raw = store.get(key);
-			if (raw === undefined) return null;
-			if (opts && opts.type === 'json') return JSON.parse(raw);
-			return raw;
-		},
-		async put(key, value) { store.set(key, value); },
-		async delete(key) { store.delete(key); }
-	};
-}
-
 const TOKEN = 'TESTTOKEN';
 const baseEnv = {
 	TOKEN,
@@ -113,10 +97,10 @@ async function call(p, env) {
 	return await handler.fetch(new Request(url), env);
 }
 
-// ---------- [1] 默认 HTML 视图（KV 后端） ----------
-console.log('\n[1] HTML 视图 - 仅 KV 后端');
+// ---------- [1] 默认 HTML 视图（D1 后端） ----------
+console.log('\n[1] HTML 视图 - D1 后端');
 {
-	const env = { ...baseEnv, KV: makeFakeKV(seed) };
+	const env = { ...baseEnv, DB: makeFakeDB(seed) };
 	const res = await call(`/${TOKEN}/export`, env);
 	assert('200 状态码', res.status === 200);
 	assert('Content-Type 是 HTML', res.headers.get('Content-Type').includes('text/html'));
@@ -125,27 +109,28 @@ console.log('\n[1] HTML 视图 - 仅 KV 后端');
 	assert('含 1002', body.includes('1002'));
 	assert('含 1003', body.includes('1003'));
 	assert('含总计 3', body.includes('总计：<b>3</b>'));
-	assert('含数据源 KV', body.includes('数据源：KV'));
+	assert('含数据源 D1', body.includes('数据源：D1（权威）'));
 	assert('含网页查看按钮', body.includes('网页查看'));
 	assert('含下载 JSON 按钮', body.includes('下载 JSON'));
 	assert('含下载 CSV 按钮', body.includes('下载 CSV'));
 	assert('含搜索框', body.includes('id="q"'));
 }
 
-// ---------- [2] HTML 视图（D1 优先） ----------
-console.log('\n[2] HTML 视图 - D1 后端');
+// ---------- [2] HTML 视图（空 D1） ----------
+console.log('\n[2] HTML 视图 - 空 D1');
 {
-	const env = { ...baseEnv, KV: makeFakeKV([]), DB: makeFakeDB(seed) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	const res = await call(`/${TOKEN}/export`, env);
 	const body = await res.text();
 	assert('数据源显示 D1（权威）', body.includes('数据源：D1（权威）'));
-	assert('总计 3', body.includes('总计：<b>3</b>'));
+	assert('总计 0', body.includes('总计：<b>0</b>'));
+	assert('显示空提示', body.includes('黑名单为空'));
 }
 
 // ---------- [3] JSON 下载 ----------
 console.log('\n[3] JSON 下载');
 {
-	const env = { ...baseEnv, KV: makeFakeKV(seed) };
+	const env = { ...baseEnv, DB: makeFakeDB(seed) };
 	const res = await call(`/${TOKEN}/export?format=json`, env);
 	assert('200', res.status === 200);
 	assert('Content-Type 是 JSON', res.headers.get('Content-Type').includes('application/json'));
@@ -162,7 +147,7 @@ console.log('\n[3] JSON 下载');
 // ---------- [4] CSV 下载 ----------
 console.log('\n[4] CSV 下载');
 {
-	const env = { ...baseEnv, KV: makeFakeKV(seed) };
+	const env = { ...baseEnv, DB: makeFakeDB(seed) };
 	const res = await call(`/${TOKEN}/export?format=csv`, env);
 	assert('200', res.status === 200);
 	assert('Content-Type 是 CSV', res.headers.get('Content-Type').includes('text/csv'));
@@ -184,7 +169,7 @@ console.log('\n[4] CSV 下载');
 console.log('\n[5] CSV 字段转义（含逗号 / 引号 / 换行）');
 {
 	const tricky = [{ id: '2000', reason: 'has,comma', by: 'has"quote', at: 'line1\nline2' }];
-	const env = { ...baseEnv, KV: makeFakeKV(tricky) };
+	const env = { ...baseEnv, DB: makeFakeDB(tricky) };
 	const res = await call(`/${TOKEN}/export?format=csv`, env);
 	const body = (await res.text());
 	assert('逗号字段加引号', body.includes('"has,comma"'));
@@ -195,7 +180,7 @@ console.log('\n[5] CSV 字段转义（含逗号 / 引号 / 换行）');
 // ---------- [6] 空黑名单 ----------
 console.log('\n[6] 空黑名单');
 {
-	const env = { ...baseEnv, KV: makeFakeKV([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	const res = await call(`/${TOKEN}/export`, env);
 	const body = await res.text();
 	assert('总计 0', body.includes('总计：<b>0</b>'));
@@ -206,7 +191,7 @@ console.log('\n[6] 空黑名单');
 // ---------- [7] 错误的 TOKEN ----------
 console.log('\n[7] 错误 TOKEN');
 {
-	const env = { ...baseEnv, KV: makeFakeKV(seed) };
+	const env = { ...baseEnv, DB: makeFakeDB(seed) };
 	const res = await call('/WRONG_TOKEN/export', env);
 	assert('返回 405（路由不匹配）', res.status === 405);
 }
@@ -225,7 +210,7 @@ console.log('\n[8] 无存储后端');
 console.log('\n[9] HTML 注入防护');
 {
 	const evil = [{ id: '<img src=x onerror=alert(1)>', reason: '<script>', by: '"><svg>', at: '2026-01-01T00:00:00Z' }];
-	const env = { ...baseEnv, KV: makeFakeKV(evil) };
+	const env = { ...baseEnv, DB: makeFakeDB(evil) };
 	const res = await call(`/${TOKEN}/export`, env);
 	const body = await res.text();
 	assert('id 被转义（无 <img）', !body.includes('<img src=x'));
