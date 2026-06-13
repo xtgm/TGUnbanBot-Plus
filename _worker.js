@@ -38,6 +38,7 @@ const PURGE_DEFAULT_PAIR_LIMIT = 20;
 const PURGE_MAX_PAIR_LIMIT = 20;
 const PURGE_CONCURRENCY = 5;
 const PURGE_RUN_DELAY_MS = 250;
+const PURGE_DEFAULT_REASONS = ['manual', 'spam'];
 
 // 5) /blacklist 列表中"原因"字段的中文映射。
 //    内置三种：spam（/spam 举报）、manual（/ban 手动添加）、manual_ban（chat_member 自动同步）。
@@ -576,13 +577,31 @@ async function readD1Blacklist(env) {
 	}));
 }
 
-async function getD1BlacklistCount(env) {
+function buildD1BlacklistReasonFilter(reasons) {
+	if (!Array.isArray(reasons)) {
+		return { where: '', params: [] };
+	}
+	const safeReasons = reasons
+		.map((reason) => String(reason || '').trim())
+		.filter((reason) => /^[a-z0-9_-]+$/i.test(reason));
+	if (safeReasons.length === 0) {
+		return { where: 'WHERE 1 = 0', params: [] };
+	}
+	return {
+		where: `WHERE reason IN (${safeReasons.map(() => '?').join(', ')})`,
+		params: safeReasons
+	};
+}
+
+async function getD1BlacklistCount(env, reasons = null) {
 	await ensureD1Table(env);
-	const row = await env.DB.prepare('SELECT COUNT(*) AS total FROM blacklist').first();
+	const filter = buildD1BlacklistReasonFilter(reasons);
+	const stmt = env.DB.prepare(`SELECT COUNT(*) AS total FROM blacklist ${filter.where}`);
+	const row = filter.params.length > 0 ? await stmt.bind(...filter.params).first() : await stmt.first();
 	return Number(row?.total ?? 0);
 }
 
-async function readD1BlacklistWindow(env, offset, limit) {
+async function readD1BlacklistWindow(env, offset, limit, reasons = null) {
 	await ensureD1Table(env);
 	const safeOffset = Math.max(0, Number(offset) || 0);
 	const safeLimit = Math.max(0, Number(limit) || 0);
@@ -590,13 +609,15 @@ async function readD1BlacklistWindow(env, offset, limit) {
 		return [];
 	}
 
+	const filter = buildD1BlacklistReasonFilter(reasons);
 	const stmt = env.DB.prepare(`
 		SELECT id, reason, by_user, at
 		FROM blacklist
+		${filter.where}
 		ORDER BY COALESCE(at, ''), id
 		LIMIT ? OFFSET ?
 	`);
-	const { results } = await stmt.bind(safeLimit, safeOffset).all();
+	const { results } = await stmt.bind(...filter.params, safeLimit, safeOffset).all();
 	return (results || []).map((r) => ({
 		id: String(r.id),
 		reason: r.reason ?? null,
@@ -1203,6 +1224,44 @@ function parsePurgeGroupIds(url) {
 	return GROUP_IDS.filter((groupId) => requested.has(String(groupId)));
 }
 
+function parsePurgeReasons(url) {
+	const raw = url.searchParams.get('reasons') ?? url.searchParams.get('reason');
+	if (raw === null || String(raw).trim() === '') {
+		return [...PURGE_DEFAULT_REASONS];
+	}
+	const tokens = String(raw)
+		.toLowerCase()
+		.split(/[,，\s]+/)
+		.map((reason) => reason.trim())
+		.filter(Boolean);
+	if (tokens.includes('all')) {
+		return null;
+	}
+	const seen = new Set();
+	const reasons = [];
+	for (const reason of tokens) {
+		if (!/^[a-z0-9_-]+$/.test(reason) || seen.has(reason)) continue;
+		seen.add(reason);
+		reasons.push(reason);
+	}
+	return reasons.length > 0 ? reasons : [...PURGE_DEFAULT_REASONS];
+}
+
+function stringifyPurgeReasons(reasons) {
+	return Array.isArray(reasons) ? reasons.join(',') : 'all';
+}
+
+function describePurgeReasons(reasons) {
+	if (!Array.isArray(reasons)) {
+		return '全部黑名单';
+	}
+	const normalized = reasons.join(',');
+	if (normalized === PURGE_DEFAULT_REASONS.join(',')) {
+		return '/ban + /spam';
+	}
+	return normalized || '/ban + /spam';
+}
+
 function stringifyPurgeGroups(groups) {
 	return (groups || []).map((id) => String(id)).join(',');
 }
@@ -1284,10 +1343,14 @@ function jsonForInlineScript(value) {
 function handlePurgeRunner(url) {
 	const limit = parsePurgeLimit(url);
 	const cursor = parsePurgePositiveInt(url.searchParams.get('cursor'), 0);
+	const purgeReasons = parsePurgeReasons(url);
+	const purgeReasonsParam = stringifyPurgeReasons(purgeReasons);
+	const purgeScope = describePurgeReasons(purgeReasons);
 	const apiUrl = new URL(url.toString());
 	apiUrl.pathname = apiUrl.pathname.replace(/\/run$/, '');
 	apiUrl.searchParams.set('cursor', String(cursor));
 	apiUrl.searchParams.set('limit', String(limit));
+	apiUrl.searchParams.set('reasons', purgeReasonsParam);
 	const groupCheckUrl = new URL(apiUrl.toString());
 	groupCheckUrl.pathname = groupCheckUrl.pathname.replace(/\/purge$/, '/purge/groups');
 	groupCheckUrl.search = '';
@@ -1321,7 +1384,7 @@ function handlePurgeRunner(url) {
 <body>
 <main>
 	<h1>黑名单清扫</h1>
-	<p>页面会先预检机器人在各群的封禁权限，只清扫有权限的群。每批默认 ${PURGE_DEFAULT_PAIR_LIMIT} 个“用户×群”组合，批内 ${PURGE_CONCURRENCY} 并发，避免触发 Cloudflare Worker 子请求限制。</p>
+	<p>页面会先预检机器人在各群的封禁权限，只清扫有权限的群。默认范围：${escapeHtml(purgeScope)}。每批默认 ${PURGE_DEFAULT_PAIR_LIMIT} 个“用户×群”组合，批内 ${PURGE_CONCURRENCY} 并发，避免触发 Cloudflare Worker 子请求限制。</p>
 	<div class="toolbar">
 		<label>每批 <input id="limit" type="number" min="1" max="${PURGE_MAX_PAIR_LIMIT}" value="${limit}"></label>
 		<button id="start">继续</button>
@@ -1346,6 +1409,8 @@ function handlePurgeRunner(url) {
 <script>
 	const delayMs = ${PURGE_RUN_DELAY_MS};
 	const groupCheckUrl = ${jsonForInlineScript(groupCheckUrl.toString())};
+	const purgeReasons = ${jsonForInlineScript(purgeReasonsParam)};
+	const purgeScope = ${jsonForInlineScript(purgeScope)};
 	let nextUrl = ${jsonForInlineScript(apiUrl.toString())};
 	let running = false;
 	let checkedGroups = false;
@@ -1413,6 +1478,7 @@ function handlePurgeRunner(url) {
 			'黑名单清扫报告',
 			'开始时间: ' + startedAt.toISOString(),
 			'结束时间: ' + finishedAt.toISOString(),
+			'清扫范围: ' + purgeScope,
 			'黑名单总数: ' + (last['黑名单总数'] ?? 0),
 			'配置群组数: ' + (last['配置群组数'] ?? 0),
 			'总任务数: ' + (last['总任务数'] ?? 0),
@@ -1490,6 +1556,7 @@ function handlePurgeRunner(url) {
 			const url = new URL(nextUrl);
 			url.searchParams.set('limit', String(limit));
 			url.searchParams.set('groups', activeGroups);
+			url.searchParams.set('reasons', purgeReasons);
 			const res = await fetch(url.toString(), { cache: 'no-store' });
 			const data = await res.json();
 			if (!res.ok || data['成功'] !== true) throw new Error(data['错误'] || ('HTTP ' + res.status));
@@ -1548,9 +1615,12 @@ async function handlePurge(env, url) {
 		return jsonResponse({ 成功: false, 错误: 'GROUP_IDS 未配置' }, 400);
 	}
 
+	const purgeReasons = parsePurgeReasons(url);
+	const purgeReasonsParam = stringifyPurgeReasons(purgeReasons);
+	const purgeScope = describePurgeReasons(purgeReasons);
 	let totalBlacklist;
 	try {
-		totalBlacklist = await getD1BlacklistCount(env);
+		totalBlacklist = await getD1BlacklistCount(env, purgeReasons);
 	} catch (error) {
 		return jsonResponse({ 成功: false, 错误: '读取黑名单数量失败: ' + error.message }, 500);
 	}
@@ -1564,6 +1634,8 @@ async function handlePurge(env, url) {
 	const done = endCursor >= totalPairs;
 	const nextCursor = done ? null : endCursor;
 	const summary = {
+		清扫范围: purgeScope,
+		reasons: purgeReasonsParam,
 		黑名单总数: totalBlacklist,
 		配置群组数: GROUP_IDS.length,
 		参与群组数: groupCount,
@@ -1594,7 +1666,7 @@ async function handlePurge(env, url) {
 	const userEndIndex = Math.ceil(endCursor / groupCount);
 	let blacklistWindow;
 	try {
-		blacklistWindow = await readD1BlacklistWindow(env, userStartIndex, userEndIndex - userStartIndex);
+		blacklistWindow = await readD1BlacklistWindow(env, userStartIndex, userEndIndex - userStartIndex, purgeReasons);
 	} catch (error) {
 		return jsonResponse({ 成功: false, 错误: '读取黑名单批次失败: ' + error.message }, 500);
 	}

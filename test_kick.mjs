@@ -77,6 +77,30 @@ function makeFakeDB(seed = []) {
 			at: r.at ?? null,
 		}))));
 	};
+	const getBlacklistRowsForSql = (sql, bound) => {
+		let filterCount = 0;
+		let filtered = [...rows.values()];
+		const reasonFilter = sql.match(/reason IN\s*\(([^)]+)\)/i);
+		if (reasonFilter) {
+			filterCount = (reasonFilter[1].match(/\?/g) || []).length;
+			const reasons = new Set(bound.slice(0, filterCount).map((value) => String(value)));
+			filtered = filtered.filter((r) => reasons.has(String(r.reason ?? '')));
+		}
+		return {
+			filterCount,
+			results: filtered
+				.map((r) => ({
+					id: String(r.id),
+					reason: r.reason ?? null,
+					by_user: r.by_user ?? r.by ?? null,
+					at: r.at ?? null,
+				}))
+				.sort((a, b) => {
+					const byAt = String(a.at ?? '').localeCompare(String(b.at ?? ''));
+					return byAt || String(a.id).localeCompare(String(b.id));
+				})
+		};
+	};
 	syncBlacklist();
 	const getJson = (key, fallback = null) => {
 		const raw = store.get(key);
@@ -98,7 +122,7 @@ function makeFakeDB(seed = []) {
 						return rows.has(id) ? { id } : null;
 					}
 					if (sql.startsWith('SELECT COUNT(*) AS total FROM blacklist')) {
-						return { total: rows.size };
+						return { total: getBlacklistRowsForSql(sql, bound).results.length };
 					}
 					if (sql.startsWith('SELECT data FROM ad_keywords')) {
 						const data = store.get('ad_keywords_custom');
@@ -166,19 +190,9 @@ function makeFakeDB(seed = []) {
 				},
 				async all() {
 					if (sql.includes('FROM blacklist')) {
-						const limit = Number(bound[0]);
-						const offset = Number(bound[1]) || 0;
-						const results = [...rows.values()]
-							.map((r) => ({
-								id: String(r.id),
-								reason: r.reason ?? null,
-								by_user: r.by_user ?? r.by ?? null,
-								at: r.at ?? null,
-							}))
-							.sort((a, b) => {
-								const byAt = String(a.at ?? '').localeCompare(String(b.at ?? ''));
-								return byAt || String(a.id).localeCompare(String(b.id));
-							});
+						const { filterCount, results } = getBlacklistRowsForSql(sql, bound);
+						const limit = Number(bound[filterCount]);
+						const offset = Number(bound[filterCount + 1]) || 0;
 						if (Number.isFinite(limit)) {
 							return { results: results.slice(offset, offset + limit) };
 						}
@@ -700,6 +714,63 @@ console.log('\n[8g] /{TOKEN}/purge groups 参数只扫可清扫群');
 	assert('总任务只剩 2', json.总任务数 === 2);
 	assert('只调用目标群 -1002', callsOf('banChatMember').every((c) => Number(c.body.chat_id) === -1002));
 	assert('banChatMember 调用 2 次', callsOf('banChatMember').length === 2);
+}
+
+// ---------- [8h] /{TOKEN}/purge 默认只清扫 /ban + /spam ----------
+console.log('\n[8h] /{TOKEN}/purge 默认只清扫 /ban + /spam');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'member', user: { id: Number(b.user_id) } } }),
+		banChatMember: () => ({ ok: true, result: true }),
+	});
+
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([
+			{ id: '8101', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' },
+			{ id: '8102', reason: 'spam', by: '1000', at: '2026-05-02T00:00:00Z' },
+			{ id: '8103', reason: 'ad_auto', by: 'system', at: '2026-05-03T00:00:00Z' },
+			{ id: '8104', reason: 'manual_ban', by: '999', at: '2026-05-04T00:00:00Z' },
+		]),
+	};
+	const res = await handler.fetch(new Request(`https://x.com/${TOKEN}/purge?limit=20`), env);
+	const json = await res.json();
+
+	assert('默认清扫 200', res.status === 200);
+	assert('默认范围是 /ban + /spam', json.reasons === 'manual,spam' && json.清扫范围 === '/ban + /spam');
+	assert('默认只统计 manual/spam 2 条', json.黑名单总数 === 2);
+	assert('默认总任务数 4', json.总任务数 === 4);
+	assert('默认不扫 ad_auto/manual_ban', callsOf('banChatMember').every((c) => ['8101', '8102'].includes(String(c.body.user_id))));
+	assert('默认踢出 4 次', callsOf('banChatMember').length === 4);
+}
+
+// ---------- [8i] /{TOKEN}/purge?reasons=all 全量清扫兜底 ----------
+console.log('\n[8i] /{TOKEN}/purge?reasons=all 全量清扫兜底');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'member', user: { id: Number(b.user_id) } } }),
+		banChatMember: () => ({ ok: true, result: true }),
+	});
+
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([
+			{ id: '8201', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' },
+			{ id: '8202', reason: 'spam', by: '1000', at: '2026-05-02T00:00:00Z' },
+			{ id: '8203', reason: 'ad_auto', by: 'system', at: '2026-05-03T00:00:00Z' },
+			{ id: '8204', reason: 'manual_ban', by: '999', at: '2026-05-04T00:00:00Z' },
+		]),
+	};
+	const res = await handler.fetch(new Request(`https://x.com/${TOKEN}/purge?reasons=all&limit=20`), env);
+	const json = await res.json();
+
+	assert('全量清扫 200', res.status === 200);
+	assert('全量范围显示 all', json.reasons === 'all' && json.清扫范围 === '全部黑名单');
+	assert('全量统计 4 条', json.黑名单总数 === 4);
+	assert('全量总任务数 8', json.总任务数 === 8);
+	assert('全量包含 ad_auto/manual_ban', callsOf('banChatMember').some((c) => String(c.body.user_id) === '8203') && callsOf('banChatMember').some((c) => String(c.body.user_id) === '8204'));
 }
 
 // ---------- [9] /{TOKEN}/purge 错误 TOKEN ----------
