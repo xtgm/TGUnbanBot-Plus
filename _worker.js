@@ -34,9 +34,10 @@ const DEFAULT_BLACKLIST_PAGE_LIMIT = 30;
 
 // /purge 清扫按“黑名单用户 × 配置群组”分批执行，避免单次 Worker 撞 Cloudflare 子请求限制。
 // 最坏情况下每个组合会调用 getChatMember + banChatMember 两次 Telegram API。
-const PURGE_DEFAULT_PAIR_LIMIT = 15;
+const PURGE_DEFAULT_PAIR_LIMIT = 20;
 const PURGE_MAX_PAIR_LIMIT = 20;
-const PURGE_RUN_DELAY_MS = 1200;
+const PURGE_CONCURRENCY = 5;
+const PURGE_RUN_DELAY_MS = 250;
 
 // 5) /blacklist 列表中"原因"字段的中文映射。
 //    内置三种：spam（/spam 举报）、manual（/ban 手动添加）、manual_ban（chat_member 自动同步）。
@@ -234,6 +235,9 @@ export default {
 		} else if (request.method === 'GET' && path === `${TOKEN}/export`) {
 			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
 			return await handleExport(env, url);
+		} else if (request.method === 'GET' && path === `${TOKEN}/purge/groups`) {
+			// 清扫前预检：只保留 bot 具备封禁权限的群
+			return await handlePurgeGroups();
 		} else if (request.method === 'GET' && path === `${TOKEN}/purge/run`) {
 			// 浏览器自动续跑页：由客户端逐批调用 /purge，避免单次 Worker 超限
 			return handlePurgeRunner(url);
@@ -1171,6 +1175,108 @@ function buildPurgeNextUrl(url, nextCursor, limit) {
 	return nextUrl.toString();
 }
 
+async function mapWithConcurrency(items, concurrency, worker) {
+	const results = new Array(items.length);
+	let nextIndex = 0;
+	const workerCount = Math.min(Math.max(1, concurrency), items.length);
+	const runners = Array.from({ length: workerCount }, async () => {
+		while (nextIndex < items.length) {
+			const currentIndex = nextIndex++;
+			results[currentIndex] = await worker(items[currentIndex], currentIndex);
+		}
+	});
+	await Promise.all(runners);
+	return results;
+}
+
+function parsePurgeGroupIds(url) {
+	const raw = url.searchParams.get('groups');
+	if (raw === null) {
+		return GROUP_IDS;
+	}
+	const requested = new Set(
+		String(raw)
+			.split(/[,，]/)
+			.map((id) => id.trim())
+			.filter(Boolean)
+	);
+	return GROUP_IDS.filter((groupId) => requested.has(String(groupId)));
+}
+
+function stringifyPurgeGroups(groups) {
+	return (groups || []).map((id) => String(id)).join(',');
+}
+
+function botCanRestrictMember(member) {
+	if (!member || !member.user) {
+		return false;
+	}
+	if (member.status === 'creator') {
+		return true;
+	}
+	return member.status === 'administrator' && member.can_restrict_members === true;
+}
+
+async function checkPurgeGroupAccess(groupId, botId) {
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: groupId })
+		});
+		const result = await response.json();
+		if (!response.ok || !result.ok || !Array.isArray(result.result)) {
+			return {
+				groupId,
+				ok: false,
+				reason: result.description || `HTTP ${response.status}`
+			};
+		}
+
+		const botMember = result.result.find((member) => String(member?.user?.id) === String(botId));
+		if (!botMember) {
+			return { groupId, ok: false, reason: 'bot 不在群管理员列表中' };
+		}
+		if (!botCanRestrictMember(botMember)) {
+			return { groupId, ok: false, status: botMember.status, reason: 'bot 缺少封禁用户权限 can_restrict_members' };
+		}
+		return { groupId, ok: true, status: botMember.status };
+	} catch (error) {
+		return { groupId, ok: false, reason: error.message };
+	}
+}
+
+async function handlePurgeGroups() {
+	if (!Array.isArray(GROUP_IDS) || GROUP_IDS.length === 0) {
+		return jsonResponse({ 成功: false, 错误: 'GROUP_IDS 未配置' }, 400);
+	}
+
+	const botId = await getBotId();
+	if (!botId) {
+		return jsonResponse({ 成功: false, 错误: '无法获取机器人 ID，无法预检群权限' }, 500);
+	}
+
+	const checks = await mapWithConcurrency(
+		GROUP_IDS,
+		PURGE_CONCURRENCY,
+		(groupId) => checkPurgeGroupAccess(groupId, botId)
+	);
+	const available = checks.filter((item) => item.ok);
+	const skipped = checks.filter((item) => !item.ok);
+	const availableGroupIds = available.map((item) => String(item.groupId));
+
+	return jsonResponse({
+		成功: true,
+		bot_id: String(botId),
+		配置群组数: GROUP_IDS.length,
+		可清扫群组数: available.length,
+		跳过群组数: skipped.length,
+		可清扫群组: available,
+		跳过群组: skipped,
+		groups: stringifyPurgeGroups(availableGroupIds)
+	});
+}
+
 function jsonForInlineScript(value) {
 	return JSON.stringify(value).replace(/</g, '\\u003c');
 }
@@ -1182,6 +1288,9 @@ function handlePurgeRunner(url) {
 	apiUrl.pathname = apiUrl.pathname.replace(/\/run$/, '');
 	apiUrl.searchParams.set('cursor', String(cursor));
 	apiUrl.searchParams.set('limit', String(limit));
+	const groupCheckUrl = new URL(apiUrl.toString());
+	groupCheckUrl.pathname = groupCheckUrl.pathname.replace(/\/purge$/, '/purge/groups');
+	groupCheckUrl.search = '';
 
 	const html = `<!doctype html>
 <html lang="zh-CN">
@@ -1212,7 +1321,7 @@ function handlePurgeRunner(url) {
 <body>
 <main>
 	<h1>黑名单清扫</h1>
-	<p>页面会分批调用 JSON 清扫接口。每批默认 ${PURGE_DEFAULT_PAIR_LIMIT} 个“用户×群”组合，最大 ${PURGE_MAX_PAIR_LIMIT} 个，避免触发 Cloudflare Worker 子请求限制。</p>
+	<p>页面会先预检机器人在各群的封禁权限，只清扫有权限的群。每批默认 ${PURGE_DEFAULT_PAIR_LIMIT} 个“用户×群”组合，批内 ${PURGE_CONCURRENCY} 并发，避免触发 Cloudflare Worker 子请求限制。</p>
 	<div class="toolbar">
 		<label>每批 <input id="limit" type="number" min="1" max="${PURGE_MAX_PAIR_LIMIT}" value="${limit}"></label>
 		<button id="start">继续</button>
@@ -1236,8 +1345,12 @@ function handlePurgeRunner(url) {
 </main>
 <script>
 	const delayMs = ${PURGE_RUN_DELAY_MS};
+	const groupCheckUrl = ${jsonForInlineScript(groupCheckUrl.toString())};
 	let nextUrl = ${jsonForInlineScript(apiUrl.toString())};
 	let running = false;
+	let checkedGroups = false;
+	let activeGroups = '';
+	let groupPrecheck = null;
 	const totals = { kicked: 0, left: 0, failed: 0 };
 	const batches = [];
 	const details = [];
@@ -1247,7 +1360,7 @@ function handlePurgeRunner(url) {
 	const $ = (id) => document.getElementById(id);
 	function log(line, data) {
 		const logEl = $('log');
-		logEl.textContent += '[' + new Date().toLocaleTimeString() + '] ' + line + (data ? '\\n' + JSON.stringify(data, null, 2) : '') + '\\n\\n';
+		logEl.textContent += '[' + new Date().toLocaleTimeString() + '] ' + line + (data ? '\\n' + data : '') + '\\n\\n';
 		logEl.scrollTop = logEl.scrollHeight;
 	}
 	function updateProgress(data) {
@@ -1282,7 +1395,7 @@ function handlePurgeRunner(url) {
 		$('cursor').textContent = data['下批游标'] ?? data['本批结束游标'] ?? '';
 		nextUrl = data.next_url || null;
 		updateProgress(data);
-		log('本批完成', data);
+		log('本批完成', 'cursor ' + data['本批开始游标'] + '-' + data['本批结束游标'] + ' / 踢出 ' + data['已踢出'] + ' / 不在群 ' + data['不在群'] + ' / 失败 ' + data['失败']);
 	}
 	function csvCell(value) {
 		return '"' + String(value ?? '').replace(/"/g, '""') + '"';
@@ -1309,11 +1422,15 @@ function handlePurgeRunner(url) {
 			'失败: ' + totals.failed,
 			'批次数: ' + batches.length,
 			'',
+			'群权限预检:',
+			JSON.stringify(groupPrecheck || {}, null, 2),
+			'',
 			'批次摘要:'
 		];
-		for (const batch of batches) {
+		for (let i = 0; i < batches.length; i++) {
+			const batch = batches[i];
 			lines.push(
-				'#' + (lines.length - 12) +
+				'#' + (i + 1) +
 				' cursor ' + batch['本批开始游标'] + '-' + batch['本批结束游标'] +
 				' 已踢出=' + batch['已踢出'] +
 				' 不在群=' + batch['不在群'] +
@@ -1343,13 +1460,36 @@ function handlePurgeRunner(url) {
 		$('downloads').hidden = false;
 		log('全部完成，已生成 TXT 和 CSV 下载文件');
 	}
+	async function precheckGroups() {
+		if (checkedGroups) return true;
+		$('status').textContent = '预检群权限';
+		const res = await fetch(groupCheckUrl, { cache: 'no-store' });
+		const data = await res.json();
+		if (!res.ok || data['成功'] !== true) throw new Error(data['错误'] || ('群权限预检失败 HTTP ' + res.status));
+		groupPrecheck = data;
+		activeGroups = data.groups || '';
+		checkedGroups = true;
+		log('群权限预检完成', '可清扫群 ' + data['可清扫群组数'] + '/' + data['配置群组数'] + (data['跳过群组数'] ? '，跳过 ' + data['跳过群组数'] : ''));
+		if (!activeGroups) {
+			running = false;
+			$('status').textContent = '无可清扫群';
+			$('start').textContent = '无可清扫群';
+			$('start').disabled = true;
+			$('pause').disabled = true;
+			finish();
+			return false;
+		}
+		return true;
+	}
 	async function step() {
 		if (!running || !nextUrl) return;
 		$('status').textContent = '运行中';
 		try {
+			if (!(await precheckGroups())) return;
 			const limit = Math.min(Math.max(parseInt($('limit').value, 10) || ${PURGE_DEFAULT_PAIR_LIMIT}, 1), ${PURGE_MAX_PAIR_LIMIT});
 			const url = new URL(nextUrl);
 			url.searchParams.set('limit', String(limit));
+			url.searchParams.set('groups', activeGroups);
 			const res = await fetch(url.toString(), { cache: 'no-store' });
 			const data = await res.json();
 			if (!res.ok || data['成功'] !== true) throw new Error(data['错误'] || ('HTTP ' + res.status));
@@ -1415,7 +1555,8 @@ async function handlePurge(env, url) {
 		return jsonResponse({ 成功: false, 错误: '读取黑名单数量失败: ' + error.message }, 500);
 	}
 
-	const groupCount = GROUP_IDS.length;
+	const activeGroupIds = parsePurgeGroupIds(url);
+	const groupCount = activeGroupIds.length;
 	const totalPairs = totalBlacklist * groupCount;
 	const limit = parsePurgeLimit(url);
 	const startCursor = parsePurgeCursor(url, totalPairs);
@@ -1424,7 +1565,9 @@ async function handlePurge(env, url) {
 	const nextCursor = done ? null : endCursor;
 	const summary = {
 		黑名单总数: totalBlacklist,
-		配置群组数: groupCount,
+		配置群组数: GROUP_IDS.length,
+		参与群组数: groupCount,
+		参与群组列表: activeGroupIds,
 		总任务数: totalPairs,
 		本批开始游标: startCursor,
 		本批结束游标: endCursor,
@@ -1456,18 +1599,22 @@ async function handlePurge(env, url) {
 		return jsonResponse({ 成功: false, 错误: '读取黑名单批次失败: ' + error.message }, 500);
 	}
 
+	const cursors = [];
 	for (let cursor = startCursor; cursor < endCursor; cursor++) {
+		cursors.push(cursor);
+	}
+
+	const results = await mapWithConcurrency(cursors, PURGE_CONCURRENCY, async (cursor) => {
 		const userIndex = Math.floor(cursor / groupCount);
 		const groupIndex = cursor % groupCount;
 		const entry = blacklistWindow[userIndex - userStartIndex];
-		const groupId = GROUP_IDS[groupIndex];
-
-		summary.本批已处理 += 1;
+		const groupId = activeGroupIds[groupIndex];
 
 		if (!entry) {
-			summary.失败 += 1;
-			summary.详情.push({ 游标: cursor, 群ID: groupId, 结果: '黑名单行不存在', 错误: '清扫期间黑名单发生变化，请从 cursor=0 重新开始' });
-			continue;
+			return {
+				type: 'failed',
+				detail: { 游标: cursor, 群ID: groupId, 结果: '黑名单行不存在', 错误: '清扫期间黑名单发生变化，请从 cursor=0 重新开始' }
+			};
 		}
 
 		let status = null;
@@ -1476,26 +1623,43 @@ async function handlePurge(env, url) {
 			status = statusResult?.result?.status ?? null;
 		} catch (error) {
 			if (isTelegramNotInChatError(error)) {
-				summary.不在群 += 1;
-				continue;
+				return { type: 'left' };
 			}
 			console.error(`[purge] checkUserStatus 失败 user=${entry.id} group=${groupId}:`, error.message);
-			summary.失败 += 1;
-			summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 游标: cursor, 结果: '查询状态失败', 错误: error.message });
-			continue;
+			return {
+				type: 'failed',
+				detail: { 用户ID: entry.id, 群ID: groupId, 游标: cursor, 结果: '查询状态失败', 错误: error.message }
+			};
 		}
 		// 已踢出 / 已离开 → 跳过；left/kicked 是 Telegram 返回的"非群成员"状态
 		if (status === 'kicked' || status === 'left' || status === null) {
-			summary.不在群 += 1;
-			continue;
+			return { type: 'left' };
 		}
 		const r = await banUserFromGroup(groupId, entry.id);
 		if (r.ok) {
+			return {
+				type: 'kicked',
+				detail: { 用户ID: entry.id, 群ID: groupId, 游标: cursor, 旧状态: status, 结果: '已踢' }
+			};
+		}
+		return {
+			type: 'failed',
+			detail: { 用户ID: entry.id, 群ID: groupId, 游标: cursor, 旧状态: status, 结果: '失败', 错误: r.error }
+		};
+	});
+
+	for (const result of results) {
+		summary.本批已处理 += 1;
+		if (result?.type === 'kicked') {
 			summary.已踢出 += 1;
-			summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 游标: cursor, 旧状态: status, 结果: '已踢' });
+			summary.详情.push(result.detail);
+		} else if (result?.type === 'left') {
+			summary.不在群 += 1;
 		} else {
 			summary.失败 += 1;
-			summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 游标: cursor, 旧状态: status, 结果: '失败', 错误: r.error });
+			if (result?.detail) {
+				summary.详情.push(result.detail);
+			}
 		}
 	}
 

@@ -366,33 +366,36 @@ curl -o blacklist.csv "https://你的Worker域名/你的TOKEN/export?format=csv"
 
 ```http
 GET /{TOKEN}/purge
-GET /{TOKEN}/purge?limit=15&cursor=0
+GET /{TOKEN}/purge?limit=20&cursor=0
+GET /{TOKEN}/purge/groups
 GET /{TOKEN}/purge/run
 ```
 
 扫描当前 D1 黑名单 × 所有 `GROUP_IDS`，对每个**仍在群里**的人调 `banChatMember` 真踢出群。Telegram 状态为 `kicked` / `left` 的会跳过。
 
-为避免 Cloudflare Worker 单次请求的子请求限制，`/{TOKEN}/purge` 默认只处理 15 个“用户 × 群组”组合，`limit` 最大会被压到 20。返回的 `next_url` 不为空时，继续请求它即可跑下一批。浏览器直接打开 `/{TOKEN}/purge/run` 会自动按批次续跑，适合几千条黑名单的大清扫。
+为避免 Cloudflare Worker 单次请求的子请求限制，`/{TOKEN}/purge` 默认只处理 20 个“用户 × 群组”组合，`limit` 最大会被压到 20，批内最多 5 并发。返回的 `next_url` 不为空时，继续请求它即可跑下一批。浏览器直接打开 `/{TOKEN}/purge/run` 会先预检 bot 在各群是否具备封禁权限，只清扫有权限的群，然后自动按批次续跑，适合几千条黑名单的大清扫。
 
 ```json
 {
   "成功": true,
   "黑名单总数": 33,
   "配置群组数": 2,
+  "参与群组数": 2,
+  "参与群组列表": ["-1001234567890", "-1009876543210"],
   "总任务数": 66,
   "本批开始游标": 0,
-  "本批结束游标": 15,
-  "下批游标": 15,
-  "本批处理上限": 15,
-  "本批计划处理": 15,
-  "本批已处理": 15,
-  "剩余任务数": 51,
+  "本批结束游标": 20,
+  "下批游标": 20,
+  "本批处理上限": 20,
+  "本批计划处理": 20,
+  "本批已处理": 20,
+  "剩余任务数": 46,
   "已完成": false,
   "done": false,
-  "next_cursor": 15,
-  "next_url": "https://你的Worker域名/你的TOKEN/purge?limit=15&cursor=15",
+  "next_cursor": 20,
+  "next_url": "https://你的Worker域名/你的TOKEN/purge?limit=20&cursor=20",
   "已踢出": 5,
-  "不在群": 9,
+  "不在群": 14,
   "失败": 1,
   "详情": [
     { "用户ID": "123", "群ID": "-1001234567890", "旧状态": "member", "结果": "已踢" },

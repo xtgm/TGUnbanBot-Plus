@@ -649,6 +649,59 @@ console.log('\n[8e] /{TOKEN}/purge/run 浏览器自动续跑页');
 	assert('runner 不调用 Telegram', apiCalls.length === 0);
 }
 
+// ---------- [8f] /{TOKEN}/purge/groups 群权限预检 ----------
+console.log('\n[8f] /{TOKEN}/purge/groups 群权限预检');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getMe: () => ({ ok: true, result: { id: 42, username: 'clean_bot' } }),
+		getChatAdministrators: (b) => {
+			const chat = Number(b.chat_id);
+			if (chat === -1001) {
+				return { ok: true, result: [{ user: { id: 42, is_bot: true }, status: 'administrator', can_restrict_members: true }] };
+			}
+			return { ok: true, result: [{ user: { id: 42, is_bot: true }, status: 'administrator', can_restrict_members: false }] };
+		},
+	});
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	const res = await handler.fetch(new Request(`https://x.com/${TOKEN}/purge/groups`), env);
+	const json = await res.json();
+
+	assert('groups 200', res.status === 200);
+	assert('groups 成功', json.成功 === true);
+	assert('只保留 1 个可清扫群', json.可清扫群组数 === 1 && json.groups === '-1001');
+	assert('跳过缺少封禁权限的群', json.跳过群组数 === 1 && String(json.跳过群组[0].groupId) === '-1002' && json.跳过群组[0].reason.includes('can_restrict_members'));
+	assert('预检调用 getMe 1 次', callsOf('getMe').length === 1);
+	assert('预检查询 2 个群管理员', callsOf('getChatAdministrators').length === 2);
+}
+
+// ---------- [8g] /{TOKEN}/purge groups 参数只扫可清扫群 ----------
+console.log('\n[8g] /{TOKEN}/purge groups 参数只扫可清扫群');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'member', user: { id: Number(b.user_id) } } }),
+		banChatMember: () => ({ ok: true, result: true }),
+	});
+
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([
+			{ id: '5555', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' },
+			{ id: '6666', reason: 'manual', by: '999', at: '2026-05-02T00:00:00Z' },
+		]),
+	};
+	const res = await handler.fetch(new Request(`https://x.com/${TOKEN}/purge?groups=-1002&limit=20`), env);
+	const json = await res.json();
+
+	assert('groups 参数 200', res.status === 200);
+	assert('配置群组数仍为 2', json.配置群组数 === 2);
+	assert('参与群组数为 1', json.参与群组数 === 1);
+	assert('总任务只剩 2', json.总任务数 === 2);
+	assert('只调用目标群 -1002', callsOf('banChatMember').every((c) => Number(c.body.chat_id) === -1002));
+	assert('banChatMember 调用 2 次', callsOf('banChatMember').length === 2);
+}
+
 // ---------- [9] /{TOKEN}/purge 错误 TOKEN ----------
 console.log('\n[9] /purge 错误 TOKEN');
 {
