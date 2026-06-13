@@ -4147,7 +4147,7 @@ async function muteChatMember(chatId, userId) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/restrictChatMember`;
 	const body = {
 		chat_id: chatId,
-		user_id: userId,
+		user_id: Number(userId),
 		use_independent_chat_permissions: true,
 		permissions: {
 			can_send_messages: false,
@@ -4263,7 +4263,7 @@ async function unbanUser(userId, groupId = GROUP_ID) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`;
 	const body = {
 		chat_id: groupId,
-		user_id: userId
+		user_id: Number(userId)
 	};
 
 	const response = await fetch(url, {
@@ -4289,7 +4289,7 @@ async function restrictUser(userId, groupId = GROUP_ID) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/restrictChatMember`;
 	const body = {
 		chat_id: groupId,
-		user_id: userId,
+		user_id: Number(userId),
 		permissions: {
 			can_send_messages: true,
 			can_send_media_messages: true,
@@ -4325,7 +4325,7 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`;
 	const body = {
 		chat_id: groupId,
-		user_id: userId
+		user_id: Number(userId)
 	};
 
 	const response = await fetch(url, {

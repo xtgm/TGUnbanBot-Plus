@@ -281,7 +281,7 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊
 
 	const banCalls = callsOf('banChatMember');
 	assert('banChatMember 调用 2 次（两个群）', banCalls.length === 2, `实际 ${banCalls.length}`);
-	assert('banChatMember 用户ID 都是 8888', banCalls.every((c) => c.body.user_id === 8888));
+	assert('banChatMember 用户ID 都是 8888', banCalls.every((c) => String(c.body.user_id) === '8888'));
 	const banGroups = banCalls.map((c) => String(c.body.chat_id)).sort();
 	assert('两个群 ID 都被覆盖', JSON.stringify(banGroups) === JSON.stringify(['-1001', '-1002']), `实际 ${JSON.stringify(banGroups)}`);
 
@@ -348,6 +348,35 @@ console.log('\n[1b] /spam 错误翻译:CHAT_ADMIN_REQUIRED + 删消息失败');
 	assert('详情含建议"超过 48 小时"', dmSend.body.text.includes('48'));
 }
 
+// ---------- [1c] /spam 大 TGID 不转 Number ----------
+console.log('\n[1c] /spam 大 TGID 不转 Number');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const update = {
+		message: {
+			message_id: 210,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 999, is_bot: false },
+			text: '/spam 7965398892',
+		},
+	};
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const banCalls = callsOf('banChatMember');
+	assert('/spam 大 TGID 全群踢出', banCalls.length === 2);
+	assert('/spam 大 TGID 传数字', banCalls.every((c) => c.body.user_id === 7965398892));
+}
+
 // ---------- [2] /ban 单条:加黑 + 全群踢 ----------
 console.log('\n[2] /ban 123（单条）:加黑 + 全群踢');
 {
@@ -374,7 +403,7 @@ console.log('\n[2] /ban 123（单条）:加黑 + 全群踢');
 
 	const banCalls = callsOf('banChatMember');
 	assert('banChatMember 调用 2 次', banCalls.length === 2);
-	assert('用户 ID 是 123', banCalls.every((c) => c.body.user_id === 123));
+	assert('用户 ID 是 123', banCalls.every((c) => String(c.body.user_id) === '123'));
 }
 
 // ---------- [3] /ban 批量:每个用户都遍历群踢 ----------
@@ -429,7 +458,7 @@ console.log('\n[4] 黑名单用户在群里发言 → 删消息 + 踢人');
 	const banCalls = callsOf('banChatMember');
 	assert('deleteMessage 调用 1 次', delCalls.length === 1);
 	assert('banChatMember 调用 1 次（仅当前群）', banCalls.length === 1);
-	assert('踢的是 8888', banCalls[0].body.user_id === 8888);
+	assert('踢的是 8888', String(banCalls[0].body.user_id) === '8888');
 	assert('删除发生在 -1001', delCalls[0].body.chat_id === -1001);
 	assert('删除的是 msgId 500', delCalls[0].body.message_id === 500);
 }
@@ -482,7 +511,7 @@ console.log('\n[6] chat_member 复入群分支');
 	const banCalls = callsOf('banChatMember');
 	assert('黑名单用户复入群被立即踢', banCalls.length === 1);
 	assert('踢的是当前群 -1001', banCalls[0].body.chat_id === -1001);
-	assert('用户 ID 是 8888', banCalls[0].body.user_id === 8888);
+	assert('用户 ID 是 8888', String(banCalls[0].body.user_id) === '8888');
 }
 
 // ---------- [7] chat_member 复入群:非黑名单用户不受影响 ----------
@@ -883,6 +912,40 @@ console.log('\n[10b] 群内 /ban 单条 + 部分群失败');
 	assert('部分失败:汇总显示踢出 1/2', dmSend.body.text.includes('1/2'));
 	assert('部分失败:含友好原因（权限不足）', dmSend.body.text.includes('权限不足'));
 	assert('部分失败:含建议（封禁用户）', dmSend.body.text.includes('封禁用户'));
+}
+
+// ---------- [10c] 群内 /ban 大 TGID 已存在仍保持字符串踢出 ----------
+console.log('\n[10c] 群内 /ban 大 TGID 已存在仍保持字符串踢出');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const update = {
+		message: {
+			message_id: 780,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 999, is_bot: false },
+			text: '/ban 7965398892',
+		},
+	};
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([{ id: '7965398892', reason: 'manual', by: '999', at: '2026-06-13T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const banCalls = callsOf('banChatMember');
+	assert('/ban 已存在大 TGID 仍全群踢出', banCalls.length === 2);
+	assert('/ban 大 TGID 传数字', banCalls.every((c) => c.body.user_id === 7965398892));
+	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('/ban 已存在分支仍有回执', !!dmSend && dmSend.body.text.includes('已在黑名单中'));
 }
 
 // ---------- [11] 群内 /ban 批量 ----------
