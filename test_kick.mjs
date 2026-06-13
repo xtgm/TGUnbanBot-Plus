@@ -97,6 +97,9 @@ function makeFakeDB(seed = []) {
 						const id = bound[0];
 						return rows.has(id) ? { id } : null;
 					}
+					if (sql.startsWith('SELECT COUNT(*) AS total FROM blacklist')) {
+						return { total: rows.size };
+					}
 					if (sql.startsWith('SELECT data FROM ad_keywords')) {
 						const data = store.get('ad_keywords_custom');
 						return data ? { data } : null;
@@ -162,6 +165,25 @@ function makeFakeDB(seed = []) {
 					return { meta: { changes: 0 } };
 				},
 				async all() {
+					if (sql.includes('FROM blacklist')) {
+						const limit = Number(bound[0]);
+						const offset = Number(bound[1]) || 0;
+						const results = [...rows.values()]
+							.map((r) => ({
+								id: String(r.id),
+								reason: r.reason ?? null,
+								by_user: r.by_user ?? r.by ?? null,
+								at: r.at ?? null,
+							}))
+							.sort((a, b) => {
+								const byAt = String(a.at ?? '').localeCompare(String(b.at ?? ''));
+								return byAt || String(a.id).localeCompare(String(b.id));
+							});
+						if (Number.isFinite(limit)) {
+							return { results: results.slice(offset, offset + limit) };
+						}
+						return { results };
+					}
 					if (sql.startsWith('SELECT mid, chat_id, chat_title')) {
 						const data = getJson('recent_messages', { items: [] });
 						return {
@@ -504,6 +526,9 @@ console.log('\n[8] /{TOKEN}/purge 扫描');
 	assert('成功:true', json.成功 === true);
 	assert('黑名单总数 2', json.黑名单总数 === 2);
 	assert('配置群组数 2', json.配置群组数 === 2);
+	assert('总任务数 4', json.总任务数 === 4);
+	assert('本批已完成', json.已完成 === true && json.done === true);
+	assert('next_url 为空', json.next_url === null);
 	// 8888 在 -1001 踢一次,在 -1002 跳过 = 1 踢 + 1 不在群
 	// 9999 在两个群各踢一次 = 2 踢
 	// 总: 已踢 3, 不在群 1
@@ -512,6 +537,110 @@ console.log('\n[8] /{TOKEN}/purge 扫描');
 
 	const banCalls = callsOf('banChatMember');
 	assert('banChatMember 调用 3 次', banCalls.length === 3);
+}
+
+// ---------- [8b] /{TOKEN}/purge 游标分批 ----------
+console.log('\n[8b] /{TOKEN}/purge 游标分批');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'member', user: { id: Number(b.user_id) } } }),
+		banChatMember: () => ({ ok: true, result: true }),
+	});
+
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([
+			{ id: '1111', reason: 'spam', by: '999', at: '2026-05-01T00:00:00Z' },
+			{ id: '2222', reason: 'manual', by: '999', at: '2026-05-02T00:00:00Z' },
+			{ id: '3333', reason: 'manual', by: '999', at: '2026-05-03T00:00:00Z' },
+		]),
+	};
+	const first = await handler.fetch(new Request(`https://x.com/${TOKEN}/purge?limit=2`), env);
+	const firstJson = await first.json();
+
+	assert('首批 200', first.status === 200);
+	assert('首批只处理 2 个组合', firstJson.本批已处理 === 2);
+	assert('首批未完成', firstJson.已完成 === false && firstJson.done === false);
+	assert('首批 next_cursor=2', firstJson.next_cursor === 2 && firstJson.下批游标 === 2);
+	assert('首批 next_url 带 cursor=2', typeof firstJson.next_url === 'string' && firstJson.next_url.includes('cursor=2'));
+	assert('首批踢出 2', firstJson.已踢出 === 2);
+	assert('首批 banChatMember 2 次', callsOf('banChatMember').length === 2);
+
+	resetCalls();
+	const second = await handler.fetch(new Request(firstJson.next_url), env);
+	const secondJson = await second.json();
+	assert('第二批从 cursor=2 开始', secondJson.本批开始游标 === 2);
+	assert('第二批 next_cursor=4', secondJson.next_cursor === 4 && secondJson.下批游标 === 4);
+	assert('第二批踢出 2', secondJson.已踢出 === 2);
+	assert('第二批第一条是第二个用户', secondJson.详情[0].用户ID === '2222');
+}
+
+// ---------- [8c] /{TOKEN}/purge limit 强制限流 ----------
+console.log('\n[8c] /{TOKEN}/purge limit 强制限流');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (b) => ({ ok: true, result: { status: 'member', user: { id: Number(b.user_id) } } }),
+		banChatMember: () => ({ ok: true, result: true }),
+	});
+
+	const seed = Array.from({ length: 30 }, (_, i) => ({
+		id: String(7000 + i),
+		reason: 'manual',
+		by: '999',
+		at: `2026-05-${String(i + 1).padStart(2, '0')}T00:00:00Z`,
+	}));
+	const env = { ...baseEnv, DB: makeFakeDB(seed) };
+	const res = await handler.fetch(new Request(`https://x.com/${TOKEN}/purge?limit=999`), env);
+	const json = await res.json();
+
+	assert('超大 limit 被压到 20', json.本批处理上限 === 20);
+	assert('本批只处理 20 个组合', json.本批已处理 === 20);
+	assert('本批 getChatMember 20 次', callsOf('getChatMember').length === 20);
+	assert('本批 banChatMember 20 次', callsOf('banChatMember').length === 20);
+	assert('大批量仍未完成', json.done === false && json.next_cursor === 20);
+}
+
+// ---------- [8d] /{TOKEN}/purge 不在群错误计入跳过 ----------
+console.log('\n[8d] /{TOKEN}/purge 不在群错误计入跳过');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatMember: () => {
+			throw new Error('Bad Request: user not found');
+		},
+		banChatMember: () => ({ ok: true, result: true }),
+	});
+
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([
+			{ id: '4444', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' },
+		]),
+	};
+	const res = await handler.fetch(new Request(`https://x.com/${TOKEN}/purge?limit=2`), env);
+	const json = await res.json();
+
+	assert('不在群错误不失败', json.失败 === 0);
+	assert('不在群计数 2', json.不在群 === 2);
+	assert('不调用 banChatMember', callsOf('banChatMember').length === 0);
+}
+
+// ---------- [8e] /{TOKEN}/purge/run 浏览器自动续跑页 ----------
+console.log('\n[8e] /{TOKEN}/purge/run 浏览器自动续跑页');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({});
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	const res = await handler.fetch(new Request(`https://x.com/${TOKEN}/purge/run?limit=18`), env);
+	const html = await res.text();
+
+	assert('runner 200', res.status === 200);
+	assert('runner 是 HTML', res.headers.get('Content-Type').includes('text/html'));
+	assert('runner 含标题', html.includes('黑名单清扫'));
+	assert('runner 会调用 /purge', html.includes('/purge?limit=18'));
+	assert('runner 不调用 Telegram', apiCalls.length === 0);
 }
 
 // ---------- [9] /{TOKEN}/purge 错误 TOKEN ----------

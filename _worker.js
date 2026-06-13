@@ -32,6 +32,12 @@ const DEFAULT_SELF_UNBAN_APPROVED = `✅ 已同意给予解封\n\n请点击 {use
 //    环境变量名：BLACKLIST_PAGE_LIMIT （要求是正整数）
 const DEFAULT_BLACKLIST_PAGE_LIMIT = 30;
 
+// /purge 清扫按“黑名单用户 × 配置群组”分批执行，避免单次 Worker 撞 Cloudflare 子请求限制。
+// 最坏情况下每个组合会调用 getChatMember + banChatMember 两次 Telegram API。
+const PURGE_DEFAULT_PAIR_LIMIT = 15;
+const PURGE_MAX_PAIR_LIMIT = 20;
+const PURGE_RUN_DELAY_MS = 1200;
+
 // 5) /blacklist 列表中"原因"字段的中文映射。
 //    内置三种：spam（/spam 举报）、manual（/ban 手动添加）、manual_ban（chat_member 自动同步）。
 //    环境变量名：BLACKLIST_REASON_LABELS （要求是 JSON 字符串，例如 {"spam":"群内举报"}）
@@ -228,9 +234,12 @@ export default {
 		} else if (request.method === 'GET' && path === `${TOKEN}/export`) {
 			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
 			return await handleExport(env, url);
+		} else if (request.method === 'GET' && path === `${TOKEN}/purge/run`) {
+			// 浏览器自动续跑页：由客户端逐批调用 /purge，避免单次 Worker 超限
+			return handlePurgeRunner(url);
 		} else if (request.method === 'GET' && path === `${TOKEN}/purge`) {
-			// 一次性清扫：把仍在群里的黑名单用户全部踢出（受 TOKEN 保护）
-			return await handlePurge(env);
+			// 分批清扫：把仍在群里的黑名单用户全部踢出（受 TOKEN 保护）
+			return await handlePurge(env, url);
 		} else if (request.method === 'POST') {
 			// 如果是 Telegram Webhook 请求
 			if (path === '') {
@@ -555,6 +564,35 @@ async function readD1Blacklist(env) {
 	await ensureD1Table(env);
 	const stmt = env.DB.prepare('SELECT id, reason, by_user, at FROM blacklist ORDER BY at ASC');
 	const { results } = await stmt.all();
+	return (results || []).map((r) => ({
+		id: String(r.id),
+		reason: r.reason ?? null,
+		by: r.by_user ?? null,
+		at: r.at ?? null
+	}));
+}
+
+async function getD1BlacklistCount(env) {
+	await ensureD1Table(env);
+	const row = await env.DB.prepare('SELECT COUNT(*) AS total FROM blacklist').first();
+	return Number(row?.total ?? 0);
+}
+
+async function readD1BlacklistWindow(env, offset, limit) {
+	await ensureD1Table(env);
+	const safeOffset = Math.max(0, Number(offset) || 0);
+	const safeLimit = Math.max(0, Number(limit) || 0);
+	if (safeLimit === 0) {
+		return [];
+	}
+
+	const stmt = env.DB.prepare(`
+		SELECT id, reason, by_user, at
+		FROM blacklist
+		ORDER BY COALESCE(at, ''), id
+		LIMIT ? OFFSET ?
+	`);
+	const { results } = await stmt.bind(safeLimit, safeOffset).all();
 	return (results || []).map((r) => ({
 		id: String(r.id),
 		reason: r.reason ?? null,
@@ -1098,7 +1136,7 @@ ${sorted.length === 0 ? '' : `<script>
 	});
 }
 
-// 一次性清扫：扫描当前黑名单 × 所有 GROUP_IDS,把仍在群里的人全部踢出
+// 分批清扫：扫描当前黑名单 × 所有 GROUP_IDS，把仍在群里的人全部踢出
 // 受 TOKEN 保护（与 /export 同等防护级别）
 // 串行执行避免 Telegram API 限流，先 checkUserStatus 跳过已离群/已踢的用户
 function isTelegramNotInChatError(error) {
@@ -1111,7 +1149,153 @@ function isTelegramNotInChatError(error) {
 	);
 }
 
-async function handlePurge(env) {
+function parsePurgePositiveInt(value, fallback) {
+	const n = parseInt(String(value ?? '').trim(), 10);
+	return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+function parsePurgeLimit(url) {
+	const requested = parsePurgePositiveInt(url.searchParams.get('limit'), PURGE_DEFAULT_PAIR_LIMIT);
+	return Math.min(Math.max(requested, 1), PURGE_MAX_PAIR_LIMIT);
+}
+
+function parsePurgeCursor(url, totalPairs) {
+	const cursor = parsePurgePositiveInt(url.searchParams.get('cursor'), 0);
+	return Math.min(Math.max(cursor, 0), Math.max(0, totalPairs));
+}
+
+function buildPurgeNextUrl(url, nextCursor, limit) {
+	const nextUrl = new URL(url.toString());
+	nextUrl.searchParams.set('cursor', String(nextCursor));
+	nextUrl.searchParams.set('limit', String(limit));
+	return nextUrl.toString();
+}
+
+function jsonForInlineScript(value) {
+	return JSON.stringify(value).replace(/</g, '\\u003c');
+}
+
+function handlePurgeRunner(url) {
+	const limit = parsePurgeLimit(url);
+	const cursor = parsePurgePositiveInt(url.searchParams.get('cursor'), 0);
+	const apiUrl = new URL(url.toString());
+	apiUrl.pathname = apiUrl.pathname.replace(/\/run$/, '');
+	apiUrl.searchParams.set('cursor', String(cursor));
+	apiUrl.searchParams.set('limit', String(limit));
+
+	const html = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>黑名单清扫</title>
+<style>
+	body { margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f7f9; color: #111827; }
+	main { max-width: 980px; margin: 0 auto; padding: 28px 18px 40px; }
+	h1 { margin: 0 0 8px; font-size: 26px; }
+	p { margin: 8px 0; color: #4b5563; line-height: 1.55; }
+	.toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 18px 0; }
+	button { border: 0; border-radius: 6px; padding: 9px 14px; color: white; background: #2563eb; cursor: pointer; font-weight: 600; }
+	button.secondary { background: #4b5563; }
+	button:disabled { opacity: .55; cursor: not-allowed; }
+	input { width: 72px; border: 1px solid #d1d5db; border-radius: 6px; padding: 8px; }
+	.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin: 18px 0; }
+	.stat { background: white; border: 1px solid #e5e7eb; border-radius: 6px; padding: 12px; }
+	.stat b { display: block; font-size: 20px; margin-top: 4px; }
+	pre { white-space: pre-wrap; word-break: break-word; background: #111827; color: #e5e7eb; border-radius: 6px; padding: 14px; max-height: 420px; overflow: auto; }
+</style>
+</head>
+<body>
+<main>
+	<h1>黑名单清扫</h1>
+	<p>页面会分批调用 JSON 清扫接口。每批默认 ${PURGE_DEFAULT_PAIR_LIMIT} 个“用户×群”组合，最大 ${PURGE_MAX_PAIR_LIMIT} 个，避免触发 Cloudflare Worker 子请求限制。</p>
+	<div class="toolbar">
+		<label>每批 <input id="limit" type="number" min="1" max="${PURGE_MAX_PAIR_LIMIT}" value="${limit}"></label>
+		<button id="start">开始</button>
+		<button id="pause" class="secondary" disabled>暂停</button>
+	</div>
+	<div class="stats">
+		<div class="stat">状态<b id="status">未开始</b></div>
+		<div class="stat">游标<b id="cursor">${cursor}</b></div>
+		<div class="stat">已踢出<b id="kicked">0</b></div>
+		<div class="stat">不在群<b id="left">0</b></div>
+		<div class="stat">失败<b id="failed">0</b></div>
+	</div>
+	<pre id="log"></pre>
+</main>
+<script>
+	const delayMs = ${PURGE_RUN_DELAY_MS};
+	let nextUrl = ${jsonForInlineScript(apiUrl.toString())};
+	let running = false;
+	const totals = { kicked: 0, left: 0, failed: 0 };
+	const $ = (id) => document.getElementById(id);
+	function log(line, data) {
+		$('log').textContent = '[' + new Date().toLocaleTimeString() + '] ' + line + (data ? '\\n' + JSON.stringify(data, null, 2) : '') + '\\n\\n' + $('log').textContent;
+	}
+	function apply(data) {
+		totals.kicked += data['已踢出'] || 0;
+		totals.left += data['不在群'] || 0;
+		totals.failed += data['失败'] || 0;
+		$('kicked').textContent = totals.kicked;
+		$('left').textContent = totals.left;
+		$('failed').textContent = totals.failed;
+		$('cursor').textContent = data['下批游标'] ?? data['本批结束游标'] ?? '';
+		nextUrl = data.next_url || null;
+		log('本批完成', data);
+	}
+	async function step() {
+		if (!running || !nextUrl) return;
+		$('status').textContent = '运行中';
+		try {
+			const limit = Math.min(Math.max(parseInt($('limit').value, 10) || ${PURGE_DEFAULT_PAIR_LIMIT}, 1), ${PURGE_MAX_PAIR_LIMIT});
+			const url = new URL(nextUrl);
+			url.searchParams.set('limit', String(limit));
+			const res = await fetch(url.toString(), { cache: 'no-store' });
+			const data = await res.json();
+			if (!res.ok || data['成功'] !== true) throw new Error(data['错误'] || ('HTTP ' + res.status));
+			apply(data);
+			if (data.done || data['已完成'] || !data.next_url) {
+				running = false;
+				$('status').textContent = '已完成';
+				$('start').disabled = false;
+				$('pause').disabled = true;
+				return;
+			}
+			setTimeout(step, delayMs);
+		} catch (error) {
+			running = false;
+			$('status').textContent = '已暂停';
+			$('start').disabled = false;
+			$('pause').disabled = true;
+			log('错误: ' + error.message);
+		}
+	}
+	$('start').onclick = () => {
+		if (!nextUrl) return;
+		running = true;
+		$('start').disabled = true;
+		$('pause').disabled = false;
+		step();
+	};
+	$('pause').onclick = () => {
+		running = false;
+		$('status').textContent = '已暂停';
+		$('start').disabled = false;
+		$('pause').disabled = true;
+	};
+</script>
+</body>
+</html>`;
+
+	return new Response(html, {
+		headers: {
+			'Content-Type': 'text/html; charset=UTF-8',
+			'Cache-Control': 'no-store'
+		}
+	});
+}
+
+async function handlePurge(env, url) {
 	if (!env.DB) {
 		return jsonResponse({ 成功: false, 错误: '未绑定 D1 存储空间' }, 400);
 	}
@@ -1119,51 +1303,94 @@ async function handlePurge(env) {
 		return jsonResponse({ 成功: false, 错误: 'GROUP_IDS 未配置' }, 400);
 	}
 
-	let blacklist;
+	let totalBlacklist;
 	try {
-		blacklist = await getBlacklist(env);
+		totalBlacklist = await getD1BlacklistCount(env);
 	} catch (error) {
-		return jsonResponse({ 成功: false, 错误: '读取黑名单失败: ' + error.message }, 500);
+		return jsonResponse({ 成功: false, 错误: '读取黑名单数量失败: ' + error.message }, 500);
 	}
 
+	const groupCount = GROUP_IDS.length;
+	const totalPairs = totalBlacklist * groupCount;
+	const limit = parsePurgeLimit(url);
+	const startCursor = parsePurgeCursor(url, totalPairs);
+	const endCursor = Math.min(startCursor + limit, totalPairs);
+	const done = endCursor >= totalPairs;
+	const nextCursor = done ? null : endCursor;
 	const summary = {
-		黑名单总数: blacklist.length,
-		配置群组数: GROUP_IDS.length,
+		黑名单总数: totalBlacklist,
+		配置群组数: groupCount,
+		总任务数: totalPairs,
+		本批开始游标: startCursor,
+		本批结束游标: endCursor,
+		下批游标: nextCursor,
+		本批处理上限: limit,
+		本批计划处理: endCursor - startCursor,
+		本批已处理: 0,
+		剩余任务数: Math.max(0, totalPairs - endCursor),
+		已完成: done,
+		done,
+		next_cursor: nextCursor,
+		next_url: nextCursor === null ? null : buildPurgeNextUrl(url, nextCursor, limit),
 		已踢出: 0,
 		不在群: 0,
 		失败: 0,
 		详情: []
 	};
 
-	for (const entry of blacklist) {
-		for (const groupId of GROUP_IDS) {
-			let status = null;
-			try {
-				const statusResult = await checkUserStatus(entry.id, groupId);
-				status = statusResult?.result?.status ?? null;
-			} catch (error) {
-				if (isTelegramNotInChatError(error)) {
-					summary.不在群 += 1;
-					continue;
-				}
-				console.error(`[purge] checkUserStatus 失败 user=${entry.id} group=${groupId}:`, error.message);
-				summary.失败 += 1;
-				summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 结果: '查询状态失败', 错误: error.message });
-				continue;
-			}
-			// 已踢出 / 已离开 → 跳过；left/kicked 是 Telegram 返回的"非群成员"状态
-			if (status === 'kicked' || status === 'left' || status === null) {
+	if (summary.本批计划处理 === 0) {
+		return jsonResponse({ 成功: true, ...summary });
+	}
+
+	const userStartIndex = Math.floor(startCursor / groupCount);
+	const userEndIndex = Math.ceil(endCursor / groupCount);
+	let blacklistWindow;
+	try {
+		blacklistWindow = await readD1BlacklistWindow(env, userStartIndex, userEndIndex - userStartIndex);
+	} catch (error) {
+		return jsonResponse({ 成功: false, 错误: '读取黑名单批次失败: ' + error.message }, 500);
+	}
+
+	for (let cursor = startCursor; cursor < endCursor; cursor++) {
+		const userIndex = Math.floor(cursor / groupCount);
+		const groupIndex = cursor % groupCount;
+		const entry = blacklistWindow[userIndex - userStartIndex];
+		const groupId = GROUP_IDS[groupIndex];
+
+		summary.本批已处理 += 1;
+
+		if (!entry) {
+			summary.失败 += 1;
+			summary.详情.push({ 游标: cursor, 群ID: groupId, 结果: '黑名单行不存在', 错误: '清扫期间黑名单发生变化，请从 cursor=0 重新开始' });
+			continue;
+		}
+
+		let status = null;
+		try {
+			const statusResult = await checkUserStatus(entry.id, groupId);
+			status = statusResult?.result?.status ?? null;
+		} catch (error) {
+			if (isTelegramNotInChatError(error)) {
 				summary.不在群 += 1;
 				continue;
 			}
-			const r = await banUserFromGroup(groupId, entry.id);
-			if (r.ok) {
-				summary.已踢出 += 1;
-				summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 旧状态: status, 结果: '已踢' });
-			} else {
-				summary.失败 += 1;
-				summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 旧状态: status, 结果: '失败', 错误: r.error });
-			}
+			console.error(`[purge] checkUserStatus 失败 user=${entry.id} group=${groupId}:`, error.message);
+			summary.失败 += 1;
+			summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 游标: cursor, 结果: '查询状态失败', 错误: error.message });
+			continue;
+		}
+		// 已踢出 / 已离开 → 跳过；left/kicked 是 Telegram 返回的"非群成员"状态
+		if (status === 'kicked' || status === 'left' || status === null) {
+			summary.不在群 += 1;
+			continue;
+		}
+		const r = await banUserFromGroup(groupId, entry.id);
+		if (r.ok) {
+			summary.已踢出 += 1;
+			summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 游标: cursor, 旧状态: status, 结果: '已踢' });
+		} else {
+			summary.失败 += 1;
+			summary.详情.push({ 用户ID: entry.id, 群ID: groupId, 游标: cursor, 旧状态: status, 结果: '失败', 错误: r.error });
 		}
 	}
 
