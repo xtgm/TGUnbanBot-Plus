@@ -181,6 +181,15 @@ console.log('\n[1] parseBatchTgids 解析器');
 
 	r = parseBatchTgids('  123 ， 456 , abc , 123  ');
 	assert('混合分隔+去重', eq(r, { valid: ['123', '456'], invalid: ['abc'] }));
+
+	r = parseBatchTgids('[123,456,789]');
+	assert('数组外壳+半角逗号', eq(r, { valid: ['123', '456', '789'], invalid: [] }));
+
+	r = parseBatchTgids('[123，456，789]');
+	assert('数组外壳+全角逗号', eq(r, { valid: ['123', '456', '789'], invalid: [] }));
+
+	r = parseBatchTgids('[\n123,\n456 789\n]');
+	assert('数组外壳+换行+空格', eq(r, { valid: ['123', '456', '789'], invalid: [] }));
 }
 
 // ---------- 2. BATCH_LIMIT 常量 ----------

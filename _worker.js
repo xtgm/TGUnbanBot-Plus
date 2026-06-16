@@ -522,12 +522,18 @@ async function handleInitialization(request) {
 
 // 批量 /ban /unban 上限（工程上限，非业务文案，不暴露环境变量）
 const BATCH_LIMIT = 50;
+const BULK_TASK_THRESHOLD = 20;
+const BULK_TASK_USER_BATCH_SIZE = 20;
+const BULK_TASK_CONCURRENCY = 10;
+const BULK_TASK_RETRY_LIMIT = 2;
+const BULK_TASK_MAX_RUNTIME_MS = 18000;
+const BULK_TASK_FAILURE_LIMIT = 100;
 
-// 解析批量 TGID 字符串：半角逗号 / 全角逗号 / 空格 / 换行 都当分隔符；去空、去重、分类
+// 解析批量 TGID 字符串：半角逗号 / 全角逗号 / 空格 / 换行 / 数组外壳 [] 都当分隔符；去空、去重、分类
 // 返回 { valid: ['123', '456'], invalid: ['abc'] }
 function parseBatchTgids(raw) {
 	const tokens = String(raw || '')
-		.split(/[,，\s]+/)
+		.split(/[\[\],，\s]+/)
 		.map((s) => s.trim())
 		.filter((s) => s !== '');
 	const valid = [];
@@ -545,6 +551,61 @@ function parseBatchTgids(raw) {
 	return { valid, invalid };
 }
 
+function parseTargetIdsAndNote(raw) {
+	const trimmed = String(raw || '').trim();
+	if (!trimmed) return { valid: [], invalid: [], note: '' };
+	if (trimmed.startsWith('[')) {
+		const closeIndex = trimmed.indexOf(']');
+		if (closeIndex > 0) {
+			return { ...parseBatchTgids(trimmed.slice(0, closeIndex + 1)), note: '' };
+		}
+		return { ...parseBatchTgids(trimmed), note: '' };
+	}
+	const tokens = trimmed.split(/\s+/).filter(Boolean);
+	let idEnd = 0;
+	for (; idEnd < tokens.length; idEnd++) {
+		const token = tokens[idEnd];
+		if (!/^[\d,，]+$/.test(token)) break;
+	}
+	if (idEnd === 0) {
+		return { ...parseBatchTgids(trimmed), note: '' };
+	}
+	const idText = tokens.slice(0, idEnd).join(' ');
+	const note = tokens.slice(idEnd).join(' ').trim();
+	return { ...parseBatchTgids(idText), note };
+}
+
+function formatActionNote(note) {
+	const clean = String(note || '').trim();
+	return clean ? escapeHtml(clean) : '未填写';
+}
+
+function buildActionContextLines(message, actionNote) {
+	const lines = [];
+	if (message?.chat?.type === 'private') {
+		lines.push('📍 命令来源:私聊');
+	} else {
+		const title = message?.chat?.title || message?.chat?.username || '当前群组';
+		const chatId = message?.chat?.id ?? '未知';
+		lines.push(`📍 命令来源:${escapeHtml(title)} <code>${escapeHtml(String(chatId))}</code>`);
+		const groupCount = Array.isArray(GROUP_IDS) ? GROUP_IDS.length : 0;
+		lines.push(`🧹 作用范围:全部 ${groupCount} 个配置群`);
+	}
+	lines.push(`📝 执行原因:${formatActionNote(actionNote)}`);
+	return lines;
+}
+
+function withActionContext(message, detailText, actionNote) {
+	return [...buildActionContextLines(message, actionNote), '', detailText].join('\n');
+}
+
+async function deleteAuthorizedGroupCommandMessage(message, commandName) {
+	if (message?.chat?.type === 'private') return;
+	const result = await deleteMessage(message.chat.id, message.message_id);
+	if (!result.ok) {
+		console.error(`[${commandName}] 删除群内命令消息失败:${result.error || '未知错误'}`);
+	}
+}
 // 读取并归一化黑名单
 // === D1 工具函数 ===
 // 首次访问 D1 时建表（幂等），避免人工建表步骤
@@ -558,6 +619,7 @@ async function ensureD1Table(env) {
 			CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
 			CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);
 			CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
+			CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT);
 		`);
 		D1_INITED = true;
 	} catch (error) {
@@ -1020,6 +1082,317 @@ function renderBatchRemoveResult(results, invalid) {
 	for (const f of results.failed) lines.push(`❌ <code>${f.id}</code> ${escapeHtml(f.msg)}`);
 
 	return lines.join('\n');
+}
+
+function buildBulkJobId(action) {
+	const suffix = Math.random().toString(36).slice(2, 8);
+	return `${action}_${Date.now().toString(36)}_${suffix}`;
+}
+
+function normalizeBulkJob(row) {
+	if (!row?.payload) return null;
+	try {
+		const payload = JSON.parse(row.payload);
+		return {
+			...payload,
+			id: payload.id || row.id,
+			action: payload.action || row.type,
+			status: payload.status || row.status || 'unknown'
+		};
+	} catch (error) {
+		console.error('解析批量任务失败:', error);
+		return null;
+	}
+}
+
+async function saveBulkJob(env, job) {
+	await ensureD1Table(env);
+	const now = new Date().toISOString();
+	job.updatedAt = now;
+	await env.DB
+		.prepare('UPDATE batch_jobs SET status = ?, payload = ?, updated_at = ? WHERE id = ?')
+		.bind(job.status, JSON.stringify(job), now, job.id)
+		.run();
+	return job;
+}
+
+async function loadBulkJob(env, jobId) {
+	if (!env.DB) return null;
+	await ensureD1Table(env);
+	const row = await env.DB
+		.prepare('SELECT id, type, status, payload FROM batch_jobs WHERE id = ?')
+		.bind(String(jobId || '').trim())
+		.first();
+	return normalizeBulkJob(row);
+}
+
+function getBulkJobNotifyTargets(message) {
+	const targets = getOwnerNotifyTargets(true);
+	if (targets.length) return targets;
+	return message?.from?.id ? [String(message.from.id)] : [];
+}
+
+function createBulkJobPayload(action, ids, invalid, note, message) {
+	const now = new Date().toISOString();
+	const operator = formatUserMention(message.from) || `<code>${escapeHtml(String(message.from?.id || '未知'))}</code>`;
+	const groupIds = GROUP_IDS.map((id) => String(id));
+	const job = {
+		version: 1,
+		id: buildBulkJobId(action),
+		action,
+		reason: action === 'spam' ? 'spam' : 'manual',
+		command: action === 'spam' ? '/spam' : '/ban',
+		status: 'queued',
+		ids: ids.map((id) => String(id)),
+		invalid: (invalid || []).map((id) => String(id)),
+		note: String(note || '').trim(),
+		groupIds,
+		createdBy: String(message.from?.id || ''),
+		operator,
+		operatorRole: classifyOperatorRole(message.from?.id, message.chat?.type === 'private' ? '管理员' : '群管理员'),
+		sourceChatId: String(message.chat?.id ?? ''),
+		sourceChatTitle: message.chat?.title || message.chat?.username || (message.chat?.type === 'private' ? '私聊' : '当前群组'),
+		sourceChatType: message.chat?.type || 'unknown',
+		notifyTargets: getBulkJobNotifyTargets(message),
+		userBatchSize: BULK_TASK_USER_BATCH_SIZE,
+		concurrency: BULK_TASK_CONCURRENCY,
+		retryLimit: BULK_TASK_RETRY_LIMIT,
+		totals: {
+			users: ids.length,
+			groups: groupIds.length,
+			operations: ids.length * groupIds.length,
+			invalid: (invalid || []).length
+		},
+		stats: {
+			usersProcessed: 0,
+			added: 0,
+			exists: 0,
+			addFailed: 0,
+			kickOk: 0,
+			kickFailed: 0
+		},
+		failures: [],
+		cursor: 0,
+		createdAt: now,
+		updatedAt: now,
+		startedAt: null,
+		finishedAt: null
+	};
+	return job;
+}
+
+async function createBulkJob(env, action, ids, invalid, note, message) {
+	if (!env.DB) {
+		throw new Error('大批量任务需要绑定 D1 存储空间');
+	}
+	await ensureD1Table(env);
+	const job = createBulkJobPayload(action, ids, invalid, note, message);
+	await env.DB
+		.prepare('INSERT INTO batch_jobs (id, type, status, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+		.bind(job.id, job.action, job.status, JSON.stringify(job), job.createdAt, job.updatedAt)
+		.run();
+	return job;
+}
+
+function pushBulkJobFailure(job, failure) {
+	job.failures.push({
+		...failure,
+		at: new Date().toISOString()
+	});
+	if (job.failures.length > BULK_TASK_FAILURE_LIMIT) {
+		job.failures = job.failures.slice(-BULK_TASK_FAILURE_LIMIT);
+	}
+}
+
+function formatBulkJobStatus(job) {
+	const map = {
+		queued: '等待执行',
+		running: '执行中',
+		done: '已完成',
+		failed: '失败',
+		paused: '已暂停'
+	};
+	return map[job.status] || job.status || '未知';
+}
+
+function formatBulkJobAction(job) {
+	return job.action === 'spam' ? '举报加黑(/spam)' : '加入黑名单(/ban)';
+}
+
+function formatStoredBulkJobContext(job) {
+	const lines = [];
+	if (job.sourceChatType === 'private') {
+		lines.push('📍 命令来源:私聊');
+	} else {
+		lines.push(`📍 命令来源:${escapeHtml(job.sourceChatTitle || '当前群组')} <code>${escapeHtml(job.sourceChatId || '未知')}</code>`);
+		lines.push(`🧹 作用范围:全部 ${job.totals?.groups ?? job.groupIds?.length ?? 0} 个配置群`);
+	}
+	lines.push(`📝 执行原因:${formatActionNote(job.note)}`);
+	return lines;
+}
+
+function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
+	const totalUsers = job.totals?.users ?? job.ids?.length ?? 0;
+	const totalGroups = job.totals?.groups ?? job.groupIds?.length ?? 0;
+	const totalOps = job.totals?.operations ?? (totalUsers * totalGroups);
+	const cursor = Math.min(Number(job.cursor) || 0, totalUsers);
+	const percent = totalUsers > 0 ? ((cursor / totalUsers) * 100).toFixed(cursor >= totalUsers ? 0 : 1) : '100';
+	const lines = [
+		title,
+		`任务ID:<code>${escapeHtml(job.id)}</code>`,
+		`🎬 操作:${formatBulkJobAction(job)}`,
+		`状态:${formatBulkJobStatus(job)}`,
+		'',
+		...formatStoredBulkJobContext(job),
+		'',
+		`目标用户:${totalUsers}`,
+		`配置群数:${totalGroups}`,
+		`总操作数:${totalOps}`,
+		`已处理用户:${cursor}/${totalUsers} (${percent}%)`,
+		'',
+		`加黑成功:${job.stats?.added || 0}`,
+		`已存在:${job.stats?.exists || 0}`,
+		`加黑失败:${job.stats?.addFailed || 0}`,
+		`踢人成功:${job.stats?.kickOk || 0}`,
+		`踢人失败:${job.stats?.kickFailed || 0}`,
+		`格式错误:${job.totals?.invalid || 0}`,
+		'',
+		`执行参数:单轮 ${job.userBatchSize || BULK_TASK_USER_BATCH_SIZE} 用户 / 并发 ${job.concurrency || BULK_TASK_CONCURRENCY} / 重试 ${job.retryLimit ?? BULK_TASK_RETRY_LIMIT} 次`
+	];
+	if (job.status !== 'done') {
+		lines.push(`继续执行:<code>/jobrun ${escapeHtml(job.id)}</code>`);
+	}
+	if (job.failures?.length) {
+		lines.push('', `<b>最近失败</b>（最多显示 ${Math.min(job.failures.length, 5)} 条）:`);
+		for (const f of job.failures.slice(-5)) {
+			const groupText = f.groupId ? ` 群 <code>${escapeHtml(f.groupId)}</code>` : '';
+			lines.push(`❌ <code>${escapeHtml(f.userId || '')}</code>${groupText}: ${escapeHtml(f.error || f.message || '失败')}`);
+		}
+	}
+	return lines.join('\n');
+}
+
+async function notifyBulkJobTargets(job, detailText) {
+	const targets = Array.isArray(job.notifyTargets) ? job.notifyTargets : [];
+	if (!targets.length) return;
+	await Promise.allSettled(targets.map((targetId) => {
+		const text = String(targetId) === String(job.createdBy)
+			? detailText
+			: renderAuditNotification(job.operator || `<code>${escapeHtml(job.createdBy || '')}</code>`, detailText, job.sourceChatType === 'private' ? '私聊' : '群内', job.operatorRole || '管理员');
+		return sendTelegramMessage(targetId, text).then((r) => {
+			if (!r?.ok) console.error(`[批量任务通知] 私聊${targetId}失败:${r?.description || '未知'}`);
+		});
+	}));
+}
+
+async function banUserFromGroupWithRetry(groupId, userId, retryLimit) {
+	let last = null;
+	for (let attempt = 0; attempt <= retryLimit; attempt++) {
+		const result = await banUserFromGroup(groupId, userId);
+		if (result.ok) {
+			return { ...result, attempts: attempt + 1 };
+		}
+		last = result;
+		if (attempt < retryLimit) {
+			await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+		}
+	}
+	return { ok: false, error: last?.error || '失败', attempts: retryLimit + 1 };
+}
+
+async function processBulkJobUserBatch(job, env, ids) {
+	const kickTasks = [];
+	for (const id of ids) {
+		const result = await addToBlacklistCore(id, env, { reason: job.reason, by: job.createdBy });
+		if (result.success) {
+			job.stats.added += 1;
+		} else if (result.message && result.message.includes('已在黑名单')) {
+			job.stats.exists += 1;
+		} else {
+			job.stats.addFailed += 1;
+			pushBulkJobFailure(job, { userId: id, phase: 'add', error: result.message || '加黑失败' });
+			continue;
+		}
+		for (const groupId of job.groupIds) {
+			kickTasks.push({ userId: id, groupId });
+		}
+	}
+
+	await mapWithConcurrency(kickTasks, job.concurrency || BULK_TASK_CONCURRENCY, async (task) => {
+		const result = await banUserFromGroupWithRetry(task.groupId, task.userId, job.retryLimit ?? BULK_TASK_RETRY_LIMIT);
+		if (result.ok) {
+			job.stats.kickOk += 1;
+		} else {
+			job.stats.kickFailed += 1;
+			pushBulkJobFailure(job, {
+				userId: task.userId,
+				groupId: task.groupId,
+				phase: 'kick',
+				error: result.error || '踢人失败'
+			});
+		}
+	});
+}
+
+async function runBulkModerationJob(env, jobId, options = {}) {
+	let job = await loadBulkJob(env, jobId);
+	if (!job) return null;
+	if (job.status === 'done') return job;
+	const started = Date.now();
+	job.status = 'running';
+	job.startedAt = job.startedAt || new Date().toISOString();
+	await saveBulkJob(env, job);
+
+	while (job.cursor < job.ids.length) {
+		const batch = job.ids.slice(job.cursor, job.cursor + (job.userBatchSize || BULK_TASK_USER_BATCH_SIZE));
+		await processBulkJobUserBatch(job, env, batch);
+		job.cursor += batch.length;
+		job.stats.usersProcessed = job.cursor;
+		if (job.cursor >= job.ids.length) {
+			job.status = 'done';
+			job.finishedAt = new Date().toISOString();
+		}
+		await saveBulkJob(env, job);
+		if (job.status === 'done') break;
+		if (Date.now() - started >= BULK_TASK_MAX_RUNTIME_MS) break;
+	}
+
+	if (job.status === 'done' && options.notifyOnDone !== false) {
+		await notifyBulkJobTargets(job, formatBulkJobDetail(job, '✅ <b>批量任务完成</b>'));
+	}
+	return job;
+}
+
+async function startBulkModerationJobFromCommand(message, env, ctx, options) {
+	const { action, valid, invalid, note, isInGroup } = options;
+	if (valid.length < BULK_TASK_THRESHOLD) return false;
+	if (!env.DB) {
+		const detailText = withActionContext(message, `❌ 大批量任务需要绑定 D1 存储空间\n目标用户:${valid.length}`, note);
+		await replyToAdmin(message, ctx, {
+			flashText: '❌ 大批量任务需要绑定 D1',
+			detailText,
+			isInGroup,
+			notifySecondaryOwners: true
+		});
+		return true;
+	}
+	const job = await createBulkJob(env, action, valid, invalid, note, message);
+	const detailText = formatBulkJobDetail(job, '📦 <b>批量任务已创建</b>');
+	await replyToAdmin(message, ctx, {
+		flashText: `📦 批量任务已创建 <code>${job.id}</code>\n目标 ${job.totals.users} 个`,
+		detailText,
+		isInGroup,
+		notifySecondaryOwners: true
+	});
+	const runner = runBulkModerationJob(env, job.id, { notifyOnDone: true }).catch((error) => {
+		console.error(`[批量任务] 执行失败 ${job.id}:`, error);
+	});
+	if (ctx && typeof ctx.waitUntil === 'function') {
+		ctx.waitUntil(runner);
+	} else {
+		await runner;
+	}
+	return true;
 }
 
 // 黑名单导出接口（受 TOKEN 保护）
@@ -1787,6 +2160,15 @@ function isCheckCommand(text) {
 
 	const trimmedText = text.trim();
 	return /^\/check(?:@[^\s]+)?(?:\s|$)/i.test(trimmedText);
+}
+
+function isJobCommand(text) {
+	if (!text) {
+		return false;
+	}
+
+	const trimmedText = text.trim();
+	return /^\/job(?:run)?(?:@[^\s]+)?(?:\s|$)/i.test(trimmedText);
 }
 
 // 判断给定 chat_id 是否属于配置的任一群组
@@ -3137,14 +3519,16 @@ async function handleMessage(message, env, ctx) {
 			}
 			return;
 		}
+		await deleteAuthorizedGroupCommandMessage(message, '/spam');
 
-		// 提取 /spam 后面的参数
-		const argMatch = text.trim().match(/^\/spam(?:@[^\s]+)?\s+([\s\S]+)/i);
+		// 提取 /spam 后面的参数。回复模式优先把参数当执行原因；无回复时才按 TGID 模式解析。
+		const argMatch = text.trim().match(/^\/spam(?:@[^\s]+)?\s*([\s\S]*)/i);
 		const rawArg = argMatch ? argMatch[1].trim() : '';
+		const repliedMsg = message.reply_to_message;
 
-		if (rawArg) {
+		if (rawArg && !repliedMsg) {
 			// ===== TGID 模式：直接通过 ID 封禁 =====
-			const { valid, invalid } = parseBatchTgids(rawArg);
+			const { valid, invalid, note } = parseTargetIdsAndNote(rawArg);
 
 			if (valid.length === 0 && invalid.length === 0) {
 				const usageText = `❌ 使用方法：<code>/spam 用户ID</code> 或 <code>/spam 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
@@ -3153,6 +3537,15 @@ async function handleMessage(message, env, ctx) {
 				} else {
 					await sendTelegramMessage(chatId, usageText);
 				}
+				return;
+			}
+			if (await startBulkModerationJobFromCommand(message, env, ctx, {
+				action: 'spam',
+				valid,
+				invalid,
+				note,
+				isInGroup
+			})) {
 				return;
 			}
 			if (valid.length > BATCH_LIMIT) {
@@ -3188,7 +3581,12 @@ async function handleMessage(message, env, ctx) {
 					lines.push(result.message);
 					flashText = `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
 				}
-				await replyToAdmin(message, ctx, { flashText, detailText: lines.join('\n'), isInGroup, notifySecondaryOwners: true });
+				await replyToAdmin(message, ctx, {
+					flashText,
+					detailText: withActionContext(message, lines.join('\n'), note),
+					isInGroup,
+					notifySecondaryOwners: true
+				});
 				return;
 			}
 
@@ -3219,7 +3617,7 @@ async function handleMessage(message, env, ctx) {
 			}
 			await replyToAdmin(message, ctx, {
 				flashText,
-				detailText: fullDetail,
+				detailText: withActionContext(message, fullDetail, note),
 				isInGroup,
 				notifySecondaryOwners: true
 			});
@@ -3227,7 +3625,6 @@ async function handleMessage(message, env, ctx) {
 		}
 
 		// ===== 回复模式：回复垃圾消息加黑（原有逻辑）=====
-		const repliedMsg = message.reply_to_message;
 		const repliedUserId = repliedMsg?.from?.id || repliedMsg?.sender_chat?.id;
 		if (!repliedUserId) {
 			const usageText = '❌ 使用方法：\n• 回复垃圾消息后发 <code>/spam</code>\n• 或直接 <code>/spam 用户ID</code>（支持批量：<code>/spam 123,456,789</code>）';
@@ -3239,6 +3636,7 @@ async function handleMessage(message, env, ctx) {
 			return;
 		}
 
+		const replySpamNote = rawArg;
 		const result = await addToBlacklist(repliedUserId, env, { reason: 'spam', by: userId });
 		const alreadyExists = result.message && result.message.includes('已在黑名单');
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
@@ -3286,7 +3684,7 @@ async function handleMessage(message, env, ctx) {
 
 			await replyToAdmin(message, ctx, {
 				flashText: `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} ${linkedUserId}`,
-				detailText: lines.join('\n'),
+				detailText: withActionContext(message, lines.join('\n'), replySpamNote),
 				isInGroup,
 				notifySecondaryOwners: true
 			});
@@ -3305,10 +3703,75 @@ async function handleMessage(message, env, ctx) {
 			}
 			await replyToAdmin(message, ctx, {
 				flashText: `⚠️ ${linkedUserId}: ${escapeHtml(plainMsg)}`,
-				detailText: failLines.join('\n'),
+				detailText: withActionContext(message, failLines.join('\n'), replySpamNote),
 				isInGroup,
 				notifySecondaryOwners: true
 			});
+		}
+		return;
+	}
+
+	// 处理 /job /jobrun：查询或续跑大批量 /ban /spam 任务
+	if (isJobCommand(text)) {
+		const isInGroup = message.chat.type !== 'private';
+		const isAdmin = await checkIfUserIsAdmin(userId);
+		if (!isAdmin) {
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+			}
+			return;
+		}
+		const isRun = /^\/jobrun(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
+		const jobId = text.trim().replace(/^\/job(?:run)?(?:@[^\s]+)?\s*/i, '').trim().split(/\s+/)[0] || '';
+		if (!jobId) {
+			const usageText = '❌ 使用方法：<code>/job 任务ID</code> 或 <code>/jobrun 任务ID</code>';
+			if (isInGroup) {
+				await sendFlashMessage(chatId, usageText, ctx);
+			} else {
+				await sendTelegramMessage(chatId, usageText);
+			}
+			return;
+		}
+		if (!env.DB) {
+			const errorText = '❌ 批量任务需要绑定 D1 存储空间';
+			if (isInGroup) {
+				await sendFlashMessage(chatId, errorText, ctx);
+			} else {
+				await sendTelegramMessage(chatId, errorText);
+			}
+			return;
+		}
+		const job = await loadBulkJob(env, jobId);
+		if (!job) {
+			const errorText = `❌ 未找到任务:<code>${escapeHtml(jobId)}</code>`;
+			if (isInGroup) {
+				await sendFlashMessage(chatId, errorText, ctx);
+			} else {
+				await sendTelegramMessage(chatId, errorText);
+			}
+			return;
+		}
+		if (isRun && job.status !== 'done') {
+			const runner = runBulkModerationJob(env, job.id, { notifyOnDone: true }).catch((error) => {
+				console.error(`[批量任务] 续跑失败 ${job.id}:`, error);
+			});
+			if (ctx && typeof ctx.waitUntil === 'function') {
+				ctx.waitUntil(runner);
+			} else {
+				await runner;
+			}
+		}
+		const latestJob = await loadBulkJob(env, job.id) || job;
+		const detailText = formatBulkJobDetail(latestJob, isRun ? '▶️ <b>批量任务已继续执行</b>' : '📦 <b>批量任务状态</b>');
+		if (isInGroup) {
+			await replyToAdmin(message, ctx, {
+				flashText: `📦 任务状态已发送私聊 <code>${escapeHtml(job.id)}</code>`,
+				detailText,
+				isInGroup,
+				notifySecondaryOwners: false
+			});
+		} else {
+			await sendTelegramMessage(chatId, detailText);
 		}
 		return;
 	}
@@ -3836,10 +4299,11 @@ async function handleMessage(message, env, ctx) {
 			}
 			return;
 		}
+		await deleteAuthorizedGroupCommandMessage(message, '/ban');
 
-		// 提取参数（支持单个 / 批量；分隔符见 parseBatchTgids）
+		// 提取参数（支持单个 / 批量；开头 TGID 列表之后的文本作为执行原因）
 		const rawArg = text.slice(5);
-		const { valid, invalid } = parseBatchTgids(rawArg);
+		const { valid, invalid, note } = parseTargetIdsAndNote(rawArg);
 
 		if (valid.length === 0 && invalid.length === 0) {
 			const usageText = `❌ 使用方法：<code>/ban 用户ID</code> 或 <code>/ban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
@@ -3848,6 +4312,15 @@ async function handleMessage(message, env, ctx) {
 			} else {
 				await sendTelegramMessage(chatId, usageText);
 			}
+			return;
+		}
+		if (await startBulkModerationJobFromCommand(message, env, ctx, {
+			action: 'ban',
+			valid,
+			invalid,
+			note,
+			isInGroup
+		})) {
 			return;
 		}
 		if (valid.length > BATCH_LIMIT) {
@@ -3885,7 +4358,12 @@ async function handleMessage(message, env, ctx) {
 				lines.push(result.message);
 				flashText = `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
 			}
-			await replyToAdmin(message, ctx, { flashText, detailText: lines.join('\n'), isInGroup, notifySecondaryOwners: true });
+			await replyToAdmin(message, ctx, {
+				flashText,
+				detailText: withActionContext(message, lines.join('\n'), note),
+				isInGroup,
+				notifySecondaryOwners: true
+			});
 			return;
 		}
 
@@ -3918,7 +4396,7 @@ async function handleMessage(message, env, ctx) {
 		}
 		await replyToAdmin(message, ctx, {
 			flashText,
-			detailText: fullDetail,
+			detailText: withActionContext(message, fullDetail, note),
 			isInGroup,
 			notifySecondaryOwners: true
 		});

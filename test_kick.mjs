@@ -68,6 +68,7 @@ const handler = sandbox.__handler;
 function makeFakeDB(seed = []) {
 	const rows = new Map(seed.map((r) => [String(r.id), { ...r, id: String(r.id), by_user: r.by_user ?? r.by ?? null }]));
 	const store = new Map();
+	const batchJobs = new Map();
 	let recentSeq = 1;
 	const syncBlacklist = () => {
 		store.set('blacklist', JSON.stringify([...rows.values()].map((r) => ({
@@ -111,6 +112,7 @@ function makeFakeDB(seed = []) {
 	return {
 		_rows: rows,
 		_store: store,
+		_jobs: batchJobs,
 		exec: async () => {},
 		prepare(sql) {
 			let bound = [];
@@ -135,6 +137,9 @@ function makeFakeDB(seed = []) {
 					if (sql.startsWith('SELECT data FROM learn_snapshot')) {
 						const data = store.get('learn_snapshot');
 						return data ? { data } : null;
+					}
+					if (sql.startsWith('SELECT id, type, status, payload FROM batch_jobs WHERE id = ?')) {
+						return batchJobs.get(bound[0]) || null;
 					}
 					return null;
 				},
@@ -162,6 +167,17 @@ function makeFakeDB(seed = []) {
 					if (sql.startsWith('INSERT OR REPLACE INTO learn_snapshot')) {
 						setJson('learn_snapshot', JSON.parse(bound[0]));
 						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('INSERT INTO batch_jobs')) {
+						const [id, type, status, payload, createdAt, updatedAt] = bound;
+						batchJobs.set(id, { id, type, status, payload, created_at: createdAt, updated_at: updatedAt });
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('UPDATE batch_jobs SET status = ?')) {
+						const [status, payload, updatedAt, id] = bound;
+						const current = batchJobs.get(id) || { id, type: JSON.parse(payload).action, created_at: updatedAt };
+						batchJobs.set(id, { ...current, status, payload, updated_at: updatedAt });
+						return { meta: { changes: batchJobs.has(id) ? 1 : 0 } };
 					}
 					if (sql.startsWith('INSERT INTO recent_messages')) {
 						const [mid, chatId, chatTitle, text, fromId, fromName, createdAt] = bound;
@@ -262,7 +278,7 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊
 			message_id: 100,
 			chat: { id: -1001, type: 'supergroup' },
 			from: { id: 999, is_bot: false },
-			text: '/spam',
+			text: '/spam 广告引流',
 			reply_to_message: {
 				message_id: 50,
 				from: { id: 8888, is_bot: false }, // 被举报的用户
@@ -286,6 +302,8 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊
 	assert('两个群 ID 都被覆盖', JSON.stringify(banGroups) === JSON.stringify(['-1001', '-1002']), `实际 ${JSON.stringify(banGroups)}`);
 
 	const delCalls = callsOf('deleteMessage');
+	const commandDelCalls = delCalls.filter((c) => c.body.message_id === 100);
+	assert('群内 /spam 指令消息 msgId=100 被删除', commandDelCalls.length >= 1, `实际 ${commandDelCalls.length}`);
 	// 至少 1 次:删除被回复的 msgId=50 那条;闪屏撤回是否调用取决于 ctx 是否同步执行
 	const realDelCalls = delCalls.filter((c) => c.body.message_id === 50);
 	assert('删除被回复消息 msgId=50 至少 1 次', realDelCalls.length >= 1, `实际 ${realDelCalls.length}`);
@@ -300,6 +318,8 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊
 	assert('私聊详情 sendMessage 1 次', dmSends.length === 1);
 	assert('私聊详情含"添加到黑名单"', dmSends[0].body.text.includes('添加到黑名单'));
 	assert('私聊详情含群名"主群"', dmSends[0].body.text.includes('主群'));
+	assert('/spam 回复模式含命令来源', dmSends[0].body.text.includes('命令来源') && dmSends[0].body.text.includes('-1001'));
+	assert('/spam 回复模式含执行原因', dmSends[0].body.text.includes('执行原因:广告引流'));
 }
 
 // ---------- [1b] /spam bot 不是管理员 + 删消息失败:错误翻译 ----------
@@ -327,7 +347,7 @@ console.log('\n[1b] /spam 错误翻译:CHAT_ADMIN_REQUIRED + 删消息失败');
 			message_id: 200,
 			chat: { id: -1001, type: 'supergroup' },
 			from: { id: 999, is_bot: false },
-			text: '/spam',
+			text: '/spam 广告引流',
 			reply_to_message: {
 				message_id: 60,
 				from: { id: 7777, is_bot: false },
@@ -366,7 +386,7 @@ console.log('\n[1c] /spam 大 TGID 不转 Number');
 			message_id: 210,
 			chat: { id: -1001, type: 'supergroup' },
 			from: { id: 999, is_bot: false },
-			text: '/spam 7965398892',
+			text: '/spam 7965398892 广告引流',
 		},
 	};
 	const env = { ...baseEnv, DB: makeFakeDB([]) };
@@ -375,6 +395,10 @@ console.log('\n[1c] /spam 大 TGID 不转 Number');
 	const banCalls = callsOf('banChatMember');
 	assert('/spam 大 TGID 全群踢出', banCalls.length === 2);
 	assert('/spam 大 TGID 传数字', banCalls.every((c) => c.body.user_id === 7965398892));
+	const delCalls = callsOf('deleteMessage').filter((c) => c.body.message_id === 210);
+	assert('/spam TGID 模式删除群内指令消息', delCalls.length >= 1, `实际 ${delCalls.length}`);
+	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('/spam TGID 模式含执行原因', !!dmSend && dmSend.body.text.includes('执行原因:广告引流'));
 }
 
 // ---------- [2] /ban 单条:加黑 + 全群踢 ----------
@@ -421,7 +445,7 @@ console.log('\n[3] /ban 100,200,300（批量）');
 			message_id: 300,
 			chat: { id: 999, type: 'private' },
 			from: { id: 999, is_bot: false },
-			text: '/ban 100,200,300',
+			text: '/ban [100, 200，\n300]',
 		},
 	};
 	const env = { ...baseEnv, DB: makeFakeDB([]) };
@@ -870,6 +894,11 @@ console.log('\n[10] 群内 /ban 单条');
 	assert('私聊详情含群名 副群-公告', dmSend.body.text.includes('副群-公告'));
 	assert('私聊详情含群 ID -1001', dmSend.body.text.includes('-1001'));
 	assert('私聊详情含群 ID -1002', dmSend.body.text.includes('-1002'));
+	assert('私聊详情含命令来源', dmSend.body.text.includes('命令来源:当前群组') && dmSend.body.text.includes('-1001'));
+	assert('私聊详情含作用范围', dmSend.body.text.includes('作用范围:全部 2 个配置群'));
+	assert('私聊详情默认原因未填写', dmSend.body.text.includes('执行原因:未填写'));
+	const commandDelCalls = callsOf('deleteMessage').filter((c) => c.body.message_id === 700);
+	assert('群内 /ban 指令消息 msgId=700 被删除', commandDelCalls.length >= 1, `实际 ${commandDelCalls.length}`);
 
 	assert('ctx.waitUntil 至少调用 1 次（用于撤回闪屏）', ctxCalls.length >= 1);
 }
@@ -966,7 +995,7 @@ console.log('\n[11] 群内 /ban 批量');
 			message_id: 800,
 			chat: { id: -1001, type: 'supergroup' },
 			from: { id: 999, is_bot: false },
-			text: '/ban 100,200,300',
+			text: '/ban [100, 200，\n300]',
 		},
 	};
 	const env = { ...baseEnv, DB: makeFakeDB([]) };
@@ -985,6 +1014,97 @@ console.log('\n[11] 群内 /ban 批量');
 	assert('私聊详情含每个用户', dmSend.body.text.includes('100') && dmSend.body.text.includes('200') && dmSend.body.text.includes('300'));
 	assert('私聊详情含逐用户明细', dmSend.body.text.includes('逐用户踢人明细'));
 	assert('私聊详情含群名', dmSend.body.text.includes('测试群-1001') && dmSend.body.text.includes('测试群-1002'));
+	assert('批量 /ban 数组格式默认原因未填写', dmSend.body.text.includes('执行原因:未填写'));
+	assert('批量 /ban 含作用范围', dmSend.body.text.includes('作用范围:全部 2 个配置群'));
+	const commandDelCalls = callsOf('deleteMessage').filter((c) => c.body.message_id === 800);
+	assert('群内批量 /ban 指令消息 msgId=800 被删除', commandDelCalls.length >= 1, `实际 ${commandDelCalls.length}`);
+	assert('小批量 /ban 不创建 D1 任务', env.DB._jobs.size === 0);
+}
+
+// ---------- [11b] 群内 /ban 20 个 TGID → D1 批量任务 ----------
+console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
+{
+	resetCalls();
+	const pending = [];
+	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p).catch((e) => { throw e; })); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const ids = Array.from({ length: 20 }, (_, i) => String(9000 + i));
+	const update = {
+		message: {
+			message_id: 810,
+			chat: { id: -1001, type: 'supergroup', title: '批量测试群' },
+			from: { id: 999, is_bot: false, first_name: '主人' },
+			text: `/ban [${ids.join(',')}]`,
+		},
+	};
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+	await Promise.all(pending);
+
+	assert('20 个 /ban 创建 1 个 D1 任务', env.DB._jobs.size === 1);
+	const jobRow = [...env.DB._jobs.values()][0];
+	const job = JSON.parse(jobRow.payload);
+	assert('批量 /ban 任务已完成', job.status === 'done' && job.cursor === 20);
+	assert('批量 /ban 任务记录操作类型', job.action === 'ban' && job.reason === 'manual');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
+	assert('批量 /ban 20 个全部写入黑名单', blacklist.length === 20 && blacklist.every((e) => e.reason === 'manual'));
+	assert('批量 /ban 全群踢人 40 次', callsOf('banChatMember').length === 40);
+	assert('批量 /ban 指令消息被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 810));
+	const sendTexts = callsOf('sendMessage').map((c) => c.body.text).join('\n');
+	assert('批量 /ban 发送任务创建通知', sendTexts.includes('批量任务已创建'));
+	assert('批量 /ban 发送任务完成通知', sendTexts.includes('批量任务完成'));
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 2 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 811, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: `/job ${job.id}` } })
+	}), env, fakeCtx);
+	const jobDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('/job 可查询批量任务状态', !!jobDm && jobDm.body.text.includes(job.id) && jobDm.body.text.includes('已完成'));
+}
+
+// ---------- [11c] 群内 /spam 20 个 TGID → D1 批量任务 ----------
+console.log('\n[11c] 群内 /spam 20 个 TGID → D1 批量任务');
+{
+	resetCalls();
+	const pending = [];
+	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p).catch((e) => { throw e; })); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const ids = Array.from({ length: 20 }, (_, i) => String(9300 + i));
+	const update = {
+		message: {
+			message_id: 812,
+			chat: { id: -1001, type: 'supergroup', title: '批量测试群' },
+			from: { id: 999, is_bot: false, first_name: '主人' },
+			text: `/spam [${ids.join('，')}]`,
+		},
+	};
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+	await Promise.all(pending);
+
+	assert('20 个 /spam 创建 1 个 D1 任务', env.DB._jobs.size === 1);
+	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
+	assert('批量 /spam 任务已完成', job.status === 'done' && job.action === 'spam');
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
+	assert('批量 /spam 20 个全部写入 spam reason', blacklist.length === 20 && blacklist.every((e) => e.reason === 'spam'));
+	assert('批量 /spam 全群踢人 40 次', callsOf('banChatMember').length === 40);
 }
 
 // ---------- [12] 群内 /unban 单条 ----------
@@ -1082,6 +1202,7 @@ console.log('\n[14] 群内非管理员发 /ban 静默忽略');
 	assert('未加黑（无权）', blacklist.length === 0);
 	assert('banChatMember 未调用', callsOf('banChatMember').length === 0);
 	assert('sendMessage 未调用（群内静默）', callsOf('sendMessage').length === 0);
+	assert('非管理员 /ban 指令消息不删除', callsOf('deleteMessage').length === 0);
 }
 
 // ---------- [15] 私聊主人投递失败 → 仅记日志,不追加群内提示 ----------
