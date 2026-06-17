@@ -155,6 +155,7 @@ let SELF_UNBAN_APPROVED;
 let BLACKLIST_PAGE_LIMIT;
 let BLACKLIST_REASON_LABELS;
 let GKY_BANLIST_ENDPOINT;
+let SELF_WORKER_URL = '';
 
 // Telegram Bot Token
 let TOKEN;
@@ -220,6 +221,7 @@ export default {
 			BLACKLIST_PAGE_LIMIT = config.BLACKLIST_PAGE_LIMIT;
 			BLACKLIST_REASON_LABELS = config.BLACKLIST_REASON_LABELS;
 			GKY_BANLIST_ENDPOINT = config.GKY_BANLIST_ENDPOINT;
+			SELF_WORKER_URL = config.SELF_WORKER_URL;
 		} catch (error) {
 			return jsonResponse({
 				success: false,
@@ -379,6 +381,7 @@ function loadRequiredConfig(env) {
 	}
 
 	const gkyEndpoint = pickStr(env.GKY_BANLIST_ENDPOINT, DEFAULT_GKY_BANLIST_ENDPOINT);
+	const selfWorkerUrl = String(env.SELF_WORKER_URL || env.WORKER_SELF_URL || '').trim();
 
 	// ===== 广告检测配置 =====
 	const parseBool = (v, dflt) => {
@@ -430,7 +433,8 @@ function loadRequiredConfig(env) {
 		SELF_UNBAN_APPROVED: selfUnbanApproved,
 		BLACKLIST_PAGE_LIMIT: blacklistPageLimit,
 		BLACKLIST_REASON_LABELS: blacklistReasonLabels,
-		GKY_BANLIST_ENDPOINT: gkyEndpoint
+		GKY_BANLIST_ENDPOINT: gkyEndpoint,
+		SELF_WORKER_URL: selfWorkerUrl
 	};
 }
 
@@ -1393,7 +1397,7 @@ function clearBulkJobLease(job) {
 
 function buildBulkJobInternalAutoRunRequest(requestUrl, jobId) {
 	if (!requestUrl || !TOKEN) return null;
-	const url = new URL(requestUrl);
+	const url = new URL(SELF_WORKER_URL || requestUrl);
 	url.pathname = '/';
 	url.search = '';
 	return {

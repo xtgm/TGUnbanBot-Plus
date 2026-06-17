@@ -1206,7 +1206,13 @@ console.log('\n[11d] /ban 7 个 TGID × 12 群 → 按操作量转 D1 任务');
 
 	const groupIds = Array.from({ length: 12 }, (_, i) => String(-1000000000000 - i));
 	const ids = Array.from({ length: 7 }, (_, i) => String(9700 + i));
-	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: groupIds.join(','), OWNER_IDS: '999', DB: makeFakeDB([]) };
+	env = {
+		TOKEN,
+		BOT_TOKEN: '0:fake',
+		GROUP_ID: groupIds.join(','),
+		OWNER_IDS: '999',
+		DB: makeFakeDB([])
+	};
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({
@@ -1254,7 +1260,14 @@ console.log('\n[11e] 私聊 /ban 10 个 TGID × 11 群 → 自动执行');
 
 	const groupIds = Array.from({ length: 11 }, (_, i) => String(-1000000000000 - i));
 	const ids = ['7930069580', '8742844397', '8618390622', '8940881073', '8706367417', '8526485529', '8968301847', '8983701946', '8977565377', '8260524718'];
-	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: groupIds.join(','), OWNER_IDS: '999', DB: makeFakeDB([]) };
+	env = {
+		TOKEN,
+		BOT_TOKEN: '0:fake',
+		GROUP_ID: groupIds.join(','),
+		OWNER_IDS: '999',
+		SELF_WORKER_URL: 'https://tc03.example.workers.dev',
+		DB: makeFakeDB([])
+	};
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({
@@ -1273,6 +1286,7 @@ console.log('\n[11e] 私聊 /ban 10 个 TGID × 11 群 → 自动执行');
 	assert('私聊 10×11 自动续接后完成', job.status === 'done' && job.cursor === 10);
 	assert('私聊 10×11 自动续接分阶段执行', job.autoRunCount >= 5);
 	assert('私聊 10×11 自动续接走 webhook 根路径', internalUrls.length >= 1 && internalUrls.every((u) => new URL(u).pathname === '/'));
+	assert('私聊 10×11 自动续接使用 SELF_WORKER_URL', internalUrls.every((u) => new URL(u).hostname === 'tc03.example.workers.dev'));
 	assert('私聊 10×11 自动踢人全部完成', callsOf('banChatMember').length === 110);
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('私聊 10×11 自动写入全部黑名单', blacklist.length === 10 && blacklist.every((e) => e.reason === 'manual'));
