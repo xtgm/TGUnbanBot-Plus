@@ -70,6 +70,17 @@ function makeInternalWorkerRequest(url, init = {}) {
 	});
 }
 
+function makeFakeBulkQueue(getEnv, fakeCtx) {
+	const queue = {
+		sent: [],
+		async send(body) {
+			queue.sent.push(body);
+			await handler.queue({ messages: [{ body }] }, getEnv(), fakeCtx);
+		}
+	};
+	return queue;
+}
+
 const sandbox = {
 	console, URL, URLSearchParams, TextEncoder, TextDecoder,
 	Response, Request, Headers, atob, btoa, setTimeout, clearTimeout,
@@ -1064,6 +1075,7 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 		},
 	};
 	env = { ...baseEnv, DB: makeFakeDB([]) };
+	env.BULK_QUEUE = makeFakeBulkQueue(() => env, fakeCtx);
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 	await drainPending(pending);
 
@@ -1072,6 +1084,7 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 	const job = JSON.parse(jobRow.payload);
 	assert('批量 /ban 自动续接后完成', job.status === 'done' && job.cursor === 20);
 	assert('批量 /ban 自动续接分阶段执行', job.autoRunCount >= 2);
+	assert('批量 /ban 自动续接使用 Queue', env.BULK_QUEUE.sent.length >= 1);
 	assert('批量 /ban 任务记录操作类型', job.action === 'ban' && job.reason === 'manual');
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('批量 /ban 自动写入全部黑名单', blacklist.length === 20 && blacklist.every((e) => e.reason === 'manual'));
@@ -1101,6 +1114,42 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 	assert('/jobrun 可查询批量任务状态', jobDms.some((c) => c.body.text.includes(job.id) && c.body.text.includes('已完成')));
 }
 
+// ---------- [11b1] 未绑定 Queue 时只创建 D1 任务，不后台跑大批量 ----------
+console.log('\n[11b1] 未绑定 Queue 时只创建 D1 任务，不后台跑大批量');
+{
+	resetCalls();
+	const pending = [];
+	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p).catch((e) => { throw e; })); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const ids = Array.from({ length: 20 }, (_, i) => String(9100 + i));
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({
+			message: {
+				message_id: 819,
+				chat: { id: -1001, type: 'supergroup', title: '批量测试群' },
+				from: { id: 999, is_bot: false, first_name: '主人' },
+				text: `/ban [${ids.join(',')}]`,
+			}
+		})
+	}), env, fakeCtx);
+	await drainPending(pending);
+
+	assert('未绑定 Queue 仍创建 D1 批量任务', env.DB._jobs.size === 1);
+	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
+	assert('未绑定 Queue 不自动执行大批量', job.status === 'queued' && job.cursor === 0 && job.autoRunCount === 0);
+	assert('未绑定 Queue 不调用踢人接口', callsOf('banChatMember').length === 0);
+	const sendTexts = callsOf('sendMessage').map((c) => c.body.text).join('\n');
+	assert('未绑定 Queue 回执提示手动继续执行', sendTexts.includes(`/jobrun ${job.id}`) && !sendTexts.includes('自动续接:已开启'));
+}
+
 // ---------- [11b2] D1 批量任务失败原因中文化 ----------
 console.log('\n[11b2] D1 批量任务失败原因中文化');
 {
@@ -1119,6 +1168,7 @@ console.log('\n[11b2] D1 批量任务失败原因中文化');
 
 	const ids = Array.from({ length: 20 }, (_, i) => String(9200 + i));
 	env = { ...baseEnv, DB: makeFakeDB([]) };
+	env.BULK_QUEUE = makeFakeBulkQueue(() => env, fakeCtx);
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({
@@ -1176,6 +1226,7 @@ console.log('\n[11c] 群内 /spam 20 个 TGID → D1 批量任务');
 		},
 	};
 	env = { ...baseEnv, DB: makeFakeDB([]) };
+	env.BULK_QUEUE = makeFakeBulkQueue(() => env, fakeCtx);
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 	await drainPending(pending);
 
@@ -1183,6 +1234,7 @@ console.log('\n[11c] 群内 /spam 20 个 TGID → D1 批量任务');
 	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
 	assert('批量 /spam 自动续接后完成', job.status === 'done' && job.cursor === 20 && job.action === 'spam');
 	assert('批量 /spam 自动续接分阶段执行', job.autoRunCount >= 2);
+	assert('批量 /spam 自动续接使用 Queue', env.BULK_QUEUE.sent.length >= 1);
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('批量 /spam 自动写入全部 spam reason', blacklist.length === 20 && blacklist.every((e) => e.reason === 'spam'));
 	assert('批量 /spam 自动踢人全部完成', callsOf('banChatMember').length === 40);
@@ -1211,9 +1263,9 @@ console.log('\n[11d] /ban 7 个 TGID × 12 群 → 按操作量转 D1 任务');
 		BOT_TOKEN: '0:fake',
 		GROUP_ID: groupIds.join(','),
 		OWNER_IDS: '999',
-		SELF_WORKER_URL: 'https://tc03.example.workers.dev',
 		DB: makeFakeDB([])
 	};
+	env.BULK_QUEUE = makeFakeBulkQueue(() => env, fakeCtx);
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({
@@ -1232,6 +1284,7 @@ console.log('\n[11d] /ban 7 个 TGID × 12 群 → 按操作量转 D1 任务');
 	assert('7 个 TGID × 12 群总操作数记录为 84', job.totals.operations === 84 && job.totals.groups === 12);
 	assert('7×12 自动续接后完成', job.status === 'done' && job.cursor === 7);
 	assert('7×12 自动续接分阶段执行', job.autoRunCount >= 4);
+	assert('7×12 自动续接使用 Queue', env.BULK_QUEUE.sent.length >= 1);
 	assert('7×12 自动踢人全部完成', callsOf('banChatMember').length === 84);
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('7×12 自动写入全部黑名单', blacklist.length === 7 && blacklist.every((e) => e.reason === 'manual'));
@@ -1266,9 +1319,9 @@ console.log('\n[11e] 私聊 /ban 10 个 TGID × 11 群 → 自动执行');
 		BOT_TOKEN: '0:fake',
 		GROUP_ID: groupIds.join(','),
 		OWNER_IDS: '999',
-		SELF_WORKER_URL: 'https://tc03.example.workers.dev',
 		DB: makeFakeDB([])
 	};
+	env.BULK_QUEUE = makeFakeBulkQueue(() => env, fakeCtx);
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({
@@ -1286,8 +1339,8 @@ console.log('\n[11e] 私聊 /ban 10 个 TGID × 11 群 → 自动执行');
 	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
 	assert('私聊 10×11 自动续接后完成', job.status === 'done' && job.cursor === 10);
 	assert('私聊 10×11 自动续接分阶段执行', job.autoRunCount >= 5);
-	assert('私聊 10×11 自动续接走 webhook 根路径', internalUrls.length >= 1 && internalUrls.every((u) => new URL(u).pathname === '/'));
-	assert('私聊 10×11 自动续接使用 SELF_WORKER_URL', internalUrls.every((u) => new URL(u).hostname === 'tc03.example.workers.dev'));
+	assert('私聊 10×11 自动续接使用 Queue', env.BULK_QUEUE.sent.length >= 1);
+	assert('私聊 10×11 自动续接不再 HTTP 自调用', internalUrls.length === 0);
 	assert('私聊 10×11 自动踢人全部完成', callsOf('banChatMember').length === 110);
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('私聊 10×11 自动写入全部黑名单', blacklist.length === 10 && blacklist.every((e) => e.reason === 'manual'));

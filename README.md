@@ -29,7 +29,7 @@
 - **黑名单结构升级（向后兼容）**：从 `["123","456"]` 裸数组升级为 `[{id, reason, by, at}]` 对象数组，记录封禁原因、操作人、时间。旧裸数组数据自动归一化升级，零迁移。
 - **D1 数据库（唯一存储后端）**：完全基于 Cloudflare D1 数据库，免费层每天 10 万次写入不会溢出。黑名单、广告词库、学习样本、消息缓存、批量任务全部存 D1。
 - **`/blacklist` 命令**：管理员私聊查看当前黑名单（最多 30 条）。
-- **`/ban` `/spam` `/unban` 支持批量**：分隔符兼容半角逗号 / 全角逗号 / 空格 / 换行，也支持 `[123,456,789]` 数组外壳。`/ban` `/spam` 小操作量即时执行；当 TGID 达到 20 个，或 `TGID 数量 × 配置群数量` 超过安全操作预算时，自动进入 D1 批量任务模式并按安全分片执行；`/unban` 保持单次最多 50 个。单条用法完全保持原样。
+- **`/ban` `/spam` `/unban` 支持批量**：分隔符兼容半角逗号 / 全角逗号 / 空格 / 换行，也支持 `[123,456,789]` 数组外壳。`/ban` `/spam` 小操作量即时执行；当 TGID 达到 20 个，或 `TGID 数量 × 配置群数量` 超过安全操作预算时，自动进入 D1 批量任务模式，并通过 Cloudflare Queues 按安全分片自动续接执行；`/unban` 保持单次最多 50 个。单条用法完全保持原样。
 - **黑名单导出接口**：`GET /{TOKEN}/export` 浏览器直接看 HTML 表格（带搜索过滤），`?format=json` / `?format=csv` 下载完整数据，CSV 自带 BOM 让 Excel 不乱码。
 - **全局黑名单真踢人闭环**：`/ban` `/spam` 加黑后会**立即遍历所有 GROUP_IDS 把人踢出群**（之前只写库不踢人）；`/spam` 还会删除被回复的垃圾消息；黑名单用户在群里发言会被实时拦截删消息+踢人；被人拉回群也会立即被踢回去；新增 `/{TOKEN}/purge` / `/{TOKEN}/purge/run` 默认分批清扫 `/ban` + `/spam` 存量数据。
 - **`/ban` `/unban` `/spam` 群内可用 + 闪屏 + 私聊详情**：原项目 `/ban` `/unban` 强制只能私聊，本项目允许群内直接发命令；`/spam` 也升级为同款双通道。群内执行时机器人发短闪屏提示（5 秒自动撤回）+ 按 `OWNER_IDS` 规则私聊完整详情，既快又不污染群消息流；授权管理员在群内发送 `/ban` `/spam` 后，机器人会自动撤回该命令消息本身。详情含**命令来源 / 作用范围 / 执行原因 / 群名 / 群 ID / 失败原因 / 解决建议**（Telegram 英文错误自动翻译为中文）。
@@ -134,7 +134,7 @@
 ├── wrangler.toml    # Cloudflare Wrangler 配置
 ├── test_batch.mjs   # 批量解析与黑名单写入离线测试（43 项）
 ├── test_export.mjs  # 导出接口离线测试（41 项）
-├── test_kick.mjs    # 真踢人闭环 + 广告学习 + 大批量任务离线测试（333 项）
+├── test_kick.mjs    # 真踢人闭环 + 广告学习 + 大批量任务离线测试（372 项）
 ├── README.md
 └── LICENSE
 ```
@@ -212,8 +212,9 @@ const DEFAULT_OWNER_IDS = ['123456', '789012'];        // 第一个主人,后续
 | 绑定 | binding 名 | 用途 |
 | --- | --- | --- |
 | D1 Database | `DB` | **唯一存储后端**。黑名单、广告词库、学习样本、消息缓存、批量任务全部存 D1。表结构由代码自动建立，首次写入自动建表。 |
+| Queue | `BULK_QUEUE` | `/ban` `/spam` 大批量任务自动续接队列。注意这是 Cloudflare Queue 绑定，不是 `wrangler secret put` 环境变量。 |
 
-> 未绑定 D1 时，自助解封仍可用，但 `/ban` `/spam` `/blacklist` 等命令会提示未绑定存储空间。
+> 未绑定 D1 时，自助解封仍可用，但 `/ban` `/spam` `/blacklist` 等命令会提示未绑定存储空间。未绑定 `BULK_QUEUE` 时，大批量任务仍会创建到 D1，但不会自动续接，需要管理员用 `/jobrun 任务ID` 手动补跑。
 
 ## 部署
 
@@ -243,11 +244,19 @@ wrangler d1 create tg-unban-bot-plus
 | `learn_snapshot` | `/recent` 冻结快照，供 `/learnlast` 二次复核 |
 | `batch_jobs` | `/ban` `/spam` 自动创建的 D1 批量任务状态、进度、统计和失败记录 |
 
-### 3. 启用 Observability（可选）
+### 3. 创建批量任务 Queue
+
+```bash
+wrangler queues create tg-unban-bot-plus-bulk
+```
+
+`wrangler.toml` 已包含 `BULK_QUEUE` 的 producer / consumer 绑定。这里不需要新增环境变量，也不需要 `wrangler secret put BULK_QUEUE`。
+
+### 4. 启用 Observability（可选）
 
 参考 `wrangler.toml` 中的 `[observability]` 配置段。建议至少开启 `logs`，因为 Worker 会输出 Telegram 更新、权限检查、API 返回等调试信息。
 
-### 4. 设置环境变量
+### 5. 设置环境变量
 
 ```bash
 wrangler secret put TOKEN
@@ -265,7 +274,7 @@ wrangler secret put SUPER_ADMINS    # 可选
 
 也可以在 Cloudflare Dashboard 的 Worker 设置页中添加同名变量。
 
-### 5. 部署 Worker
+### 6. 部署 Worker
 
 ```bash
 wrangler deploy
@@ -277,7 +286,7 @@ wrangler deploy
 https://tg-unban-bot-plus.example.workers.dev
 ```
 
-### 6. 初始化 Webhook
+### 7. 初始化 Webhook
 
 访问下面的地址：
 
@@ -522,8 +531,8 @@ GET /{TOKEN}/purge/run
 **原因**：当前有两套批量路径：`/ban` `/spam` 小操作量走即时流程；当 TGID 达到 20 个，或 `TGID 数量 × 配置群数量` 超过安全操作预算时，自动创建 D1 批量任务。`/unban` 不走 D1 批量任务，仍受 `_worker.js` 的 `BATCH_LIMIT = 50` 限制。
 **解决**：
 
-1. `/ban` `/spam` 大名单可以直接粘贴，例如 `/ban [100,101,102,...]` 或 `/spam 100,101,102,... 批量广告`。进入 D1 批量任务后会保存到 `batch_jobs`，按每轮最多 24 个“用户 × 群组”操作预算自动切片，最多 3 并发，并自动续接下一阶段，避免 Cloudflare Worker 单次子请求超限。
-2. 任务创建后会返回任务 ID；用 `/job 任务ID` 查询进度。正常情况下不需要手动续跑，若自动续接被外部异常打断，可用 `/jobrun 任务ID` 补跑。
+1. `/ban` `/spam` 大名单可以直接粘贴，例如 `/ban [100,101,102,...]` 或 `/spam 100,101,102,... 批量广告`。进入 D1 批量任务后会保存到 `batch_jobs`，按每轮最多 24 个“用户 × 群组”操作预算自动切片，最多 3 并发，并通过 Cloudflare Queues 自动续接下一阶段，避免 Cloudflare Worker 单次子请求超限。
+2. 任务创建后会返回任务 ID；用 `/job 任务ID` 查询进度。正常情况下不需要手动续跑，若 Queue 未绑定或自动续接被外部异常打断，可用 `/jobrun 任务ID` 补跑。
 3. `/unban` 仍需按每批最多 50 个拆分，例如 `/unban 100,101,...,149` 一批，`/unban 150,151,...,199` 又一批。
 4. 分隔符可混用：半角 `,` / 全角 `，` / 空格 / 换行，也支持 `[123,456]` 数组外壳，便于从其它表格 / 聊天记录直接粘贴。
 5. 批量过程中重复 ID 会自动去重，已在黑名单的会单独标记，不会让整批失败。

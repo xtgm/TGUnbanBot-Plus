@@ -155,7 +155,6 @@ let SELF_UNBAN_APPROVED;
 let BLACKLIST_PAGE_LIMIT;
 let BLACKLIST_REASON_LABELS;
 let GKY_BANLIST_ENDPOINT;
-let SELF_WORKER_URL = '';
 
 // Telegram Bot Token
 let TOKEN;
@@ -192,36 +191,38 @@ let BOT_ID = null;
 let GROUP_TITLE = null;
 let GROUP_USERNAME = null;
 
+function applyRuntimeConfig(config) {
+	TOKEN = config.TOKEN;
+	BOT_TOKEN = config.BOT_TOKEN;
+	GROUP_IDS = config.GROUP_IDS;
+	GROUP_ID = config.GROUP_ID;
+	SUPER_ADMINS = config.SUPER_ADMINS;
+	OWNER_IDS = config.OWNER_IDS;
+	AD_FILTER_ENABLED = config.AD_FILTER_ENABLED;
+	AD_SCORE_THRESHOLD = config.AD_SCORE_THRESHOLD;
+	AD_KEYWORDS = config.AD_KEYWORDS;
+	AD_WHITELIST = config.AD_WHITELIST;
+	AD_KEYWORDS_FINANCE = config.AD_KEYWORDS_FINANCE;
+	AD_KEYWORDS_PORN = config.AD_KEYWORDS_PORN;
+	AD_KEYWORDS_SPAM = config.AD_KEYWORDS_SPAM;
+	AD_KEYWORDS_FRAUD = config.AD_KEYWORDS_FRAUD;
+	MSG_CACHE_ENABLED = config.MSG_CACHE_ENABLED;
+	MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
+	SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
+	SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
+	SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
+	BLACKLIST_PAGE_LIMIT = config.BLACKLIST_PAGE_LIMIT;
+	BLACKLIST_REASON_LABELS = config.BLACKLIST_REASON_LABELS;
+	GKY_BANLIST_ENDPOINT = config.GKY_BANLIST_ENDPOINT;
+}
+
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 		const path = url.pathname.slice(1); // 移除开头的斜杠
 
 		try {
-			const config = loadRequiredConfig(env);
-			TOKEN = config.TOKEN;
-			BOT_TOKEN = config.BOT_TOKEN;
-			GROUP_IDS = config.GROUP_IDS;
-			GROUP_ID = config.GROUP_ID;
-			SUPER_ADMINS = config.SUPER_ADMINS;
-			OWNER_IDS = config.OWNER_IDS;
-			AD_FILTER_ENABLED = config.AD_FILTER_ENABLED;
-			AD_SCORE_THRESHOLD = config.AD_SCORE_THRESHOLD;
-			AD_KEYWORDS = config.AD_KEYWORDS;
-			AD_WHITELIST = config.AD_WHITELIST;
-			AD_KEYWORDS_FINANCE = config.AD_KEYWORDS_FINANCE;
-			AD_KEYWORDS_PORN = config.AD_KEYWORDS_PORN;
-			AD_KEYWORDS_SPAM = config.AD_KEYWORDS_SPAM;
-			AD_KEYWORDS_FRAUD = config.AD_KEYWORDS_FRAUD;
-			MSG_CACHE_ENABLED = config.MSG_CACHE_ENABLED;
-			MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
-			SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
-			SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
-			SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
-			BLACKLIST_PAGE_LIMIT = config.BLACKLIST_PAGE_LIMIT;
-			BLACKLIST_REASON_LABELS = config.BLACKLIST_REASON_LABELS;
-			GKY_BANLIST_ENDPOINT = config.GKY_BANLIST_ENDPOINT;
-			SELF_WORKER_URL = config.SELF_WORKER_URL;
+			applyRuntimeConfig(loadRequiredConfig(env));
 		} catch (error) {
 			return jsonResponse({
 				success: false,
@@ -248,20 +249,12 @@ export default {
 			// 分批清扫：把仍在群里的黑名单用户全部踢出（受 TOKEN 保护）
 			return await handlePurge(env, url);
 		} else if (request.method === 'GET' && path === `${TOKEN}/jobrun`) {
-			// D1 批量任务自动续接入口：每次仍只跑安全分片，由 Worker 自己逐段续接。
+			// D1 批量任务续跑入口：每次仍只跑安全分片，正常由 Queue 自动续接，异常时可手动调用。
 			return await handleBulkJobAutoRun(env, url, ctx, request.url);
 		} else if (request.method === 'POST') {
 			// 如果是 Telegram Webhook 请求
 			if (path === '') {
 				const update = await request.json();
-				if (update?.__bulk_job_auto_run === true) {
-					if (String(update.token || '') !== String(TOKEN)) {
-						return jsonResponse({ success: false, error: 'forbidden' }, 403);
-					}
-					const autoUrl = new URL(request.url);
-					autoUrl.searchParams.set('id', String(update.id || ''));
-					return await handleBulkJobAutoRun(env, autoUrl, ctx, request.url);
-				}
 				console.log('[Telegram更新] 收到更新:', JSON.stringify({
 					更新ID: update.update_id,
 					包含字段: Object.keys(update),
@@ -297,6 +290,31 @@ export default {
 		}
 
 		return new Response('Method Not Allowed', { status: 405 });
+	},
+
+	async queue(batch, env, ctx) {
+		try {
+			applyRuntimeConfig(loadRequiredConfig(env));
+		} catch (error) {
+			console.error('[批量任务] Queue 初始化失败:', error);
+			throw error;
+		}
+
+		for (const message of batch.messages || []) {
+			const body = message.body || {};
+			const jobId = String(body.id || body.jobId || '').trim();
+			if (!jobId) {
+				console.error('[批量任务] Queue 消息缺少 job id:', body);
+				continue;
+			}
+			await runBulkModerationJob(env, jobId, {
+				notifyOnDone: true,
+				autoContinue: true,
+				ctx,
+				requestUrl: '',
+				source: 'queue'
+			});
+		}
 	}
 };
 
@@ -381,8 +399,6 @@ function loadRequiredConfig(env) {
 	}
 
 	const gkyEndpoint = pickStr(env.GKY_BANLIST_ENDPOINT, DEFAULT_GKY_BANLIST_ENDPOINT);
-	const selfWorkerUrl = String(env.SELF_WORKER_URL || env.WORKER_SELF_URL || '').trim();
-
 	// ===== 广告检测配置 =====
 	const parseBool = (v, dflt) => {
 		if (v === undefined || v === null || String(v).trim() === '') return dflt;
@@ -433,8 +449,7 @@ function loadRequiredConfig(env) {
 		SELF_UNBAN_APPROVED: selfUnbanApproved,
 		BLACKLIST_PAGE_LIMIT: blacklistPageLimit,
 		BLACKLIST_REASON_LABELS: blacklistReasonLabels,
-		GKY_BANLIST_ENDPOINT: gkyEndpoint,
-		SELF_WORKER_URL: selfWorkerUrl
+		GKY_BANLIST_ENDPOINT: gkyEndpoint
 	};
 }
 
@@ -1417,50 +1432,32 @@ async function markBulkJobFailed(env, jobId, error) {
 	return job;
 }
 
-function buildBulkJobInternalAutoRunRequest(requestUrl, jobId) {
-	if (!requestUrl || !TOKEN) return null;
-	const url = new URL(SELF_WORKER_URL || requestUrl);
-	url.pathname = '/';
-	url.search = '';
-	return {
-		url: url.toString(),
-		init: {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				__bulk_job_auto_run: true,
-				token: TOKEN,
-				id: jobId
-			})
-		}
-	};
+function getBulkQueue(env) {
+	return env?.BULK_QUEUE && typeof env.BULK_QUEUE.send === 'function' ? env.BULK_QUEUE : null;
 }
 
 function scheduleBulkJobAutoContinue(job, ctx, requestUrl, env = null) {
 	if (!env || !job || job.status === 'done' || job.cursor >= job.ids.length || job.autoContinue === false) return false;
-	const nextRequest = buildBulkJobInternalAutoRunRequest(requestUrl, job.id);
-	if (!nextRequest) return false;
+	const queue = getBulkQueue(env);
+	if (!queue) {
+		console.warn(`[批量任务] 未绑定 BULK_QUEUE，自动续接未启动 ${job.id}; 可手动 /jobrun ${job.id}`);
+		return false;
+	}
 	const task = (async () => {
 		let lastError = null;
 		for (let attempt = 1; attempt <= 3; attempt += 1) {
 			try {
-				const response = await fetch(nextRequest.url, nextRequest.init);
-				if (response.ok) return;
-				let body = '';
-				try {
-					body = await response.text();
-				} catch (_) {}
-				lastError = `自动续接 HTTP ${response.status}: ${body || response.statusText || '无响应内容'}; target=${nextRequest.url}`;
-				console.error(`[批量任务] 自动续接触发失败 ${job.id}: ${lastError}`);
+				await queue.send({ type: 'bulk_job_run', id: job.id });
+				return;
 			} catch (error) {
-				lastError = `${getErrorMessage(error)}; target=${nextRequest.url}`;
-				console.error(`[批量任务] 自动续接触发异常 ${job.id}:`, error);
+				lastError = getErrorMessage(error);
+				console.error(`[批量任务] Queue 自动续接触发异常 ${job.id}:`, error);
 			}
 			if (attempt < 3) {
 				await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
 			}
 		}
-		await markBulkJobFailed(env, job.id, lastError || '自动续接触发失败');
+		await markBulkJobFailed(env, job.id, `Queue 自动续接触发失败: ${lastError || '未知错误'}`);
 	})().catch(async (error) => {
 		console.error(`[批量任务] 自动续接异常 ${job.id}:`, error);
 		await markBulkJobFailed(env, job.id, error);
@@ -1550,6 +1547,11 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 		return true;
 	}
 	const job = await createBulkJob(env, action, valid, invalid, note, message);
+	const autoQueueAvailable = Boolean(getBulkQueue(env));
+	if (!autoQueueAvailable) {
+		job.autoContinue = false;
+		await saveBulkJob(env, job);
+	}
 	const detailText = formatBulkJobDetail(job, '📦 <b>批量任务已创建</b>');
 	await replyToAdmin(message, ctx, {
 		flashText: `📦 批量任务已创建 <code>${job.id}</code>\n目标 ${job.totals.users} 个`,
@@ -1557,21 +1559,8 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 		isInGroup,
 		notifySecondaryOwners: true
 	});
-	const scheduled = scheduleBulkJobAutoContinue(job, ctx, options.requestUrl, env);
-	if (!scheduled) {
-		const runner = runBulkModerationJob(env, job.id, {
-			notifyOnDone: true,
-			autoContinue: true,
-			ctx,
-			requestUrl: options.requestUrl,
-			source: 'command'
-		});
-		if (ctx && typeof ctx.waitUntil === 'function') {
-			ctx.waitUntil(runner);
-		} else {
-			await runner;
-		}
-	} else if (scheduled && typeof scheduled.then === 'function') {
+	const scheduled = autoQueueAvailable ? scheduleBulkJobAutoContinue(job, ctx, options.requestUrl, env) : false;
+	if (scheduled && typeof scheduled.then === 'function') {
 		await scheduled;
 	}
 	return true;
