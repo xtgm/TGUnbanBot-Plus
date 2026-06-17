@@ -157,6 +157,7 @@ let BLACKLIST_REASON_LABELS;
 let GKY_BANLIST_ENDPOINT;
 
 // Telegram Bot Token
+let TOKEN;
 let BOT_TOKEN;
 // 主群组ID（GROUP_IDS 的第一项，用于发送二次审核提醒、缓存群组信息等"主群行为"）
 let GROUP_ID;
@@ -194,7 +195,6 @@ export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 		const path = url.pathname.slice(1); // 移除开头的斜杠
-		let TOKEN;
 
 		try {
 			const config = loadRequiredConfig(env);
@@ -245,6 +245,9 @@ export default {
 		} else if (request.method === 'GET' && path === `${TOKEN}/purge`) {
 			// 分批清扫：把仍在群里的黑名单用户全部踢出（受 TOKEN 保护）
 			return await handlePurge(env, url);
+		} else if (request.method === 'GET' && path === `${TOKEN}/jobrun`) {
+			// D1 批量任务自动续接入口：每次仍只跑安全分片，由 Worker 自己逐段续接。
+			return await handleBulkJobAutoRun(env, url, ctx, request.url);
 		} else if (request.method === 'POST') {
 			// 如果是 Telegram Webhook 请求
 			if (path === '') {
@@ -264,7 +267,7 @@ export default {
 
 				// 分发：普通消息 / 群成员状态变更 / 按钮回调
 				if (update.message) {
-					await handleMessage(update.message, env, ctx);
+					await handleMessage(update.message, env, ctx, request.url);
 				} else if (update.chat_member) {
 					await handleChatMemberUpdate(update.chat_member, env);
 				} else if (update.callback_query) {
@@ -530,6 +533,7 @@ const BULK_TASK_CONCURRENCY = 3;
 const BULK_TASK_RETRY_LIMIT = 0;
 const BULK_TASK_MAX_RUNTIME_MS = 18000;
 const BULK_TASK_FAILURE_LIMIT = 100;
+const BULK_TASK_LEASE_MS = 45000;
 
 // 解析批量 TGID 字符串：半角逗号 / 全角逗号 / 空格 / 换行 / 数组外壳 [] 都当分隔符；去空、去重、分类
 // 返回 { valid: ['123', '456'], invalid: ['abc'] }
@@ -1182,6 +1186,11 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 		},
 		failures: [],
 		cursor: 0,
+		autoContinue: true,
+		autoRunCount: 0,
+		doneNotified: false,
+		leaseOwner: null,
+		leaseUntil: null,
 		createdAt: now,
 		updatedAt: now,
 		startedAt: null,
@@ -1279,7 +1288,12 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 		`执行参数:单轮最多 ${getBulkJobSafeUserBatchSize(job)} 用户 / 操作预算 ${job.totals?.operationBatchLimit || BULK_TASK_OPERATION_BATCH_LIMIT} / 并发 ${job.concurrency || BULK_TASK_CONCURRENCY} / 重试 ${job.retryLimit ?? BULK_TASK_RETRY_LIMIT} 次`
 	];
 	if (job.status !== 'done') {
-		lines.push(`继续执行:<code>/jobrun ${escapeHtml(job.id)}</code>`);
+		if (job.autoContinue !== false) {
+			lines.push('自动续接:已开启');
+			lines.push(`手动补跑:<code>/jobrun ${escapeHtml(job.id)}</code>`);
+		} else {
+			lines.push(`继续执行:<code>/jobrun ${escapeHtml(job.id)}</code>`);
+		}
 	}
 	if (job.failures?.length) {
 		lines.push('', `<b>最近失败</b>（最多显示 ${Math.min(job.failures.length, 5)} 条）:`);
@@ -1359,15 +1373,65 @@ function getBulkJobSafeUserBatchSize(job) {
 	return Math.max(1, Math.min(configured, byOperations));
 }
 
+function isBulkJobLeaseActive(job) {
+	const until = Date.parse(job?.leaseUntil || '');
+	return Number.isFinite(until) && until > Date.now();
+}
+
+function clearBulkJobLease(job) {
+	job.leaseOwner = null;
+	job.leaseUntil = null;
+}
+
+function buildBulkJobAutoRunUrl(requestUrl, jobId) {
+	if (!requestUrl || !TOKEN) return null;
+	const url = new URL(requestUrl);
+	url.pathname = `/${TOKEN}/jobrun`;
+	url.search = '';
+	url.searchParams.set('id', jobId);
+	url.searchParams.set('auto', '1');
+	return url.toString();
+}
+
+function scheduleBulkJobAutoContinue(job, ctx, requestUrl) {
+	if (!job || job.status === 'done' || job.cursor >= job.ids.length || job.autoContinue === false) return false;
+	const nextUrl = buildBulkJobAutoRunUrl(requestUrl, job.id);
+	if (!nextUrl) return false;
+	const task = fetch(nextUrl, { method: 'GET' }).then(async (response) => {
+		if (!response.ok) {
+			let body = '';
+			try {
+				body = await response.text();
+			} catch (_) {}
+			console.error(`[批量任务] 自动续接失败 ${job.id}: HTTP ${response.status} ${body}`);
+		}
+	}).catch((error) => {
+		console.error(`[批量任务] 自动续接异常 ${job.id}:`, error);
+	});
+	if (ctx && typeof ctx.waitUntil === 'function') {
+		ctx.waitUntil(task);
+	} else {
+		return task;
+	}
+	return true;
+}
+
 async function runBulkModerationJob(env, jobId, options = {}) {
 	let job = await loadBulkJob(env, jobId);
 	if (!job) return null;
 	if (job.status === 'done') return job;
+	if (!options.ignoreLease && isBulkJobLeaseActive(job)) {
+		return job;
+	}
 	const started = Date.now();
 	const maxRounds = Math.max(1, Number(options.maxRounds) || 1);
 	let rounds = 0;
+	const leaseOwner = `${options.source || 'run'}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 	job.status = 'running';
 	job.startedAt = job.startedAt || new Date().toISOString();
+	job.leaseOwner = leaseOwner;
+	job.leaseUntil = new Date(Date.now() + BULK_TASK_LEASE_MS).toISOString();
+	job.autoRunCount = (Number(job.autoRunCount) || 0) + 1;
 	await saveBulkJob(env, job);
 
 	while (job.cursor < job.ids.length && rounds < maxRounds) {
@@ -1381,13 +1445,30 @@ async function runBulkModerationJob(env, jobId, options = {}) {
 			job.status = 'done';
 			job.finishedAt = new Date().toISOString();
 		}
+		if (job.status === 'done') {
+			clearBulkJobLease(job);
+		}
 		await saveBulkJob(env, job);
 		if (job.status === 'done') break;
 		if (Date.now() - started >= BULK_TASK_MAX_RUNTIME_MS) break;
 	}
 
-	if (job.status === 'done' && options.notifyOnDone !== false) {
+	if (job.status !== 'done') {
+		job.status = 'queued';
+		clearBulkJobLease(job);
+		await saveBulkJob(env, job);
+		if (options.autoContinue !== false) {
+			const scheduled = scheduleBulkJobAutoContinue(job, options.ctx, options.requestUrl);
+			if (scheduled && typeof scheduled.then === 'function') {
+				await scheduled;
+			}
+		}
+	}
+
+	if (job.status === 'done' && options.notifyOnDone !== false && !job.doneNotified) {
 		await notifyBulkJobTargets(job, formatBulkJobDetail(job, '✅ <b>批量任务完成</b>'));
+		job.doneNotified = true;
+		await saveBulkJob(env, job);
 	}
 	return job;
 }
@@ -1414,7 +1495,13 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 		isInGroup,
 		notifySecondaryOwners: true
 	});
-	const runner = runBulkModerationJob(env, job.id, { notifyOnDone: true }).catch((error) => {
+	const runner = runBulkModerationJob(env, job.id, {
+		notifyOnDone: true,
+		autoContinue: true,
+		ctx,
+		requestUrl: options.requestUrl,
+		source: 'command'
+	}).catch((error) => {
 		console.error(`[批量任务] 执行失败 ${job.id}:`, error);
 	});
 	if (ctx && typeof ctx.waitUntil === 'function') {
@@ -1423,6 +1510,35 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 		await runner;
 	}
 	return true;
+}
+
+async function handleBulkJobAutoRun(env, url, ctx, requestUrl) {
+	if (!env.DB) {
+		return jsonResponse({ success: false, error: '批量任务需要绑定 D1 存储空间' }, 400);
+	}
+	const jobId = String(url.searchParams.get('id') || '').trim();
+	if (!jobId) {
+		return jsonResponse({ success: false, error: 'missing id' }, 400);
+	}
+	const job = await runBulkModerationJob(env, jobId, {
+		notifyOnDone: true,
+		autoContinue: true,
+		ctx,
+		requestUrl,
+		source: 'auto'
+	});
+	if (!job) {
+		return jsonResponse({ success: false, error: 'job not found', id: jobId }, 404);
+	}
+	return jsonResponse({
+		success: true,
+		id: job.id,
+		status: job.status,
+		done: job.status === 'done',
+		cursor: job.cursor,
+		total: job.ids?.length || 0,
+		autoRunCount: job.autoRunCount || 0
+	});
 }
 
 // 黑名单导出接口（受 TOKEN 保护）
@@ -3640,7 +3756,7 @@ async function handleCallbackQuery(cb, env, ctx) {
 	}
 }
 
-async function handleMessage(message, env, ctx) {
+async function handleMessage(message, env, ctx, requestUrl = '') {
 	if (await handleNewChatMemberBots(message)) {
 		return;
 	}
@@ -3763,7 +3879,8 @@ async function handleMessage(message, env, ctx) {
 				valid,
 				invalid,
 				note,
-				isInGroup
+				isInGroup,
+				requestUrl
 			})) {
 				return;
 			}
@@ -3972,7 +4089,13 @@ async function handleMessage(message, env, ctx) {
 			return;
 		}
 		if (isRun && job.status !== 'done') {
-			const runner = runBulkModerationJob(env, job.id, { notifyOnDone: true }).catch((error) => {
+			const runner = runBulkModerationJob(env, job.id, {
+				notifyOnDone: true,
+				autoContinue: true,
+				ctx,
+				requestUrl,
+				source: 'manual'
+			}).catch((error) => {
 				console.error(`[批量任务] 续跑失败 ${job.id}:`, error);
 			});
 			if (ctx && typeof ctx.waitUntil === 'function') {
@@ -4579,7 +4702,8 @@ async function handleMessage(message, env, ctx) {
 			valid,
 			invalid,
 			note,
-			isInGroup
+			isInGroup,
+			requestUrl
 		})) {
 			return;
 		}

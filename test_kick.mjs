@@ -33,7 +33,7 @@ function stripExportDefault(source) {
 
 // 拦截 fetch:记录所有 Telegram API 调用
 const apiCalls = [];
-function makeFetchMock(routes) {
+function makeFetchMock(routes, options = {}) {
 	return async function (url, init) {
 		const u = String(url);
 		// 记录所有 telegram api
@@ -49,8 +49,17 @@ function makeFetchMock(routes) {
 			}
 			return { ok: true, status: 200, async json() { return { ok: true, result: true }; } };
 		}
+		if (options.internalHandler) {
+			return options.internalHandler(url, init);
+		}
 		throw new Error('Unexpected fetch: ' + u);
 	};
+}
+
+async function drainPending(pending) {
+	for (let i = 0; i < pending.length; i++) {
+		await pending[i];
+	}
 }
 
 const sandbox = {
@@ -1027,11 +1036,14 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 	resetCalls();
 	const pending = [];
 	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p).catch((e) => { throw e; })); } };
+	let env;
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
+	}, {
+		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
 	});
 
 	const ids = Array.from({ length: 20 }, (_, i) => String(9000 + i));
@@ -1043,37 +1055,40 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 			text: `/ban [${ids.join(',')}]`,
 		},
 	};
-	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
-	await Promise.all(pending);
+	await drainPending(pending);
 
 	assert('20 个 /ban 创建 1 个 D1 任务', env.DB._jobs.size === 1);
 	const jobRow = [...env.DB._jobs.values()][0];
 	const job = JSON.parse(jobRow.payload);
-	assert('批量 /ban 任务先按安全分片执行', job.status === 'running' && job.cursor === 12);
+	assert('批量 /ban 自动续接后完成', job.status === 'done' && job.cursor === 20);
+	assert('批量 /ban 自动续接分阶段执行', job.autoRunCount >= 2);
 	assert('批量 /ban 任务记录操作类型', job.action === 'ban' && job.reason === 'manual');
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
-	assert('批量 /ban 首轮只写入安全分片黑名单', blacklist.length === 12 && blacklist.every((e) => e.reason === 'manual'));
-	assert('批量 /ban 首轮踢人 24 次', callsOf('banChatMember').length === 24);
+	assert('批量 /ban 自动写入全部黑名单', blacklist.length === 20 && blacklist.every((e) => e.reason === 'manual'));
+	assert('批量 /ban 自动踢人全部完成', callsOf('banChatMember').length === 40);
 	assert('批量 /ban 指令消息被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 810));
 	const sendTexts = callsOf('sendMessage').map((c) => c.body.text).join('\n');
 	assert('批量 /ban 发送任务创建通知', sendTexts.includes('批量任务已创建'));
-	assert('批量 /ban 首轮未发送完成通知', !sendTexts.includes('批量任务完成'));
+	assert('批量 /ban 自动完成后发送完成通知', sendTexts.includes('批量任务完成'));
 
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 2 } }),
+	}, {
+		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
 	});
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({ message: { message_id: 811, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: `/jobrun ${job.id}` } })
 	}), env, fakeCtx);
-	await Promise.all(pending);
+	await drainPending(pending);
 	const doneJob = JSON.parse(env.DB._jobs.get(job.id).payload);
-	assert('/jobrun 安全续跑后完成任务', doneJob.status === 'done' && doneJob.cursor === 20);
-	assert('/jobrun 只补剩余 8 人 × 2 群', callsOf('banChatMember').length === 16);
+	assert('/jobrun 对已完成任务保持完成状态', doneJob.status === 'done' && doneJob.cursor === 20);
+	assert('/jobrun 已完成任务不重复踢人', callsOf('banChatMember').length === 0);
 	const jobDms = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
 	assert('/jobrun 可查询批量任务状态', jobDms.some((c) => c.body.text.includes(job.id) && c.body.text.includes('已完成')));
 }
@@ -1084,15 +1099,18 @@ console.log('\n[11b2] D1 批量任务失败原因中文化');
 	resetCalls();
 	const pending = [];
 	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p).catch((e) => { throw e; })); } };
+	let env;
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
 		banChatMember: () => ({ ok: false, error_code: 400, description: 'Bad Request: not enough rights to restrict/unrestrict chat member' }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
+	}, {
+		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
 	});
 
 	const ids = Array.from({ length: 20 }, (_, i) => String(9200 + i));
-	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({
@@ -1104,9 +1122,10 @@ console.log('\n[11b2] D1 批量任务失败原因中文化');
 			}
 		})
 	}), env, fakeCtx);
-	await Promise.all(pending);
+	await drainPending(pending);
 
 	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
+	assert('批量任务失败场景也自动跑完', job.status === 'done' && job.cursor === 20);
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
@@ -1129,11 +1148,14 @@ console.log('\n[11c] 群内 /spam 20 个 TGID → D1 批量任务');
 	resetCalls();
 	const pending = [];
 	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p).catch((e) => { throw e; })); } };
+	let env;
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
+	}, {
+		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
 	});
 
 	const ids = Array.from({ length: 20 }, (_, i) => String(9300 + i));
@@ -1145,16 +1167,17 @@ console.log('\n[11c] 群内 /spam 20 个 TGID → D1 批量任务');
 			text: `/spam [${ids.join('，')}]`,
 		},
 	};
-	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	env = { ...baseEnv, DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
-	await Promise.all(pending);
+	await drainPending(pending);
 
 	assert('20 个 /spam 创建 1 个 D1 任务', env.DB._jobs.size === 1);
 	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
-	assert('批量 /spam 任务先按安全分片执行', job.status === 'running' && job.cursor === 12 && job.action === 'spam');
+	assert('批量 /spam 自动续接后完成', job.status === 'done' && job.cursor === 20 && job.action === 'spam');
+	assert('批量 /spam 自动续接分阶段执行', job.autoRunCount >= 2);
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
-	assert('批量 /spam 首轮只写入安全分片 spam reason', blacklist.length === 12 && blacklist.every((e) => e.reason === 'spam'));
-	assert('批量 /spam 首轮踢人 24 次', callsOf('banChatMember').length === 24);
+	assert('批量 /spam 自动写入全部 spam reason', blacklist.length === 20 && blacklist.every((e) => e.reason === 'spam'));
+	assert('批量 /spam 自动踢人全部完成', callsOf('banChatMember').length === 40);
 }
 
 // ---------- [11d] /ban 7 个 TGID × 12 群 → 按操作量转 D1 任务 ----------
@@ -1163,16 +1186,19 @@ console.log('\n[11d] /ban 7 个 TGID × 12 群 → 按操作量转 D1 任务');
 	resetCalls();
 	const pending = [];
 	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p).catch((e) => { throw e; })); } };
+	let env;
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
+	}, {
+		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
 	});
 
 	const groupIds = Array.from({ length: 12 }, (_, i) => String(-1000000000000 - i));
 	const ids = Array.from({ length: 7 }, (_, i) => String(9700 + i));
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: groupIds.join(','), OWNER_IDS: '999', DB: makeFakeDB([]) };
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: groupIds.join(','), OWNER_IDS: '999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({
@@ -1184,15 +1210,16 @@ console.log('\n[11d] /ban 7 个 TGID × 12 群 → 按操作量转 D1 任务');
 			}
 		})
 	}), env, fakeCtx);
-	await Promise.all(pending);
+	await drainPending(pending);
 
 	assert('7 个 TGID × 12 群创建 D1 任务', env.DB._jobs.size === 1);
 	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
 	assert('7 个 TGID × 12 群总操作数记录为 84', job.totals.operations === 84 && job.totals.groups === 12);
-	assert('7×12 首轮只处理 2 个用户', job.status === 'running' && job.cursor === 2);
-	assert('7×12 首轮只踢 24 次', callsOf('banChatMember').length === 24);
+	assert('7×12 自动续接后完成', job.status === 'done' && job.cursor === 7);
+	assert('7×12 自动续接分阶段执行', job.autoRunCount >= 4);
+	assert('7×12 自动踢人全部完成', callsOf('banChatMember').length === 84);
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
-	assert('7×12 首轮只写入 2 个黑名单', blacklist.length === 2 && blacklist.every((e) => e.reason === 'manual'));
+	assert('7×12 自动写入全部黑名单', blacklist.length === 7 && blacklist.every((e) => e.reason === 'manual'));
 }
 
 // ---------- [12] 群内 /unban 单条 ----------
