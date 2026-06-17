@@ -2483,12 +2483,14 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	let dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('主人 /help → 展开隐藏指令', !!dm && dm.body.text.includes('OWNER_IDS 专属'));
 	assert('主人 /help → 含 /learnlast 说明', !!dm && dm.body.text.includes('learnlast'));
+	assert('主人 /help → 含 /admins 权限名单说明', !!dm && dm.body.text.includes('/admins') && dm.body.text.includes('权限名单'));
 	// 群管理员(非主人)私聊 /help → 权限不足,不泄漏指令
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/help' } }) }), env, fakeCtxAd);
 	dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
 	assert('非主人 /help → 权限不足', !!dm && dm.body.text.includes('权限不足'));
 	assert('非主人 /help → 不泄漏隐藏指令', !!dm && !dm.body.text.includes('learnlast'));
+	assert('非主人 /help → 不泄漏 /admins', !!dm && !dm.body.text.includes('/admins'));
 }
 
 // ---------- [67b] /admins 仅主人查看权限名单 ----------
