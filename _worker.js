@@ -3271,6 +3271,38 @@ function getContactText(message) {
 	return parts.join(' ');
 }
 
+function getQuoteText(message) {
+	const parts = [
+		message.quote?.text,
+		message.reply_to_message?.text,
+		message.reply_to_message?.caption,
+		message.external_reply?.text,
+		message.external_reply?.caption,
+		message.external_reply?.quote?.text,
+	].filter(Boolean);
+	return [...new Set(parts.map((s) => String(s).trim()).filter(Boolean))].join(' ');
+}
+
+function isShortQuoteWrapperText(text) {
+	const raw = String(text || '').trim();
+	if (!raw) return true;
+	const normalized = normalizeForFingerprint(raw);
+	if (!normalized) return true;
+	if (normalized.length <= 5) return true;
+	return /^[a-z0-9]{1,8}$/i.test(raw);
+}
+
+function scoreAdWords(text) {
+	let score = 0;
+	const hits = [];
+	for (const w of AD_KEYWORDS_FINANCE) if (w && text.includes(w)) { score += 2; hits.push(`金融:${w}`); }
+	for (const w of AD_KEYWORDS_PORN) if (w && text.includes(w)) { score += 2; hits.push(`色情:${w}`); }
+	for (const w of AD_KEYWORDS_SPAM) if (w && text.includes(w)) { score += 1; hits.push(`引流:${w}`); }
+	for (const w of AD_KEYWORDS_FRAUD) if (w && text.includes(w)) { score += 2; hits.push(`诈骗:${w}`); }
+	for (const w of AD_KEYWORDS) if (w && text.includes(w)) { score += 2; hits.push(`自定义:${w}`); }
+	return { score, hits };
+}
+
 // 检测"发言人身份"(名字/用户名/简介)里的广告特征。
 // 【重要】只匹配明确的广告词(色情/卖号/卡网/赌博话术),不碰链接/@提及/域名 ——
 //   因为正常用户简介里放双向机器人 @xxxBot、github 链接、个人频道 t.me/xxx、主页域名
@@ -3296,6 +3328,7 @@ async function detectAd(message, env) {
 	if (!AD_FILTER_ENABLED) return { isAd: false, score: 0, hits: [], strong: null };
 
 	const contactText = getContactText(message); // 名片广告内容(名字/电话/vcard)
+	const quoteText = getQuoteText(message);
 	const textParts = [
 		message.text,
 		message.caption,
@@ -3344,6 +3377,42 @@ async function detectAd(message, env) {
 		}
 	}
 
+	// 强特征 2:短正文包装引用广告。广告号会把正文写成 t/s/l/1,把广告放在引用框里规避正文检测。
+	// 命中后删除当前这条"短正文+引用广告"消息,封当前发送者,不处理被引用消息发送者。
+	if (quoteText && isShortQuoteWrapperText(message.text || message.caption || '')) {
+		let quoteForScan = quoteText.toLowerCase();
+		for (const w of AD_WHITELIST) {
+			if (w) quoteForScan = quoteForScan.split(w).join('');
+		}
+		const quoteNorm = normalizeForFingerprint(quoteText);
+		if (quoteNorm.length >= SAMPLE_FP_EXACT_MIN && AD_SAMPLE_FINGERPRINTS.length > 0) {
+			for (const fp of AD_SAMPLE_FINGERPRINTS) {
+				if (!fp || fp.length < SAMPLE_FP_EXACT_MIN) continue;
+				if (quoteNorm === fp) {
+					return {
+						isAd: true,
+						score: 99,
+						hits: ['引用内容学习样本精确匹配'],
+						strong: '引用内容广告',
+						source: '引用内容',
+						quotePreview: quoteText.slice(0, 100)
+					};
+				}
+			}
+		}
+		const quotedWordScore = scoreAdWords(quoteForScan);
+		if (quotedWordScore.score >= AD_SCORE_THRESHOLD || quotedWordScore.hits.length >= 2) {
+			return {
+				isAd: true,
+				score: Math.max(quotedWordScore.score, AD_SCORE_THRESHOLD),
+				hits: quotedWordScore.hits.map((h) => `引用内容${h}`),
+				strong: '引用内容命中广告词',
+				source: '引用内容',
+				quotePreview: quoteText.slice(0, 100)
+			};
+		}
+	}
+
 	// 强特征 4:名片显示名命中词库 → 直接判广告秒杀(实现"名字带广告就杀")
 	//   原理:正常用户的名片显示名(张三/小明/John)几乎不可能含"假钞/承兑/约炮"这类词,
 	//   所以名片名字一旦命中任意分类词,直接判定,不必凑分。误杀面极低。
@@ -3368,12 +3437,9 @@ async function detectAd(message, env) {
 	}
 
 	// 加权评分
-	let score = 0;
-	for (const w of AD_KEYWORDS_FINANCE) if (w && scoringText.includes(w)) { score += 2; hits.push(`金融:${w}`); }
-	for (const w of AD_KEYWORDS_PORN) if (w && scoringText.includes(w)) { score += 2; hits.push(`色情:${w}`); }
-	for (const w of AD_KEYWORDS_SPAM) if (w && scoringText.includes(w)) { score += 1; hits.push(`引流:${w}`); }
-	for (const w of AD_KEYWORDS_FRAUD) if (w && scoringText.includes(w)) { score += 2; hits.push(`诈骗:${w}`); }
-	for (const w of AD_KEYWORDS) if (w && scoringText.includes(w)) { score += 2; hits.push(`自定义:${w}`); }
+	const wordScore = scoreAdWords(scoringText);
+	let score = wordScore.score;
+	hits.push(...wordScore.hits);
 
 	// 可疑短链(bit.ly 等)单独加分:常被广告用来藏落地页
 	if (urlsSuspicious) { score += 2; hits.push('可疑短链'); }
@@ -3394,6 +3460,9 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 	const fromUser = message.from;
 	const operator = formatUserMention(fromUser) || `<code>${escapeHtml(String(fromUser?.id || '未知'))}</code>`;
 	const preview = escapeHtml((message.text || message.caption || (message.contact ? '[名片] ' + getContactText(message) : '') || '(无文本)').slice(0, 100));
+	const quotePreview = adResult.source === '引用内容' && adResult.quotePreview
+		? escapeHtml(adResult.quotePreview)
+		: '';
 	const reason = adResult.strong
 		? `强特征命中:${adResult.strong}`
 		: `评分 ${adResult.score}（${adResult.hits.slice(0, 6).join('、')}）`;
@@ -3412,6 +3481,7 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 		`📍 触发群:${groupLabel}`,
 		`🔍 判定依据:${escapeHtml(reason)}`,
 		`📝 内容预览:${preview}`,
+		...(quotePreview ? [`💬 引用内容:${quotePreview}`] : []),
 		'',
 		await renderBanResultsDetail(banResults),
 	];

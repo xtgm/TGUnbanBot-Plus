@@ -2997,8 +2997,56 @@ console.log('\n[80] 发言人身份引流检测');
 	assert('正常名字+正文 → 不删消息', callsOf('deleteMessage').length === 0);
 }
 
-// ---------- [81] identity词库导入 ----------
-console.log('\n[81] identity词库导入');
+// ---------- [81] 短正文引用广告自动拦截 ----------
+console.log('\n[81] 短正文引用广告自动拦截');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	let db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify({ general: ['揾逼赚钱'], porn: ['大婆啦'] }));
+	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({
+		message: {
+			message_id: 900,
+			chat: { id: -1001, type: 'supergroup', title: '广告测试群' },
+			from: { id: 91001, is_bot: false, first_name: '广告号' },
+			text: 't',
+			quote: { text: '📢 大婆啦\n我的妈 揾逼赚钱' },
+		}
+	}) }), env, fakeCtxAd);
+	let bl = JSON.parse(db._store.get('blacklist') || '[]');
+	assert('短正文引用广告 → 加黑当前发送者', bl.some((e) => e.id === '91001' && e.reason === 'ad_auto'));
+	assert('短正文引用广告 → 删除当前消息', callsOf('deleteMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 900));
+	assert('短正文引用广告 → 全群踢当前发送者', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '91001'));
+	const ownerDm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
+	assert('短正文引用广告 → 通知包含引用内容', ownerDm.some((c) => c.body.text.includes('引用内容') && c.body.text.includes('揾逼赚钱')));
+
+	resetCalls();
+	db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify({ general: ['揾逼赚钱'], porn: ['大婆啦'] }));
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({
+		message: {
+			message_id: 901,
+			chat: { id: -1001, type: 'supergroup', title: '广告测试群' },
+			from: { id: 91002, is_bot: false, first_name: '正常用户' },
+			text: '这个引用内容是广告吗，大家帮忙看一下',
+			quote: { text: '📢 大婆啦\n我的妈 揾逼赚钱' },
+		}
+	}) }), env, fakeCtxAd);
+	bl = JSON.parse(db._store.get('blacklist') || '[]');
+	assert('长正文讨论引用广告 → 不误杀当前发送者', !bl.some((e) => e.id === '91002'));
+	assert('长正文讨论引用广告 → 不删当前消息', callsOf('deleteMessage').length === 0);
+}
+
+// ---------- [82] identity词库导入 ----------
+console.log('\n[82] identity词库导入');
 {
 	// ② identity 词库 importdefault 导入
 	resetCalls();
