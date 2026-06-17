@@ -1222,6 +1222,51 @@ console.log('\n[11d] /ban 7 个 TGID × 12 群 → 按操作量转 D1 任务');
 	assert('7×12 自动写入全部黑名单', blacklist.length === 7 && blacklist.every((e) => e.reason === 'manual'));
 }
 
+// ---------- [11e] 私聊 /ban 10 个 TGID × 11 群 → 自动执行 ----------
+console.log('\n[11e] 私聊 /ban 10 个 TGID × 11 群 → 自动执行');
+{
+	resetCalls();
+	const pending = [];
+	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p).catch((e) => { throw e; })); } };
+	let env;
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: (body) => {
+			const isLastGroup = String(body.chat_id) === '-1000000000010';
+			return { ok: true, result: isLastGroup ? [{ user: { id: 999 }, status: 'creator' }] : [] };
+		},
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	}, {
+		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
+	});
+
+	const groupIds = Array.from({ length: 11 }, (_, i) => String(-1000000000000 - i));
+	const ids = ['7930069580', '8742844397', '8618390622', '8940881073', '8706367417', '8526485529', '8968301847', '8983701946', '8977565377', '8260524718'];
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: groupIds.join(','), OWNER_IDS: '999', DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({
+			message: {
+				message_id: 816,
+				chat: { id: 999, type: 'private' },
+				from: { id: 999, is_bot: false, first_name: '主人' },
+				text: `/ban ${ids.join(',')}`,
+			}
+		})
+	}), env, fakeCtx);
+	await drainPending(pending);
+
+	assert('私聊 10×11 创建 1 个 D1 任务', env.DB._jobs.size === 1);
+	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
+	assert('私聊 10×11 自动续接后完成', job.status === 'done' && job.cursor === 10);
+	assert('私聊 10×11 自动续接分阶段执行', job.autoRunCount >= 5);
+	assert('私聊 10×11 自动踢人全部完成', callsOf('banChatMember').length === 110);
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
+	assert('私聊 10×11 自动写入全部黑名单', blacklist.length === 10 && blacklist.every((e) => e.reason === 'manual'));
+	const sendTexts = callsOf('sendMessage').map((c) => c.body.text).join('\n');
+	assert('私聊 10×11 自动完成后发送完成通知', sendTexts.includes('批量任务完成') && sendTexts.includes('已完成'));
+}
+
 // ---------- [12] 群内 /unban 单条 ----------
 console.log('\n[12] 群内 /unban 单条');
 {

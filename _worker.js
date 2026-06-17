@@ -1393,7 +1393,29 @@ function buildBulkJobAutoRunUrl(requestUrl, jobId) {
 	return url.toString();
 }
 
-function scheduleBulkJobAutoContinue(job, ctx, requestUrl) {
+function getErrorMessage(error) {
+	if (!error) return '未知错误';
+	if (typeof error === 'string') return error;
+	return error.message || String(error);
+}
+
+async function markBulkJobFailed(env, jobId, error) {
+	const job = typeof jobId === 'object' ? jobId : await loadBulkJob(env, jobId);
+	if (!job || job.status === 'done') return job;
+	const message = getErrorMessage(error).slice(0, 500);
+	job.status = 'failed';
+	clearBulkJobLease(job);
+	pushBulkJobFailure(job, { phase: 'auto', error: message });
+	const shouldNotify = !job.failedNotified;
+	job.failedNotified = true;
+	await saveBulkJob(env, job);
+	if (shouldNotify) {
+		await notifyBulkJobTargets(job, formatBulkJobDetail(job, '❌ <b>批量任务执行失败</b>'));
+	}
+	return job;
+}
+
+function scheduleBulkJobAutoContinue(job, ctx, requestUrl, env = null) {
 	if (!job || job.status === 'done' || job.cursor >= job.ids.length || job.autoContinue === false) return false;
 	const nextUrl = buildBulkJobAutoRunUrl(requestUrl, job.id);
 	if (!nextUrl) return false;
@@ -1404,9 +1426,15 @@ function scheduleBulkJobAutoContinue(job, ctx, requestUrl) {
 				body = await response.text();
 			} catch (_) {}
 			console.error(`[批量任务] 自动续接失败 ${job.id}: HTTP ${response.status} ${body}`);
+			if (env) {
+				await markBulkJobFailed(env, job.id, `自动续接 HTTP ${response.status}: ${body || response.statusText || '无响应内容'}`);
+			}
 		}
-	}).catch((error) => {
+	}).catch(async (error) => {
 		console.error(`[批量任务] 自动续接异常 ${job.id}:`, error);
+		if (env) {
+			await markBulkJobFailed(env, job.id, error);
+		}
 	});
 	if (ctx && typeof ctx.waitUntil === 'function') {
 		ctx.waitUntil(task);
@@ -1427,50 +1455,55 @@ async function runBulkModerationJob(env, jobId, options = {}) {
 	const maxRounds = Math.max(1, Number(options.maxRounds) || 1);
 	let rounds = 0;
 	const leaseOwner = `${options.source || 'run'}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-	job.status = 'running';
-	job.startedAt = job.startedAt || new Date().toISOString();
-	job.leaseOwner = leaseOwner;
-	job.leaseUntil = new Date(Date.now() + BULK_TASK_LEASE_MS).toISOString();
-	job.autoRunCount = (Number(job.autoRunCount) || 0) + 1;
-	await saveBulkJob(env, job);
+	try {
+		job.status = 'running';
+		job.startedAt = job.startedAt || new Date().toISOString();
+		job.leaseOwner = leaseOwner;
+		job.leaseUntil = new Date(Date.now() + BULK_TASK_LEASE_MS).toISOString();
+		job.autoRunCount = (Number(job.autoRunCount) || 0) + 1;
+		await saveBulkJob(env, job);
 
-	while (job.cursor < job.ids.length && rounds < maxRounds) {
-		const safeBatchSize = getBulkJobSafeUserBatchSize(job);
-		const batch = job.ids.slice(job.cursor, job.cursor + safeBatchSize);
-		await processBulkJobUserBatch(job, env, batch);
-		job.cursor += batch.length;
-		job.stats.usersProcessed = job.cursor;
-		rounds += 1;
-		if (job.cursor >= job.ids.length) {
-			job.status = 'done';
-			job.finishedAt = new Date().toISOString();
+		while (job.cursor < job.ids.length && rounds < maxRounds) {
+			const safeBatchSize = getBulkJobSafeUserBatchSize(job);
+			const batch = job.ids.slice(job.cursor, job.cursor + safeBatchSize);
+			await processBulkJobUserBatch(job, env, batch);
+			job.cursor += batch.length;
+			job.stats.usersProcessed = job.cursor;
+			rounds += 1;
+			if (job.cursor >= job.ids.length) {
+				job.status = 'done';
+				job.finishedAt = new Date().toISOString();
+			}
+			if (job.status === 'done') {
+				clearBulkJobLease(job);
+			}
+			await saveBulkJob(env, job);
+			if (job.status === 'done') break;
+			if (Date.now() - started >= BULK_TASK_MAX_RUNTIME_MS) break;
 		}
-		if (job.status === 'done') {
+
+		if (job.status !== 'done') {
+			job.status = 'queued';
 			clearBulkJobLease(job);
-		}
-		await saveBulkJob(env, job);
-		if (job.status === 'done') break;
-		if (Date.now() - started >= BULK_TASK_MAX_RUNTIME_MS) break;
-	}
-
-	if (job.status !== 'done') {
-		job.status = 'queued';
-		clearBulkJobLease(job);
-		await saveBulkJob(env, job);
-		if (options.autoContinue !== false) {
-			const scheduled = scheduleBulkJobAutoContinue(job, options.ctx, options.requestUrl);
-			if (scheduled && typeof scheduled.then === 'function') {
-				await scheduled;
+			await saveBulkJob(env, job);
+			if (options.autoContinue !== false) {
+				const scheduled = scheduleBulkJobAutoContinue(job, options.ctx, options.requestUrl, env);
+				if (scheduled && typeof scheduled.then === 'function') {
+					await scheduled;
+				}
 			}
 		}
-	}
 
-	if (job.status === 'done' && options.notifyOnDone !== false && !job.doneNotified) {
-		await notifyBulkJobTargets(job, formatBulkJobDetail(job, '✅ <b>批量任务完成</b>'));
-		job.doneNotified = true;
-		await saveBulkJob(env, job);
+		if (job.status === 'done' && options.notifyOnDone !== false && !job.doneNotified) {
+			await notifyBulkJobTargets(job, formatBulkJobDetail(job, '✅ <b>批量任务完成</b>'));
+			job.doneNotified = true;
+			await saveBulkJob(env, job);
+		}
+		return job;
+	} catch (error) {
+		console.error(`[批量任务] 执行异常 ${job.id}:`, error);
+		return await markBulkJobFailed(env, job, error);
 	}
-	return job;
 }
 
 async function startBulkModerationJobFromCommand(message, env, ctx, options) {
@@ -1495,19 +1528,22 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 		isInGroup,
 		notifySecondaryOwners: true
 	});
-	const runner = runBulkModerationJob(env, job.id, {
-		notifyOnDone: true,
-		autoContinue: true,
-		ctx,
-		requestUrl: options.requestUrl,
-		source: 'command'
-	}).catch((error) => {
-		console.error(`[批量任务] 执行失败 ${job.id}:`, error);
-	});
-	if (ctx && typeof ctx.waitUntil === 'function') {
-		ctx.waitUntil(runner);
-	} else {
-		await runner;
+	const scheduled = scheduleBulkJobAutoContinue(job, ctx, options.requestUrl, env);
+	if (!scheduled) {
+		const runner = runBulkModerationJob(env, job.id, {
+			notifyOnDone: true,
+			autoContinue: true,
+			ctx,
+			requestUrl: options.requestUrl,
+			source: 'command'
+		});
+		if (ctx && typeof ctx.waitUntil === 'function') {
+			ctx.waitUntil(runner);
+		} else {
+			await runner;
+		}
+	} else if (scheduled && typeof scheduled.then === 'function') {
+		await scheduled;
 	}
 	return true;
 }
