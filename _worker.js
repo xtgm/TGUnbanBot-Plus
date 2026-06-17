@@ -2208,8 +2208,18 @@ function isSuperAdmin(userId) {
 	return SUPER_ADMINS.some((id) => id === idStr);
 }
 
+function sanitizeTelegramText(value) {
+	return String(value ?? '').replace(/[\uD800-\uDFFF]/g, '');
+}
+
+function truncateTelegramText(value, maxLength) {
+	const clean = sanitizeTelegramText(value);
+	if (!Number.isFinite(maxLength) || maxLength <= 0) return '';
+	return Array.from(clean).slice(0, maxLength).join('');
+}
+
 function escapeHtml(value) {
-	return String(value ?? '')
+	return sanitizeTelegramText(value)
 		.replace(/&/g, '&amp;')
 		.replace(/</g, '&lt;')
 		.replace(/>/g, '&gt;')
@@ -4378,7 +4388,7 @@ async function handleMessage(message, env, ctx) {
 			list.forEach((it, i) => {
 				const who = `${escapeHtml(it.fromName || '')}(<code>${escapeHtml(it.fromId || '?')}</code>)`;
 				const grp = isInGroup ? '' : ` [${escapeHtml(it.chatTitle || it.chatId || '?')}]`;
-				lines.push(`${i + 1}. <code>${escapeHtml((it.text || '').slice(0, 50))}</code>`);
+				lines.push(`${i + 1}. <code>${escapeHtml(truncateTelegramText(it.text || '', 50))}</code>`);
 				lines.push(`   — ${who}${grp}`);
 			});
 			lines.push('', '✅ <b>请私聊我</b>核对后学习(群内不能学习):');
@@ -4760,7 +4770,7 @@ async function sendTelegramMessage(chatId, text, replyMarkup) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
 	const body = {
 		chat_id: chatId,
-		text: text,
+		text: sanitizeTelegramText(text),
 		parse_mode: 'HTML',
 		disable_web_page_preview: true
 	};

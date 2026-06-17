@@ -2380,6 +2380,27 @@ console.log('\n[65] /recent 冻结快照');
 	assert('/recent → 列表推到主人私聊', !!dm && dm.body.text.includes('快照'));
 }
 
+// ---------- [65b] /recent 清洗损坏 Unicode 字符 ----------
+console.log('\n[65b] /recent 清洗损坏 Unicode 字符');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '主群', type: 'supergroup' } }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const db = makeFakeDB([]);
+	db._store.set('recent_messages', JSON.stringify({ items: [
+		{ mid: 3, chatId: '-1001', text: `广告异常字符${String.fromCharCode(0xD800)}测试`, fromId: '203', fromName: `C${String.fromCharCode(0xDC00)}`, at: '2026-05-29T00:00:03Z' },
+	] }));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	const update = { message: { message_id: 10, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/recent' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
+	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('/recent → 损坏 Unicode 仍发送私聊', !!dm && dm.body.text.includes('广告异常字符测试'));
+	assert('/recent → 私聊文本不含代理字符', !/[\uD800-\uDFFF]/.test(dm.body.text));
+}
+
 // ---------- [66] /learnlast 群内被拒(强制私聊) ----------
 console.log('\n[66] /learnlast 群内被拒');
 {
