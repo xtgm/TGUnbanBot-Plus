@@ -2384,6 +2384,63 @@ async function renderPermissionAdminsList() {
 	return lines.join('\n');
 }
 
+async function fetchConfiguredGroupInfo(groupId) {
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: groupId }),
+		});
+		const result = await response.json();
+		if (!response.ok || !result.ok || !result.result) {
+			return { ok: false, error: result?.description || `HTTP ${response.status}` };
+		}
+		return { ok: true, chat: result.result };
+	} catch (error) {
+		return { ok: false, error: error?.message || '查询失败' };
+	}
+}
+
+function renderConfiguredGroupLine(groupId, result, index) {
+	const idText = `<code>${escapeHtml(groupId)}</code>`;
+	if (!result?.ok) {
+		const { 中文, 建议 } = translateTelegramError(result?.error || '查询失败');
+		return [
+			`${index}. ChatID:${idText}`,
+			`   状态:获取失败 - ${escapeHtml(中文)}`,
+			`   建议:${escapeHtml(建议)}`
+		];
+	}
+	const chat = result.chat || {};
+	const title = chat.title || chat.first_name || chat.username || '未设置';
+	const username = chat.username ? `@${escapeHtml(chat.username)}` : '未设置';
+	return [
+		`${index}. 群名:${escapeHtml(title)}`,
+		`   ChatID:${idText}`,
+		`   类型:${escapeHtml(chat.type || '未知')}`,
+		`   用户名:${username}`
+	];
+}
+
+async function renderConfiguredGroupsList() {
+	const groupIds = [...new Set((GROUP_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
+	const lines = [
+		'📋 <b>配置群组列表</b>',
+		`配置群数:${groupIds.length}`,
+		''
+	];
+	if (!groupIds.length) {
+		lines.push('未配置 GROUP_ID。');
+		return lines.join('\n');
+	}
+	const results = await Promise.all(groupIds.map((groupId) => fetchConfiguredGroupInfo(groupId)));
+	groupIds.forEach((groupId, idx) => {
+		if (idx > 0) lines.push('');
+		lines.push(...renderConfiguredGroupLine(groupId, results[idx], idx + 1));
+	});
+	return lines.join('\n');
+}
+
 async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	const banlistResult = await handleBanlist(tgidToCheck);
 	const banlistData = JSON.parse(banlistResult);
@@ -4086,9 +4143,10 @@ async function handleMessage(message, env, ctx) {
 			'',
 			'<b>━━ 权限名单查询(仅主人私聊)━━</b>',
 			'<code>/admins</code> 查看当前主人/副主人/超级管理员名单,显示 TGID、昵称、用户名、群内身份',
+			'<code>/groups</code> 查看当前 GROUP_ID 配置群组,显示群名、ChatID、类型、用户名',
 			'',
 			'<b>━━ 说明 ━━</b>',
-			'• 以上指令对普通用户/群管理员/超级管理员<b>完全无反应</b>；<code>/admins</code> 只允许主人私聊使用',
+			'• 以上指令对普通用户/群管理员/超级管理员<b>完全无反应</b>；<code>/admins</code>/<code>/groups</code> 只允许主人私聊使用',
 			'• 学习一律<b>只入库不踢人</b>;要踢发广告的人,用回执里给的 TGID 发 <code>/ban TGID</code>',
 			'• 学习只写整句指纹,<b>不再自动往词库加词</b>(避免误杀正常消息);建议词需你手动 /addword',
 			'• <b>链接识别</b>:github/google 等正常域名链接永不被杀;含链接的样本只精确匹配不扩散;可疑短链(bit.ly等)才加分',
@@ -4111,6 +4169,24 @@ async function handleMessage(message, env, ctx) {
 			return;
 		}
 		const listText = await renderPermissionAdminsList();
+		await sendTelegramMessage(chatId, listText);
+		return;
+	}
+
+	// ===== /groups 主人专属配置群组查询 =====
+	// 仅 OWNER_IDS[0] 主人私聊可用;群内完全静默,避免暴露群组配置。
+	if (text && /^\/groups(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		if (!isPrimaryOwner(userId)) {
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人使用。');
+			}
+			return;
+		}
+		if (isInGroup) {
+			return;
+		}
+		const listText = await renderConfiguredGroupsList();
 		await sendTelegramMessage(chatId, listText);
 		return;
 	}

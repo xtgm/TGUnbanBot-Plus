@@ -2484,6 +2484,7 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('主人 /help → 展开隐藏指令', !!dm && dm.body.text.includes('OWNER_IDS 专属'));
 	assert('主人 /help → 含 /learnlast 说明', !!dm && dm.body.text.includes('learnlast'));
 	assert('主人 /help → 含 /admins 权限名单说明', !!dm && dm.body.text.includes('/admins') && dm.body.text.includes('权限名单'));
+	assert('主人 /help → 含 /groups 群组查询说明', !!dm && dm.body.text.includes('/groups') && dm.body.text.includes('GROUP_ID'));
 	// 群管理员(非主人)私聊 /help → 权限不足,不泄漏指令
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/help' } }) }), env, fakeCtxAd);
@@ -2491,6 +2492,7 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('非主人 /help → 权限不足', !!dm && dm.body.text.includes('权限不足'));
 	assert('非主人 /help → 不泄漏隐藏指令', !!dm && !dm.body.text.includes('learnlast'));
 	assert('非主人 /help → 不泄漏 /admins', !!dm && !dm.body.text.includes('/admins'));
+	assert('非主人 /help → 不泄漏 /groups', !!dm && !dm.body.text.includes('/groups'));
 }
 
 // ---------- [67b] /admins 仅主人查看权限名单 ----------
@@ -2545,6 +2547,44 @@ console.log('\n[67b] /admins 主人专属权限名单');
 		body: JSON.stringify({ message: { message_id: 3, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/admins' } })
 	}), env, fakeCtxAd);
 	assert('/admins 群内静默不公开名单', callsOf('sendMessage').length === 0);
+}
+
+// ---------- [67c] /groups 仅主人查看配置群组 ----------
+console.log('\n[67c] /groups 主人专属配置群组');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChat: (b) => {
+			if (String(b.chat_id) === '-1001') return { ok: true, result: { id: -1001, title: '主群', username: 'main_group', type: 'supergroup' } };
+			if (String(b.chat_id) === '-1002') return { ok: true, result: { id: -1002, title: '副群', type: 'supergroup' } };
+			return { ok: false, description: 'Bad Request: chat not found' };
+		},
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,888', SUPER_ADMINS: '7777', DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/groups' } })
+	}), env, fakeCtxAd);
+	let dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('/groups 主人可查看配置群组', !!dm && dm.body.text.includes('配置群组列表'));
+	assert('/groups 显示群名和 ChatID', dm.body.text.includes('主群') && dm.body.text.includes('副群') && dm.body.text.includes('ChatID:<code>-1001</code>') && dm.body.text.includes('ChatID:<code>-1002</code>'));
+	assert('/groups 显示类型和用户名', dm.body.text.includes('类型:supergroup') && dm.body.text.includes('@main_group') && dm.body.text.includes('用户名:未设置'));
+
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 2, chat: { id: 888, type: 'private' }, from: { id: 888, is_bot: false }, text: '/groups' } })
+	}), env, fakeCtxAd);
+	dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '888');
+	assert('/groups 副主人无权查看', !!dm && dm.body.text.includes('权限不足') && !dm.body.text.includes('主群'));
+
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 3, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/groups' } })
+	}), env, fakeCtxAd);
+	assert('/groups 群内静默不公开群组配置', callsOf('sendMessage').length === 0);
 }
 
 // ---------- [68] 正常域名链接(github)不被杀,即便学过同域名样本 ----------
