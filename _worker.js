@@ -155,6 +155,7 @@ let SELF_UNBAN_APPROVED;
 let BLACKLIST_PAGE_LIMIT;
 let BLACKLIST_REASON_LABELS;
 let GKY_BANLIST_ENDPOINT;
+let SELF_WORKER_URL = '';
 
 // Telegram Bot Token
 let TOKEN;
@@ -220,6 +221,7 @@ export default {
 			BLACKLIST_PAGE_LIMIT = config.BLACKLIST_PAGE_LIMIT;
 			BLACKLIST_REASON_LABELS = config.BLACKLIST_REASON_LABELS;
 			GKY_BANLIST_ENDPOINT = config.GKY_BANLIST_ENDPOINT;
+			SELF_WORKER_URL = config.SELF_WORKER_URL;
 		} catch (error) {
 			return jsonResponse({
 				success: false,
@@ -379,6 +381,7 @@ function loadRequiredConfig(env) {
 	}
 
 	const gkyEndpoint = pickStr(env.GKY_BANLIST_ENDPOINT, DEFAULT_GKY_BANLIST_ENDPOINT);
+	const selfWorkerUrl = String(env.SELF_WORKER_URL || env.WORKER_SELF_URL || '').trim();
 
 	// ===== 广告检测配置 =====
 	const parseBool = (v, dflt) => {
@@ -430,7 +433,8 @@ function loadRequiredConfig(env) {
 		SELF_UNBAN_APPROVED: selfUnbanApproved,
 		BLACKLIST_PAGE_LIMIT: blacklistPageLimit,
 		BLACKLIST_REASON_LABELS: blacklistReasonLabels,
-		GKY_BANLIST_ENDPOINT: gkyEndpoint
+		GKY_BANLIST_ENDPOINT: gkyEndpoint,
+		SELF_WORKER_URL: selfWorkerUrl
 	};
 }
 
@@ -540,7 +544,6 @@ const BULK_TASK_USER_BATCH_SIZE = 20;
 const BULK_TASK_CONCURRENCY = 3;
 const BULK_TASK_RETRY_LIMIT = 0;
 const BULK_TASK_MAX_RUNTIME_MS = 18000;
-const BULK_TASK_BACKGROUND_MAX_RUNTIME_MS = 26000;
 const BULK_TASK_FAILURE_LIMIT = 100;
 const BULK_TASK_LEASE_MS = 45000;
 
@@ -1414,38 +1417,51 @@ async function markBulkJobFailed(env, jobId, error) {
 	return job;
 }
 
-async function runBulkModerationJobInBackground(env, jobId, options = {}) {
-	const started = Date.now();
-	const maxRuntimeMs = Math.max(1000, Number(options.maxRuntimeMs) || BULK_TASK_BACKGROUND_MAX_RUNTIME_MS);
-	const maxCycles = Math.max(1, Number(options.maxCycles) || 200);
-	let job = null;
-	let cycles = 0;
-	while (cycles < maxCycles) {
-		job = await runBulkModerationJob(env, jobId, {
-			...options,
-			ctx: null,
-			autoContinue: false,
-			ignoreLease: true,
-			maxRounds: 1,
-			source: options.source || 'background'
-		});
-		cycles += 1;
-		if (!job || job.status === 'done' || job.status === 'failed') break;
-		if (Date.now() - started >= maxRuntimeMs) {
-			console.warn(`[批量任务] 后台自动续接达到时间预算 ${job.id}: ${job.cursor}/${job.ids?.length || 0}`);
-			break;
+function buildBulkJobInternalAutoRunRequest(requestUrl, jobId) {
+	if (!requestUrl || !TOKEN) return null;
+	const url = new URL(SELF_WORKER_URL || requestUrl);
+	url.pathname = '/';
+	url.search = '';
+	return {
+		url: url.toString(),
+		init: {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				__bulk_job_auto_run: true,
+				token: TOKEN,
+				id: jobId
+			})
 		}
-	}
-	return job;
+	};
 }
 
 function scheduleBulkJobAutoContinue(job, ctx, requestUrl, env = null) {
 	if (!env || !job || job.status === 'done' || job.cursor >= job.ids.length || job.autoContinue === false) return false;
-	const task = runBulkModerationJobInBackground(env, job.id, {
-		notifyOnDone: true,
-		requestUrl,
-		source: 'auto'
-	}).catch(async (error) => {
+	const nextRequest = buildBulkJobInternalAutoRunRequest(requestUrl, job.id);
+	if (!nextRequest) return false;
+	const task = (async () => {
+		let lastError = null;
+		for (let attempt = 1; attempt <= 3; attempt += 1) {
+			try {
+				const response = await fetch(nextRequest.url, nextRequest.init);
+				if (response.ok) return;
+				let body = '';
+				try {
+					body = await response.text();
+				} catch (_) {}
+				lastError = `自动续接 HTTP ${response.status}: ${body || response.statusText || '无响应内容'}; target=${nextRequest.url}`;
+				console.error(`[批量任务] 自动续接触发失败 ${job.id}: ${lastError}`);
+			} catch (error) {
+				lastError = `${getErrorMessage(error)}; target=${nextRequest.url}`;
+				console.error(`[批量任务] 自动续接触发异常 ${job.id}:`, error);
+			}
+			if (attempt < 3) {
+				await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
+			}
+		}
+		await markBulkJobFailed(env, job.id, lastError || '自动续接触发失败');
+	})().catch(async (error) => {
 		console.error(`[批量任务] 自动续接异常 ${job.id}:`, error);
 		await markBulkJobFailed(env, job.id, error);
 	});

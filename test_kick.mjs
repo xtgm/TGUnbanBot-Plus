@@ -1211,6 +1211,7 @@ console.log('\n[11d] /ban 7 个 TGID × 12 群 → 按操作量转 D1 任务');
 		BOT_TOKEN: '0:fake',
 		GROUP_ID: groupIds.join(','),
 		OWNER_IDS: '999',
+		SELF_WORKER_URL: 'https://tc03.example.workers.dev',
 		DB: makeFakeDB([])
 	};
 	await handler.fetch(new Request('https://x.com/', {
@@ -1265,6 +1266,7 @@ console.log('\n[11e] 私聊 /ban 10 个 TGID × 11 群 → 自动执行');
 		BOT_TOKEN: '0:fake',
 		GROUP_ID: groupIds.join(','),
 		OWNER_IDS: '999',
+		SELF_WORKER_URL: 'https://tc03.example.workers.dev',
 		DB: makeFakeDB([])
 	};
 	await handler.fetch(new Request('https://x.com/', {
@@ -1284,7 +1286,8 @@ console.log('\n[11e] 私聊 /ban 10 个 TGID × 11 群 → 自动执行');
 	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
 	assert('私聊 10×11 自动续接后完成', job.status === 'done' && job.cursor === 10);
 	assert('私聊 10×11 自动续接分阶段执行', job.autoRunCount >= 5);
-	assert('私聊 10×11 自动续接不再依赖 HTTP 自调用', internalUrls.length === 0);
+	assert('私聊 10×11 自动续接走 webhook 根路径', internalUrls.length >= 1 && internalUrls.every((u) => new URL(u).pathname === '/'));
+	assert('私聊 10×11 自动续接使用 SELF_WORKER_URL', internalUrls.every((u) => new URL(u).hostname === 'tc03.example.workers.dev'));
 	assert('私聊 10×11 自动踢人全部完成', callsOf('banChatMember').length === 110);
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('私聊 10×11 自动写入全部黑名单', blacklist.length === 10 && blacklist.every((e) => e.reason === 'manual'));
