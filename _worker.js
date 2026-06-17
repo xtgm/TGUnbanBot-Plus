@@ -523,9 +523,11 @@ async function handleInitialization(request) {
 // 批量 /ban /unban 上限（工程上限，非业务文案，不暴露环境变量）
 const BATCH_LIMIT = 50;
 const BULK_TASK_THRESHOLD = 20;
+const BULK_TASK_SYNC_OPERATION_LIMIT = 24;
+const BULK_TASK_OPERATION_BATCH_LIMIT = 24;
 const BULK_TASK_USER_BATCH_SIZE = 20;
-const BULK_TASK_CONCURRENCY = 10;
-const BULK_TASK_RETRY_LIMIT = 2;
+const BULK_TASK_CONCURRENCY = 3;
+const BULK_TASK_RETRY_LIMIT = 0;
 const BULK_TASK_MAX_RUNTIME_MS = 18000;
 const BULK_TASK_FAILURE_LIMIT = 100;
 
@@ -861,10 +863,11 @@ function translateTelegramError(description) {
 // 渲染单用户全群踢人结果(详细版)：包含群名、群ID、失败原因和建议
 // banResults: [{ groupId, ok, error }] 来自 banUserFromAllGroups
 // 返回多行 HTML 文案，每行一个群的具体结果
-async function renderBanResultsDetail(banResults) {
+async function renderBanResultsDetail(banResults, chatInfoCache = null) {
 	const okCount = banResults.filter((r) => r.ok).length;
 	const total = banResults.length;
 	const lines = [];
+	const cache = chatInfoCache || new Map();
 
 	if (okCount === total) {
 		lines.push(`🚫 <b>已从全部 ${total} 个群踢出</b>`);
@@ -874,16 +877,22 @@ async function renderBanResultsDetail(banResults) {
 		lines.push(`🚫 <b>已踢出 ${okCount}/${total} 个群</b>（${total - okCount} 个失败）`);
 	}
 
-	// 并行拉群名（最多 GROUP_IDS.length 个，串行也无所谓但并行更快）
-	const detailLines = await Promise.all(
-		banResults.map(async (r) => {
-			let title = '未知群名';
+	// 同一批回执内每个群只拉一次群名，避免 用户数 × 群数 重复 getChat。
+	await Promise.all(
+		[...new Set(banResults.map((r) => String(r.groupId)))].map(async (groupId) => {
+			if (cache.has(groupId)) return;
 			try {
-				const info = await getChatInfoFromId(r.groupId);
-				if (info?.title) title = info.title;
+				const info = await getChatInfoFromId(groupId);
+				cache.set(groupId, info?.title || '未知群名');
 			} catch (e) {
 				// 拉群名失败不影响主流程
+				cache.set(groupId, '未知群名');
 			}
+		})
+	);
+
+	const detailLines = banResults.map((r) => {
+			const title = cache.get(String(r.groupId)) || '未知群名';
 			const safeTitle = escapeHtml(title);
 			const safeId = escapeHtml(String(r.groupId));
 			if (r.ok) {
@@ -891,8 +900,7 @@ async function renderBanResultsDetail(banResults) {
 			}
 			const { 中文, 建议 } = translateTelegramError(r.error);
 			return `  ❌ <b>${safeTitle}</b> <code>${safeId}</code>\n     原因：${escapeHtml(中文)}\n     建议：${escapeHtml(建议)}`;
-		})
-	);
+		});
 
 	lines.push('', ...detailLines);
 	return lines.join('\n');
@@ -1161,7 +1169,8 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 			users: ids.length,
 			groups: groupIds.length,
 			operations: ids.length * groupIds.length,
-			invalid: (invalid || []).length
+			invalid: (invalid || []).length,
+			operationBatchLimit: BULK_TASK_OPERATION_BATCH_LIMIT
 		},
 		stats: {
 			usersProcessed: 0,
@@ -1257,7 +1266,7 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 		`踢人失败:${job.stats?.kickFailed || 0}`,
 		`格式错误:${job.totals?.invalid || 0}`,
 		'',
-		`执行参数:单轮 ${job.userBatchSize || BULK_TASK_USER_BATCH_SIZE} 用户 / 并发 ${job.concurrency || BULK_TASK_CONCURRENCY} / 重试 ${job.retryLimit ?? BULK_TASK_RETRY_LIMIT} 次`
+		`执行参数:单轮最多 ${getBulkJobSafeUserBatchSize(job)} 用户 / 操作预算 ${job.totals?.operationBatchLimit || BULK_TASK_OPERATION_BATCH_LIMIT} / 并发 ${job.concurrency || BULK_TASK_CONCURRENCY} / 重试 ${job.retryLimit ?? BULK_TASK_RETRY_LIMIT} 次`
 	];
 	if (job.status !== 'done') {
 		lines.push(`继续执行:<code>/jobrun ${escapeHtml(job.id)}</code>`);
@@ -1334,20 +1343,31 @@ async function processBulkJobUserBatch(job, env, ids) {
 	});
 }
 
+function getBulkJobSafeUserBatchSize(job) {
+	const groups = Math.max(1, Number(job?.totals?.groups ?? job?.groupIds?.length ?? GROUP_IDS.length) || 1);
+	const byOperations = Math.max(1, Math.floor(BULK_TASK_OPERATION_BATCH_LIMIT / groups));
+	const configured = Math.max(1, Number(job?.userBatchSize) || BULK_TASK_USER_BATCH_SIZE);
+	return Math.max(1, Math.min(configured, byOperations));
+}
+
 async function runBulkModerationJob(env, jobId, options = {}) {
 	let job = await loadBulkJob(env, jobId);
 	if (!job) return null;
 	if (job.status === 'done') return job;
 	const started = Date.now();
+	const maxRounds = Math.max(1, Number(options.maxRounds) || 1);
+	let rounds = 0;
 	job.status = 'running';
 	job.startedAt = job.startedAt || new Date().toISOString();
 	await saveBulkJob(env, job);
 
-	while (job.cursor < job.ids.length) {
-		const batch = job.ids.slice(job.cursor, job.cursor + (job.userBatchSize || BULK_TASK_USER_BATCH_SIZE));
+	while (job.cursor < job.ids.length && rounds < maxRounds) {
+		const safeBatchSize = getBulkJobSafeUserBatchSize(job);
+		const batch = job.ids.slice(job.cursor, job.cursor + safeBatchSize);
 		await processBulkJobUserBatch(job, env, batch);
 		job.cursor += batch.length;
 		job.stats.usersProcessed = job.cursor;
+		rounds += 1;
 		if (job.cursor >= job.ids.length) {
 			job.status = 'done';
 			job.finishedAt = new Date().toISOString();
@@ -1365,11 +1385,12 @@ async function runBulkModerationJob(env, jobId, options = {}) {
 
 async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 	const { action, valid, invalid, note, isInGroup } = options;
-	if (valid.length < BULK_TASK_THRESHOLD) return false;
+	const operationCount = valid.length * Math.max(1, GROUP_IDS.length);
+	if (valid.length < BULK_TASK_THRESHOLD && operationCount <= BULK_TASK_SYNC_OPERATION_LIMIT) return false;
 	if (!env.DB) {
-		const detailText = withActionContext(message, `❌ 大批量任务需要绑定 D1 存储空间\n目标用户:${valid.length}`, note);
+		const detailText = withActionContext(message, `❌ 批量任务需要绑定 D1 存储空间\n目标用户:${valid.length}\n总操作数:${operationCount}`, note);
 		await replyToAdmin(message, ctx, {
-			flashText: '❌ 大批量任务需要绑定 D1',
+			flashText: '❌ 批量任务需要绑定 D1',
 			detailText,
 			isInGroup,
 			notifySecondaryOwners: true
@@ -2220,6 +2241,128 @@ async function formatTargetByTgid(tgid) {
 		}
 	}
 	return `<code>${escapeHtml(idStr)}</code>`;
+}
+
+async function resolvePermissionUserProfiles(ids) {
+	const wanted = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))];
+	const wantedSet = new Set(wanted);
+	const profiles = new Map();
+
+	for (const groupId of GROUP_IDS) {
+		try {
+			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ chat_id: groupId }),
+			});
+			const result = await response.json();
+			if (!response.ok || !result.ok || !Array.isArray(result.result)) {
+				continue;
+			}
+			for (const member of result.result) {
+				const user = member?.user;
+				const id = user?.id ? String(user.id) : '';
+				if (wantedSet.has(id) && !profiles.has(id)) {
+					profiles.set(id, {
+						user,
+						status: member.status || '',
+						source: 'getChatAdministrators',
+						groupId: String(groupId)
+					});
+				}
+			}
+		} catch (error) {
+			console.error(`[权限名单] 查询群管理员失败 group=${groupId}:`, error);
+		}
+	}
+
+	for (const id of wanted) {
+		if (profiles.has(id)) continue;
+		for (const groupId of GROUP_IDS) {
+			try {
+				const result = await checkUserStatus(id, groupId);
+				const user = result?.result?.user;
+				if (user?.id) {
+					profiles.set(id, {
+						user,
+						status: result.result.status || '',
+						source: 'getChatMember',
+						groupId: String(groupId)
+					});
+					break;
+				}
+			} catch (_) {
+				// 单群查不到继续下一个群
+			}
+		}
+	}
+
+	return profiles;
+}
+
+function renderPermissionUserLine(id, profile, index) {
+	const user = profile?.user;
+	const fullName = user
+		? ([user.first_name, user.last_name].filter(Boolean).join(' ') || '未设置')
+		: '未获取';
+	const username = user?.username ? `@${escapeHtml(user.username)}` : (user ? '未设置' : '未获取');
+	const statusMap = {
+		creator: '群主',
+		administrator: '管理员',
+		member: '成员',
+		restricted: '受限成员',
+		left: '已离群',
+		kicked: '已踢出'
+	};
+	const lines = [
+		`${index}. TGID:<code>${escapeHtml(id)}</code>`,
+		`   昵称:${escapeHtml(fullName)}`,
+		`   用户名:${username}`
+	];
+	if (profile?.status) {
+		lines.push(`   群内身份:${escapeHtml(statusMap[profile.status] || profile.status)}`);
+	}
+	if (profile?.groupId) {
+		lines.push(`   来源群:<code>${escapeHtml(profile.groupId)}</code>`);
+	}
+	if (!user) {
+		lines.push('   资料状态:未在配置群中获取到用户资料');
+	}
+	return lines;
+}
+
+function renderPermissionSection(title, ids, profiles) {
+	const cleanIds = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))];
+	const lines = [title];
+	if (!cleanIds.length) {
+		lines.push('无');
+		return lines;
+	}
+	cleanIds.forEach((id, idx) => {
+		if (idx > 0) lines.push('');
+		lines.push(...renderPermissionUserLine(id, profiles.get(id), idx + 1));
+	});
+	return lines;
+}
+
+async function renderPermissionAdminsList() {
+	const primaryOwner = OWNER_IDS.length ? [OWNER_IDS[0]] : [];
+	const secondaryOwners = OWNER_IDS.length > 1 ? OWNER_IDS.slice(1) : [];
+	const superAdmins = SUPER_ADMINS || [];
+	const allIds = [...primaryOwner, ...secondaryOwners, ...superAdmins];
+	const profiles = await resolvePermissionUserProfiles(allIds);
+	const lines = [
+		'🔐 <b>权限名单</b>',
+		'',
+		...renderPermissionSection('👑 <b>主人</b>', primaryOwner, profiles),
+		'',
+		...renderPermissionSection('👤 <b>副主人</b>', secondaryOwners, profiles),
+		'',
+		...renderPermissionSection('🛡️ <b>超级管理员</b>', superAdmins, profiles),
+		'',
+		'说明:用户名/昵称来自 Telegram 当前可读取的群成员资料;未获取时仍以 TGID 为准。'
+	];
+	return lines.join('\n');
 }
 
 async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
@@ -3609,9 +3752,10 @@ async function handleMessage(message, env, ctx) {
 			let fullDetail = baseDetail;
 			if (perUserBanResults.length > 0) {
 				const perUserDetailLines = ['', '<b>逐用户踢人明细</b>:'];
+				const chatInfoCache = new Map();
 				for (const { userId: uid, banResults } of perUserBanResults) {
 					perUserDetailLines.push('', `<b>用户 <code>${uid}</code></b>`);
-					perUserDetailLines.push(await renderBanResultsDetail(banResults));
+					perUserDetailLines.push(await renderBanResultsDetail(banResults, chatInfoCache));
 				}
 				fullDetail += '\n' + perUserDetailLines.join('\n');
 			}
@@ -3928,6 +4072,24 @@ async function handleMessage(message, env, ctx) {
 			'• <b>链接识别</b>:github/google 等正常域名链接永不被杀;含链接的样本只精确匹配不扩散;可疑短链(bit.ly等)才加分',
 		];
 		await sendTelegramMessage(chatId, helpLines.join('\n'));
+		return;
+	}
+
+	// ===== /admins 主人专属权限名单查询 =====
+	// 仅 OWNER_IDS[0] 主人私聊可用;群内完全静默,避免暴露权限配置和用户资料。
+	if (text && /^\/admins(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		if (!isPrimaryOwner(userId)) {
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人使用。');
+			}
+			return;
+		}
+		if (isInGroup) {
+			return;
+		}
+		const listText = await renderPermissionAdminsList();
+		await sendTelegramMessage(chatId, listText);
 		return;
 	}
 
@@ -4388,9 +4550,10 @@ async function handleMessage(message, env, ctx) {
 		let fullDetail = baseDetail;
 		if (perUserBanResults.length > 0) {
 			const perUserDetailLines = ['', '<b>逐用户踢人明细</b>:'];
+			const chatInfoCache = new Map();
 			for (const { userId: uid, banResults } of perUserBanResults) {
 				perUserDetailLines.push('', `<b>用户 <code>${uid}</code></b>`);
-				perUserDetailLines.push(await renderBanResultsDetail(banResults));
+				perUserDetailLines.push(await renderBanResultsDetail(banResults, chatInfoCache));
 			}
 			fullDetail += '\n' + perUserDetailLines.join('\n');
 		}

@@ -1050,27 +1050,32 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 	assert('20 个 /ban 创建 1 个 D1 任务', env.DB._jobs.size === 1);
 	const jobRow = [...env.DB._jobs.values()][0];
 	const job = JSON.parse(jobRow.payload);
-	assert('批量 /ban 任务已完成', job.status === 'done' && job.cursor === 20);
+	assert('批量 /ban 任务先按安全分片执行', job.status === 'running' && job.cursor === 12);
 	assert('批量 /ban 任务记录操作类型', job.action === 'ban' && job.reason === 'manual');
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
-	assert('批量 /ban 20 个全部写入黑名单', blacklist.length === 20 && blacklist.every((e) => e.reason === 'manual'));
-	assert('批量 /ban 全群踢人 40 次', callsOf('banChatMember').length === 40);
+	assert('批量 /ban 首轮只写入安全分片黑名单', blacklist.length === 12 && blacklist.every((e) => e.reason === 'manual'));
+	assert('批量 /ban 首轮踢人 24 次', callsOf('banChatMember').length === 24);
 	assert('批量 /ban 指令消息被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 810));
 	const sendTexts = callsOf('sendMessage').map((c) => c.body.text).join('\n');
 	assert('批量 /ban 发送任务创建通知', sendTexts.includes('批量任务已创建'));
-	assert('批量 /ban 发送任务完成通知', sendTexts.includes('批量任务完成'));
+	assert('批量 /ban 首轮未发送完成通知', !sendTexts.includes('批量任务完成'));
 
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 2 } }),
 	});
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
-		body: JSON.stringify({ message: { message_id: 811, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: `/job ${job.id}` } })
+		body: JSON.stringify({ message: { message_id: 811, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: `/jobrun ${job.id}` } })
 	}), env, fakeCtx);
-	const jobDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('/job 可查询批量任务状态', !!jobDm && jobDm.body.text.includes(job.id) && jobDm.body.text.includes('已完成'));
+	await Promise.all(pending);
+	const doneJob = JSON.parse(env.DB._jobs.get(job.id).payload);
+	assert('/jobrun 安全续跑后完成任务', doneJob.status === 'done' && doneJob.cursor === 20);
+	assert('/jobrun 只补剩余 8 人 × 2 群', callsOf('banChatMember').length === 16);
+	const jobDms = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
+	assert('/jobrun 可查询批量任务状态', jobDms.some((c) => c.body.text.includes(job.id) && c.body.text.includes('已完成')));
 }
 
 // ---------- [11c] 群内 /spam 20 个 TGID → D1 批量任务 ----------
@@ -1101,10 +1106,48 @@ console.log('\n[11c] 群内 /spam 20 个 TGID → D1 批量任务');
 
 	assert('20 个 /spam 创建 1 个 D1 任务', env.DB._jobs.size === 1);
 	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
-	assert('批量 /spam 任务已完成', job.status === 'done' && job.action === 'spam');
+	assert('批量 /spam 任务先按安全分片执行', job.status === 'running' && job.cursor === 12 && job.action === 'spam');
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
-	assert('批量 /spam 20 个全部写入 spam reason', blacklist.length === 20 && blacklist.every((e) => e.reason === 'spam'));
-	assert('批量 /spam 全群踢人 40 次', callsOf('banChatMember').length === 40);
+	assert('批量 /spam 首轮只写入安全分片 spam reason', blacklist.length === 12 && blacklist.every((e) => e.reason === 'spam'));
+	assert('批量 /spam 首轮踢人 24 次', callsOf('banChatMember').length === 24);
+}
+
+// ---------- [11d] /ban 7 个 TGID × 12 群 → 按操作量转 D1 任务 ----------
+console.log('\n[11d] /ban 7 个 TGID × 12 群 → 按操作量转 D1 任务');
+{
+	resetCalls();
+	const pending = [];
+	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p).catch((e) => { throw e; })); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const groupIds = Array.from({ length: 12 }, (_, i) => String(-1000000000000 - i));
+	const ids = Array.from({ length: 7 }, (_, i) => String(9700 + i));
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: groupIds.join(','), OWNER_IDS: '999', DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({
+			message: {
+				message_id: 813,
+				chat: { id: Number(groupIds[0]), type: 'supergroup', title: '多群测试' },
+				from: { id: 999, is_bot: false, first_name: '主人' },
+				text: `/ban ${ids.join(' ')} 批量广告`,
+			}
+		})
+	}), env, fakeCtx);
+	await Promise.all(pending);
+
+	assert('7 个 TGID × 12 群创建 D1 任务', env.DB._jobs.size === 1);
+	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
+	assert('7 个 TGID × 12 群总操作数记录为 84', job.totals.operations === 84 && job.totals.groups === 12);
+	assert('7×12 首轮只处理 2 个用户', job.status === 'running' && job.cursor === 2);
+	assert('7×12 首轮只踢 24 次', callsOf('banChatMember').length === 24);
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
+	assert('7×12 首轮只写入 2 个黑名单', blacklist.length === 2 && blacklist.every((e) => e.reason === 'manual'));
 }
 
 // ---------- [12] 群内 /unban 单条 ----------
@@ -2380,6 +2423,60 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
 	assert('非主人 /help → 权限不足', !!dm && dm.body.text.includes('权限不足'));
 	assert('非主人 /help → 不泄漏隐藏指令', !!dm && !dm.body.text.includes('learnlast'));
+}
+
+// ---------- [67b] /admins 仅主人查看权限名单 ----------
+console.log('\n[67b] /admins 主人专属权限名单');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: (b) => {
+			if (String(b.chat_id) === '-1001') {
+				return {
+					ok: true,
+					result: [
+						{ user: { id: 999, first_name: '主人', username: 'owner_user' }, status: 'creator' },
+						{ user: { id: 888, first_name: '副主人', username: 'deputy_user' }, status: 'administrator' },
+						{ user: { id: 7777, first_name: '超管', last_name: '甲', username: 'super_user' }, status: 'administrator' }
+					]
+				};
+			}
+			return { ok: true, result: [] };
+		},
+		getChatMember: (b) => {
+			if (String(b.user_id) === '6666') {
+				return { ok: true, result: { user: { id: 6666, first_name: '兜底', username: 'fallback_user' }, status: 'member' } };
+			}
+			return { ok: false, description: 'Bad Request: user not found' };
+		},
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,888', SUPER_ADMINS: '7777,6666', DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/admins' } })
+	}), env, fakeCtxAd);
+	let dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('/admins 主人可查看权限名单', !!dm && dm.body.text.includes('权限名单'));
+	assert('/admins 显示主人用户名', dm.body.text.includes('@owner_user') && dm.body.text.includes('TGID:<code>999</code>'));
+	assert('/admins 显示副主人用户名', dm.body.text.includes('@deputy_user') && dm.body.text.includes('TGID:<code>888</code>'));
+	assert('/admins 显示超级管理员用户名', dm.body.text.includes('@super_user') && dm.body.text.includes('TGID:<code>7777</code>'));
+	assert('/admins 可用 getChatMember 兜底', dm.body.text.includes('@fallback_user') && dm.body.text.includes('TGID:<code>6666</code>'));
+
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 2, chat: { id: 888, type: 'private' }, from: { id: 888, is_bot: false }, text: '/admins' } })
+	}), env, fakeCtxAd);
+	dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '888');
+	assert('/admins 副主人无权查看', !!dm && dm.body.text.includes('权限不足') && !dm.body.text.includes('@owner_user'));
+
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 3, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/admins' } })
+	}), env, fakeCtxAd);
+	assert('/admins 群内静默不公开名单', callsOf('sendMessage').length === 0);
 }
 
 // ---------- [68] 正常域名链接(github)不被杀,即便学过同域名样本 ----------
