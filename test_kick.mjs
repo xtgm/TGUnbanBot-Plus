@@ -62,6 +62,14 @@ async function drainPending(pending) {
 	}
 }
 
+function makeInternalWorkerRequest(url, init = {}) {
+	return new Request(url, {
+		method: init?.method || 'GET',
+		headers: init?.headers,
+		body: init?.body,
+	});
+}
+
 const sandbox = {
 	console, URL, URLSearchParams, TextEncoder, TextDecoder,
 	Response, Request, Headers, atob, btoa, setTimeout, clearTimeout,
@@ -1043,7 +1051,7 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
 	}, {
-		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
+		internalHandler: (url, init) => handler.fetch(makeInternalWorkerRequest(url, init), env, fakeCtx),
 	});
 
 	const ids = Array.from({ length: 20 }, (_, i) => String(9000 + i));
@@ -1079,7 +1087,7 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 2 } }),
 	}, {
-		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
+		internalHandler: (url, init) => handler.fetch(makeInternalWorkerRequest(url, init), env, fakeCtx),
 	});
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
@@ -1106,7 +1114,7 @@ console.log('\n[11b2] D1 批量任务失败原因中文化');
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
 	}, {
-		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
+		internalHandler: (url, init) => handler.fetch(makeInternalWorkerRequest(url, init), env, fakeCtx),
 	});
 
 	const ids = Array.from({ length: 20 }, (_, i) => String(9200 + i));
@@ -1155,7 +1163,7 @@ console.log('\n[11c] 群内 /spam 20 个 TGID → D1 批量任务');
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
 	}, {
-		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
+		internalHandler: (url, init) => handler.fetch(makeInternalWorkerRequest(url, init), env, fakeCtx),
 	});
 
 	const ids = Array.from({ length: 20 }, (_, i) => String(9300 + i));
@@ -1193,7 +1201,7 @@ console.log('\n[11d] /ban 7 个 TGID × 12 群 → 按操作量转 D1 任务');
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
 	}, {
-		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
+		internalHandler: (url, init) => handler.fetch(makeInternalWorkerRequest(url, init), env, fakeCtx),
 	});
 
 	const groupIds = Array.from({ length: 12 }, (_, i) => String(-1000000000000 - i));
@@ -1228,6 +1236,7 @@ console.log('\n[11e] 私聊 /ban 10 个 TGID × 11 群 → 自动执行');
 	resetCalls();
 	const pending = [];
 	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p).catch((e) => { throw e; })); } };
+	const internalUrls = [];
 	let env;
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: (body) => {
@@ -1237,7 +1246,10 @@ console.log('\n[11e] 私聊 /ban 10 个 TGID × 11 群 → 自动执行');
 		banChatMember: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	}, {
-		internalHandler: (url, init) => handler.fetch(new Request(url, { method: init?.method || 'GET' }), env, fakeCtx),
+		internalHandler: (url, init) => {
+			internalUrls.push(String(url));
+			return handler.fetch(makeInternalWorkerRequest(url, init), env, fakeCtx);
+		},
 	});
 
 	const groupIds = Array.from({ length: 11 }, (_, i) => String(-1000000000000 - i));
@@ -1260,6 +1272,7 @@ console.log('\n[11e] 私聊 /ban 10 个 TGID × 11 群 → 自动执行');
 	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
 	assert('私聊 10×11 自动续接后完成', job.status === 'done' && job.cursor === 10);
 	assert('私聊 10×11 自动续接分阶段执行', job.autoRunCount >= 5);
+	assert('私聊 10×11 自动续接走 webhook 根路径', internalUrls.length >= 1 && internalUrls.every((u) => new URL(u).pathname === '/'));
 	assert('私聊 10×11 自动踢人全部完成', callsOf('banChatMember').length === 110);
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('私聊 10×11 自动写入全部黑名单', blacklist.length === 10 && blacklist.every((e) => e.reason === 'manual'));

@@ -252,6 +252,14 @@ export default {
 			// 如果是 Telegram Webhook 请求
 			if (path === '') {
 				const update = await request.json();
+				if (update?.__bulk_job_auto_run === true) {
+					if (String(update.token || '') !== String(TOKEN)) {
+						return jsonResponse({ success: false, error: 'forbidden' }, 403);
+					}
+					const autoUrl = new URL(request.url);
+					autoUrl.searchParams.set('id', String(update.id || ''));
+					return await handleBulkJobAutoRun(env, autoUrl, ctx, request.url);
+				}
 				console.log('[Telegram更新] 收到更新:', JSON.stringify({
 					更新ID: update.update_id,
 					包含字段: Object.keys(update),
@@ -1383,14 +1391,23 @@ function clearBulkJobLease(job) {
 	job.leaseUntil = null;
 }
 
-function buildBulkJobAutoRunUrl(requestUrl, jobId) {
+function buildBulkJobInternalAutoRunRequest(requestUrl, jobId) {
 	if (!requestUrl || !TOKEN) return null;
 	const url = new URL(requestUrl);
-	url.pathname = `/${TOKEN}/jobrun`;
+	url.pathname = '/';
 	url.search = '';
-	url.searchParams.set('id', jobId);
-	url.searchParams.set('auto', '1');
-	return url.toString();
+	return {
+		url: url.toString(),
+		init: {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				__bulk_job_auto_run: true,
+				token: TOKEN,
+				id: jobId
+			})
+		}
+	};
 }
 
 function getErrorMessage(error) {
@@ -1417,9 +1434,9 @@ async function markBulkJobFailed(env, jobId, error) {
 
 function scheduleBulkJobAutoContinue(job, ctx, requestUrl, env = null) {
 	if (!job || job.status === 'done' || job.cursor >= job.ids.length || job.autoContinue === false) return false;
-	const nextUrl = buildBulkJobAutoRunUrl(requestUrl, job.id);
-	if (!nextUrl) return false;
-	const task = fetch(nextUrl, { method: 'GET' }).then(async (response) => {
+	const nextRequest = buildBulkJobInternalAutoRunRequest(requestUrl, job.id);
+	if (!nextRequest) return false;
+	const task = fetch(nextRequest.url, nextRequest.init).then(async (response) => {
 		if (!response.ok) {
 			let body = '';
 			try {
