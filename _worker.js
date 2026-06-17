@@ -1213,6 +1213,16 @@ function pushBulkJobFailure(job, failure) {
 	}
 }
 
+function formatBulkJobFailureLine(failure) {
+	const groupText = failure.groupId ? ` 群 <code>${escapeHtml(failure.groupId)}</code>` : '';
+	const rawError = failure.error || failure.message || '失败';
+	const { 中文, 建议 } = translateTelegramError(rawError);
+	const reasonText = 中文 === rawError
+		? escapeHtml(rawError)
+		: `${escapeHtml(中文)}（${escapeHtml(rawError)}）`;
+	return `❌ <code>${escapeHtml(failure.userId || '')}</code>${groupText}: ${reasonText}\n   建议:${escapeHtml(建议)}`;
+}
+
 function formatBulkJobStatus(job) {
 	const map = {
 		queued: '等待执行',
@@ -1274,8 +1284,7 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 	if (job.failures?.length) {
 		lines.push('', `<b>最近失败</b>（最多显示 ${Math.min(job.failures.length, 5)} 条）:`);
 		for (const f of job.failures.slice(-5)) {
-			const groupText = f.groupId ? ` 群 <code>${escapeHtml(f.groupId)}</code>` : '';
-			lines.push(`❌ <code>${escapeHtml(f.userId || '')}</code>${groupText}: ${escapeHtml(f.error || f.message || '失败')}`);
+			lines.push(formatBulkJobFailureLine(f));
 		}
 	}
 	return lines.join('\n');

@@ -1078,6 +1078,51 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 	assert('/jobrun 可查询批量任务状态', jobDms.some((c) => c.body.text.includes(job.id) && c.body.text.includes('已完成')));
 }
 
+// ---------- [11b2] D1 批量任务失败原因中文化 ----------
+console.log('\n[11b2] D1 批量任务失败原因中文化');
+{
+	resetCalls();
+	const pending = [];
+	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p).catch((e) => { throw e; })); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		banChatMember: () => ({ ok: false, error_code: 400, description: 'Bad Request: not enough rights to restrict/unrestrict chat member' }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const ids = Array.from({ length: 20 }, (_, i) => String(9200 + i));
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({
+			message: {
+				message_id: 814,
+				chat: { id: -1001, type: 'supergroup', title: '批量测试群' },
+				from: { id: 999, is_bot: false, first_name: '主人' },
+				text: `/ban [${ids.join(',')}]`,
+			}
+		})
+	}), env, fakeCtx);
+	await Promise.all(pending);
+
+	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 2 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 815, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: `/job ${job.id}` } })
+	}), env, fakeCtx);
+
+	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('批量任务失败原因显示中文', !!dm && dm.body.text.includes('bot 权限不足'));
+	assert('批量任务失败原因保留原始错误', dm.body.text.includes('not enough rights to restrict/unrestrict chat member'));
+	assert('批量任务失败建议含封禁用户权限', dm.body.text.includes('封禁用户'));
+}
+
 // ---------- [11c] 群内 /spam 20 个 TGID → D1 批量任务 ----------
 console.log('\n[11c] 群内 /spam 20 个 TGID → D1 批量任务');
 {
