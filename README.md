@@ -134,7 +134,7 @@
 ├── wrangler.toml    # Cloudflare Wrangler 配置
 ├── test_batch.mjs   # 批量解析与黑名单写入离线测试（43 项）
 ├── test_export.mjs  # 导出接口离线测试（41 项）
-├── test_kick.mjs    # 真踢人闭环 + 广告学习 + 大批量任务离线测试（385 项）
+├── test_kick.mjs    # 真踢人闭环 + 广告学习 + 大批量任务离线测试（388 项）
 ├── README.md
 └── LICENSE
 ```

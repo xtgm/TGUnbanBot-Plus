@@ -3327,16 +3327,69 @@ function getContactText(message) {
 	return parts.join(' ');
 }
 
+const QUOTE_TEXT_KEYS = new Set(['text', 'caption', 'title', 'description']);
+const QUOTE_TEXT_SKIP_KEYS = new Set([
+	'from', 'sender_chat', 'chat', 'via_bot',
+	'forward_from', 'forward_from_chat', 'forward_origin', 'origin',
+	'entities', 'caption_entities'
+]);
+
+function collectQuoteTextParts(value, parts, depth = 0, key = '') {
+	if (!value || depth > 6) return;
+	if (typeof value === 'string') {
+		if (QUOTE_TEXT_KEYS.has(key)) parts.push(value);
+		return;
+	}
+	if (typeof value !== 'object') return;
+	if (QUOTE_TEXT_SKIP_KEYS.has(key)) return;
+	if (Array.isArray(value)) {
+		for (const item of value) collectQuoteTextParts(item, parts, depth + 1, key);
+		return;
+	}
+	for (const [childKey, childValue] of Object.entries(value)) {
+		collectQuoteTextParts(childValue, parts, depth + 1, childKey);
+	}
+}
+
 function getQuoteText(message) {
-	const parts = [
-		message.quote?.text,
-		message.reply_to_message?.text,
-		message.reply_to_message?.caption,
-		message.external_reply?.text,
-		message.external_reply?.caption,
-		message.external_reply?.quote?.text,
-	].filter(Boolean);
+	const parts = [];
+	collectQuoteTextParts(message.quote, parts, 0, 'quote');
+	collectQuoteTextParts(message.reply_to_message, parts, 0, 'reply_to_message');
+	collectQuoteTextParts(message.external_reply, parts, 0, 'external_reply');
 	return [...new Set(parts.map((s) => String(s).trim()).filter(Boolean))].join(' ');
+}
+
+function hasQuoteLikeStructure(message) {
+	return Boolean(message?.quote || message?.reply_to_message || message?.external_reply);
+}
+
+function summarizeQuoteStructure(value) {
+	if (!value || typeof value !== 'object') return null;
+	const textFields = [];
+	const scan = (node, prefix = '', depth = 0, key = '') => {
+		if (!node || typeof node !== 'object' || depth > 3 || QUOTE_TEXT_SKIP_KEYS.has(key)) return;
+		for (const [childKey, childValue] of Object.entries(node)) {
+			const path = prefix ? `${prefix}.${childKey}` : childKey;
+			if (typeof childValue === 'string' && QUOTE_TEXT_KEYS.has(childKey)) {
+				textFields.push(path);
+			} else if (childValue && typeof childValue === 'object') {
+				scan(childValue, path, depth + 1, childKey);
+			}
+		}
+	};
+	scan(value);
+	return {
+		keys: Object.keys(value).slice(0, 16),
+		text_fields: [...new Set(textFields)].slice(0, 16)
+	};
+}
+
+function summarizeQuoteStructures(message) {
+	return {
+		quote: summarizeQuoteStructure(message?.quote),
+		reply_to_message: summarizeQuoteStructure(message?.reply_to_message),
+		external_reply: summarizeQuoteStructure(message?.external_reply)
+	};
 }
 
 function isShortQuoteWrapperText(text) {
@@ -3459,7 +3512,8 @@ async function detectAd(message, env) {
 
 	// 强特征 2:短正文包装引用广告。广告号会把正文写成 t/s/l/1,把广告放在引用框里规避正文检测。
 	// 命中后删除当前这条"短正文+引用广告"消息,封当前发送者,不处理被引用消息发送者。
-	if (quoteText && isShortQuoteWrapperText(message.text || message.caption || '')) {
+	const shortQuoteWrapper = isShortQuoteWrapperText(message.text || message.caption || '');
+	if (quoteText && shortQuoteWrapper) {
 		let quoteForScan = quoteText.toLowerCase();
 		for (const w of AD_WHITELIST) {
 			if (w) quoteForScan = quoteForScan.split(w).join('');
@@ -3524,6 +3578,11 @@ async function detectAd(message, env) {
 			score: quotedWordScore.score,
 			hits: quotedWordScore.hits,
 			highRiskHits: quotedHighRiskHits
+		});
+	} else if (shortQuoteWrapper && hasQuoteLikeStructure(message)) {
+		logQuoteAdDiagnostic(message, quoteText, {
+			decision: 'quote_structure_no_text',
+			structures: summarizeQuoteStructures(message)
 		});
 	}
 
