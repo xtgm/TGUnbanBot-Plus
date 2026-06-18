@@ -3178,6 +3178,24 @@ console.log('\n[81] 短正文引用广告自动拦截');
 
 	resetCalls();
 	db = makeFakeDB([]);
+	db._store.set('ad_keywords_custom', JSON.stringify({ porn: ['探花'] }));
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({
+		message: {
+			message_id: 902,
+			chat: { id: -1001, type: 'supergroup', title: '广告测试群' },
+			from: { id: 91003, is_bot: false, first_name: '包装号' },
+			text: 'k',
+			quote: { text: '我去招探花了' },
+		}
+	}) }), env, fakeCtxAd);
+	bl = JSON.parse(db._store.get('blacklist') || '[]');
+	assert('短正文引用单个高危词 → 加黑当前发送者', bl.some((e) => e.id === '91003' && e.reason === 'ad_auto'));
+	assert('短正文引用单个高危词 → 删除当前消息', callsOf('deleteMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 902));
+	assert('短正文引用单个高危词 → 全群踢当前发送者', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '91003'));
+
+	resetCalls();
+	db = makeFakeDB([]);
 	db._store.set('ad_keywords_custom', JSON.stringify({ general: ['揾逼赚钱'], porn: ['大婆啦'] }));
 	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({

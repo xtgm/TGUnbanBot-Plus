@@ -3348,6 +3348,21 @@ function isShortQuoteWrapperText(text) {
 	return /^[a-z0-9]{1,8}$/i.test(raw);
 }
 
+function logQuoteAdDiagnostic(message, quoteText, detail = {}) {
+	try {
+		console.log('[引用广告诊断]', JSON.stringify({
+			chat_id: message?.chat?.id,
+			message_id: message?.message_id,
+			user_id: message?.from?.id,
+			wrapper: truncateTelegramText(message?.text || message?.caption || '', 30),
+			quote: truncateTelegramText(quoteText || '', 120),
+			...detail
+		}));
+	} catch (error) {
+		console.error('[引用广告诊断] 输出失败:', error);
+	}
+}
+
 function scoreAdWords(text) {
 	let score = 0;
 	const hits = [];
@@ -3357,6 +3372,15 @@ function scoreAdWords(text) {
 	for (const w of AD_KEYWORDS_FRAUD) if (w && text.includes(w)) { score += 2; hits.push(`诈骗:${w}`); }
 	for (const w of AD_KEYWORDS) if (w && text.includes(w)) { score += 2; hits.push(`自定义:${w}`); }
 	return { score, hits };
+}
+
+function scoreHighRiskAdWords(text) {
+	const hits = [];
+	for (const w of AD_KEYWORDS_FINANCE) if (w && text.includes(w)) hits.push(`金融:${w}`);
+	for (const w of AD_KEYWORDS_PORN) if (w && text.includes(w)) hits.push(`色情:${w}`);
+	for (const w of AD_KEYWORDS_FRAUD) if (w && text.includes(w)) hits.push(`诈骗:${w}`);
+	for (const w of AD_KEYWORDS) if (w && text.includes(w)) hits.push(`自定义:${w}`);
+	return hits;
 }
 
 // 检测"发言人身份"(名字/用户名/简介)里的广告特征。
@@ -3445,6 +3469,11 @@ async function detectAd(message, env) {
 			for (const fp of AD_SAMPLE_FINGERPRINTS) {
 				if (!fp || fp.length < SAMPLE_FP_EXACT_MIN) continue;
 				if (quoteNorm === fp) {
+					logQuoteAdDiagnostic(message, quoteText, {
+						decision: 'kill_sample_exact',
+						score: 99,
+						hits: ['引用内容学习样本精确匹配']
+					});
 					return {
 						isAd: true,
 						score: 99,
@@ -3456,17 +3485,46 @@ async function detectAd(message, env) {
 				}
 			}
 		}
+		const quotedHighRiskHits = scoreHighRiskAdWords(quoteForScan);
+		if (quotedHighRiskHits.length > 0) {
+			const hits = quotedHighRiskHits.map((h) => `引用内容高危:${h}`);
+			logQuoteAdDiagnostic(message, quoteText, {
+				decision: 'kill_high_risk_word',
+				score: 99,
+				hits
+			});
+			return {
+				isAd: true,
+				score: 99,
+				hits,
+				strong: '引用内容高危词',
+				source: '引用内容',
+				quotePreview: quoteText.slice(0, 100)
+			};
+		}
 		const quotedWordScore = scoreAdWords(quoteForScan);
 		if (quotedWordScore.score >= AD_SCORE_THRESHOLD || quotedWordScore.hits.length >= 2) {
+			const hits = quotedWordScore.hits.map((h) => `引用内容${h}`);
+			logQuoteAdDiagnostic(message, quoteText, {
+				decision: 'kill_score_or_multi_word',
+				score: Math.max(quotedWordScore.score, AD_SCORE_THRESHOLD),
+				hits
+			});
 			return {
 				isAd: true,
 				score: Math.max(quotedWordScore.score, AD_SCORE_THRESHOLD),
-				hits: quotedWordScore.hits.map((h) => `引用内容${h}`),
+				hits,
 				strong: '引用内容命中广告词',
 				source: '引用内容',
 				quotePreview: quoteText.slice(0, 100)
 			};
 		}
+		logQuoteAdDiagnostic(message, quoteText, {
+			decision: 'no_match',
+			score: quotedWordScore.score,
+			hits: quotedWordScore.hits,
+			highRiskHits: quotedHighRiskHits
+		});
 	}
 
 	// 强特征 4:名片显示名命中词库 → 直接判广告秒杀(实现"名字带广告就杀")
