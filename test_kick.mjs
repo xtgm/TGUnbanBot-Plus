@@ -1112,6 +1112,15 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 	assert('/jobrun 已完成任务不重复踢人', callsOf('banChatMember').length === 0);
 	const jobDms = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
 	assert('/jobrun 可查询批量任务状态', jobDms.some((c) => c.body.text.includes(job.id) && c.body.text.includes('已完成')));
+
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 818, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: `/job ${job.id}` } })
+	}), env, fakeCtx);
+	await drainPending(pending);
+	assert('群内 /job 指令消息 msgId=818 被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 818));
+	assert('群内 /job 仍发送任务状态私聊', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '999' && c.body.text.includes(job.id)));
 }
 
 // ---------- [11b1] 未绑定 Queue 时只创建 D1 任务，不后台跑大批量 ----------
@@ -1383,6 +1392,7 @@ console.log('\n[12] 群内 /unban 单条');
 	assert('sendMessage 调用 2 次（闪屏+私聊）', sendCalls.length === 2);
 	const groupSend = sendCalls.find((c) => String(c.body.chat_id) === '-1001');
 	assert('群内闪屏含"已移黑"', groupSend.body.text.includes('已移黑'));
+	assert('群内 /unban 指令消息 msgId=900 被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 900));
 }
 
 // ---------- [13] 私聊 /ban 单条:行为不变(向后兼容) ----------
@@ -2319,6 +2329,12 @@ console.log('\n[52] /listsamples 展示');
 	assert('/listsamples 回执', !!dm);
 	assert('展示样本数 2', dm.body.text.includes('共 2 条'));
 	assert('展示样本内容', dm.body.text.includes('承兑出u日入过万'));
+
+	resetCalls();
+	const groupUpdate = { message: { message_id: 52, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/listsamples' } };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(groupUpdate) }), env, fakeCtxAd);
+	assert('群内 /listsamples 指令消息 msgId=52 被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 52));
+	assert('群内 /listsamples 详情推给主人', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '999' && c.body.text.includes('广告学习样本')));
 }
 
 // ---------- [53] /delsample 按序号删 ----------
@@ -2576,6 +2592,7 @@ console.log('\n[65] /recent 冻结快照');
 	assert('/recent → 快照序号1=最新(202)', snap.items[0].fromId === '202');
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('/recent → 列表推到主人私聊', !!dm && dm.body.text.includes('快照'));
+	assert('群内 /recent 指令消息 msgId=9 被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 9));
 }
 
 // ---------- [65b] /recent 清洗损坏 Unicode 字符 ----------
@@ -2597,6 +2614,7 @@ console.log('\n[65b] /recent 清洗损坏 Unicode 字符');
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('/recent → 损坏 Unicode 仍发送私聊', !!dm && dm.body.text.includes('广告异常字符测试'));
 	assert('/recent → 私聊文本不含代理字符', !/[\uD800-\uDFFF]/.test(dm.body.text));
+	assert('群内 /recent 清洗场景指令消息 msgId=10 被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 10));
 }
 
 // ---------- [66] /learnlast 群内被拒(强制私聊) ----------
@@ -2619,6 +2637,7 @@ console.log('\n[66] /learnlast 群内被拒');
 	assert('群内 /learnlast → 不学习(强制私聊)', !samples);
 	const bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('群内 /learnlast → 不加黑', bl.length === 0);
+	assert('群内 /learnlast 指令消息 msgId=9 被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 9));
 }
 
 // ---------- [67] /help 仅 OWNER_IDS(非 OWNER_IDS 无反应) ----------
@@ -2646,6 +2665,10 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('非主人 /help → 不泄漏隐藏指令', !!dm && !dm.body.text.includes('learnlast'));
 	assert('非主人 /help → 不泄漏 /admins', !!dm && !dm.body.text.includes('/admins'));
 	assert('非主人 /help → 不泄漏 /groups', !!dm && !dm.body.text.includes('/groups'));
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 3, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/help' } }) }), env, fakeCtxAd);
+	assert('主人群内 /help 指令消息 msgId=3 被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 3));
+	assert('主人群内 /help 只发闪屏提示', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.text.includes('请私聊')));
 }
 
 // ---------- [67b] /admins 仅主人查看权限名单 ----------

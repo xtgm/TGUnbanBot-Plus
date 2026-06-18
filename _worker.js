@@ -634,6 +634,8 @@ function withActionContext(message, detailText, actionNote) {
 
 async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 	if (message?.chat?.type === 'private') return;
+	if (message.__authorizedGroupCommandDeleted) return;
+	message.__authorizedGroupCommandDeleted = true;
 	const result = await deleteMessage(message.chat.id, message.message_id);
 	if (!result.ok) {
 		console.error(`[${commandName}] 删除群内命令消息失败:${result.error || '未知错误'}`);
@@ -4183,6 +4185,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 		const isRun = /^\/jobrun(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
+		await deleteAuthorizedGroupCommandMessage(message, isRun ? '/jobrun' : '/job');
 		const jobId = text.trim().replace(/^\/job(?:run)?(?:@[^\s]+)?\s*/i, '').trim().split(/\s+/)[0] || '';
 		if (!jobId) {
 			const usageText = '❌ 使用方法：<code>/job 任务ID</code> 或 <code>/jobrun 任务ID</code>';
@@ -4330,6 +4333,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 处理 /blacklist 命令 - 私聊管理员查看 D1 黑名单
 	if (text && /^\/blacklist(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		if (message.chat.type !== 'private') {
+			const isAdmin = await checkIfUserIsAdmin(userId);
+			if (isAdmin) {
+				await deleteAuthorizedGroupCommandMessage(message, '/blacklist');
+			}
 			return; // 非私聊不予回复
 		}
 
@@ -4361,6 +4368,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			return;
 		}
+		await deleteAuthorizedGroupCommandMessage(message, '/help');
 		// 隐藏指令仅在私聊展开(群内不回,避免其他成员看到指令清单)
 		if (isInGroup) {
 			await sendFlashMessage(chatId, 'ℹ️ 请私聊我发送 /help 查看 OWNER_IDS 专属指令。', ctx, 6000);
@@ -4412,6 +4420,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			return;
 		}
+		await deleteAuthorizedGroupCommandMessage(message, '/admins');
 		if (isInGroup) {
 			return;
 		}
@@ -4430,6 +4439,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			return;
 		}
+		await deleteAuthorizedGroupCommandMessage(message, '/groups');
 		if (isInGroup) {
 			return;
 		}
@@ -4450,6 +4460,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			return;
 		}
+		await deleteAuthorizedGroupCommandMessage(message, '/adwords');
 		if (!env.DB) {
 			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间,无法管理广告词库。');
 			return;
@@ -4583,6 +4594,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			return;
 		}
+		await deleteAuthorizedGroupCommandMessage(message, '/samples');
 		if (!env.DB) {
 			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间,无法管理学习样本。');
 			return;
@@ -4675,6 +4687,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			return;
 		}
+		await deleteAuthorizedGroupCommandMessage(message, '/learn');
 		if (!env.DB) {
 			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间,无法学习。');
 			return;
@@ -4929,6 +4942,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				}
 				return;
 			}
+			await deleteAuthorizedGroupCommandMessage(message, '/unban');
 
 			const { valid, invalid } = parseBatchTgids(rest);
 
