@@ -738,8 +738,16 @@ async function getBlacklist(env) {
 }
 
 // 检查用户是否在黑名单中
-async function checkBlacklist(userId, env) {
+async function checkBlacklist(userId, env, options = {}) {
 	if (!env.DB) {
+		if (options.strict) {
+			return {
+				isBlacklisted: true,
+				message: '❌ 系统暂时无法确认 D1 黑名单状态，已拒绝自助解封。请联系管理员处理。',
+				entry: null,
+				checkFailed: true
+			};
+		}
 		return { isBlacklisted: false, message: null };
 	}
 
@@ -759,9 +767,31 @@ async function checkBlacklist(userId, env) {
 		return { isBlacklisted: false, message: null };
 	} catch (error) {
 		console.error('检查黑名单时出错:', error);
+		if (options.strict) {
+			return {
+				isBlacklisted: true,
+				message: '❌ 系统暂时无法确认 D1 黑名单状态，已拒绝自助解封。请联系管理员处理。',
+				entry: null,
+				checkFailed: true,
+				error
+			};
+		}
 		// 如果出错，不阻止用户操作
 		return { isBlacklisted: false, message: null };
 	}
+}
+
+async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env) {
+	const blacklistCheck = await checkBlacklist(userId, env, { strict: true });
+	if (!blacklistCheck.isBlacklisted) {
+		return false;
+	}
+
+	await sendTelegramMessage(chatId, blacklistCheck.message);
+	if (!blacklistCheck.checkFailed) {
+		await notifyOwnerBlacklistAppeal(fromUser, blacklistCheck);
+	}
+	return true;
 }
 
 // 添加用户到黑名单（核心实现）
@@ -2913,10 +2943,18 @@ async function handleChatMemberUpdate(chatMember, env) {
 		console.log('[chat_member] 同步加黑:', JSON.stringify({ ...logCommon, 结果: result.success ? '已加入' : result.message }));
 		await notifyOwnerChatMemberAction(chatMember, '加黑', oldStatus, newStatus);
 	} else if (oldStatus === 'kicked') {
-		// 管理员手动解封 → 移黑（仅当原本在黑名单里才会有变化）
-		const result = await removeFromBlacklist(targetIdStr, env);
-		console.log('[chat_member] 同步移黑:', JSON.stringify({ ...logCommon, 结果: result.success ? '已移除' : result.message }));
-		await notifyOwnerChatMemberAction(chatMember, '解黑', oldStatus, newStatus);
+		// 群内手动解封：D1 黑名单是权威封禁，禁止经此被绕过/清除。
+		// 仅 /unban 指令(群管理员/超管/主人/副主人鉴权)可移出 D1 黑名单。
+		const blacklistCheck = await checkBlacklist(targetIdStr, env);
+		if (blacklistCheck.isBlacklisted) {
+			// 仍在 D1 黑名单 → 撤销本次群内手动解封，立即封回，绝不删除黑名单记录
+			const banResult = await banUserFromGroup(chat.id, targetIdStr);
+			console.log('[chat_member] 拦截群内手动解封(D1黑名单保护):', JSON.stringify({ ...logCommon, 封回结果: banResult.ok ? '成功' : `失败:${banResult.error}` }));
+			await notifyOwnerBlacklistIntercept(targetUser, chat, '群内手动解封拦截', blacklistCheck, banResult);
+		} else {
+			// 不在 D1 黑名单：无黑名单变化，仅发审计通知告知主人群内发生了解封动作
+			await notifyOwnerChatMemberAction(chatMember, '解封用户（非黑名单）', oldStatus, newStatus);
+		}
 	}
 }
 
@@ -5119,17 +5157,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 	// 处理 /start 和 /unban 命令 - 显示欢迎消息
 	if (text === '/start' || text === '/unban') {
-		// 检查黑名单
-		const blacklistCheck = await checkBlacklist(userId, env);
-		if (blacklistCheck.isBlacklisted) {
-			const reason = blacklistCheck.entry?.reason;
-			if (reason === 'manual' || reason === 'spam') {
-				await sendTelegramMessage(chatId, blacklistCheck.message);
-				await notifyOwnerBlacklistAppeal(message.from, blacklistCheck);
-				return;
-			}
-			// ad_auto / manual_ban 允许自助解封，先自动移出黑名单
-			await removeFromBlacklist(userId, env);
+		// D1 全局黑名单是自助解封的硬闸门：命中任何 reason 都拒绝，且不自动移除黑名单。
+		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env)) {
+			return;
 		}
 
 		const groupInfo = await getGroupInfo();
@@ -5142,17 +5172,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 	// 检查用户回复是否完全匹配提示语，禁止夹带其它内容
 	else if (text && text.trim() === SELF_UNBAN_KEYWORD) {
-		// D1 异常时保持放行策略：checkBlacklist 内部出错会返回 isBlacklisted=false
-		const blacklistCheck = await checkBlacklist(userId, env);
-		if (blacklistCheck.isBlacklisted) {
-			const reason = blacklistCheck.entry?.reason;
-			if (reason === 'manual' || reason === 'spam') {
-				await sendTelegramMessage(chatId, blacklistCheck.message);
-				await notifyOwnerBlacklistAppeal(message.from, blacklistCheck);
-				return;
-			}
-			// ad_auto / manual_ban 允许自助解封，先自动移出黑名单
-			await removeFromBlacklist(userId, env);
+		// D1 全局黑名单是自助解封的硬闸门：命中任何 reason 都拒绝，且不自动移除黑名单。
+		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env)) {
+			return;
 		}
 		const groupInfo = await getGroupInfo();
 		await sendTelegramMessage(chatId, SELF_UNBAN_APPROVED.replaceAll('{username}', groupInfo.username));
@@ -5474,6 +5496,12 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 // 单群查询失败不阻塞后续群；任一群命中即返回 true。
 async function checkIfUserIsAdmin(userId) {
 	const userIdStr = String(userId);
+
+	// 主人/副主人直接放行（最高权限，先于超管/群管理员检查）
+	if (isOwner(userIdStr)) {
+		console.log(`[管理员鉴权] 用户 ${userId} 是主人/副主人 ✅`);
+		return true;
+	}
 
 	// 超级管理员直接放行（最高权限,优先于群管理员检查）
 	if (isSuperAdmin(userIdStr)) {

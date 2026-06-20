@@ -1395,6 +1395,68 @@ console.log('\n[12] 群内 /unban 单条');
 	assert('群内 /unban 指令消息 msgId=900 被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 900));
 }
 
+// ---------- [12b] D1 黑名单用户确认自助解封:任何 reason 都拒绝 ----------
+console.log('\n[12b] D1 黑名单用户确认自助解封一律拒绝');
+{
+	const reasons = ['manual', 'spam', 'manual_ban', 'ad_auto', 'unknown_reason'];
+	for (const reason of reasons) {
+		resetCalls();
+		sandbox.fetch = makeFetchMock({
+			sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+			getChat: () => ({ ok: true, result: { id: 1397983659, first_name: '管理员', type: 'private' } }),
+		});
+
+		const env = {
+			...baseEnv,
+			OWNER_IDS: '',
+			DB: makeFakeDB([{ id: '7787880224', reason, by: '1397983659', at: '2026-06-20T06:24:44.203Z' }]),
+		};
+		const update = {
+			message: {
+				message_id: 1201,
+				chat: { id: 7787880224, type: 'private' },
+				from: { id: 7787880224, is_bot: false, first_name: '慢' },
+				text: '我不是广告狗，我是误封的，希望可以解封。',
+			},
+		};
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, { waitUntil: () => {} });
+
+		const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
+		assert(`自助解封拒绝 reason=${reason}: D1 黑名单仍保留`, blacklist.some((e) => e.id === '7787880224' && e.reason === reason));
+		assert(`自助解封拒绝 reason=${reason}: 不调用 unbanChatMember`, callsOf('unbanChatMember').length === 0);
+		assert(`自助解封拒绝 reason=${reason}: 不调用 restrictChatMember`, callsOf('restrictChatMember').length === 0);
+		assert(`自助解封拒绝 reason=${reason}: 不查询群成员状态`, callsOf('getChatMember').length === 0);
+		const userReply = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7787880224');
+		assert(`自助解封拒绝 reason=${reason}: 用户收到黑名单拒绝`, !!userReply && userReply.body.text.includes('黑名单'));
+	}
+}
+
+// ---------- [12c] D1 不可用时自助解封失败关闭 ----------
+console.log('\n[12c] D1 不可用时自助解封失败关闭');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+
+	const env = { ...baseEnv, OWNER_IDS: '' };
+	const update = {
+		message: {
+			message_id: 1202,
+			chat: { id: 7787880224, type: 'private' },
+			from: { id: 7787880224, is_bot: false, first_name: '慢' },
+			text: '我不是广告狗，我是误封的，希望可以解封。',
+		},
+	};
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, { waitUntil: () => {} });
+
+	const userReply = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7787880224');
+	assert('D1 不可用: 用户收到拒绝提示', !!userReply && userReply.body.text.includes('无法确认 D1 黑名单状态'));
+	assert('D1 不可用: 不调用 unbanChatMember', callsOf('unbanChatMember').length === 0);
+	assert('D1 不可用: 不调用 restrictChatMember', callsOf('restrictChatMember').length === 0);
+	assert('D1 不可用: 不查询群成员状态', callsOf('getChatMember').length === 0);
+}
+
 // ---------- [13] 私聊 /ban 单条:行为不变(向后兼容) ----------
 console.log('\n[13] 私聊 /ban 单条向后兼容');
 {
