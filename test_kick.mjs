@@ -1835,7 +1835,9 @@ console.log('\n[24] chat_member 手动 ban:主人收审计');
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('主人 999 收到 chat_member 审计', !!ownerDm);
 	assert('审计含"群管理员操作通知"', ownerDm.body.text.includes('群管理员操作通知'));
-	assert('审计含"群内手动 加黑"', ownerDm.body.text.includes('群内手动 加黑'));
+	assert('审计含"群内手动 封禁"（不再加黑）', ownerDm.body.text.includes('群内手动 封禁'));
+	assert('审计标注"未加入全局黑名单"', ownerDm.body.text.includes('未加入全局黑名单'));
+	assert('真人群内手动封禁不写入 D1 黑名单（唯一来源=/ban /spam）', !env.DB._rows.has('5555'));
 	assert('审计含操作人"台风"', ownerDm.body.text.includes('台风'));
 	assert('审计含目标"广告号"', ownerDm.body.text.includes('广告号'));
 	// 状态变更已翻译为中文
@@ -1887,6 +1889,46 @@ console.log('\n[25] 重复加黑同一用户:已在黑名单仍继续踢出');
 	assert('已在黑名单仍会全群踢出', callsOf('banChatMember').length === 2);
 }
 
+// ---------- [25b] 作为管理员的机器人发 /ban → 不写入 D1 黑名单（仅真人可加黑）----------
+console.log('\n[25b] 机器人管理员发 /ban:不加黑');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		// 即便这个机器人是群管理员，发 /ban 也必须被真人防护拦在 checkIfUserIsAdmin 之前
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 5566001122, is_bot: true }, status: 'administrator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const update = {
+		message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 5566001122, is_bot: true, first_name: 'nmBot' }, text: '/ban 99999 广告' },
+	};
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+	assert('机器人发 /ban 不写入 D1 黑名单', !env.DB._rows.has('99999'));
+	assert('机器人发 /ban 不触发踢人', callsOf('banChatMember').length === 0);
+}
+
+// ---------- [25c] 作为管理员的机器人发 /spam → 不写入 D1 黑名单 ----------
+console.log('\n[25c] 机器人管理员发 /spam:不加黑');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 5566001122, is_bot: true }, status: 'administrator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const update = {
+		message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 5566001122, is_bot: true, first_name: 'nmBot' }, text: '/spam 88888 广告' },
+	};
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([]) };
+	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+	assert('机器人发 /spam 不写入 D1 黑名单', !env.DB._rows.has('88888'));
+	assert('机器人发 /spam 不触发踢人', callsOf('banChatMember').length === 0);
+}
+
 // ---------- [26] 机器人操作 chat_member → 不通知主人 ----------
 console.log('\n[26] 机器人(其它bot)手动操作:不通知主人');
 {
@@ -1908,6 +1950,7 @@ console.log('\n[26] 机器人(其它bot)手动操作:不通知主人');
 
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('机器人操作 → 主人不收通知', !ownerDm);
+	assert('机器人封禁不写入 D1 黑名单（核心:作为管理员的 bot 封禁绝不进黑名单）', !env.DB._rows.has('5555'));
 }
 
 // ---------- [27] 匿名管理员(GroupAnonymousBot)操作 → 仍通知主人 ----------
@@ -1934,6 +1977,7 @@ console.log('\n[27] 匿名管理员操作:仍通知主人');
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('匿名管理员操作 → 主人仍收通知', !!ownerDm);
 	assert('通知含目标"广告"', ownerDm.body.text.includes('广告'));
+	assert('匿名管理员群内手动封禁不写入 D1 黑名单', !env.DB._rows.has('6666'));
 }
 
 // ===== 广告自动检测专项测试([28]-[37]) =====

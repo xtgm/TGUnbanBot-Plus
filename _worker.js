@@ -981,6 +981,15 @@ function renderBanResults(banResults) {
 // 双通道回执：群内场景发闪屏 + 私聊管理员发详情；私聊场景直接发详情
 // 私聊投递失败（管理员从未 /start 过 bot）时，群里追加一条闪屏说明
 
+// GroupAnonymousBot 的固定 TGID：真人开启"匿名管理员"身份发言时 from 会是它，代表真人操作。
+const ANON_ADMIN_BOT_ID = '1087968824';
+
+// 判断操作发起者是否为"机器人操作"。加黑等【仅限真人】的动作据此排除：
+// 任何作为管理员的第三方机器人都算机器人操作；GroupAnonymousBot（真人匿名身份）视为真人，不算。
+function isBotOperator(user) {
+	return Boolean(user?.is_bot) && String(user?.id || '') !== ANON_ADMIN_BOT_ID;
+}
+
 function isOwner(id) {
 	return OWNER_IDS.length > 0 && OWNER_IDS.includes(String(id || ''));
 }
@@ -2938,10 +2947,11 @@ async function handleChatMemberUpdate(chatMember, env) {
 	};
 
 	if (newStatus === 'kicked') {
-		// 管理员手动封禁 → 加黑
-		const result = await addToBlacklist(targetIdStr, env, { reason: 'manual_ban', by: fromIdStr });
-		console.log('[chat_member] 同步加黑:', JSON.stringify({ ...logCommon, 结果: result.success ? '已加入' : result.message }));
-		await notifyOwnerChatMemberAction(chatMember, '加黑', oldStatus, newStatus);
+		// 群内手动封禁（真人点 Telegram 封禁按钮 / 任何作为管理员的机器人执行封禁）一律【不再】同步进 D1 黑名单。
+		// D1 全局黑名单的唯一来源 = 真人管理员的 /ban、/spam 指令（含 /ban 123、/spam 123、引用消息 /spam）。
+		// 这里仅发审计通知告知主人群里发生了手动封禁；notifyOwnerChatMemberAction 内部已自动过滤机器人操作，机器人封禁不会打扰主人。
+		console.log('[chat_member] 群内手动封禁，按规则不同步加黑:', JSON.stringify(logCommon));
+		await notifyOwnerChatMemberAction(chatMember, '封禁（未加入全局黑名单）', oldStatus, newStatus);
 	} else if (oldStatus === 'kicked') {
 		// 群内手动解封：D1 黑名单是权威封禁，禁止经此被绕过/清除。
 		// 仅 /unban 指令(群管理员/超管/主人/副主人鉴权)可移出 D1 黑名单。
@@ -4128,6 +4138,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	if (isSpamCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
 
+		// 仅真人可通过 /spam 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
+		if (isBotOperator(message.from)) return;
+
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
 			if (!isInGroup) {
@@ -4964,6 +4977,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 处理 /ban 命令 - 添加用户到黑名单（支持批量、群内/私聊双场景）
 	if (text && text.startsWith('/ban ')) {
 		const isInGroup = message.chat.type !== 'private';
+
+		// 仅真人可通过 /ban 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
+		if (isBotOperator(message.from)) return;
 
 		// 检查是否是群组管理员
 		const isAdmin = await checkIfUserIsAdmin(userId);
