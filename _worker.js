@@ -4616,6 +4616,37 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
+	// ===== /leavegroup 主人私聊命令：让 bot 退出指定群组 =====
+	// 仅 OWNER_IDS[0] 主人私聊可用；群内发送只撤回命令，不执行退出。
+	if (text && /^\/leavegroup(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		if (!isPrimaryOwner(userId)) {
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人私聊使用。');
+			}
+			return;
+		}
+		if (isInGroup) {
+			await deleteAuthorizedGroupCommandMessage(message, '/leavegroup');
+			return;
+		}
+
+		const argMatch = text.trim().match(/^\/leavegroup(?:@[^\s]+)?\s+(-\d{5,20})\s*$/i);
+		if (!argMatch) {
+			await sendTelegramMessage(chatId, '用法:<code>/leavegroup -1001234567890</code>\n仅支持负数群组 ID。');
+			return;
+		}
+
+		const targetChatId = argMatch[1];
+		const result = await leaveTelegramChat(targetChatId);
+		if (result.ok) {
+			await sendTelegramMessage(chatId, `✅ 已退出群组\n群组ID:<code>${escapeHtml(targetChatId)}</code>`);
+		} else {
+			await sendTelegramMessage(chatId, `❌ 退出群组失败\n群组ID:<code>${escapeHtml(targetChatId)}</code>\n原因:${escapeHtml(result.error || '未知错误')}`);
+		}
+		return;
+	}
+
 	// ===== 广告词库热更新命令(仅主人可用)=====
 	// /addword /delword /listwords /importdefault
 	if (text && /^\/(addword|delword|listwords|importdefault)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
@@ -5372,6 +5403,30 @@ async function banUserFromGroup(chatId, userId) {
 		return { ok: true };
 	} catch (error) {
 		console.error(`[banChatMember] chat=${chatId} user=${userId} 异常:`, error);
+		return { ok: false, error: error.message };
+	}
+}
+
+// 让 bot 退出指定群组（Telegram leaveChat API）
+// 返回 { ok: bool, error?: string }；目标群不存在、bot 不在群内等场景不抛异常。
+async function leaveTelegramChat(chatId) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/leaveChat`;
+	const body = { chat_id: String(chatId) };
+
+	try {
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		console.log(`[leaveChat] chat=${chatId} ok=${result.ok}${result.description ? ' desc=' + result.description : ''}`);
+		if (!response.ok || !result.ok) {
+			return { ok: false, error: result.description || `HTTP ${response.status}` };
+		}
+		return { ok: true };
+	} catch (error) {
+		console.error(`[leaveChat] chat=${chatId} 异常:`, error);
 		return { ok: false, error: error.message };
 	}
 }
