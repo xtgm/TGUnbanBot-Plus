@@ -4567,9 +4567,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'<b>━━ 权限名单查询(仅主人私聊)━━</b>',
 			'<code>/admins</code> 查看当前主人/副主人/超级管理员名单,显示 TGID、昵称、用户名、群内身份',
 			'<code>/groups</code> 查看当前 GROUP_ID 配置群组,显示群名、ChatID、类型、用户名',
+			'<code>/leavegroup -1001234567890</code> 让 bot 退出指定群组(仅主人私聊)',
 			'',
 			'<b>━━ 说明 ━━</b>',
-			'• 以上指令对普通用户/群管理员/超级管理员<b>完全无反应</b>；<code>/admins</code>/<code>/groups</code> 只允许主人私聊使用',
+			'• 以上指令对普通用户/群管理员/超级管理员<b>完全无反应</b>；<code>/admins</code>/<code>/groups</code>/<code>/leavegroup</code> 只允许主人私聊使用',
 			'• 学习一律<b>只入库不踢人</b>;要踢发广告的人,用回执里给的 TGID 发 <code>/be TGID</code>',
 			'• 学习只写整句指纹,<b>不再自动往词库加词</b>(避免误杀正常消息);建议词需你手动 /addword',
 			'• <b>链接识别</b>:github/google 等正常域名链接永不被杀;含链接的样本只精确匹配不扩散;可疑短链(bit.ly等)才加分',
@@ -4638,11 +4639,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		const targetChatId = argMatch[1];
+		const chatInfo = await getChatInfoFromId(targetChatId);
+		const groupTitle = chatInfo?.title || '未知群组';
+		const groupLines = [
+			`群组:<b>${escapeHtml(groupTitle)}</b>`,
+			`群组ID:<code>${escapeHtml(targetChatId)}</code>`
+		].join('\n');
 		const result = await leaveTelegramChat(targetChatId);
 		if (result.ok) {
-			await sendTelegramMessage(chatId, `✅ 已退出群组\n群组ID:<code>${escapeHtml(targetChatId)}</code>`);
+			await sendTelegramMessage(chatId, `✅ 已退出群组\n${groupLines}`);
 		} else {
-			await sendTelegramMessage(chatId, `❌ 退出群组失败\n群组ID:<code>${escapeHtml(targetChatId)}</code>\n原因:${escapeHtml(result.error || '未知错误')}`);
+			await sendTelegramMessage(chatId, `❌ 退出群组失败\n${groupLines}\n原因:${escapeHtml(translateLeaveChatError(result.error))}`);
 		}
 		return;
 	}
@@ -5429,6 +5436,35 @@ async function leaveTelegramChat(chatId) {
 		console.error(`[leaveChat] chat=${chatId} 异常:`, error);
 		return { ok: false, error: error.message };
 	}
+}
+
+function translateLeaveChatError(description) {
+	if (!description) return '未知错误，请查看 Worker 日志获取详情。';
+	const lower = String(description).toLowerCase();
+
+	if (lower.includes("can't be changed in private chats") || lower.includes('private chat')) {
+		return '这是私聊 ID，不是群组 ID；bot 不能退出私聊。';
+	}
+	if (lower.includes('chat not found')) {
+		return '找不到该群组，可能群组 ID 错误，或 bot 已不在该群。';
+	}
+	if (lower.includes('bot is not a member') || lower.includes('not a member of the chat')) {
+		return 'bot 当前不在该群，无法执行退出。';
+	}
+	if (lower.includes('was kicked') || lower.includes('kicked from the group')) {
+		return 'bot 已经被踢出该群，无需再次退出。';
+	}
+	if (lower.includes('peer_id_invalid') || lower.includes('chat_id_invalid')) {
+		return '群组 ID 无效，请检查是否为正确的负数群组 ID。';
+	}
+	if (lower.includes('flood') || lower.includes('too many requests')) {
+		return 'Telegram 请求过于频繁，请稍后重试。';
+	}
+	if (lower.includes('forbidden')) {
+		return 'Telegram 拒绝本次请求，可能 bot 已无法访问该群。';
+	}
+
+	return 'Telegram 返回未识别错误，请查看 Worker 日志获取原始描述。';
 }
 
 // 删除单条消息（Telegram deleteMessage API）

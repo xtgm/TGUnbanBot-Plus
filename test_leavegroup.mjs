@@ -26,6 +26,12 @@ function stripExportDefault(source) {
 }
 
 const calls = [];
+let telegramHandlers = {};
+
+function setTelegramHandlers(next = {}) {
+	telegramHandlers = next;
+}
+
 const sandbox = {
 	console, URL, URLSearchParams, TextEncoder, TextDecoder,
 	Response, Request, Headers, atob, btoa, setTimeout, clearTimeout,
@@ -33,11 +39,17 @@ const sandbox = {
 		const apiMethod = String(url).split('/').pop();
 		const body = init?.body ? JSON.parse(init.body) : null;
 		calls.push({ method: apiMethod, body });
-		return {
+		const handler = telegramHandlers[apiMethod];
+		const mock = handler ? handler(body) : null;
+		const payload = mock?.payload || mock || {
 			ok: true,
-			status: 200,
+			result: apiMethod === 'sendMessage' ? { message_id: 999 } : true
+		};
+		return {
+			ok: mock?.httpOk ?? true,
+			status: mock?.status ?? 200,
 			async json() {
-				return { ok: true, result: apiMethod === 'sendMessage' ? { message_id: 999 } : true };
+				return payload;
 			}
 		};
 	}
@@ -69,6 +81,12 @@ function assert(name, condition, detail = '') {
 
 function resetCalls() {
 	calls.length = 0;
+	setTelegramHandlers();
+}
+
+function lastSentText() {
+	const sent = calls.filter((c) => c.method === 'sendMessage').at(-1);
+	return String(sent?.body?.text || '');
 }
 
 async function sendUpdate(message) {
@@ -103,28 +121,50 @@ function groupMessage(fromId, text) {
 
 console.log('\n[1] owner private /leavegroup calls leaveChat');
 resetCalls();
+setTelegramHandlers({
+	getChat: () => ({ ok: true, result: { title: 'Alpha Test Group', username: 'alpha_test_group' } }),
+	leaveChat: () => ({ ok: true, result: true })
+});
 await sendUpdate(privateMessage(10001, '/leavegroup -1002565053719'));
 assert('leaveChat called once', calls.filter((c) => c.method === 'leaveChat').length === 1, JSON.stringify(calls));
 assert('leaveChat uses target chat id', calls.some((c) => c.method === 'leaveChat' && c.body?.chat_id === '-1002565053719'));
-assert('success reply sent', calls.some((c) => c.method === 'sendMessage' && String(c.body?.text || '').includes('已退出群组')));
+assert('getChat runs before leaveChat', calls.findIndex((c) => c.method === 'getChat') > -1 && calls.findIndex((c) => c.method === 'getChat') < calls.findIndex((c) => c.method === 'leaveChat'));
+assert('success reply includes group title', lastSentText().includes('Alpha Test Group'), lastSentText());
+assert('success reply includes group id', lastSentText().includes('-1002565053719'), lastSentText());
 
 console.log('\n[2] owner group /leavegroup never calls leaveChat');
 resetCalls();
 await sendUpdate(groupMessage(10001, '/leavegroup -1002565053719'));
 assert('leaveChat not called in group', calls.every((c) => c.method !== 'leaveChat'), JSON.stringify(calls));
+assert('getChat not called in group', calls.every((c) => c.method !== 'getChat'), JSON.stringify(calls));
 assert('group command delete attempted', calls.some((c) => c.method === 'deleteMessage'));
 
 console.log('\n[3] non-owner private /leavegroup is rejected');
 resetCalls();
 await sendUpdate(privateMessage(20002, '/leavegroup -1002565053719'));
 assert('leaveChat not called for non-owner', calls.every((c) => c.method !== 'leaveChat'), JSON.stringify(calls));
+assert('getChat not called for non-owner', calls.every((c) => c.method !== 'getChat'), JSON.stringify(calls));
 assert('permission denied reply sent', calls.some((c) => c.method === 'sendMessage' && String(c.body?.text || '').includes('权限不足')));
 
 console.log('\n[4] invalid chat id is rejected before leaveChat');
 resetCalls();
 await sendUpdate(privateMessage(10001, '/leavegroup 1397983659'));
 assert('leaveChat not called for positive id', calls.every((c) => c.method !== 'leaveChat'), JSON.stringify(calls));
+assert('getChat not called for positive id', calls.every((c) => c.method !== 'getChat'), JSON.stringify(calls));
 assert('usage reply sent', calls.some((c) => c.method === 'sendMessage' && String(c.body?.text || '').includes('/leavegroup -1001234567890')));
+
+console.log('\n[5] leaveChat failure is translated to Chinese');
+resetCalls();
+setTelegramHandlers({
+	getChat: () => ({ ok: true, result: { title: 'Missing Test Group' } }),
+	leaveChat: () => ({ ok: false, description: 'Bad Request: chat not found' })
+});
+await sendUpdate(privateMessage(10001, '/leavegroup -1002031471502'));
+assert('failed leaveChat called once', calls.filter((c) => c.method === 'leaveChat').length === 1, JSON.stringify(calls));
+assert('failure reply includes group title', lastSentText().includes('Missing Test Group'), lastSentText());
+assert('failure reply includes group id', lastSentText().includes('-1002031471502'), lastSentText());
+assert('failure reason is Chinese', lastSentText().includes('找不到该群组'), lastSentText());
+assert('failure reply hides raw English error', !lastSentText().includes('Bad Request') && !lastSentText().includes('chat not found'), lastSentText());
 
 console.log(`\nResult: ${pass} passed, ${fail} failed`);
 if (fail > 0) {
