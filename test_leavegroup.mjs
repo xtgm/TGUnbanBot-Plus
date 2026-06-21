@@ -41,10 +41,7 @@ const sandbox = {
 		calls.push({ method: apiMethod, body });
 		const handler = telegramHandlers[apiMethod];
 		const mock = handler ? handler(body) : null;
-		const payload = mock?.payload || mock || {
-			ok: true,
-			result: apiMethod === 'sendMessage' ? { message_id: 999 } : true
-		};
+		const payload = mock?.payload || mock || defaultTelegramPayload(apiMethod);
 		return {
 			ok: mock?.httpOk ?? true,
 			status: mock?.status ?? 200,
@@ -89,6 +86,12 @@ function lastSentText() {
 	return String(sent?.body?.text || '');
 }
 
+function defaultTelegramPayload(apiMethod) {
+	if (apiMethod === 'sendMessage') return { ok: true, result: { message_id: 999 } };
+	if (apiMethod === 'getMe') return { ok: true, result: { id: 777000, username: 'LeaveGroupTestBot' } };
+	return { ok: true, result: true };
+}
+
 async function sendUpdate(message) {
 	const request = new Request('https://example.workers.dev/', {
 		method: 'POST',
@@ -121,16 +124,26 @@ function groupMessage(fromId, text) {
 
 console.log('\n[1] owner private /leavegroup calls leaveChat');
 resetCalls();
+let membershipChecks = 0;
 setTelegramHandlers({
 	getChat: () => ({ ok: true, result: { title: 'Alpha Test Group', username: 'alpha_test_group' } }),
+	getChatMember: () => {
+		membershipChecks += 1;
+		return {
+			ok: true,
+			result: { status: membershipChecks === 1 ? 'administrator' : 'left', user: { id: 777000, is_bot: true } }
+		};
+	},
 	leaveChat: () => ({ ok: true, result: true })
 });
 await sendUpdate(privateMessage(10001, '/leavegroup -1002565053719'));
 assert('leaveChat called once', calls.filter((c) => c.method === 'leaveChat').length === 1, JSON.stringify(calls));
 assert('leaveChat uses target chat id', calls.some((c) => c.method === 'leaveChat' && c.body?.chat_id === '-1002565053719'));
 assert('getChat runs before leaveChat', calls.findIndex((c) => c.method === 'getChat') > -1 && calls.findIndex((c) => c.method === 'getChat') < calls.findIndex((c) => c.method === 'leaveChat'));
+assert('getChatMember checks before and after leaveChat', calls.filter((c) => c.method === 'getChatMember').length === 2, JSON.stringify(calls));
 assert('success reply includes group title', lastSentText().includes('Alpha Test Group'), lastSentText());
 assert('success reply includes group id', lastSentText().includes('-1002565053719'), lastSentText());
+assert('success reply is confirmed', lastSentText().includes('已确认退出群组'), lastSentText());
 
 console.log('\n[2] owner group /leavegroup never calls leaveChat');
 resetCalls();
@@ -157,6 +170,7 @@ console.log('\n[5] leaveChat failure is translated to Chinese');
 resetCalls();
 setTelegramHandlers({
 	getChat: () => ({ ok: true, result: { title: 'Missing Test Group' } }),
+	getChatMember: () => ({ ok: true, result: { status: 'administrator', user: { id: 777000, is_bot: true } } }),
 	leaveChat: () => ({ ok: false, description: 'Bad Request: chat not found' })
 });
 await sendUpdate(privateMessage(10001, '/leavegroup -1002031471502'));
@@ -165,6 +179,37 @@ assert('failure reply includes group title', lastSentText().includes('Missing Te
 assert('failure reply includes group id', lastSentText().includes('-1002031471502'), lastSentText());
 assert('failure reason is Chinese', lastSentText().includes('找不到该群组'), lastSentText());
 assert('failure reply hides raw English error', !lastSentText().includes('Bad Request') && !lastSentText().includes('chat not found'), lastSentText());
+
+console.log('\n[6] already-left group is not reported as newly exited');
+resetCalls();
+setTelegramHandlers({
+	getChat: () => ({ ok: true, result: { title: 'Already Left Group' } }),
+	getChatMember: () => ({ ok: true, result: { status: 'left', user: { id: 777000, is_bot: true } } })
+});
+await sendUpdate(privateMessage(10001, '/leavegroup -1003744258220'));
+assert('leaveChat not called when bot already left', calls.every((c) => c.method !== 'leaveChat'), JSON.stringify(calls));
+assert('already-left reply includes group title', lastSentText().includes('Already Left Group'), lastSentText());
+assert('already-left reply says bot is not in group', lastSentText().includes('bot 已不在该群组'), lastSentText());
+assert('already-left reply does not say confirmed exit', !lastSentText().includes('已确认退出群组'), lastSentText());
+
+console.log('\n[7] post-check still in group blocks success reply');
+resetCalls();
+let stillInGroupChecks = 0;
+setTelegramHandlers({
+	getChat: () => ({ ok: true, result: { title: 'Still In Group' } }),
+	getChatMember: () => {
+		stillInGroupChecks += 1;
+		return {
+			ok: true,
+			result: { status: stillInGroupChecks === 1 ? 'administrator' : 'member', user: { id: 777000, is_bot: true } }
+		};
+	},
+	leaveChat: () => ({ ok: true, result: true })
+});
+await sendUpdate(privateMessage(10001, '/leavegroup -100315741565'));
+assert('leaveChat called for still-in-group scenario', calls.filter((c) => c.method === 'leaveChat').length === 1, JSON.stringify(calls));
+assert('still-in-group reply reports failure', lastSentText().includes('退出群组失败'), lastSentText());
+assert('still-in-group reply does not say confirmed exit', !lastSentText().includes('已确认退出群组'), lastSentText());
 
 console.log(`\nResult: ${pass} passed, ${fail} failed`);
 if (fail > 0) {

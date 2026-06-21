@@ -4645,11 +4645,30 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			`群组:<b>${escapeHtml(groupTitle)}</b>`,
 			`群组ID:<code>${escapeHtml(targetChatId)}</code>`
 		].join('\n');
+
+		const beforeLeave = await getBotChatMembership(targetChatId);
+		if (beforeLeave.ok && !beforeLeave.inChat) {
+			await sendTelegramMessage(chatId, `ℹ️ bot 已不在该群组\n${groupLines}\n状态:${escapeHtml(formatBotChatMembershipStatus(beforeLeave))}`);
+			return;
+		}
+		if (!beforeLeave.ok) {
+			await sendTelegramMessage(chatId, `❌ 退出群组失败\n${groupLines}\n原因:无法确认 bot 当前是否仍在群内，已取消退出操作。${escapeHtml(translateLeaveChatError(beforeLeave.error))}`);
+			return;
+		}
+
 		const result = await leaveTelegramChat(targetChatId);
-		if (result.ok) {
-			await sendTelegramMessage(chatId, `✅ 已退出群组\n${groupLines}`);
-		} else {
+		if (!result.ok) {
 			await sendTelegramMessage(chatId, `❌ 退出群组失败\n${groupLines}\n原因:${escapeHtml(translateLeaveChatError(result.error))}`);
+			return;
+		}
+
+		const afterLeave = await getBotChatMembership(targetChatId);
+		if (afterLeave.ok && !afterLeave.inChat) {
+			await sendTelegramMessage(chatId, `✅ 已确认退出群组\n${groupLines}\n状态:${escapeHtml(formatBotChatMembershipStatus(afterLeave))}`);
+		} else if (afterLeave.ok && afterLeave.inChat) {
+			await sendTelegramMessage(chatId, `❌ 退出群组失败\n${groupLines}\n原因:Telegram 已返回退出成功，但复查显示 bot 仍在群内（状态:${escapeHtml(formatBotChatMembershipStatus(afterLeave))}）。`);
+		} else {
+			await sendTelegramMessage(chatId, `⚠️ 退出请求已发送，但无法确认最终状态\n${groupLines}\n原因:${escapeHtml(translateLeaveChatError(afterLeave.error))}`);
 		}
 		return;
 	}
@@ -5436,6 +5455,53 @@ async function leaveTelegramChat(chatId) {
 		console.error(`[leaveChat] chat=${chatId} 异常:`, error);
 		return { ok: false, error: error.message };
 	}
+}
+
+async function getBotChatMembership(chatId) {
+	const botId = await getBotId();
+	if (!botId) {
+		return { ok: false, inChat: false, error: '无法获取机器人 ID' };
+	}
+
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`;
+	const body = { chat_id: String(chatId), user_id: Number(botId) };
+
+	try {
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		console.log(`[getBotChatMembership] chat=${chatId} bot=${botId} ok=${result.ok}${result.description ? ' desc=' + result.description : ''}`);
+		if (!response.ok || !result.ok) {
+			return { ok: false, inChat: false, error: result.description || `HTTP ${response.status}` };
+		}
+
+		const member = result.result || {};
+		const status = String(member.status || '').toLowerCase();
+		const inChat = status === 'creator' ||
+			status === 'administrator' ||
+			status === 'member' ||
+			(status === 'restricted' && member.is_member !== false);
+		return { ok: true, inChat, status, isMember: member.is_member };
+	} catch (error) {
+		console.error(`[getBotChatMembership] chat=${chatId} 异常:`, error);
+		return { ok: false, inChat: false, error: error.message };
+	}
+}
+
+function formatBotChatMembershipStatus(membership) {
+	const status = String(membership?.status || '').toLowerCase();
+	const map = {
+		creator: '群主',
+		administrator: '管理员',
+		member: '成员',
+		restricted: membership?.isMember === false ? '已离开' : '受限成员',
+		left: '已离开',
+		kicked: '已被移出'
+	};
+	return map[status] || status || '未知';
 }
 
 function translateLeaveChatError(description) {
