@@ -3882,6 +3882,22 @@ function translateBlacklistReason(reason) {
 async function translateBlacklistOperator(byId) {
 	if (!byId) return '未知';
 	if (byId === 'system') return '🤖 系统自动';
+	const anonymousMatch = String(byId).match(/^anonymous_admin:(-?\d+)$/);
+	if (anonymousMatch) {
+		const groupId = anonymousMatch[1];
+		let groupLabel = `<code>${escapeHtml(groupId)}</code>`;
+		const isConfiguredSourceGroup = isConfiguredGroup(groupId);
+		if (isConfiguredSourceGroup) {
+			try {
+				const info = await getChatInfoFromId(groupId);
+				if (info?.title) {
+					groupLabel = `<b>${escapeHtml(info.title)}</b> <code>${escapeHtml(groupId)}</code>`;
+				}
+			} catch (_) {}
+		}
+		const sourceLabel = isConfiguredSourceGroup ? '来源群' : '来源群(未在当前 GROUP_ID)';
+		return `<b>匿名管理员</b>\n   ${sourceLabel}:${groupLabel}`;
+	}
 
 	let roleTag = '👤 群管理员';
 	if (isPrimaryOwner(byId)) roleTag = '👑 主人';

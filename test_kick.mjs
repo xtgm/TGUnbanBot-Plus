@@ -1729,6 +1729,72 @@ console.log('\n[12b] D1 黑名单用户确认自助解封一律拒绝');
 	}
 }
 
+// ---------- [12b2] 黑名单用户申诉:匿名管理员来源展示 ----------
+console.log('\n[12b2] 黑名单用户申诉:匿名管理员来源展示');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChat: (b) => {
+			if (String(b.chat_id) === '-1001') {
+				return { ok: true, result: { id: -1001, title: '杀神专用黑名', type: 'supergroup' } };
+			}
+			return { ok: true, result: { id: Number(b.chat_id), first_name: '用户', type: 'private' } };
+		},
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+
+	const env = {
+		...baseEnv,
+		OWNER_IDS: '999',
+		DB: makeFakeDB([{ id: '7787880224', reason: 'manual', by: 'anonymous_admin:-1001', at: '2026-06-22T05:38:15.224Z' }]),
+	};
+	const update = {
+		message: {
+			message_id: 12015,
+			chat: { id: 7787880224, type: 'private' },
+			from: { id: 7787880224, is_bot: false, first_name: '鬼鬼' },
+			text: '/unban',
+		},
+	};
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, { waitUntil: () => {} });
+
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('匿名加黑申诉:主人收到通知', !!ownerDm && ownerDm.body.text.includes('黑名单用户申诉'));
+	assert('匿名加黑申诉:显示匿名管理员', ownerDm.body.text.includes('加黑操作人:<b>匿名管理员</b>'));
+	assert('匿名加黑申诉:显示来源群名和群ID', ownerDm.body.text.includes('来源群:<b>杀神专用黑名</b>') && ownerDm.body.text.includes('-1001'));
+	assert('匿名加黑申诉:不直接暴露内部 by_user 标记', !ownerDm.body.text.includes('anonymous_admin:-1001'));
+}
+
+// ---------- [12b3] 黑名单用户申诉:匿名来源群必须命中 GROUP_ID 才展示群名 ----------
+console.log('\n[12b3] 黑名单用户申诉:匿名来源群按 GROUP_ID 判定');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '不应显示的未配置群名', type: 'supergroup' } }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+
+	const env = {
+		...baseEnv,
+		OWNER_IDS: '999',
+		DB: makeFakeDB([{ id: '7787880224', reason: 'manual', by: 'anonymous_admin:-2001', at: '2026-06-22T05:38:15.224Z' }]),
+	};
+	const update = {
+		message: {
+			message_id: 12016,
+			chat: { id: 7787880224, type: 'private' },
+			from: { id: 7787880224, is_bot: false, first_name: '鬼鬼' },
+			text: '/unban',
+		},
+	};
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, { waitUntil: () => {} });
+
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('未配置匿名来源:主人收到通知', !!ownerDm && ownerDm.body.text.includes('黑名单用户申诉'));
+	assert('未配置匿名来源:标注未在当前 GROUP_ID', ownerDm.body.text.includes('来源群(未在当前 GROUP_ID):') && ownerDm.body.text.includes('-2001'));
+	assert('未配置匿名来源:不展示未配置群名', !ownerDm.body.text.includes('不应显示的未配置群名'));
+}
+
 // ---------- [12c] D1 不可用时自助解封失败关闭 ----------
 console.log('\n[12c] D1 不可用时自助解封失败关闭');
 {
