@@ -396,6 +396,44 @@ console.log('\n[1b] /sa 错误翻译:CHAT_ADMIN_REQUIRED + 删消息失败');
 	assert('详情含建议"超过 48 小时"', dmSend.body.text.includes('48'));
 }
 
+// ---------- [1b2] /sa USER_ID_INVALID 重试后仍失败:精准提示 ----------
+console.log('\n[1b2] /sa USER_ID_INVALID 重试后仍失败');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
+		banChatMember: (b) => {
+			if (String(b.chat_id) === '-1002') {
+				return { ok: false, error_code: 400, description: 'Bad Request: USER_ID_INVALID' };
+			}
+			return { ok: true, result: true };
+		},
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const update = {
+		message: {
+			message_id: 205,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 999, is_bot: false },
+			text: '/sa 8899 广告引流',
+		},
+	};
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const banCalls = callsOf('banChatMember');
+	assert('/sa USER_ID_INVALID 只对失败群重试一次', banCalls.length === 3 && banCalls.filter((c) => String(c.body.chat_id) === '-1002').length === 2, `实际 ${banCalls.length}`);
+	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('/sa 用户识别失败:私聊回执存在', !!dmSend);
+	assert('/sa 用户识别失败:不再误报用户 ID 无效', !dmSend.body.text.includes('用户 ID 无效'));
+	assert('/sa 用户识别失败:提示 Telegram 暂时无法识别', dmSend.body.text.includes('Telegram 暂时无法识别该用户'));
+	assert('/sa 用户识别失败:建议包含 /sa 重试', dmSend.body.text.includes('重试 /sa'));
+}
+
 // ---------- [1c] /sa 大 TGID 不转 Number ----------
 console.log('\n[1c] /sa 大 TGID 不转 Number');
 {
@@ -970,6 +1008,46 @@ console.log('\n[10b] 群内 /be 单条 + 部分群失败');
 	assert('部分失败:汇总显示踢出 1/2', dmSend.body.text.includes('1/2'));
 	assert('部分失败:含友好原因（权限不足）', dmSend.body.text.includes('权限不足'));
 	assert('部分失败:含建议（封禁用户）', dmSend.body.text.includes('封禁用户'));
+}
+
+// ---------- [10b2] 群内 /be USER_ID_INVALID 首次失败后自动重试成功 ----------
+console.log('\n[10b2] 群内 /be USER_ID_INVALID 首次失败后自动重试成功');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	let failedOnce = false;
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
+		banChatMember: (b) => {
+			if (String(b.chat_id) === '-1002' && !failedOnce) {
+				failedOnce = true;
+				return { ok: false, error_code: 400, description: 'Bad Request: USER_ID_INVALID' };
+			}
+			return { ok: true, result: true };
+		},
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+
+	const update = {
+		message: {
+			message_id: 760,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 999, is_bot: false },
+			text: '/be 812889600',
+		},
+	};
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const banCalls = callsOf('banChatMember');
+	assert('/be USER_ID_INVALID 自动重试一次', banCalls.length === 3 && banCalls.filter((c) => String(c.body.chat_id) === '-1002').length === 2, `实际 ${banCalls.length}`);
+	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('/be 重试成功:私聊回执存在', !!dmSend);
+	assert('/be 重试成功:最终显示全部群成功', dmSend.body.text.includes('已从全部 2 个群踢出'));
+	assert('/be 重试成功:不显示用户 ID 无效', !dmSend.body.text.includes('用户 ID 无效'));
+	assert('/be 重试成功:不显示失败原因', !dmSend.body.text.includes('Telegram 暂时无法识别该用户'));
 }
 
 // ---------- [10c] 群内 /be 大 TGID 已存在仍保持字符串踢出 ----------

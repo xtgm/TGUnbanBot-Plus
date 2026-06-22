@@ -39,6 +39,7 @@ const PURGE_MAX_PAIR_LIMIT = 20;
 const PURGE_CONCURRENCY = 5;
 const PURGE_RUN_DELAY_MS = 250;
 const PURGE_DEFAULT_REASONS = ['manual', 'sa', 'spam'];
+const TG_USER_LOOKUP_RETRY_DELAY_MS = 350;
 
 // 5) /blacklist 列表中"原因"字段的中文映射。
 //    内置三种：sa（/sa 举报）、manual（/be 手动添加）、manual_ban（chat_member 自动同步）。
@@ -869,7 +870,7 @@ async function banUserFromAllGroups(userId) {
 	const results = [];
 	for (const groupId of GROUP_IDS) {
 		const r = await banUserFromGroup(groupId, userId);
-		results.push({ groupId, ok: r.ok, error: r.error });
+		results.push({ groupId, userId: String(userId), ok: r.ok, error: r.error, retried: r.retried === true });
 	}
 	return results;
 }
@@ -896,7 +897,16 @@ async function unbanUserFromAllGroups(userId) {
 // 渲染单个用户多群踢人结果为简短 HTML 文案
 // 把 Telegram API 的英文错误描述翻译成中文 + 解决建议
 // description 是 banChatMember/deleteMessage 等 API 在失败时返回的 description 字段
-function translateTelegramError(description) {
+function isTelegramUserLookupError(description) {
+	const lower = String(description || '').toLowerCase();
+	return lower.includes('participant_id_invalid') || lower.includes('user_id_invalid');
+}
+
+function isPureTgid(value) {
+	return /^\d+$/.test(String(value || ''));
+}
+
+function translateTelegramError(description, options = {}) {
 	if (!description) return { 中文: '未知错误', 建议: '查看 Worker 日志获取详情' };
 	const desc = String(description);
 	const lower = desc.toLowerCase();
@@ -930,8 +940,15 @@ function translateTelegramError(description) {
 	if (lower.includes('user not found')) {
 		return { 中文: '用户不存在', 建议: '确认 TGID 是否正确，或该用户从未与 Telegram 交互' };
 	}
-	if (lower.includes('participant_id_invalid') || lower.includes('user_id_invalid')) {
-		return { 中文: '用户 ID 无效', 建议: '检查 TGID 格式是否为纯数字' };
+	if (isTelegramUserLookupError(lower)) {
+		if (isPureTgid(options.userId)) {
+			const retryCommand = options.retryCommand || '/be 或 /sa';
+			return {
+				中文: 'Telegram 暂时无法识别该用户',
+				建议: `TGID 格式正确，但 Telegram 在该群暂时返回用户不可用；请稍后重试 ${retryCommand}，若持续失败，确认该用户是否曾加入过该群。`
+			};
+		}
+		return { 中文: 'TGID 格式错误', 建议: '检查 TGID 是否为纯数字' };
 	}
 	if (lower.includes('forbidden') && lower.includes('blocked')) {
 		return { 中文: '用户拉黑了 bot', 建议: '此情况无影响，踢人仍会执行' };
@@ -946,7 +963,7 @@ function translateTelegramError(description) {
 // 渲染单用户全群踢人结果(详细版)：包含群名、群ID、失败原因和建议
 // banResults: [{ groupId, ok, error }] 来自 banUserFromAllGroups
 // 返回多行 HTML 文案，每行一个群的具体结果
-async function renderBanResultsDetail(banResults, chatInfoCache = null) {
+async function renderBanResultsDetail(banResults, chatInfoCache = null, options = {}) {
 	const okCount = banResults.filter((r) => r.ok).length;
 	const total = banResults.length;
 	const lines = [];
@@ -981,7 +998,10 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null) {
 			if (r.ok) {
 				return `  ✅ <b>${safeTitle}</b> <code>${safeId}</code>`;
 			}
-			const { 中文, 建议 } = translateTelegramError(r.error);
+			const { 中文, 建议 } = translateTelegramError(r.error, {
+				userId: r.userId || options.userId,
+				retryCommand: options.retryCommand
+			});
 			return `  ❌ <b>${safeTitle}</b> <code>${safeId}</code>\n     原因：${escapeHtml(中文)}\n     建议：${escapeHtml(建议)}`;
 		});
 
@@ -4294,7 +4314,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					if (alreadyExists) {
 						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行全群踢出</b>');
 					}
-					lines.push(await renderBanResultsDetail(banResults));
+					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/sa' }));
 					flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
 				} else {
 					lines.push('');
@@ -4332,7 +4352,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				const chatInfoCache = new Map();
 				for (const { userId: uid, banResults } of perUserBanResults) {
 					perUserDetailLines.push('', `<b>用户 <code>${uid}</code></b>`);
-					perUserDetailLines.push(await renderBanResultsDetail(banResults, chatInfoCache));
+					perUserDetailLines.push(await renderBanResultsDetail(banResults, chatInfoCache, { userId: uid, retryCommand: '/sa' }));
 				}
 				fullDetail += '\n' + perUserDetailLines.join('\n');
 			}
@@ -4375,7 +4395,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				result.success
 					? `✅ 已将用户 ${linkedUserId} 添加到黑名单`
 					: `⚠️ 用户 ${linkedUserId} 已在黑名单中,本次已继续执行清理`,
-				await renderBanResultsDetail(banResults),
+				await renderBanResultsDetail(banResults, null, { userId: repliedUserId, retryCommand: '/sa' }),
 			];
 			if (delResult.ok) {
 				lines.push('🗑️ 已删除被回复的垃圾消息');
@@ -5193,7 +5213,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				if (alreadyExists) {
 					lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行全群踢出</b>');
 				}
-				lines.push(await renderBanResultsDetail(banResults));
+				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/be' }));
 				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
@@ -5234,7 +5254,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const chatInfoCache = new Map();
 			for (const { userId: uid, banResults } of perUserBanResults) {
 				perUserDetailLines.push('', `<b>用户 <code>${uid}</code></b>`);
-				perUserDetailLines.push(await renderBanResultsDetail(banResults, chatInfoCache));
+				perUserDetailLines.push(await renderBanResultsDetail(banResults, chatInfoCache, { userId: uid, retryCommand: '/be' }));
 			}
 			fullDetail += '\n' + perUserDetailLines.join('\n');
 		}
@@ -5547,17 +5567,31 @@ async function banUserFromGroup(chatId, userId) {
 	};
 
 	try {
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body)
-		});
-		const result = await response.json();
-		console.log(`[banChatMember] chat=${chatId} user=${userId} ok=${result.ok}${result.description ? ' desc=' + result.description : ''}`);
-		if (!response.ok || !result.ok) {
-			return { ok: false, error: result.description || `HTTP ${response.status}` };
+		const callBanChatMember = async (attemptLabel) => {
+			const response = await fetch(url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(body)
+			});
+			const result = await response.json();
+			console.log(`[banChatMember] chat=${chatId} user=${userId} attempt=${attemptLabel} ok=${result.ok}${result.description ? ' desc=' + result.description : ''}`);
+			if (!response.ok || !result.ok) {
+				return { ok: false, error: result.description || `HTTP ${response.status}` };
+			}
+			return { ok: true };
+		};
+
+		const first = await callBanChatMember('first');
+		if (first.ok) return first;
+
+		if (isPureTgid(userId) && isTelegramUserLookupError(first.error)) {
+			console.warn(`[banChatMember] chat=${chatId} user=${userId} Telegram user lookup failed, retrying once: ${first.error}`);
+			await new Promise((resolve) => setTimeout(resolve, TG_USER_LOOKUP_RETRY_DELAY_MS));
+			const second = await callBanChatMember('retry');
+			return { ...second, retried: true };
 		}
-		return { ok: true };
+
+		return first;
 	} catch (error) {
 		console.error(`[banChatMember] chat=${chatId} user=${userId} 异常:`, error);
 		return { ok: false, error: error.message };
