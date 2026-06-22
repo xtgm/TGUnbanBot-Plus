@@ -1493,7 +1493,7 @@ console.log('\n[12a] 私聊 /unban 单条 + 部分群解封失败');
 		},
 		unbanChatMember: (b) => {
 			if (String(b.chat_id) === '-1002') {
-				return { ok: false, error_code: 400, description: 'Bad Request: not enough rights to restrict/unrestrict chat member' };
+				return { ok: false, error_code: 400, description: 'Bad Request: user is an administrator' };
 			}
 			return { ok: true, result: true };
 		},
@@ -1519,7 +1519,9 @@ console.log('\n[12a] 私聊 /unban 单条 + 部分群解封失败');
 	assert('私聊 /unban 对两个配置群执行解封', unbanCalls.length === 2);
 	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('私聊 /unban 详情显示部分群解封', !!dmSend && dmSend.body.text.includes('已解除 1/2 个配置群'));
-	assert('私聊 /unban 详情显示失败群原因', dmSend.body.text.includes('副群') && dmSend.body.text.includes('bot 权限不足'));
+	assert('私聊 /unban 管理员目标失败显示解封语境', dmSend.body.text.includes('副群') && dmSend.body.text.includes('目标用户是群管理员'));
+	assert('私聊 /unban 管理员目标失败不再提示再踢', !dmSend.body.text.includes('再踢'));
+	assert('私聊 /unban 管理员目标失败建议手动检查', dmSend.body.text.includes('无需通过 bot 解封') && dmSend.body.text.includes('手动检查'));
 }
 
 // ---------- [12a2] 匿名管理员 /unban: sender_chat 放行 ----------
@@ -1529,6 +1531,12 @@ console.log('\n[12a2] 匿名管理员 /unban');
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		unbanChatMember: (b) => {
+			if (String(b.chat_id) === '-1002') {
+				return { ok: false, error_code: 400, description: 'Bad Request: user is an administrator' };
+			}
+			return { ok: true, result: true };
+		},
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
 	});
@@ -1552,6 +1560,10 @@ console.log('\n[12a2] 匿名管理员 /unban');
 	assert('匿名 /unban 删除群内命令', callsOf('deleteMessage').some((c) => c.body.message_id === 920));
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('匿名 /unban 主人收到匿名管理员审计', !!ownerDm && ownerDm.body.text.includes('匿名管理员'));
+	assert('匿名 /unban 审计头换行显示匿名身份', ownerDm.body.text.includes('操作人:<b>匿名管理员</b>\n') && ownerDm.body.text.includes('匿名身份:'));
+	assert('匿名 /unban 审计头不重复角色后缀', !ownerDm.body.text.includes('（匿名管理员）'));
+	assert('匿名 /unban 管理员目标失败不再提示再踢', !ownerDm.body.text.includes('再踢'));
+	assert('匿名 /unban 管理员目标失败使用解封建议', ownerDm.body.text.includes('无需通过 bot 解封') && ownerDm.body.text.includes('手动检查'));
 }
 
 // ---------- [12a3] 匿名管理员 /be@bot: 不依赖真实 TGID ----------

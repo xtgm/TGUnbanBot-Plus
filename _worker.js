@@ -910,10 +910,13 @@ function translateTelegramError(description, options = {}) {
 	if (!description) return { 中文: '未知错误', 建议: '查看 Worker 日志获取详情' };
 	const desc = String(description);
 	const lower = desc.toLowerCase();
+	const isUnbanAction = options.action === 'unban';
 
 	// 更具体的错误码先匹配（Telegram 有时同时携带多个特征）
 	if (lower.includes('chat_admin_required')) {
-		return { 中文: 'bot 必须是群管理员', 建议: '把 bot 设为群管理员，并打开"封禁用户"和"删除消息"权限' };
+		return isUnbanAction
+			? { 中文: 'bot 必须是群管理员', 建议: '把 bot 设为群管理员，并打开"封禁用户"权限；Telegram 将群解封也归在该权限下' }
+			: { 中文: 'bot 必须是群管理员', 建议: '把 bot 设为群管理员，并打开"封禁用户"和"删除消息"权限' };
 	}
 	if (lower.includes("message can't be deleted") || lower.includes("can't be deleted for everyone")) {
 		return { 中文: '该消息无法删除', 建议: '消息可能超过 48 小时或不属于 bot 可删除范围；可手动删除' };
@@ -922,20 +925,26 @@ function translateTelegramError(description, options = {}) {
 		return { 中文: '消息已不存在', 建议: '消息可能已被其他人删除，无需操作' };
 	}
 	if (lower.includes('user is not a member') || lower.includes('user_not_participant')) {
-		return { 中文: '用户已不在群中', 建议: '该用户已离群或被踢，本次踢人请求实际无影响' };
+		return isUnbanAction
+			? { 中文: '用户未在该群中', 建议: '该用户可能未被该群封禁或已不在群内，本次群解封请求无影响' }
+			: { 中文: '用户已不在群中', 建议: '该用户已离群或被踢，本次踢人请求实际无影响' };
 	}
 	if (lower.includes('peer_id_invalid') || lower.includes('chat_id_invalid')) {
 		return { 中文: '群 ID 无效', 建议: '检查 GROUP_ID 环境变量配置，群组 ID 应为负数（如 -1001234567890）' };
 	}
 
 	if (lower.includes('not enough rights') || lower.includes('not enough privileges')) {
-		return { 中文: 'bot 权限不足', 建议: '把 bot 设为群管理员，并打开"封禁用户"权限' };
+		return isUnbanAction
+			? { 中文: 'bot 权限不足', 建议: '把 bot 设为群管理员，并打开"封禁用户"权限；Telegram 将群解封也归在该权限下' }
+			: { 中文: 'bot 权限不足', 建议: '把 bot 设为群管理员，并打开"封禁用户"权限' };
 	}
 	if (lower.includes('bot is not a member') || lower.includes('chat not found')) {
 		return { 中文: 'bot 不在该群', 建议: '请重新把 bot 拉进该群并设为管理员' };
 	}
 	if (lower.includes("can't restrict self") || lower.includes('user is an administrator')) {
-		return { 中文: '目标用户是群管理员', 建议: '先在群里降级或撤销该用户的管理员身份再踢' };
+		return isUnbanAction
+			? { 中文: '目标用户是群管理员', 建议: '该用户在此群是管理员，通常无需通过 bot 解封；如仍无法加入，请在该群手动检查管理员身份、封禁列表或入群限制' }
+			: { 中文: '目标用户是群管理员', 建议: '先在群里降级或撤销该用户的管理员身份再踢' };
 	}
 	if (lower.includes('user not found')) {
 		return { 中文: '用户不存在', 建议: '确认 TGID 是否正确，或该用户从未与 Telegram 交互' };
@@ -1055,7 +1064,7 @@ async function renderUnbanResultsDetail(unbanResults, chatInfoCache = null) {
 		if (r.ok) {
 			return `  ✅ <b>${safeTitle}</b> <code>${safeId}</code>`;
 		}
-		const { 中文, 建议 } = translateTelegramError(r.error);
+		const { 中文, 建议 } = translateTelegramError(r.error, { action: 'unban' });
 		return `  ❌ <b>${safeTitle}</b> <code>${safeId}</code>\n     原因：${escapeHtml(中文)}\n     建议：${escapeHtml(建议)}`;
 	});
 
@@ -1104,7 +1113,7 @@ function getMessageActorId(message) {
 function formatMessageActorMention(message) {
 	if (isAnonymousAdminMessage(message)) {
 		const title = message.chat?.title || message.sender_chat?.title || '当前群组';
-		return `<b>匿名管理员</b> <code>${escapeHtml(String(message.chat.id))}</code>（${escapeHtml(title)}）`;
+		return `<b>匿名管理员</b>\n🏷️ 匿名身份:<b>${escapeHtml(title)}</b> <code>${escapeHtml(String(message.chat.id))}</code>`;
 	}
 	return formatUserMention(message?.from) || `<code>${escapeHtml(String(message?.from?.id || '未知'))}</code>`;
 }
@@ -1167,6 +1176,9 @@ function classifyOperatorRole(userId, fallback = '管理员') {
 // roleLabel: 由 classifyOperatorRole 生成,通常是"超级管理员"/"群管理员"/"管理员"
 // sourceLabel: '群内' / '私聊' 等触发场景标记
 function renderAuditNotification(operatorMention, detailText, sourceLabel, roleLabel = '管理员') {
+	if (roleLabel === '匿名管理员') {
+		return `🔔 <b>匿名管理员操作通知</b>\n👤 操作人:${operatorMention}\n📍 来源:${escapeHtml(sourceLabel)}\n\n${detailText}`;
+	}
 	return `🔔 <b>${escapeHtml(roleLabel)}操作通知</b>\n👤 操作人:${operatorMention}（${escapeHtml(roleLabel)}）\n📍 来源:${escapeHtml(sourceLabel)}\n\n${detailText}`;
 }
 
