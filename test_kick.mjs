@@ -1522,6 +1522,165 @@ console.log('\n[12a] 私聊 /unban 单条 + 部分群解封失败');
 	assert('私聊 /unban 详情显示失败群原因', dmSend.body.text.includes('副群') && dmSend.body.text.includes('bot 权限不足'));
 }
 
+// ---------- [12a2] 匿名管理员 /unban: sender_chat 放行 ----------
+console.log('\n[12a2] 匿名管理员 /unban');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+	const update = {
+		message: {
+			message_id: 920,
+			chat: { id: -1001, type: 'supergroup', title: '杀神专用黑名' },
+			sender_chat: { id: -1001, type: 'supergroup', title: '杀神专用黑名' },
+			text: '/unban 5973367305',
+		},
+	};
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([{ id: '5973367305', reason: 'manual', by: '999', at: '2026-06-22T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
+	assert('匿名 /unban 从 D1 移除', !blacklist.some((e) => e.id === '5973367305'));
+	assert('匿名 /unban 执行 Telegram 群解封', callsOf('unbanChatMember').length === 2);
+	assert('匿名 /unban 删除群内命令', callsOf('deleteMessage').some((c) => c.body.message_id === 920));
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('匿名 /unban 主人收到匿名管理员审计', !!ownerDm && ownerDm.body.text.includes('匿名管理员'));
+}
+
+// ---------- [12a3] 匿名管理员 /be@bot: 不依赖真实 TGID ----------
+console.log('\n[12a3] 匿名管理员 /be@bot');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+	const update = {
+		message: {
+			message_id: 921,
+			chat: { id: -1001, type: 'supergroup', title: '杀神专用黑名' },
+			from: { id: 1087968824, is_bot: true, first_name: 'GroupAnonymousBot' },
+			sender_chat: { id: -1001, type: 'supergroup', title: '杀神专用黑名' },
+			text: '/be@tc520lh_bot 8416738230',
+		},
+	};
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const row = env.DB._rows.get('8416738230');
+	assert('匿名 /be@bot 写入 D1 黑名单', !!row && row.reason === 'manual');
+	assert('匿名 /be@bot 操作人记录匿名群身份', row?.by_user === 'anonymous_admin:-1001', row?.by_user);
+	assert('匿名 /be@bot 执行全群踢出', callsOf('banChatMember').length === 2);
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('匿名 /be@bot 主人收到匿名管理员审计', !!ownerDm && ownerDm.body.text.includes('匿名管理员'));
+}
+
+// ---------- [12a4] 匿名管理员 /sa@bot TGID ----------
+console.log('\n[12a4] 匿名管理员 /sa@bot TGID');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+	const update = {
+		message: {
+			message_id: 922,
+			chat: { id: -1001, type: 'supergroup', title: '杀神专用黑名' },
+			from: { id: 1087968824, is_bot: true, first_name: 'GroupAnonymousBot' },
+			sender_chat: { id: -1001, type: 'supergroup', title: '杀神专用黑名' },
+			text: '/sa@tc520lh_bot 8416738230 广告',
+		},
+	};
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const row = env.DB._rows.get('8416738230');
+	assert('匿名 /sa@bot 写入 D1 黑名单', !!row && row.reason === 'sa');
+	assert('匿名 /sa@bot 操作人记录匿名群身份', row?.by_user === 'anonymous_admin:-1001', row?.by_user);
+	assert('匿名 /sa@bot 执行全群踢出', callsOf('banChatMember').length === 2);
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('匿名 /sa@bot 主人收到匿名管理员审计', !!ownerDm && ownerDm.body.text.includes('匿名管理员'));
+}
+
+// ---------- [12a5] 匿名管理员回复消息 /sa ----------
+console.log('\n[12a5] 匿名管理员回复 /sa');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+	const update = {
+		message: {
+			message_id: 923,
+			chat: { id: -1001, type: 'supergroup', title: '杀神专用黑名' },
+			from: { id: 1087968824, is_bot: true, first_name: 'GroupAnonymousBot' },
+			sender_chat: { id: -1001, type: 'supergroup', title: '杀神专用黑名' },
+			text: '/sa 广告',
+			reply_to_message: {
+				message_id: 5000,
+				from: { id: 771234, is_bot: false, first_name: '广告号' },
+			},
+		},
+	};
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const row = env.DB._rows.get('771234');
+	assert('匿名回复 /sa 写入被回复用户', !!row && row.reason === 'sa');
+	assert('匿名回复 /sa 操作人记录匿名群身份', row?.by_user === 'anonymous_admin:-1001', row?.by_user);
+	assert('匿名回复 /sa 删除被回复消息', callsOf('deleteMessage').some((c) => c.body.message_id === 5000));
+	assert('匿名回复 /sa 执行全群踢出', callsOf('banChatMember').length === 2);
+}
+
+// ---------- [12a6] 非 GROUP_ID 群的匿名身份不放行 ----------
+console.log('\n[12a6] 非 GROUP_ID 匿名身份不放行');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+	const update = {
+		message: {
+			message_id: 924,
+			chat: { id: -2001, type: 'supergroup', title: '未配置群' },
+			from: { id: 1087968824, is_bot: true, first_name: 'GroupAnonymousBot' },
+			sender_chat: { id: -2001, type: 'supergroup', title: '未配置群' },
+			text: '/be 999001',
+		},
+	};
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	assert('非 GROUP_ID 匿名 /be 不写 D1', !env.DB._rows.has('999001'));
+	assert('非 GROUP_ID 匿名 /be 不踢人', callsOf('banChatMember').length === 0);
+	assert('非 GROUP_ID 匿名 /be 群内静默', callsOf('sendMessage').length === 0);
+}
+
 // ---------- [12b] D1 黑名单用户确认自助解封:任何 reason 都拒绝 ----------
 console.log('\n[12b] D1 黑名单用户确认自助解封一律拒绝');
 {

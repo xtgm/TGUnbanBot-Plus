@@ -1085,6 +1085,43 @@ function isBotOperator(user) {
 	return Boolean(user?.is_bot) && String(user?.id || '') !== ANON_ADMIN_BOT_ID;
 }
 
+function isAnonymousAdminMessage(message) {
+	const sentAsCurrentGroup = message?.chat?.type !== 'private'
+		&& isConfiguredGroup(message?.chat?.id)
+		&& String(message?.sender_chat?.id || '') === String(message?.chat?.id || '');
+	if (!sentAsCurrentGroup) return false;
+	const fromId = String(message?.from?.id || '');
+	return !message?.from || fromId === ANON_ADMIN_BOT_ID;
+}
+
+function getMessageActorId(message) {
+	if (isAnonymousAdminMessage(message)) {
+		return `anonymous_admin:${message.chat.id}`;
+	}
+	return String(message?.from?.id || '');
+}
+
+function formatMessageActorMention(message) {
+	if (isAnonymousAdminMessage(message)) {
+		const title = message.chat?.title || message.sender_chat?.title || '当前群组';
+		return `<b>匿名管理员</b> <code>${escapeHtml(String(message.chat.id))}</code>（${escapeHtml(title)}）`;
+	}
+	return formatUserMention(message?.from) || `<code>${escapeHtml(String(message?.from?.id || '未知'))}</code>`;
+}
+
+function classifyMessageOperatorRole(message, fallback = '管理员') {
+	if (isAnonymousAdminMessage(message)) return '匿名管理员';
+	return classifyOperatorRole(message?.from?.id, fallback);
+}
+
+async function checkMessageOperatorIsAdmin(message, userId) {
+	if (isAnonymousAdminMessage(message)) {
+		console.log(`[管理员鉴权] 匿名管理员在群 ${message.chat.id} 发出命令 ✅`);
+		return true;
+	}
+	return checkIfUserIsAdmin(userId);
+}
+
 function isOwner(id) {
 	return OWNER_IDS.length > 0 && OWNER_IDS.includes(String(id || ''));
 }
@@ -1146,9 +1183,8 @@ function renderAuditNotification(operatorMention, detailText, sourceLabel, roleL
 //   * 私聊投递失败(主人没和 bot 私聊过等) → 仅记日志,不在群里追加任何"主人"字样
 async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, notifySecondaryOwners = false }) {
 	const chatId = message.chat.id;
-	const triggerId = message.from.id;
-	const triggerIdStr = String(triggerId);
-	const operator = formatUserMention(message.from) || `<code>${escapeHtml(String(triggerId))}</code>`;
+	const triggerIdStr = getMessageActorId(message);
+	const operator = formatMessageActorMention(message);
 	const targets = getOwnerNotifyTargets(notifySecondaryOwners);
 
 	if (!isInGroup) {
@@ -1157,7 +1193,7 @@ async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, no
 		// 主人/副主人收审计副本；触发者本人已收到原详情，避免私聊重复投递
 		const notifyTargets = targets.filter(oid => oid !== triggerIdStr);
 		if (notifyTargets.length) {
-			const role = classifyOperatorRole(triggerId, '管理员');
+			const role = classifyMessageOperatorRole(message, '管理员');
 			await Promise.allSettled(notifyTargets.map(oid => {
 				const auditText = renderAuditNotification(operator, detailText, '私聊', role);
 				return sendTelegramMessage(oid, auditText).then(r => {
@@ -1176,7 +1212,7 @@ async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, no
 		await Promise.allSettled(targets.map(oid => {
 			const auditText = (triggerIdStr === oid)
 				? `🔔 <b>主人操作通知</b>\n👤 操作人:${operator}（你自己）\n📍 来源:群内\n\n${detailText}`
-				: renderAuditNotification(operator, detailText, '群内', classifyOperatorRole(triggerId, '群管理员'));
+				: renderAuditNotification(operator, detailText, '群内', classifyMessageOperatorRole(message, '群管理员'));
 			return sendTelegramMessage(oid, auditText).then(r => {
 				if (!r?.ok) console.error(`[审计通知] 私聊主人${oid}失败:${r?.description || r?.error || '未知'}`);
 			});
@@ -1304,12 +1340,13 @@ async function loadBulkJob(env, jobId) {
 function getBulkJobNotifyTargets(message) {
 	const targets = getOwnerNotifyTargets(true);
 	if (targets.length) return targets;
+	if (isAnonymousAdminMessage(message)) return [];
 	return message?.from?.id ? [String(message.from.id)] : [];
 }
 
 function createBulkJobPayload(action, ids, invalid, note, message) {
 	const now = new Date().toISOString();
-	const operator = formatUserMention(message.from) || `<code>${escapeHtml(String(message.from?.id || '未知'))}</code>`;
+	const operator = formatMessageActorMention(message);
 	const groupIds = GROUP_IDS.map((id) => String(id));
 	const job = {
 		version: 1,
@@ -1322,9 +1359,9 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 		invalid: (invalid || []).map((id) => String(id)),
 		note: String(note || '').trim(),
 		groupIds,
-		createdBy: String(message.from?.id || ''),
+		createdBy: getMessageActorId(message),
 		operator,
-		operatorRole: classifyOperatorRole(message.from?.id, message.chat?.type === 'private' ? '管理员' : '群管理员'),
+		operatorRole: classifyMessageOperatorRole(message, message.chat?.type === 'private' ? '管理员' : '群管理员'),
 		sourceChatId: String(message.chat?.id ?? ''),
 		sourceChatTitle: message.chat?.title || message.chat?.username || (message.chat?.type === 'private' ? '私聊' : '当前群组'),
 		sourceChatType: message.chat?.type || 'unknown',
@@ -4162,15 +4199,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
-	if (!message.from) {
+	if (!message.from && !isAnonymousAdminMessage(message)) {
 		logBotModeration('skip:no-message-from', getMessageLogInfo(message));
 		return;
 	}
 
 	const chatId = message.chat.id;
-	const userId = message.from.id;
+	const userId = message.from?.id || ANON_ADMIN_BOT_ID;
+	const operatorId = getMessageActorId(message);
 	const text = message.text;
-	const username = message.from.username || message.from.first_name || '用户';
+	const username = message.from?.username || message.from?.first_name || (isAnonymousAdminMessage(message) ? '匿名管理员' : '用户');
 
 	// 诊断日志:配置群里收到名片(contact)时,打印完整结构(尤其 vcard),供排查名片广告漏检。
 	// 只在名片消息触发,极轻量;贴 Worker 日志即可看清 Telegram 实际传了什么字段。
@@ -4251,7 +4289,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 仅真人可通过 /sa 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
 		if (isBotOperator(message.from)) return;
 
-		const isAdmin = await checkIfUserIsAdmin(userId);
+		const isAdmin = await checkMessageOperatorIsAdmin(message, userId);
 		if (!isAdmin) {
 			if (!isInGroup) {
 				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
@@ -4300,7 +4338,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			// 单条
 			if (valid.length === 1 && invalid.length === 0) {
-				const result = await addToBlacklist(valid[0], env, { reason: 'sa', by: userId });
+				const result = await addToBlacklist(valid[0], env, { reason: 'sa', by: operatorId });
 				const alreadyExists = result.code === 'EXISTS';
 				const targetMention = await formatTargetByTgid(valid[0]);
 				const lines = [
@@ -4331,7 +4369,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 
 			// 批量
-			const results = await addManyToBlacklist(valid, env, { reason: 'sa', by: userId });
+			const results = await addManyToBlacklist(valid, env, { reason: 'sa', by: operatorId });
 			const idsToKick = [...results.success, ...results.exists];
 			const banSummary = { success: idsToKick.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
 			const perUserBanResults = [];
@@ -4378,7 +4416,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		const replySpamNote = rawArg;
-		const result = await addToBlacklist(repliedUserId, env, { reason: 'sa', by: userId });
+		const result = await addToBlacklist(repliedUserId, env, { reason: 'sa', by: operatorId });
 		const alreadyExists = result.code === 'EXISTS';
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
@@ -4455,7 +4493,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 处理 /job /jobrun：查询或续跑大批量 /be /sa 任务
 	if (isJobCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
-		const isAdmin = await checkIfUserIsAdmin(userId);
+		const isAdmin = await checkMessageOperatorIsAdmin(message, userId);
 		if (!isAdmin) {
 			if (!isInGroup) {
 				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
@@ -4533,7 +4571,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const hasTgidArg = /^\d+$/.test(checkArg);
 
 		// 鉴权:必须是任一配置群管理员(私聊也能用,checkIfUserIsAdmin 与当前 chatId 无关)
-		const isAdmin = await checkIfUserIsAdmin(userId);
+		const isAdmin = await checkMessageOperatorIsAdmin(message, userId);
 
 		if (hasTgidArg) {
 			// 带 TGID 参数:私聊 / 群内均可
@@ -5150,7 +5188,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (isBotOperator(message.from)) return;
 
 		// 检查是否是群组管理员
-		const isAdmin = await checkIfUserIsAdmin(userId);
+		const isAdmin = await checkMessageOperatorIsAdmin(message, userId);
 		if (!isAdmin) {
 			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
 			if (!isInGroup) {
@@ -5198,7 +5236,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		// 单条且无格式错误
 		if (valid.length === 1 && invalid.length === 0) {
-			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: userId });
+			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: operatorId });
 			const alreadyExists = result.code === 'EXISTS';
 			// 统一详情格式:无论成功失败都展示完整字段
 			const targetMention = await formatTargetByTgid(valid[0]);
@@ -5231,7 +5269,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		// 批量
-		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: userId });
+		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: operatorId });
 		const idsToKick = [...results.success, ...results.exists];
 		const banSummary = { success: idsToKick.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
 		// 收集每个用户的逐群结果,用于在 detail 末尾渲染明细
@@ -5277,7 +5315,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const isInGroup = message.chat.type !== 'private';
 
 			// 检查是否是群组管理员
-			const isAdmin = await checkIfUserIsAdmin(userId);
+			const isAdmin = await checkMessageOperatorIsAdmin(message, userId);
 			if (!isAdmin) {
 				if (!isInGroup) {
 					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
