@@ -1386,14 +1386,62 @@ console.log('\n[12] 群内 /unban 单条');
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
 	assert('8888 已从黑名单移除', !blacklist.some((e) => e.id === '8888'));
 
-	// /unban 不调 banChatMember
+	// /unban 不调 banChatMember，但会对 GROUP_ID 配置群执行 unbanChatMember
 	assert('banChatMember 没调用', callsOf('banChatMember').length === 0);
+	const unbanCalls = callsOf('unbanChatMember');
+	assert('/unban 调用 unbanChatMember 2 次（两个群）', unbanCalls.length === 2);
+	assert('/unban 解封用户 ID 都是 8888', unbanCalls.every((c) => String(c.body.user_id) === '8888'));
+	assert('/unban 解封覆盖两个配置群', JSON.stringify(unbanCalls.map((c) => String(c.body.chat_id)).sort()) === JSON.stringify(['-1001', '-1002']));
 
 	const sendCalls = callsOf('sendMessage');
 	assert('sendMessage 调用 2 次（闪屏+私聊）', sendCalls.length === 2);
 	const groupSend = sendCalls.find((c) => String(c.body.chat_id) === '-1001');
-	assert('群内闪屏含"已移黑"', groupSend.body.text.includes('已移黑'));
+	assert('群内闪屏含"已移黑并解封"', groupSend.body.text.includes('已移黑并解封'));
+	const dmSend = sendCalls.find((c) => String(c.body.chat_id) === '999');
+	assert('/unban 私聊详情含 Telegram 群解封结果', dmSend.body.text.includes('Telegram 群解封结果'));
 	assert('群内 /unban 指令消息 msgId=900 被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 900));
+}
+
+// ---------- [12a] 私聊 /unban 单条 + 部分群解封失败 ----------
+console.log('\n[12a] 私聊 /unban 单条 + 部分群解封失败');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		getChat: (b) => {
+			const id = String(b.chat_id);
+			const titles = { '-1001': '主群', '-1002': '副群' };
+			return { ok: true, result: { id: Number(b.chat_id), title: titles[id] || `群${id}`, type: 'supergroup' } };
+		},
+		unbanChatMember: (b) => {
+			if (String(b.chat_id) === '-1002') {
+				return { ok: false, error_code: 400, description: 'Bad Request: not enough rights to restrict/unrestrict chat member' };
+			}
+			return { ok: true, result: true };
+		},
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const update = {
+		message: {
+			message_id: 910,
+			chat: { id: 999, type: 'private' },
+			from: { id: 999, is_bot: false },
+			text: '/unban 8890',
+		},
+	};
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([{ id: '8890', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env);
+
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
+	assert('私聊 /unban 已从 D1 黑名单移除', !blacklist.some((e) => e.id === '8890'));
+	const unbanCalls = callsOf('unbanChatMember');
+	assert('私聊 /unban 对两个配置群执行解封', unbanCalls.length === 2);
+	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('私聊 /unban 详情显示部分群解封', !!dmSend && dmSend.body.text.includes('已解除 1/2 个配置群'));
+	assert('私聊 /unban 详情显示失败群原因', dmSend.body.text.includes('副群') && dmSend.body.text.includes('bot 权限不足'));
 }
 
 // ---------- [12b] D1 黑名单用户确认自助解封:任何 reason 都拒绝 ----------

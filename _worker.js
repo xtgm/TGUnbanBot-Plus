@@ -874,6 +874,25 @@ async function banUserFromAllGroups(userId) {
 	return results;
 }
 
+// 把用户从所有配置群解除 Telegram 封禁，逐群结果数组返回
+// 删除 D1 黑名单后调用，用于让用户真正能重新加入 GROUP_ID 配置的群。
+async function unbanUserFromAllGroups(userId) {
+	const results = [];
+	for (const groupId of GROUP_IDS) {
+		try {
+			const r = await unbanUser(userId, groupId);
+			results.push({
+				groupId,
+				ok: r?.ok === true,
+				error: r?.ok === true ? null : (r?.description || r?.error || '未知错误')
+			});
+		} catch (error) {
+			results.push({ groupId, ok: false, error: error.message || String(error) });
+		}
+	}
+	return results;
+}
+
 // 渲染单个用户多群踢人结果为简短 HTML 文案
 // 把 Telegram API 的英文错误描述翻译成中文 + 解决建议
 // description 是 banChatMember/deleteMessage 等 API 在失败时返回的 description 字段
@@ -977,6 +996,61 @@ function renderBanResults(banResults) {
 	if (okCount === total) return `🚫 已从全部 ${total} 个群踢出`;
 	if (okCount === 0) return `⚠️ 全部 ${total} 个群踢人失败（请检查 bot 是否为群管理员）`;
 	return `🚫 已踢出 ${okCount}/${total} 个群（${total - okCount} 个失败）`;
+}
+
+// 渲染单用户全群 Telegram 解封结果(详细版)
+async function renderUnbanResultsDetail(unbanResults, chatInfoCache = null) {
+	const okCount = unbanResults.filter((r) => r.ok).length;
+	const total = unbanResults.length;
+	const lines = [];
+	const cache = chatInfoCache || new Map();
+
+	if (total === 0) {
+		return 'ℹ️ 未配置 GROUP_ID，未执行 Telegram 群解封。';
+	}
+	if (okCount === total) {
+		lines.push(`✅ <b>已解除全部 ${total} 个配置群的 Telegram 封禁</b>`);
+	} else if (okCount === 0) {
+		lines.push(`⚠️ <b>全部 ${total} 个配置群 Telegram 解封失败</b>`);
+	} else {
+		lines.push(`✅ <b>已解除 ${okCount}/${total} 个配置群的 Telegram 封禁</b>（${total - okCount} 个失败）`);
+	}
+
+	await Promise.all(
+		[...new Set(unbanResults.map((r) => String(r.groupId)))].map(async (groupId) => {
+			if (cache.has(groupId)) return;
+			try {
+				const info = await getChatInfoFromId(groupId);
+				cache.set(groupId, info?.title || '未知群名');
+			} catch (_) {
+				cache.set(groupId, '未知群名');
+			}
+		})
+	);
+
+	const detailLines = unbanResults.map((r) => {
+		const title = cache.get(String(r.groupId)) || '未知群名';
+		const safeTitle = escapeHtml(title);
+		const safeId = escapeHtml(String(r.groupId));
+		if (r.ok) {
+			return `  ✅ <b>${safeTitle}</b> <code>${safeId}</code>`;
+		}
+		const { 中文, 建议 } = translateTelegramError(r.error);
+		return `  ❌ <b>${safeTitle}</b> <code>${safeId}</code>\n     原因：${escapeHtml(中文)}\n     建议：${escapeHtml(建议)}`;
+	});
+
+	lines.push('', ...detailLines);
+	return lines.join('\n');
+}
+
+// 简短版（用于群内闪屏）
+function renderUnbanResults(unbanResults) {
+	const okCount = unbanResults.filter((r) => r.ok).length;
+	const total = unbanResults.length;
+	if (total === 0) return 'ℹ️ 未配置 GROUP_ID，未执行群解封';
+	if (okCount === total) return `✅ 已解除全部 ${total} 个群的 Telegram 封禁`;
+	if (okCount === 0) return `⚠️ 全部 ${total} 个群解封失败（请检查 bot 是否为群管理员）`;
+	return `✅ 已解除 ${okCount}/${total} 个群的 Telegram 封禁（${total - okCount} 个失败）`;
 }
 
 // 双通道回执：群内场景发闪屏 + 私聊管理员发详情；私聊场景直接发详情
@@ -5216,9 +5290,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 单条且无格式错误
 			if (valid.length === 1 && invalid.length === 0) {
 				const result = await removeFromBlacklist(valid[0], env);
+				const shouldUnbanGroups = result.success || result.code === 'NOT_FOUND';
+				const unbanResults = shouldUnbanGroups ? await unbanUserFromAllGroups(valid[0]) : [];
 				const targetMention = await formatTargetByTgid(valid[0]);
 				const lines = [
-					`🎬 操作:移出黑名单`,
+					`🎬 操作:移出黑名单 + Telegram 群解封`,
 					`🎯 目标用户:${targetMention}`,
 					'',
 				];
@@ -5227,20 +5303,50 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				} else {
 					lines.push(result.message);
 				}
+				if (shouldUnbanGroups) {
+					lines.push('', '<b>Telegram 群解封结果</b>:');
+					lines.push(await renderUnbanResultsDetail(unbanResults));
+				}
 				const flashText = result.success
-					? `✅ 已移黑 <code>${valid[0]}</code>`
-					: `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
+					? `✅ 已移黑并解封 <code>${valid[0]}</code>\n${renderUnbanResults(unbanResults)}`
+					: result.code === 'NOT_FOUND'
+						? `ℹ️ <code>${valid[0]}</code> 不在黑名单，已尝试群解封\n${renderUnbanResults(unbanResults)}`
+						: `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
 				await replyToAdmin(message, ctx, { flashText, detailText: lines.join('\n'), isInGroup });
 				return;
 			}
 
 			// 批量
 			const results = await removeManyFromBlacklist(valid, env);
+			const idsToUnban = [...results.success, ...results.notFound];
+			const unbanSummary = { okAll: 0, partial: 0, failedAll: 0 };
+			const perUserUnbanResults = [];
+			for (const id of idsToUnban) {
+				const unbanResults = await unbanUserFromAllGroups(id);
+				const okCount = unbanResults.filter((r) => r.ok).length;
+				if (okCount === unbanResults.length) unbanSummary.okAll += 1;
+				else if (okCount === 0) unbanSummary.failedAll += 1;
+				else unbanSummary.partial += 1;
+				perUserUnbanResults.push({ userId: id, unbanResults });
+			}
 			const failedCount = invalid.length + results.failed.length;
 			const flashText = `✅ 批量移黑：成功 ${results.success.length}${results.notFound.length ? ` / 不在黑名单 ${results.notFound.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+			let detailText = renderBatchRemoveResult(results, invalid);
+			if (idsToUnban.length > 0) {
+				const unbanLines = ['', '<b>Telegram 群解封结果</b>:'];
+				unbanLines.push(`✅ 全部群解封成功: ${unbanSummary.okAll}`);
+				if (unbanSummary.partial) unbanLines.push(`⚠️ 部分群解封: ${unbanSummary.partial}`);
+				if (unbanSummary.failedAll) unbanLines.push(`❌ 全部群解封失败: ${unbanSummary.failedAll}（请检查 bot 是否为群管理员）`);
+				const chatInfoCache = new Map();
+				for (const { userId: uid, unbanResults } of perUserUnbanResults) {
+					unbanLines.push('', `<b>用户 <code>${uid}</code></b>`);
+					unbanLines.push(await renderUnbanResultsDetail(unbanResults, chatInfoCache));
+				}
+				detailText += '\n' + unbanLines.join('\n');
+			}
 			await replyToAdmin(message, ctx, {
 				flashText,
-				detailText: renderBatchRemoveResult(results, invalid),
+				detailText,
 				isInGroup
 			});
 			return;
