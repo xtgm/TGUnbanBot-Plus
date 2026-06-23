@@ -863,14 +863,18 @@ async function removeFromBlacklist(userId, env) {
 	return result;
 }
 
-// 把用户从所有配置群踢出，逐群结果数组返回
-// bot 不在群 / 没权限单群失败不影响其它群；串行避免 Telegram API 限流
-// 返回 [{ groupId, ok, error }]
-async function banUserFromAllGroups(userId) {
+// 对目标用户执行所有配置群的 Telegram 封禁/预封，逐群结果数组返回。
+// 用户在群内时 banChatMember 会把人移出并封禁；用户不在群内但 Telegram 可识别时，会加入群封禁列表（预封）。
+// bot 不在群 / 没权限 / Telegram 无法识别用户时，单群失败不影响其它群；串行避免 Telegram API 限流。
+// 返回 [{ groupId, userId, ok, error, memberProbe }]
+async function banUserFromAllGroups(userId, options = {}) {
 	const results = [];
 	for (const groupId of GROUP_IDS) {
+		const memberProbe = options.probeMembership
+			? await probeTargetMemberBeforeBan(groupId, userId)
+			: null;
 		const r = await banUserFromGroup(groupId, userId);
-		results.push({ groupId, userId: String(userId), ok: r.ok, error: r.error, retried: r.retried === true });
+		results.push({ groupId, userId: String(userId), ok: r.ok, error: r.error, retried: r.retried === true, memberProbe });
 	}
 	return results;
 }
@@ -902,8 +906,57 @@ function isTelegramUserLookupError(description) {
 	return lower.includes('participant_id_invalid') || lower.includes('user_id_invalid');
 }
 
+function isTelegramUserUnresolvableError(description) {
+	const lower = String(description || '').toLowerCase();
+	return isTelegramUserLookupError(lower) || lower.includes('user not found');
+}
+
 function isPureTgid(value) {
 	return /^\d+$/.test(String(value || ''));
+}
+
+function classifyMemberProbeStatus(status) {
+	const normalized = String(status || '').toLowerCase();
+	if (normalized === 'member') return { state: 'in_group', label: '在群内（普通成员）' };
+	if (normalized === 'restricted') return { state: 'in_group', label: '在群内（受限成员）' };
+	if (normalized === 'administrator') return { state: 'admin', label: '在群内（管理员）' };
+	if (normalized === 'creator') return { state: 'admin', label: '在群内（群主）' };
+	if (normalized === 'left') return { state: 'not_in_group', label: '不在群内' };
+	if (normalized === 'kicked') return { state: 'already_banned', label: '已在群封禁列表' };
+	return { state: 'unknown', label: status ? `状态未知（${status}）` : '状态未知' };
+}
+
+async function probeTargetMemberBeforeBan(groupId, userId) {
+	if (!isPureTgid(userId)) {
+		return { ok: false, state: 'invalid', label: 'TGID 格式错误', error: 'invalid tgid' };
+	}
+
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: groupId, user_id: Number(userId) })
+		});
+		const result = await response.json();
+		if (response.ok && result?.ok && result.result) {
+			const classified = classifyMemberProbeStatus(result.result.status);
+			return {
+				ok: true,
+				state: classified.state,
+				label: classified.label,
+				status: result.result.status,
+				user: result.result.user || null
+			};
+		}
+		const error = result?.description || `HTTP ${response.status}`;
+		if (isTelegramUserUnresolvableError(error)) {
+			return { ok: false, state: 'unresolvable', label: 'Telegram 无法在该群识别此 TGID', error };
+		}
+		const { 中文 } = translateTelegramError(error, { userId, retryCommand: '/be 或 /sa' });
+		return { ok: false, state: 'unknown', label: `成员状态查询失败：${中文}`, error };
+	} catch (error) {
+		return { ok: false, state: 'unknown', label: `成员状态查询异常：${error.message || String(error)}`, error: error.message || String(error) };
+	}
 }
 
 function translateTelegramError(description, options = {}) {
@@ -927,7 +980,7 @@ function translateTelegramError(description, options = {}) {
 	if (lower.includes('user is not a member') || lower.includes('user_not_participant')) {
 		return isUnbanAction
 			? { 中文: '用户未在该群中', 建议: '该用户可能未被该群封禁或已不在群内，本次群解封请求无影响' }
-			: { 中文: '用户已不在群中', 建议: '该用户已离群或被踢，本次踢人请求实际无影响' };
+			: { 中文: '用户不在该群中', 建议: '该用户当前不是群成员；若 Telegram 接受封禁请求，则会表现为预封，禁止后续进群' };
 	}
 	if (lower.includes('peer_id_invalid') || lower.includes('chat_id_invalid')) {
 		return { 中文: '群 ID 无效', 建议: '检查 GROUP_ID 环境变量配置，群组 ID 应为负数（如 -1001234567890）' };
@@ -947,20 +1000,27 @@ function translateTelegramError(description, options = {}) {
 			: { 中文: '目标用户是群管理员', 建议: '先在群里降级或撤销该用户的管理员身份再踢' };
 	}
 	if (lower.includes('user not found')) {
-		return { 中文: '用户不存在', 建议: '确认 TGID 是否正确，或该用户从未与 Telegram 交互' };
+		if (isPureTgid(options.userId)) {
+			const retryCommand = options.retryCommand || '/be 或 /sa';
+			return {
+				中文: 'Telegram 当前无法识别该 TGID',
+				建议: `D1 黑名单记录不受影响；该用户若后续进群/发言仍会被黑名单拦截。可稍后重试 ${retryCommand}，或等待用户进群后再由系统自动拦截。`
+			};
+		}
+		return { 中文: 'Telegram 当前无法识别该用户', 建议: '确认 TGID 是否为纯数字，或等待用户进群后再处理' };
 	}
 	if (isTelegramUserLookupError(lower)) {
 		if (isPureTgid(options.userId)) {
 			const retryCommand = options.retryCommand || '/be 或 /sa';
 			return {
-				中文: 'Telegram 暂时无法识别该用户',
-				建议: `TGID 格式正确，但 Telegram 在该群暂时返回用户不可用；请稍后重试 ${retryCommand}，若持续失败，确认该用户是否曾加入过该群。`
+				中文: 'Telegram 当前无法识别该 TGID',
+				建议: `D1 黑名单记录不受影响；该用户若后续进群/发言仍会被黑名单拦截。可稍后重试 ${retryCommand}，或等待用户进群后再由系统自动拦截。`
 			};
 		}
 		return { 中文: 'TGID 格式错误', 建议: '检查 TGID 是否为纯数字' };
 	}
 	if (lower.includes('forbidden') && lower.includes('blocked')) {
-		return { 中文: '用户拉黑了 bot', 建议: '此情况无影响，踢人仍会执行' };
+		return { 中文: '用户拉黑了 bot', 建议: '此情况不影响 Telegram 群封禁/预封执行' };
 	}
 	if (lower.includes('flood') || lower.includes('too many requests')) {
 		return { 中文: 'Telegram 限流', 建议: '稍后重试，或减小批量大小' };
@@ -969,21 +1029,78 @@ function translateTelegramError(description, options = {}) {
 	return { 中文: desc, 建议: '查看 Worker 日志和 Telegram 文档' };
 }
 
-// 渲染单用户全群踢人结果(详细版)：包含群名、群ID、失败原因和建议
+function isTelegramPermissionError(description) {
+	const lower = String(description || '').toLowerCase();
+	return lower.includes('chat_admin_required') ||
+		lower.includes('not enough rights') ||
+		lower.includes('not enough privileges') ||
+		lower.includes("can't restrict self") ||
+		lower.includes('user is an administrator');
+}
+
+function getBanResultStats(banResults) {
+	const total = banResults.length;
+	const okCount = banResults.filter((r) => r.ok).length;
+	const failed = banResults.filter((r) => !r.ok);
+	return {
+		total,
+		okCount,
+		failCount: total - okCount,
+		lookupFailCount: failed.filter((r) => isTelegramUserUnresolvableError(r.error)).length,
+		permissionFailCount: failed.filter((r) => isTelegramPermissionError(r.error)).length
+	};
+}
+
+function formatBanSuccessResult(r) {
+	const state = r?.memberProbe?.state;
+	if (state === 'in_group') return '已封禁并移出群聊';
+	if (state === 'not_in_group') return '已加入群封禁列表（预封，禁止后续进群）';
+	if (state === 'already_banned') return '已确认仍在群封禁列表';
+	if (state === 'admin') return 'Telegram 已接受封禁请求';
+	return 'Telegram 已接受封禁/预封请求';
+}
+
+function formatMemberProbeLine(probe) {
+	if (!probe) return '';
+	return `\n     封禁前状态：${escapeHtml(probe.label || '状态未知')}`;
+}
+
+function formatTargetFromBanResults(tgid, banResults) {
+	const idStr = String(tgid);
+	for (const result of banResults || []) {
+		const user = result?.memberProbe?.user;
+		if (user && user.id) {
+			return `${formatUserMention(user)} <code>${escapeHtml(idStr)}</code>`;
+		}
+	}
+	return `<code>${escapeHtml(idStr)}</code>`;
+}
+
+// 渲染单用户全群 Telegram 封禁/预封结果(详细版)：包含群名、群ID、封禁前状态、失败原因和建议
 // banResults: [{ groupId, ok, error }] 来自 banUserFromAllGroups
 // 返回多行 HTML 文案，每行一个群的具体结果
 async function renderBanResultsDetail(banResults, chatInfoCache = null, options = {}) {
-	const okCount = banResults.filter((r) => r.ok).length;
-	const total = banResults.length;
+	const { okCount, total, failCount, lookupFailCount, permissionFailCount } = getBanResultStats(banResults);
 	const lines = [];
 	const cache = chatInfoCache || new Map();
 
+	if (total === 0) {
+		return 'ℹ️ 未配置 GROUP_ID，未执行 Telegram 群封禁/预封。';
+	}
 	if (okCount === total) {
-		lines.push(`🚫 <b>已从全部 ${total} 个群踢出</b>`);
+		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${total}</b>`);
 	} else if (okCount === 0) {
-		lines.push(`⚠️ <b>全部 ${total} 个群踢人失败</b>`);
+		lines.push(`⚠️ <b>D1 黑名单已生效；Telegram 群封禁/预封成功 0/${total}</b>`);
 	} else {
-		lines.push(`🚫 <b>已踢出 ${okCount}/${total} 个群</b>（${total - okCount} 个失败）`);
+		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${total}</b>（${failCount} 个失败）`);
+	}
+	if (banResults.some((r) => r.ok && r.memberProbe?.state === 'not_in_group')) {
+		lines.push('ℹ️ 目标不在群内时，成功表示已加入该群封禁列表（预封），不是从群里踢出了在线成员。');
+	}
+	if (lookupFailCount > 0) {
+		lines.push('ℹ️ Telegram 无法识别 TGID 不代表 D1 黑名单失败；后续进群/发言仍会按 D1 黑名单拦截。');
+	} else if (okCount === 0 && permissionFailCount === total) {
+		lines.push('ℹ️ 全部配置群都因权限或管理员身份失败，请重点检查 bot 的封禁权限和目标是否为管理员。');
 	}
 
 	// 同一批回执内每个群只拉一次群名，避免 用户数 × 群数 重复 getChat。
@@ -1005,13 +1122,13 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 			const safeTitle = escapeHtml(title);
 			const safeId = escapeHtml(String(r.groupId));
 			if (r.ok) {
-				return `  ✅ <b>${safeTitle}</b> <code>${safeId}</code>`;
+				return `  ✅ <b>${safeTitle}</b> <code>${safeId}</code>\n     结果：${escapeHtml(formatBanSuccessResult(r))}${formatMemberProbeLine(r.memberProbe)}`;
 			}
 			const { 中文, 建议 } = translateTelegramError(r.error, {
 				userId: r.userId || options.userId,
 				retryCommand: options.retryCommand
 			});
-			return `  ❌ <b>${safeTitle}</b> <code>${safeId}</code>\n     原因：${escapeHtml(中文)}\n     建议：${escapeHtml(建议)}`;
+			return `  ❌ <b>${safeTitle}</b> <code>${safeId}</code>${formatMemberProbeLine(r.memberProbe)}\n     原因：${escapeHtml(中文)}\n     建议：${escapeHtml(建议)}`;
 		});
 
 	lines.push('', ...detailLines);
@@ -1020,11 +1137,13 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 
 // 简短版（用于群内闪屏，不能太长）
 function renderBanResults(banResults) {
-	const okCount = banResults.filter((r) => r.ok).length;
-	const total = banResults.length;
-	if (okCount === total) return `🚫 已从全部 ${total} 个群踢出`;
-	if (okCount === 0) return `⚠️ 全部 ${total} 个群踢人失败（请检查 bot 是否为群管理员）`;
-	return `🚫 已踢出 ${okCount}/${total} 个群（${total - okCount} 个失败）`;
+	const { okCount, total, lookupFailCount, permissionFailCount } = getBanResultStats(banResults);
+	if (total === 0) return 'ℹ️ 未配置 GROUP_ID，未执行 Telegram 群封禁';
+	if (okCount === total) return `✅ Telegram封禁/预封成功 ${okCount}/${total} 个配置群`;
+	if (okCount === 0 && lookupFailCount === total) return '⚠️ D1已生效，Telegram暂无法识别TGID';
+	if (okCount === 0 && permissionFailCount === total) return `⚠️ Telegram封禁失败 0/${total}（检查bot封禁权限）`;
+	if (okCount === 0) return `⚠️ Telegram封禁/预封失败 0/${total}`;
+	return `✅ Telegram封禁/预封成功 ${okCount}/${total} 个配置群`;
 }
 
 // 渲染单用户全群 Telegram 解封结果(详细版)
@@ -1266,7 +1385,7 @@ async function removeManyFromBlacklist(ids, env) {
 
 // 渲染批量添加结果
 // banSummary（可选）：{ success, banOkAll, banPartial, banFailedAll }
-//   表示对每个加黑成功的用户做"全群踢"后的统计：完全成功 / 部分成功 / 全部失败
+//   表示对每个加黑成功的用户做 Telegram 群封禁/预封后的统计：完全成功 / 部分成功 / 全部失败
 function renderBatchAddResult(results, invalid, banSummary) {
 	const lines = ['✅ <b>批量添加完成</b>', ''];
 	lines.push(`✅ 成功: ${results.success.length}`);
@@ -1275,10 +1394,10 @@ function renderBatchAddResult(results, invalid, banSummary) {
 	if (results.failed.length) lines.push(`❌ 失败: ${results.failed.length}`);
 
 	if (banSummary && banSummary.success > 0) {
-		lines.push('', '<b>踢人结果</b>:');
-		lines.push(`🚫 全群踢出成功: ${banSummary.banOkAll}`);
-		if (banSummary.banPartial) lines.push(`⚠️ 部分群踢出: ${banSummary.banPartial}`);
-		if (banSummary.banFailedAll) lines.push(`❌ 全部群失败: ${banSummary.banFailedAll}（请检查 bot 是否为群管理员）`);
+		lines.push('', '<b>Telegram 群封禁/预封结果</b>:');
+		lines.push(`✅ 全部配置群成功: ${banSummary.banOkAll}`);
+		if (banSummary.banPartial) lines.push(`⚠️ 部分配置群成功: ${banSummary.banPartial}`);
+		if (banSummary.banFailedAll) lines.push(`❌ 全部配置群失败: ${banSummary.banFailedAll}`);
 	}
 
 	lines.push('', '<b>详情</b>:');
@@ -1493,8 +1612,8 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 		`加黑成功:${job.stats?.added || 0}`,
 		`已存在:${job.stats?.exists || 0}`,
 		`加黑失败:${job.stats?.addFailed || 0}`,
-		`踢人成功:${job.stats?.kickOk || 0}`,
-		`踢人失败:${job.stats?.kickFailed || 0}`,
+		`群封禁成功:${job.stats?.kickOk || 0}`,
+		`群封禁失败:${job.stats?.kickFailed || 0}`,
 		`格式错误:${job.totals?.invalid || 0}`,
 		'',
 		`执行参数:单轮最多 ${getBulkJobSafeUserBatchSize(job)} 用户 / 操作预算 ${job.totals?.operationBatchLimit || BULK_TASK_OPERATION_BATCH_LIMIT} / 并发 ${job.concurrency || BULK_TASK_CONCURRENCY} / 重试 ${job.retryLimit ?? BULK_TASK_RETRY_LIMIT} 次`
@@ -1572,7 +1691,7 @@ async function processBulkJobUserBatch(job, env, ids) {
 				userId: task.userId,
 				groupId: task.groupId,
 				phase: 'kick',
-				error: result.error || '踢人失败'
+				error: result.error || '群封禁失败'
 			});
 		}
 	});
@@ -4368,21 +4487,21 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			if (valid.length === 1 && invalid.length === 0) {
 				const result = await addToBlacklist(valid[0], env, { reason: 'sa', by: operatorId });
 				const alreadyExists = result.code === 'EXISTS';
-				const targetMention = await formatTargetByTgid(valid[0]);
-				const lines = [
-					`🎬 操作:举报加黑(/sa)`,
-					`🎯 目标用户:${targetMention}`,
-				];
+				let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
+				const lines = [`🎬 操作:举报加黑(/sa)`];
 				let flashText;
 				if (result.success || alreadyExists) {
-					const banResults = await banUserFromAllGroups(valid[0]);
+					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
+					targetMention = formatTargetFromBanResults(valid[0], banResults);
+					lines.push(`🎯 目标用户:${targetMention}`);
 					lines.push('');
 					if (alreadyExists) {
-						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行全群踢出</b>');
+						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
 					}
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/sa' }));
 					flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
 				} else {
+					lines.push(`🎯 目标用户:${targetMention}`);
 					lines.push('');
 					lines.push(result.message);
 					flashText = `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
@@ -4414,7 +4533,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const baseDetail = renderBatchAddResult(results, invalid, banSummary);
 			let fullDetail = baseDetail;
 			if (perUserBanResults.length > 0) {
-				const perUserDetailLines = ['', '<b>逐用户踢人明细</b>:'];
+				const perUserDetailLines = ['', '<b>逐用户 Telegram 群封禁/预封明细</b>:'];
 				const chatInfoCache = new Map();
 				for (const { userId: uid, banResults } of perUserBanResults) {
 					perUserDetailLines.push('', `<b>用户 <code>${uid}</code></b>`);
@@ -4449,8 +4568,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success || alreadyExists) {
-			// 加黑成功或已存在 → 全群踢人 + 删除被回复的垃圾消息
-			const banResults = await banUserFromAllGroups(repliedUserId);
+			// 加黑成功或已存在 → Telegram 群封禁/预封 + 删除被回复的垃圾消息
+			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true });
 			const repliedMsgId = repliedMsg.message_id;
 			const delResult = await deleteMessage(chatId, repliedMsgId);
 
@@ -4460,7 +4579,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				'',
 				result.success
 					? `✅ 已将用户 ${linkedUserId} 添加到黑名单`
-					: `⚠️ 用户 ${linkedUserId} 已在黑名单中,本次已继续执行清理`,
+					: `⚠️ 用户 ${linkedUserId} 已在黑名单中,本次已继续执行 Telegram 群封禁/预封`,
 				await renderBanResultsDetail(banResults, null, { userId: repliedUserId, retryCommand: '/sa' }),
 			];
 			if (delResult.ok) {
@@ -5267,22 +5386,22 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: operatorId });
 			const alreadyExists = result.code === 'EXISTS';
 			// 统一详情格式:无论成功失败都展示完整字段
-			const targetMention = await formatTargetByTgid(valid[0]);
-			const lines = [
-				`🎬 操作:加入黑名单`,
-				`🎯 目标用户:${targetMention}`,
-			];
+			let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
+			const lines = [`🎬 操作:加入黑名单`];
 			let flashText;
 			if (result.success || alreadyExists) {
-				const banResults = await banUserFromAllGroups(valid[0]);
+				const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
+				targetMention = formatTargetFromBanResults(valid[0], banResults);
+				lines.push(`🎯 目标用户:${targetMention}`);
 				lines.push('');
 				if (alreadyExists) {
-					lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行全群踢出</b>');
+					lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
 				}
 				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/be' }));
 				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
+				lines.push(`🎯 目标用户:${targetMention}`);
 				lines.push('');
 				lines.push(result.message);
 				flashText = `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
@@ -5316,7 +5435,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const baseDetail = renderBatchAddResult(results, invalid, banSummary);
 		let fullDetail = baseDetail;
 		if (perUserBanResults.length > 0) {
-			const perUserDetailLines = ['', '<b>逐用户踢人明细</b>:'];
+			const perUserDetailLines = ['', '<b>逐用户 Telegram 群封禁/预封明细</b>:'];
 			const chatInfoCache = new Map();
 			for (const { userId: uid, banResults } of perUserBanResults) {
 				perUserDetailLines.push('', `<b>用户 <code>${uid}</code></b>`);
