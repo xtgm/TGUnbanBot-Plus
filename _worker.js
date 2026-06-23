@@ -3744,8 +3744,10 @@ function isShortQuoteWrapperText(text) {
 	if (!raw) return true;
 	const normalized = normalizeForFingerprint(raw);
 	if (!normalized) return true;
-	if (normalized.length <= 5) return true;
-	return /^[a-z0-9]{1,8}$/i.test(raw);
+	// 只把 t/k/1/ok 这类无意义 ASCII 包装当作"引用广告包装"。
+	// 正常中文短回复(如"那还挺好的""好的谢谢")不能触发引用广告封禁。
+	if (!/^[a-z0-9]+$/i.test(normalized)) return false;
+	return normalized.length <= 8 && /^[a-z0-9\W_]{1,16}$/i.test(raw);
 }
 
 function logQuoteAdDiagnostic(message, quoteText, detail = {}) {
@@ -3776,10 +3778,10 @@ function scoreAdWords(text) {
 
 function scoreHighRiskAdWords(text) {
 	const hits = [];
-	for (const w of AD_KEYWORDS_FINANCE) if (w && text.includes(w)) hits.push(`金融:${w}`);
+	// 金融词(如 usdt/usdc/承兑)在正常讨论里很常见，不能单词直杀引用回复者。
+	// 普通自定义词也可能是宽泛词，只走 scoreAdWords 的多词/达阈值规则。
 	for (const w of AD_KEYWORDS_PORN) if (w && text.includes(w)) hits.push(`色情:${w}`);
 	for (const w of AD_KEYWORDS_FRAUD) if (w && text.includes(w)) hits.push(`诈骗:${w}`);
-	for (const w of AD_KEYWORDS) if (w && text.includes(w)) hits.push(`自定义:${w}`);
 	return hits;
 }
 
