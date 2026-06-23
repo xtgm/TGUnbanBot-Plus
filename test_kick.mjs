@@ -1619,6 +1619,45 @@ console.log('\n[12a] 私聊 /unban 单条 + 部分群解封失败');
 	assert('私聊 /unban 管理员目标失败建议手动检查', dmSend.body.text.includes('无需通过 bot 解封') && dmSend.body.text.includes('手动检查'));
 }
 
+// ---------- [12a1] 群内 /unban 特殊 TGID: D1 移除成功但 Telegram 无法识别 ----------
+console.log('\n[12a1] 群内 /unban 特殊 TGID');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
+		unbanChatMember: () => ({ ok: false, error_code: 400, description: 'Bad Request: USER_ID_INVALID' }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+	const update = {
+		message: {
+			message_id: 915,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 999, is_bot: false },
+			text: '/unban 7070447913',
+		},
+	};
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([{ id: '7070447913', reason: 'manual', by: '999', at: '2026-06-23T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
+	assert('特殊 TGID /unban:D1 黑名单已移除', !blacklist.some((e) => e.id === '7070447913'));
+	assert('特殊 TGID /unban:仍对配置群执行 Telegram 解封', callsOf('unbanChatMember').length === 2);
+	const groupFlash = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '-1001');
+	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('特殊 TGID /unban:群内短提示说明 Telegram 暂无法识别', !!groupFlash && groupFlash.body.text.includes('D1已处理') && groupFlash.body.text.includes('Telegram暂无法识别TGID'));
+	assert('特殊 TGID /unban:群内短提示不误报 bot 管理员权限', !!groupFlash && !groupFlash.body.text.includes('请检查 bot 是否为群管理员'));
+	assert('特殊 TGID /unban:私聊详情说明 Telegram 当前无法识别', !!dmSend && dmSend.body.text.includes('Telegram 当前无法识别该 TGID'));
+	assert('特殊 TGID /unban:私聊详情不误报 TGID 格式错误', !!dmSend && !dmSend.body.text.includes('TGID 格式错误'));
+	assert('特殊 TGID /unban:私聊详情说明 D1 移除不受影响', !!dmSend && dmSend.body.text.includes('D1 移除结果不受影响'));
+	assert('特殊 TGID /unban:删除群内命令', callsOf('deleteMessage').some((c) => c.body.message_id === 915));
+}
+
 // ---------- [12a2] 匿名管理员 /unban: sender_chat 放行 ----------
 console.log('\n[12a2] 匿名管理员 /unban');
 {

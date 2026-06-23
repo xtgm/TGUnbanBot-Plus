@@ -888,11 +888,12 @@ async function unbanUserFromAllGroups(userId) {
 			const r = await unbanUser(userId, groupId);
 			results.push({
 				groupId,
+				userId: String(userId),
 				ok: r?.ok === true,
 				error: r?.ok === true ? null : (r?.description || r?.error || '未知错误')
 			});
 		} catch (error) {
-			results.push({ groupId, ok: false, error: error.message || String(error) });
+			results.push({ groupId, userId: String(userId), ok: false, error: error.message || String(error) });
 		}
 	}
 	return results;
@@ -1002,6 +1003,12 @@ function translateTelegramError(description, options = {}) {
 	if (lower.includes('user not found')) {
 		if (isPureTgid(options.userId)) {
 			const retryCommand = options.retryCommand || '/be 或 /sa';
+			if (isUnbanAction) {
+				return {
+					中文: 'Telegram 当前无法识别该 TGID',
+					建议: `D1 移除结果不受影响；Telegram 无法对该 TGID 执行群解封。若该用户仍无法进群，请在对应群封禁列表手动检查，或稍后重试 ${retryCommand}。`
+				};
+			}
 			return {
 				中文: 'Telegram 当前无法识别该 TGID',
 				建议: `D1 黑名单记录不受影响；该用户若后续进群/发言仍会被黑名单拦截。可稍后重试 ${retryCommand}，或等待用户进群后再由系统自动拦截。`
@@ -1012,6 +1019,12 @@ function translateTelegramError(description, options = {}) {
 	if (isTelegramUserLookupError(lower)) {
 		if (isPureTgid(options.userId)) {
 			const retryCommand = options.retryCommand || '/be 或 /sa';
+			if (isUnbanAction) {
+				return {
+					中文: 'Telegram 当前无法识别该 TGID',
+					建议: `D1 移除结果不受影响；Telegram 无法对该 TGID 执行群解封。若该用户仍无法进群，请在对应群封禁列表手动检查，或稍后重试 ${retryCommand}。`
+				};
+			}
 			return {
 				中文: 'Telegram 当前无法识别该 TGID',
 				建议: `D1 黑名单记录不受影响；该用户若后续进群/发言仍会被黑名单拦截。可稍后重试 ${retryCommand}，或等待用户进群后再由系统自动拦截。`
@@ -1147,9 +1160,10 @@ function renderBanResults(banResults) {
 }
 
 // 渲染单用户全群 Telegram 解封结果(详细版)
-async function renderUnbanResultsDetail(unbanResults, chatInfoCache = null) {
+async function renderUnbanResultsDetail(unbanResults, chatInfoCache = null, options = {}) {
 	const okCount = unbanResults.filter((r) => r.ok).length;
 	const total = unbanResults.length;
+	const lookupFailCount = unbanResults.filter((r) => !r.ok && isTelegramUserUnresolvableError(r.error)).length;
 	const lines = [];
 	const cache = chatInfoCache || new Map();
 
@@ -1158,6 +1172,8 @@ async function renderUnbanResultsDetail(unbanResults, chatInfoCache = null) {
 	}
 	if (okCount === total) {
 		lines.push(`✅ <b>已解除全部 ${total} 个配置群的 Telegram 封禁</b>`);
+	} else if (okCount === 0 && lookupFailCount === total) {
+		lines.push(`⚠️ <b>全部 ${total} 个配置群 Telegram 解封失败：Telegram 当前无法识别该 TGID</b>`);
 	} else if (okCount === 0) {
 		lines.push(`⚠️ <b>全部 ${total} 个配置群 Telegram 解封失败</b>`);
 	} else {
@@ -1183,7 +1199,11 @@ async function renderUnbanResultsDetail(unbanResults, chatInfoCache = null) {
 		if (r.ok) {
 			return `  ✅ <b>${safeTitle}</b> <code>${safeId}</code>`;
 		}
-		const { 中文, 建议 } = translateTelegramError(r.error, { action: 'unban' });
+		const { 中文, 建议 } = translateTelegramError(r.error, {
+			action: 'unban',
+			userId: r.userId || options.userId,
+			retryCommand: options.retryCommand || '/unban'
+		});
 		return `  ❌ <b>${safeTitle}</b> <code>${safeId}</code>\n     原因：${escapeHtml(中文)}\n     建议：${escapeHtml(建议)}`;
 	});
 
@@ -1195,8 +1215,10 @@ async function renderUnbanResultsDetail(unbanResults, chatInfoCache = null) {
 function renderUnbanResults(unbanResults) {
 	const okCount = unbanResults.filter((r) => r.ok).length;
 	const total = unbanResults.length;
+	const lookupFailCount = unbanResults.filter((r) => !r.ok && isTelegramUserUnresolvableError(r.error)).length;
 	if (total === 0) return 'ℹ️ 未配置 GROUP_ID，未执行群解封';
 	if (okCount === total) return `✅ 已解除全部 ${total} 个群的 Telegram 封禁`;
+	if (okCount === 0 && lookupFailCount === total) return '⚠️ D1已处理，Telegram暂无法识别TGID';
 	if (okCount === 0) return `⚠️ 全部 ${total} 个群解封失败（请检查 bot 是否为群管理员）`;
 	return `✅ 已解除 ${okCount}/${total} 个群的 Telegram 封禁（${total - okCount} 个失败）`;
 }
@@ -5510,7 +5532,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				}
 				if (shouldUnbanGroups) {
 					lines.push('', '<b>Telegram 群解封结果</b>:');
-					lines.push(await renderUnbanResultsDetail(unbanResults));
+					lines.push(await renderUnbanResultsDetail(unbanResults, null, { userId: valid[0], retryCommand: '/unban' }));
 				}
 				const flashText = result.success
 					? `✅ 已移黑并解封 <code>${valid[0]}</code>\n${renderUnbanResults(unbanResults)}`
@@ -5545,7 +5567,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				const chatInfoCache = new Map();
 				for (const { userId: uid, unbanResults } of perUserUnbanResults) {
 					unbanLines.push('', `<b>用户 <code>${uid}</code></b>`);
-					unbanLines.push(await renderUnbanResultsDetail(unbanResults, chatInfoCache));
+					unbanLines.push(await renderUnbanResultsDetail(unbanResults, chatInfoCache, { userId: uid, retryCommand: '/unban' }));
 				}
 				detailText += '\n' + unbanLines.join('\n');
 			}
