@@ -42,13 +42,13 @@ const PURGE_DEFAULT_REASONS = ['manual', 'sa', 'spam'];
 const TG_USER_LOOKUP_RETRY_DELAY_MS = 350;
 
 // 5) /blacklist 列表中"原因"字段的中文映射。
-//    内置三种：sa（/sa 举报）、manual（/be 手动添加）、manual_ban（chat_member 自动同步）。
+//    内置三种：sa（/sa 举报）、manual（/be 手动添加）、manual_ban（旧版 chat_member 自动同步遗留记录）。
 //    环境变量名：BLACKLIST_REASON_LABELS （要求是 JSON 字符串，例如 {"sa":"群内举报"}）
 const DEFAULT_BLACKLIST_REASON_LABELS = {
 	sa: '群内 /sa 举报',
 	spam: '群内 /sa 举报',
 	manual: '管理员 /be 指令加黑',
-	manual_ban: '管理员手动封禁（自动同步）',
+	manual_ban: '旧版 Telegram 原生封禁同步记录',
 	ad_auto: '🤖 广告自动检测',
 	ad_learn: '🤖 上报学习'
 };
@@ -655,6 +655,7 @@ async function ensureD1Table(env) {
 			CREATE TABLE IF NOT EXISTS ad_keywords (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
 			CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
 			CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);
+			CREATE TABLE IF NOT EXISTS moderation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, from_id TEXT, created_at TEXT);
 			CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
 			CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT);
 		`);
@@ -724,7 +725,6 @@ async function readD1BlacklistWindow(env, offset, limit, reasons = null) {
 		at: r.at ?? null
 	}));
 }
-
 
 // === 黑名单读写接口 ===
 // 仅走 D1
@@ -873,7 +873,7 @@ async function banUserFromAllGroups(userId, options = {}) {
 		const memberProbe = options.probeMembership
 			? await probeTargetMemberBeforeBan(groupId, userId)
 			: null;
-		const r = await banUserFromGroup(groupId, userId);
+		const r = await banUserFromGroup(groupId, userId, { revokeMessages: options.revokeMessages !== false });
 		results.push({ groupId, userId: String(userId), ok: r.ok, error: r.error, retried: r.retried === true, memberProbe });
 	}
 	return results;
@@ -3605,6 +3605,71 @@ async function cacheRecentMessage(env, message) {
 	}
 }
 
+// 当前群清扫缓存：保存普通用户近期消息 ID，供 /sa 引用回复时清扫该用户当前群近期消息。
+// 与 recent_messages 分开，避免 /recent 学习列表被普通聊天污染。
+async function cacheModerationMessage(env, message) {
+	if (!env.DB || !message?.message_id || !message?.from?.id) return;
+	try {
+		await ensureD1Table(env);
+		await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
+			.bind(
+				message.message_id,
+				String(message.chat.id),
+				String(message.from.id),
+				new Date().toISOString()
+			)
+			.run();
+		const limit = Math.max(MSG_CACHE_SIZE, 200);
+		await env.DB.prepare('DELETE FROM moderation_messages WHERE id NOT IN (SELECT id FROM moderation_messages ORDER BY id DESC LIMIT ?)').bind(limit).run();
+	} catch (error) {
+		console.error('[清扫缓存] 写 D1 失败:', error);
+	}
+}
+
+async function cleanupCurrentChatUserMessages(env, chatId, userId, fallbackMessageIds = []) {
+	const messageIds = [];
+	const addMessageId = (mid) => {
+		const n = Number(mid);
+		if (Number.isInteger(n) && n > 0) messageIds.push(n);
+	};
+
+	if (env.DB) {
+		try {
+			await ensureD1Table(env);
+			const { results } = await env.DB.prepare('SELECT mid FROM moderation_messages WHERE chat_id = ? AND from_id = ? ORDER BY id DESC LIMIT ?')
+				.bind(String(chatId), String(userId), Math.max(MSG_CACHE_SIZE, 200))
+				.all();
+			for (const row of results || []) addMessageId(row.mid);
+			await env.DB.prepare('DELETE FROM moderation_messages WHERE chat_id = ? AND from_id = ?')
+				.bind(String(chatId), String(userId))
+				.run();
+		} catch (error) {
+			console.error('[当前群清扫] 读取 D1 缓存失败:', error);
+		}
+	}
+
+	for (const mid of fallbackMessageIds) addMessageId(mid);
+	const uniqueIds = [...new Set(messageIds)];
+	let ok = 0;
+	let failed = 0;
+	const errors = [];
+	for (const mid of uniqueIds) {
+		const result = await deleteMessage(chatId, mid);
+		if (result.ok) {
+			ok += 1;
+		} else {
+			failed += 1;
+			errors.push({ messageId: mid, error: result.error || '未知错误' });
+		}
+	}
+	return { total: uniqueIds.length, ok, failed, errors };
+}
+
+function renderCurrentChatCleanupResult(cleanup) {
+	if (!cleanup || cleanup.total === 0) return '🧹 当前群近期消息清扫:未找到缓存消息';
+	const suffix = cleanup.failed ? `，失败 ${cleanup.failed}` : '';
+	return `🧹 当前群近期消息清扫:成功 ${cleanup.ok}/${cleanup.total}${suffix}`;
+}
 // 收集消息里所有 URL(entities + caption_entities 里的 url / text_link)
 function collectUrls(message) {
 	const urls = [];
@@ -3803,7 +3868,6 @@ function detectIdentitySpam(identityText) {
 	return hits;
 }
 
-
 // 广告检测(多维度评分 + 强特征直杀)
 // 返回 { isAd, score, hits: string[], strong: string|null }
 async function detectAd(message, env) {
@@ -3845,7 +3909,6 @@ async function detectAd(message, env) {
 	if (nameHits.length > 0) {
 		return { isAd: true, score: 99, hits: ['发言人名字引流:' + nameHits.join('/')], strong: '发言人名字含广告' };
 	}
-
 
 	// 强特征 1:学习样本指纹精确匹配(/sa /learn /learnlast 上报过的广告)
 	//   归一化后完全相等才命中,不做子串包含(避免误杀正常长消息)
@@ -4011,7 +4074,7 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 }
 function translateBlacklistReason(reason) {
 	const map = {
-		manual_ban: '群管理员手动封禁（Telegram原生操作，自动同步）',
+		manual_ban: '旧版 Telegram 原生封禁同步记录',
 		manual: '管理员 /be 指令加黑',
 		sa: '管理员 /sa 引用回复加黑',
 		spam: '管理员 /sa 引用回复加黑',
@@ -4397,6 +4460,19 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		} catch (_) {}
 	}
 
+	// 缓存配置群普通用户消息 ID，供 /sa 引用回复后只清扫当前群、该用户的近期消息。
+	if (
+		env.DB && isConfiguredGroup(chatId) &&
+		message.from && !message.from.is_bot &&
+		message.message_id &&
+		!(text && text.startsWith('/'))
+	) {
+		if (ctx && typeof ctx.waitUntil === 'function') {
+			ctx.waitUntil(cacheModerationMessage(env, message));
+		} else {
+			await cacheModerationMessage(env, message);
+		}
+	}
 	// 缓存"疑似广告"群消息(供 /learnlast 学习被 GKY 删掉的广告);ctx.waitUntil 异步不阻塞
 	if (
 		MSG_CACHE_ENABLED && env.DB && isConfiguredGroup(chatId) &&
@@ -4592,10 +4668,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success || alreadyExists) {
-			// 加黑成功或已存在 → Telegram 群封禁/预封 + 删除被回复的垃圾消息
-			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true });
-			const repliedMsgId = repliedMsg.message_id;
-			const delResult = await deleteMessage(chatId, repliedMsgId);
+			// 加黑成功或已存在 → Telegram 群封禁/预封 + 清扫当前群该用户近期消息
+			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true, revokeMessages: false });
+			const cleanupResult = await cleanupCurrentChatUserMessages(env, chatId, repliedUserId, [repliedMsg.message_id]);
 
 			const lines = [
 				`🎬 操作:举报加黑(/sa)`,
@@ -4606,13 +4681,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					: `⚠️ 用户 ${linkedUserId} 已在黑名单中,本次已继续执行 Telegram 群封禁/预封`,
 				await renderBanResultsDetail(banResults, null, { userId: repliedUserId, retryCommand: '/sa' }),
 			];
-			if (delResult.ok) {
-				lines.push('🗑️ 已删除被回复的垃圾消息');
-			} else {
-				const { 中文, 建议 } = translateTelegramError(delResult.error);
-				lines.push(`⚠️ 删除消息失败:${escapeHtml(中文)}\n   建议:${escapeHtml(建议)}`);
+			lines.push(renderCurrentChatCleanupResult(cleanupResult));
+			if (cleanupResult.failed > 0 && cleanupResult.errors.length > 0) {
+				const previews = cleanupResult.errors.slice(0, 3).map((item) => {
+					const { 中文, 建议 } = translateTelegramError(item.error);
+					return `<code>${escapeHtml(String(item.messageId))}</code>:${escapeHtml(中文)}；建议:${escapeHtml(建议)}`;
+				});
+				lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
 			}
-
 			// 仅主人 /sa → 学习样本(只写整句指纹入库,不污染词库)
 			const isOwnerSpam = isOwner(userId);
 			if (isOwnerSpam && env.DB) {
@@ -5765,14 +5841,14 @@ async function muteChatMember(chatId, userId) {
 }
 
 // 把用户踢出群（Telegram banChatMember API）
-// revoke_messages: true → 同时撤回该用户在群里的最近 48 小时内消息（Telegram 上限）
+// revoke_messages 默认 true → 同时撤回该用户在群里的最近 48 小时内消息（Telegram 上限）
 // 返回 { ok: bool, error?: string }；bot 没权限/不在群时返回 ok=false 但不抛异常
-async function banUserFromGroup(chatId, userId) {
+async function banUserFromGroup(chatId, userId, options = {}) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`;
 	const body = {
 		chat_id: chatId,
 		user_id: Number(userId),
-		revoke_messages: true
+		revoke_messages: options.revokeMessages !== false
 	};
 
 	try {

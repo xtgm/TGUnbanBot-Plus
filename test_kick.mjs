@@ -98,6 +98,7 @@ function makeFakeDB(seed = []) {
 	const store = new Map();
 	const batchJobs = new Map();
 	let recentSeq = 1;
+	let moderationSeq = 1;
 	const syncBlacklist = () => {
 		store.set('blacklist', JSON.stringify([...rows.values()].map((r) => ({
 			id: String(r.id),
@@ -223,12 +224,40 @@ function makeFakeDB(seed = []) {
 						setJson('recent_messages', data);
 						return { meta: { changes: 1 } };
 					}
+					if (sql.startsWith('INSERT INTO moderation_messages')) {
+						const [mid, chatId, fromId, createdAt] = bound;
+						const data = getJson('moderation_messages', { items: [] });
+						data.items.push({
+							id: moderationSeq++,
+							mid,
+							chatId: String(chatId),
+							fromId: String(fromId),
+							at: createdAt,
+						});
+						setJson('moderation_messages', data);
+						return { meta: { changes: 1 } };
+					}
 					if (sql.startsWith('DELETE FROM recent_messages WHERE id NOT IN')) {
 						const limit = Number(bound[0]) || 50;
 						const data = getJson('recent_messages', { items: [] });
 						data.items = [...data.items].sort((a, b) => b.id - a.id).slice(0, limit).sort((a, b) => a.id - b.id);
 						setJson('recent_messages', data);
 						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('DELETE FROM moderation_messages WHERE id NOT IN')) {
+						const limit = Number(bound[0]) || 200;
+						const data = getJson('moderation_messages', { items: [] });
+						data.items = [...data.items].sort((a, b) => b.id - a.id).slice(0, limit).sort((a, b) => a.id - b.id);
+						setJson('moderation_messages', data);
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('DELETE FROM moderation_messages WHERE chat_id = ? AND from_id = ?')) {
+						const [chatId, fromId] = bound;
+						const data = getJson('moderation_messages', { items: [] });
+						const before = data.items.length;
+						data.items = data.items.filter((it) => !(String(it.chatId) === String(chatId) && String(it.fromId) === String(fromId)));
+						setJson('moderation_messages', data);
+						return { meta: { changes: before - data.items.length } };
 					}
 					return { meta: { changes: 0 } };
 				},
@@ -241,6 +270,18 @@ function makeFakeDB(seed = []) {
 							return { results: results.slice(offset, offset + limit) };
 						}
 						return { results };
+					}
+					if (sql.startsWith('SELECT mid FROM moderation_messages')) {
+						const [chatId, fromId, limitValue] = bound;
+						const limit = Number(limitValue) || 200;
+						const data = getJson('moderation_messages', { items: [] });
+						return {
+							results: data.items
+								.filter((it) => String(it.chatId) === String(chatId) && String(it.fromId) === String(fromId))
+								.sort((a, b) => b.id - a.id)
+								.slice(0, limit)
+								.map((it) => ({ mid: it.mid }))
+						};
 					}
 					if (sql.startsWith('SELECT mid, chat_id, chat_title')) {
 						const data = getJson('recent_messages', { items: [] });
@@ -282,14 +323,13 @@ function assert(name, cond, detail) {
 function resetCalls() { apiCalls.length = 0; }
 function callsOf(method) { return apiCalls.filter((c) => c.method === method); }
 
-// ---------- [1] /sa 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊详情 ----------
-console.log('\n[1] /sa 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊详情');
+// ---------- [1] /sa 触发:加黑 + 全群踢 + 当前群近期消息清扫 ----------
+console.log('\n[1] /sa 触发:加黑 + 全群踢 + 当前群近期消息清扫');
 {
 	resetCalls();
-	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	const pending = [];
+	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p)); } };
 	sandbox.fetch = makeFetchMock({
-		// /sa 流程会调:
-		// - getChatMember (admin 校验) - 让发送者是管理员
 		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		getChat: (b) => {
 			const id = String(b.chat_id);
@@ -301,6 +341,19 @@ console.log('\n[1] /sa 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊�
 		sendMessage: () => ({ ok: true, result: { message_id: 999 } }),
 	});
 
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	const messages = [
+		{ message_id: 40, chat: { id: -1001, type: 'supergroup' }, from: { id: 8888, is_bot: false }, text: '普通一' },
+		{ message_id: 41, chat: { id: -1001, type: 'supergroup' }, from: { id: 8888, is_bot: false }, text: '普通二' },
+		{ message_id: 42, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false }, text: '别人的消息' },
+		{ message_id: 50, chat: { id: -1001, type: 'supergroup' }, from: { id: 8888, is_bot: false }, text: '被引用的原消息' },
+		{ message_id: 60, chat: { id: -1002, type: 'supergroup' }, from: { id: 8888, is_bot: false }, text: '别群消息不该被删' },
+	];
+	for (const msg of messages) {
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: msg }) }), env, fakeCtx);
+	}
+	await drainPending(pending);
+
 	const update = {
 		message: {
 			message_id: 100,
@@ -309,15 +362,11 @@ console.log('\n[1] /sa 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊�
 			text: '/sa 广告引流',
 			reply_to_message: {
 				message_id: 50,
-				from: { id: 8888, is_bot: false }, // 被举报的用户
+				from: { id: 8888, is_bot: false },
 			},
 		},
 	};
-	const env = { ...baseEnv, DB: makeFakeDB([]) };
-	const res = await handler.fetch(
-		new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }),
-		env, fakeCtx
-	);
+	const res = await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 	assert('webhook 返回 OK', res.status === 200);
 
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
@@ -326,30 +375,30 @@ console.log('\n[1] /sa 触发:加黑 + 全群踢 + 删消息 + 闪屏 + 私聊�
 	const banCalls = callsOf('banChatMember');
 	assert('banChatMember 调用 2 次（两个群）', banCalls.length === 2, `实际 ${banCalls.length}`);
 	assert('banChatMember 用户ID 都是 8888', banCalls.every((c) => String(c.body.user_id) === '8888'));
+	assert('/sa 回复全群封禁不跨群撤回消息', banCalls.every((c) => c.body.revoke_messages === false));
 	const banGroups = banCalls.map((c) => String(c.body.chat_id)).sort();
 	assert('两个群 ID 都被覆盖', JSON.stringify(banGroups) === JSON.stringify(['-1001', '-1002']), `实际 ${JSON.stringify(banGroups)}`);
 
 	const delCalls = callsOf('deleteMessage');
-	const commandDelCalls = delCalls.filter((c) => c.body.message_id === 100);
-	assert('群内 /sa 指令消息 msgId=100 被删除', commandDelCalls.length >= 1, `实际 ${commandDelCalls.length}`);
-	// 至少 1 次:删除被回复的 msgId=50 那条;闪屏撤回是否调用取决于 ctx 是否同步执行
-	const realDelCalls = delCalls.filter((c) => c.body.message_id === 50);
-	assert('删除被回复消息 msgId=50 至少 1 次', realDelCalls.length >= 1, `实际 ${realDelCalls.length}`);
-	assert('删除发生在举报群 -1001', realDelCalls[0].body.chat_id === -1001);
+	assert('群内 /sa 指令消息 msgId=100 被删除', delCalls.some((c) => c.body.message_id === 100), `实际 ${delCalls.length}`);
+	assert('当前群清扫删除 msgId=40', delCalls.some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 40));
+	assert('当前群清扫删除 msgId=41', delCalls.some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 41));
+	assert('当前群清扫删除 msgId=50', delCalls.some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 50));
+	assert('不删除别人的消息 msgId=42', !delCalls.some((c) => c.body.message_id === 42));
+	assert('不删除其它群同用户消息 msgId=60', !delCalls.some((c) => c.body.message_id === 60));
 
-	// 新断言:/sa 现在走 replyToAdmin 双通道
 	const sendCalls = callsOf('sendMessage');
 	const groupSends = sendCalls.filter((c) => String(c.body.chat_id) === '-1001');
 	const dmSends = sendCalls.filter((c) => String(c.body.chat_id) === '999');
 	assert('群内闪屏 sendMessage 至少 1 次', groupSends.length >= 1);
 	assert('闪屏含"已加黑"', groupSends[0].body.text.includes('已加黑'));
 	assert('私聊详情 sendMessage 1 次', dmSends.length === 1);
-	assert('私聊详情含"添加到黑名单"', dmSends[0].body.text.includes('添加到黑名单'));
+	assert('私聊详情含当前群近期消息清扫', dmSends[0].body.text.includes('当前群近期消息清扫'));
+	assert('私聊详情显示 3/3 清扫成功', dmSends[0].body.text.includes('成功 3/3'));
 	assert('私聊详情含群名"主群"', dmSends[0].body.text.includes('主群'));
 	assert('/sa 回复模式含命令来源', dmSends[0].body.text.includes('命令来源') && dmSends[0].body.text.includes('-1001'));
 	assert('/sa 回复模式含执行原因', dmSends[0].body.text.includes('执行原因:广告引流'));
 }
-
 // ---------- [1b] /sa bot 不是管理员 + 删消息失败:错误翻译 ----------
 console.log('\n[1b] /sa 错误翻译:CHAT_ADMIN_REQUIRED + 删消息失败');
 {
