@@ -98,14 +98,18 @@ const DEFAULT_AD_KEYWORDS_FRAUD = [];
 // 仅在主人执行 /importdefault 时一次性写入 D1,不默认生效
 const RECOMMENDED_AD_KEYWORDS = {
 	finance: ['us' + 'dt', 'u' + '商', '承' + '兑', '刷' + '单', '日' + '入', '出' + 'u', '接' + 'u', '搬' + '砖', '套' + '利', '包' + '网', '跑' + '分', '水' + '房', '料' + '子'],
-	porn: ['约' + '炮', '萝' + '莉', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '萝' + '控'],
+	porn: ['约' + '炮', '萝' + '莉', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '萝' + '控',
+		'性' + '爱', '不' + '雅', '完整' + '版', '免费' + '观看', '在线' + '观看', '楼' + '凤', '上门' + '服务', '空' + '降', '嫩' + '模', '探' + '花'],
 	sa: [],
-	fraud: ['假' + '钞', '假' + '币', '代开' + '发票', '黑客' + '接单', '网' + '赚', '菠' + '菜'],
+	fraud: ['假' + '钞', '假' + '币', '代开' + '发票', '黑客' + '接单', '网' + '赚', '菠' + '菜',
+		'无' + '风险', '拍' + '单', '刷' + '信誉', '一单' + '无风险', '收' + '视频', '提供' + '设备',
+		'拍商家' + '码', '六' + '合彩', '世界杯' + '内幕', 'pc' + '28', '加群' + '手', '红包' + '福利'],
 	// identity:只用于检测发言人"名字/简介",不碰正文。色情/赌博露骨话术。
 	//   注意:只放正常用户绝不会用的露骨词,不放链接/@/域名(那些会误杀双向bot/技术讨论)。
 	identity: ['出租' + '淫妻', '淫' + '妻', '性' + '奴', '约' + '炮', '裸' + '聊', '楼' + '凤',
 		'小' + '姐', '上门' + '服务', '特殊' + '服务', '援' + '交', '菠' + '菜', '博' + '彩',
-		'赌' + '场', '六' + '合彩', '时时' + '彩', '网' + '赌'],
+		'赌' + '场', '六' + '合彩', '时时' + '彩', '网' + '赌',
+		'看我' + '介绍', '看我' + '主页', '搞钱' + '找我', '正品水果' + '專卖店', '正品水果' + '专卖店'],
 };
 
 // /recent 冻结快照 D1 表(供 /learnlast 按固定序号引用,根治序号漂移)
@@ -3361,9 +3365,15 @@ async function mergeAdKeywordsFromD1(env) {
 	// 先把域名白名单、身份广告词重置为内置默认(无论 D1 是否有数据都生效)
 	URL_WHITELIST = [...DEFAULT_URL_WHITELIST];
 	IDENTITY_SPAM_WORDS = [...DEFAULT_IDENTITY_SPAM_WORDS];
+	const norm = (a) => (Array.isArray(a) ? a : []).map((s) => String(s).toLowerCase()).filter(Boolean);
+	// 内置推荐词库自动生效(不再必须手动 /importdefault)。字符串拆分写法保证 GitHub 无明文。
+	// D1 里主人 /addword 加的词会在下面继续叠加,两者取并集去重,互不冲突。
+	AD_KEYWORDS_FINANCE = [...new Set([...AD_KEYWORDS_FINANCE, ...norm(RECOMMENDED_AD_KEYWORDS.finance)])];
+	AD_KEYWORDS_PORN = [...new Set([...AD_KEYWORDS_PORN, ...norm(RECOMMENDED_AD_KEYWORDS.porn)])];
+	AD_KEYWORDS_FRAUD = [...new Set([...AD_KEYWORDS_FRAUD, ...norm(RECOMMENDED_AD_KEYWORDS.fraud)])];
+	IDENTITY_SPAM_WORDS = [...new Set([...IDENTITY_SPAM_WORDS, ...norm(RECOMMENDED_AD_KEYWORDS.identity)])];
 	const data = await loadAdKeywordsFromD1(env);
 	if (!data) return;
-	const norm = (a) => (Array.isArray(a) ? a : []).map((s) => String(s).toLowerCase()).filter(Boolean);
 	AD_KEYWORDS_FINANCE = [...new Set([...AD_KEYWORDS_FINANCE, ...norm(data.finance)])];
 	AD_KEYWORDS_PORN = [...new Set([...AD_KEYWORDS_PORN, ...norm(data.porn)])];
 	AD_KEYWORDS_SPAM = [...new Set([...AD_KEYWORDS_SPAM, ...norm(data.sa), ...norm(data.spam)])];
@@ -3753,6 +3763,58 @@ function getContactText(message) {
 	return parts.join(' ');
 }
 
+// 判断名片电话号是否为"外国号"(非中国大陆 +86)。
+// 中文群里正常人极少分享外国号名片,广告号几乎清一色 +63/+7/+972/+1 等。
+// 只有能明确识别出国际区号且【不是 +86】时才返回 true;号码缺失/无法判断 → false(保守,不误判)。
+function isForeignPhoneNumber(phone) {
+	const raw = String(phone || '').trim();
+	if (!raw) return false;
+	// 归一:去空格/横线/括号,保留开头 + 号
+	const digits = raw.replace(/[\s\-()]/g, '');
+	// 必须是国际格式(以 + 或 00 开头)才能判断"是不是外国号";纯本地号无区号 → 不判断
+	let intl = '';
+	if (digits.startsWith('+')) intl = digits.slice(1);
+	else if (digits.startsWith('00')) intl = digits.slice(2);
+	else return false;
+	if (!/^\d{6,15}$/.test(intl)) return false;
+	// +86 开头 = 中国大陆,放行
+	if (intl.startsWith('86')) return false;
+	return true;
+}
+
+// 名片显示名是否呈"推广模式"(而非正常人名)。用于外国号名片的第二重条件,压误杀。
+// 命中任一:含"数字+单位(单/元/块/部/一单)"、专卖/代购、无风险、看我介绍/主页、加好友/加微信、
+//   搞钱/找我、内幕/预测、招募/收购、+联系方式引导词。正常人名(张三/John/小明)不会命中。
+function looksLikePromoName(name) {
+	const t = String(name || '');
+	if (!t.trim()) return false;
+	const patterns = [
+		/\d+\s*(单|元|块|部|一单|美金|u\b)/i,
+		/(专卖|代购|专营|旗舰)/,
+		/(无风险|风险自负)/,
+		/(看我(介绍|主页)|个人?主页|看主页|看简介)/,
+		/(加(好友|微信|群|我|一下)|私聊|滴滴我|dd我)/,
+		/(搞钱|找我|带你|带飞|上岸)/,
+		/(内幕|预测|回血|上分|下注)/,
+		/(招募|收(视频|料|号)|出(u|货|料))/i,
+	];
+	return patterns.some((re) => re.test(t));
+}
+
+// 统计文本里"引流@提及/频道"的分布。广告常用重复 @同一账号 或堆叠多个 @账号 引流。
+// 返回 { distinct: 去重后@数量, maxRepeat: 同一@最多重复次数 }。
+function analyzeMentionFlood(text) {
+	const t = String(text || '');
+	const counts = new Map();
+	for (const m of t.matchAll(/@[a-zA-Z][\w]{3,}/g)) {
+		const key = m[0].toLowerCase();
+		counts.set(key, (counts.get(key) || 0) + 1);
+	}
+	let maxRepeat = 0;
+	for (const v of counts.values()) if (v > maxRepeat) maxRepeat = v;
+	return { distinct: counts.size, maxRepeat };
+}
+
 const QUOTE_TEXT_KEYS = new Set(['text', 'caption', 'title', 'description']);
 const QUOTE_TEXT_SKIP_KEYS = new Set([
 	'from', 'sender_chat', 'chat', 'via_bot',
@@ -3924,6 +3986,24 @@ async function detectAd(message, env) {
 		return { isAd: true, score: 99, hits: ['发言人名字引流:' + nameHits.join('/')], strong: '发言人名字含广告' };
 	}
 
+	// 强特征 0.5:外国号名片直杀(双条件,压误杀)。
+	//   条件① 分享的是名片(contact) 且 电话是非 +86 的外国号;
+	//   条件② 名片显示名呈"推广模式"(数字+单位/专卖/无风险/看我介绍/加好友/搞钱/内幕…)。
+	//   中文群里"外国号 + 推广名"的名片几乎 100% 是广告(拍单/水果机/彩票内幕/搞钱找我这类),
+	//   而正常人分享的外国朋友名片显示名是人名(不会命中推广模式),所以双条件误杀率极低。
+	if (message.contact) {
+		const contactPhone = message.contact.phone_number || '';
+		const contactDisplayName = [message.contact.first_name, message.contact.last_name].filter(Boolean).join(' ');
+		if (isForeignPhoneNumber(contactPhone) && looksLikePromoName(contactDisplayName)) {
+			return {
+				isAd: true,
+				score: 99,
+				hits: [`外国号名片:${contactDisplayName.slice(0, 30)} / ${contactPhone}`],
+				strong: '外国号推广名片'
+			};
+		}
+	}
+
 	// 强特征 1:学习样本指纹精确匹配(/sa /learn /learnlast 上报过的广告)
 	//   归一化后完全相等才命中,不做子串包含(避免误杀正常长消息)
 	const normMsg = normalizeForFingerprint(bodyText);
@@ -3933,6 +4013,31 @@ async function detectAd(message, env) {
 			if (normMsg === fp) {
 				return { isAd: true, score: 99, hits: ['学习样本精确匹配'], strong: '学习样本(精确)' };
 			}
+		}
+	}
+
+	// 强特征 1.5:引用框@引流泛滥(专治"短正文 + 引用框堆叠@账号"的引流广告)。
+	//   命中双条件:① 当前发送者正文很短(归一化 ≤ 8 字,任何语言,包括"笛裙带走六百"这类无意义中文包装);
+	//   ② 被引用内容里 @账号 泛滥:同一 @重复 ≥ 3 次,或不同 @账号 ≥ 4 个。
+	//   正常人引用某条消息回复时,正文是正常句子(不会 ≤8 字无意义)且不会堆一堆@,所以误杀率极低。
+	//   杀当前"二次广播广告"的发送者,不处理被引用的原消息作者。
+	if (quoteText) {
+		const senderBodyNorm = normalizeForFingerprint(message.text || message.caption || '');
+		const mention = analyzeMentionFlood(quoteText);
+		if (senderBodyNorm.length <= 8 && (mention.maxRepeat >= 3 || mention.distinct >= 4)) {
+			logQuoteAdDiagnostic(message, quoteText, {
+				decision: 'kill_mention_flood',
+				score: 99,
+				hits: [`引用@引流泛滥:不同${mention.distinct}/最多重复${mention.maxRepeat}`]
+			});
+			return {
+				isAd: true,
+				score: 99,
+				hits: [`引用@引流泛滥:不同${mention.distinct}个/最多重复${mention.maxRepeat}次`],
+				strong: '引用@引流泛滥',
+				source: '引用内容',
+				quotePreview: quoteText.slice(0, 100)
+			};
 		}
 	}
 
@@ -4049,6 +4154,13 @@ async function detectAd(message, env) {
 
 	// 纯链接刷屏:有外链 + 文本很短。纯白名单链接(github等)不算,避免误杀正常分享。
 	if (!urlsAllWhite && urls.length > 0 && fullText.length < 20) { score += 1; hits.push('短文本+链接'); }
+
+	// @bot 引流 + 诱导词组合(专治"图片+@xxx_bot+点击下方免费看完整版"这类色情图文广告)。
+	//   单独 @bot 不加分(正常人会 @双向机器人),但 @bot 同时出现"点击下方/完整版/免费看/加我看/资源"
+	//   这类诱导词时 +2,配合词库色情分极易达阈值。正常技术 @bot 不带这些诱导词,不受影响。
+	const mentionsBot = /@[a-z][\w]{2,}bot\b/i.test(fullText);
+	const hasLure = /(点击下方|完整版|免费(看|观看|领)|加我(看|领)|资源(群|站)|看完整|扫码|进群看)/.test(fullText);
+	if (mentionsBot && hasLure) { score += 2; hits.push('@bot+诱导词'); }
 
 	return { isAd: score >= AD_SCORE_THRESHOLD, score, hits, strong: null };
 }
