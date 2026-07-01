@@ -50,7 +50,8 @@ const DEFAULT_BLACKLIST_REASON_LABELS = {
 	manual: '管理员 /be 指令加黑',
 	manual_ban: '旧版 Telegram 原生封禁同步记录',
 	ad_auto: '🤖 广告自动检测',
-	ad_learn: '🤖 上报学习'
+	ad_learn: '🤖 上报学习',
+	gky_global: '🌐 杀神全局封禁库命中'
 };
 
 // 6) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
@@ -89,6 +90,21 @@ const DEFAULT_AD_KEYWORDS_FINANCE = [];
 const DEFAULT_AD_KEYWORDS_PORN = [];
 const DEFAULT_AD_KEYWORDS_SPAM = [];
 const DEFAULT_AD_KEYWORDS_FRAUD = [];
+
+// 9.1) 严格模式(A 开关):开启后【彻底关闭正文关键词加权评分】,只保留高精度强特征直杀。
+//    正文加权评分是"误杀正常人"的主因(正常用户聊 usdt/搬砖/套利 会被弱信号累加误判);
+//    严格模式下只留:全局黑名单命中 / 学习样本指纹精确匹配 / 发言人名字身份词 /
+//    名片显示名命中词库 / 外国号推广名片 / 引用@引流泛滥 / @bot+诱导词。
+//    效果:误杀正常人趋近于零,代价是"整体像广告但不命中强特征"的会漏(可事后 /learn 补)。
+//    环境变量名:AD_STRICT_MODE(默认 false)
+const DEFAULT_AD_STRICT_MODE = false;
+
+// 9.2) 杀神全局封禁库主动查杀(B 方案,最接近杀神的做法)。
+//    新成员进群时,主动查一次杀神全局库(GKY_BANLIST_ENDPOINT),命中 → 删/踢/加黑(reason:gky_global)。
+//    等于白嫖杀神跨群信誉数据:某号在别的群发广告被杀神全局标记,一进你群就被拦,不用猜消息内容。
+//    只在"新成员进群"触发(频率低,不撞 Cloudflare 子请求限制),不对每条消息查。
+//    环境变量名:GKY_ACTIVE_CHECK(默认 false,需显式开)
+const DEFAULT_GKY_ACTIVE_CHECK = false;
 
 // =============================================================================
 // =结束= 普通使用者一般无需修改下方任何内容
@@ -176,6 +192,8 @@ let OWNER_IDS = [];
 // 广告检测运行期配置
 let AD_FILTER_ENABLED = false;
 let AD_SCORE_THRESHOLD = 3;
+let AD_STRICT_MODE = false;      // 严格模式:关闭正文加权评分,只留强特征(A 开关)
+let GKY_ACTIVE_CHECK = false;    // 新成员进群主动查杀神全局库(B 方案)
 let AD_KEYWORDS = [];          // 环境变量追加的自定义广告词
 let AD_WHITELIST = [];         // 白名单词(命中不计分)
 let AD_KEYWORDS_FINANCE = [];
@@ -206,6 +224,8 @@ function applyRuntimeConfig(config) {
 	OWNER_IDS = config.OWNER_IDS;
 	AD_FILTER_ENABLED = config.AD_FILTER_ENABLED;
 	AD_SCORE_THRESHOLD = config.AD_SCORE_THRESHOLD;
+	AD_STRICT_MODE = config.AD_STRICT_MODE;
+	GKY_ACTIVE_CHECK = config.GKY_ACTIVE_CHECK;
 	AD_KEYWORDS = config.AD_KEYWORDS;
 	AD_WHITELIST = config.AD_WHITELIST;
 	AD_KEYWORDS_FINANCE = config.AD_KEYWORDS_FINANCE;
@@ -416,6 +436,8 @@ function loadRequiredConfig(env) {
 		)];
 
 	const adFilterEnabled = parseBool(env.AD_FILTER_ENABLED, DEFAULT_AD_FILTER_ENABLED);
+	const adStrictMode = parseBool(env.AD_STRICT_MODE, DEFAULT_AD_STRICT_MODE);
+	const gkyActiveCheck = parseBool(env.GKY_ACTIVE_CHECK, DEFAULT_GKY_ACTIVE_CHECK);
 	let adScoreThreshold = DEFAULT_AD_SCORE_THRESHOLD;
 	if (env.AD_SCORE_THRESHOLD !== undefined && env.AD_SCORE_THRESHOLD !== null && String(env.AD_SCORE_THRESHOLD).trim() !== '') {
 		const n = parseInt(String(env.AD_SCORE_THRESHOLD).trim(), 10);
@@ -442,6 +464,8 @@ function loadRequiredConfig(env) {
 		OWNER_IDS: ownerIds,
 		AD_FILTER_ENABLED: adFilterEnabled,
 		AD_SCORE_THRESHOLD: adScoreThreshold,
+		AD_STRICT_MODE: adStrictMode,
+		GKY_ACTIVE_CHECK: gkyActiveCheck,
 		AD_KEYWORDS: adKeywords,
 		AD_WHITELIST: adWhitelist,
 		AD_KEYWORDS_FINANCE: lower(DEFAULT_AD_KEYWORDS_FINANCE),
@@ -3189,6 +3213,72 @@ async function handleNewChatMemberBots(message) {
 	return true;
 }
 
+// ===== B 方案:新成员进群时主动查杀神全局封禁库 =====
+// 对单个用户查一次 GKY 全局库(GKY_BANLIST_ENDPOINT)。命中(banned=true)→ 删/踢/加黑(reason:gky_global)+ 通知主人。
+// 精度极高:杀神在别的群已判定过的广告号,一进本群就被拦,不用猜消息内容。
+// 返回 true 表示已命中并处置(调用方可据此跳过后续)。异常/未命中 → false(绝不误伤)。
+async function checkGkyGlobalBanAndPunish(userId, chat, env, ctx, options = {}) {
+	if (!GKY_ACTIVE_CHECK) return false;
+	const userIdStr = String(userId);
+	if (!/^\d+$/.test(userIdStr)) return false;
+	try {
+		const raw = await handleBanlist(userIdStr);
+		const data = JSON.parse(raw);
+		if (!data || !data.success || !data.banned) return false;
+
+		// 命中全局库 → 处置。管理员豁免(防误伤配置群管理员)。
+		const isAdmin = await checkIfUserIsAdmin(userIdStr);
+		if (isAdmin) {
+			console.log(`[杀神全局库] 命中但为管理员,豁免: ${userIdStr}`);
+			return false;
+		}
+
+		console.log(`[杀神全局库] 命中: 用户=${userIdStr} 群=${chat?.id} 原因=${data.reason || '无'}`);
+		// 删除触发消息(如果有,进群消息本身也删掉)
+		if (options.messageId && chat?.id != null) {
+			await deleteMessage(chat.id, options.messageId);
+		}
+		// 加黑(全局,永久) + 全群踢/预封
+		await addToBlacklist(userIdStr, env, { reason: 'gky_global', by: 'system', note: `杀神全局库命中${data.reason ? ':' + data.reason : ''}` });
+		const banResults = await banUserFromAllGroups(userIdStr);
+		// 通知主人
+		if (OWNER_IDS.length) {
+			const okCount = banResults.filter((r) => r.ok).length;
+			const target = options.user
+				? (formatUserMention(options.user) || `<code>${escapeHtml(userIdStr)}</code>`)
+				: `<code>${escapeHtml(userIdStr)}</code>`;
+			const auditText = `🌐 <b>杀神全局库命中处置</b>\n` +
+				`🎬 触发:${escapeHtml(options.trigger || '新成员进群')}\n` +
+				`🎯 用户:${target}\n` +
+				`📋 全局库原因:${escapeHtml(String(data.reason || '未提供'))}\n` +
+				`🚫 已加黑(gky_global) + 全群封禁 ${okCount}/${banResults.length}`;
+			await notifyAllOwners(auditText, null);
+		}
+		return true;
+	} catch (error) {
+		// 查询失败(网络/解析)→ 绝不误伤,静默放行
+		console.error(`[杀神全局库] 查询失败 用户=${userIdStr}:`, error.message || error);
+		return false;
+	}
+}
+
+// 新成员进群(真人)批量查杀神全局库。bot 由 handleNewChatMemberBots 单独处理,这里跳过 bot。
+async function handleNewMemberGkyCheck(message, env, ctx) {
+	if (!GKY_ACTIVE_CHECK) return;
+	const chat = message.chat;
+	const newMembers = message.new_chat_members;
+	if (!Array.isArray(newMembers) || newMembers.length === 0) return;
+	if (!chat || !isConfiguredGroup(chat.id)) return;
+	for (const member of newMembers) {
+		if (!member || member.is_bot) continue; // bot 交给 handleNewChatMemberBots
+		await checkGkyGlobalBanAndPunish(member.id, chat, env, ctx, {
+			user: member,
+			messageId: message.message_id,
+			trigger: '新成员进群'
+		});
+	}
+}
+
 // 处理 chat_member 事件：管理员手动封/解封时同步 D1 黑名单
 // 加黑：从其它状态 → kicked
 // 移黑：从 kicked → 任意其它状态
@@ -4140,7 +4230,24 @@ async function detectAd(message, env) {
 		}
 	}
 
-	// 加权评分
+	// @bot 引流 + 诱导词组合(专治"图片+@xxx_bot+点击下方免费看完整版"这类色情图文广告)。
+	//   单独 @bot 不加分(正常人会 @双向机器人),但 @bot 同时出现"点击下方/完整版/免费看/加我看/资源"
+	//   这类诱导词时命中。双条件精度高,严格模式下作为强特征直杀;普通模式 +2 分。
+	const mentionsBot = /@[a-z][\w]{2,}bot\b/i.test(fullText);
+	const hasLure = /(点击下方|完整版|免费(看|观看|领)|加我(看|领)|资源(群|站)|看完整|扫码|进群看)/.test(fullText);
+
+	// ===== A 严格模式:关闭正文加权评分,只保留高精度强特征 =====
+	//   正文关键词加权累加是"误杀正常人"的主因(聊 usdt/搬砖/套利 的正常用户被弱信号叠加误判)。
+	//   严格模式下上面所有"强特征直杀"仍全部生效(全局库/样本指纹/身份词/名片词/外国号名片/引用@泛滥),
+	//   此处只保留同为双条件、高精度的 @bot+诱导词直杀,其余加权评分一律不计 → 误杀趋近于零。
+	if (AD_STRICT_MODE) {
+		if (mentionsBot && hasLure) {
+			return { isAd: true, score: 99, hits: ['@bot+诱导词(严格模式直杀)'], strong: '@bot+诱导词' };
+		}
+		return { isAd: false, score: 0, hits: [], strong: null };
+	}
+
+	// ===== 普通模式:加权评分 =====
 	const wordScore = scoreAdWords(scoringText);
 	let score = wordScore.score;
 	hits.push(...wordScore.hits);
@@ -4155,11 +4262,6 @@ async function detectAd(message, env) {
 	// 纯链接刷屏:有外链 + 文本很短。纯白名单链接(github等)不算,避免误杀正常分享。
 	if (!urlsAllWhite && urls.length > 0 && fullText.length < 20) { score += 1; hits.push('短文本+链接'); }
 
-	// @bot 引流 + 诱导词组合(专治"图片+@xxx_bot+点击下方免费看完整版"这类色情图文广告)。
-	//   单独 @bot 不加分(正常人会 @双向机器人),但 @bot 同时出现"点击下方/完整版/免费看/加我看/资源"
-	//   这类诱导词时 +2,配合词库色情分极易达阈值。正常技术 @bot 不带这些诱导词,不受影响。
-	const mentionsBot = /@[a-z][\w]{2,}bot\b/i.test(fullText);
-	const hasLure = /(点击下方|完整版|免费(看|观看|领)|加我(看|领)|资源(群|站)|看完整|扫码|进群看)/.test(fullText);
 	if (mentionsBot && hasLure) { score += 2; hits.push('@bot+诱导词'); }
 
 	return { isAd: score >= AD_SCORE_THRESHOLD, score, hits, strong: null };
@@ -4555,6 +4657,10 @@ async function handleCallbackQuery(cb, env, ctx) {
 }
 
 async function handleMessage(message, env, ctx, requestUrl = '') {
+	// B 方案:新成员进群时主动查杀神全局封禁库(真人)。放在 bot 处理之前,
+	//   因为 handleNewChatMemberBots 遇到 new_chat_members 会 return true 提前结束。
+	await handleNewMemberGkyCheck(message, env, ctx);
+
 	if (await handleNewChatMemberBots(message)) {
 		return;
 	}
