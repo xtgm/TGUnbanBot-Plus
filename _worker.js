@@ -651,7 +651,7 @@ async function ensureD1Table(env) {
 	if (!env.DB || D1_INITED) return;
 	try {
 		await env.DB.exec(`
-			CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT);
+			CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT);
 			CREATE TABLE IF NOT EXISTS ad_keywords (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
 			CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
 			CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);
@@ -659,6 +659,12 @@ async function ensureD1Table(env) {
 			CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
 			CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT);
 		`);
+		// 兼容旧库:blacklist 表若无 note 列则补加(已存在会报错,吞掉即可,幂等)
+		try {
+			await env.DB.exec('ALTER TABLE blacklist ADD COLUMN note TEXT;');
+		} catch (_) {
+			// 列已存在 → duplicate column name,忽略
+		}
 		D1_INITED = true;
 	} catch (error) {
 		console.error('D1 建表失败:', error);
@@ -667,13 +673,14 @@ async function ensureD1Table(env) {
 
 async function readD1Blacklist(env) {
 	await ensureD1Table(env);
-	const stmt = env.DB.prepare('SELECT id, reason, by_user, at FROM blacklist ORDER BY at ASC');
+	const stmt = env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at ASC');
 	const { results } = await stmt.all();
 	return (results || []).map((r) => ({
 		id: String(r.id),
 		reason: r.reason ?? null,
 		by: r.by_user ?? null,
-		at: r.at ?? null
+		at: r.at ?? null,
+		note: r.note ?? null
 	}));
 }
 
@@ -711,7 +718,7 @@ async function readD1BlacklistWindow(env, offset, limit, reasons = null) {
 
 	const filter = buildD1BlacklistReasonFilter(reasons);
 	const stmt = env.DB.prepare(`
-		SELECT id, reason, by_user, at
+		SELECT id, reason, by_user, at, note
 		FROM blacklist
 		${filter.where}
 		ORDER BY COALESCE(at, ''), id
@@ -722,7 +729,8 @@ async function readD1BlacklistWindow(env, offset, limit, reasons = null) {
 		id: String(r.id),
 		reason: r.reason ?? null,
 		by: r.by_user ?? null,
-		at: r.at ?? null
+		at: r.at ?? null,
+		note: r.note ?? null
 	}));
 }
 
@@ -805,13 +813,15 @@ async function addToBlacklistCore(userId, env, options = {}) {
 	const userIdStr = String(userId);
 	const reason = options.reason ?? null;
 	const by = options.by != null ? String(options.by) : null;
+	const noteRaw = options.note != null ? String(options.note).trim() : '';
+	const note = noteRaw ? noteRaw : null;
 	const at = new Date().toISOString();
 
 	try {
 		await ensureD1Table(env);
 		const result = await env.DB
-			.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at) VALUES (?, ?, ?, ?)')
-			.bind(userIdStr, reason, by, at)
+			.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at, note) VALUES (?, ?, ?, ?, ?)')
+			.bind(userIdStr, reason, by, at, note)
 			.run();
 		const changed = result?.meta?.changes ?? result?.changes ?? 0;
 		if (!changed) {
@@ -1688,7 +1698,7 @@ async function banUserFromGroupWithRetry(groupId, userId, retryLimit) {
 async function processBulkJobUserBatch(job, env, ids) {
 	const kickTasks = [];
 	for (const id of ids) {
-		const result = await addToBlacklistCore(id, env, { reason: job.reason, by: job.createdBy });
+		const result = await addToBlacklistCore(id, env, { reason: job.reason, by: job.createdBy, note: job.note });
 		if (result.success) {
 			job.stats.added += 1;
 		} else if (result.code === 'EXISTS') {
@@ -2960,9 +2970,13 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 			const reason = translateBlacklistReason(entry?.reason);
 			const operator = await translateBlacklistOperator(entry?.by);
 			const addedAt = entry?.at || '未知';
+			const noteText = String(entry?.note || '').trim();
 			localBlacklistInfo = `\n🚫 <b>本地黑名单:在黑名单中</b>\n` +
-				`├ 加黑方式:${reason}\n` +
-				`├ 操作人:${operator}\n` +
+				`├ 加黑方式:${reason}\n`;
+			if (noteText) {
+				localBlacklistInfo += `├ 执行原因:${escapeHtml(noteText)}\n`;
+			}
+			localBlacklistInfo += `├ 操作人:${operator}\n` +
 				`└ 时间:${escapeHtml(addedAt)}\n`;
 		} else {
 			localBlacklistInfo = `\n✅ <b>本地黑名单:不在黑名单中</b>\n`;
@@ -4585,7 +4599,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			// 单条
 			if (valid.length === 1 && invalid.length === 0) {
-				const result = await addToBlacklist(valid[0], env, { reason: 'sa', by: operatorId });
+				const result = await addToBlacklist(valid[0], env, { reason: 'sa', by: operatorId, note });
 				const alreadyExists = result.code === 'EXISTS';
 				let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
 				const lines = [`🎬 操作:举报加黑(/sa)`];
@@ -4616,7 +4630,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 
 			// 批量
-			const results = await addManyToBlacklist(valid, env, { reason: 'sa', by: operatorId });
+			const results = await addManyToBlacklist(valid, env, { reason: 'sa', by: operatorId, note });
 			const idsToKick = [...results.success, ...results.exists];
 			const banSummary = { success: idsToKick.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
 			const perUserBanResults = [];
@@ -4663,7 +4677,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		const replySpamNote = rawArg;
-		const result = await addToBlacklist(repliedUserId, env, { reason: 'sa', by: operatorId });
+		const result = await addToBlacklist(repliedUserId, env, { reason: 'sa', by: operatorId, note: replySpamNote });
 		const alreadyExists = result.code === 'EXISTS';
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
@@ -5483,7 +5497,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		// 单条且无格式错误
 		if (valid.length === 1 && invalid.length === 0) {
-			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: operatorId });
+			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: operatorId, note });
 			const alreadyExists = result.code === 'EXISTS';
 			// 统一详情格式:无论成功失败都展示完整字段
 			let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
@@ -5516,7 +5530,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		// 批量
-		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: operatorId });
+		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: operatorId, note });
 		const idsToKick = [...results.success, ...results.exists];
 		const banSummary = { success: idsToKick.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
 		// 收集每个用户的逐群结果,用于在 detail 末尾渲染明细
