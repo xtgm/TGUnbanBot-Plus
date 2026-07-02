@@ -4900,8 +4900,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success || alreadyExists) {
-			// 加黑成功或已存在 → Telegram 群封禁/预封 + 清扫当前群该用户近期消息
-			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true, revokeMessages: false });
+			// 加黑成功或已存在 → Telegram 群封禁/预封(revoke_messages 默认 true:封禁同时删该用户在各群全部消息)
+			//   + 缓存清扫兜底(补删 revoke 偶尔漏的、当前群近期消息)
+			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true });
 			const cleanupResult = await cleanupCurrentChatUserMessages(env, chatId, repliedUserId, [repliedMsg.message_id]);
 
 			const lines = [
