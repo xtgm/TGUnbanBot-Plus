@@ -375,7 +375,7 @@ console.log('\n[1] /sa 触发:加黑 + 全群踢 + 当前群近期消息清扫')
 	const banCalls = callsOf('banChatMember');
 	assert('banChatMember 调用 2 次（两个群）', banCalls.length === 2, `实际 ${banCalls.length}`);
 	assert('banChatMember 用户ID 都是 8888', banCalls.every((c) => String(c.body.user_id) === '8888'));
-	assert('/sa 回复全群封禁不跨群撤回消息', banCalls.every((c) => c.body.revoke_messages === false));
+	assert('/sa 回复全群封禁默认跨群撤回消息(revoke_messages=true)', banCalls.every((c) => c.body.revoke_messages === true));
 	const banGroups = banCalls.map((c) => String(c.body.chat_id)).sort();
 	assert('两个群 ID 都被覆盖', JSON.stringify(banGroups) === JSON.stringify(['-1001', '-1002']), `实际 ${JSON.stringify(banGroups)}`);
 
