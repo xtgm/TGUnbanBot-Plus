@@ -3999,11 +3999,34 @@ function logQuoteAdDiagnostic(message, quoteText, detail = {}) {
 function scoreAdWords(text) {
 	let score = 0;
 	const hits = [];
-	for (const w of AD_KEYWORDS_FINANCE) if (w && text.includes(w)) { score += 2; hits.push(`金融:${w}`); }
-	for (const w of AD_KEYWORDS_PORN) if (w && text.includes(w)) { score += 2; hits.push(`色情:${w}`); }
-	for (const w of AD_KEYWORDS_SPAM) if (w && text.includes(w)) { score += 1; hits.push(`引流:${w}`); }
-	for (const w of AD_KEYWORDS_FRAUD) if (w && text.includes(w)) { score += 2; hits.push(`诈骗:${w}`); }
-	for (const w of AD_KEYWORDS) if (w && text.includes(w)) { score += 2; hits.push(`自定义:${w}`); }
+	// 跨分类去重:同一个词无论出现在几个词库,只计一次分/一个 hit
+	const seen = new Set();
+	const scan = (words, weight, label) => {
+		for (const w of words) {
+			if (!w || seen.has(w)) continue;
+			if (text.includes(w)) { seen.add(w); score += weight; hits.push(`${label}:${w}`); }
+		}
+	};
+	// 金融词先收集命中，但不立即加分:需要 ≥2 个金融词才入计分
+	// 单个金融词(usdt/搬砖/套利等)在正常讨论中极其普遍，单独出现不应定罪
+	const financeHits = [];
+	const financeSeen = new Set();
+	for (const w of AD_KEYWORDS_FINANCE) {
+		if (!w || financeSeen.has(w)) continue;
+		if (text.includes(w)) { financeSeen.add(w); financeHits.push(`金融:${w}`); }
+	}
+	// ≥2 个金融词叠加才计入评分
+	if (financeHits.length >= 2) {
+		for (const h of financeHits) { seen.add(h.slice(3)); score += 2; hits.push(h); }
+	} else if (financeHits.length === 1) {
+		// 单个金融词：加入 seen 防止自定义库重复，但 score 不加
+		seen.add(financeHits[0].slice(3));
+		hits.push(financeHits[0]); // 保留在 hits 里供诊断日志，但 score=0
+	}
+	scan(AD_KEYWORDS_PORN,  2, '色情');
+	scan(AD_KEYWORDS_SPAM,  1, '引流');
+	scan(AD_KEYWORDS_FRAUD, 2, '诈骗');
+	scan(AD_KEYWORDS,       2, '自定义');
 	return { score, hits };
 }
 
@@ -4177,29 +4200,34 @@ async function detectAd(message, env) {
 				quotePreview: quoteText.slice(0, 100)
 			};
 		}
-		const quotedWordScore = scoreAdWords(quoteForScan);
-		if (quotedWordScore.score >= AD_SCORE_THRESHOLD || quotedWordScore.hits.length >= 2) {
-			const hits = quotedWordScore.hits.map((h) => `引用内容${h}`);
+		// 严格模式下跳过引用内容加权评分(同正文路径逻辑一致,只留上方强特征直杀)
+		if (!AD_STRICT_MODE) {
+			const quotedWordScore = scoreAdWords(quoteForScan);
+			if (quotedWordScore.score >= AD_SCORE_THRESHOLD || quotedWordScore.hits.length >= 2) {
+				const hits = quotedWordScore.hits.map((h) => `引用内容${h}`);
+				logQuoteAdDiagnostic(message, quoteText, {
+					decision: 'kill_score_or_multi_word',
+					score: Math.max(quotedWordScore.score, AD_SCORE_THRESHOLD),
+					hits
+				});
+				return {
+					isAd: true,
+					score: Math.max(quotedWordScore.score, AD_SCORE_THRESHOLD),
+					hits,
+					strong: '引用内容命中广告词',
+					source: '引用内容',
+					quotePreview: quoteText.slice(0, 100)
+				};
+			}
 			logQuoteAdDiagnostic(message, quoteText, {
-				decision: 'kill_score_or_multi_word',
-				score: Math.max(quotedWordScore.score, AD_SCORE_THRESHOLD),
-				hits
+				decision: 'no_match',
+				score: quotedWordScore.score,
+				hits: quotedWordScore.hits,
+				highRiskHits: quotedHighRiskHits
 			});
-			return {
-				isAd: true,
-				score: Math.max(quotedWordScore.score, AD_SCORE_THRESHOLD),
-				hits,
-				strong: '引用内容命中广告词',
-				source: '引用内容',
-				quotePreview: quoteText.slice(0, 100)
-			};
+		} else {
+			logQuoteAdDiagnostic(message, quoteText, { decision: 'no_match', score: 0, hits: [], highRiskHits: [] });
 		}
-		logQuoteAdDiagnostic(message, quoteText, {
-			decision: 'no_match',
-			score: quotedWordScore.score,
-			hits: quotedWordScore.hits,
-			highRiskHits: quotedHighRiskHits
-		});
 	} else if (shortQuoteWrapper && hasQuoteLikeStructure(message)) {
 		logQuoteAdDiagnostic(message, quoteText, {
 			decision: 'quote_structure_no_text',
