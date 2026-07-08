@@ -1848,6 +1848,35 @@ console.log('\n[12a5] 匿名管理员回复 /sa');
 	assert('匿名回复 /sa 执行全群踢出', callsOf('banChatMember').length === 2);
 }
 
+// ---------- [12a5b] /sa 回复 sender_chat 不当 TGID 加黑 ----------
+console.log('\n[12a5b] /sa 回复 sender_chat 不加黑');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+	const update = {
+		message: {
+			message_id: 9231,
+			chat: { id: -1001, type: 'supergroup', title: '杀神专用黑名' },
+			from: { id: 999, is_bot: false, first_name: '主人' },
+			text: '/sa',
+			reply_to_message: {
+				message_id: 5010,
+				sender_chat: { id: -100999, type: 'channel', title: '频道身份' },
+			},
+		},
+	};
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
+
+	assert('/sa 回复 sender_chat 不写负数 ID', !env.DB._rows.has('-100999'));
+	assert('/sa 回复 sender_chat 不触发踢人', callsOf('banChatMember').length === 0);
+}
 // ---------- [12a6] 非 GROUP_ID 群的匿名身份不放行 ----------
 console.log('\n[12a6] 非 GROUP_ID 匿名身份不放行');
 {
@@ -1876,6 +1905,87 @@ console.log('\n[12a6] 非 GROUP_ID 匿名身份不放行');
 	assert('非 GROUP_ID 匿名 /be 群内静默', callsOf('sendMessage').length === 0);
 }
 
+// ---------- [12a7] 非 GROUP_ID 实名管理员 /be /sa 不生效 ----------
+console.log('\n[12a7] 非 GROUP_ID 实名管理员 /be /sa 不生效');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 925, chat: { id: -2001, type: 'supergroup', title: '未配置群' }, from: { id: 999, is_bot: false }, text: '/be 999002' } }) }), env, fakeCtx);
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 926, chat: { id: -2001, type: 'supergroup', title: '未配置群' }, from: { id: 999, is_bot: false }, text: '/sa 999003 广告' } }) }), env, fakeCtx);
+
+	assert('非 GROUP_ID 实名管理员 /be 不写 D1', !env.DB._rows.has('999002'));
+	assert('非 GROUP_ID 实名管理员 /sa 不写 D1', !env.DB._rows.has('999003'));
+	assert('非 GROUP_ID 实名管理员 /be /sa 不踢人', callsOf('banChatMember').length === 0);
+	assert('非 GROUP_ID 实名管理员 /be /sa 不回显', callsOf('sendMessage').length === 0);
+	assert('非 GROUP_ID 实名管理员 /be /sa 不删命令', callsOf('deleteMessage').length === 0);
+	assert('非 GROUP_ID 实名管理员 /be /sa 不查管理员', callsOf('getChatAdministrators').length === 0);
+}
+// ---------- [12a8] 非 GROUP_ID 群所有斜杠指令完全无效化 ----------
+console.log('\n[12a8] 非 GROUP_ID 群所有斜杠指令完全无效化');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: () => ({ ok: true, result: { id: -1001, title: '主群', type: 'supergroup' } }),
+		getChatMember: () => ({ ok: true, result: { status: 'member', user: { id: 999004 } } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		unbanChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const db = makeFakeDB([{ id: '999004', reason: 'manual', by: '999', at: '2026-07-08T00:00:00.000Z' }]);
+	db._store.set('ad_keywords_custom', JSON.stringify({ general: ['原词'], fraud: [], finance: [], porn: [], sa: [], whitelist: [] }));
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: ['原样本'], count: 1 }));
+	const env = { ...baseEnv, SUPER_ADMINS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	const beforeKeywords = db._store.get('ad_keywords_custom');
+	const beforeSamples = db._store.get('ad_samples');
+	const commands = [
+		'/job test-job',
+		'/jobrun test-job',
+		'/check 993005028',
+		'/start',
+		'/start check_993005028',
+		'/blacklist',
+		'/help@SomeBot',
+		'/admins',
+		'/groups',
+		'/leavegroup -1001',
+		'/addword fraud 测试词',
+		'/delword fraud 原词',
+		'/listwords',
+		'/importdefault',
+		'/listsamples',
+		'/delsample 1',
+		'/clearsamples',
+		'/learn 993005028 广告样本',
+		'/learnlast',
+		'/recent',
+		'/unban 999004',
+		'/unban',
+		'/be 999005',
+		'/sa 999006 广告',
+		'我不是广告狗，我是误封的，希望可以解封。',
+	];
+	for (let i = 0; i < commands.length; i++) {
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: { message_id: 930 + i, chat: { id: -2001, type: 'supergroup', title: '未配置群' }, from: { id: 999, is_bot: false }, text: commands[i] } })
+		}), env, fakeCtx);
+	}
+	assert('非 GROUP_ID 群所有 / 指令无 Telegram API 调用', apiCalls.length === 0, apiCalls.map((c) => c.method).join(','));
+	assert('非 GROUP_ID 群 /unban 不移除 D1', db._rows.has('999004'));
+	assert('非 GROUP_ID 群 /be /sa 不写 D1', !db._rows.has('999005') && !db._rows.has('999006'));
+	assert('非 GROUP_ID 群词库/样本命令不改库', db._store.get('ad_keywords_custom') === beforeKeywords && db._store.get('ad_samples') === beforeSamples);
+	assert('非 GROUP_ID 群 /job /jobrun 不创建任务', db._jobs.size === 0);
+}
 // ---------- [12b] D1 黑名单用户确认自助解封:任何 reason 都拒绝 ----------
 console.log('\n[12b] D1 黑名单用户确认自助解封一律拒绝');
 {
@@ -2365,6 +2475,11 @@ console.log('\n[23] 一键解封按钮:主人收审计');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
+		getMe: () => ({ ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }),
+		getChatAdministrators: () => ({ ok: true, result: [
+			{ user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' },
+			{ user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' },
+		] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		editMessageText: () => ({ ok: true, result: true }),
 		editMessageReplyMarkup: () => ({ ok: true, result: true }),
@@ -2373,24 +2488,109 @@ console.log('\n[23] 一键解封按钮:主人收审计');
 	const cbUpdate = {
 		callback_query: {
 			id: 'cb-1',
-			from: { id: 8888, is_bot: false, first_name: '某超管' },
+			from: { id: 999, is_bot: false, first_name: '主人' },
 			message: { message_id: 100, chat: { id: -1001, type: 'supergroup' }, text: 'GKY二次审核内容' },
 			data: 'gky:a:55555:-1001',
 		},
 	};
-	// OWNER_IDS = 999, SUPER_ADMINS 含 8888 才能让按钮通过权限校验
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
+	// OWNER_IDS[0] = 999，只有主人能让按钮通过权限校验
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888', DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cbUpdate) }), env);
 
 	const ownerDms = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
-	assert('主人 999 收到一键解封审计', ownerDms.length > 0);
-	const auditDm = ownerDms.find((c) => c.body.text.includes('操作通知')) || ownerDms[ownerDms.length - 1];
-	assert('审计含"超级管理员操作通知"', auditDm.body.text.includes('超级管理员操作通知'));
-	assert('审计含"一键解封代发"', auditDm.body.text.includes('一键解封代发'));
-	assert('审计含操作人名"某超管"', auditDm.body.text.includes('某超管'));
-	assert('审计含目标用户 55555', auditDm.body.text.includes('55555'));
-	// 新增:回查解封结果消息也应发给主人(含"解封"字样)
-	assert('主人收到解封回查结果', ownerDms.some((c) => c.body.text.includes('解封') || c.body.text.includes('封禁记录')));
+	assert('主人点击按钮 → 代发 GKYbotSave 到配置群', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
+	assert('主人点击按钮 → 收到代发确认私聊', ownerDms.some((c) => c.body.text.includes('已代发 GKYbotSave')));
+	assert('主人点击按钮 → 收到解封回查结果', ownerDms.some((c) => c.body.text.includes('解封') || c.body.text.includes('封禁记录')));
+	assert('主人自己点击按钮 → 不产生额外操作审计', !ownerDms.some((c) => c.body.text.includes('操作通知')));
+}
+
+
+// ---------- [23b] 一键解封按钮来源与目标群硬校验 ----------
+console.log('\n[23b] 一键解封按钮来源与目标群硬校验');
+{
+	const cb = (fromId, sourceChatId, targetChatId = '-1001', sourceChatType = 'supergroup') => ({
+		callback_query: {
+			id: `cb-gate-${fromId}-${sourceChatId}-${targetChatId}`,
+			from: { id: fromId, is_bot: false, first_name: fromId === 999 ? '主人' : '超管' },
+			message: { message_id: 100, chat: { id: sourceChatId, type: sourceChatType }, text: 'GKY二次审核' },
+			data: `gky:a:55555:${targetChatId}`,
+		}
+	});
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(8888, -1001, '-1001')) }), env);
+	let answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('仅限主人'));
+	assert('非主人超级管理员点按钮 → 弹窗拒绝', !!answer);
+	assert('非主人超级管理员点按钮 → 不代发', callsOf('sendMessage').length === 0);
+	assert('非主人超级管理员点按钮 → 不查目标群管理员', callsOf('getChatAdministrators').length === 0);
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -2001, '-1001')) }), env);
+	answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('来源群'));
+	assert('按钮来源非 GROUP_ID → 弹窗拒绝', !!answer);
+	assert('按钮来源非 GROUP_ID → 不代发', callsOf('sendMessage').length === 0);
+	assert('按钮来源非 GROUP_ID → 不查目标群管理员', callsOf('getChatAdministrators').length === 0);
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getMe: () => ({ ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }),
+		getChatAdministrators: () => ({ ok: true, result: [
+			{ user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' },
+			{ user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' },
+		] }),
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+		editMessageText: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, 999, '-1001', 'private')) }), env);
+	assert('私聊来源主人按钮 → 目标群预检后代发', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
+	assert('私聊来源主人按钮 → 查询目标群管理员', callsOf('getChatAdministrators').length >= 1);
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-2001')) }), env);
+	answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('目标群不在 GROUP_IDS'));
+	assert('按钮目标非 GROUP_ID → 弹窗拒绝', !!answer);
+	assert('按钮目标非 GROUP_ID → 不代发', callsOf('sendMessage').length === 0);
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getMe: () => ({ ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }),
+		getChatAdministrators: () => ({ ok: true, result: [
+			{ user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' },
+		] }),
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
+	answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('当前机器人不是目标群管理员'));
+	assert('目标群当前 bot 非管理员 → 弹窗拒绝', !!answer);
+	assert('目标群当前 bot 非管理员 → 不代发', callsOf('sendMessage').length === 0);
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getMe: () => ({ ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }),
+		getChatAdministrators: () => ({ ok: true, result: [
+			{ user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' },
+		] }),
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
+	answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('GKYbot'));
+	assert('目标群无管理员 GKYbot → 弹窗拒绝', !!answer);
+	assert('目标群无管理员 GKYbot → 不代发', callsOf('sendMessage').length === 0);
 }
 
 // ---------- [24] chat_member 手动 be → 主人收审计 ----------
@@ -3675,6 +3875,8 @@ console.log('\n[77] 一键代发回查解封结果');
 			const method = u.split('/').pop();
 			const body = init && init.body ? JSON.parse(init.body) : null;
 			apiCalls.push({ method, body });
+			if (method === 'getMe') return { ok: true, status: 200, async json() { return { ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }; } };
+			if (method === 'getChatAdministrators') return { ok: true, status: 200, async json() { return { ok: true, result: [{ user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' }, { user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' }] }; } };
 			if (method === 'getChatMember') return { ok: true, status: 200, async json() { return { ok: true, result: { user: { id: 55555, first_name: '某用户' }, status: 'member' } }; } };
 			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
 		}
@@ -3686,14 +3888,14 @@ console.log('\n[77] 一键代发回查解封结果');
 	};
 	const cbUpdate = {
 		callback_query: {
-			id: 'cb-77a', from: { id: 8888, is_bot: false, first_name: '某超管' },
+			id: 'cb-77a', from: { id: 999, is_bot: false, first_name: '主人' },
 			message: { message_id: 100, chat: { id: -1001, type: 'supergroup' }, text: 'GKY二次审核' },
 			data: 'gky:a:55555:-1001',
 		},
 	};
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cbUpdate) }), env);
-	const opDms = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
+	const opDms = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
 	assert('代发后 → 操作人收到"正在确认"', opDms.some((c) => c.body.text.includes('正在确认')));
 	assert('GKY无记录 → 提示"解封成功"', opDms.some((c) => c.body.text.includes('解封成功')));
 
@@ -3705,6 +3907,8 @@ console.log('\n[77] 一键代发回查解封结果');
 			const method = u.split('/').pop();
 			const body = init && init.body ? JSON.parse(init.body) : null;
 			apiCalls.push({ method, body });
+			if (method === 'getMe') return { ok: true, status: 200, async json() { return { ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }; } };
+			if (method === 'getChatAdministrators') return { ok: true, status: 200, async json() { return { ok: true, result: [{ user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' }, { user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' }] }; } };
 			if (method === 'getChatMember') return { ok: true, status: 200, async json() { return { ok: true, result: { user: { id: 55555, first_name: '某用户' }, status: 'member' } }; } };
 			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
 		}
@@ -3716,14 +3920,14 @@ console.log('\n[77] 一键代发回查解封结果');
 	};
 	const cbUpdate2 = {
 		callback_query: {
-			id: 'cb-77b', from: { id: 8888, is_bot: false, first_name: '某超管' },
+			id: 'cb-77b', from: { id: 999, is_bot: false, first_name: '主人' },
 			message: { message_id: 101, chat: { id: -1001, type: 'supergroup' }, text: 'GKY二次审核' },
 			data: 'gky:a:55555:-1001',
 		},
 	};
 	const env2 = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cbUpdate2) }), env2);
-	const opDms2 = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
+	const opDms2 = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
 	assert('GKY仍有记录 → 提示稍后 /check 复查', opDms2.some((c) => c.body.text.includes('/check')));
 	assert('回查提示带具体 TGID(可复制)', opDms2.some((c) => c.body.text.includes('/check 55555')));
 }
@@ -3764,6 +3968,15 @@ console.log('\n[78] /check TGID 私聊直查');
 	assert('私聊 /check TGID → 返回查询结果', dm.some((c) => c.body.text.includes('993005028')));
 	assert('私聊 /check TGID → 含无封禁记录', dm.some((c) => c.body.text.includes('没有 GKY 封禁记录') || c.body.text.includes('沒有封鎖記錄') || c.body.text.includes('no ban record')));
 
+	// 私聊查到 GKY 封禁记录时，保留一键代发按钮和复制按钮。
+	resetCalls();
+	sandbox.fetch = makeCheckFetch('<strong>TGID:</strong> 993005028<br><strong>ChatID:</strong> -1001<br><strong>Reason:</strong> SpamGP<br>', [999]);
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 11, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/check 993005028' } }) }), env, fakeCtxAd);
+	dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
+	const privateCheckMarkup = dm.find((c) => c.body.reply_markup)?.body.reply_markup;
+	const privateCheckButtons = (privateCheckMarkup?.inline_keyboard || []).flat();
+	assert('私聊 /check 有封禁记录 → 返回一键代发按钮', privateCheckButtons.some((button) => String(button.callback_data || '').startsWith('gky:a:')));
+	assert('私聊 /check 有封禁记录 → 保留复制按钮', privateCheckButtons.some((button) => String(button.copy_text?.text || '').includes('GKYbotSave')));
 	// ② 非管理员私聊 /check TGID → 权限不足
 	resetCalls();
 	sandbox.fetch = makeCheckFetch('This TG account has no ban record', [999]); // 5555 不在 admin
@@ -3777,6 +3990,20 @@ console.log('\n[78] /check TGID 私聊直查');
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 3, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/check' } }) }), env, fakeCtxAd);
 	dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
 	assert('私聊 /check 无参数 → 提示用 /check TGID', dm.some((c) => c.body.text.includes('/check TGID')));
+
+	// ④ 非 GROUP_ID 群 /check TGID → 静默忽略
+	resetCalls();
+	sandbox.fetch = makeCheckFetch('This TG account has no ban record', [999]);
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 4, chat: { id: -2001, type: 'supergroup', title: '未配置群' }, from: { id: 999, is_bot: false }, text: '/check 993005028' } }) }), env, fakeCtxAd);
+	assert('非 GROUP_ID 群 /check TGID 静默', callsOf('sendMessage').length === 0);
+	assert('非 GROUP_ID 群 /check TGID 不查管理员', callsOf('getChatAdministrators').length === 0);
+
+	// ⑤ /start check_ 非数字 → 拒绝查询
+	resetCalls();
+	sandbox.fetch = makeCheckFetch('This TG account has no ban record', [999]);
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 5, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/start check_abc' } }) }), env, fakeCtxAd);
+	dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
+	assert('/start check_ 非数字 → TGID 格式错误', dm.some((c) => c.body.text.includes('TGID 格式错误')));
 }
 
 // ---------- [79] 一键代发警告:目标群无GKYbot + 原群封禁 ----------
@@ -3790,6 +4017,7 @@ console.log('\n[79] 代发有效性警告');
 				const method = u.split('/').pop();
 				const body = init && init.body ? JSON.parse(init.body) : null;
 				apiCalls.push({ method, body });
+			if (method === 'getMe') return { ok: true, status: 200, async json() { return { ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }; } };
 				if (method === 'getChatAdministrators') {
 					return { ok: true, status: 200, async json() { return { ok: true, result: admins }; } };
 				}
@@ -3803,28 +4031,29 @@ console.log('\n[79] 代发有效性警告');
 			throw new Error('Unexpected fetch: ' + u);
 		};
 	}
-	const cb = (id) => ({ callback_query: { id, from: { id: 8888, is_bot: false, first_name: '超管' }, message: { message_id: 100, chat: { id: -1001, type: 'supergroup' }, text: '审核' }, data: 'gky:a:55555:-1001' } });
+	const cb = (id) => ({ callback_query: { id, from: { id: 999, is_bot: false, first_name: '主人' }, message: { message_id: 100, chat: { id: -1001, type: 'supergroup' }, text: '审核' }, data: 'gky:a:55555:-1001' } });
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
 
 	// ① 目标群无 GKYbot(管理员里只有普通bot)→ 警告"未发现 GKYbot"
 	resetCalls();
-	sandbox.fetch = makeWarnFetch({ banlist: 'This TG account has no ban record', admins: [{ user: { id: 8888, is_bot: false }, status: 'creator' }, { user: { id: 111, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' }] });
+	sandbox.fetch = makeWarnFetch({ banlist: 'This TG account has no ban record', admins: [{ user: { id: 8888, is_bot: false }, status: 'creator' }, { user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' }] });
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb('w1')) }), env);
-	let dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
-	assert('目标群无GKYbot → 警告未发现GKYbot', dm.some((c) => c.body.text.includes('未发现 GKYbot')));
+	let answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('GKYbot'));
+	assert('目标群无GKYbot → 弹窗拒绝', !!answer);
+	assert('目标群无GKYbot → 不代发GKYbotSave', !callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
 
 	// ② 目标群有 GKYbot(username 含 GKY)→ 无该警告
 	resetCalls();
-	sandbox.fetch = makeWarnFetch({ banlist: 'This TG account has no ban record', admins: [{ user: { id: 8888, is_bot: false }, status: 'creator' }, { user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' }] });
+	sandbox.fetch = makeWarnFetch({ banlist: 'This TG account has no ban record', admins: [{ user: { id: 8888, is_bot: false }, status: 'creator' }, { user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' }, { user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' }] });
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb('w2')) }), env);
-	dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
+	let dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
 	assert('目标群有GKYbot → 无"未发现GKYbot"警告', !dm.some((c) => c.body.text.includes('未发现 GKYbot')));
 
 	// ③ 原群封禁(ChatID 非配置群)→ 警告"属于原群"
 	resetCalls();
-	sandbox.fetch = makeWarnFetch({ banlist: '<strong>TGID:</strong> 55555<br><strong>ChatID:</strong> -1009999999<br><strong>Reason:</strong> SpamGP<br>', admins: [{ user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' }] });
+	sandbox.fetch = makeWarnFetch({ banlist: '<strong>TGID:</strong> 55555<br><strong>ChatID:</strong> -1009999999<br><strong>Reason:</strong> SpamGP<br>', admins: [{ user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' }, { user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' }] });
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb('w3')) }), env);
-	dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '8888');
+	dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
 	assert('原群封禁 → 警告属于原群', dm.some((c) => c.body.text.includes('属于原群')));
 }
 
