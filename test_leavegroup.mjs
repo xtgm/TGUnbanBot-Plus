@@ -117,7 +117,7 @@ function groupMessage(fromId, text) {
 		message_id: 2,
 		date: 1,
 		text,
-		chat: { id: -1002222222222, type: 'supergroup', title: 'Test Group' },
+		chat: { id: -1001111111111, type: 'supergroup', title: 'Test Group' },
 		from: { id: fromId, is_bot: false, first_name: 'Owner' }
 	};
 }

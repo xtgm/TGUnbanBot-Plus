@@ -674,11 +674,84 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 // 读取并归一化黑名单
 // === D1 工具函数 ===
 // 首次访问 D1 时建表（幂等），避免人工建表步骤
+const D1_SCHEMA_VERSION = 1;
+const D1_CACHE_PRUNE_INTERVAL = 64;
+const D1_RUNTIME_CACHE_TTL_MS = 15000;
 let D1_INITED = false;
+const D1_AD_KEYWORDS_CACHE = new WeakMap();
+const D1_AD_SAMPLES_CACHE = new WeakMap();
+
+function cloneD1RuntimeValue(value) {
+	if (value === null || value === undefined) return value;
+	return JSON.parse(JSON.stringify(value));
+}
+
+function setD1RuntimeCache(cache, db, value) {
+	if (!db) return;
+	cache.set(db, {
+		value: cloneD1RuntimeValue(value),
+		expiresAt: Date.now() + D1_RUNTIME_CACHE_TTL_MS,
+		promise: null
+	});
+}
+
+async function loadD1RuntimeCachedValue(env, cache, loader) {
+	if (!env.DB) return null;
+	const cached = cache.get(env.DB);
+	if (cached?.promise) {
+		return cloneD1RuntimeValue(await cached.promise);
+	}
+	if (cached && cached.expiresAt > Date.now()) {
+		return cloneD1RuntimeValue(cached.value);
+	}
+
+	const promise = Promise.resolve().then(() => loader(env));
+	cache.set(env.DB, { value: null, expiresAt: 0, promise });
+	try {
+		const value = await promise;
+		setD1RuntimeCache(cache, env.DB, value);
+		return cloneD1RuntimeValue(value);
+	} catch (error) {
+		cache.delete(env.DB);
+		throw error;
+	}
+}
+
+function normalizeD1BlacklistRow(row) {
+	if (!row) return null;
+	return {
+		id: String(row.id),
+		reason: row.reason ?? null,
+		by: row.by_user ?? null,
+		at: row.at ?? null,
+		note: row.note ?? null
+	};
+}
+
+async function d1ColumnExists(env, table, column) {
+	const { results } = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
+	return (results || []).some((row) => String(row.name) === column);
+}
+
+async function readD1SchemaVersion(env) {
+	try {
+		const row = await env.DB.prepare('SELECT version FROM schema_meta WHERE id = 1').first();
+		return Number(row?.version || 0);
+	} catch (_) {
+		return 0;
+	}
+}
+
 async function ensureD1Table(env) {
 	if (!env.DB || D1_INITED) return;
+	if ((await readD1SchemaVersion(env)) >= D1_SCHEMA_VERSION) {
+		D1_INITED = true;
+		return;
+	}
+
 	try {
 		await env.DB.exec(`
+			CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, updated_at TEXT);
 			CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT);
 			CREATE TABLE IF NOT EXISTS ad_keywords (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
 			CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
@@ -686,13 +759,25 @@ async function ensureD1Table(env) {
 			CREATE TABLE IF NOT EXISTS moderation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, from_id TEXT, created_at TEXT);
 			CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
 			CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT);
+			CREATE INDEX IF NOT EXISTS idx_blacklist_at_id ON blacklist(at, id);
+			CREATE INDEX IF NOT EXISTS idx_blacklist_reason_at_id ON blacklist(reason, at, id);
+			CREATE INDEX IF NOT EXISTS idx_moderation_chat_from_id ON moderation_messages(chat_id, from_id, id);
 		`);
-		// 兼容旧库:blacklist 表若无 note 列则补加(已存在会报错,吞掉即可,幂等)
+
 		try {
-			await env.DB.exec('ALTER TABLE blacklist ADD COLUMN note TEXT;');
-		} catch (_) {
-			// 列已存在 → duplicate column name,忽略
+			if (!(await d1ColumnExists(env, 'blacklist', 'note'))) {
+				await env.DB.exec('ALTER TABLE blacklist ADD COLUMN note TEXT;');
+			}
+		} catch (error) {
+			const message = String(error?.message || error).toLowerCase();
+			if (!message.includes('duplicate') && !message.includes('exists')) {
+				throw error;
+			}
 		}
+
+		await env.DB.prepare('INSERT OR REPLACE INTO schema_meta (id, version, updated_at) VALUES (1, ?, ?)')
+			.bind(D1_SCHEMA_VERSION, new Date().toISOString())
+			.run();
 		D1_INITED = true;
 	} catch (error) {
 		console.error('D1 建表失败:', error);
@@ -701,15 +786,48 @@ async function ensureD1Table(env) {
 
 async function readD1Blacklist(env) {
 	await ensureD1Table(env);
-	const stmt = env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at ASC');
+	const stmt = env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at ASC, id ASC');
 	const { results } = await stmt.all();
-	return (results || []).map((r) => ({
-		id: String(r.id),
-		reason: r.reason ?? null,
-		by: r.by_user ?? null,
-		at: r.at ?? null,
-		note: r.note ?? null
-	}));
+	return (results || []).map(normalizeD1BlacklistRow).filter(Boolean);
+}
+
+async function readD1BlacklistEntry(env, userId) {
+	await ensureD1Table(env);
+	const id = String(userId ?? '').trim();
+	if (!id) return null;
+	const row = await env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ? LIMIT 1')
+		.bind(id)
+		.first();
+	return normalizeD1BlacklistRow(row);
+}
+
+async function readD1BlacklistRecent(env, limit) {
+	await ensureD1Table(env);
+	const safeLimit = Math.max(1, Math.min(Number(limit) || BLACKLIST_PAGE_LIMIT, 200));
+	const { results } = await env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at DESC, id DESC LIMIT ?')
+		.bind(safeLimit)
+		.all();
+	return (results || []).map(normalizeD1BlacklistRow).filter(Boolean);
+}
+
+function d1LastRowId(result) {
+	const id = Number(result?.meta?.last_row_id ?? result?.meta?.lastRowId ?? result?.meta?.last_rowid);
+	return Number.isFinite(id) && id > 0 ? id : null;
+}
+
+function shouldPruneD1Cache(insertResult) {
+	const insertedId = d1LastRowId(insertResult);
+	return insertedId === null || insertedId % D1_CACHE_PRUNE_INTERVAL === 0;
+}
+
+async function pruneAutoincrementCacheTable(env, table, keepLimit) {
+	if (table !== 'recent_messages' && table !== 'moderation_messages') {
+		throw new Error(`Unsupported D1 cache table: ${table}`);
+	}
+	const safeLimit = Math.max(1, Math.floor(Number(keepLimit) || 1));
+	await env.DB.prepare(`DELETE FROM ${table} WHERE id <= COALESCE((SELECT id FROM ${table} ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`)
+		.bind(safeLimit)
+		.run();
 }
 
 function buildD1BlacklistReasonFilter(reasons) {
@@ -749,7 +867,7 @@ async function readD1BlacklistWindow(env, offset, limit, reasons = null) {
 		SELECT id, reason, by_user, at, note
 		FROM blacklist
 		${filter.where}
-		ORDER BY COALESCE(at, ''), id
+		ORDER BY at ASC, id ASC
 		LIMIT ? OFFSET ?
 	`);
 	const { results } = await stmt.bind(...filter.params, safeLimit, safeOffset).all();
@@ -790,10 +908,7 @@ async function checkBlacklist(userId, env, options = {}) {
 	}
 
 	try {
-		const blacklist = await getBlacklist(env);
-		const userIdStr = String(userId);
-
-		const hit = blacklist.find((entry) => entry.id === userIdStr);
+		const hit = await readD1BlacklistEntry(env, userId);
 		if (hit) {
 			return {
 				isBlacklisted: true,
@@ -2727,16 +2842,18 @@ async function handlePurge(env, url) {
 // 渲染黑名单为 HTML 文本（用于 /blacklist 命令展示）
 function renderBlacklist(blacklist, options = {}) {
 	const limit = options.limit ?? BLACKLIST_PAGE_LIMIT;
-	const total = blacklist.length;
+	const alreadyRecent = Boolean(options.alreadyRecent);
+	const total = Number.isFinite(options.total) ? Number(options.total) : blacklist.length;
 
-	if (total === 0) {
+	if (blacklist.length === 0) {
 		return '📋 <b>当前黑名单</b>\n\n（空）';
 	}
 
 	const reasonLabels = BLACKLIST_REASON_LABELS;
-	const visible = blacklist.slice(-limit).reverse(); // 最近添加的排前面
+	const visible = alreadyRecent ? blacklist.slice(0, limit) : blacklist.slice(-limit).reverse(); // 最近添加的排前面
+	const limitedText = total > visible.length ? `，仅显示最近 ${visible.length} 条` : '';
 
-	let lines = [`📋 <b>当前黑名单</b>（共 ${total} 条${total > limit ? `，仅显示最近 ${limit} 条` : ''}）`, ''];
+	let lines = [`📋 <b>当前黑名单</b>（共 ${total} 条${limitedText}）`, ''];
 
 	for (const entry of visible) {
 		const idLink = `<a href="tg://user?id=${escapeHtml(entry.id)}">${escapeHtml(entry.id)}</a>`;
@@ -2801,6 +2918,18 @@ function isConfiguredGroup(chatId) {
 	}
 	const idStr = chatId.toString();
 	return GROUP_IDS.some((g) => g.toString() === idStr);
+}
+
+function parseTelegramCommand(text) {
+	const trimmed = String(text || '').trim();
+	const match = trimmed.match(/^(\/[a-z0-9_]+)(?:@[^\s]+)?(?:\s+([\s\S]*))?$/i);
+	if (!match) {
+		return { head: '', rest: '' };
+	}
+	return {
+		head: match[1].toLowerCase(),
+		rest: String(match[2] || '').trim()
+	};
 }
 
 function isTelegramSlashCommand(text) {
@@ -3506,6 +3635,10 @@ async function loadAdKeywordsFromD1(env) {
 	return null;
 }
 
+async function loadAdKeywordsCachedFromD1(env) {
+	return loadD1RuntimeCachedValue(env, D1_AD_KEYWORDS_CACHE, loadAdKeywordsFromD1);
+}
+
 // 把 D1 自定义词库 merge 到运行期模块级变量(在 detectAd 之前调用)
 // fetch 入口每请求已把 AD_KEYWORDS_* 重置为基线(DEFAULT 空 / 环境变量),这里 push 叠加安全
 async function mergeAdKeywordsFromD1(env) {
@@ -3519,7 +3652,7 @@ async function mergeAdKeywordsFromD1(env) {
 	AD_KEYWORDS_PORN = [...new Set([...AD_KEYWORDS_PORN, ...norm(RECOMMENDED_AD_KEYWORDS.porn)])];
 	AD_KEYWORDS_FRAUD = [...new Set([...AD_KEYWORDS_FRAUD, ...norm(RECOMMENDED_AD_KEYWORDS.fraud)])];
 	IDENTITY_SPAM_WORDS = [...new Set([...IDENTITY_SPAM_WORDS, ...norm(RECOMMENDED_AD_KEYWORDS.identity)])];
-	const data = await loadAdKeywordsFromD1(env);
+	const data = await loadAdKeywordsCachedFromD1(env);
 	if (!data) return;
 	AD_KEYWORDS_FINANCE = [...new Set([...AD_KEYWORDS_FINANCE, ...norm(data.finance)])];
 	AD_KEYWORDS_PORN = [...new Set([...AD_KEYWORDS_PORN, ...norm(data.porn)])];
@@ -3546,6 +3679,7 @@ async function saveAdKeywordsToD1(env, data) {
 		await env.DB.prepare('INSERT OR REPLACE INTO ad_keywords (id, data, updated_at) VALUES (1, ?, ?)')
 			.bind(JSON.stringify(data), new Date().toISOString())
 			.run();
+		setD1RuntimeCache(D1_AD_KEYWORDS_CACHE, env.DB, data);
 		return { ok: true };
 	} catch (error) {
 		console.error('[广告词库] 写 D1 失败:', error);
@@ -3614,6 +3748,10 @@ async function loadAdSamplesFromD1(env) {
 	return null;
 }
 
+async function loadAdSamplesCachedFromD1(env) {
+	return loadD1RuntimeCachedValue(env, D1_AD_SAMPLES_CACHE, loadAdSamplesFromD1);
+}
+
 // 写样本回 D1
 async function saveAdSamplesToD1(env, data) {
 	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
@@ -3622,6 +3760,7 @@ async function saveAdSamplesToD1(env, data) {
 		await env.DB.prepare('INSERT OR REPLACE INTO ad_samples (id, data, updated_at) VALUES (1, ?, ?)')
 			.bind(JSON.stringify(data), new Date().toISOString())
 			.run();
+		setD1RuntimeCache(D1_AD_SAMPLES_CACHE, env.DB, data);
 		return { ok: true };
 	} catch (error) {
 		console.error('[广告样本] 写 D1 失败:', error);
@@ -3631,7 +3770,7 @@ async function saveAdSamplesToD1(env, data) {
 
 // 把样本指纹 merge 到运行期变量(handleMessage 入口调用)
 async function mergeAdSamplesFromD1(env) {
-	const data = await loadAdSamplesFromD1(env);
+	const data = await loadAdSamplesCachedFromD1(env);
 	if (data && Array.isArray(data.fingerprints)) {
 		AD_SAMPLE_FINGERPRINTS = data.fingerprints.filter(Boolean);
 	}
@@ -3725,8 +3864,11 @@ async function loadRecentMessages(env) {
 	if (!env.DB) return [];
 	try {
 		await ensureD1Table(env);
-		const { results } = await env.DB.prepare('SELECT mid, chat_id, chat_title, text, from_id, from_name, created_at FROM recent_messages ORDER BY id ASC').all();
-		return (results || []).map(r => ({
+		const safeLimit = Math.max(1, Math.min(Number(MSG_CACHE_SIZE) || DEFAULT_MSG_CACHE_SIZE, 500));
+		const { results } = await env.DB.prepare('SELECT mid, chat_id, chat_title, text, from_id, from_name, created_at FROM recent_messages ORDER BY id DESC LIMIT ?')
+			.bind(safeLimit)
+			.all();
+		return [...(results || [])].reverse().map(r => ({
 			mid: r.mid,
 			chatId: r.chat_id,
 			chatTitle: r.chat_title || '',
@@ -3759,7 +3901,7 @@ async function cacheRecentMessage(env, message) {
 	try {
 		await ensureD1Table(env);
 		const cacheText = (message.text || message.caption || getContactText(message) || '').slice(0, 500);
-		await env.DB.prepare('INSERT INTO recent_messages (mid, chat_id, chat_title, text, from_id, from_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+		const insertResult = await env.DB.prepare('INSERT INTO recent_messages (mid, chat_id, chat_title, text, from_id, from_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
 			.bind(
 				message.message_id,
 				String(message.chat.id),
@@ -3770,7 +3912,9 @@ async function cacheRecentMessage(env, message) {
 				new Date().toISOString()
 			)
 			.run();
-		await env.DB.prepare('DELETE FROM recent_messages WHERE id NOT IN (SELECT id FROM recent_messages ORDER BY id DESC LIMIT ?)').bind(MSG_CACHE_SIZE).run();
+		if (shouldPruneD1Cache(insertResult)) {
+			await pruneAutoincrementCacheTable(env, 'recent_messages', MSG_CACHE_SIZE);
+		}
 	} catch (error) {
 		console.error('[消息缓存] 写 D1 失败:', error);
 	}
@@ -3782,7 +3926,7 @@ async function cacheModerationMessage(env, message) {
 	if (!env.DB || !message?.message_id || !message?.from?.id) return;
 	try {
 		await ensureD1Table(env);
-		await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
+		const insertResult = await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
 			.bind(
 				message.message_id,
 				String(message.chat.id),
@@ -3791,7 +3935,9 @@ async function cacheModerationMessage(env, message) {
 			)
 			.run();
 		const limit = Math.max(MSG_CACHE_SIZE, 200);
-		await env.DB.prepare('DELETE FROM moderation_messages WHERE id NOT IN (SELECT id FROM moderation_messages ORDER BY id DESC LIMIT ?)').bind(limit).run();
+		if (shouldPruneD1Cache(insertResult)) {
+			await pruneAutoincrementCacheTable(env, 'moderation_messages', limit);
+		}
 	} catch (error) {
 		console.error('[清扫缓存] 写 D1 失败:', error);
 	}
@@ -4799,6 +4945,29 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		} catch (_) {}
 	}
 
+	// 黑名单兜底：已黑用户在配置群里发言 → 删消息 + 立即踢出
+	// 必须先于消息缓存执行，避免已黑用户刷消息继续产生 D1 写入。
+	// 排除 bot 自身 / 私聊 / 群管理员（避免误伤误加黑的管理员）
+	// 命令命中后 return，不进入后续命令分发
+	if (
+		isConfiguredGroup(chatId) &&
+		message.from &&
+		!message.from.is_bot
+	) {
+		const blacklistCheck = await checkBlacklist(userId, env);
+		if (blacklistCheck.isBlacklisted) {
+			// 双保险：管理员豁免，避免误加黑导致管理员被踢
+			const isAdmin = await checkIfUserIsAdmin(userId);
+			if (!isAdmin) {
+				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+踢人`);
+				await deleteMessage(chatId, message.message_id);
+				await banUserFromGroup(chatId, userId);
+				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, null);
+				return;
+			}
+		}
+	}
+
 	// 缓存配置群普通用户消息 ID，供 /sa 引用回复后只清扫当前群、该用户的近期消息。
 	if (
 		env.DB && isConfiguredGroup(chatId) &&
@@ -4826,34 +4995,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 	}
 
-	// 黑名单兜底：已黑用户在配置群里发言 → 删消息 + 立即踢出
-	// 排除 bot 自身 / 私聊 / 群管理员（避免误伤误加黑的管理员）
-	// 命令命中后 return，不进入后续命令分发
-	if (
-		isConfiguredGroup(chatId) &&
-		message.from &&
-		!message.from.is_bot
-	) {
-		const blacklistCheck = await checkBlacklist(userId, env);
-		if (blacklistCheck.isBlacklisted) {
-			// 双保险：管理员豁免，避免误加黑导致管理员被踢
-			const isAdmin = await checkIfUserIsAdmin(userId);
-			if (!isAdmin) {
-				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+踢人`);
-				await deleteMessage(chatId, message.message_id);
-				await banUserFromGroup(chatId, userId);
-				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, null);
-				return;
-			}
-		}
-	}
-
 	// 广告自动检测：普通成员发的疑似广告 → 删消息 + 加黑 + 全群踢 + 通知主人
 	// 在黑名单拦截之后、命令分发之前；管理员豁免
 	if (AD_FILTER_ENABLED && isConfiguredGroup(chatId) && message.from && !message.from.is_bot) {
 		// 先把 D1 自定义词库与学习样本 merge 进来(detectAd 之前)
-		await mergeAdKeywordsFromD1(env);
-		await mergeAdSamplesFromD1(env);
+		await Promise.all([
+			mergeAdKeywordsFromD1(env),
+			mergeAdSamplesFromD1(env)
+		]);
 		const adResult = await detectAd(message, env);
 		if (adResult.isAd) {
 			const isAdmin = await checkIfUserIsAdmin(userId);
@@ -5212,10 +5361,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 
 	// 处理 /start 命令（包含 deep link 参数）
-	if (text && text.startsWith('/start')) {
-		// 检查是否有参数 (例如: /start check_8435016129)
-		const parts = text.split(' ');
-		if (parts.length > 1 && parts[1].startsWith('check_')) {
+	const startCommand = parseTelegramCommand(text);
+	if (startCommand.head === '/start') {
+		const startArg = startCommand.rest.split(/\s+/)[0] || '';
+		if (startArg.startsWith('check_')) {
 			// 验证用户是否是群组管理员
 			const isAdmin = await checkIfUserIsAdmin(userId);
 
@@ -5226,7 +5375,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 
 			// 提取 TGID
-			const tgidToCheck = parts[1].replace('check_', '').trim();
+			const tgidToCheck = startArg.replace('check_', '').trim();
 			if (!/^\d+$/.test(tgidToCheck)) {
 				await sendTelegramMessage(chatId, '❌ TGID 格式错误，请使用 <code>/check TGID</code>。');
 				return;
@@ -5234,11 +5383,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
 			const response = await buildBanlistCheckResponse(tgidToCheck, { includeReviewAction: true, env });
 			await sendTelegramMessage(chatId, response.text, response.replyMarkup);
-
 			return;
 		}
 
-		// 普通的 /start 命令，显示欢迎消息
+		// 普通的 /start 命令在后面的欢迎消息分支统一处理
 	}
 
 	// 处理 /blacklist 命令 - 私聊管理员查看 D1 黑名单
@@ -5262,8 +5410,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 
-		const blacklist = await getBlacklist(env);
-		await sendTelegramMessage(chatId, renderBlacklist(blacklist));
+		const [total, blacklist] = await Promise.all([
+			getD1BlacklistCount(env),
+			readD1BlacklistRecent(env, BLACKLIST_PAGE_LIMIT)
+		]);
+		await sendTelegramMessage(chatId, renderBlacklist(blacklist, { total, alreadyRecent: true }));
 		return;
 	}
 
@@ -5286,7 +5437,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 		const helpLines = [
-			'🔐 <b>OWNER_IDS 专属隐藏指令</b>(仅 OWNER_IDS 配置的主人/副主人可用,其他人无任何反应)',
+			'🔐 <b>OWNER_IDS 专属隐藏指令</b>(仅 OWNER_IDS 配置的主人/副主人可用；非主人群内静默，私聊仅提示权限不足)',
 			'',
 			'<b>━━ 广告词库热更新(私聊)━━</b>',
 			'<code>/importdefault</code> 一键导入推荐词库(金融/色情/引流/诈骗/身份引流)',
@@ -5313,7 +5464,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'<code>/leavegroup -1001234567890</code> 让 bot 退出指定群组(仅主人私聊)',
 			'',
 			'<b>━━ 说明 ━━</b>',
-			'• 以上指令对普通用户/群管理员/超级管理员<b>完全无反应</b>；<code>/admins</code>/<code>/groups</code>/<code>/leavegroup</code> 只允许主人私聊使用',
+			'• 非 OWNER_IDS 用户在群内使用以上指令时静默；私聊会提示权限不足；<code>/admins</code>/<code>/groups</code>/<code>/leavegroup</code> 只允许主人私聊使用',
 			'• 学习一律<b>只入库不踢人</b>;要踢发广告的人,用回执里给的 TGID 发 <code>/be TGID</code>',
 			'• 学习只写整句指纹,<b>不再自动往词库加词</b>(避免误杀正常消息);建议词需你手动 /addword',
 			'• <b>链接识别</b>:github/google 等正常域名链接永不被杀;含链接的样本只精确匹配不扩散;可疑短链(bit.ly等)才加分',
@@ -5434,8 +5585,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 
-		const head = text.trim().split(/\s+/)[0].replace(/@.*$/, '').toLowerCase();
-		const rest = text.trim().slice(text.trim().indexOf(head) + head.length).trim();
+		const { head, rest } = parseTelegramCommand(text);
 
 		// /listwords —— 查看当前词库
 		if (head === '/listwords') {
@@ -5563,14 +5713,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			return;
 		}
-		await deleteAuthorizedGroupCommandMessage(message, '/saples');
+		await deleteAuthorizedGroupCommandMessage(message, '/samples');
 		if (!env.DB) {
 			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间,无法管理学习样本。');
 			return;
 		}
 
-		const head = text.trim().split(/\s+/)[0].replace(/@.*$/, '').toLowerCase();
-		const rest = text.trim().slice(text.trim().indexOf(head) + head.length).trim();
+		const { head, rest } = parseTelegramCommand(text);
 		const data = (await loadAdSamplesFromD1(env)) || { fingerprints: [], count: 0 };
 
 		// /listsamples —— 查看已学习样本
@@ -5662,8 +5811,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 
-		const head = text.trim().split(/\s+/)[0].replace(/@.*$/, '').toLowerCase();
-		const rest = text.trim().slice(text.trim().indexOf(head) + head.length).trim();
+		const { head, rest } = parseTelegramCommand(text);
 
 		// /learn <文本> —— 主人直接粘贴广告文本学习(只学指纹入库,不踢人)
 		if (head === '/learn') {
@@ -5902,9 +6050,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 
 	// 处理 /unban 命令 - 从黑名单移除或显示欢迎消息（支持批量、群内/私聊双场景）
-	if (text && text.startsWith('/unban')) {
-		const head = text.split(' ')[0];
-		const rest = text.slice(head.length); // 保留参数原貌（含前导空格）
+	const unbanCommand = parseTelegramCommand(text);
+	if (unbanCommand.head === '/unban') {
+		const rest = unbanCommand.rest;
 
 		// 如果有参数，处理黑名单移除
 		if (rest.trim()) {
@@ -6008,7 +6156,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 
 	// 处理 /start 和 /unban 命令 - 显示欢迎消息
-	if (text === '/start' || text === '/unban') {
+	if (
+		(startCommand.head === '/start' && !startCommand.rest) ||
+		(unbanCommand.head === '/unban' && !unbanCommand.rest)
+	) {
 		// D1 全局黑名单是自助解封的硬闸门：命中任何 reason 都拒绝，且不自动移除黑名单。
 		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env)) {
 			return;

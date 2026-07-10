@@ -93,18 +93,20 @@ vm.runInContext(stripExportDefault(src), sandbox, { filename: '_worker.js' });
 const handler = sandbox.__handler;
 
 // ---------- 伪 D1 ----------
-function makeFakeDB(seed = []) {
+function makeFakeDB(seed = [], options = {}) {
 	const rows = new Map(seed.map((r) => [String(r.id), { ...r, id: String(r.id), by_user: r.by_user ?? r.by ?? null }]));
 	const store = new Map();
 	const batchJobs = new Map();
-	let recentSeq = 1;
-	let moderationSeq = 1;
+	const preparedSql = [];
+	let recentSeq = Math.max(1, Number(options.recentSeq) || 1);
+	let moderationSeq = Math.max(1, Number(options.moderationSeq) || 1);
 	const syncBlacklist = () => {
 		store.set('blacklist', JSON.stringify([...rows.values()].map((r) => ({
 			id: String(r.id),
 			reason: r.reason ?? null,
 			by: r.by_user ?? r.by ?? null,
 			at: r.at ?? null,
+			note: r.note ?? null,
 		}))));
 	};
 	const getBlacklistRowsForSql = (sql, bound) => {
@@ -124,6 +126,7 @@ function makeFakeDB(seed = []) {
 					reason: r.reason ?? null,
 					by_user: r.by_user ?? r.by ?? null,
 					at: r.at ?? null,
+					note: r.note ?? null,
 				}))
 				.sort((a, b) => {
 					const byAt = String(a.at ?? '').localeCompare(String(b.at ?? ''));
@@ -142,14 +145,26 @@ function makeFakeDB(seed = []) {
 		_rows: rows,
 		_store: store,
 		_jobs: batchJobs,
+		_sql: preparedSql,
 		exec: async () => {},
 		prepare(sql) {
+			preparedSql.push(sql);
 			let bound = [];
 			return {
 				bind(...args) { bound = args; return this; },
 				async first() {
+					if (sql.startsWith('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ?')) {
+						const row = rows.get(String(bound[0]));
+						return row ? {
+							id: String(row.id),
+							reason: row.reason ?? null,
+							by_user: row.by_user ?? row.by ?? null,
+							at: row.at ?? null,
+							note: row.note ?? null,
+						} : null;
+					}
 					if (sql.startsWith('SELECT id FROM blacklist WHERE id = ?')) {
-						const id = bound[0];
+						const id = String(bound[0]);
 						return rows.has(id) ? { id } : null;
 					}
 					if (sql.startsWith('SELECT COUNT(*) AS total FROM blacklist')) {
@@ -211,8 +226,9 @@ function makeFakeDB(seed = []) {
 					if (sql.startsWith('INSERT INTO recent_messages')) {
 						const [mid, chatId, chatTitle, text, fromId, fromName, createdAt] = bound;
 						const data = getJson('recent_messages', { items: [] });
+						const id = recentSeq++;
 						data.items.push({
-							id: recentSeq++,
+							id,
 							mid,
 							chatId,
 							chatTitle,
@@ -222,29 +238,30 @@ function makeFakeDB(seed = []) {
 							at: createdAt,
 						});
 						setJson('recent_messages', data);
-						return { meta: { changes: 1 } };
+						return { meta: { changes: 1, last_row_id: id } };
 					}
 					if (sql.startsWith('INSERT INTO moderation_messages')) {
 						const [mid, chatId, fromId, createdAt] = bound;
 						const data = getJson('moderation_messages', { items: [] });
+						const id = moderationSeq++;
 						data.items.push({
-							id: moderationSeq++,
+							id,
 							mid,
 							chatId: String(chatId),
 							fromId: String(fromId),
 							at: createdAt,
 						});
 						setJson('moderation_messages', data);
-						return { meta: { changes: 1 } };
+						return { meta: { changes: 1, last_row_id: id } };
 					}
-					if (sql.startsWith('DELETE FROM recent_messages WHERE id NOT IN')) {
+					if (sql.startsWith('DELETE FROM recent_messages WHERE id <= COALESCE')) {
 						const limit = Number(bound[0]) || 50;
 						const data = getJson('recent_messages', { items: [] });
 						data.items = [...data.items].sort((a, b) => b.id - a.id).slice(0, limit).sort((a, b) => a.id - b.id);
 						setJson('recent_messages', data);
 						return { meta: { changes: 1 } };
 					}
-					if (sql.startsWith('DELETE FROM moderation_messages WHERE id NOT IN')) {
+					if (sql.startsWith('DELETE FROM moderation_messages WHERE id <= COALESCE')) {
 						const limit = Number(bound[0]) || 200;
 						const data = getJson('moderation_messages', { items: [] });
 						data.items = [...data.items].sort((a, b) => b.id - a.id).slice(0, limit).sort((a, b) => a.id - b.id);
@@ -262,14 +279,18 @@ function makeFakeDB(seed = []) {
 					return { meta: { changes: 0 } };
 				},
 				async all() {
+					if (sql.startsWith('PRAGMA table_info(blacklist)')) {
+						return { results: ['id', 'reason', 'by_user', 'at', 'note'].map((name) => ({ name })) };
+					}
 					if (sql.includes('FROM blacklist')) {
 						const { filterCount, results } = getBlacklistRowsForSql(sql, bound);
+						const ordered = /ORDER BY at DESC/i.test(sql) ? [...results].reverse() : results;
 						const limit = Number(bound[filterCount]);
 						const offset = Number(bound[filterCount + 1]) || 0;
 						if (Number.isFinite(limit)) {
-							return { results: results.slice(offset, offset + limit) };
+							return { results: ordered.slice(offset, offset + limit) };
 						}
-						return { results };
+						return { results: ordered };
 					}
 					if (sql.startsWith('SELECT mid FROM moderation_messages')) {
 						const [chatId, fromId, limitValue] = bound;
@@ -285,8 +306,17 @@ function makeFakeDB(seed = []) {
 					}
 					if (sql.startsWith('SELECT mid, chat_id, chat_title')) {
 						const data = getJson('recent_messages', { items: [] });
+						const descending = /ORDER BY id DESC/i.test(sql);
+						let items = data.items
+							.map((item, index) => ({
+								...item,
+								__orderId: Number.isFinite(Number(item.id)) ? Number(item.id) : index + 1,
+							}))
+							.sort((a, b) => descending ? b.__orderId - a.__orderId : a.__orderId - b.__orderId);
+						const limit = Number(bound[0]);
+						if (Number.isFinite(limit)) items = items.slice(0, limit);
 						return {
-							results: data.items.map((it) => ({
+							results: items.map((it) => ({
 								id: it.id,
 								mid: it.mid,
 								chat_id: it.chatId,
@@ -600,6 +630,65 @@ console.log('\n[4] 黑名单用户在群里发言 → 删消息 + 踢人');
 	assert('踢的是 8888', String(banCalls[0].body.user_id) === '8888');
 	assert('删除发生在 -1001', delCalls[0].body.chat_id === -1001);
 	assert('删除的是 msgId 500', delCalls[0].body.message_id === 500);
+	const normalizedD1Sql = env.DB._sql.map((sql) => sql.replace(/\s+/g, ' ').trim());
+	assert('黑名单发言使用 TGID 定点查询', normalizedD1Sql.includes('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ? LIMIT 1'));
+	assert('黑名单发言不再读取完整黑名单', !normalizedD1Sql.some((sql) => (
+		sql.startsWith('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at ASC')
+	)));
+}
+
+// ---------- [4a] D1 高频路径固定上限 ----------
+console.log('\n[4a] D1 高频路径低请求验证');
+{
+	const db = makeFakeDB([], { moderationSeq: 63 });
+	const env = { ...baseEnv, DB: db };
+	const makeMessage = (messageId) => ({
+		message_id: messageId,
+		chat: { id: -1001, type: 'supergroup', title: '测试群' },
+		from: { id: 12345, is_bot: false, first_name: '测试用户' },
+		text: `普通消息 ${messageId}`,
+	});
+
+	await sandbox.cacheModerationMessage(env, makeMessage(701));
+	let pruneQueries = db._sql.filter((sql) => sql.startsWith('DELETE FROM moderation_messages WHERE id <= COALESCE'));
+	assert('第 63 条缓存写入不执行裁剪', pruneQueries.length === 0, `实际 ${pruneQueries.length}`);
+
+	await sandbox.cacheModerationMessage(env, makeMessage(702));
+	pruneQueries = db._sql.filter((sql) => sql.startsWith('DELETE FROM moderation_messages WHERE id <= COALESCE'));
+	assert('第 64 条缓存写入只执行一次裁剪', pruneQueries.length === 1, `实际 ${pruneQueries.length}`);
+
+	db._store.set('ad_keywords_custom', JSON.stringify({ finance: ['usdt'], general: [] }));
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: ['samplefingerprint'], count: 1 }));
+	await sandbox.mergeAdKeywordsFromD1(env);
+	await sandbox.mergeAdKeywordsFromD1(env);
+	await sandbox.mergeAdSamplesFromD1(env);
+	await sandbox.mergeAdSamplesFromD1(env);
+
+	const keywordReads = db._sql.filter((sql) => sql.startsWith('SELECT data FROM ad_keywords')).length;
+	const sampleReads = db._sql.filter((sql) => sql.startsWith('SELECT data FROM ad_samples')).length;
+	assert('同一实例短时间重复合并词库只读 D1 一次', keywordReads === 1, `实际 ${keywordReads}`);
+	assert('同一实例短时间重复合并样本只读 D1 一次', sampleReads === 1, `实际 ${sampleReads}`);
+
+	const sqlCountBeforeSteadyMessage = db._sql.length;
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({
+			message: {
+				message_id: 703,
+				chat: { id: -1001, type: 'supergroup', title: '测试群' },
+				from: { id: 23456, is_bot: false, first_name: '普通用户' },
+				text: '普通聊天内容',
+			}
+		})
+	}), env);
+	const steadyMessageSql = db._sql
+		.slice(sqlCountBeforeSteadyMessage)
+		.map((sql) => sql.replace(/\s+/g, ' ').trim());
+	assert('稳定态普通群消息仅执行 2 条必要 D1 SQL', steadyMessageSql.length === 2, JSON.stringify(steadyMessageSql));
+	assert('稳定态 D1 SQL = 消息缓存写入 + 黑名单主键查询', (
+		steadyMessageSql.some((sql) => sql.startsWith('INSERT INTO moderation_messages')) &&
+		steadyMessageSql.includes('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ? LIMIT 1')
+	), JSON.stringify(steadyMessageSql));
 }
 
 // ---------- [5] 管理员被误加黑名单 → 群里发言不被踢（豁免） ----------
@@ -1596,7 +1685,7 @@ console.log('\n[12] 群内 /unban 单条');
 			message_id: 900,
 			chat: { id: -1001, type: 'supergroup' },
 			from: { id: 999, is_bot: false },
-			text: '/unban 8888',
+			text: '/unban@TestBot 8888',
 		},
 	};
 	const env = {
@@ -2929,7 +3018,7 @@ console.log('\n[38] 主人 /addword 写入 D1');
 	const db = makeFakeDB([]); // 空词库
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 主人私聊发 /addword fraud 杀猪盘
-	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/addword fraud 杀猪盘 刷信誉' } };
+	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/addword@TestBot fraud 杀猪盘 刷信誉' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
 	const stored = JSON.parse(db._store.get('ad_keywords_custom') || '{}');
 	assert('/addword 写入 fraud 分类', stored.fraud && stored.fraud.includes('杀猪盘') && stored.fraud.includes('刷信誉'));
@@ -3244,7 +3333,7 @@ console.log('\n[52] /listsamples 展示');
 	const db = makeFakeDB([]);
 	db._store.set('ad_samples', JSON.stringify({ fingerprints: ['承兑出u日入过万', '看片约炮资源群'], count: 2 }));
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
-	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/listsamples' } };
+	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/listsamples@TestBot' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('/listsamples 回执', !!dm);
@@ -3324,7 +3413,7 @@ console.log('\n[56] /learn 粘贴文本学习');
 	});
 	const db = makeFakeDB([]);
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
-	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/learn 世界杯红单推荐天天收米日赚三千' } };
+	const update = { message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/learn@TestBot 世界杯红单推荐天天收米日赚三千' } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
 	const samples = JSON.parse(db._store.get('ad_samples') || '{"fingerprints":[]}');
 	assert('/learn → 指纹入库', samples.fingerprints.length === 1);
@@ -3572,9 +3661,33 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	const db = makeFakeDB([]);
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: db };
 	// 主人私聊 /help → 展开隐藏指令
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/help' } }) }), env, fakeCtxAd);
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/help@TestBot' } }) }), env, fakeCtxAd);
 	let dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('主人 /help → 展开隐藏指令', !!dm && dm.body.text.includes('OWNER_IDS 专属'));
+	const expectedHelpCommands = [
+		'/importdefault', '/addword', '/delword', '/listwords',
+		'/sa', '/learn', '/recent', '/learnlast',
+		'/listsamples', '/delsample', '/clearsamples',
+		'/admins', '/groups', '/leavegroup',
+	];
+	const missingHelpCommands = expectedHelpCommands.filter((command) => !dm?.body?.text?.includes(command));
+	assert('主人 /help → 全部 14 个指令齐全', missingHelpCommands.length === 0, `缺少 ${missingHelpCommands.join(',')}`);
+	const mentionParseOk = expectedHelpCommands.every((command) => (
+		sandbox.parseTelegramCommand(`${command}@TestBot`).head === command
+	));
+	const argumentParseOk = [
+		['/addword@TestBot fraud test', '/addword', 'fraud test'],
+		['/learn@TestBot sample text', '/learn', 'sample text'],
+		['/recent@TestBot 20', '/recent', '20'],
+		['/learnlast@TestBot 1,3', '/learnlast', '1,3'],
+		['/delsample@TestBot 2', '/delsample', '2'],
+		['/clearsamples@TestBot confirm', '/clearsamples', 'confirm'],
+		['/leavegroup@TestBot -1001234567890', '/leavegroup', '-1001234567890'],
+	].every(([input, head, rest]) => {
+		const parsed = sandbox.parseTelegramCommand(input);
+		return parsed.head === head && parsed.rest === rest;
+	});
+	assert('/help 全部指令兼容 @机器人名', mentionParseOk && argumentParseOk);
 	assert('主人 /help → 含 /learnlast 说明', !!dm && dm.body.text.includes('learnlast'));
 	assert('主人 /help → 含 /admins 权限名单说明', !!dm && dm.body.text.includes('/admins') && dm.body.text.includes('权限名单'));
 	assert('主人 /help → 含 /groups 群组查询说明', !!dm && dm.body.text.includes('/groups') && dm.body.text.includes('GROUP_ID'));
@@ -3590,6 +3703,10 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 3, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/help' } }) }), env, fakeCtxAd);
 	assert('主人群内 /help 指令消息 msgId=3 被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 3));
 	assert('主人群内 /help 只发闪屏提示', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.text.includes('请私聊')));
+
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 4, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/start@TestBot' } }) }), env, fakeCtxAd);
+	assert('/start@机器人名 → 正常显示自助解封欢迎消息', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '999' && c.body.text.includes('自助解封机器人')));
 }
 
 // ---------- [67b] /admins 仅主人查看权限名单 ----------
