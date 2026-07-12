@@ -59,7 +59,6 @@ const DEFAULT_BLACKLIST_REASON_LABELS = {
 const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
 
 // 7) 超级管理员 TGID 白名单。用于普通管理命令鉴权，支持多个 TGID。
-//    GKY 一键代发不使用此名单，只允许 OWNER_IDS[0] 主人点击。
 //    环境变量名：SUPER_ADMINS （字符串形式，逗号分隔）
 //    例：'123456,789012'
 //    硬编码这里写数组形式，留空数组表示默认无超管。
@@ -69,7 +68,7 @@ const DEFAULT_SUPER_ADMINS = [
 ];
 
 // 8) 主人 TGID(项目所有者),用于"主人审计通知"系统
-//    所有管理员/超管在群里使用 /be /unban /sa 命令、点一键解封按钮、
+//    所有管理员/超管在群里使用 /be /unban /sa 命令、
 //    群内手动 be/unban 时,主人会收到一份带操作人标记的私聊审计通知
 //    环境变量 OWNER_IDS(逗号分隔,中英文逗号均可):第一个是主人,后续是副主人
 //    主人收全部通知;副主人只收 /be、/sa 这类加黑踢人通知
@@ -185,7 +184,7 @@ let BOT_TOKEN;
 let GROUP_ID;
 // 全部配置群组ID列表（支持 GROUP_ID 环境变量逗号分隔多群组）
 let GROUP_IDS = [];
-// 超级管理员 TGID 白名单（用于普通管理命令；GKY 一键代发仅 OWNER_IDS[0]）
+// 超级管理员 TGID 白名单（用于普通管理命令）
 let SUPER_ADMINS = [];
 // 主人 TGID 列表:第一个是主人,后续是副主人。空数组 = 未配置,禁用通知
 let OWNER_IDS = [];
@@ -290,19 +289,16 @@ export default {
 					有编辑消息: Boolean(update.edited_message),
 					有频道消息: Boolean(update.channel_post),
 					有消息反应: Boolean(update.message_reaction),
-					有成员状态变更: Boolean(update.chat_member),
-					有按钮回调: Boolean(update.callback_query)
+					有成员状态变更: Boolean(update.chat_member)
 				}));
 
-				// 分发：普通消息 / 群成员状态变更 / 按钮回调
+				// 分发：普通消息 / 群成员状态变更
 				if (update.message) {
 					await handleMessage(update.message, env, ctx, request.url);
 				} else if (update.chat_member) {
 					await handleChatMemberUpdate(update.chat_member, env);
-				} else if (update.callback_query) {
-					await handleCallbackQuery(update.callback_query, env, ctx);
 				} else {
-					console.log('[Telegram更新] 跳过：当前代码仅处理 message/chat_member/callback_query。');
+					console.log('[Telegram更新] 跳过：当前代码仅处理 message/chat_member。');
 				}
 
 				return new Response('OK');
@@ -500,7 +496,7 @@ async function handleInitialization(request) {
 		const setWebhookUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`;
 		const setWebhookBody = {
 			url: webhookUrl.toString(),
-			allowed_updates: ['message', 'chat_member', 'callback_query']
+			allowed_updates: ['message', 'chat_member']
 		};
 
 		const response = await fetch(setWebhookUrl, {
@@ -2318,34 +2314,6 @@ function stringifyPurgeGroups(groups) {
 	return (groups || []).map((id) => String(id)).join(',');
 }
 
-async function checkGkyDispatchRecord(tgid, expectedChatId) {
-	try {
-		const raw = await handleBanlist(String(tgid));
-		const data = JSON.parse(raw);
-		if (!data.success) {
-			return { ok: false, reason: `无法确认 GKY 封禁记录:${data.error || '查询失败'}` };
-		}
-		if (!data.banned) {
-			return { ok: false, reason: 'GKY 封禁记录已不存在，请重新使用 /check 查询' };
-		}
-		const recordTgid = String(data.tgid || '');
-		if (recordTgid !== String(tgid)) {
-			return { ok: false, reason: 'GKY 封禁记录 TGID 已变化，请重新使用 /check 查询' };
-		}
-		const recordChatId = String(data.chatId || '');
-		if (!isConfiguredGroup(recordChatId)) {
-			return { ok: false, reason: '该 GKY 封禁记录不属于 GROUP_ID 配置群，不能一键代发' };
-		}
-		if (recordChatId !== String(expectedChatId)) {
-			return { ok: false, reason: 'GKY 封禁记录群已变化，请重新使用 /check 查询' };
-		}
-		return { ok: true, data };
-	} catch (error) {
-		console.error('[callback_query] GKY 封禁记录复核失败:', error);
-		return { ok: false, reason: 'GKY 封禁记录复核异常，请稍后重新 /check' };
-	}
-}
-
 function botCanRestrictMember(member) {
 	if (!member || !member.user) {
 		return false;
@@ -3150,13 +3118,21 @@ async function renderConfiguredGroupsList() {
 }
 
 async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
-	const banlistResult = await handleBanlist(tgidToCheck);
-	const banlistData = JSON.parse(banlistResult);
+	const queryTgid = String(tgidToCheck);
+	let banlistData;
+	try {
+		const banlistResult = await handleBanlist(queryTgid);
+		banlistData = JSON.parse(banlistResult);
+	} catch (error) {
+		console.error('[GKY 查询] /check 查询失败:', error);
+		banlistData = { success: false, error: error?.message || 'GKY 查询异常' };
+	}
 
-	// 同时查询本地 D1 黑名单
+	// GKY 与本地 D1 是两套独立状态；任一查询结果都不能吞掉另一套复制操作。
+	let localCheck = { isBlacklisted: false, entry: null };
 	let localBlacklistInfo = '';
 	if (options.env) {
-		const localCheck = await checkBlacklist(tgidToCheck, options.env);
+		localCheck = await checkBlacklist(queryTgid, options.env);
 		if (localCheck.isBlacklisted) {
 			const entry = localCheck.entry;
 			const reason = translateBlacklistReason(entry?.reason);
@@ -3175,83 +3151,90 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		}
 	}
 
-	if (!banlistData.success) {
-		return {
-			text: `❌ <b>查询失败</b>\n\n${escapeHtml(banlistData.error || '未知错误')}${localBlacklistInfo}`
-		};
-	}
+	let responseMessage = '';
+	let canCopyGkyCommand = false;
 
-	if (!banlistData.banned) {
-		let responseMessage = `✅ <b>查询结果</b>\n\nTGID <code>${escapeHtml(tgidToCheck)}</code> 没有 GKY 封禁记录。`;
+	if (!banlistData.success) {
+		responseMessage = `❌ <b>GKY 查询失败</b>\n\n${escapeHtml(banlistData.error || '未知错误')}${localBlacklistInfo}`;
+	} else if (!banlistData.banned) {
+		responseMessage = `✅ <b>查询结果</b>\n\nTGID <code>${escapeHtml(queryTgid)}</code> 没有 GKY 封禁记录。`;
 		if (options.targetUser) {
-			responseMessage = `✅ <b>查询结果</b>\n\n用户 ${formatUserMention(options.targetUser) || `<code>${escapeHtml(tgidToCheck)}</code>`} 没有 GKY 封禁记录。\nTGID: <code>${escapeHtml(tgidToCheck)}</code>`;
+			responseMessage = `✅ <b>查询结果</b>\n\n用户 ${formatUserMention(options.targetUser) || `<code>${escapeHtml(queryTgid)}</code>`} 没有 GKY 封禁记录。\nTGID: <code>${escapeHtml(queryTgid)}</code>`;
 		}
 		responseMessage += localBlacklistInfo;
-		return { text: responseMessage };
-	}
+	} else {
+		responseMessage = `🔍 <b>封禁查询结果</b>\n\n`;
+		if (options.targetUser) {
+			responseMessage += `👤 <b>用户:</b> ${formatUserMention(options.targetUser) || `<code>${escapeHtml(queryTgid)}</code>`}\n`;
+		}
+		responseMessage += `📋 <b>TGID:</b> <a href="tg://user?id=${escapeHtml(queryTgid)}">${escapeHtml(queryTgid)}</a>\n`;
 
-	let responseMessage = `🔍 <b>封禁查询结果</b>\n\n`;
-	if (options.targetUser) {
-		responseMessage += `👤 <b>用户:</b> ${formatUserMention(options.targetUser) || `<code>${escapeHtml(tgidToCheck)}</code>`}\n`;
-	}
-	responseMessage += `📋 <b>TGID:</b> <a href="tg://user?id=${escapeHtml(tgidToCheck)}">${escapeHtml(tgidToCheck)}</a>\n`;
+		if (banlistData.chatId) {
+			const chatInfo = await getChatInfoFromId(banlistData.chatId);
+			responseMessage += `💬 <b>ChatID:</b> <code>${escapeHtml(banlistData.chatId)}</code>`;
+			if (chatInfo && chatInfo.title) {
+				if (chatInfo.link) {
+					responseMessage += `(<a href="${escapeHtml(chatInfo.link)}">${escapeHtml(chatInfo.title)}</a>)`;
+				} else {
+					responseMessage += `(${escapeHtml(chatInfo.title)})`;
+				}
+			}
+			responseMessage += `\n`;
+		}
 
-	if (banlistData.chatId) {
-		const chatInfo = await getChatInfoFromId(banlistData.chatId);
-		responseMessage += `💬 <b>ChatID:</b> <code>${escapeHtml(banlistData.chatId)}</code>`;
-		if (chatInfo && chatInfo.title) {
-			if (chatInfo.link) {
-				responseMessage += `(<a href="${escapeHtml(chatInfo.link)}">${escapeHtml(chatInfo.title)}</a>)`;
+		if (banlistData.msgId) responseMessage += `📨 <b>MsgID:</b> <code>${escapeHtml(banlistData.msgId)}</code>\n`;
+		if (banlistData.recordedDate) responseMessage += `📅 <b>封禁日期:</b> ${escapeHtml(banlistData.recordedDate)}\n`;
+		if (banlistData.reason) responseMessage += `⚠️ <b>封禁原因:</b> ${escapeHtml(banlistData.reason)}\n`;
+		if (banlistData.info) responseMessage += `\n📝 <b>封禁内容:</b>\n<tg-spoiler>${escapeHtml(banlistData.info)}</tg-spoiler>\n`;
+		responseMessage += localBlacklistInfo;
+
+		const recordTgid = String(banlistData.tgid || '');
+		if (recordTgid !== queryTgid) {
+			responseMessage += '\n\n⚠️ 当前 GKY 返回记录的 TGID 无法与查询目标核对，因此不提供 GKY 复制按钮。请稍后重新使用 <code>/check</code>。';
+		} else {
+			const recordChatId = String(banlistData.chatId || '');
+			if (!isConfiguredGroup(recordChatId)) {
+				responseMessage += '\n\n⚠️ 此 GKY 封禁记录不属于当前 <b>GROUP_ID</b> 配置群，因此不提供 GKY 复制按钮。请使用 GKY 官方网页处理全局解封。';
 			} else {
-				responseMessage += `(${escapeHtml(chatInfo.title)})`;
+				canCopyGkyCommand = true;
 			}
 		}
-		responseMessage += `\n`;
 	}
-
-	if (banlistData.msgId) responseMessage += `📨 <b>MsgID:</b> <code>${escapeHtml(banlistData.msgId)}</code>\n`;
-	if (banlistData.recordedDate) responseMessage += `📅 <b>封禁日期:</b> ${escapeHtml(banlistData.recordedDate)}\n`;
-	if (banlistData.reason) responseMessage += `⚠️ <b>封禁原因:</b> ${escapeHtml(banlistData.reason)}\n`;
-	if (banlistData.info) responseMessage += `\n📝 <b>封禁内容:</b>\n<tg-spoiler>${escapeHtml(banlistData.info)}</tg-spoiler>\n`;
-	responseMessage += localBlacklistInfo;
 
 	if (!options.includeReviewAction) {
 		return { text: responseMessage };
 	}
 
-	const recordTgid = String(banlistData.tgid || '');
-	if (recordTgid !== String(tgidToCheck)) {
-		responseMessage += '\n\n⚠️ 当前 GKY 返回记录的 TGID 无法与查询目标核对，因此仅提供查询结果，不生成一键代发按钮。请稍后重新使用 <code>/check</code>。';
-		return { text: responseMessage };
-	}
-	const dispatchChatId = String(banlistData.chatId || '');
-	if (!isConfiguredGroup(dispatchChatId)) {
-		responseMessage += '\n\n⚠️ 此 GKY 封禁记录不属于当前 <b>GROUP_ID</b> 配置群，因此仅提供查询结果，不生成一键代发按钮。请使用 GKY 官方网页处理全局解封。';
-		return { text: responseMessage };
-	}
+	// 非 GROUP_ID 群仍可查询两套状态，但不开放任何复制操作。
 	if (options.dispatchSourceAllowed === false) {
-		responseMessage += '\n\n⚠️ 当前查询来自非 <b>GROUP_ID</b> 群，因此仅提供查询结果，不生成一键代发或复制按钮。请在私聊或 GROUP_ID 配置群重新使用 <code>/check</code>。';
+		responseMessage += '\n\n⚠️ 当前查询来自非 <b>GROUP_ID</b> 群，因此仅提供查询结果，不提供任何复制按钮。请在私聊或 GROUP_ID 配置群重新使用 <code>/check</code>。';
 		return { text: responseMessage };
 	}
 
-	const gkyAction = 'GKY 全局解封';
-	const copyText = `GKYbotSave\n${banlistData.tgid}`;
-	responseMessage += '\n\nℹ️ 此按钮只处理 <b>GKY 全局黑名单</b>，不会删除或修改上方本地 D1 黑名单。';
-	if (options.actionInCurrentChat) {
-		responseMessage += `\n若同意 <b>${gkyAction}</b>，主人可点击下方按钮；机器人会把源项目同款 GKYbotSave 指令代发到封禁记录群 👇`;
-	} else {
-		responseMessage += `\n若同意 <b>${gkyAction}</b>，主人可点击下方按钮；指令只会代发到封禁记录对应的 GROUP_ID 配置群 👇`;
+	const inlineKeyboard = [];
+	if (canCopyGkyCommand) {
+		responseMessage += '\n\nℹ️ GKY 与本地 D1 黑名单相互独立。下方按钮只复制 GKY 添加白名单代码，必须由真人管理员在封禁记录对应的配置群发送。';
+		inlineKeyboard.push([{
+			text: '📋 点击复制 GKY 添加白名单代码',
+			copy_text: { text: `GKYbotSave\n${queryTgid}` }
+		}]);
 	}
-	const inlineKeyboard = [
-		[{ text: `✅ 同意 ${gkyAction}（一键代发）`, callback_data: `gky:a:${banlistData.tgid}:${dispatchChatId}` }],
-		[{ text: '📋 点击复制 GKY 全局解封代码', copy_text: { text: copyText } }]
-	];
+
+	if (localCheck.isBlacklisted) {
+		responseMessage += '\n\nℹ️ 下方按钮只复制本地解封命令，不会直接修改 D1；仍需由有权限的管理员发送执行。';
+		inlineKeyboard.push([{
+			text: '📋 点击复制 本地解封命令',
+			copy_text: { text: `/unban ${queryTgid}` }
+		}]);
+	}
+
+	if (!inlineKeyboard.length) {
+		return { text: responseMessage };
+	}
 
 	return {
 		text: responseMessage,
-		replyMarkup: {
-			inline_keyboard: inlineKeyboard
-		}
+		replyMarkup: { inline_keyboard: inlineKeyboard }
 	};
 }
 
@@ -4665,195 +4648,6 @@ async function notifyOwnerSelfUnban(fromUser, perGroupResults) {
 	await notifyAllOwners(lines.join('\n'), null);
 }
 
-// 应答 callback_query，让前端按钮停止 loading 并可选弹出提示气泡
-async function answerCallbackQuery(callbackQueryId, text, showAlert = false) {
-	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`;
-		const body = { callback_query_id: callbackQueryId };
-		if (text) body.text = text;
-		if (showAlert) body.show_alert = true;
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body)
-		});
-		return await response.json();
-	} catch (error) {
-		console.error('answerCallbackQuery 失败:', error);
-	}
-}
-
-// 编辑消息的 inline_keyboard（用于按钮点击后清除按钮防止重复点击）
-async function editMessageReplyMarkup(chatId, messageId, replyMarkup) {
-	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`;
-		const body = {
-			chat_id: chatId,
-			message_id: messageId,
-			reply_markup: replyMarkup || { inline_keyboard: [] }
-		};
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body)
-		});
-		return await response.json();
-	} catch (error) {
-		console.error('editMessageReplyMarkup 失败:', error);
-	}
-}
-
-// 回查一键代发 GKYbotSave 后的解封结果:查 TGID 最新封禁状态,生成确认文案。
-// 返回 { cleared: bool, text: string }
-//   cleared=true  → GKY 已无该用户封禁记录(解封/加白成功)
-//   cleared=false → 仍有记录(GKY 可能还在处理)或查询失败,提示稍后 /check 复查
-async function verifyUnbanResult(tgid, targetLabel) {
-	const who = targetLabel || `<code>${escapeHtml(String(tgid))}</code>`;
-	const recheckHint = `请稍后用 <code>/check ${escapeHtml(String(tgid))}</code> 复查(私聊我直接发即可)。`;
-	try {
-		const raw = await handleBanlist(String(tgid));
-		const data = JSON.parse(raw);
-		if (!data.success) {
-			return {
-				cleared: false,
-				text: `⚠️ <b>解封结果待确认</b>\n👤 用户:${who}\n查询暂时失败(${escapeHtml(data.error || '未知')})。\n${recheckHint}`,
-			};
-		}
-		if (!data.banned) {
-			return {
-				cleared: true,
-				text: `✅ <b>解封成功</b>\n👤 用户:${who}\nTGID:<code>${escapeHtml(String(tgid))}</code>\n已确认 GKY 无封禁记录(已移出黑名单/加白)。`,
-			};
-		}
-		// 仍有记录:GKY 可能还没处理完,给兜底复查提示
-		let line = `⚠️ <b>仍显示有封禁记录</b>\n👤 用户:${who}\nTGID:<code>${escapeHtml(String(tgid))}</code>\n`;
-		if (data.reason) line += `封禁原因:${escapeHtml(String(data.reason))}\n`;
-		line += `\nGKY 可能仍在处理,${recheckHint}`;
-		return { cleared: false, text: line };
-	} catch (error) {
-		console.error('[解封回查] 失败:', error);
-		return {
-			cleared: false,
-			text: `⚠️ <b>解封结果待确认</b>\n👤 用户:${who}\n回查异常,${recheckHint}`,
-		};
-	}
-}
-
-// 处理 callback_query：当前仅支持 gky:a:{tgid}:{chatId} 一键代发 GKYbotSave
-async function handleCallbackQuery(cb, env, ctx) {
-	if (!cb) return;
-	const data = cb.data || '';
-	const fromUser = cb.from;
-	const message = cb.message;
-
-	if (!fromUser?.id || !message) {
-		await answerCallbackQuery(cb.id, '❌ 参数缺失', true);
-		return;
-	}
-
-	// 一键代发按钮只允许 OWNER_IDS[0] 主人点击，副主人/超级管理员/群管理员都不放行。
-	if (!isPrimaryOwner(fromUser.id)) {
-		await answerCallbackQuery(cb.id, '❌ 此按钮仅限主人使用', true);
-		console.log('[callback_query] 非主人点击:', JSON.stringify({ 用户ID: fromUser.id, 按钮数据: data }));
-		return;
-	}
-
-	// 解析 gky:a:{tgid}:{chatId}
-	const parts = data.split(':');
-	if (parts.length !== 4 || parts[0] !== 'gky' || parts[1] !== 'a') {
-		await answerCallbackQuery(cb.id, '❌ 未知的按钮指令', true);
-		return;
-	}
-
-	const tgid = parts[2];
-	const dispatchChatId = parts[3];
-	if (!/^\d+$/.test(tgid) || !/^-?\d+$/.test(dispatchChatId)) {
-		await answerCallbackQuery(cb.id, '❌ 参数格式错误', true);
-		return;
-	}
-
-	const sourceChat = message.chat || {};
-	const sourceIsPrivate = sourceChat.type === 'private';
-	if (!sourceIsPrivate && !isConfiguredGroup(sourceChat.id)) {
-		await answerCallbackQuery(cb.id, '❌ 按钮来源群不在 GROUP_IDS', true);
-		console.log('[callback_query] 来源群拒绝:', JSON.stringify({ 来源群: sourceChat.id, 按钮数据: data }));
-		return;
-	}
-	if (!isConfiguredGroup(dispatchChatId)) {
-		await answerCallbackQuery(cb.id, '❌ 目标群不在 GROUP_IDS', true);
-		console.log('[callback_query] 目标群拒绝:', JSON.stringify({ 目标群: dispatchChatId, 按钮数据: data }));
-		return;
-	}
-
-	const recordReady = await checkGkyDispatchRecord(tgid, dispatchChatId);
-	if (!recordReady.ok) {
-		await answerCallbackQuery(cb.id, `❌ ${recordReady.reason}`, true);
-		console.log('[callback_query] GKY 封禁记录复核拒绝:', JSON.stringify({ TGID: tgid, 按钮群: dispatchChatId, 原因: recordReady.reason }));
-		return;
-	}
-
-	// 代发 GKYbotSave 指令到目标群（纯文本，不带 HTML）
-	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-		const body = {
-			chat_id: dispatchChatId,
-			text: `GKYbotSave\n${tgid}`
-		};
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body)
-		});
-		const result = await response.json();
-
-		if (response.ok && result.ok) {
-			await answerCallbackQuery(cb.id, '✅ 已代发 GKYbotSave 指令');
-			// 在原消息上追加操作记录并清除按钮
-			const fromName = [fromUser.first_name, fromUser.last_name].filter(Boolean).join(' ') || fromUser.username || fromUser.id;
-			const note = `\n\n✅ 已由主人 <a href="tg://user?id=${fromUser.id}">${escapeHtml(fromName)}</a> 一键代发。`;
-			try {
-				const editUrl = `https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`;
-				const editBody = {
-					chat_id: message.chat.id,
-					message_id: message.message_id,
-					text: (message.text || message.caption || '') + note,
-					parse_mode: 'HTML',
-					disable_web_page_preview: true
-				};
-				await fetch(editUrl, {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify(editBody)
-				});
-			} catch (_) {
-				// 编辑失败不影响主流程，至少把按钮清掉
-				await editMessageReplyMarkup(message.chat.id, message.message_id, { inline_keyboard: [] });
-			}
-			console.log('[callback_query] GKY 全局解封代发成功:', JSON.stringify({
-				操作人: fromUser.id,
-				TGID: tgid,
-				封禁记录群: dispatchChatId
-			}));
-
-			// 回查解封结果并发给主人私聊:先发"正在确认",再补发回查结果。
-			// 用户原来看不到"到底加白成功没有",这里给一个明确确认。
-			const targetLabel = await formatTargetByTgid(tgid);
-			const pendingText = `⏳ <b>已代发 GKY 全局解封指令</b>\n👤 用户:${targetLabel}\nTGID:<code>${escapeHtml(String(tgid))}</code>\n📍 封禁记录群:<code>${escapeHtml(String(dispatchChatId))}</code>\n正在回查 GKY 全局黑名单…`;
-			// 一键代发仅主人可点，结果直接发给主人本人。
-			await sendTelegramMessage(fromUser.id, pendingText);
-			// 立即回查(GKY 若还没处理完会提示稍后 /check 复查)
-			const verify = await verifyUnbanResult(tgid, targetLabel);
-			await sendTelegramMessage(fromUser.id, verify.text);
-		} else {
-			await answerCallbackQuery(cb.id, `❌ 代发失败: ${result.description || '未知错误'}`, true);
-			console.error('[callback_query] 代发失败:', result);
-		}
-	} catch (error) {
-		await answerCallbackQuery(cb.id, '❌ 代发异常', true);
-		console.error('[callback_query] 代发异常:', error);
-	}
-}
-
 async function handleMessage(message, env, ctx, requestUrl = '') {
 	// B 方案:新成员进群时主动查杀神全局封禁库(真人)。放在 bot 处理之前,
 	//   因为 handleNewChatMemberBots 遇到 new_chat_members 会 return true 提前结束。
@@ -4875,7 +4669,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	const username = message.from?.username || message.from?.first_name || (isAnonymousAdminMessage(message) ? '匿名管理员' : '用户');
 
 	// 非配置群默认禁用 bot 指令；只放行只读的 /check 查询。
-	// /check 的一键代发资格会在响应构建与 callback 两层继续按 GROUP_IDS 严格校验。
+	// /check 的复制按钮会在响应构建时继续按 GROUP_IDS 严格校验。
 	const isNonConfiguredGroup = message.chat.type !== 'private' && !isConfiguredGroup(chatId);
 	const isSelfUnbanConfirmText = typeof text === 'string' && text.trim() === SELF_UNBAN_KEYWORD;
 	const isReadOnlyExternalCheck = isNonConfiguredGroup && isCheckCommand(text);
@@ -5255,7 +5049,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 	// 处理 /check 命令查询封禁状态。两种用法:
 	//   ① 群内回复某条消息发 /check —— 查被回复用户(原有)
-	//   ② /check <TGID> —— 私聊或群内带参数直接查指定 TGID(新增,配合一键代发回查复查)
+	//   ② /check <TGID> —— 私聊或群内带参数直接查指定 TGID
 	if (isCheckCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
 		const isConfiguredSourceGroup = isConfiguredGroup(chatId);
@@ -5279,7 +5073,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${escapeHtml(checkArg)}</code> 的封禁状态...`);
 			const response = await buildBanlistCheckResponse(checkArg, {
 				includeReviewAction: true,
-				actionInCurrentChat: isConfiguredSourceGroup,
 				dispatchSourceAllowed,
 				env,
 			});
@@ -5306,7 +5099,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const response = await buildBanlistCheckResponse(tgidToCheck, {
 			targetUser: repliedUser,
 			includeReviewAction: true,
-			actionInCurrentChat: isConfiguredSourceGroup,
 			dispatchSourceAllowed,
 			env,
 		});
@@ -6563,7 +6355,7 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 // 检查用户是否是任一配置群组的管理员
 // 检查用户是否是任一配置群组的管理员 / 超级管理员
 // 权限层级（高 → 低）:超级管理员 > 群管理员 > 普通用户
-// 超级管理员（SUPER_ADMINS 名单）拥有普通管理命令权限；GKY 一键代发仍只允许 OWNER_IDS[0]。
+// 超级管理员（SUPER_ADMINS 名单）拥有普通管理命令权限。
 // 这里直接把 super 当成 admin,所以 SUPER_ADMINS 用户即使不是任何群的成员也能使用 /be /unban /sa 等命令
 //
 // 用 getChatAdministrators 拉群管理员列表本地匹配，比 getChatMember 更稳:
