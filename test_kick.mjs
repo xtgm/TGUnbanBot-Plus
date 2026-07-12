@@ -56,34 +56,6 @@ function makeFetchMock(routes, options = {}) {
 	};
 }
 
-function makeFullAdmin(user, overrides = {}) {
-	return {
-		user,
-		status: 'administrator',
-		can_delete_messages: true,
-		can_restrict_members: true,
-		...overrides,
-	};
-}
-
-function makeCurrentBotAdmin(overrides = {}) {
-	return makeFullAdmin({ id: 42, is_bot: true, username: 'MyUnbanBot' }, overrides);
-}
-
-function makeGkyMainAdmin(overrides = {}) {
-	return makeFullAdmin(
-		{ id: 221, is_bot: true, username: 'KillerServiceBot', first_name: '神隱bot' },
-		overrides,
-	);
-}
-
-function makeGkyAssistantAdmin(overrides = {}) {
-	return makeFullAdmin(
-		{ id: 222, is_bot: true, username: 'GKY96e0163eBot', first_name: 'GKY闇影【E級】' },
-		overrides,
-	);
-}
-
 function makeGkyCallbackFetch(routes, banlistText = '<strong>TGID:</strong> 55555<br><strong>ChatID:</strong> -1001<br><strong>Reason:</strong> SpamGP<br>') {
 	return makeFetchMock(routes, {
 		internalHandler: async (url) => {
@@ -2603,8 +2575,6 @@ console.log('\n[23] 一键解封按钮:主人收审计');
 {
 	resetCalls();
 	sandbox.fetch = makeGkyCallbackFetch({
-		getMe: () => ({ ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }),
-		getChatAdministrators: () => ({ ok: true, result: [makeCurrentBotAdmin(), makeGkyMainAdmin(), makeGkyAssistantAdmin()] }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		editMessageText: () => ({ ok: true, result: true }),
 		editMessageReplyMarkup: () => ({ ok: true, result: true }),
@@ -2628,13 +2598,14 @@ console.log('\n[23] 一键解封按钮:主人收审计');
 	assert('主人点击按钮 → 收到 GKY 全局解封代发确认', ownerDms.some((c) => c.body.text.includes('已代发 GKY 全局解封指令')));
 	assert('主人点击按钮 → 收到解封回查结果', ownerDms.some((c) => c.body.text.includes('解封') || c.body.text.includes('封禁记录')));
 	assert('主人自己点击按钮 → 不产生额外操作审计', !ownerDms.some((c) => c.body.text.includes('操作通知')));
+	assert('一键代发与源项目一致 → 不扫描杀神管理员列表', callsOf('getChatAdministrators').length === 0);
 	const localBlacklist = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('GKY 全局解封代发 → 不删除本地 D1 黑名单', localBlacklist.some((entry) => entry.id === '55555'));
 }
 
 
-// ---------- [23b] 一键解封按钮来源、目标群、主副机器人与权限校验 ----------
-console.log('\n[23b] 一键解封按钮完整前置校验');
+// ---------- [23b] 一键解封按钮来源、目标群与实时记录校验 ----------
+console.log('\n[23b] 一键解封按钮来源、目标群与实时记录校验');
 {
 	const cb = (fromId, sourceChatId, targetChatId = '-1001', sourceChatType = 'supergroup') => ({
 		callback_query: {
@@ -2645,16 +2616,12 @@ console.log('\n[23b] 一键解封按钮完整前置校验');
 		}
 	});
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
-	const successRoutes = (admins) => ({
-		getMe: () => ({ ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }),
-		getChatAdministrators: () => ({ ok: true, result: admins }),
+	const successRoutes = () => ({
 		answerCallbackQuery: () => ({ ok: true, result: true }),
 		editMessageText: () => ({ ok: true, result: true }),
 		editMessageReplyMarkup: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const validAdmins = () => [makeCurrentBotAdmin(), makeGkyMainAdmin(), makeGkyAssistantAdmin()];
-
 	resetCalls();
 	sandbox.fetch = makeFetchMock({ answerCallbackQuery: () => ({ ok: true, result: true }), sendMessage: () => ({ ok: true, result: { message_id: 1 } }) });
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(8888, -1001, '-1001')) }), env);
@@ -2678,100 +2645,51 @@ console.log('\n[23b] 一键解封按钮完整前置校验');
 	assert('封禁记录群非 GROUP_ID → 不代发', callsOf('sendMessage').length === 0);
 
 	resetCalls();
-	sandbox.fetch = makeGkyCallbackFetch(successRoutes(validAdmins()));
+	sandbox.fetch = makeGkyCallbackFetch(successRoutes());
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, 999, '-1001', 'private')) }), env);
-	assert('主人私聊点击 + 三方权限完整 → 向封禁记录 GROUP_ID 群代发', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
-	assert('合法代发只查询封禁记录群管理员', callsOf('getChatAdministrators').length === 1 && String(callsOf('getChatAdministrators')[0].body.chat_id) === '-1001');
+	assert('主人私聊点击 → 向封禁记录 GROUP_ID 群代发', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.text === 'GKYbotSave\n55555'));
+	assert('合法代发 → 不查询当前机器人或杀神管理员列表', callsOf('getChatAdministrators').length === 0 && callsOf('getMe').length === 0);
 
 	resetCalls();
-	sandbox.fetch = makeGkyCallbackFetch(successRoutes(validAdmins()));
+	sandbox.fetch = makeGkyCallbackFetch(successRoutes());
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1002, '-1001')) }), env);
 	assert('按钮位于另一个 GROUP_ID 群 → 仍向封禁记录群代发', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
-	assert('按钮来源群不覆盖封禁记录目标群', !callsOf('getChatAdministrators').some((c) => String(c.body.chat_id) === '-1002'));
+	assert('按钮来源群不覆盖封禁记录目标群', !callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1002' && String(c.body.text || '').includes('GKYbotSave')));
 
 	resetCalls();
-	sandbox.fetch = makeGkyCallbackFetch(successRoutes(validAdmins()), '<strong>TGID:</strong> 55555<br><strong>ChatID:</strong> -1009999999<br><strong>Reason:</strong> SpamGP<br>');
+	sandbox.fetch = makeGkyCallbackFetch(successRoutes(), '<strong>TGID:</strong> 55555<br><strong>ChatID:</strong> -1009999999<br><strong>Reason:</strong> SpamGP<br>');
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
 	answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('不属于 GROUP_ID'));
 	assert('旧按钮对应记录已变为非 GROUP_ID 群 → 复核拒绝', !!answer);
 	assert('旧按钮对应记录已变为非 GROUP_ID 群 → 不代发', !callsOf('sendMessage').some((c) => String(c.body.text || '').includes('GKYbotSave')));
 
 	resetCalls();
-	sandbox.fetch = makeGkyCallbackFetch(successRoutes(validAdmins()), '<strong>TGID:</strong> 55555<br><strong>ChatID:</strong> -1002<br><strong>Reason:</strong> SpamGP<br>');
+	sandbox.fetch = makeGkyCallbackFetch(successRoutes(), '<strong>TGID:</strong> 55555<br><strong>ChatID:</strong> -1002<br><strong>Reason:</strong> SpamGP<br>');
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
 	answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('封禁记录群已变化'));
 	assert('旧按钮 ChatID 与当前记录不一致 → 复核拒绝', !!answer);
 	assert('旧按钮 ChatID 与当前记录不一致 → 不代发', !callsOf('sendMessage').some((c) => String(c.body.text || '').includes('GKYbotSave')));
 
 	resetCalls();
-	sandbox.fetch = makeGkyCallbackFetch(successRoutes(validAdmins()), '<strong>TGID:</strong> 77777<br><strong>ChatID:</strong> -1001<br><strong>Reason:</strong> SpamGP<br>');
+	sandbox.fetch = makeGkyCallbackFetch(successRoutes(), '<strong>TGID:</strong> 77777<br><strong>ChatID:</strong> -1001<br><strong>Reason:</strong> SpamGP<br>');
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
 	answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('TGID 已变化'));
 	assert('旧按钮 TGID 与当前记录不一致 → 复核拒绝', !!answer);
 	assert('旧按钮 TGID 与当前记录不一致 → 不代发', !callsOf('sendMessage').some((c) => String(c.body.text || '').includes('GKYbotSave')));
 
 	resetCalls();
-	sandbox.fetch = makeGkyCallbackFetch(successRoutes(validAdmins()), 'This TG account has no ban record');
+	sandbox.fetch = makeGkyCallbackFetch(successRoutes(), 'This TG account has no ban record');
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
 	answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('封禁记录已不存在'));
 	assert('旧按钮对应 GKY 记录已解除 → 复核拒绝', !!answer);
 	assert('旧按钮对应 GKY 记录已解除 → 不重复代发', !callsOf('sendMessage').some((c) => String(c.body.text || '').includes('GKYbotSave')));
 
-	const rejectCase = async (admins, expectedText, label) => {
-		resetCalls();
-		sandbox.fetch = makeGkyCallbackFetch(successRoutes(admins));
-		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
-		const rejected = callsOf('answerCallbackQuery').some((c) => String(c.body.text || '').includes(expectedText));
-		assert(`${label} → 弹窗拒绝`, rejected);
-		assert(`${label} → 不代发`, !callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
-	};
-
-	await rejectCase([makeCurrentBotAdmin(), makeGkyAssistantAdmin()], '杀神主手', '缺少管理员杀神主手');
-	await rejectCase([makeCurrentBotAdmin(), makeGkyMainAdmin()], '杀神副手', '缺少管理员杀神副手');
-	await rejectCase([makeGkyMainAdmin(), makeGkyAssistantAdmin()], '当前机器人不是该群管理员', '当前机器人非管理员');
-	await rejectCase([makeCurrentBotAdmin({ can_delete_messages: false }), makeGkyMainAdmin(), makeGkyAssistantAdmin()], '当前机器人缺少删除消息或封禁用户权限', '当前机器人权限不足');
-	await rejectCase([makeCurrentBotAdmin(), makeGkyMainAdmin({ can_restrict_members: false }), makeGkyAssistantAdmin()], '杀神主手缺少删除消息或封禁用户权限', '杀神主手权限不足');
-	await rejectCase([makeCurrentBotAdmin(), makeGkyMainAdmin(), makeGkyAssistantAdmin({ can_restrict_members: false })], '杀神副手缺少删除消息或封禁用户权限', '杀神副手权限不足');
-	const overlappingMainAssistant = makeFullAdmin({ id: 227, is_bot: true, username: 'GKYabcdef12Bot', first_name: '神隱bot' });
-	await rejectCase([makeCurrentBotAdmin(), overlappingMainAssistant], '杀神副手', '同一 Bot 不能同时充当杀神主手和副手');
-
 	resetCalls();
-	const displayAssistant = makeFullAdmin({ id: 225, is_bot: true, username: 'ShadowGuardianBot', first_name: 'GKY闇影【E級】' });
-	sandbox.fetch = makeGkyCallbackFetch(successRoutes([makeCurrentBotAdmin(), makeGkyMainAdmin(), displayAssistant]));
+	sandbox.fetch = makeGkyCallbackFetch(successRoutes());
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
-	assert('杀神副手显示名 GKY闇影 → 成功代发', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
-
-	await rejectCase([
-		makeCurrentBotAdmin(),
-		makeGkyMainAdmin(),
-		makeFullAdmin({ id: 333, is_bot: false, username: 'GKY96e0163eBot', first_name: 'GKY闇影【E級】' }),
-	], '杀神副手', '真人冒用 GKY Bot 用户名');
-	await rejectCase([
-		makeCurrentBotAdmin(),
-		makeGkyMainAdmin(),
-		makeFullAdmin({ id: 444, is_bot: true, username: 'ShadowGuardianBot', first_name: 'My GKY Helper' }),
-	], '杀神副手', '普通 Bot 名称中间含 GKY');
-	await rejectCase([
-		makeCurrentBotAdmin(),
-		makeFullAdmin({ id: 445, is_bot: true, username: 'KillerHelperBot', first_name: '神隐助手' }),
-		makeGkyAssistantAdmin(),
-	], '杀神主手', '主手名称只有前缀相似');
-	await rejectCase([
-		makeCurrentBotAdmin(),
-		makeFullAdmin({ id: 446, is_bot: true, username: 'KillerHelperBot', first_name: '神隱bot test' }),
-		makeGkyAssistantAdmin(),
-	], '杀神主手', '主手名称带额外后缀');
-	await rejectCase([
-		makeCurrentBotAdmin(),
-		makeFullAdmin({ id: 447, is_bot: false, username: 'KillerHuman', first_name: '神隱bot' }),
-		makeGkyAssistantAdmin(),
-	], '杀神主手', '真人冒用杀神主手名称');
-
-	resetCalls();
-	const simplifiedMain = makeFullAdmin({ id: 448, is_bot: true, username: 'KillerServiceBotCN', first_name: '神隐bot' });
-	sandbox.fetch = makeGkyCallbackFetch(successRoutes([makeCurrentBotAdmin(), simplifiedMain, makeGkyAssistantAdmin()]));
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
-	assert('杀神主手简体名称 神隐bot → 成功代发', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
+	const dispatchMessage = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').startsWith('GKYbotSave'));
+	assert('一键代发 → 发送源项目同款两行纯文本', dispatchMessage?.body.text === 'GKYbotSave\n55555');
+	assert('一键代发 → 不依赖杀神主手、副手名称或管理员权限扫描', callsOf('getChatAdministrators').length === 0);
 }
 
 // ---------- [24] chat_member 手动 be → 主人收审计 ----------
@@ -4085,8 +4003,6 @@ console.log('\n[77] 一键代发回查解封结果');
 			const method = u.split('/').pop();
 			const body = init && init.body ? JSON.parse(init.body) : null;
 			apiCalls.push({ method, body });
-			if (method === 'getMe') return { ok: true, status: 200, async json() { return { ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }; } };
-			if (method === 'getChatAdministrators') return { ok: true, status: 200, async json() { return { ok: true, result: [makeCurrentBotAdmin(), makeGkyMainAdmin(), makeGkyAssistantAdmin()] }; } };
 			if (method === 'getChatMember') return { ok: true, status: 200, async json() { return { ok: true, result: { user: { id: 55555, first_name: '某用户' }, status: 'member' } }; } };
 			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
 		}
@@ -4121,8 +4037,6 @@ console.log('\n[77] 一键代发回查解封结果');
 			const method = u.split('/').pop();
 			const body = init && init.body ? JSON.parse(init.body) : null;
 			apiCalls.push({ method, body });
-			if (method === 'getMe') return { ok: true, status: 200, async json() { return { ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }; } };
-			if (method === 'getChatAdministrators') return { ok: true, status: 200, async json() { return { ok: true, result: [makeCurrentBotAdmin(), makeGkyMainAdmin(), makeGkyAssistantAdmin()] }; } };
 			if (method === 'getChatMember') return { ok: true, status: 200, async json() { return { ok: true, result: { user: { id: 55555, first_name: '某用户' }, status: 'member' } }; } };
 			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
 		}
@@ -4190,7 +4104,7 @@ console.log('\n[78] /check TGID 私聊直查');
 	const privateCheckMarkup = dm.find((c) => c.body.reply_markup)?.body.reply_markup;
 	const privateCheckButtons = (privateCheckMarkup?.inline_keyboard || []).flat();
 	assert('私聊 /check 有封禁记录 → 返回一键代发按钮', privateCheckButtons.some((button) => String(button.callback_data || '').startsWith('gky:a:')));
-	assert('私聊 /check 有封禁记录 → 保留复制按钮', privateCheckButtons.some((button) => String(button.copy_text?.text || '').includes('GKYbotSave')));
+	assert('私聊 /check 有封禁记录 → 复制按钮是源项目同款两行文本', privateCheckButtons.some((button) => button.copy_text?.text === 'GKYbotSave\n993005028'));
 	assert('GROUP_ID 群封禁记录 → 按钮明确为 GKY 全局解封', privateCheckButtons.some((button) => String(button.text || '').includes('GKY 全局解封')));
 
 	// GKY 封禁记录来自非 GROUP_ID 群：仍返回查询详情，但不生成代发或复制按钮。
@@ -4268,56 +4182,30 @@ console.log('\n[78] /check TGID 私聊直查');
 	assert('/start check_ 非数字 → TGID 格式错误', dm.some((c) => c.body.text.includes('TGID 格式错误')));
 }
 
-// ---------- [79] GKY 全局解封代发条件 ----------
-console.log('\n[79] GKY 全局解封代发条件');
+// ---------- [79] 一键代发与源项目手动代码完全一致 ----------
+console.log('\n[79] 一键代发与源项目手动代码完全一致');
 {
-	// 通用 fetch:可配置 banlist 返回 + 目标群管理员列表(是否含GKYbot)
-	function makeWarnFetch({ banlist, admins }) {
-		return async function (url, init) {
-			const u = String(url);
-			if (u.includes('api.telegram.org')) {
-				const method = u.split('/').pop();
-				const body = init && init.body ? JSON.parse(init.body) : null;
-				apiCalls.push({ method, body });
-			if (method === 'getMe') return { ok: true, status: 200, async json() { return { ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }; } };
-				if (method === 'getChatAdministrators') {
-					return { ok: true, status: 200, async json() { return { ok: true, result: admins }; } };
-				}
-				if (method === 'getChatMember') return { ok: true, status: 200, async json() { return { ok: true, result: { user: { id: 55555, first_name: 'U' }, status: 'member' } }; } };
-				if (method === 'getChat') return { ok: true, status: 200, async json() { return { ok: true, result: { id: -1001, title: '群', type: 'supergroup' } }; } };
-				return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
-			}
-			if (u.includes('banlist')) {
-				return { ok: true, status: 200, async text() { return banlist; } };
-			}
-			throw new Error('Unexpected fetch: ' + u);
-		};
-	}
-	const cb = (id) => ({ callback_query: { id, from: { id: 999, is_bot: false, first_name: '主人' }, message: { message_id: 100, chat: { id: -1001, type: 'supergroup' }, text: '审核' }, data: 'gky:a:55555:-1001' } });
+	sandbox.fetch = makeGkyCallbackFetch({
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+		editMessageText: () => ({ ok: true, result: true }),
+		editMessageReplyMarkup: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const cb = {
+		callback_query: {
+			id: 'source-compatible-dispatch',
+			from: { id: 999, is_bot: false, first_name: '主人' },
+			message: { message_id: 100, chat: { id: -1001, type: 'supergroup' }, text: '审核' },
+			data: 'gky:a:55555:-1001',
+		},
+	};
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
-
-	// ① 封禁记录 GROUP_ID 群没有杀神主手 → 拒绝
 	resetCalls();
-	sandbox.fetch = makeWarnFetch({ banlist: 'This TG account has no ban record', admins: [makeCurrentBotAdmin()] });
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb('w1')) }), env);
-	let answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('杀神主手'));
-	assert('封禁记录群无杀神主手 → 弹窗拒绝', !!answer);
-	assert('封禁记录群无杀神主手 → 不代发GKYbotSave', !callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
-
-	// ② 主手 + 显示名为 GKY闇影 的副手 + 当前机器人权限完整 → 可代发
-	resetCalls();
-	const displayAssistant = makeFullAdmin({ id: 226, is_bot: true, username: 'ShadowGuardianBot', first_name: 'GKY闇影【E級】' });
-	sandbox.fetch = makeWarnFetch({ banlist: '<strong>TGID:</strong> 55555<br><strong>ChatID:</strong> -1001<br><strong>Reason:</strong> SpamGP<br>', admins: [makeCurrentBotAdmin(), makeGkyMainAdmin(), displayAssistant] });
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb('w2')) }), env);
-	let dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
-	assert('主手和显示名副手均符合 → 成功代发', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
-	assert('成功代发 → 私聊进入 GKY 全局黑名单回查', dm.some((c) => String(c.body.text || '').includes('正在回查 GKY 全局黑名单')));
-
-	// ③ 副手用户名 @GKYxxxxxxxxBot → 可稳定识别
-	resetCalls();
-	sandbox.fetch = makeWarnFetch({ banlist: '<strong>TGID:</strong> 55555<br><strong>ChatID:</strong> -1001<br><strong>Reason:</strong> SpamGP<br>', admins: [makeCurrentBotAdmin(), makeGkyMainAdmin(), makeGkyAssistantAdmin()] });
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb('w3')) }), env);
-	assert('@GKYxxxxxxxxBot 副手 → 成功代发', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb) }), env);
+	const sent = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '-1001');
+	assert('一键代发 → 目标群收到 GKYbotSave + TGID 两行纯文本', sent?.body.text === 'GKYbotSave\n55555');
+	assert('一键代发 → 不调用 getChatAdministrators', callsOf('getChatAdministrators').length === 0);
+	assert('一键代发 → 不调用 getMe 识别当前机器人', callsOf('getMe').length === 0);
 }
 
 // ---------- [80] 发言人身份(名字/简介)引流检测 ----------
