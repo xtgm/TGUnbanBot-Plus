@@ -2643,6 +2643,56 @@ console.log('\n[23b] 一键解封按钮来源与目标群硬校验');
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, 999, '-1001', 'private')) }), env);
 	assert('私聊来源主人按钮 → 目标群预检后代发', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
 	assert('私聊来源主人按钮 → 查询目标群管理员', callsOf('getChatAdministrators').length >= 1);
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getMe: () => ({ ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }),
+		getChatAdministrators: () => ({ ok: true, result: [
+			{ user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' },
+			{ user: { id: 222, is_bot: true, username: 'ShadowGuardianBot', first_name: 'GKY闇影【E級】' }, status: 'administrator' },
+		] }),
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+		editMessageText: () => ({ ok: true, result: true }),
+		editMessageReplyMarkup: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
+	const displayNameOwnerDms = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
+	assert('GKY 显示名机器人 → 成功代发 GKYbotSave', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
+	assert('GKY 显示名机器人 → 前置与事后均检查管理员列表', callsOf('getChatAdministrators').length >= 2);
+	assert('GKY 显示名机器人 → 前置检查不误报', !callsOf('answerCallbackQuery').some((c) => String(c.body.text || '').includes('未发现管理员 GKYbot')));
+	assert('GKY 显示名机器人 → 事后回查不误报', !displayNameOwnerDms.some((c) => String(c.body.text || '').includes('目标群未发现 GKYbot')));
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getMe: () => ({ ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }),
+		getChatAdministrators: () => ({ ok: true, result: [
+			{ user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' },
+			{ user: { id: 333, is_bot: false, username: 'GKYHumanAdmin', first_name: 'GKY 真人管理员' }, status: 'creator' },
+		] }),
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
+	answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('未发现管理员 GKYbot'));
+	assert('真人管理员名称含 GKY → 不误识别为机器人', !!answer);
+	assert('真人管理员名称含 GKY → 不代发', !callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getMe: () => ({ ok: true, result: { id: 42, is_bot: true, username: 'MyUnbanBot' } }),
+		getChatAdministrators: () => ({ ok: true, result: [
+			{ user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' },
+			{ user: { id: 444, is_bot: true, username: 'ShadowGuardianBot', first_name: 'My GKY Helper' }, status: 'administrator' },
+		] }),
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb(999, -1001, '-1001')) }), env);
+	answer = callsOf('answerCallbackQuery').find((c) => String(c.body.text || '').includes('未发现管理员 GKYbot'));
+	assert('普通 Bot 名称中间含 GKY → 不误识别', !!answer);
+	assert('普通 Bot 名称中间含 GKY → 不代发', !callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
+
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
 		answerCallbackQuery: () => ({ ok: true, result: true }),
@@ -4159,11 +4209,12 @@ console.log('\n[79] 代发有效性警告');
 	assert('目标群无GKYbot → 弹窗拒绝', !!answer);
 	assert('目标群无GKYbot → 不代发GKYbotSave', !callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
 
-	// ② 目标群有 GKYbot(username 含 GKY)→ 无该警告
+	// ② 目标群有 GKYbot(显示名以 GKY 开头,username 不含 GKY)→ 可代发且无该警告
 	resetCalls();
-	sandbox.fetch = makeWarnFetch({ banlist: 'This TG account has no ban record', admins: [{ user: { id: 8888, is_bot: false }, status: 'creator' }, { user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' }, { user: { id: 222, is_bot: true, username: 'GKY96e0163eBot' }, status: 'administrator' }] });
+	sandbox.fetch = makeWarnFetch({ banlist: 'This TG account has no ban record', admins: [{ user: { id: 8888, is_bot: false }, status: 'creator' }, { user: { id: 42, is_bot: true, username: 'MyUnbanBot' }, status: 'administrator' }, { user: { id: 222, is_bot: true, username: 'ShadowGuardianBot', first_name: 'GKY闇影【E級】' }, status: 'administrator' }] });
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cb('w2')) }), env);
 	let dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
+	assert('目标群 GKYbot 仅显示名命中 → 成功代发', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && String(c.body.text || '').includes('GKYbotSave')));
 	assert('目标群有GKYbot → 无"未发现GKYbot"警告', !dm.some((c) => c.body.text.includes('未发现 GKYbot')));
 
 	// ③ 原群封禁(ChatID 非配置群)→ 警告"属于原群"

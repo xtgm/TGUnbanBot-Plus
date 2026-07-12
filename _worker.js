@@ -2323,10 +2323,28 @@ function isTelegramAdminMember(member) {
 	return status === 'creator' || status === 'administrator';
 }
 
+function isGkyBotUser(user) {
+	if (user?.is_bot !== true) {
+		return false;
+	}
+
+	const username = typeof user.username === 'string' ? user.username.trim() : '';
+	if (/gky/i.test(username)) {
+		return true;
+	}
+
+	const displayName = [user.first_name, user.last_name]
+		.filter((value) => typeof value === 'string' && value.trim())
+		.join(' ')
+		.normalize('NFKC')
+		.trim();
+
+	return /^gky(?:bot)?(?=$|[^a-z0-9_])/i.test(displayName);
+}
+
 function findGkyAdminMember(members) {
 	return (members || []).find((member) => {
-		const user = member?.user;
-		return isTelegramAdminMember(member) && user?.is_bot && typeof user.username === 'string' && /gky/i.test(user.username);
+		return isTelegramAdminMember(member) && isGkyBotUser(member?.user);
 	}) || null;
 }
 
@@ -4841,7 +4859,7 @@ async function handleCallbackQuery(cb, env, ctx) {
 
 			// 组装"代发有效性"警告:① 目标群是否真有 GKYbot ② 封禁是否属于非配置的原群
 			const warnLines = [];
-			// ① GKYbot 在场检测(目标群管理员里有没有 username 含 GKY 的 bot)
+			// ① GKYbot 在场检测(兼容 username 含 GKY 或显示名以 GKY/GKYbot 开头)
 			const gkyCheck = await groupHasGKYBot(dispatchChatId);
 			if (gkyCheck.checked && !gkyCheck.found) {
 				warnLines.push('⚠️ <b>目标群未发现 GKYbot</b>:这条 GKYbotSave 指令可能<b>无人处理</b>(显示已代发≠已生效)。请确认 GKYbot 在该群且为管理员。');
@@ -6667,7 +6685,7 @@ async function checkIfUserIsAdmin(userId) {
 	return false;
 }
 
-// 检测目标群管理员里是否有 GKYbot(username 含 GKY,覆盖 GKYxxxxBot 双bot变体)。
+// 检测目标群管理员里是否有 GKYbot，兼容 username 与 Telegram 显示名。
 // 返回 { checked: bool, found: bool }。checked=false 表示查询失败(无法确认,按"未知"处理)。
 // 注意:GKY 要执行删封必须是管理员,所以查管理员列表足够可靠;非管理员的 bot API 列不出。
 async function groupHasGKYBot(chatId) {
@@ -6682,10 +6700,7 @@ async function groupHasGKYBot(chatId) {
 		if (!response.ok || !result.ok || !Array.isArray(result.result)) {
 			return { checked: false, found: false };
 		}
-		const found = result.result.some((m) => {
-			const u = m?.user;
-			return u && u.is_bot && typeof u.username === 'string' && /gky/i.test(u.username);
-		});
+		const found = Boolean(findGkyAdminMember(result.result));
 		return { checked: true, found };
 	} catch (error) {
 		console.error('[GKYbot检测] 查询失败:', error);
