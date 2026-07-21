@@ -951,14 +951,16 @@ async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, option
 		return false;
 	}
 
-	if (options.flashOnly) {
-		await sendFlashMessage(chatId, blacklistCheck.message, options.ctx);
-	} else {
-		await sendTelegramMessage(chatId, blacklistCheck.message);
+	if (!options.silentGroupReply) {
+		if (options.flashOnly) {
+			await sendFlashMessage(chatId, blacklistCheck.message, options.ctx);
+		} else {
+			await sendTelegramMessage(chatId, blacklistCheck.message);
+		}
 	}
 	if (!blacklistCheck.checkFailed) {
 		await notifyOwnerBlacklistAppeal(fromUser, blacklistCheck);
-	} else if (options.flashOnly && options.message) {
+	} else if ((options.flashOnly || options.silentGroupReply) && options.message) {
 		const auditText = renderAuditNotification(
 			formatMessageActorMention(options.message),
 			blacklistCheck.message,
@@ -1679,7 +1681,11 @@ async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, no
 		return;
 	}
 
-	await sendFlashMessage(chatId, flashText, ctx);
+	// 第一主人保留现有群聊回执；其余有权限角色在 GROUP_ID 群内只执行并私聊通知，群内零回执。
+	// 未配置 OWNER_IDS 时保留原有群闪屏兜底，避免执行结果无处投递。
+	if (!shouldSilenceAuthorizedGroupCommand(message) || targets.length === 0) {
+		await sendFlashMessage(chatId, flashText, ctx);
+	}
 	if (targets.length) {
 		await mapWithConcurrency(targets, BATCH_USER_PROFILE_CONCURRENCY, async (oid) => {
 			const auditText = (triggerIdStr === oid)
@@ -1692,7 +1698,7 @@ async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, no
 }
 
 // 已完成权限校验后的通用结果路由：
-// 非第一主人在配置群执行命令时，群内只保留 5 秒闪屏，完整结果仅发第一主人；
+// 非第一主人在配置群执行命令时群内零回执，完整结果仅发第一主人；
 // 第一主人群聊以及所有私聊路径继续使用原来的直接回复行为。
 async function sendAuthorizedCommandResult(message, ctx, { flashText, detailText, replyMarkup = null }) {
 	if (shouldSilenceAuthorizedGroupCommand(message)) {
@@ -1708,7 +1714,7 @@ async function sendAuthorizedCommandResult(message, ctx, { flashText, detailText
 }
 
 // /be、/sa、/unban、/job 的参数/环境校验回执：
-// 非第一主人群聊需同时把完整提示给主人；第一主人仍保持原来的群闪屏，私聊仍直接回复发令者。
+// 非第一主人群聊不发机器人回执，只把完整提示给主人；第一主人仍保持原来的群闪屏，私聊仍直接回复发令者。
 async function sendModerationCommandFeedback(message, ctx, { flashText, detailText = flashText }) {
 	if (shouldSilenceAuthorizedGroupCommand(message)) {
 		await replyToAdmin(message, ctx, {
@@ -6618,7 +6624,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 		// D1 全局黑名单是自助解封的硬闸门：命中任何 reason 都拒绝，且不自动移除黑名单。
 		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env, {
-			flashOnly: quietManagerCommand,
+			silentGroupReply: quietManagerCommand && OWNER_IDS.length > 0,
 			ctx,
 			message,
 		})) {

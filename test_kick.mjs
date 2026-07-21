@@ -2645,6 +2645,8 @@ console.log('\n[12a3] 匿名管理员 /be@bot');
 	assert('匿名 /be@bot 操作人记录匿名群身份', row?.by_user === 'anonymous_admin:-1001', row?.by_user);
 	assert('匿名 /be@bot 执行全群踢出', callsOf('banChatMember').length === 2);
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
+	assert('匿名 /be@bot 群内零机器人回执', groupSends.length === 0);
 	assert('匿名 /be@bot 主人收到匿名管理员审计', !!ownerDm && ownerDm.body.text.includes('匿名管理员'));
 }
 
@@ -2677,6 +2679,8 @@ console.log('\n[12a4] 匿名管理员 /sa@bot TGID');
 	assert('匿名 /sa@bot 操作人记录匿名群身份', row?.by_user === 'anonymous_admin:-1001', row?.by_user);
 	assert('匿名 /sa@bot 执行全群踢出', callsOf('banChatMember').length === 2);
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
+	assert('匿名 /sa@bot 群内零机器人回执', groupSends.length === 0);
 	assert('匿名 /sa@bot 主人收到匿名管理员审计', !!ownerDm && ownerDm.body.text.includes('匿名管理员'));
 }
 
@@ -2713,6 +2717,8 @@ console.log('\n[12a5] 匿名管理员回复 /sa');
 	assert('匿名回复 /sa 操作人记录匿名群身份', row?.by_user === 'anonymous_admin:-1001', row?.by_user);
 	assert('匿名回复 /sa 删除被回复消息', callsOf('deleteMessage').some((c) => c.body.message_id === 5000));
 	assert('匿名回复 /sa 执行全群踢出', callsOf('banChatMember').length === 2);
+	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
+	assert('匿名回复 /sa 群内零机器人回执', groupSends.length === 0);
 }
 
 // ---------- [12a5b] /sa 回复 sender_chat 不当 TGID 加黑 ----------
@@ -3037,8 +3043,7 @@ console.log('\n[12d2] 超级管理员 /blacklist 群聊静默 + 私聊不变');
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	const triggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
-	assert('超级管理员群内 /blacklist 仅 1 条闪屏', groupSends.length === 1 && groupSends[0].body.text.includes('完整结果已发送给主人'));
-	assert('超级管理员群内 /blacklist 不在群里展示完整名单', !groupSends[0].body.text.includes('8801') && !groupSends[0].body.text.includes('8802'));
+	assert('超级管理员群内 /blacklist 零机器人回执', groupSends.length === 0);
 	assert('超级管理员群内 /blacklist 完整名单发给主人', !!ownerDm && ownerDm.body.text.includes('8801') && ownerDm.body.text.includes('8802'));
 	assert('超级管理员群内 /blacklist 不私聊发令者', !triggerDm);
 	assert('超级管理员群内 /blacklist 删除命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 1204));
@@ -3190,8 +3195,9 @@ console.log('\n[16] 普通管理员当前群鉴权 + 全局封禁');
 	assert('B 群鉴权只查询当前 B 群', adminCalls.length === 1 && String(adminCalls[0].body.chat_id) === '-1002');
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1002');
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('普通管理员群内 /be 只有 1 条闪屏', groupSends.length === 1);
+	assert('普通管理员群内 /be 零机器人回执', groupSends.length === 0);
 	assert('普通管理员群内 /be 完整结果只发给主人', !!ownerDm && ownerDm.body.text.includes('Telegram 群封禁/预封成功'));
+	assert('普通管理员群内 /be 仍删除命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 2));
 }
 
 // ---------- [17] 普通用户不是任何群的 admin → 静默忽略 ----------
@@ -3408,6 +3414,8 @@ console.log('\n[22] 群管理员触发:主人收审计,触发者零私信');
 
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	const triggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
+	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
+	assert('群管理员 /be 群内零机器人回执', groupSends.length === 0);
 	assert('主人 999 收到审计通知', !!ownerDm);
 	assert('触发者 7777 完全不收私信', !triggerDm);
 	assert('审计含"群管理员操作通知"标题', ownerDm.body.text.includes('群管理员操作通知'));
@@ -3437,6 +3445,7 @@ console.log('\n[22b] OWNER_IDS 通知范围:主人全量,副主人仅 /be /sa');
 	let deputyDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '1000');
 	assert('/be → 主人收到群封禁通知', !!ownerDm && ownerDm.body.text.includes('Telegram 群封禁/预封成功'));
 	assert('/be → 副主人收到群封禁通知', !!deputyDm && deputyDm.body.text.includes('Telegram 群封禁/预封成功'));
+	assert('/be → 群内零机器人回执', callsOf('sendMessage').every((c) => Number(c.body.chat_id) > 0));
 
 	resetCalls();
 	env = {
@@ -3452,6 +3461,7 @@ console.log('\n[22b] OWNER_IDS 通知范围:主人全量,副主人仅 /be /sa');
 	deputyDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '1000');
 	assert('超级管理员 /unban → 主人收到通知', !!ownerDm && ownerDm.body.text.includes('从黑名单中移除'));
 	assert('/unban → 副主人不收到通知', !deputyDm);
+	assert('超级管理员 /unban → 群内零机器人回执', callsOf('sendMessage').every((c) => Number(c.body.chat_id) > 0));
 }
 
 // ---------- [23] 一键代发链路已移除 ----------
@@ -4523,7 +4533,7 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('/start@机器人名 → 正常显示自助解封欢迎消息', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '999' && c.body.text.includes('自助解封机器人')));
 }
 
-// ---------- [67a] 副主人私聊不变，群内命令只闪屏并给主人详情 ----------
+// ---------- [67a] 副主人私聊不变，群内命令零回执并给主人详情 ----------
 console.log('\n[67a] 副主人隐藏命令群聊静默 + 私聊不变');
 {
 	resetCalls();
@@ -4550,8 +4560,7 @@ console.log('\n[67a] 副主人隐藏命令群聊静默 + 私聊不变');
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	const deputyDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '888');
-	assert('副主人群内 /listwords 仅 1 条 5 秒闪屏', groupSends.length === 1 && groupSends[0].body.text.includes('词库共'));
-	assert('副主人群内 /listwords 不展示完整词库', !groupSends[0].body.text.includes('副主人测试词'));
+	assert('副主人群内 /listwords 零机器人回执', groupSends.length === 0);
 	assert('副主人群内 /listwords 完整结果发给主人', !!ownerDm && ownerDm.body.text.includes('副主人测试词'));
 	assert('副主人群内 /listwords 不私聊发令副主人', !deputyDm);
 	assert('副主人群内 /listwords 删除命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 23));
@@ -4575,11 +4584,26 @@ console.log('\n[67a2] 普通管理员 /start 群聊静默 + 主人不受影响')
 	let groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
 	let ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	let triggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
-	assert('普通管理员群内 /start 仅 1 条闪屏', groupSends.length === 1 && groupSends[0].body.text.includes('完整结果已发送给主人'));
+	assert('普通管理员群内 /start 零机器人回执', groupSends.length === 0);
 	assert('普通管理员群内 /start 完整欢迎结果发给主人', !!ownerDm && ownerDm.body.text.includes('自助解封机器人'));
 	assert('普通管理员群内 /start 不私聊发令者', !triggerDm);
 	assert('普通管理员群内 /start 只鉴权当前群', callsOf('getChatAdministrators').length === 1 && String(callsOf('getChatAdministrators')[0].body.chat_id) === '-1001');
 	assert('普通管理员群内 /start 删除命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 30));
+
+	resetCalls();
+	const blacklistedEnv = {
+		...env,
+		DB: makeFakeDB([{ id: '7777', reason: 'manual', by: '999', at: '2026-07-21T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 32, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '普通管理员' }, text: '/start' } }),
+	}), blacklistedEnv, fakeCtxAd);
+	groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
+	ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('黑名单普通管理员群内 /start 拦截仍零机器人回执', groupSends.length === 0);
+	assert('黑名单普通管理员群内 /start 拦截仍通知主人', !!ownerDm && ownerDm.body.text.includes('黑名单'));
+	assert('黑名单普通管理员群内 /start 仍删除命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 32));
 
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', {
@@ -4948,8 +4972,7 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 	const ownerCheckResult = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').at(-1);
 	const ownerCheckButtons = (ownerCheckResult?.body.reply_markup?.inline_keyboard || []).flat();
 	const superTriggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
-	assert('超级管理员群内 /check 仅 1 条闪屏', quietGroupSends.length === 1 && quietGroupSends[0].body.text.includes('完整结果已发送给主人'));
-	assert('超级管理员群内 /check 不展示永久完整结果', !quietGroupSends[0].body.text.includes('封禁查询结果'));
+	assert('超级管理员群内 /check 零机器人回执', quietGroupSends.length === 0);
 	assert('超级管理员群内 /check 完整结果发给主人', !!ownerCheckResult && ownerCheckResult.body.text.includes('封禁查询结果'));
 	assert('超级管理员群内 /check 复制按钮完整发给主人', ownerCheckButtons.length === 2 && ownerCheckButtons.every((button) => !!button.copy_text?.text));
 	assert('超级管理员群内 /check 不私聊发令者', !superTriggerDm);
