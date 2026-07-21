@@ -39,7 +39,7 @@ const PURGE_MAX_PAIR_LIMIT = 20;
 const PURGE_CONCURRENCY = 5;
 const PURGE_RUN_DELAY_MS = 250;
 const PURGE_DEFAULT_REASONS = ['manual', 'sa', 'spam'];
-const TG_USER_LOOKUP_RETRY_DELAY_MS = 350;
+const TG_MUTATION_RETRY_DELAY_MS = 350;
 
 // 5) /blacklist 列表中"原因"字段的中文映射。
 //    内置三种：sa（/sa 举报）、manual（/be 手动添加）、manual_ban（旧版 chat_member 自动同步遗留记录）。
@@ -524,10 +524,10 @@ async function handleInitialization(request) {
 		const setCommandsBody = {
 			commands: [
 				{ command: "unban", description: "开始自助解封" },
-				{ command: "be", description: "添加用户到黑名单 (管理员)" },
-				{ command: "sa", description: "回复消息添加用户到黑名单 (管理员)" },
-				{ command: "check", description: "查询封禁状态:回复消息 或 /check TGID (管理员)" },
-				{ command: "blacklist", description: "查看当前黑名单 (管理员)" }
+				{ command: "be", description: "添加用户到全局黑名单 (当前群管理员)" },
+				{ command: "sa", description: "举报并加入全局黑名单 (当前群管理员)" },
+				{ command: "check", description: "查询封禁状态 (高级管理员)" },
+				{ command: "blacklist", description: "查看当前黑名单 (高级管理员)" }
 			]
 		};
 
@@ -580,13 +580,21 @@ async function handleInitialization(request) {
 const BATCH_LIMIT = 50;
 const BULK_TASK_THRESHOLD = 20;
 const BULK_TASK_SYNC_OPERATION_LIMIT = 24;
-const BULK_TASK_OPERATION_BATCH_LIMIT = 24;
+const BULK_TASK_SYNC_SUBREQUEST_BUDGET = 100;
+const BULK_TASK_FIXED_SUBREQUEST_RESERVE = 10;
 const BULK_TASK_USER_BATCH_SIZE = 20;
+const BULK_TASK_OPERATION_SLICE_SIZE = 24;
 const BULK_TASK_CONCURRENCY = 3;
-const BULK_TASK_RETRY_LIMIT = 0;
-const BULK_TASK_MAX_RUNTIME_MS = 18000;
+const BULK_TASK_D1_RETRY_LIMIT = 1;
+const BULK_TASK_D1_RETRY_DELAY_MS = 200;
 const BULK_TASK_FAILURE_LIMIT = 100;
 const BULK_TASK_LEASE_MS = 45000;
+const D1_BATCH_MUTATION_SIZE = 20;
+const BATCH_USER_PROFILE_CONCURRENCY = 3;
+const BATCH_USER_NAME_MAX_LENGTH = 48;
+const BULK_JOB_PROFILE_PAGE_SIZE = 10;
+const TELEGRAM_SAFE_MESSAGE_LENGTH = 3500;
+const BATCH_ACTION_NOTE_MAX_LENGTH = 500;
 
 // 解析批量 TGID 字符串：半角逗号 / 全角逗号 / 空格 / 换行 / 数组外壳 [] 都当分隔符；去空、去重、分类
 // 返回 { valid: ['123', '456'], invalid: ['abc'] }
@@ -634,8 +642,15 @@ function parseTargetIdsAndNote(raw) {
 	return { ...parseBatchTgids(idText), note };
 }
 
+function normalizeActionNote(note) {
+	const clean = sanitizeTelegramText(note).replace(/\s+/g, ' ').trim();
+	if (!clean) return '';
+	if (Array.from(clean).length <= BATCH_ACTION_NOTE_MAX_LENGTH) return clean;
+	return `${truncateTelegramText(clean, BATCH_ACTION_NOTE_MAX_LENGTH - 1)}…`;
+}
+
 function formatActionNote(note) {
-	const clean = String(note || '').trim();
+	const clean = normalizeActionNote(note);
 	return clean ? escapeHtml(clean) : '未填写';
 }
 
@@ -930,15 +945,27 @@ async function checkBlacklist(userId, env, options = {}) {
 	}
 }
 
-async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env) {
+async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, options = {}) {
 	const blacklistCheck = await checkBlacklist(userId, env, { strict: true });
 	if (!blacklistCheck.isBlacklisted) {
 		return false;
 	}
 
-	await sendTelegramMessage(chatId, blacklistCheck.message);
+	if (options.flashOnly) {
+		await sendFlashMessage(chatId, blacklistCheck.message, options.ctx);
+	} else {
+		await sendTelegramMessage(chatId, blacklistCheck.message);
+	}
 	if (!blacklistCheck.checkFailed) {
 		await notifyOwnerBlacklistAppeal(fromUser, blacklistCheck);
+	} else if (options.flashOnly && options.message) {
+		const auditText = renderAuditNotification(
+			formatMessageActorMention(options.message),
+			blacklistCheck.message,
+			'群内',
+			classifyMessageOperatorRole(options.message, '群管理员')
+		);
+		await notifyAllOwners(auditText, null);
 	}
 	return true;
 }
@@ -1266,8 +1293,10 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 	}
 
 	// 同一批回执内每个群只拉一次群名，避免 用户数 × 群数 重复 getChat。
-	await Promise.all(
-		[...new Set(banResults.map((r) => String(r.groupId)))].map(async (groupId) => {
+	await mapWithConcurrency(
+		[...new Set(banResults.map((r) => String(r.groupId)))],
+		BATCH_USER_PROFILE_CONCURRENCY,
+		async (groupId) => {
 			if (cache.has(groupId)) return;
 			try {
 				const info = await getChatInfoFromId(groupId);
@@ -1276,7 +1305,7 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 				// 拉群名失败不影响主流程
 				cache.set(groupId, '未知群名');
 			}
-		})
+		}
 	);
 
 	const detailLines = banResults.map((r) => {
@@ -1293,7 +1322,8 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 			return `  ❌ <b>${safeTitle}</b> <code>${safeId}</code>${formatMemberProbeLine(r.memberProbe)}\n     原因：${escapeHtml(中文)}\n     建议：${escapeHtml(建议)}`;
 		});
 
-	lines.push('', ...detailLines);
+	if (!options.compactSpacing) lines.push('');
+	lines.push(...detailLines);
 	return lines.join('\n');
 }
 
@@ -1329,8 +1359,10 @@ async function renderUnbanResultsDetail(unbanResults, chatInfoCache = null, opti
 		lines.push(`✅ <b>已解除 ${okCount}/${total} 个配置群的 Telegram 封禁</b>（${total - okCount} 个失败）`);
 	}
 
-	await Promise.all(
-		[...new Set(unbanResults.map((r) => String(r.groupId)))].map(async (groupId) => {
+	await mapWithConcurrency(
+		[...new Set(unbanResults.map((r) => String(r.groupId)))],
+		BATCH_USER_PROFILE_CONCURRENCY,
+		async (groupId) => {
 			if (cache.has(groupId)) return;
 			try {
 				const info = await getChatInfoFromId(groupId);
@@ -1338,7 +1370,7 @@ async function renderUnbanResultsDetail(unbanResults, chatInfoCache = null, opti
 			} catch (_) {
 				cache.set(groupId, '未知群名');
 			}
-		})
+		}
 	);
 
 	const detailLines = unbanResults.map((r) => {
@@ -1356,7 +1388,8 @@ async function renderUnbanResultsDetail(unbanResults, chatInfoCache = null, opti
 		return `  ❌ <b>${safeTitle}</b> <code>${safeId}</code>\n     原因：${escapeHtml(中文)}\n     建议：${escapeHtml(建议)}`;
 	});
 
-	lines.push('', ...detailLines);
+	if (!options.compactSpacing) lines.push('');
+	lines.push(...detailLines);
 	return lines.join('\n');
 }
 
@@ -1434,6 +1467,73 @@ function isSecondaryOwner(id) {
 	return OWNER_IDS.length > 1 && OWNER_IDS.slice(1).includes(idStr);
 }
 
+// 高级管理员：主人、副主人、SUPER_ADMINS。
+// 这三类角色保留原有全部管理命令和跨群操作权限。
+function isPrivilegedManager(userId) {
+	const idStr = String(userId || '');
+	return isOwner(idStr) || isSuperAdmin(idStr);
+}
+
+// 只检查用户是否为“指定当前群”的 Telegram 管理员。
+// 普通管理员的 /be、/sa 必须使用该鉴权，禁止遍历其它 GROUP_IDS 借权。
+async function checkIfUserIsAdminInGroup(userId, groupId) {
+	const userIdStr = String(userId || '');
+	const groupIdStr = String(groupId || '');
+	if (!userIdStr || !isConfiguredGroup(groupIdStr)) return false;
+
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: groupIdStr }),
+		});
+		const result = await response.json();
+		if (!response.ok || !result.ok || !Array.isArray(result.result)) {
+			console.log(`[当前群鉴权] 群 ${groupIdStr} 查询失败: ${result.description || `HTTP ${response.status}`}`);
+			return false;
+		}
+		const hit = result.result.find((member) => member?.user && String(member.user.id) === userIdStr);
+		if (hit) {
+			console.log(`[当前群鉴权] 用户 ${userIdStr} 在当前群 ${groupIdStr} 是 ${hit.status} ✅`);
+			return true;
+		}
+		console.log(`[当前群鉴权] 用户 ${userIdStr} 不是当前群 ${groupIdStr} 的管理员`);
+		return false;
+	} catch (error) {
+		console.error(`[当前群鉴权] 群 ${groupIdStr} 查询异常:`, error);
+		return false;
+	}
+}
+
+// /be、/sa 专用权限：
+// - 主人/副主人/超级管理员保持原权限；
+// - 匿名管理员仅能在其当前配置群使用；
+// - 普通 Telegram 管理员必须是当前发令群的管理员，私聊不放行。
+async function checkMessageOperatorCanBan(message, userId) {
+	if (isPrivilegedManager(userId)) return true;
+	if (isAnonymousAdminMessage(message)) {
+		console.log(`[当前群鉴权] 匿名管理员在群 ${message.chat.id} 使用封禁命令 ✅`);
+		return true;
+	}
+	if (message?.chat?.type === 'private') return false;
+	return checkIfUserIsAdminInGroup(userId, message?.chat?.id);
+}
+
+function shouldSilenceAuthorizedGroupCommand(message) {
+	return message?.chat?.type !== 'private'
+		&& isConfiguredGroup(message?.chat?.id)
+		&& !isPrimaryOwner(getMessageActorId(message));
+}
+
+// 仅用于无需管理权限的公共命令（如 /start、无参数 /unban）：
+// 判断发令者是否属于“非第一主人”的当前群管理员/高级管理员。
+async function isNonPrimaryConfiguredGroupManager(message, userId) {
+	if (!shouldSilenceAuthorizedGroupCommand(message)) return false;
+	if (isPrivilegedManager(userId) || isAnonymousAdminMessage(message)) return true;
+	if (isBotOperator(message?.from)) return false;
+	return checkIfUserIsAdminInGroup(userId, message?.chat?.id);
+}
+
 function getOwnerNotifyTargets(includeSecondaryOwners = false) {
 	if (!OWNER_IDS.length) return [];
 	return includeSecondaryOwners ? OWNER_IDS : [OWNER_IDS[0]];
@@ -1483,72 +1583,222 @@ function renderAuditNotification(operatorMention, detailText, sourceLabel, roleL
 //   * 触发者是收件人本人 → 收"你自己"标记的详情
 //   * 触发者非收件人 → 收带"🔔 操作人/来源"头的审计通知
 //   * 私聊投递失败(主人没和 bot 私聊过等) → 仅记日志,不在群里追加任何"主人"字样
-async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, notifySecondaryOwners = false }) {
+function telegramMessageLength(text) {
+	return sanitizeTelegramText(text).length;
+}
+
+function decodeBasicTelegramHtmlEntities(value) {
+	return String(value || '')
+		.replace(/&quot;/g, '"')
+		.replace(/&gt;/g, '>')
+		.replace(/&lt;/g, '<')
+		.replace(/&amp;/g, '&');
+}
+
+function splitEscapedPlainTelegramText(value, maxLength) {
+	const chunks = [];
+	let current = '';
+	for (const char of Array.from(sanitizeTelegramText(value))) {
+		const escaped = escapeHtml(char);
+		if (current && telegramMessageLength(current + escaped) > maxLength) {
+			chunks.push(current);
+			current = '';
+		}
+		current += escaped;
+	}
+	if (current || chunks.length === 0) chunks.push(current);
+	return chunks;
+}
+
+function splitOversizedTelegramHtmlBlock(block, maxLength) {
+	const plain = decodeBasicTelegramHtmlEntities(String(block || '').replace(/<[^>]+>/g, ''));
+	return splitEscapedPlainTelegramText(plain, maxLength);
+}
+
+function splitTelegramHtmlBlocks(text, maxLength = TELEGRAM_SAFE_MESSAGE_LENGTH) {
+	const normalized = sanitizeTelegramText(text);
+	if (telegramMessageLength(normalized) <= maxLength) return [normalized];
+
+	const chunks = [];
+	let current = '';
+	const append = (block) => {
+		const candidate = current ? `${current}\n\n${block}` : block;
+		if (telegramMessageLength(candidate) <= maxLength) {
+			current = candidate;
+			return;
+		}
+		if (current) chunks.push(current);
+		current = block;
+	};
+
+	for (const block of normalized.split(/\n{2,}/)) {
+		const pieces = telegramMessageLength(block) <= maxLength
+			? [block]
+			: splitOversizedTelegramHtmlBlock(block, maxLength);
+		for (const piece of pieces) append(piece);
+	}
+	if (current || chunks.length === 0) chunks.push(current);
+	return chunks;
+}
+
+function buildTelegramAtomicHtmlBlock(parts) {
+	return (parts || [])
+		.filter((part) => part !== null && part !== undefined && String(part) !== '')
+		.map((part) => sanitizeTelegramText(part))
+		.join('\n')
+		.replace(/\n{2,}/g, '\n');
+}
+
+async function sendTelegramMessageChunks(chatId, text, replyMarkup = null) {
+	const chunks = splitTelegramHtmlBlocks(text);
+	let lastResult = { ok: true };
+	for (let index = 0; index < chunks.length; index += 1) {
+		lastResult = await sendTelegramMessage(chatId, chunks[index], index === chunks.length - 1 ? replyMarkup : null);
+		if (!lastResult?.ok) return lastResult;
+	}
+	return lastResult;
+}
+
+async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, notifySecondaryOwners = false, replyMarkup = null }) {
 	const chatId = message.chat.id;
 	const triggerIdStr = getMessageActorId(message);
 	const operator = formatMessageActorMention(message);
 	const targets = getOwnerNotifyTargets(notifySecondaryOwners);
 
 	if (!isInGroup) {
-		// 私聊场景:触发者本人收原详情(向后兼容)
-		await sendTelegramMessage(chatId, detailText);
-		// 主人/副主人收审计副本；触发者本人已收到原详情，避免私聊重复投递
-		const notifyTargets = targets.filter(oid => oid !== triggerIdStr);
+		await sendTelegramMessageChunks(chatId, detailText, replyMarkup);
+		const notifyTargets = targets.filter((oid) => oid !== triggerIdStr);
 		if (notifyTargets.length) {
 			const role = classifyMessageOperatorRole(message, '管理员');
-			await Promise.allSettled(notifyTargets.map(oid => {
+			await mapWithConcurrency(notifyTargets, BATCH_USER_PROFILE_CONCURRENCY, async (oid) => {
 				const auditText = renderAuditNotification(operator, detailText, '私聊', role);
-				return sendTelegramMessage(oid, auditText).then(r => {
-					if (!r?.ok) console.error(`[审计通知] 私聊主人${oid}失败:${r?.description || r?.error || '未知'}`);
-				});
-			}));
+				const result = await sendTelegramMessageChunks(oid, auditText);
+				if (!result?.ok) console.error(`[审计通知] 私聊主人${oid}失败:${result?.description || result?.error || '未知'}`);
+			});
 		}
 		return;
 	}
 
-	// 群内:闪屏所有人可见(5 秒自动撤回)
 	await sendFlashMessage(chatId, flashText, ctx);
-
-	// 私聊详情:投递给主人
 	if (targets.length) {
-		await Promise.allSettled(targets.map(oid => {
+		await mapWithConcurrency(targets, BATCH_USER_PROFILE_CONCURRENCY, async (oid) => {
 			const auditText = (triggerIdStr === oid)
 				? `🔔 <b>主人操作通知</b>\n👤 操作人:${operator}（你自己）\n📍 来源:群内\n\n${detailText}`
 				: renderAuditNotification(operator, detailText, '群内', classifyMessageOperatorRole(message, '群管理员'));
-			return sendTelegramMessage(oid, auditText).then(r => {
-				if (!r?.ok) console.error(`[审计通知] 私聊主人${oid}失败:${r?.description || r?.error || '未知'}`);
-			});
-		}));
+			const result = await sendTelegramMessageChunks(oid, auditText, replyMarkup);
+			if (!result?.ok) console.error(`[审计通知] 私聊主人${oid}失败:${result?.description || result?.error || '未知'}`);
+		});
 	}
 }
 
+// 已完成权限校验后的通用结果路由：
+// 非第一主人在配置群执行命令时，群内只保留 5 秒闪屏，完整结果仅发第一主人；
+// 第一主人群聊以及所有私聊路径继续使用原来的直接回复行为。
+async function sendAuthorizedCommandResult(message, ctx, { flashText, detailText, replyMarkup = null }) {
+	if (shouldSilenceAuthorizedGroupCommand(message)) {
+		await replyToAdmin(message, ctx, {
+			flashText,
+			detailText,
+			isInGroup: true,
+			replyMarkup,
+		});
+		return;
+	}
+	await sendTelegramMessage(message.chat.id, detailText, replyMarkup);
+}
+
+// /be、/sa、/unban、/job 的参数/环境校验回执：
+// 非第一主人群聊需同时把完整提示给主人；第一主人仍保持原来的群闪屏，私聊仍直接回复发令者。
+async function sendModerationCommandFeedback(message, ctx, { flashText, detailText = flashText }) {
+	if (shouldSilenceAuthorizedGroupCommand(message)) {
+		await replyToAdmin(message, ctx, {
+			flashText,
+			detailText,
+			isInGroup: true,
+		});
+		return;
+	}
+	if (message?.chat?.type !== 'private') {
+		await sendFlashMessage(message.chat.id, flashText, ctx);
+		return;
+	}
+	await sendTelegramMessage(message.chat.id, detailText);
+}
+
 // 批量添加：串行写 D1；重复 TGID 归入 exists，不作为异常。
+function normalizeBatchMutationIds(ids) {
+	return [...new Set((ids || []).map((id) => String(id || '').trim()).filter(isPureTgid))];
+}
+
+function chunkBatchItems(items, size = D1_BATCH_MUTATION_SIZE) {
+	const chunks = [];
+	for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
+	return chunks;
+}
+
+// 批量添加：每 20 个 TGID 一条多行 SQL；RETURNING 精确区分新增与已存在。
 async function addManyToBlacklist(ids, env, options = {}) {
 	const results = { success: [], exists: [], failed: [] };
-	for (const id of ids) {
-		const r = await addToBlacklistCore(id, env, options);
-		if (r.success) {
-			results.success.push(id);
-		} else if (r.code === 'EXISTS') {
-			results.exists.push(id);
-		} else {
-			results.failed.push({ id, msg: r.message || '失败' });
+	const uniqueIds = normalizeBatchMutationIds(ids);
+	if (!env.DB) {
+		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间' })));
+		return results;
+	}
+	if (uniqueIds.length === 0) return results;
+
+	await ensureD1Table(env);
+	const reason = options.reason ?? null;
+	const by = options.by != null ? String(options.by) : null;
+	const note = normalizeActionNote(options.note) || null;
+	const at = new Date().toISOString();
+
+	for (const chunk of chunkBatchItems(uniqueIds)) {
+		try {
+			const valuesSql = chunk.map(() => '(?, ?, ?, ?, ?)').join(', ');
+			const params = chunk.flatMap((id) => [id, reason, by, at, note]);
+			const response = await env.DB
+				.prepare(`INSERT OR IGNORE INTO blacklist (id, reason, by_user, at, note) VALUES ${valuesSql} RETURNING id`)
+				.bind(...params)
+				.all();
+			const inserted = new Set((response?.results || []).map((row) => String(row.id)));
+			for (const id of chunk) {
+				if (inserted.has(id)) results.success.push(id);
+				else results.exists.push(id);
+			}
+		} catch (error) {
+			console.error('批量添加黑名单时出错:', error);
+			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 添加黑名单失败: ${error.message || error}` })));
 		}
 	}
 	return results;
 }
 
-// 批量移除
+// 批量移除：每 20 个 TGID 一条 DELETE ... RETURNING，无需逐条预查询。
 async function removeManyFromBlacklist(ids, env) {
 	const results = { success: [], notFound: [], failed: [] };
-	for (const id of ids) {
-		const r = await removeFromBlacklistCore(id, env);
-		if (r.success) {
-			results.success.push(id);
-		} else if (r.code === 'NOT_FOUND') {
-			results.notFound.push(id);
-		} else {
-			results.failed.push({ id, msg: r.message || '失败' });
+	const uniqueIds = normalizeBatchMutationIds(ids);
+	if (!env.DB) {
+		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间' })));
+		return results;
+	}
+	if (uniqueIds.length === 0) return results;
+
+	await ensureD1Table(env);
+	for (const chunk of chunkBatchItems(uniqueIds)) {
+		try {
+			const placeholders = chunk.map(() => '?').join(', ');
+			const response = await env.DB
+				.prepare(`DELETE FROM blacklist WHERE id IN (${placeholders}) RETURNING id`)
+				.bind(...chunk)
+				.all();
+			const removed = new Set((response?.results || []).map((row) => String(row.id)));
+			for (const id of chunk) {
+				if (removed.has(id)) results.success.push(id);
+				else results.notFound.push(id);
+			}
+		} catch (error) {
+			console.error('批量移除黑名单时出错:', error);
+			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 移除黑名单失败: ${error.message || error}` })));
 		}
 	}
 	return results;
@@ -1557,7 +1807,7 @@ async function removeManyFromBlacklist(ids, env) {
 // 渲染批量添加结果
 // banSummary（可选）：{ success, banOkAll, banPartial, banFailedAll }
 //   表示对每个加黑成功的用户做 Telegram 群封禁/预封后的统计：完全成功 / 部分成功 / 全部失败
-function renderBatchAddResult(results, invalid, banSummary) {
+function renderBatchAddResult(results, invalid, banSummary, userProfiles = null) {
 	const lines = ['✅ <b>批量添加完成</b>', ''];
 	lines.push(`✅ 成功: ${results.success.length}`);
 	if (results.exists.length) lines.push(`⚠️ 已存在: ${results.exists.length}`);
@@ -1572,16 +1822,16 @@ function renderBatchAddResult(results, invalid, banSummary) {
 	}
 
 	lines.push('', '<b>详情</b>:');
-	for (const id of results.success) lines.push(`✅ <code>${id}</code> 已加入`);
-	for (const id of results.exists) lines.push(`⚠️ <code>${id}</code> 已存在`);
+	for (const id of results.success) lines.push(`✅ ${formatBatchUserTarget(id, userProfiles)} 已加入`);
+	for (const id of results.exists) lines.push(`⚠️ ${formatBatchUserTarget(id, userProfiles)} 已存在`);
 	for (const id of invalid) lines.push(`❌ <code>${escapeHtml(id)}</code> 格式错误`);
-	for (const f of results.failed) lines.push(`❌ <code>${f.id}</code> ${escapeHtml(f.msg)}`);
+	for (const f of results.failed) lines.push(`❌ ${formatBatchUserTarget(f.id, userProfiles)} ${escapeHtml(f.msg)}`);
 
 	return lines.join('\n');
 }
 
 // 渲染批量移除结果
-function renderBatchRemoveResult(results, invalid) {
+function renderBatchRemoveResult(results, invalid, userProfiles = null) {
 	const lines = ['✅ <b>批量移除完成</b>', ''];
 	lines.push(`✅ 成功: ${results.success.length}`);
 	if (results.notFound.length) lines.push(`⚠️ 不在黑名单: ${results.notFound.length}`);
@@ -1589,10 +1839,10 @@ function renderBatchRemoveResult(results, invalid) {
 	if (results.failed.length) lines.push(`❌ 失败: ${results.failed.length}`);
 
 	lines.push('', '<b>详情</b>:');
-	for (const id of results.success) lines.push(`✅ <code>${id}</code> 已移除`);
-	for (const id of results.notFound) lines.push(`⚠️ <code>${id}</code> 不在黑名单`);
+	for (const id of results.success) lines.push(`✅ ${formatBatchUserTarget(id, userProfiles)} 已移除`);
+	for (const id of results.notFound) lines.push(`⚠️ ${formatBatchUserTarget(id, userProfiles)} 不在黑名单`);
 	for (const id of invalid) lines.push(`❌ <code>${escapeHtml(id)}</code> 格式错误`);
-	for (const f of results.failed) lines.push(`❌ <code>${f.id}</code> ${escapeHtml(f.msg)}`);
+	for (const f of results.failed) lines.push(`❌ ${formatBatchUserTarget(f.id, userProfiles)} ${escapeHtml(f.msg)}`);
 
 	return lines.join('\n');
 }
@@ -1618,14 +1868,42 @@ function normalizeBulkJob(row) {
 	}
 }
 
+function setBulkJobLeaseVersion(job, value) {
+	Object.defineProperty(job, '__leaseVersion', {
+		value,
+		writable: true,
+		configurable: true,
+		enumerable: false
+	});
+}
+
+function getNextBulkJobUpdatedAt(expected) {
+	const expectedTime = Date.parse(expected || '');
+	const minimum = Number.isFinite(expectedTime) ? expectedTime + 1 : 0;
+	return new Date(Math.max(Date.now(), minimum)).toISOString();
+}
+
+function createBulkJobLeaseLostError(jobId) {
+	const error = new Error(`批量任务租约已被其它执行器接管: ${jobId}`);
+	error.code = 'BULK_JOB_LEASE_LOST';
+	return error;
+}
+
 async function saveBulkJob(env, job) {
 	await ensureD1Table(env);
-	const now = new Date().toISOString();
+	const expectedVersion = job.__leaseVersion || '';
+	const now = getNextBulkJobUpdatedAt(expectedVersion);
 	job.updatedAt = now;
-	await env.DB
-		.prepare('UPDATE batch_jobs SET status = ?, payload = ?, updated_at = ? WHERE id = ?')
-		.bind(job.status, JSON.stringify(job), now, job.id)
-		.run();
+	const statement = expectedVersion
+		? env.DB.prepare('UPDATE batch_jobs SET status = ?, payload = ?, updated_at = ? WHERE id = ? AND updated_at = ?')
+			.bind(job.status, JSON.stringify(job), now, job.id, expectedVersion)
+		: env.DB.prepare('UPDATE batch_jobs SET status = ?, payload = ?, updated_at = ? WHERE id = ?')
+			.bind(job.status, JSON.stringify(job), now, job.id);
+	const result = await statement.run();
+	if (expectedVersion && Number(result?.meta?.changes || 0) !== 1) {
+		throw createBulkJobLeaseLostError(job.id);
+	}
+	if (expectedVersion) setBulkJobLeaseVersion(job, now);
 	return job;
 }
 
@@ -1639,6 +1917,30 @@ async function loadBulkJob(env, jobId) {
 	return normalizeBulkJob(row);
 }
 
+async function acquireBulkJobLease(env, job, leaseOwner) {
+	const now = getNextBulkJobUpdatedAt(job.updatedAt);
+	const staleBefore = new Date(Date.now() - BULK_TASK_LEASE_MS).toISOString();
+	job.status = 'running';
+	job.startedAt = job.startedAt || now;
+	job.leaseOwner = leaseOwner;
+	job.leaseUntil = new Date(Date.now() + BULK_TASK_LEASE_MS).toISOString();
+	job.autoRunCount = (Number(job.autoRunCount) || 0) + 1;
+	job.updatedAt = now;
+	const result = await env.DB
+		.prepare(`UPDATE batch_jobs
+			SET status = ?, payload = ?, updated_at = ?
+			WHERE id = ?
+			  AND (
+				status IN ('queued', 'failed', 'paused')
+				OR (status = 'running' AND updated_at <= ?)
+			  )`)
+		.bind(job.status, JSON.stringify(job), now, job.id, staleBefore)
+		.run();
+	if (Number(result?.meta?.changes || 0) !== 1) return null;
+	setBulkJobLeaseVersion(job, now);
+	return job;
+}
+
 function getBulkJobNotifyTargets(message) {
 	const targets = getOwnerNotifyTargets(true);
 	if (targets.length) return targets;
@@ -1646,20 +1948,73 @@ function getBulkJobNotifyTargets(message) {
 	return message?.from?.id ? [String(message.from.id)] : [];
 }
 
+function estimateBulkTaskSubrequests(userCount, groupCount, options = {}) {
+	const users = Math.max(0, Number(userCount) || 0);
+	const groups = Math.max(1, Number(groupCount) || 1);
+	const operations = users * groups;
+	const authorizationRequests = Math.max(0, Number(options.authorizationRequests) || 0);
+	const profileRequests = options.probeMembership === true && users === 1 ? groups : users;
+	const telegramMutationAttempts = 2 * operations;
+	const groupInfoRequests = groups;
+	const d1MutationBatches = Math.ceil(users / D1_BATCH_MUTATION_SIZE);
+	return {
+		fixedReserve: BULK_TASK_FIXED_SUBREQUEST_RESERVE,
+		authorizationRequests,
+		profileRequests,
+		telegramMutationAttempts,
+		groupInfoRequests,
+		d1MutationBatches,
+		total: BULK_TASK_FIXED_SUBREQUEST_RESERVE
+			+ authorizationRequests
+			+ profileRequests
+			+ telegramMutationAttempts
+			+ groupInfoRequests
+			+ d1MutationBatches
+	};
+}
+
+function shouldUseBulkQueue(userCount, groupCount, options = {}) {
+	const users = Math.max(0, Number(userCount) || 0);
+	const groups = Math.max(1, Number(groupCount) || 1);
+	const operations = users * groups;
+	const estimate = estimateBulkTaskSubrequests(users, groups, options);
+	return {
+		useQueue: users >= BULK_TASK_THRESHOLD
+			|| operations > BULK_TASK_SYNC_OPERATION_LIMIT
+			|| estimate.total > BULK_TASK_SYNC_SUBREQUEST_BUDGET,
+		users,
+		groups,
+		operations,
+		estimate
+	};
+}
+
+function estimateBulkAuthorizationRequests(message) {
+	if (isAnonymousAdminMessage(message)) return 0;
+	const actorId = getMessageActorId(message);
+	if (isPrivilegedManager(actorId)) return 0;
+	return message?.chat?.type !== 'private' && isConfiguredGroup(message?.chat?.id) ? 1 : 0;
+}
+
 function createBulkJobPayload(action, ids, invalid, note, message) {
 	const now = new Date().toISOString();
 	const operator = formatMessageActorMention(message);
 	const groupIds = GROUP_IDS.map((id) => String(id));
+	const isUnban = action === 'unban';
+	const budget = shouldUseBulkQueue(ids.length, groupIds.length, {
+		probeMembership: !isUnban && ids.length === 1,
+		authorizationRequests: estimateBulkAuthorizationRequests(message)
+	});
 	const job = {
-		version: 1,
+		version: 2,
 		id: buildBulkJobId(action),
 		action,
-		reason: action === 'sa' ? 'sa' : 'manual',
-		command: action === 'sa' ? '/sa' : '/be',
+		reason: action === 'sa' ? 'sa' : (isUnban ? null : 'manual'),
+		command: action === 'sa' ? '/sa' : (isUnban ? '/unban' : '/be'),
 		status: 'queued',
 		ids: ids.map((id) => String(id)),
 		invalid: (invalid || []).map((id) => String(id)),
-		note: String(note || '').trim(),
+		note: normalizeActionNote(note),
 		groupIds,
 		createdBy: getMessageActorId(message),
 		operator,
@@ -1670,13 +2025,14 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 		notifyTargets: getBulkJobNotifyTargets(message),
 		userBatchSize: BULK_TASK_USER_BATCH_SIZE,
 		concurrency: BULK_TASK_CONCURRENCY,
-		retryLimit: BULK_TASK_RETRY_LIMIT,
 		totals: {
 			users: ids.length,
 			groups: groupIds.length,
-			operations: ids.length * groupIds.length,
+			operations: budget.operations,
 			invalid: (invalid || []).length,
-			operationBatchLimit: BULK_TASK_OPERATION_BATCH_LIMIT
+			estimatedSubrequests: budget.estimate.total,
+			subrequestBudget: BULK_TASK_SYNC_SUBREQUEST_BUDGET,
+			d1MutationBatches: budget.estimate.d1MutationBatches
 		},
 		stats: {
 			usersProcessed: 0,
@@ -1684,9 +2040,15 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 			exists: 0,
 			addFailed: 0,
 			kickOk: 0,
-			kickFailed: 0
+			kickFailed: 0,
+			removed: 0,
+			notFound: 0,
+			removeFailed: 0,
+			unbanOk: 0,
+			unbanFailed: 0
 		},
 		failures: [],
+		activeBatch: null,
 		cursor: 0,
 		autoContinue: true,
 		autoRunCount: 0,
@@ -1727,7 +2089,12 @@ function pushBulkJobFailure(job, failure) {
 function formatBulkJobFailureLine(failure) {
 	const groupText = failure.groupId ? ` 群 <code>${escapeHtml(failure.groupId)}</code>` : '';
 	const rawError = failure.error || failure.message || '失败';
-	const { 中文, 建议 } = translateTelegramError(rawError);
+	const isUnban = failure.phase === 'unban' || failure.phase === 'remove';
+	const { 中文, 建议 } = translateTelegramError(rawError, {
+		action: isUnban ? 'unban' : undefined,
+		userId: failure.userId,
+		retryCommand: isUnban ? '/unban' : '/be 或 /sa'
+	});
 	const reasonText = 中文 === rawError
 		? escapeHtml(rawError)
 		: `${escapeHtml(中文)}（${escapeHtml(rawError)}）`;
@@ -1746,6 +2113,7 @@ function formatBulkJobStatus(job) {
 }
 
 function formatBulkJobAction(job) {
+	if (job.action === 'unban') return '移出黑名单并群解封(/unban)';
 	return (job.action === 'sa' || job.action === 'spam') ? '举报加黑(/sa)' : '加入黑名单(/be)';
 }
 
@@ -1779,16 +2147,36 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 		`配置群数:${totalGroups}`,
 		`总操作数:${totalOps}`,
 		`已处理用户:${cursor}/${totalUsers} (${percent}%)`,
-		'',
-		`加黑成功:${job.stats?.added || 0}`,
-		`已存在:${job.stats?.exists || 0}`,
-		`加黑失败:${job.stats?.addFailed || 0}`,
-		`群封禁成功:${job.stats?.kickOk || 0}`,
-		`群封禁失败:${job.stats?.kickFailed || 0}`,
+		''
+	];
+	if (job.activeBatch) {
+		lines.push(`当前 20 人批次群操作:${job.activeBatch.operationCursor || 0}/${job.activeBatch.totalOperations || 0}`, '');
+	}
+	if (job.action === 'unban') {
+		lines.push(
+			`移黑成功:${job.stats?.removed || 0}`,
+			`原本不在黑名单:${job.stats?.notFound || 0}`,
+			`移黑失败:${job.stats?.removeFailed || 0}`,
+			`群解封成功:${job.stats?.unbanOk || 0}`,
+			`群解封失败:${job.stats?.unbanFailed || 0}`
+		);
+	} else {
+		lines.push(
+			`加黑成功:${job.stats?.added || 0}`,
+			`已存在:${job.stats?.exists || 0}`,
+			`加黑失败:${job.stats?.addFailed || 0}`,
+			`群封禁成功:${job.stats?.kickOk || 0}`,
+			`群封禁失败:${job.stats?.kickFailed || 0}`
+		);
+	}
+	lines.push(
 		`格式错误:${job.totals?.invalid || 0}`,
 		'',
-		`执行参数:单轮最多 ${getBulkJobSafeUserBatchSize(job)} 用户 / 操作预算 ${job.totals?.operationBatchLimit || BULK_TASK_OPERATION_BATCH_LIMIT} / 并发 ${job.concurrency || BULK_TASK_CONCURRENCY} / 重试 ${job.retryLimit ?? BULK_TASK_RETRY_LIMIT} 次`
-	];
+		`执行参数:D1 每批最多 ${getBulkJobSafeUserBatchSize(job)} 用户 / 单次 Queue 最多 ${BULK_TASK_OPERATION_SLICE_SIZE} 个群操作 / 并发 ${getBulkJobSafeConcurrency(job)} / 单个群操作最多 2 次请求`
+	);
+	if (job.totals?.estimatedSubrequests) {
+		lines.push(`同步路径估算:${job.totals.estimatedSubrequests} / 安全预算 ${job.totals.subrequestBudget || BULK_TASK_SYNC_SUBREQUEST_BUDGET}`);
+	}
 	if (job.status !== 'done') {
 		if (job.autoContinue !== false) {
 			lines.push('自动续接:已开启');
@@ -1799,9 +2187,45 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 	}
 	if (job.failures?.length) {
 		lines.push('', `<b>最近失败</b>（最多显示 ${Math.min(job.failures.length, 5)} 条）:`);
-		for (const f of job.failures.slice(-5)) {
-			lines.push(formatBulkJobFailureLine(f));
-		}
+		for (const f of job.failures.slice(-5)) lines.push(formatBulkJobFailureLine(f));
+	}
+	return lines.join('\n');
+}
+
+function normalizeBulkJobPage(job, requestedPage) {
+	const totalUsers = job?.ids?.length || 0;
+	const pageCount = Math.max(1, Math.ceil(totalUsers / BULK_JOB_PROFILE_PAGE_SIZE));
+	const parsed = Number.parseInt(String(requestedPage || '1'), 10);
+	const page = Number.isFinite(parsed) ? Math.min(Math.max(parsed, 1), pageCount) : 1;
+	return { page, pageCount, totalUsers };
+}
+
+function getBulkJobPageIds(job, requestedPage) {
+	const pageInfo = normalizeBulkJobPage(job, requestedPage);
+	const start = (pageInfo.page - 1) * BULK_JOB_PROFILE_PAGE_SIZE;
+	return {
+		...pageInfo,
+		start,
+		ids: (job?.ids || []).slice(start, start + BULK_JOB_PROFILE_PAGE_SIZE)
+	};
+}
+
+function formatBulkJobUserPage(job, requestedPage, profiles) {
+	const pageInfo = getBulkJobPageIds(job, requestedPage);
+	const cursor = Math.max(0, Number(job?.cursor) || 0);
+	const failedUsers = new Set((job?.failures || []).map((failure) => String(failure.userId || '')).filter(Boolean));
+	const lines = [
+		`<b>目标用户</b>（第 ${pageInfo.page}/${pageInfo.pageCount} 页，每页最多 ${BULK_JOB_PROFILE_PAGE_SIZE} 人）:`
+	];
+	pageInfo.ids.forEach((id, index) => {
+		const absoluteIndex = pageInfo.start + index;
+		const state = absoluteIndex < cursor
+			? (failedUsers.has(String(id)) ? '⚠️ 已处理，存在失败' : '✅ 已处理')
+			: '⏳ 待处理';
+		lines.push(`${absoluteIndex + 1}. ${formatBatchUserTarget(id, profiles)} — ${state}`);
+	});
+	if (pageInfo.pageCount > 1) {
+		lines.push('', `翻页:<code>/job ${escapeHtml(job.id)} ${pageInfo.page < pageInfo.pageCount ? pageInfo.page + 1 : 1}</code>`);
 	}
 	return lines.join('\n');
 }
@@ -1809,55 +2233,130 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 async function notifyBulkJobTargets(job, detailText) {
 	const targets = Array.isArray(job.notifyTargets) ? job.notifyTargets : [];
 	if (!targets.length) return;
-	await Promise.allSettled(targets.map((targetId) => {
+	await mapWithConcurrency(targets, BATCH_USER_PROFILE_CONCURRENCY, async (targetId) => {
 		const text = String(targetId) === String(job.createdBy)
 			? detailText
 			: renderAuditNotification(job.operator || `<code>${escapeHtml(job.createdBy || '')}</code>`, detailText, job.sourceChatType === 'private' ? '私聊' : '群内', job.operatorRole || '管理员');
-		return sendTelegramMessage(targetId, text).then((r) => {
-			if (!r?.ok) console.error(`[批量任务通知] 私聊${targetId}失败:${r?.description || r?.error || '未知'}`);
+		const result = await sendTelegramMessageChunks(targetId, text);
+		if (!result?.ok) console.error(`[批量任务通知] 私聊${targetId}失败:${result?.description || result?.error || '未知'}`);
+	});
+}
+
+function incrementBulkJobStat(job, key, amount = 1) {
+	if (!job.stats || typeof job.stats !== 'object') job.stats = {};
+	job.stats[key] = (Number(job.stats[key]) || 0) + amount;
+}
+
+async function performBulkJobD1Mutation(job, env, ids) {
+	let lastResults = null;
+	for (let attempt = 0; attempt <= BULK_TASK_D1_RETRY_LIMIT; attempt += 1) {
+		lastResults = job.action === 'unban'
+			? await removeManyFromBlacklist(ids, env)
+			: await addManyToBlacklist(ids, env, {
+				reason: job.reason,
+				by: job.createdBy,
+				note: job.note
+			});
+		if (!lastResults.failed.length) return lastResults;
+		if (attempt < BULK_TASK_D1_RETRY_LIMIT) {
+			await new Promise((resolve) => setTimeout(resolve, BULK_TASK_D1_RETRY_DELAY_MS));
+		}
+	}
+	const preview = lastResults?.failed?.[0]?.msg || '未知 D1 错误';
+	throw new Error(`批量 D1 操作连续失败，未推进任务游标: ${preview}`);
+}
+
+function getBulkJobConfiguredGroupIds(job) {
+	const seen = new Set();
+	return (Array.isArray(job?.groupIds) ? job.groupIds : [])
+		.map((id) => String(id || '').trim())
+		.filter((id) => {
+			if (!id || seen.has(id) || !isConfiguredGroup(id)) return false;
+			seen.add(id);
+			return true;
 		});
-	}));
 }
 
-async function banUserFromGroupWithRetry(groupId, userId, retryLimit) {
-	let last = null;
-	for (let attempt = 0; attempt <= retryLimit; attempt++) {
-		const result = await banUserFromGroup(groupId, userId);
-		if (result.ok) {
-			return { ...result, attempts: attempt + 1 };
-		}
-		last = result;
-		if (attempt < retryLimit) {
-			await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
-		}
+async function prepareBulkJobActiveBatch(job, env) {
+	if (job.activeBatch) return job.activeBatch;
+	const ids = job.ids.slice(job.cursor, job.cursor + getBulkJobSafeUserBatchSize(job));
+	if (!ids.length) return null;
+	const results = await performBulkJobD1Mutation(job, env, ids);
+	const isUnban = job.action === 'unban';
+	const actionableIds = isUnban
+		? [...results.success, ...results.notFound]
+		: [...results.success, ...results.exists];
+	const activeGroupIds = getBulkJobConfiguredGroupIds(job);
+
+	if (isUnban) {
+		incrementBulkJobStat(job, 'removed', results.success.length);
+		incrementBulkJobStat(job, 'notFound', results.notFound.length);
+	} else {
+		incrementBulkJobStat(job, 'added', results.success.length);
+		incrementBulkJobStat(job, 'exists', results.exists.length);
 	}
-	return { ok: false, error: last?.error || '失败', attempts: retryLimit + 1 };
+
+	job.activeBatch = {
+		startCursor: job.cursor,
+		userCount: ids.length,
+		ids,
+		actionableIds,
+		groupIds: activeGroupIds,
+		operationCursor: 0,
+		totalOperations: actionableIds.length * activeGroupIds.length
+	};
+	await saveBulkJob(env, job);
+	return job.activeBatch;
 }
 
-async function processBulkJobUserBatch(job, env, ids) {
-	const kickTasks = [];
-	for (const id of ids) {
-		const result = await addToBlacklistCore(id, env, { reason: job.reason, by: job.createdBy, note: job.note });
-		if (result.success) {
-			job.stats.added += 1;
-		} else if (result.code === 'EXISTS') {
-			job.stats.exists += 1;
-		} else {
-			job.stats.addFailed += 1;
-			pushBulkJobFailure(job, { userId: id, phase: 'add', error: result.message || '加黑失败' });
-			continue;
-		}
-		for (const groupId of job.groupIds) {
-			kickTasks.push({ userId: id, groupId });
-		}
-	}
+function getBulkJobOperationTask(job, operationIndex) {
+	const active = job.activeBatch;
+	const groupIds = Array.isArray(active?.groupIds)
+		? active.groupIds
+		: (Array.isArray(job?.groupIds) ? job.groupIds : []);
+	const groupCount = groupIds.length;
+	if (!active || groupCount <= 0) return null;
+	const userIndex = Math.floor(operationIndex / groupCount);
+	const groupIndex = operationIndex % groupCount;
+	const userId = active.actionableIds[userIndex];
+	const groupId = groupIds[groupIndex];
+	return userId && groupId && isConfiguredGroup(groupId) ? { userId, groupId } : null;
+}
 
-	await mapWithConcurrency(kickTasks, job.concurrency || BULK_TASK_CONCURRENCY, async (task) => {
-		const result = await banUserFromGroupWithRetry(task.groupId, task.userId, job.retryLimit ?? BULK_TASK_RETRY_LIMIT);
+async function processBulkJobOperationSlice(job, env) {
+	const active = job.activeBatch;
+	if (!active) return;
+	const start = Math.max(0, Number(active.operationCursor) || 0);
+	const end = Math.min(active.totalOperations, start + BULK_TASK_OPERATION_SLICE_SIZE);
+	const tasks = [];
+	for (let index = start; index < end; index += 1) {
+		const task = getBulkJobOperationTask(job, index);
+		if (task) tasks.push(task);
+	}
+	const isUnban = job.action === 'unban';
+
+	await mapWithConcurrency(tasks, getBulkJobSafeConcurrency(job), async (task) => {
+		if (isUnban) {
+			const result = await unbanUser(task.userId, task.groupId);
+			if (result?.ok) {
+				incrementBulkJobStat(job, 'unbanOk');
+			} else {
+				incrementBulkJobStat(job, 'unbanFailed');
+				pushBulkJobFailure(job, {
+					userId: task.userId,
+					groupId: task.groupId,
+					phase: 'unban',
+					error: result?.description || result?.error || '群解封失败'
+				});
+			}
+			return;
+		}
+
+		const result = await banUserFromGroup(task.groupId, task.userId);
 		if (result.ok) {
-			job.stats.kickOk += 1;
+			incrementBulkJobStat(job, 'kickOk');
 		} else {
-			job.stats.kickFailed += 1;
+			incrementBulkJobStat(job, 'kickFailed');
 			pushBulkJobFailure(job, {
 				userId: task.userId,
 				groupId: task.groupId,
@@ -1866,13 +2365,32 @@ async function processBulkJobUserBatch(job, env, ids) {
 			});
 		}
 	});
+
+	active.operationCursor = end;
+	if (end >= active.totalOperations) {
+		job.cursor = Math.min(job.ids.length, active.startCursor + active.userCount);
+		job.stats.usersProcessed = job.cursor;
+		job.activeBatch = null;
+	}
+	if (job.cursor >= job.ids.length && !job.activeBatch) {
+		job.status = 'done';
+		job.finishedAt = new Date().toISOString();
+	} else {
+		job.status = 'queued';
+	}
+	clearBulkJobLease(job);
+	await saveBulkJob(env, job);
+}
+
+function getBulkJobSafeConcurrency(job) {
+	const configured = Math.floor(Number(job?.concurrency));
+	if (!Number.isFinite(configured) || configured <= 0) return BULK_TASK_CONCURRENCY;
+	return Math.min(BULK_TASK_CONCURRENCY, configured);
 }
 
 function getBulkJobSafeUserBatchSize(job) {
-	const groups = Math.max(1, Number(job?.totals?.groups ?? job?.groupIds?.length ?? GROUP_IDS.length) || 1);
-	const byOperations = Math.max(1, Math.floor(BULK_TASK_OPERATION_BATCH_LIMIT / groups));
 	const configured = Math.max(1, Number(job?.userBatchSize) || BULK_TASK_USER_BATCH_SIZE);
-	return Math.max(1, Math.min(configured, byOperations));
+	return Math.min(BULK_TASK_USER_BATCH_SIZE, configured);
 }
 
 function isBulkJobLeaseActive(job) {
@@ -1907,6 +2425,18 @@ async function markBulkJobFailed(env, jobId, error) {
 	return job;
 }
 
+async function markBulkJobFailedIfCurrent(env, job, error) {
+	try {
+		return await markBulkJobFailed(env, job, error);
+	} catch (markError) {
+		if (markError?.code === 'BULK_JOB_LEASE_LOST') {
+			console.warn(`[批量任务] 状态已被新执行器接管，忽略旧执行器失败标记 ${job?.id || ''}`);
+			return await loadBulkJob(env, job?.id) || job;
+		}
+		throw markError;
+	}
+}
+
 function getBulkQueue(env) {
 	return env?.BULK_QUEUE && typeof env.BULK_QUEUE.send === 'function' ? env.BULK_QUEUE : null;
 }
@@ -1932,10 +2462,10 @@ function scheduleBulkJobAutoContinue(job, ctx, requestUrl, env = null) {
 				await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
 			}
 		}
-		await markBulkJobFailed(env, job.id, `Queue 自动续接触发失败: ${lastError || '未知错误'}`);
+		await markBulkJobFailedIfCurrent(env, job, `Queue 自动续接触发失败: ${lastError || '未知错误'}`);
 	})().catch(async (error) => {
 		console.error(`[批量任务] 自动续接异常 ${job.id}:`, error);
-		await markBulkJobFailed(env, job.id, error);
+		await markBulkJobFailedIfCurrent(env, job, error);
 	});
 	if (ctx && typeof ctx.waitUntil === 'function') {
 		ctx.waitUntil(task);
@@ -1949,50 +2479,27 @@ async function runBulkModerationJob(env, jobId, options = {}) {
 	let job = await loadBulkJob(env, jobId);
 	if (!job) return null;
 	if (job.status === 'done') return job;
-	if (!options.ignoreLease && isBulkJobLeaseActive(job)) {
-		return job;
-	}
-	const started = Date.now();
-	const maxRounds = Math.max(1, Number(options.maxRounds) || 1);
-	let rounds = 0;
+	if (!options.ignoreLease && isBulkJobLeaseActive(job)) return job;
+
 	const leaseOwner = `${options.source || 'run'}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 	try {
-		job.status = 'running';
-		job.startedAt = job.startedAt || new Date().toISOString();
-		job.leaseOwner = leaseOwner;
-		job.leaseUntil = new Date(Date.now() + BULK_TASK_LEASE_MS).toISOString();
-		job.autoRunCount = (Number(job.autoRunCount) || 0) + 1;
-		await saveBulkJob(env, job);
+		const acquired = await acquireBulkJobLease(env, job, leaseOwner);
+		if (!acquired) return await loadBulkJob(env, job.id) || job;
+		job = acquired;
 
-		while (job.cursor < job.ids.length && rounds < maxRounds) {
-			const safeBatchSize = getBulkJobSafeUserBatchSize(job);
-			const batch = job.ids.slice(job.cursor, job.cursor + safeBatchSize);
-			await processBulkJobUserBatch(job, env, batch);
-			job.cursor += batch.length;
-			job.stats.usersProcessed = job.cursor;
-			rounds += 1;
-			if (job.cursor >= job.ids.length) {
-				job.status = 'done';
-				job.finishedAt = new Date().toISOString();
-			}
-			if (job.status === 'done') {
-				clearBulkJobLease(job);
-			}
-			await saveBulkJob(env, job);
-			if (job.status === 'done') break;
-			if (Date.now() - started >= BULK_TASK_MAX_RUNTIME_MS) break;
-		}
-
-		if (job.status !== 'done') {
-			job.status = 'queued';
+		const activeBatch = await prepareBulkJobActiveBatch(job, env);
+		if (activeBatch) {
+			await processBulkJobOperationSlice(job, env);
+		} else {
+			job.status = 'done';
+			job.finishedAt = new Date().toISOString();
 			clearBulkJobLease(job);
 			await saveBulkJob(env, job);
-			if (options.autoContinue !== false) {
-				const scheduled = scheduleBulkJobAutoContinue(job, options.ctx, options.requestUrl, env);
-				if (scheduled && typeof scheduled.then === 'function') {
-					await scheduled;
-				}
-			}
+		}
+
+		if (job.status !== 'done' && options.autoContinue !== false) {
+			const scheduled = scheduleBulkJobAutoContinue(job, options.ctx, options.requestUrl, env);
+			if (scheduled && typeof scheduled.then === 'function') await scheduled;
 		}
 
 		if (job.status === 'done' && options.notifyOnDone !== false && !job.doneNotified) {
@@ -2002,17 +2509,35 @@ async function runBulkModerationJob(env, jobId, options = {}) {
 		}
 		return job;
 	} catch (error) {
+		if (error?.code === 'BULK_JOB_LEASE_LOST') {
+			console.warn(`[批量任务] 租约已转移，旧执行器停止保存 ${job.id}`);
+			return await loadBulkJob(env, job.id) || job;
+		}
 		console.error(`[批量任务] 执行异常 ${job.id}:`, error);
-		return await markBulkJobFailed(env, job, error);
+		try {
+			return await markBulkJobFailed(env, job, error);
+		} catch (markError) {
+			if (markError?.code === 'BULK_JOB_LEASE_LOST') {
+				return await loadBulkJob(env, job.id) || job;
+			}
+			throw markError;
+		}
 	}
 }
 
 async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 	const { action, valid, invalid, note, isInGroup } = options;
-	const operationCount = valid.length * Math.max(1, GROUP_IDS.length);
-	if (valid.length < BULK_TASK_THRESHOLD && operationCount <= BULK_TASK_SYNC_OPERATION_LIMIT) return false;
+	const budget = shouldUseBulkQueue(valid.length, GROUP_IDS.length, {
+		probeMembership: action !== 'unban' && valid.length === 1,
+		authorizationRequests: estimateBulkAuthorizationRequests(message)
+	});
+	if (!budget.useQueue) return false;
 	if (!env.DB) {
-		const detailText = withActionContext(message, `❌ 批量任务需要绑定 D1 存储空间\n目标用户:${valid.length}\n总操作数:${operationCount}`, note);
+		const detailText = withActionContext(
+			message,
+			`❌ 批量任务需要绑定 D1 存储空间\n目标用户:${valid.length}\n总操作数:${budget.operations}\n预计子请求:${budget.estimate.total}/${BULK_TASK_SYNC_SUBREQUEST_BUDGET}`,
+			note
+		);
 		await replyToAdmin(message, ctx, {
 			flashText: '❌ 批量任务需要绑定 D1',
 			detailText,
@@ -2918,6 +3443,65 @@ function formatUserMention(user) {
 
 	const displayName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.id;
 	return `<a href="tg://user?id=${user.id}">${escapeHtml(displayName)}</a>`;
+}
+
+function normalizeBatchUserDisplayName(user) {
+	const fullName = [user?.first_name, user?.last_name]
+		.filter(Boolean)
+		.join(' ')
+		.replace(/\s+/g, ' ')
+		.trim();
+	if (!fullName) return '';
+	if (Array.from(fullName).length <= BATCH_USER_NAME_MAX_LENGTH) return fullName;
+	return `${truncateTelegramText(fullName, BATCH_USER_NAME_MAX_LENGTH - 1)}…`;
+}
+
+function normalizeTelegramUsername(value) {
+	const username = String(value || '').trim().replace(/^@/, '');
+	return /^[A-Za-z0-9_]{5,32}$/.test(username) ? username : '';
+}
+
+function formatBatchUserCompactTarget(tgid) {
+	const safeId = escapeHtml(String(tgid));
+	return `<a href="tg://user?id=${safeId}">${safeId}</a>`;
+}
+
+function formatBatchUserTarget(tgid, userProfiles = null) {
+	const idStr = String(tgid);
+	const safeId = escapeHtml(idStr);
+	const user = userProfiles && typeof userProfiles.get === 'function'
+		? userProfiles.get(idStr)
+		: null;
+	if (user?.id) {
+		const fullName = normalizeBatchUserDisplayName(user);
+		const username = normalizeTelegramUsername(user.username);
+		const label = fullName || (username ? `@${username}` : idStr);
+		const usernameSuffix = fullName && username ? ` <code>@${escapeHtml(username)}</code>` : '';
+		return `<a href="tg://user?id=${safeId}">${escapeHtml(label)}</a>${usernameSuffix} <code>${safeId}</code>`;
+	}
+	return `${formatBatchUserCompactTarget(idStr)} <code>${safeId}</code>`;
+}
+
+// 即时小批量只在一个配置群查询一次用户资料，避免 用户数 × 群数 的额外子请求。
+// 群内命令优先查来源群；私聊命令只查第一个配置群。失败直接回退可点击 TGID。
+async function resolveBatchUserProfiles(ids, sourceChatId) {
+	const profiles = new Map();
+	const preferredGroupId = isConfiguredGroup(sourceChatId)
+		? String(sourceChatId)
+		: String(GROUP_IDS[0] || '');
+	if (!preferredGroupId) return profiles;
+
+	const uniqueIds = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(isPureTgid))];
+	await mapWithConcurrency(uniqueIds, BATCH_USER_PROFILE_CONCURRENCY, async (id) => {
+		try {
+			const result = await checkUserStatus(id, preferredGroupId);
+			const user = result?.result?.user;
+			if (user?.id) profiles.set(id, user);
+		} catch (_) {
+			// 查询不到资料不影响黑名单或 Telegram 群操作主流程。
+		}
+	});
+	return profiles;
 }
 
 // 按 TGID 拉用户信息(遍历配置群,任一群命中即返回名字 mention + TGID)
@@ -4773,10 +5357,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 仅真人可通过 /sa 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
 		if (isBotOperator(message.from)) return;
 
-		const isAdmin = await checkMessageOperatorIsAdmin(message, userId);
+		const isAdmin = await checkMessageOperatorCanBan(message, userId);
 		if (!isAdmin) {
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /sa；私聊仅限主人、副主人或超级管理员。');
 			}
 			return;
 		}
@@ -4793,11 +5377,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			if (valid.length === 0 && invalid.length === 0) {
 				const usageText = `❌ 使用方法：<code>/sa 用户ID</code> 或 <code>/sa 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
-				if (isInGroup) {
-					await sendFlashMessage(chatId, usageText, ctx);
-				} else {
-					await sendTelegramMessage(chatId, usageText);
-				}
+				await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
+				return;
+			}
+			if (valid.length > BATCH_LIMIT) {
+				const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
+				await sendModerationCommandFeedback(message, ctx, { flashText: limitText });
 				return;
 			}
 			if (await startBulkModerationJobFromCommand(message, env, ctx, {
@@ -4808,15 +5393,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				isInGroup,
 				requestUrl
 			})) {
-				return;
-			}
-			if (valid.length > BATCH_LIMIT) {
-				const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
-				if (isInGroup) {
-					await sendFlashMessage(chatId, limitText, ctx);
-				} else {
-					await sendTelegramMessage(chatId, limitText);
-				}
 				return;
 			}
 
@@ -4855,28 +5431,38 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 批量
 			const results = await addManyToBlacklist(valid, env, { reason: 'sa', by: operatorId, note });
 			const idsToKick = [...results.success, ...results.exists];
+			const userProfiles = await resolveBatchUserProfiles(idsToKick, chatId);
 			const banSummary = { success: idsToKick.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
-			const perUserBanResults = [];
-			for (const id of idsToKick) {
-				const banResults = await banUserFromAllGroups(id);
+			const perUserBanResults = await mapWithConcurrency(
+				idsToKick,
+				BULK_TASK_CONCURRENCY,
+				async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id) })
+			);
+			for (const { banResults } of perUserBanResults) {
 				const okCount = banResults.filter((r) => r.ok).length;
 				if (okCount === banResults.length) banSummary.banOkAll += 1;
 				else if (okCount === 0) banSummary.banFailedAll += 1;
 				else banSummary.banPartial += 1;
-				perUserBanResults.push({ userId: id, banResults });
 			}
 			const failedCount = invalid.length + results.failed.length;
 			const flashText = `✅ 批量加黑(/sa)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
-			const baseDetail = renderBatchAddResult(results, invalid, banSummary);
+			const baseDetail = renderBatchAddResult(results, invalid, banSummary, userProfiles);
 			let fullDetail = baseDetail;
 			if (perUserBanResults.length > 0) {
-				const perUserDetailLines = ['', '<b>逐用户 Telegram 群封禁/预封明细</b>:'];
+				const perUserBlocks = [];
 				const chatInfoCache = new Map();
 				for (const { userId: uid, banResults } of perUserBanResults) {
-					perUserDetailLines.push('', `<b>用户 <code>${uid}</code></b>`);
-					perUserDetailLines.push(await renderBanResultsDetail(banResults, chatInfoCache, { userId: uid, retryCommand: '/sa' }));
+					const resultDetail = await renderBanResultsDetail(banResults, chatInfoCache, {
+						userId: uid,
+						retryCommand: '/sa',
+						compactSpacing: true
+					});
+					perUserBlocks.push(buildTelegramAtomicHtmlBlock([
+						`<b>用户</b> ${formatBatchUserCompactTarget(uid)}`,
+						resultDetail
+					]));
 				}
-				fullDetail += '\n' + perUserDetailLines.join('\n');
+				fullDetail += `\n\n<b>逐用户 Telegram 群封禁/预封明细</b>:\n\n${perUserBlocks.join('\n\n')}`;
 			}
 			await replyToAdmin(message, ctx, {
 				flashText,
@@ -4891,11 +5477,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const repliedUserId = repliedMsg?.from?.id;
 		if (!repliedUserId) {
 			const usageText = '❌ 使用方法：\n• 回复垃圾消息后发 <code>/sa</code>\n• 或直接 <code>/sa 用户ID</code>（支持批量：<code>/sa 123,456,789</code>）';
-			if (isInGroup) {
-				await sendFlashMessage(chatId, usageText, ctx);
-			} else {
-				await sendTelegramMessage(chatId, usageText);
-			}
+			await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
 			return;
 		}
 
@@ -4978,42 +5560,32 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 处理 /job /jobrun：查询或续跑大批量 /be /sa 任务
 	if (isJobCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
-		const isAdmin = await checkMessageOperatorIsAdmin(message, userId);
+		const isAdmin = isPrivilegedManager(userId);
 		if (!isAdmin) {
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
 			}
 			return;
 		}
 		const isRun = /^\/jobrun(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
 		await deleteAuthorizedGroupCommandMessage(message, isRun ? '/jobrun' : '/job');
-		const jobId = text.trim().replace(/^\/job(?:run)?(?:@[^\s]+)?\s*/i, '').trim().split(/\s+/)[0] || '';
+		const jobArgs = text.trim().replace(/^\/job(?:run)?(?:@[^\s]+)?\s*/i, '').trim().split(/\s+/).filter(Boolean);
+		const jobId = jobArgs[0] || '';
+		const requestedPage = jobArgs[1] || '1';
 		if (!jobId) {
-			const usageText = '❌ 使用方法：<code>/job 任务ID</code> 或 <code>/jobrun 任务ID</code>';
-			if (isInGroup) {
-				await sendFlashMessage(chatId, usageText, ctx);
-			} else {
-				await sendTelegramMessage(chatId, usageText);
-			}
+			const usageText = '❌ 使用方法：<code>/job 任务ID [页码]</code> 或 <code>/jobrun 任务ID</code>';
+			await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
 			return;
 		}
 		if (!env.DB) {
 			const errorText = '❌ 批量任务需要绑定 D1 存储空间';
-			if (isInGroup) {
-				await sendFlashMessage(chatId, errorText, ctx);
-			} else {
-				await sendTelegramMessage(chatId, errorText);
-			}
+			await sendModerationCommandFeedback(message, ctx, { flashText: errorText });
 			return;
 		}
 		const job = await loadBulkJob(env, jobId);
 		if (!job) {
 			const errorText = `❌ 未找到任务:<code>${escapeHtml(jobId)}</code>`;
-			if (isInGroup) {
-				await sendFlashMessage(chatId, errorText, ctx);
-			} else {
-				await sendTelegramMessage(chatId, errorText);
-			}
+			await sendModerationCommandFeedback(message, ctx, { flashText: errorText });
 			return;
 		}
 		if (isRun && job.status !== 'done') {
@@ -5033,7 +5605,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 		}
 		const latestJob = await loadBulkJob(env, job.id) || job;
-		const detailText = formatBulkJobDetail(latestJob, isRun ? '▶️ <b>批量任务已继续执行</b>' : '📦 <b>批量任务状态</b>');
+		let detailText = formatBulkJobDetail(latestJob, isRun ? '▶️ <b>批量任务已继续执行</b>' : '📦 <b>批量任务状态</b>');
+		if (!isRun && isOwner(userId)) {
+			const pageInfo = getBulkJobPageIds(latestJob, requestedPage);
+			const profiles = await resolveBatchUserProfiles(pageInfo.ids, latestJob.sourceChatId);
+			detailText += `\n\n${formatBulkJobUserPage(latestJob, pageInfo.page, profiles)}`;
+		}
 		if (isInGroup) {
 			await replyToAdmin(message, ctx, {
 				flashText: `📦 任务状态已发送私聊 <code>${escapeHtml(job.id)}</code>`,
@@ -5042,7 +5619,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				notifySecondaryOwners: false
 			});
 		} else {
-			await sendTelegramMessage(chatId, detailText);
+			await sendTelegramMessageChunks(chatId, detailText);
 		}
 		return;
 	}
@@ -5059,50 +5636,86 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const checkArg = text.trim().replace(/^\/check(?:@[^\s]+)?\s*/i, '').trim();
 		const hasTgidArg = /^\d+$/.test(checkArg);
 
-		// 鉴权:必须是任一配置群管理员(私聊也能用,checkIfUserIsAdmin 与当前 chatId 无关)
-		const isAdmin = await checkMessageOperatorIsAdmin(message, userId);
+		// /check 属于高级管理命令，普通 Telegram 群管理员不开放。
+		const isAdmin = isPrivilegedManager(userId);
+		const quietGroupCommand = isInGroup && isConfiguredSourceGroup && !isPrimaryOwner(userId);
 
 		if (hasTgidArg) {
 			// 带 TGID 参数:私聊 / 群内均可
 			if (!isAdmin) {
 				if (message.chat.type === 'private') {
-					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
 				}
 				return;
 			}
-			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${escapeHtml(checkArg)}</code> 的封禁状态...`);
+			if (quietGroupCommand) {
+				await deleteAuthorizedGroupCommandMessage(message, '/check');
+			} else {
+				await sendTelegramMessage(chatId, `正在查询 TGID: <code>${escapeHtml(checkArg)}</code> 的封禁状态...`);
+			}
 			const response = await buildBanlistCheckResponse(checkArg, {
 				includeReviewAction: true,
 				dispatchSourceAllowed,
 				env,
 			});
-			await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+			if (quietGroupCommand) {
+				await replyToAdmin(message, ctx, {
+					flashText: `🔍 查询完成 <code>${escapeHtml(checkArg)}</code>，完整结果已发送给主人`,
+					detailText: response.text,
+					isInGroup: true,
+					replyMarkup: response.replyMarkup,
+				});
+			} else {
+				await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+			}
 			return;
 		}
 
 		// 无参数:沿用原"群内回复消息"用法
 		if (!isInGroup) {
+			if (!isAdmin) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
+				return;
+			}
 			await sendTelegramMessage(chatId, 'ℹ️ 私聊查询请用:<code>/check TGID</code>\n例:<code>/check 993005028</code>\n群内可回复某条消息发 <code>/check</code> 查该用户。');
 			return;
 		}
 		if (!isAdmin) {
 			return;
 		}
+		if (quietGroupCommand) {
+			await deleteAuthorizedGroupCommandMessage(message, '/check');
+		}
 		const repliedUser = message.reply_to_message?.from;
 		if (!repliedUser?.id) {
-			await sendTelegramMessage(chatId, '❌ 请回复要查询封禁状态的用户消息后再发送 <code>/check</code>，或用 <code>/check TGID</code> 直接查。');
+			const usageText = '❌ 请回复要查询封禁状态的用户消息后再发送 <code>/check</code>，或用 <code>/check TGID</code> 直接查。';
+			await sendAuthorizedCommandResult(message, ctx, {
+				flashText: '❌ /check 用法错误，完整提示已发送给主人',
+				detailText: usageText,
+			});
 			return;
 		}
 
 		const tgidToCheck = repliedUser.id.toString();
-		await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
+		if (!quietGroupCommand) {
+			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
+		}
 		const response = await buildBanlistCheckResponse(tgidToCheck, {
 			targetUser: repliedUser,
 			includeReviewAction: true,
 			dispatchSourceAllowed,
 			env,
 		});
-		await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+		if (quietGroupCommand) {
+			await replyToAdmin(message, ctx, {
+				flashText: `🔍 查询完成 <code>${escapeHtml(tgidToCheck)}</code>，完整结果已发送给主人`,
+				detailText: response.text,
+				isInGroup: true,
+				replyMarkup: response.replyMarkup,
+			});
+		} else {
+			await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+		}
 		return;
 	}
 
@@ -5111,24 +5724,44 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	if (startCommand.head === '/start') {
 		const startArg = startCommand.rest.split(/\s+/)[0] || '';
 		if (startArg.startsWith('check_')) {
-			// 验证用户是否是群组管理员
-			const isAdmin = await checkIfUserIsAdmin(userId);
+			const isInGroup = message.chat.type !== 'private';
+			// 二次审核属于高级管理权限，普通 Telegram 群管理员不开放。
+			const isAdmin = isPrivilegedManager(userId);
 
 			if (!isAdmin) {
-				const groupInfo = await getGroupInfo();
-				await sendTelegramMessage(chatId, `❌ <b>权限不足</b>\n\n此功能仅限 ${groupInfo.title} 的管理员使用。`);
+				if (!isInGroup) {
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
+				}
 				return;
+			}
+			const quietGroupCommand = shouldSilenceAuthorizedGroupCommand(message);
+			if (quietGroupCommand) {
+				await deleteAuthorizedGroupCommandMessage(message, '/start');
 			}
 
 			// 提取 TGID
 			const tgidToCheck = startArg.replace('check_', '').trim();
 			if (!/^\d+$/.test(tgidToCheck)) {
-				await sendTelegramMessage(chatId, '❌ TGID 格式错误，请使用 <code>/check TGID</code>。');
+				await sendAuthorizedCommandResult(message, ctx, {
+					flashText: '❌ TGID 格式错误，完整提示已发送给主人',
+					detailText: '❌ TGID 格式错误，请使用 <code>/check TGID</code>。',
+				});
 				return;
 			}
-			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
+			if (!quietGroupCommand) {
+				await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
+			}
 			const response = await buildBanlistCheckResponse(tgidToCheck, { includeReviewAction: true, env });
-			await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+			if (quietGroupCommand) {
+				await replyToAdmin(message, ctx, {
+					flashText: `🔍 查询完成 <code>${escapeHtml(tgidToCheck)}</code>，完整结果已发送给主人`,
+					detailText: response.text,
+					isInGroup: true,
+					replyMarkup: response.replyMarkup,
+				});
+			} else {
+				await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+			}
 			return;
 		}
 
@@ -5138,16 +5771,34 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 处理 /blacklist 命令 - 私聊管理员查看 D1 黑名单
 	if (text && /^\/blacklist(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		if (message.chat.type !== 'private') {
-			const isAdmin = await checkIfUserIsAdmin(userId);
+			const isAdmin = isPrivilegedManager(userId);
 			if (isAdmin) {
 				await deleteAuthorizedGroupCommandMessage(message, '/blacklist');
 			}
-			return; // 非私聊不予回复
+			if (!isAdmin || isPrimaryOwner(userId)) return;
+			if (!env.DB) {
+				await replyToAdmin(message, ctx, {
+					flashText: '❌ 未绑定 D1，完整结果已发送给主人',
+					detailText: '❌ 未绑定 D1 存储空间，无法查看黑名单。',
+					isInGroup: true,
+				});
+				return;
+			}
+			const [total, blacklist] = await Promise.all([
+				getD1BlacklistCount(env),
+				readD1BlacklistRecent(env, BLACKLIST_PAGE_LIMIT)
+			]);
+			await replyToAdmin(message, ctx, {
+				flashText: `📋 黑名单共 ${total} 条，完整结果已发送给主人`,
+				detailText: renderBlacklist(blacklist, { total, alreadyRecent: true }),
+				isInGroup: true,
+			});
+			return;
 		}
 
-		const isAdmin = await checkIfUserIsAdmin(userId);
+		const isAdmin = isPrivilegedManager(userId);
 		if (!isAdmin) {
-			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
 			return;
 		}
 
@@ -5164,15 +5815,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
-	// ===== /help OWNER_IDS 专属帮助(展开全部隐藏指令)=====
-	// 仅 OWNER_IDS 中的主人/副主人可用。非 OWNER_IDS:群内静默、私聊提示权限不足,绝不泄漏隐藏指令的存在。
+	// ===== /help 第一主人专属帮助(展开全部隐藏指令)=====
+	// 仅 OWNER_IDS[0] 第一主人可用。其他角色群内静默、私聊提示权限不足。
 	if (text && /^\/help(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		const isOwnerUser = isOwner(userId);
+		const isOwnerUser = isPrimaryOwner(userId);
 		if (!isOwnerUser) {
 			// 群内完全静默(连"权限不足"都不发,避免暴露命令存在);私聊也不暴露隐藏指令
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限 OWNER_IDS 中的主人/副主人使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限第一主人使用。');
 			}
 			return;
 		}
@@ -5183,7 +5834,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 		const helpLines = [
-			'🔐 <b>OWNER_IDS 专属隐藏指令</b>(仅 OWNER_IDS 配置的主人/副主人可用；非主人群内静默，私聊仅提示权限不足)',
+			'🔐 <b>第一主人专属隐藏指令索引</b>(仅 OWNER_IDS[0] 可展开；其他角色群内静默，私聊仅提示权限不足)',
 			'',
 			'<b>━━ 广告词库热更新(私聊)━━</b>',
 			'<code>/importdefault</code> 一键导入推荐词库(金融/色情/引流/诈骗/身份引流)',
@@ -5327,7 +5978,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 		await deleteAuthorizedGroupCommandMessage(message, '/adwords');
 		if (!env.DB) {
-			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间,无法管理广告词库。');
+			await sendAuthorizedCommandResult(message, ctx, {
+				flashText: '❌ 未绑定 D1，完整提示已发送给主人',
+				detailText: '❌ 未绑定 D1 存储空间,无法管理广告词库。',
+			});
 			return;
 		}
 
@@ -5388,7 +6042,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// /addword [分类] <词...> —— 加词(分类可选,默认 general)
 		if (head === '/addword') {
 			if (!rest) {
-				await sendTelegramMessage(chatId, '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/sa/fraud/general/identity/whitelist(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>\nidentity=只查发言人名字/简介的引流词(如 卡网 发卡 车队)');
+				await sendAuthorizedCommandResult(message, ctx, {
+					flashText: '❌ /addword 用法错误，完整提示已发送给主人',
+					detailText: '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/sa/fraud/general/identity/whitelist(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>\nidentity=只查发言人名字/简介的引流词(如 卡网 发卡 车队)',
+				});
 				return;
 			}
 			const validCats = ['finance', 'porn', 'sa', 'spam', 'fraud', 'general', 'identity', 'whitelist'];
@@ -5400,7 +6057,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			if (cat === 'spam') cat = 'sa';
 			const words = [...new Set(tokens.map((w) => w.toLowerCase()))];
 			if (words.length === 0) {
-				await sendTelegramMessage(chatId, '❌ 没有提供有效的词。');
+				await sendAuthorizedCommandResult(message, ctx, {
+					flashText: '❌ 没有有效词，完整提示已发送给主人',
+					detailText: '❌ 没有提供有效的词。',
+				});
 				return;
 			}
 			const kw = await getAdKeywordsRaw(env);
@@ -5423,7 +6083,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// /delword <词...> —— 从所有分类删除
 		if (head === '/delword') {
 			if (!rest) {
-				await sendTelegramMessage(chatId, '用法:<code>/delword 词1 词2 ...</code>(从所有分类中删除)');
+				await sendAuthorizedCommandResult(message, ctx, {
+					flashText: '❌ /delword 用法错误，完整提示已发送给主人',
+					detailText: '用法:<code>/delword 词1 词2 ...</code>(从所有分类中删除)',
+				});
 				return;
 			}
 			const words = [...new Set(rest.split(/[\s,，]+/).filter(Boolean).map((w) => w.toLowerCase()))];
@@ -5461,7 +6124,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 		await deleteAuthorizedGroupCommandMessage(message, '/samples');
 		if (!env.DB) {
-			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间,无法管理学习样本。');
+			await sendAuthorizedCommandResult(message, ctx, {
+				flashText: '❌ 未绑定 D1，完整提示已发送给主人',
+				detailText: '❌ 未绑定 D1 存储空间,无法管理学习样本。',
+			});
 			return;
 		}
 
@@ -5494,7 +6160,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// /delsample <序号|关键词> —— 删除样本
 		if (head === '/delsample') {
 			if (!rest) {
-				await sendTelegramMessage(chatId, '用法:<code>/delsample 序号</code>(见 /listsamples)或 <code>/delsample 关键词</code>');
+				await sendAuthorizedCommandResult(message, ctx, {
+					flashText: '❌ /delsample 用法错误，完整提示已发送给主人',
+					detailText: '用法:<code>/delsample 序号</code>(见 /listsamples)或 <code>/delsample 关键词</code>',
+				});
 				return;
 			}
 			const fps = data.fingerprints || [];
@@ -5526,7 +6195,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// /clearsamples —— 清空所有样本(二次确认)
 		if (head === '/clearsamples') {
 			if (rest.trim().toLowerCase() !== 'confirm') {
-				await sendTelegramMessage(chatId, `⚠️ 这将清空全部 ${data.count || 0} 条学习样本,不可恢复。\n确认请发送:<code>/clearsamples confirm</code>`);
+				const confirmText = `⚠️ 这将清空全部 ${data.count || 0} 条学习样本,不可恢复。\n确认请发送:<code>/clearsamples confirm</code>`;
+				await sendAuthorizedCommandResult(message, ctx, {
+					flashText: '⚠️ 清空操作待确认，完整提示已发送给主人',
+					detailText: confirmText,
+				});
 				return;
 			}
 			const saved = await saveAdSamplesToD1(env, { fingerprints: [], count: 0, updatedAt: new Date().toISOString() });
@@ -5553,7 +6226,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 		await deleteAuthorizedGroupCommandMessage(message, '/learn');
 		if (!env.DB) {
-			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间,无法学习。');
+			await sendAuthorizedCommandResult(message, ctx, {
+				flashText: '❌ 未绑定 D1，完整提示已发送给主人',
+				detailText: '❌ 未绑定 D1 存储空间,无法学习。',
+			});
 			return;
 		}
 
@@ -5562,7 +6238,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// /learn <文本> —— 主人直接粘贴广告文本学习(只学指纹入库,不踢人)
 		if (head === '/learn') {
 			if (!rest) {
-				await sendTelegramMessage(chatId, '用法:<code>/learn 广告文本</code>\n直接粘贴广告文字即可学习(不需要回复消息)。\n例:<code>/learn 世界杯红单推荐 天天收米 日赚3千</code>');
+				await sendAuthorizedCommandResult(message, ctx, {
+					flashText: '❌ /learn 用法错误，完整提示已发送给主人',
+					detailText: '用法:<code>/learn 广告文本</code>\n直接粘贴广告文字即可学习(不需要回复消息)。\n例:<code>/learn 世界杯红单推荐 天天收米 日赚3千</code>',
+				});
 				return;
 			}
 			const learn = await learnAdSample(env, rest);
@@ -5590,7 +6269,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const list = filterMessagesByContext(all, message).slice(0, n); // 最新在前,最多 50 条
 			const scopeLabel = isInGroup ? '本群' : '全部群';
 			if (list.length === 0) {
-				await sendTelegramMessage(chatId, `ℹ️ ${scopeLabel}最近没有缓存到疑似广告消息。\n(只缓存含链接/@提及/长数字/长文本的群消息)`);
+				const emptyText = `ℹ️ ${scopeLabel}最近没有缓存到疑似广告消息。\n(只缓存含链接/@提及/长数字/长文本的群消息)`;
+				await sendAuthorizedCommandResult(message, ctx, {
+					flashText: `ℹ️ ${scopeLabel}暂无疑似广告，完整提示已发送给主人`,
+					detailText: emptyText,
+				});
 				return;
 			}
 			// 冻结快照:序号 1..N 对应 list[0..N-1],/learnlast 只认这份
@@ -5618,7 +6301,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (head === '/learnlast') {
 			// 强制私聊:群内禁止学习(防手忙脚乱点错序号误伤),闪屏引导到私聊
 			if (isInGroup) {
-				await sendFlashMessage(chatId, '⚠️ 学习请私聊我操作。群内只能用 /recent 拉取快照。', ctx, 8000);
+				const privateOnlyText = '⚠️ 学习请私聊我操作。群内只能用 /recent 拉取快照。';
+				if (shouldSilenceAuthorizedGroupCommand(message)) {
+					await sendAuthorizedCommandResult(message, ctx, {
+						flashText: privateOnlyText,
+						detailText: privateOnlyText,
+					});
+				} else {
+					await sendFlashMessage(chatId, privateOnlyText, ctx, 8000);
+				}
 				return;
 			}
 			// 从冻结快照读(不再读实时缓存,序号永不漂移)
@@ -5677,12 +6368,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 仅真人可通过 /be 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
 		if (isBotOperator(message.from)) return;
 
-		// 检查是否是群组管理员
-		const isAdmin = await checkMessageOperatorIsAdmin(message, userId);
+		// 普通管理员必须是当前群管理员；高级管理员保持原有权限。
+		const isAdmin = await checkMessageOperatorCanBan(message, userId);
 		if (!isAdmin) {
 			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /be；私聊仅限主人、副主人或超级管理员。');
 			}
 			return;
 		}
@@ -5697,11 +6388,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		if (valid.length === 0 && invalid.length === 0) {
 			const usageText = `❌ 使用方法：<code>/be 用户ID</code> 或 <code>/be 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
-			if (isInGroup) {
-				await sendFlashMessage(chatId, usageText, ctx);
-			} else {
-				await sendTelegramMessage(chatId, usageText);
-			}
+			await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
+			return;
+		}
+		if (valid.length > BATCH_LIMIT) {
+			const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
+			await sendModerationCommandFeedback(message, ctx, { flashText: limitText });
 			return;
 		}
 		if (await startBulkModerationJobFromCommand(message, env, ctx, {
@@ -5712,15 +6404,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			isInGroup,
 			requestUrl
 		})) {
-			return;
-		}
-		if (valid.length > BATCH_LIMIT) {
-			const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
-			if (isInGroup) {
-				await sendFlashMessage(chatId, limitText, ctx);
-			} else {
-				await sendTelegramMessage(chatId, limitText);
-			}
 			return;
 		}
 
@@ -5761,30 +6444,40 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 批量
 		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: operatorId, note });
 		const idsToKick = [...results.success, ...results.exists];
+		const userProfiles = await resolveBatchUserProfiles(idsToKick, chatId);
 		const banSummary = { success: idsToKick.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
-		// 收集每个用户的逐群结果,用于在 detail 末尾渲染明细
-		const perUserBanResults = []; // [{ userId, banResults }]
-		for (const id of idsToKick) {
-			const banResults = await banUserFromAllGroups(id);
+		// 每次最多并发 3 个用户；每个用户内部仍按配置群串行，避免连接与 Telegram 限流突增。
+		const perUserBanResults = await mapWithConcurrency(
+			idsToKick,
+			BULK_TASK_CONCURRENCY,
+			async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id) })
+		);
+		for (const { banResults } of perUserBanResults) {
 			const okCount = banResults.filter((r) => r.ok).length;
 			if (okCount === banResults.length) banSummary.banOkAll += 1;
 			else if (okCount === 0) banSummary.banFailedAll += 1;
 			else banSummary.banPartial += 1;
-			perUserBanResults.push({ userId: id, banResults });
 		}
 		const failedCount = invalid.length + results.failed.length;
 		const flashText = `✅ 批量加黑：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
 		// 详细 detailText：批量汇总 + 每个用户的逐群明细
-		const baseDetail = renderBatchAddResult(results, invalid, banSummary);
+		const baseDetail = renderBatchAddResult(results, invalid, banSummary, userProfiles);
 		let fullDetail = baseDetail;
 		if (perUserBanResults.length > 0) {
-			const perUserDetailLines = ['', '<b>逐用户 Telegram 群封禁/预封明细</b>:'];
+			const perUserBlocks = [];
 			const chatInfoCache = new Map();
 			for (const { userId: uid, banResults } of perUserBanResults) {
-				perUserDetailLines.push('', `<b>用户 <code>${uid}</code></b>`);
-				perUserDetailLines.push(await renderBanResultsDetail(banResults, chatInfoCache, { userId: uid, retryCommand: '/be' }));
+				const resultDetail = await renderBanResultsDetail(banResults, chatInfoCache, {
+					userId: uid,
+					retryCommand: '/be',
+					compactSpacing: true
+				});
+				perUserBlocks.push(buildTelegramAtomicHtmlBlock([
+					`<b>用户</b> ${formatBatchUserCompactTarget(uid)}`,
+					resultDetail
+				]));
 			}
-			fullDetail += '\n' + perUserDetailLines.join('\n');
+			fullDetail += `\n\n<b>逐用户 Telegram 群封禁/预封明细</b>:\n\n${perUserBlocks.join('\n\n')}`;
 		}
 		await replyToAdmin(message, ctx, {
 			flashText,
@@ -5804,11 +6497,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (rest.trim()) {
 			const isInGroup = message.chat.type !== 'private';
 
-			// 检查是否是群组管理员
-			const isAdmin = await checkMessageOperatorIsAdmin(message, userId);
+			// /unban 只能由主人、副主人或超级管理员执行。
+			const isAdmin = isPrivilegedManager(userId);
 			if (!isAdmin) {
 				if (!isInGroup) {
-					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/unban 仅限主人、副主人或超级管理员使用。');
 				}
 				return;
 			}
@@ -5818,20 +6511,22 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			if (valid.length === 0 && invalid.length === 0) {
 				const usageText = `❌ 使用方法：<code>/unban 用户ID</code> 或 <code>/unban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
-				if (isInGroup) {
-					await sendFlashMessage(chatId, usageText, ctx);
-				} else {
-					await sendTelegramMessage(chatId, usageText);
-				}
+				await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
 				return;
 			}
 			if (valid.length > BATCH_LIMIT) {
 				const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
-				if (isInGroup) {
-					await sendFlashMessage(chatId, limitText, ctx);
-				} else {
-					await sendTelegramMessage(chatId, limitText);
-				}
+				await sendModerationCommandFeedback(message, ctx, { flashText: limitText });
+				return;
+			}
+			if (await startBulkModerationJobFromCommand(message, env, ctx, {
+				action: 'unban',
+				valid,
+				invalid,
+				note: '',
+				isInGroup,
+				requestUrl
+			})) {
 				return;
 			}
 
@@ -5840,7 +6535,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				const result = await removeFromBlacklist(valid[0], env);
 				const shouldUnbanGroups = result.success || result.code === 'NOT_FOUND';
 				const unbanResults = shouldUnbanGroups ? await unbanUserFromAllGroups(valid[0]) : [];
-				const targetMention = await formatTargetByTgid(valid[0]);
+				const userProfiles = await resolveBatchUserProfiles([valid[0]], chatId);
+				const targetMention = formatBatchUserTarget(valid[0], userProfiles);
 				const lines = [
 					`🎬 操作:移出黑名单 + Telegram 群解封`,
 					`🎯 目标用户:${targetMention}`,
@@ -5864,33 +6560,43 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				return;
 			}
 
-			// 批量
+			// 批量：D1 每 20 人一条 SQL；资料每个 TGID 最多查询一次；群解封并发最多 3 个用户。
 			const results = await removeManyFromBlacklist(valid, env);
 			const idsToUnban = [...results.success, ...results.notFound];
+			const userProfiles = await resolveBatchUserProfiles(idsToUnban, chatId);
 			const unbanSummary = { okAll: 0, partial: 0, failedAll: 0 };
-			const perUserUnbanResults = [];
-			for (const id of idsToUnban) {
-				const unbanResults = await unbanUserFromAllGroups(id);
+			const perUserUnbanResults = await mapWithConcurrency(
+				idsToUnban,
+				BULK_TASK_CONCURRENCY,
+				async (id) => ({ userId: id, unbanResults: await unbanUserFromAllGroups(id) })
+			);
+			for (const { unbanResults } of perUserUnbanResults) {
 				const okCount = unbanResults.filter((r) => r.ok).length;
 				if (okCount === unbanResults.length) unbanSummary.okAll += 1;
 				else if (okCount === 0) unbanSummary.failedAll += 1;
 				else unbanSummary.partial += 1;
-				perUserUnbanResults.push({ userId: id, unbanResults });
 			}
 			const failedCount = invalid.length + results.failed.length;
 			const flashText = `✅ 批量移黑：成功 ${results.success.length}${results.notFound.length ? ` / 不在黑名单 ${results.notFound.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
-			let detailText = renderBatchRemoveResult(results, invalid);
+			let detailText = renderBatchRemoveResult(results, invalid, userProfiles);
 			if (idsToUnban.length > 0) {
-				const unbanLines = ['', '<b>Telegram 群解封结果</b>:'];
-				unbanLines.push(`✅ 全部群解封成功: ${unbanSummary.okAll}`);
-				if (unbanSummary.partial) unbanLines.push(`⚠️ 部分群解封: ${unbanSummary.partial}`);
-				if (unbanSummary.failedAll) unbanLines.push(`❌ 全部群解封失败: ${unbanSummary.failedAll}（请检查 bot 是否为群管理员）`);
+				const unbanHeaderLines = ['<b>Telegram 群解封结果</b>:', `✅ 全部群解封成功: ${unbanSummary.okAll}`];
+				if (unbanSummary.partial) unbanHeaderLines.push(`⚠️ 部分群解封: ${unbanSummary.partial}`);
+				if (unbanSummary.failedAll) unbanHeaderLines.push(`❌ 全部群解封失败: ${unbanSummary.failedAll}（请检查 bot 是否为群管理员）`);
+				const perUserBlocks = [];
 				const chatInfoCache = new Map();
 				for (const { userId: uid, unbanResults } of perUserUnbanResults) {
-					unbanLines.push('', `<b>用户 <code>${uid}</code></b>`);
-					unbanLines.push(await renderUnbanResultsDetail(unbanResults, chatInfoCache, { userId: uid, retryCommand: '/unban' }));
+					const resultDetail = await renderUnbanResultsDetail(unbanResults, chatInfoCache, {
+						userId: uid,
+						retryCommand: '/unban',
+						compactSpacing: true
+					});
+					perUserBlocks.push(buildTelegramAtomicHtmlBlock([
+						`<b>用户</b> ${formatBatchUserCompactTarget(uid)}`,
+						resultDetail
+					]));
 				}
-				detailText += '\n' + unbanLines.join('\n');
+				detailText += `\n\n${unbanHeaderLines.join('\n')}\n\n${perUserBlocks.join('\n\n')}`;
 			}
 			await replyToAdmin(message, ctx, {
 				flashText,
@@ -5906,8 +6612,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		(startCommand.head === '/start' && !startCommand.rest) ||
 		(unbanCommand.head === '/unban' && !unbanCommand.rest)
 	) {
+		const quietManagerCommand = await isNonPrimaryConfiguredGroupManager(message, userId);
+		if (quietManagerCommand) {
+			await deleteAuthorizedGroupCommandMessage(message, startCommand.head === '/start' ? '/start' : '/unban');
+		}
 		// D1 全局黑名单是自助解封的硬闸门：命中任何 reason 都拒绝，且不自动移除黑名单。
-		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env)) {
+		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env, {
+			flashOnly: quietManagerCommand,
+			ctx,
+			message,
+		})) {
 			return;
 		}
 
@@ -5917,7 +6631,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			.replaceAll('{title}', groupInfo.title)
 			.replaceAll('{keyword}', SELF_UNBAN_KEYWORD);
 
-		await sendTelegramMessage(chatId, welcomeMessage);
+		if (quietManagerCommand) {
+			await replyToAdmin(message, ctx, {
+				flashText: 'ℹ️ 完整结果已发送给主人',
+				detailText: welcomeMessage,
+				isInGroup: true,
+			});
+		} else {
+			await sendTelegramMessage(chatId, welcomeMessage);
+		}
 	}
 	// 检查用户回复是否完全匹配提示语，禁止夹带其它内容
 	else if (text && text.trim() === SELF_UNBAN_KEYWORD) {
@@ -6089,6 +6811,24 @@ async function muteChatMember(chatId, userId) {
 // 把用户踢出群（Telegram banChatMember API）
 // revoke_messages 默认 true → 同时撤回该用户在群里的最近 48 小时内消息（Telegram 上限）
 // 返回 { ok: bool, error?: string }；bot 没权限/不在群时返回 ok=false 但不抛异常
+function shouldRetryTelegramMutationFailure(failure) {
+	if (!failure) return false;
+	if (failure.networkError) return true;
+	const httpStatus = Number(failure.httpStatus) || 0;
+	const errorCode = Number(failure.errorCode) || 0;
+	if (httpStatus === 429 || httpStatus >= 500) return true;
+	if (errorCode === 429 || errorCode >= 500) return true;
+	return false;
+}
+
+function getTelegramMutationRetryDelayMs(failure) {
+	const retryAfterSeconds = Number(failure?.retryAfterSeconds) || 0;
+	if (retryAfterSeconds > 0) {
+		return Math.max(TG_MUTATION_RETRY_DELAY_MS, Math.ceil(retryAfterSeconds * 1000));
+	}
+	return TG_MUTATION_RETRY_DELAY_MS;
+}
+
 async function banUserFromGroup(chatId, userId, options = {}) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`;
 	const body = {
@@ -6096,37 +6836,50 @@ async function banUserFromGroup(chatId, userId, options = {}) {
 		user_id: Number(userId),
 		revoke_messages: options.revokeMessages !== false
 	};
+	let lastFailure = null;
+	let attempts = 0;
 
-	try {
-		const callBanChatMember = async (attemptLabel) => {
+	for (let attempt = 1; attempt <= 2; attempt += 1) {
+		attempts = attempt;
+		try {
 			const response = await fetch(url, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify(body)
 			});
 			const result = await response.json();
-			console.log(`[banChatMember] chat=${chatId} user=${userId} attempt=${attemptLabel} ok=${result.ok}${result.description ? ' desc=' + result.description : ''}`);
-			if (!response.ok || !result.ok) {
-				return { ok: false, error: result.description || `HTTP ${response.status}` };
+			console.log(`[banChatMember] chat=${chatId} user=${userId} attempt=${attempt} ok=${result.ok}${result.description ? ' desc=' + result.description : ''}`);
+			if (response.ok && result?.ok) {
+				return { ok: true, attempts: attempt, retried: attempt > 1 };
 			}
-			return { ok: true };
-		};
-
-		const first = await callBanChatMember('first');
-		if (first.ok) return first;
-
-		if (isPureTgid(userId) && isTelegramUserLookupError(first.error)) {
-			console.warn(`[banChatMember] chat=${chatId} user=${userId} Telegram user lookup failed, retrying once: ${first.error}`);
-			await new Promise((resolve) => setTimeout(resolve, TG_USER_LOOKUP_RETRY_DELAY_MS));
-			const second = await callBanChatMember('retry');
-			return { ...second, retried: true };
+			lastFailure = {
+				ok: false,
+				error: result?.description || `HTTP ${response.status}`,
+				httpStatus: response.status,
+				errorCode: result?.error_code,
+				retryAfterSeconds: result?.parameters?.retry_after,
+				userId
+			};
+		} catch (error) {
+			lastFailure = {
+				ok: false,
+				error: error.message || String(error),
+				networkError: true,
+				userId
+			};
+			console.error(`[banChatMember] chat=${chatId} user=${userId} attempt=${attempt} 异常:`, error);
 		}
 
-		return first;
-	} catch (error) {
-		console.error(`[banChatMember] chat=${chatId} user=${userId} 异常:`, error);
-		return { ok: false, error: error.message };
+		if (attempt >= 2 || !shouldRetryTelegramMutationFailure(lastFailure)) break;
+		await new Promise((resolve) => setTimeout(resolve, getTelegramMutationRetryDelayMs(lastFailure)));
 	}
+
+	return {
+		ok: false,
+		error: lastFailure?.error || '失败',
+		attempts,
+		retried: attempts > 1
+	};
 }
 
 // 让 bot 退出指定群组（Telegram leaveChat API）
@@ -6274,23 +7027,52 @@ async function unbanUser(userId, groupId = GROUP_ID) {
 		chat_id: groupId,
 		user_id: Number(userId)
 	};
+	let lastFailure = null;
+	let attempts = 0;
 
-	const response = await fetch(url, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(body)
-	});
-
-	const result = await response.json();
-
-	if (!response.ok) {
-		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
+	for (let attempt = 1; attempt <= 2; attempt += 1) {
+		attempts = attempt;
+		try {
+			const response = await fetch(url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(body)
+			});
+			const result = await response.json();
+			console.log(`执行 unbanUser，群:${groupId}，尝试:${attempt}，状态:${response.status}，响应:${JSON.stringify(result)}`);
+			if (response.ok && result?.ok) {
+				return { ...result, attempts, retried: attempts > 1 };
+			}
+			lastFailure = {
+				ok: false,
+				description: result?.description || `HTTP ${response.status}`,
+				error: result?.description || `HTTP ${response.status}`,
+				httpStatus: response.status,
+				errorCode: result?.error_code,
+				retryAfterSeconds: result?.parameters?.retry_after,
+				userId
+			};
+		} catch (error) {
+			lastFailure = {
+				ok: false,
+				error: error.message || String(error),
+				description: error.message || String(error),
+				networkError: true,
+				userId
+			};
+			console.error(`[unbanChatMember] chat=${groupId} user=${userId} attempt=${attempt} 异常:`, error);
+		}
+		if (attempt >= 2 || !shouldRetryTelegramMutationFailure(lastFailure)) break;
+		await new Promise((resolve) => setTimeout(resolve, getTelegramMutationRetryDelayMs(lastFailure)));
 	}
 
-	// 添加调试日志
-	console.log(`执行 unbanUser，状态: ${response.status}, 响应: ${JSON.stringify(result)}`);
-
-	return result;
+	return {
+		ok: false,
+		description: lastFailure?.description || lastFailure?.error || '失败',
+		error: lastFailure?.error || lastFailure?.description || '失败',
+		attempts,
+		retried: attempts > 1
+	};
 }
 
 // 解除用户禁言（恢复发言权限）
