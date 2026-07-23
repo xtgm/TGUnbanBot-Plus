@@ -5232,6 +5232,193 @@ console.log('\n[82] identity词库导入');
 	assert('importdefault → identity 分类有词', Array.isArray(kwStore.identity) && kwStore.identity.length > 0);
 }
 
+// ---------- [83] 代理相关内容绝对豁免与安全边界 ----------
+console.log('\n[83] 代理相关内容绝对豁免与安全边界');
+{
+	const makeProxyTestEnv = (db) => ({
+		TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999',
+		AD_FILTER_ENABLED: 'true', MSG_CACHE_ENABLED: 'true', DB: db,
+	});
+	const dispatchMessage = async (message, env, ctx) => handler.fetch(
+		new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message }) }),
+		env,
+		ctx
+	);
+
+	// 用户截图原文：短正文 + SOCKS5 引用内容不得触发“引用 @ 引流泛滥”或其它自动广告规则。
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	let db = makeAdD1();
+	let env = makeProxyTestEnv(db);
+	await dispatchMessage({
+		message_id: 93001,
+		chat: { id: -1001, type: 'supergroup', title: '代理讨论群' },
+		from: { id: 93001, is_bot: false, first_name: '普通用户' },
+		text: '缺s5做代理池',
+		quote: {
+			text: 'socks5 OTC独家资源分享\nsocks5://888:888@47.243.87.133:1080#HK The Peak机房/机房\nAS45102 Alibaba(US) Tech',
+		},
+	}, env);
+	assert('截图原文代理内容 → 不加黑、不删消息、不全群封禁',
+		!db._rows.has('93001') && callsOf('deleteMessage').length === 0 && callsOf('banChatMember').length === 0);
+
+	// 主消息中的代理链接本来会因 URL/长数字进入 recent_messages；豁免后必须完全不进疑似广告缓存。
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	db = makeAdD1();
+	env = makeProxyTestEnv(db);
+	await dispatchMessage({
+		message_id: 93002,
+		chat: { id: -1001, type: 'supergroup' },
+		from: { id: 93002, is_bot: false, first_name: '普通用户' },
+		text: 'socks5://888:888@47.243.87.133:1080#HK The Peak',
+	}, env);
+	const proxyRecent = JSON.parse(db._store.get('recent_messages') || '{"items":[]}');
+	assert('代理链接 → 不进入 recent_messages 疑似广告缓存', proxyRecent.items.length === 0);
+
+	// 每个案例都混入足以触发广告评分的词，验证命中任一代理协议/客户端/配置后仍是“整条绝对豁免”。
+	const proxyCases = [
+		{ label: 'SOCKS4', content: 'SOCKS4 47.0.0.1:1080' },
+		{ label: 'SOCKS5简称', content: 'S5 47.0.0.1:1080' },
+		{ label: 'HTTP(S)', content: 'HTTP(S)' },
+		{ label: 'SS', content: 'SS' },
+		{ label: 'SSR', content: 'SSR' },
+		{ label: 'VMess', content: 'vmess://encoded-node' },
+		{ label: 'VLESS', content: 'vless://uuid@edge.example.com:443' },
+		{ label: 'Trojan', content: 'trojan://password@edge.example.com:443' },
+		{ label: 'Hysteria', content: 'Hysteria2 hy2://token@edge.example.com:443' },
+		{ label: 'TUIC', content: 'tuic://uuid:password@edge.example.com:443' },
+		{ label: 'WireGuard', content: 'WireGuard 配置' },
+		{ label: 'Clash', content: 'Clash Verge' },
+		{ label: 'Mihomo', content: 'Mihomo' },
+		{ label: 'v2rayN', content: 'v2rayN' },
+		{ label: 'NekoRay', content: 'NekoRay' },
+		{ label: 'sing-box', content: 'sing-box' },
+		{ label: 'Shadowrocket', content: 'Shadowrocket' },
+		{ label: 'Surge', content: 'Surge' },
+		{ label: 'Loon', content: 'Loon' },
+		{ label: 'Quantumult X', content: 'Quantumult X' },
+		{ label: 'Hiddify', content: 'Hiddify' },
+		{ label: '中文代理范围', content: '代理池 节点 机场 订阅器 订阅生成器' },
+		{ label: 'Subconverter', content: 'Subconverter' },
+		{ label: 'Sub-Store', content: 'Sub-Store' },
+		{ label: '反代', content: '反代 reverse proxy' },
+		{ label: 'ProxyIP', content: 'CF ProxyIP' },
+		{ label: 'TURN', content: 'TURN relay' },
+		{ label: 'STUN', content: 'STUN server' },
+		{ label: 'WebRTC中继', content: 'WebRTC 中继' },
+		{ label: 'user:pass@host', content: 'user:pass@edge.example.com:1443' },
+		{ label: '常见代理端口', content: '47.243.87.133:1080' },
+		{ label: '代理端点列表', content: 'edge-a.example.com:23456 edge-b.example.com:34567' },
+		{
+			label: '代理配置附件名',
+			content: '',
+			extra: { document: { file_id: 'doc1', file_name: 'clash-proxy-providers.yaml' } },
+		},
+		{
+			label: '订阅 text_link',
+			content: '点击链接',
+			extra: {
+				entities: [{
+					type: 'text_link', offset: 0, length: 4,
+					url: 'https://edge.example.com/api/v1/client/subscribe?token=abc',
+				}],
+			},
+		},
+	];
+	const proxyCaseFailures = [];
+	for (let i = 0; i < proxyCases.length; i++) {
+		resetCalls();
+		sandbox.fetch = adFetchMock();
+		db = makeAdD1();
+		env = makeProxyTestEnv(db);
+		const proxyCase = proxyCases[i];
+		const userId = String(93100 + i);
+		await dispatchMessage({
+			message_id: 93100 + i,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: Number(userId), is_bot: false, first_name: '普通用户' },
+			text: '专业出u承兑日入过万 ' + proxyCase.content,
+			...(proxyCase.extra || {}),
+		}, env);
+		if (
+			db._rows.has(userId) ||
+			callsOf('deleteMessage').some((call) => call.body.message_id === 93100 + i) ||
+			callsOf('banChatMember').some((call) => String(call.body.user_id) === userId)
+		) {
+			proxyCaseFailures.push(proxyCase.label);
+		}
+	}
+	assert('代理协议、客户端、订阅转换、反代及端点格式 → 即使含广告词也全部豁免',
+		proxyCaseFailures.length === 0, proxyCaseFailures.join(','));
+
+	// 即使这条代理内容已经被学习成广告指纹，代理豁免仍必须早于学习样本精确匹配。
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	db = makeAdD1();
+	const learnedProxyText = 'socks5://888:888@47.243.87.133:1080 假钞交流群';
+	db._store.set('ad_samples', JSON.stringify({
+		fingerprints: [normalizeFp(learnedProxyText)],
+		count: 1,
+		updatedAt: '2026-07-23T00:00:00.000Z',
+	}));
+	env = makeProxyTestEnv(db);
+	await dispatchMessage({
+		message_id: 93200,
+		chat: { id: -1001, type: 'supergroup' },
+		from: { id: 93200, is_bot: false, first_name: '普通用户' },
+		text: learnedProxyText,
+	}, env);
+	assert('已存在于学习样本的代理内容 → 仍不加黑、不删、不封',
+		!db._rows.has('93200') && callsOf('deleteMessage').length === 0 && callsOf('banChatMember').length === 0);
+
+	// 代理识别只看消息内容，不看发送者身份；名字含客户端名不能让真正广告获得豁免。
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	db = makeAdD1();
+	env = makeProxyTestEnv(db);
+	await dispatchMessage({
+		message_id: 93201,
+		chat: { id: -1001, type: 'supergroup' },
+		from: { id: 93201, is_bot: false, first_name: 'Clash 技术用户' },
+		text: '专业出u承兑日入过万',
+	}, env);
+	assert('仅发送者名字含 Clash、正文是真广告 → 仍正常自动封禁',
+		db._rows.has('93201') && callsOf('banChatMember').length === 2);
+
+	// 真正的非代理 Telegram @账号泛滥规则必须保持原行为。
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	db = makeAdD1();
+	env = makeProxyTestEnv(db);
+	await dispatchMessage({
+		message_id: 93202,
+		chat: { id: -1001, type: 'supergroup' },
+		from: { id: 93202, is_bot: false, first_name: '引流用户' },
+		text: 'k',
+		quote: { text: '@promo_bot @promo_bot @promo_bot 高薪兼职' },
+	}, env);
+	assert('非代理重复 Telegram @账号引流 → 仍加黑并全群封禁',
+		db._rows.has('93202') && callsOf('banChatMember').length === 2);
+
+	// 黑名单拦截在代理豁免之前：已在 D1 的用户发代理内容仍必须删消息并踢出当前群。
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	db = makeFakeDB([{ id: '93203', reason: 'manual', by: '999', at: '2026-07-23T00:00:00.000Z' }]);
+	env = makeProxyTestEnv(db);
+	await dispatchMessage({
+		message_id: 93203,
+		chat: { id: -1001, type: 'supergroup', title: '主群' },
+		from: { id: 93203, is_bot: false, first_name: '黑名单用户' },
+		text: 'socks5://user:pass@47.243.87.133:1080',
+	}, env);
+	assert('D1 黑名单用户发送代理内容 → 仍删消息、踢当前群且保留黑名单',
+		db._rows.has('93203') &&
+		callsOf('deleteMessage').some((call) => call.body.message_id === 93203) &&
+		callsOf('banChatMember').some((call) => String(call.body.user_id) === '93203'));
+}
+
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);

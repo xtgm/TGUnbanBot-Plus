@@ -4408,6 +4408,8 @@ async function loadLearnSnapshot(env) {
 
 // 预筛:是否"疑似广告"消息(只缓存这些,省 D1 写入)
 function looksLikeAdCandidate(message) {
+	// 代理相关内容按用户口径整条绝对豁免，不进入 /recent 疑似广告缓存。
+	if (isProxyRelatedMessage(message)) return false;
 	// 名片(分享联系人)直接算疑似广告候选 —— 名片广告无 text,但内容藏在 contact 里
 	if (message.contact) return true;
 	const text = (message.text || message.caption || '').trim();
@@ -4700,6 +4702,85 @@ function getQuoteText(message) {
 	return [...new Set(parts.map((s) => String(s).trim()).filter(Boolean))].join(' ');
 }
 
+// ===== 代理相关内容绝对豁免 =====
+// 只扫描消息内容，不扫描发送者姓名/用户名或群名，避免“名字叫 Clash 的用户”获得永久豁免。
+// 命中后仅跳过自动广告检测与 /recent 疑似广告缓存；D1 黑名单拦截和手动 /be /sa 不受影响。
+const PROXY_SCAN_TEXT_KEYS = new Set(['text', 'caption', 'title', 'description', 'file_name', 'url', 'vcard']);
+const PROXY_SCAN_SKIP_KEYS = new Set([
+	'from', 'sender_chat', 'chat', 'via_bot',
+	'forward_from', 'forward_from_chat', 'forward_origin', 'origin',
+	'new_chat_member', 'new_chat_members', 'left_chat_member'
+]);
+
+function collectProxyScanParts(value, parts, depth = 0, key = '') {
+	if (value === null || value === undefined || depth > 8) return;
+	if (typeof value === 'string') {
+		if (PROXY_SCAN_TEXT_KEYS.has(key)) parts.push(value);
+		return;
+	}
+	if (typeof value !== 'object' || PROXY_SCAN_SKIP_KEYS.has(key)) return;
+	if (Array.isArray(value)) {
+		for (const item of value) collectProxyScanParts(item, parts, depth + 1, key);
+		return;
+	}
+	// 分享名片属于消息内容；只在 contact 节点读取，绝不读取 message.from 身份字段。
+	if (key === 'contact') {
+		for (const field of ['first_name', 'last_name', 'phone_number', 'vcard']) {
+			if (value[field]) parts.push(String(value[field]));
+		}
+	}
+	for (const [childKey, childValue] of Object.entries(value)) {
+		collectProxyScanParts(childValue, parts, depth + 1, childKey);
+	}
+}
+
+const PROXY_CONTENT_PATTERNS = [
+	// 中文代理语境：代理池、节点、机场、订阅/订阅转换、反代等均整条豁免。
+	/(?:代理|节点|机场|订阅|反代|反向代理)/i,
+	// 常见代理协议及简称。HTTP(S) 仅匹配代理语境或明确的“HTTP(S)”写法，不把普通网页 URL 当代理。
+	/\b(?:socks(?:4|5)?|s[45]|ss|ssr|shadowsocks|vmess|vless|trojan|hysteria2?|hy2|tuic|wireguard|naiveproxy|anytls)\b/i,
+	/(?:socks(?:4|5)?|ssr?|vmess|vless|trojan|hysteria2?|hy2|tuic|wg):\/\/\S+/i,
+	/\bhttp\(s\)(?!\w)/i,
+	/\bhttps?\s*(?:proxy\b|代理)/i,
+	// 常见代理客户端/内核/路由插件。
+	/\b(?:clash(?:\s*(?:meta|verge))?|mihomo|openclash|v2ray(?:n(?:g)?)?|nekoray|nekobox|sing[- _]?box|shadowrocket|surge|loon|quantumult\s*x|hiddify|stash|passwall|homeproxy)\b/i,
+	// 订阅转换与代理配置关键词。
+	/\b(?:subconverter|sub[- _]?store|subscription(?:s|\s+(?:converter|generator))?|proxy|proxies)\b/i,
+	/\b(?:cf[- _]?)?proxy[- _]?ip\b/i,
+	/\breverse\s+proxy\b/i,
+	/\b(?:proxy-groups?|proxy-providers?|mixed-port|redir-port|tproxy-port|external-controller|allow-lan|rule-providers?)\s*:/i,
+	/\/api\/v\d+\/client\/subscribe(?:[/?#]|$)/i,
+	// TURN/STUN/WebRTC 中继。
+	/\b(?:turn|stun)\b/i,
+	/\bwebrtc(?:\s+(?:relay|turn|stun|中继))?\b/i,
+];
+
+function hasProxyEndpointSyntax(text) {
+	const authBeforeHost = /(?:^|[\s,;|])[^\s:@/]+:[^\s@/]+@(?:\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}):\d{2,5}(?=$|[\s,;|/#])/i;
+	const authAfterHost = /(?:^|[\s,;|])(?:\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}):\d{2,5}:[^\s:]+:[^\s:]+(?=$|[\s,;|/#])/i;
+	if (authBeforeHost.test(text) || authAfterHost.test(text)) return true;
+
+	// 单个常见代理端口，或同一条消息里出现多个 host:port，按代理端点列表处理。
+	const endpointRe = /(?:^|[\s,;|])(?:\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}):(\d{2,5})(?=$|[\s,;|/#])/gi;
+	const ports = [...text.matchAll(endpointRe)].map((m) => Number(m[1]));
+	if (ports.length >= 2) return true;
+	const commonProxyPorts = new Set([1080, 1081, 2080, 3128, 7890, 7891, 8080, 8118, 8888, 10808, 10809]);
+	return ports.some((port) => commonProxyPorts.has(port));
+}
+
+function isProxyRelatedMessage(message) {
+	if (!message || typeof message !== 'object') return false;
+	const parts = [];
+	collectProxyScanParts(message, parts, 0, 'message');
+	if (parts.length === 0) return false;
+	let scanText = [...new Set(parts.map((part) => String(part).trim()).filter(Boolean))].join('\n');
+	try {
+		scanText = scanText.normalize('NFKC');
+	} catch (_) {}
+	if (!scanText) return false;
+	return PROXY_CONTENT_PATTERNS.some((pattern) => pattern.test(scanText)) || hasProxyEndpointSyntax(scanText);
+}
+
 function hasQuoteLikeStructure(message) {
 	return Boolean(message?.quote || message?.reply_to_message || message?.external_reply);
 }
@@ -4824,6 +4905,8 @@ function detectIdentitySpam(identityText) {
 // 返回 { isAd, score, hits: string[], strong: string|null }
 async function detectAd(message, env) {
 	if (!AD_FILTER_ENABLED) return { isAd: false, score: 0, hits: [], strong: null };
+	// 代理相关内容整条绝对豁免：不进入词库、学习样本、引用 @、短文本包装等任何自动广告规则。
+	if (isProxyRelatedMessage(message)) return { isAd: false, score: 0, hits: [], strong: null };
 
 	const contactText = getContactText(message); // 名片广告内容(名字/电话/vcard)
 	const quoteText = getQuoteText(message);
