@@ -9,7 +9,7 @@ binding = "DB"								# D1 绑定名默认不可修改
 database_name = "tc033-apac"
 database_id = "eb0cdc8c-5284-4ddf-ba34-338fed1fa6f8"
 
-# Cloudflare Queues：用于 /be /sa /unban 超出同步安全预算后的批量任务自动分阶段续接，避免 Worker HTTP 自调用和单次子请求超限。
+# Cloudflare Queues：用于 /ban /spam /unban 超出同步安全预算后的批量任务自动分阶段续接，避免 Worker HTTP 自调用和单次子请求超限。
 # 部署前先创建同名队列：wrangler queues create tg-unban-bot-plus-bulk
 [[queues.producers]]
 binding = "BULK_QUEUE"

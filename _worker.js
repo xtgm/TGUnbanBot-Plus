@@ -42,12 +42,12 @@ const PURGE_DEFAULT_REASONS = ['manual', 'sa', 'spam'];
 const TG_MUTATION_RETRY_DELAY_MS = 350;
 
 // 5) /blacklist 列表中"原因"字段的中文映射。
-//    内置三种：sa（/sa 举报）、manual（/be 手动添加）、manual_ban（旧版 chat_member 自动同步遗留记录）。
-//    环境变量名：BLACKLIST_REASON_LABELS （要求是 JSON 字符串，例如 {"sa":"群内举报"}）
+//    spam 表示 /spam 举报，manual 表示 /ban 手动添加；历史 reason=sa 继续按 /spam 展示。
+//    环境变量名：BLACKLIST_REASON_LABELS （要求是 JSON 字符串，例如 {"spam":"群内举报"}）
 const DEFAULT_BLACKLIST_REASON_LABELS = {
-	sa: '群内 /sa 举报',
-	spam: '群内 /sa 举报',
-	manual: '管理员 /be 指令加黑',
+	sa: '群内 /spam 举报（历史记录）',
+	spam: '群内 /spam 举报',
+	manual: '管理员 /ban 指令加黑',
 	manual_ban: '旧版 Telegram 原生封禁同步记录',
 	ad_auto: '🤖 广告自动检测',
 	ad_learn: '🤖 上报学习',
@@ -68,10 +68,10 @@ const DEFAULT_SUPER_ADMINS = [
 ];
 
 // 8) 主人 TGID(项目所有者),用于"主人审计通知"系统
-//    所有管理员/超管在群里使用 /be /unban /sa 命令、
-//    群内手动 be/unban 时,主人会收到一份带操作人标记的私聊审计通知
+//    所有管理员/超管在群里使用 /ban /unban /spam 命令、
+//    群内手动 ban/unban 时,主人会收到一份带操作人标记的私聊审计通知
 //    环境变量 OWNER_IDS(逗号分隔,中英文逗号均可):第一个是主人,后续是副主人
-//    主人收全部通知;副主人只收 /be、/sa 这类加黑踢人通知
+//    主人收全部通知;副主人只收 /ban、/spam 这类加黑踢人通知
 //    空数组 = 禁用通知系统(其他管理员仍可正常使用命令,但都没有私聊详情)
 //    填了主人/副主人ID但账号从未私聊过 bot → 通知会投递失败,Worker 日志可见
 const DEFAULT_OWNER_IDS = [];
@@ -115,7 +115,7 @@ const RECOMMENDED_AD_KEYWORDS = {
 	finance: ['us' + 'dt', 'u' + '商', '承' + '兑', '刷' + '单', '日' + '入', '出' + 'u', '接' + 'u', '搬' + '砖', '套' + '利', '包' + '网', '跑' + '分', '水' + '房', '料' + '子'],
 	porn: ['约' + '炮', '萝' + '莉', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '萝' + '控',
 		'性' + '爱', '不' + '雅', '完整' + '版', '免费' + '观看', '在线' + '观看', '楼' + '凤', '上门' + '服务', '空' + '降', '嫩' + '模', '探' + '花'],
-	sa: [],
+	spam: [],
 	fraud: ['假' + '钞', '假' + '币', '代开' + '发票', '黑客' + '接单', '网' + '赚', '菠' + '菜',
 		'无' + '风险', '拍' + '单', '刷' + '信誉', '一单' + '无风险', '收' + '视频', '提供' + '设备',
 		'拍商家' + '码', '六' + '合彩', '世界杯' + '内幕', 'pc' + '28', '加群' + '手', '红包' + '福利'],
@@ -524,8 +524,8 @@ async function handleInitialization(request) {
 		const setCommandsBody = {
 			commands: [
 				{ command: "unban", description: "开始自助解封" },
-				{ command: "be", description: "添加用户到全局黑名单 (当前群管理员)" },
-				{ command: "sa", description: "举报并加入全局黑名单 (当前群管理员)" },
+				{ command: "ban", description: "添加用户到全局黑名单 (当前群管理员)" },
+				{ command: "spam", description: "举报并加入全局黑名单 (当前群管理员)" },
 				{ command: "check", description: "查询封禁状态 (高级管理员)" },
 				{ command: "blacklist", description: "查看当前黑名单 (高级管理员)" }
 			]
@@ -576,7 +576,7 @@ async function handleInitialization(request) {
 	}
 }
 
-// 批量 /be /unban 上限（工程上限，非业务文案，不暴露环境变量）
+// 批量 /ban /unban 上限（工程上限，非业务文案，不暴露环境变量）
 const BATCH_LIMIT = 50;
 const BULK_TASK_THRESHOLD = 20;
 const BULK_TASK_SYNC_OPERATION_LIMIT = 24;
@@ -1131,7 +1131,7 @@ async function probeTargetMemberBeforeBan(groupId, userId) {
 		if (isTelegramUserUnresolvableError(error)) {
 			return { ok: false, state: 'unresolvable', label: 'Telegram 无法在该群识别此 TGID', error };
 		}
-		const { 中文 } = translateTelegramError(error, { userId, retryCommand: '/be 或 /sa' });
+		const { 中文 } = translateTelegramError(error, { userId, retryCommand: '/ban 或 /spam' });
 		return { ok: false, state: 'unknown', label: `成员状态查询失败：${中文}`, error };
 	} catch (error) {
 		return { ok: false, state: 'unknown', label: `成员状态查询异常：${error.message || String(error)}`, error: error.message || String(error) };
@@ -1180,7 +1180,7 @@ function translateTelegramError(description, options = {}) {
 	}
 	if (lower.includes('user not found')) {
 		if (isPureTgid(options.userId)) {
-			const retryCommand = options.retryCommand || '/be 或 /sa';
+			const retryCommand = options.retryCommand || '/ban 或 /spam';
 			if (isUnbanAction) {
 				return {
 					中文: 'Telegram 当前无法识别该 TGID',
@@ -1196,7 +1196,7 @@ function translateTelegramError(description, options = {}) {
 	}
 	if (isTelegramUserLookupError(lower)) {
 		if (isPureTgid(options.userId)) {
-			const retryCommand = options.retryCommand || '/be 或 /sa';
+			const retryCommand = options.retryCommand || '/ban 或 /spam';
 			if (isUnbanAction) {
 				return {
 					中文: 'Telegram 当前无法识别该 TGID',
@@ -1477,7 +1477,7 @@ function isPrivilegedManager(userId) {
 }
 
 // 只检查用户是否为“指定当前群”的 Telegram 管理员。
-// 普通管理员的 /be、/sa 必须使用该鉴权，禁止遍历其它 GROUP_IDS 借权。
+// 普通管理员的 /ban、/spam 必须使用该鉴权，禁止遍历其它 GROUP_IDS 借权。
 async function checkIfUserIsAdminInGroup(userId, groupId) {
 	const userIdStr = String(userId || '');
 	const groupIdStr = String(groupId || '');
@@ -1507,7 +1507,7 @@ async function checkIfUserIsAdminInGroup(userId, groupId) {
 	}
 }
 
-// /be、/sa 专用权限：
+// /ban、/spam 专用权限：
 // - 主人/副主人/超级管理员保持原权限；
 // - 匿名管理员仅能在其当前配置群使用；
 // - 普通 Telegram 管理员必须是当前发令群的管理员，私聊不放行。
@@ -1575,13 +1575,13 @@ function renderAuditNotification(operatorMention, detailText, sourceLabel, roleL
 }
 
 // 双通道回执:
-// - 群内场景:发闪屏给所有人(5 秒自动撤回) + 私聊详情发给主人; /be、/sa 可额外发给副主人
+// - 群内场景:发闪屏给所有人(5 秒自动撤回) + 私聊详情发给主人; /ban、/spam 可额外发给副主人
 // - 私聊场景:触发者本人收一份;主人也收一份带操作人标记的副本(触发者是主人则收"你自己"版)
 //
 // 主人通知规则:
 //   * OWNER_IDS 为空 → 跳过私聊投递,仅群闪屏
 //   * 默认只通知 OWNER_IDS[0] 主人
-//   * /be、/sa 传 notifySecondaryOwners=true 时,副主人也收到加黑踢人回执
+//   * /ban、/spam 传 notifySecondaryOwners=true 时,副主人也收到加黑踢人回执
 //   * 触发者是收件人本人 → 收"你自己"标记的详情
 //   * 触发者非收件人 → 收带"🔔 操作人/来源"头的审计通知
 //   * 私聊投递失败(主人没和 bot 私聊过等) → 仅记日志,不在群里追加任何"主人"字样
@@ -1713,7 +1713,7 @@ async function sendAuthorizedCommandResult(message, ctx, { flashText, detailText
 	await sendTelegramMessage(message.chat.id, detailText, replyMarkup);
 }
 
-// /be、/sa、/unban、/job 的参数/环境校验回执：
+// /ban、/spam、/unban、/job 的参数/环境校验回执：
 // 非第一主人群聊不发机器人回执，只把完整提示给主人；第一主人仍保持原来的群闪屏，私聊仍直接回复发令者。
 async function sendModerationCommandFeedback(message, ctx, { flashText, detailText = flashText }) {
 	if (shouldSilenceAuthorizedGroupCommand(message)) {
@@ -1858,14 +1858,31 @@ function buildBulkJobId(action) {
 	return `${action}_${Date.now().toString(36)}_${suffix}`;
 }
 
+function normalizeBulkJobAction(action) {
+	const normalized = String(action || '').trim().toLowerCase();
+	if (normalized === 'sa') return 'spam';
+	if (normalized === 'be') return 'ban';
+	return normalized;
+}
+
+function getBulkJobCommand(action) {
+	const normalized = normalizeBulkJobAction(action);
+	if (normalized === 'spam') return '/spam';
+	if (normalized === 'ban') return '/ban';
+	if (normalized === 'unban') return '/unban';
+	return '';
+}
+
 function normalizeBulkJob(row) {
 	if (!row?.payload) return null;
 	try {
 		const payload = JSON.parse(row.payload);
+		const action = normalizeBulkJobAction(payload.action || row.type);
 		return {
 			...payload,
 			id: payload.id || row.id,
-			action: payload.action || row.type,
+			action,
+			command: getBulkJobCommand(action),
 			status: payload.status || row.status || 'unknown'
 		};
 	} catch (error) {
@@ -2006,17 +2023,18 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 	const now = new Date().toISOString();
 	const operator = formatMessageActorMention(message);
 	const groupIds = GROUP_IDS.map((id) => String(id));
-	const isUnban = action === 'unban';
+	const normalizedAction = normalizeBulkJobAction(action);
+	const isUnban = normalizedAction === 'unban';
 	const budget = shouldUseBulkQueue(ids.length, groupIds.length, {
 		probeMembership: !isUnban && ids.length === 1,
 		authorizationRequests: estimateBulkAuthorizationRequests(message)
 	});
 	const job = {
 		version: 2,
-		id: buildBulkJobId(action),
-		action,
-		reason: action === 'sa' ? 'sa' : (isUnban ? null : 'manual'),
-		command: action === 'sa' ? '/sa' : (isUnban ? '/unban' : '/be'),
+		id: buildBulkJobId(normalizedAction),
+		action: normalizedAction,
+		reason: normalizedAction === 'spam' ? 'spam' : (isUnban ? null : 'manual'),
+		command: getBulkJobCommand(normalizedAction),
 		status: 'queued',
 		ids: ids.map((id) => String(id)),
 		invalid: (invalid || []).map((id) => String(id)),
@@ -2099,7 +2117,7 @@ function formatBulkJobFailureLine(failure) {
 	const { 中文, 建议 } = translateTelegramError(rawError, {
 		action: isUnban ? 'unban' : undefined,
 		userId: failure.userId,
-		retryCommand: isUnban ? '/unban' : '/be 或 /sa'
+		retryCommand: isUnban ? '/unban' : '/ban 或 /spam'
 	});
 	const reasonText = 中文 === rawError
 		? escapeHtml(rawError)
@@ -2119,8 +2137,9 @@ function formatBulkJobStatus(job) {
 }
 
 function formatBulkJobAction(job) {
-	if (job.action === 'unban') return '移出黑名单并群解封(/unban)';
-	return (job.action === 'sa' || job.action === 'spam') ? '举报加黑(/sa)' : '加入黑名单(/be)';
+	const action = normalizeBulkJobAction(job.action);
+	if (action === 'unban') return '移出黑名单并群解封(/unban)';
+	return action === 'spam' ? '举报加黑(/spam)' : '加入黑名单(/ban)';
 }
 
 function formatStoredBulkJobContext(job) {
@@ -2836,9 +2855,9 @@ function describePurgeReasons(reasons) {
 	}
 	const normalized = reasons.join(',');
 	if (normalized === PURGE_DEFAULT_REASONS.join(',')) {
-		return '/be + /sa';
+		return '/ban + /spam';
 	}
-	return normalized || '/be + /sa';
+	return normalized || '/ban + /spam';
 }
 
 function stringifyPurgeGroups(groups) {
@@ -3357,8 +3376,8 @@ function isSpamCommand(text) {
 	}
 
 	const trimmedText = text.trim();
-	// 接受 /sa 和 /sa@任意机器人用户名，不限定必须 @ 当前机器人。
-	return /^\/sa(?:@[^\s]+)?(?:\s|$)/i.test(trimmedText);
+	// 接受 /spam 和 /spam@任意机器人用户名，不限定必须 @ 当前机器人。
+	return /^\/spam(?:@[^\s]+)?(?:\s|$)/i.test(trimmedText);
 }
 
 function isCheckCommand(text) {
@@ -3379,14 +3398,14 @@ function isJobCommand(text) {
 	return /^\/job(?:run)?(?:@[^\s]+)?(?:\s|$)/i.test(trimmedText);
 }
 
-// 加黑命令 /be —— 与 /sa 同款正则范式:支持 @机器人名、单发提示,且不依赖命令长度
+// 加黑命令 /ban —— 与 /spam 同款正则范式:支持 @机器人名、单发提示,且不依赖命令长度
 function isBanCommand(text) {
 	if (!text) {
 		return false;
 	}
 
 	const trimmedText = text.trim();
-	return /^\/be(?:@[^\s]+)?(?:\s|$)/i.test(trimmedText);
+	return /^\/ban(?:@[^\s]+)?(?:\s|$)/i.test(trimmedText);
 }
 
 // 判断给定 chat_id 是否属于配置的任一群组
@@ -4097,7 +4116,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 
 	if (newStatus === 'kicked') {
 		// 群内手动封禁（真人点 Telegram 封禁按钮 / 任何作为管理员的机器人执行封禁）一律【不再】同步进 D1 黑名单。
-		// D1 全局黑名单的唯一来源 = 真人管理员的 /be、/sa 指令（含 /be 123、/sa 123、引用消息 /sa）。
+		// D1 全局黑名单的唯一来源 = 真人管理员的 /ban、/spam 指令（含 /ban 123、/spam 123、引用消息 /spam）。
 		// 这里仅发审计通知告知主人群里发生了手动封禁；notifyOwnerChatMemberAction 内部已自动过滤机器人操作，机器人封禁不会打扰主人。
 		console.log('[chat_member] 群内手动封禁，按规则不同步加黑:', JSON.stringify(logCommon));
 		await notifyOwnerChatMemberAction(chatMember, '封禁（未加入全局黑名单）', oldStatus, newStatus);
@@ -4131,7 +4150,7 @@ function translateMemberStatus(status) {
 	return map[status] || `❔ ${status || '未知'}`;
 }
 
-// 主人审计通知:群内管理员手动 be/unban 时,事件只发给主人
+// 主人审计通知:群内管理员手动 ban/unban 时,事件只发给主人
 // 已豁免:OWNER_IDS 为空 / 操作人是主人本人(不通知自己) / 操作人是机器人(其它 bot 的操作不通知)
 async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newStatus) {
 	if (!OWNER_IDS.length) return;
@@ -4231,15 +4250,28 @@ async function mergeAdKeywordsFromD1(env) {
 	AD_WHITELIST = [...new Set([...AD_WHITELIST, ...wlWords])];
 }
 
+// 新保存统一使用 spam 分类；旧 D1 data.sa 只读合并，避免历史词库失效。
+function normalizeAdKeywordsForSave(data) {
+	const normalized = data && typeof data === 'object' && !Array.isArray(data) ? { ...data } : {};
+	const mergedSpam = [
+		...(Array.isArray(normalized.sa) ? normalized.sa : []),
+		...(Array.isArray(normalized.spam) ? normalized.spam : []),
+	];
+	normalized.spam = [...new Set(mergedSpam.map((w) => String(w).toLowerCase()).filter(Boolean))];
+	delete normalized.sa;
+	return normalized;
+}
+
 // 把词库对象写回 D1
 async function saveAdKeywordsToD1(env, data) {
 	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
 	try {
 		await ensureD1Table(env);
+		const normalizedData = normalizeAdKeywordsForSave(data);
 		await env.DB.prepare('INSERT OR REPLACE INTO ad_keywords (id, data, updated_at) VALUES (1, ?, ?)')
-			.bind(JSON.stringify(data), new Date().toISOString())
+			.bind(JSON.stringify(normalizedData), new Date().toISOString())
 			.run();
-		setD1RuntimeCache(D1_AD_KEYWORDS_CACHE, env.DB, data);
+		setD1RuntimeCache(D1_AD_KEYWORDS_CACHE, env.DB, normalizedData);
 		return { ok: true };
 	} catch (error) {
 		console.error('[广告词库] 写 D1 失败:', error);
@@ -4247,17 +4279,17 @@ async function saveAdKeywordsToD1(env, data) {
 	}
 }
 
-// 读取 D1 词库,空则返回标准空结构(6 个分类)
+// 读取 D1 词库,空则返回标准空结构(7 个分类)
 async function getAdKeywordsRaw(env) {
 	const data = await loadAdKeywordsFromD1(env);
-	const mergedSa = [
+	const mergedSpam = [
 		...(Array.isArray(data?.sa) ? data.sa : []),
 		...(Array.isArray(data?.spam) ? data.spam : []),
 	];
 	return {
 		finance: Array.isArray(data?.finance) ? data.finance : [],
 		porn: Array.isArray(data?.porn) ? data.porn : [],
-		sa: [...new Set(mergedSa.map((w) => String(w).toLowerCase()).filter(Boolean))],
+		spam: [...new Set(mergedSpam.map((w) => String(w).toLowerCase()).filter(Boolean))],
 		fraud: Array.isArray(data?.fraud) ? data.fraud : [],
 		general: Array.isArray(data?.general) ? data.general : [],
 		identity: Array.isArray(data?.identity) ? data.identity : [],
@@ -4265,7 +4297,7 @@ async function getAdKeywordsRaw(env) {
 	};
 }
 
-// ===== 广告学习样本(/sa 上报 → 指纹入库 → 精准查杀)=====
+// ===== 广告学习样本(/spam 上报 → 指纹入库 → 精准查杀)=====
 
 // 归一化:把文本"洗"成标准指纹,抓"加空格/标点/全半角"变体
 function normalizeForFingerprint(text) {
@@ -4482,7 +4514,7 @@ async function cacheRecentMessage(env, message) {
 	}
 }
 
-// 当前群清扫缓存：保存普通用户近期消息 ID，供 /sa 引用回复时清扫该用户当前群近期消息。
+// 当前群清扫缓存：保存普通用户近期消息 ID，供 /spam 引用回复时清扫该用户当前群近期消息。
 // 与 recent_messages 分开，避免 /recent 学习列表被普通聊天污染。
 async function cacheModerationMessage(env, message) {
 	if (!env.DB || !message?.message_id || !message?.from?.id) return;
@@ -4704,7 +4736,7 @@ function getQuoteText(message) {
 
 // ===== 代理相关内容绝对豁免 =====
 // 只扫描消息内容，不扫描发送者姓名/用户名或群名，避免“名字叫 Clash 的用户”获得永久豁免。
-// 命中后仅跳过自动广告检测与 /recent 疑似广告缓存；D1 黑名单拦截和手动 /be /sa 不受影响。
+// 命中后仅跳过自动广告检测与 /recent 疑似广告缓存；D1 黑名单拦截和手动 /ban /spam 不受影响。
 const PROXY_SCAN_TEXT_KEYS = new Set(['text', 'caption', 'title', 'description', 'file_name', 'url', 'vcard']);
 const PROXY_SCAN_SKIP_KEYS = new Set([
 	'from', 'sender_chat', 'chat', 'via_bot',
@@ -4919,8 +4951,8 @@ async function detectAd(message, env) {
 		contactText,
 	].filter(Boolean);
 	const fullText = textParts.join(' ').toLowerCase();
-	// 仅正文(text+caption+名片内容),用于学习样本指纹比对 —— 与 /sa /learn /learnlast 学习入口口径一致,
-	// 不混入发送者用户名,保证"同一条广告不同人发"也能精确命中。名片广告也能被 /sa 学习指纹。
+	// 仅正文(text+caption+名片内容),用于学习样本指纹比对 —— 与 /spam /learn /learnlast 学习入口口径一致,
+	// 不混入发送者用户名,保证"同一条广告不同人发"也能精确命中。名片广告也能被 /spam 学习指纹。
 	const bodyText = [message.text, message.caption, contactText].filter(Boolean).join(' ').toLowerCase();
 	const hits = [];
 
@@ -4963,7 +4995,7 @@ async function detectAd(message, env) {
 		}
 	}
 
-	// 强特征 1:学习样本指纹精确匹配(/sa /learn /learnlast 上报过的广告)
+	// 强特征 1:学习样本指纹精确匹配(/spam /learn /learnlast 上报过的广告)
 	//   归一化后完全相等才命中,不做子串包含(避免误杀正常长消息)
 	const normMsg = normalizeForFingerprint(bodyText);
 	if (!urlsAllWhite && normMsg.length >= SAMPLE_FP_EXACT_MIN && AD_SAMPLE_FINGERPRINTS.length > 0) {
@@ -5177,9 +5209,9 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 function translateBlacklistReason(reason) {
 	const map = {
 		manual_ban: '旧版 Telegram 原生封禁同步记录',
-		manual: '管理员 /be 指令加黑',
-		sa: '管理员 /sa 引用回复加黑',
-		spam: '管理员 /sa 引用回复加黑',
+		manual: '管理员 /ban 指令加黑',
+		sa: '管理员 /spam 引用回复加黑（历史记录）',
+		spam: '管理员 /spam 引用回复加黑',
 		ad_auto: '广告自动检测加黑',
 		ad_learn: '上报学习加黑',
 	};
@@ -5315,7 +5347,7 @@ async function notifyOwnerSelfUnban(fromUser, perGroupResults) {
 		`📋 各群解封结果:`,
 		escapeHtml(resultSummary),
 		'',
-		`如确认是广告，请执行: <code>/be ${escapeHtml(targetId)}</code>`,
+		`如确认是广告，请执行: <code>/ban ${escapeHtml(targetId)}</code>`,
 	];
 
 	await notifyAllOwners(lines.join('\n'), null);
@@ -5389,7 +5421,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 	}
 
-	// 缓存配置群普通用户消息 ID，供 /sa 引用回复后只清扫当前群、该用户的近期消息。
+	// 缓存配置群普通用户消息 ID，供 /spam 引用回复后只清扫当前群、该用户的近期消息。
 	if (
 		env.DB && isConfiguredGroup(chatId) &&
 		message.from && !message.from.is_bot &&
@@ -5438,25 +5470,25 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 	}
 
-	// 处理 /sa 命令 - 举报加黑（支持回复消息 + 直接输入TGID + 批量，群内/私聊双场景）
+	// 处理 /spam 命令 - 举报加黑（支持回复消息 + 直接输入TGID + 批量，群内/私聊双场景）
 	if (isSpamCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
 		if (isInGroup && !isConfiguredGroup(chatId)) return;
 
-		// 仅真人可通过 /sa 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
+		// 仅真人可通过 /spam 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
 		if (isBotOperator(message.from)) return;
 
 		const isAdmin = await checkMessageOperatorCanBan(message, userId);
 		if (!isAdmin) {
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /sa；私聊仅限主人、副主人或超级管理员。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /spam；私聊仅限主人、副主人或超级管理员。');
 			}
 			return;
 		}
-		await deleteAuthorizedGroupCommandMessage(message, '/sa');
+		await deleteAuthorizedGroupCommandMessage(message, '/spam');
 
-		// 提取 /sa 后面的参数。回复模式优先把参数当执行原因；无回复时才按 TGID 模式解析。
-		const argMatch = text.trim().match(/^\/sa(?:@[^\s]+)?\s*([\s\S]*)/i);
+		// 提取 /spam 后面的参数。回复模式优先把参数当执行原因；无回复时才按 TGID 模式解析。
+		const argMatch = text.trim().match(/^\/spam(?:@[^\s]+)?\s*([\s\S]*)/i);
 		const rawArg = argMatch ? argMatch[1].trim() : '';
 		const repliedMsg = message.reply_to_message;
 
@@ -5465,7 +5497,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const { valid, invalid, note } = parseTargetIdsAndNote(rawArg);
 
 			if (valid.length === 0 && invalid.length === 0) {
-				const usageText = `❌ 使用方法：<code>/sa 用户ID</code> 或 <code>/sa 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
+				const usageText = `❌ 使用方法：<code>/spam 用户ID</code> 或 <code>/spam 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
 				await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
 				return;
 			}
@@ -5475,7 +5507,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				return;
 			}
 			if (await startBulkModerationJobFromCommand(message, env, ctx, {
-				action: 'sa',
+				action: 'spam',
 				valid,
 				invalid,
 				note,
@@ -5487,10 +5519,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			// 单条
 			if (valid.length === 1 && invalid.length === 0) {
-				const result = await addToBlacklist(valid[0], env, { reason: 'sa', by: operatorId, note });
+				const result = await addToBlacklist(valid[0], env, { reason: 'spam', by: operatorId, note });
 				const alreadyExists = result.code === 'EXISTS';
 				let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
-				const lines = [`🎬 操作:举报加黑(/sa)`];
+				const lines = [`🎬 操作:举报加黑(/spam)`];
 				let flashText;
 				if (result.success || alreadyExists) {
 					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
@@ -5500,7 +5532,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					if (alreadyExists) {
 						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
 					}
-					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/sa' }));
+					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
 					flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
 				} else {
 					lines.push(`🎯 目标用户:${targetMention}`);
@@ -5518,7 +5550,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 
 			// 批量
-			const results = await addManyToBlacklist(valid, env, { reason: 'sa', by: operatorId, note });
+			const results = await addManyToBlacklist(valid, env, { reason: 'spam', by: operatorId, note });
 			const idsToKick = [...results.success, ...results.exists];
 			const userProfiles = await resolveBatchUserProfiles(idsToKick, chatId);
 			const banSummary = { success: idsToKick.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
@@ -5534,7 +5566,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				else banSummary.banPartial += 1;
 			}
 			const failedCount = invalid.length + results.failed.length;
-			const flashText = `✅ 批量加黑(/sa)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+			const flashText = `✅ 批量加黑(/spam)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
 			const baseDetail = renderBatchAddResult(results, invalid, banSummary, userProfiles);
 			let fullDetail = baseDetail;
 			if (perUserBanResults.length > 0) {
@@ -5543,7 +5575,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				for (const { userId: uid, banResults } of perUserBanResults) {
 					const resultDetail = await renderBanResultsDetail(banResults, chatInfoCache, {
 						userId: uid,
-						retryCommand: '/sa',
+						retryCommand: '/spam',
 						compactSpacing: true
 					});
 					perUserBlocks.push(buildTelegramAtomicHtmlBlock([
@@ -5565,13 +5597,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// ===== 回复模式：回复垃圾消息加黑（原有逻辑）=====
 		const repliedUserId = repliedMsg?.from?.id;
 		if (!repliedUserId) {
-			const usageText = '❌ 使用方法：\n• 回复垃圾消息后发 <code>/sa</code>\n• 或直接 <code>/sa 用户ID</code>（支持批量：<code>/sa 123,456,789</code>）';
+			const usageText = '❌ 使用方法：\n• 回复垃圾消息后发 <code>/spam</code>\n• 或直接 <code>/spam 用户ID</code>（支持批量：<code>/spam 123,456,789</code>）';
 			await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
 			return;
 		}
 
 		const replySpamNote = rawArg;
-		const result = await addToBlacklist(repliedUserId, env, { reason: 'sa', by: operatorId, note: replySpamNote });
+		const result = await addToBlacklist(repliedUserId, env, { reason: 'spam', by: operatorId, note: replySpamNote });
 		const alreadyExists = result.code === 'EXISTS';
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
@@ -5582,13 +5614,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const cleanupResult = await cleanupCurrentChatUserMessages(env, chatId, repliedUserId, [repliedMsg.message_id]);
 
 			const lines = [
-				`🎬 操作:举报加黑(/sa)`,
+				`🎬 操作:举报加黑(/spam)`,
 				`🎯 目标用户:${linkedUserId} <code>${escapeHtml(String(repliedUserId))}</code>`,
 				'',
 				result.success
 					? `✅ 已将用户 ${linkedUserId} 添加到黑名单`
 					: `⚠️ 用户 ${linkedUserId} 已在黑名单中,本次已继续执行 Telegram 群封禁/预封`,
-				await renderBanResultsDetail(banResults, null, { userId: repliedUserId, retryCommand: '/sa' }),
+				await renderBanResultsDetail(banResults, null, { userId: repliedUserId, retryCommand: '/spam' }),
 			];
 			lines.push(renderCurrentChatCleanupResult(cleanupResult));
 			if (cleanupResult.failed > 0 && cleanupResult.errors.length > 0) {
@@ -5598,7 +5630,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				});
 				lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
 			}
-			// 仅主人 /sa → 学习样本(只写整句指纹入库,不污染词库)
+			// 仅主人 /spam → 学习样本(只写整句指纹入库,不污染词库)
 			const isOwnerSpam = isOwner(userId);
 			if (isOwnerSpam && env.DB) {
 				const r = repliedMsg;
@@ -5627,7 +5659,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 写库失败(已存在 / 未绑存储等)— 也走双通道,字段齐全
 			const plainMsg = result.message.replace(/<[^>]+>/g, '');
 			const failLines = [
-				`🎬 操作:举报加黑(/sa)`,
+				`🎬 操作:举报加黑(/spam)`,
 				`🎯 目标用户:${linkedUserId} <code>${escapeHtml(String(repliedUserId))}</code>`,
 				'',
 			];
@@ -5646,7 +5678,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
-	// 处理 /job /jobrun：查询或续跑大批量 /be /sa 任务
+	// 处理 /job /jobrun：查询或续跑大批量 /ban /spam 任务
 	if (isJobCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
 		const isAdmin = isPrivilegedManager(userId);
@@ -5927,14 +5959,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'',
 			'<b>━━ 广告词库热更新(私聊)━━</b>',
 			'<code>/importdefault</code> 一键导入推荐词库(金融/色情/引流/诈骗/身份引流)',
-			'<code>/addword [分类] 词1 词2</code> 加词。分类:finance/porn/sa/fraud/general/identity/whitelist,默认 general',
+			'<code>/addword [分类] 词1 词2</code> 加词。分类:finance/porn/spam/fraud/general/identity/whitelist,默认 general',
 			'<code>/addword whitelist example.com</code> 加正常域名白名单(该域名链接永不被杀)',
 			'<code>/addword identity 卡网 车队</code> 加身份引流词(只查发言人名字/简介,不碰正文)',
 			'<code>/delword 词1 词2</code> 从所有分类删词',
 			'<code>/listwords</code> 查看当前 D1 词库全部内容',
 			'',
 			'<b>━━ 广告样本学习(两步私聊复核)━━</b>',
-			'<code>/sa</code>(群内回复广告)OWNER_IDS 版额外学习指纹(只入库,不污染词库)',
+			'<code>/spam</code>(群内回复广告)OWNER_IDS 版额外学习指纹(只入库,不污染词库)',
 			'<code>/learn 广告文本</code> 直接粘贴文字学习指纹(只入库,不踢人)',
 			'<code>/recent [N]</code> 拉取疑似广告并冻结快照,带序号推到私聊(群/私聊均可,最多50条)',
 			'<code>/learnlast 序号</code> <b>仅私聊</b>,按快照序号学指纹(只入库,不踢人)。如 /learnlast 1,3',
@@ -5951,7 +5983,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'',
 			'<b>━━ 说明 ━━</b>',
 			'• 非 OWNER_IDS 用户在群内使用以上指令时静默；私聊会提示权限不足；<code>/admins</code>/<code>/groups</code>/<code>/leavegroup</code> 只允许主人私聊使用',
-			'• 学习一律<b>只入库不踢人</b>;要踢发广告的人,用回执里给的 TGID 发 <code>/be TGID</code>',
+			'• 学习一律<b>只入库不踢人</b>;要踢发广告的人,用回执里给的 TGID 发 <code>/ban TGID</code>',
 			'• 学习只写整句指纹,<b>不再自动往词库加词</b>(避免误杀正常消息);建议词需你手动 /addword',
 			'• <b>链接识别</b>:github/google 等正常域名链接永不被杀;含链接的样本只精确匹配不扩散;可疑短链(bit.ly等)才加分',
 		];
@@ -6082,7 +6114,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const cats = [
 				['金融 finance', kw.finance],
 				['色情 porn', kw.porn],
-				['引流 sa', kw.sa],
+				['引流 spam', kw.spam],
 				['诈骗 fraud', kw.fraud],
 				['自定义 general', kw.general],
 				['身份引流 identity(只查名字/简介)', kw.identity],
@@ -6110,7 +6142,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (head === '/importdefault') {
 			const kw = await getAdKeywordsRaw(env);
 			let added = 0;
-			for (const cat of ['finance', 'porn', 'sa', 'fraud', 'identity']) {
+			for (const cat of ['finance', 'porn', 'spam', 'fraud', 'identity']) {
 				const before = new Set(kw[cat].map((w) => String(w).toLowerCase()));
 				for (const w of (RECOMMENDED_AD_KEYWORDS[cat] || [])) {
 					const lw = String(w).toLowerCase();
@@ -6133,17 +6165,23 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			if (!rest) {
 				await sendAuthorizedCommandResult(message, ctx, {
 					flashText: '❌ /addword 用法错误，完整提示已发送给主人',
-					detailText: '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/sa/fraud/general/identity/whitelist(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>\nidentity=只查发言人名字/简介的引流词(如 卡网 发卡 车队)',
+					detailText: '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/spam/fraud/general/identity/whitelist(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>\nidentity=只查发言人名字/简介的引流词(如 卡网 发卡 车队)',
 				});
 				return;
 			}
-			const validCats = ['finance', 'porn', 'sa', 'spam', 'fraud', 'general', 'identity', 'whitelist'];
+			const validCats = ['finance', 'porn', 'spam', 'fraud', 'general', 'identity', 'whitelist'];
 			const tokens = rest.split(/[\s,，]+/).filter(Boolean);
+			if (tokens[0]?.toLowerCase() === 'sa') {
+				await sendAuthorizedCommandResult(message, ctx, {
+					flashText: '❌ 旧引流分类已停用，完整提示已发送给主人',
+					detailText: '❌ 旧引流分类已停用，请改用 <code>/addword spam 词1 词2 ...</code>。',
+				});
+				return;
+			}
 			let cat = 'general';
 			if (validCats.includes(tokens[0].toLowerCase())) {
 				cat = tokens.shift().toLowerCase();
 			}
-			if (cat === 'spam') cat = 'sa';
 			const words = [...new Set(tokens.map((w) => w.toLowerCase()))];
 			if (words.length === 0) {
 				await sendAuthorizedCommandResult(message, ctx, {
@@ -6211,7 +6249,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			return;
 		}
-		await deleteAuthorizedGroupCommandMessage(message, '/samples');
+		await deleteAuthorizedGroupCommandMessage(message, 'sample-management');
 		if (!env.DB) {
 			await sendAuthorizedCommandResult(message, ctx, {
 				flashText: '❌ 未绑定 D1，完整提示已发送给主人',
@@ -6228,7 +6266,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const fps = data.fingerprints || [];
 			const lines = [`📖 <b>广告学习样本</b>(共 ${fps.length} 条)`, ''];
 			if (fps.length === 0) {
-				lines.push('(空)主人回复广告消息发 <code>/sa</code> 即可学习。');
+				lines.push('(空)主人回复广告消息发 <code>/spam</code> 即可学习。');
 			} else {
 				// 最多展示最近 50 条,避免消息超长
 				const show = fps.slice(-50);
@@ -6303,7 +6341,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 
 	// ===== /learn 粘贴学习 + /recent 看缓存 + /learnlast 按序号学(仅主人)=====
-	// 解决"GKY 已删消息无法回复 /sa"
+	// 解决"GKY 已删消息无法回复 /spam"
 	if (text && /^\/(learn|learnlast|recent)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
 		const isOwnerUser = isOwner(userId);
@@ -6377,7 +6415,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			lines.push('', '✅ <b>请私聊我</b>核对后学习(群内不能学习):');
 			lines.push('学指定条:<code>/learnlast 序号</code>(如 <code>/learnlast 2</code>)');
 			lines.push('学多条:<code>/learnlast 1,3</code>');
-			lines.push('⚠️ 学习只入库不踢人;要踢发广告的人请复制上面 TGID 发 <code>/be TGID</code>');
+			lines.push('⚠️ 学习只入库不踢人;要踢发广告的人请复制上面 TGID 发 <code>/ban TGID</code>');
 			await replyToAdmin(message, ctx, {
 				flashText: `📋 ${scopeLabel}快照 ${list.length} 条已推送私聊`,
 				detailText: lines.join('\n'),
@@ -6431,7 +6469,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				if (learn.suggestedKeywords.length > 0) {
 					lines.push(`  💡 建议词:${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
 				}
-				// 只学不踢:显示发送者 TGID 供主人决定是否手动 /be
+				// 只学不踢:显示发送者 TGID 供主人决定是否手动 /ban
 				if (it.fromId && /^\d+$/.test(it.fromId)) {
 					lines.push(`  👤 发送者:<code>${escapeHtml(it.fromId)}</code>(${escapeHtml(it.fromName || '')})`);
 					kickHints.push(it.fromId);
@@ -6439,7 +6477,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				lines.push('');
 			}
 			if (kickHints.length > 0) {
-				lines.push(`🚫 要踢发广告的人:<code>/be ${[...new Set(kickHints)].join(',')}</code>`);
+				lines.push(`🚫 要踢发广告的人:<code>/ban ${[...new Set(kickHints)].join(',')}</code>`);
 			}
 			lines.push('学错了?用 <code>/delsample 关键词</code> 删样本。');
 			await sendTelegramMessage(chatId, lines.join('\n'));
@@ -6449,12 +6487,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
-	// 处理 /be 命令 - 添加用户到黑名单（支持批量、群内/私聊双场景；兼容 /be@机器人名）
+	// 处理 /ban 命令 - 添加用户到黑名单（支持批量、群内/私聊双场景；兼容 /ban@机器人名）
 	if (isBanCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
 		if (isInGroup && !isConfiguredGroup(chatId)) return;
 
-		// 仅真人可通过 /be 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
+		// 仅真人可通过 /ban 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
 		if (isBotOperator(message.from)) return;
 
 		// 普通管理员必须是当前群管理员；高级管理员保持原有权限。
@@ -6462,21 +6500,21 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (!isAdmin) {
 			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /be；私聊仅限主人、副主人或超级管理员。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /ban；私聊仅限主人、副主人或超级管理员。');
 			}
 			return;
 		}
-		await deleteAuthorizedGroupCommandMessage(message, '/be');
+		await deleteAuthorizedGroupCommandMessage(message, '/ban');
 
 		// 提取参数（支持单个 / 批量；开头 TGID 列表之后的文本作为执行原因）
-		// 用正则提取,与 /sa 完全对称:兼容 /be、/be@机器人名、多空格;彻底不依赖命令长度,
+		// 用正则提取,与 /spam 完全对称:兼容 /ban、/ban@机器人名、多空格;彻底不依赖命令长度,
 		// 根除早期 slice(5) 吃掉参数首字符那类"命令一改短就错位"的隐患。
-		const argMatch = text.trim().match(/^\/be(?:@[^\s]+)?\s*([\s\S]*)/i);
+		const argMatch = text.trim().match(/^\/ban(?:@[^\s]+)?\s*([\s\S]*)/i);
 		const rawArg = argMatch ? argMatch[1] : '';
 		const { valid, invalid, note } = parseTargetIdsAndNote(rawArg);
 
 		if (valid.length === 0 && invalid.length === 0) {
-			const usageText = `❌ 使用方法：<code>/be 用户ID</code> 或 <code>/be 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
+			const usageText = `❌ 使用方法：<code>/ban 用户ID</code> 或 <code>/ban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
 			await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
 			return;
 		}
@@ -6486,7 +6524,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 		if (await startBulkModerationJobFromCommand(message, env, ctx, {
-			action: 'be',
+			action: 'ban',
 			valid,
 			invalid,
 			note,
@@ -6512,7 +6550,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				if (alreadyExists) {
 					lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
 				}
-				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/be' }));
+				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/ban' }));
 				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
@@ -6558,7 +6596,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			for (const { userId: uid, banResults } of perUserBanResults) {
 				const resultDetail = await renderBanResultsDetail(banResults, chatInfoCache, {
 					userId: uid,
-					retryCommand: '/be',
+					retryCommand: '/ban',
 					compactSpacing: true
 				});
 				perUserBlocks.push(buildTelegramAtomicHtmlBlock([
@@ -7227,7 +7265,7 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 // 检查用户是否是任一配置群组的管理员 / 超级管理员
 // 权限层级（高 → 低）:超级管理员 > 群管理员 > 普通用户
 // 超级管理员（SUPER_ADMINS 名单）拥有普通管理命令权限。
-// 这里直接把 super 当成 admin,所以 SUPER_ADMINS 用户即使不是任何群的成员也能使用 /be /unban /sa 等命令
+// 这里直接把 super 当成 admin,所以 SUPER_ADMINS 用户即使不是任何群的成员也能使用 /ban /unban /spam 等命令
 //
 // 用 getChatAdministrators 拉群管理员列表本地匹配，比 getChatMember 更稳:
 // - 不要求 bot 是该群管理员（仅要求 bot 在群里）
