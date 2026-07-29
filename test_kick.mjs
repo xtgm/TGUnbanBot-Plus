@@ -98,6 +98,11 @@ function makeFakeDB(seed = [], options = {}) {
 	const store = new Map();
 	const batchJobs = new Map();
 	const relayObservations = new Map();
+	const schemaState = {
+		version: Number.isFinite(Number(options.schemaVersion)) ? Number(options.schemaVersion) : 3,
+		relayTableExists: options.relayTableExists !== false,
+		schemaExecCount: 0,
+	};
 	const preparedSql = [];
 	const mutationCalls = [];
 	let mutationCallIndex = 0;
@@ -150,15 +155,27 @@ function makeFakeDB(seed = [], options = {}) {
 		_store: store,
 		_jobs: batchJobs,
 		_relayObservations: relayObservations,
+		_schema: schemaState,
 		_sql: preparedSql,
 		_mutationCalls: mutationCalls,
-		exec: async () => {},
+		exec: async (sql) => {
+			if (String(sql).includes('CREATE TABLE IF NOT EXISTS ad_relay_observations')) {
+				schemaState.schemaExecCount += 1;
+				schemaState.relayTableExists = true;
+			}
+		},
 		prepare(sql) {
 			preparedSql.push(sql);
 			let bound = [];
 			return {
 				bind(...args) { bound = args; return this; },
 				async first() {
+					if (sql.startsWith('SELECT version FROM schema_meta')) {
+						return { version: schemaState.version };
+					}
+					if (sql.includes("FROM sqlite_master") && sql.includes("ad_relay_observations")) {
+						return schemaState.relayTableExists ? { name: 'ad_relay_observations' } : null;
+					}
 					if (sql.startsWith('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ?')) {
 						const row = rows.get(String(bound[0]));
 						return row ? {
@@ -189,6 +206,7 @@ function makeFakeDB(seed = [], options = {}) {
 						return data ? { data } : null;
 					}
 					if (sql.startsWith('SELECT actor_id, occurrences, first_seen_at, last_chat_id, last_message_id FROM ad_relay_observations')) {
+						if (!schemaState.relayTableExists) throw new Error('D1_ERROR: no such table: ad_relay_observations');
 						return relayObservations.get(String(bound[0])) || null;
 					}
 
@@ -198,6 +216,10 @@ function makeFakeDB(seed = [], options = {}) {
 					return null;
 				},
 				async run() {
+					if (sql.startsWith('INSERT OR REPLACE INTO schema_meta')) {
+						schemaState.version = Number(bound[0]) || 0;
+						return { meta: { changes: 1 } };
+					}
 					if (sql.startsWith('INSERT OR IGNORE INTO blacklist')) {
 						const [rawId, reason, by, at, note] = bound;
 						const id = String(rawId);
@@ -224,6 +246,7 @@ function makeFakeDB(seed = [], options = {}) {
 						return { meta: { changes: 1 } };
 					}
 					if (sql.startsWith('INSERT INTO ad_relay_observations')) {
+						if (!schemaState.relayTableExists) throw new Error('D1_ERROR: no such table: ad_relay_observations');
 						const [actorId, occurrences, firstSeenAt, lastSeenAt, lastChatId, lastMessageId, originalAuthorId, quoteFingerprint, quotePreview, wrapperPreview, evidence] = bound;
 						relayObservations.set(String(actorId), {
 							actor_id: String(actorId),
@@ -241,6 +264,7 @@ function makeFakeDB(seed = [], options = {}) {
 						return { meta: { changes: 1 } };
 					}
 					if (sql.startsWith('UPDATE ad_relay_observations SET')) {
+						if (!schemaState.relayTableExists) throw new Error('D1_ERROR: no such table: ad_relay_observations');
 						const [occurrences, lastSeenAt, lastChatId, lastMessageId, originalAuthorId, quoteFingerprint, quotePreview, wrapperPreview, evidence, actorId] = bound;
 						const existing = relayObservations.get(String(actorId));
 						if (!existing) return { meta: { changes: 0 } };
@@ -3796,8 +3820,8 @@ const AD_KW_SEED = {
 	whitelist: [],
 };
 // 构造一个已预置广告词库的 fake D1
-function makeAdD1(extra = {}) {
-	const db = makeFakeDB([]);
+function makeAdD1(extra = {}, options = {}) {
+	const db = makeFakeDB([], options);
 	db._store.set('ad_keywords_custom', JSON.stringify({ ...AD_KW_SEED, ...extra }));
 	return db;
 }
@@ -5572,6 +5596,32 @@ console.log('\n[81g] 观察通知失败隔离');
 	assert('第一主人私聊失败 → D1 观察记录仍保留', db._relayObservations.get('94500')?.occurrences === 1);
 	assert('第一主人私聊失败 → 原作者仍写黑名单并全群封禁', db._rows.has('94501') && callsOf('banChatMember').length === 2);
 	assert('第一主人私聊失败 → 不回退发送给副主人或群聊', callsOf('sendMessage').length === 1 && String(callsOf('sendMessage')[0].body.chat_id) === '999');
+}
+
+// ---------- [81h] D1 schema v3 自动迁移与缺表自愈 ----------
+console.log('\n[81h] D1 schema v3 自动迁移与缺表自愈');
+{
+	const scenarios = [
+		{ label: '旧 schema v2', schemaVersion: 2, actorId: 94600 },
+		{ label: 'schema v3 元数据与实际表不一致', schemaVersion: 3, actorId: 94610 },
+	];
+	for (const scenario of scenarios) {
+		resetCalls();
+		sandbox.fetch = adFetchMock();
+		const db = makeAdD1({ porn: ['大婆啦'] }, { schemaVersion: scenario.schemaVersion, relayTableExists: false });
+		const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+			message_id: scenario.actorId, chat: { id: -1001, type: 'supergroup' },
+			from: { id: scenario.actorId, is_bot: false, first_name: '正常回复者' },
+			text: 'p', quote: { text: '📢 大婆啦 广告内容' },
+		} }) }), env, fakeCtxAd);
+		const ownerNotice = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
+		assert(`${scenario.label} → 自动升级 schema 到 v3`, db._schema.version === 3);
+		assert(`${scenario.label} → 自动补建引用观察表且只执行一次 schema DDL`, db._schema.relayTableExists && db._schema.schemaExecCount === 1);
+		assert(`${scenario.label} → 首次引用观察成功写入 D1`, db._relayObservations.get(String(scenario.actorId))?.occurrences === 1);
+		assert(`${scenario.label} → 主人通知显示观察次数 1、无缺表错误`, !!ownerNotice && ownerNotice.body.text.includes('观察次数:1') && !ownerNotice.body.text.includes('D1 观察记录失败'));
+		assert(`${scenario.label} → 当前正常回复者仍不进入全局黑名单`, !db._rows.has(String(scenario.actorId)) && callsOf('banChatMember').length === 0);
+	}
 }
 
 // ---------- [82] identity词库导入 ----------

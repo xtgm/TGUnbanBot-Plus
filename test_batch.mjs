@@ -123,6 +123,8 @@ function makeFakeDB(options = {}) {
 					return stmt;
 				},
 				async first() {
+					if (sql.startsWith('SELECT version FROM schema_meta')) return { version: 3 };
+					if (sql.includes("FROM sqlite_master") && sql.includes("ad_relay_observations")) return { name: 'ad_relay_observations' };
 					if (sql.startsWith('SELECT id FROM blacklist WHERE id = ?')) {
 						const id = String(bound[0]);
 						return rows.has(id) ? { id } : null;

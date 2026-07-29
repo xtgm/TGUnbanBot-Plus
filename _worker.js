@@ -692,10 +692,10 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 // 读取并归一化黑名单
 // === D1 工具函数 ===
 // 首次访问 D1 时建表（幂等），避免人工建表步骤
-const D1_SCHEMA_VERSION = 2;
+const D1_SCHEMA_VERSION = 3;
 const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
-let D1_INITED = false;
+const D1_INIT_PROMISES = new WeakMap();
 const D1_AD_KEYWORDS_CACHE = new WeakMap();
 const D1_AD_SAMPLES_CACHE = new WeakMap();
 
@@ -751,6 +751,13 @@ async function d1ColumnExists(env, table, column) {
 	return (results || []).some((row) => String(row.name) === column);
 }
 
+async function d1RelayObservationTableExists(env) {
+	const row = await env.DB.prepare(
+		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ad_relay_observations' LIMIT 1"
+	).first();
+	return String(row?.name || '') === 'ad_relay_observations';
+}
+
 async function readD1SchemaVersion(env) {
 	try {
 		const row = await env.DB.prepare('SELECT version FROM schema_meta WHERE id = 1').first();
@@ -761,59 +768,72 @@ async function readD1SchemaVersion(env) {
 }
 
 async function ensureD1Table(env) {
-	if (!env.DB || D1_INITED) return;
-	if ((await readD1SchemaVersion(env)) >= D1_SCHEMA_VERSION) {
-		D1_INITED = true;
-		return;
-	}
+	if (!env.DB) return false;
+	const cached = D1_INIT_PROMISES.get(env.DB);
+	if (cached) return cached;
 
-	try {
-		await env.DB.exec(`
-			CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, updated_at TEXT);
-			CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT);
-			CREATE TABLE IF NOT EXISTS ad_keywords (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
-			CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
-			CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);
-			CREATE TABLE IF NOT EXISTS moderation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, from_id TEXT, created_at TEXT);
-			CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
-			CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT);
-			CREATE INDEX IF NOT EXISTS idx_blacklist_at_id ON blacklist(at, id);
-			CREATE TABLE IF NOT EXISTS ad_relay_observations (
-				actor_id TEXT PRIMARY KEY,
-				occurrences INTEGER NOT NULL DEFAULT 1,
-				first_seen_at TEXT NOT NULL,
-				last_seen_at TEXT NOT NULL,
-				last_chat_id TEXT,
-				last_message_id TEXT,
-				last_original_author_id TEXT,
-				last_quote_fingerprint TEXT,
-				quote_preview TEXT,
-				wrapper_preview TEXT,
-				evidence TEXT
-			);
-			CREATE INDEX IF NOT EXISTS idx_blacklist_reason_at_id ON blacklist(reason, at, id);
-			CREATE INDEX IF NOT EXISTS idx_moderation_chat_from_id ON moderation_messages(chat_id, from_id, id);
-			CREATE INDEX IF NOT EXISTS idx_ad_relay_observations_last_seen ON ad_relay_observations(last_seen_at);
-		`);
-
+	const initPromise = (async () => {
 		try {
-			if (!(await d1ColumnExists(env, 'blacklist', 'note'))) {
-				await env.DB.exec('ALTER TABLE blacklist ADD COLUMN note TEXT;');
+			const version = await readD1SchemaVersion(env);
+			if (version >= D1_SCHEMA_VERSION && await d1RelayObservationTableExists(env)) {
+				return true;
 			}
-		} catch (error) {
-			const message = String(error?.message || error).toLowerCase();
-			if (!message.includes('duplicate') && !message.includes('exists')) {
-				throw error;
-			}
-		}
 
-		await env.DB.prepare('INSERT OR REPLACE INTO schema_meta (id, version, updated_at) VALUES (1, ?, ?)')
-			.bind(D1_SCHEMA_VERSION, new Date().toISOString())
-			.run();
-		D1_INITED = true;
-	} catch (error) {
-		console.error('D1 建表失败:', error);
-	}
+			await env.DB.exec(`
+				CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, updated_at TEXT);
+				CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT);
+				CREATE TABLE IF NOT EXISTS ad_keywords (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
+				CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
+				CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);
+				CREATE TABLE IF NOT EXISTS moderation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, from_id TEXT, created_at TEXT);
+				CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
+				CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT);
+				CREATE INDEX IF NOT EXISTS idx_blacklist_at_id ON blacklist(at, id);
+				CREATE TABLE IF NOT EXISTS ad_relay_observations (
+					actor_id TEXT PRIMARY KEY,
+					occurrences INTEGER NOT NULL DEFAULT 1,
+					first_seen_at TEXT NOT NULL,
+					last_seen_at TEXT NOT NULL,
+					last_chat_id TEXT,
+					last_message_id TEXT,
+					last_original_author_id TEXT,
+					last_quote_fingerprint TEXT,
+					quote_preview TEXT,
+					wrapper_preview TEXT,
+					evidence TEXT
+				);
+				CREATE INDEX IF NOT EXISTS idx_blacklist_reason_at_id ON blacklist(reason, at, id);
+				CREATE INDEX IF NOT EXISTS idx_moderation_chat_from_id ON moderation_messages(chat_id, from_id, id);
+				CREATE INDEX IF NOT EXISTS idx_ad_relay_observations_last_seen ON ad_relay_observations(last_seen_at);
+			`);
+
+			try {
+				if (!(await d1ColumnExists(env, 'blacklist', 'note'))) {
+					await env.DB.exec('ALTER TABLE blacklist ADD COLUMN note TEXT;');
+				}
+			} catch (error) {
+				const message = String(error?.message || error).toLowerCase();
+				if (!message.includes('duplicate') && !message.includes('exists')) {
+					throw error;
+				}
+			}
+
+			await env.DB.prepare('INSERT OR REPLACE INTO schema_meta (id, version, updated_at) VALUES (1, ?, ?)')
+				.bind(D1_SCHEMA_VERSION, new Date().toISOString())
+				.run();
+			if (!(await d1RelayObservationTableExists(env))) {
+				throw new Error('D1 schema migration incomplete: ad_relay_observations table is missing');
+			}
+			return true;
+		} catch (error) {
+			console.error('D1 建表失败:', error);
+			return false;
+		}
+	})();
+	D1_INIT_PROMISES.set(env.DB, initPromise);
+	const initialized = await initPromise;
+	if (!initialized) D1_INIT_PROMISES.delete(env.DB);
+	return initialized;
 }
 
 async function readD1Blacklist(env) {
