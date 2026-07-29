@@ -97,6 +97,7 @@ function makeFakeDB(seed = [], options = {}) {
 	const rows = new Map(seed.map((r) => [String(r.id), { ...r, id: String(r.id), by_user: r.by_user ?? r.by ?? null }]));
 	const store = new Map();
 	const batchJobs = new Map();
+	const relayObservations = new Map();
 	const preparedSql = [];
 	const mutationCalls = [];
 	let mutationCallIndex = 0;
@@ -148,6 +149,7 @@ function makeFakeDB(seed = [], options = {}) {
 		_rows: rows,
 		_store: store,
 		_jobs: batchJobs,
+		_relayObservations: relayObservations,
 		_sql: preparedSql,
 		_mutationCalls: mutationCalls,
 		exec: async () => {},
@@ -186,6 +188,10 @@ function makeFakeDB(seed = [], options = {}) {
 						const data = store.get('learn_snapshot');
 						return data ? { data } : null;
 					}
+					if (sql.startsWith('SELECT actor_id, occurrences, first_seen_at, last_chat_id, last_message_id FROM ad_relay_observations')) {
+						return relayObservations.get(String(bound[0])) || null;
+					}
+
 					if (sql.startsWith('SELECT id, type, status, payload FROM batch_jobs WHERE id = ?')) {
 						return batchJobs.get(bound[0]) || null;
 					}
@@ -217,6 +223,36 @@ function makeFakeDB(seed = [], options = {}) {
 						setJson('learn_snapshot', JSON.parse(bound[0]));
 						return { meta: { changes: 1 } };
 					}
+					if (sql.startsWith('INSERT INTO ad_relay_observations')) {
+						const [actorId, occurrences, firstSeenAt, lastSeenAt, lastChatId, lastMessageId, originalAuthorId, quoteFingerprint, quotePreview, wrapperPreview, evidence] = bound;
+						relayObservations.set(String(actorId), {
+							actor_id: String(actorId),
+							occurrences: Number(occurrences),
+							first_seen_at: firstSeenAt,
+							last_seen_at: lastSeenAt,
+							last_chat_id: String(lastChatId),
+							last_message_id: String(lastMessageId),
+							last_original_author_id: String(originalAuthorId || ''),
+							last_quote_fingerprint: quoteFingerprint,
+							quote_preview: quotePreview,
+							wrapper_preview: wrapperPreview,
+							evidence,
+						});
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('UPDATE ad_relay_observations SET')) {
+						const [occurrences, lastSeenAt, lastChatId, lastMessageId, originalAuthorId, quoteFingerprint, quotePreview, wrapperPreview, evidence, actorId] = bound;
+						const existing = relayObservations.get(String(actorId));
+						if (!existing) return { meta: { changes: 0 } };
+						relayObservations.set(String(actorId), {
+							...existing, occurrences: Number(occurrences), last_seen_at: lastSeenAt,
+							last_chat_id: String(lastChatId), last_message_id: String(lastMessageId),
+							last_original_author_id: String(originalAuthorId || ''), last_quote_fingerprint: quoteFingerprint,
+							quote_preview: quotePreview, wrapper_preview: wrapperPreview, evidence,
+						});
+						return { meta: { changes: 1 } };
+					}
+
 					if (sql.startsWith('INSERT INTO batch_jobs')) {
 						const [id, type, status, payload, createdAt, updatedAt] = bound;
 						if (batchJobs.has(id)) throw new Error('UNIQUE constraint failed: batch_jobs.id');
@@ -3735,6 +3771,22 @@ function normalizeFp(text) {
 		return String(text || '').toLowerCase().replace(/\s+/g, '');
 	}
 }
+function trustedSampleData(texts, source = 'test-confirmed') {
+	const fingerprints = texts.map(normalizeFp);
+	return {
+		fingerprints,
+		entries: fingerprints.map((fingerprint, index) => ({
+			fingerprint,
+			trusted: true,
+			source,
+			operatorId: '999',
+			learnedAt: '2026-07-29T00:00:00.000Z',
+			preview: String(texts[index] || ''),
+		})),
+		count: fingerprints.length,
+	};
+}
+
 const AD_KW_SEED = {
 	finance: ['usdt', 'u商', '承兑', '刷单', '日入', '出u', '接u', '搬砖', '套利', '包网', '价格拉满'],
 	porn: ['约炮', '萝莉', '福利姬', '看片', '裸聊', '乱伦', '不雅视频', '色色', '免费看', '资源群'],
@@ -4153,7 +4205,7 @@ console.log('\n[48] 学习后相同广告秒杀');
 	});
 	const db = makeFakeDB([]);
 	// 预置一条学习指纹(归一化后的)
-	db._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('专业承兑出u日入过万快来咨询')], count: 1 }));
+	db._store.set('ad_samples', JSON.stringify(trustedSampleData(['专业承兑出u日入过万快来咨询'])));
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 普通成员发完全相同的广告
 	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88102, is_bot: false, first_name: '路人' }, text: '专业承兑出u日入过万快来咨询' } };
@@ -4176,7 +4228,7 @@ console.log('\n[49] 加空格标点变体仍命中');
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
 	const db = makeFakeDB([]);
-	db._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('专业承兑出u日入过万')], count: 1 }));
+	db._store.set('ad_samples', JSON.stringify(trustedSampleData(['专业承兑出u日入过万'])));
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 加了空格、标点、emoji 的变体
 	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88103, is_bot: false }, text: '专业 承兑、出u!日入,过万🔥' } };
@@ -4789,7 +4841,7 @@ console.log('\n[68] 正常域名链接不误杀');
 	});
 	const db = makeFakeDB([]);
 	// 故意预置一条 github 链接样本(模拟之前误学),且与待测消息完全相同
-	db._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('https://github.com/jacobax/snippets')], count: 1 }));
+	db._store.set('ad_samples', JSON.stringify(trustedSampleData(['https://github.com/jacobax/snippets'])));
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88300, is_bot: false }, text: 'https://github.com/jacobax/snippets', entities: [{ type: 'url', offset: 0, length: 35 }] } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtxAd);
@@ -4811,7 +4863,7 @@ console.log('\n[69] URL 样本不子串扩散');
 	});
 	const db = makeFakeDB([]);
 	// 学过一条【非白名单】域名链接广告
-	db._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('http://spam-shop.xyz/abc')], count: 1 }));
+	db._store.set('ad_samples', JSON.stringify(trustedSampleData(['http://spam-shop.xyz/abc'])));
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 同域名不同路径(更长)→ 旧版会被子串命中,新版不该被杀
 	const update = { message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 88301, is_bot: false }, text: 'http://spam-shop.xyz/abc/page/normal-content-here', entities: [{ type: 'url', offset: 0, length: 49 }] } };
@@ -4821,7 +4873,7 @@ console.log('\n[69] URL 样本不子串扩散');
 	// 完全相同的那条 → 仍应精确命中
 	resetCalls();
 	const db2 = makeFakeDB([]);
-	db2._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('http://spam-shop.xyz/abc')], count: 1 }));
+	db2._store.set('ad_samples', JSON.stringify(trustedSampleData(['http://spam-shop.xyz/abc'])));
 	const env2 = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db2 };
 	const upd2 = { message: { message_id: 2, chat: { id: -1001, type: 'supergroup' }, from: { id: 88302, is_bot: false }, text: 'http://spam-shop.xyz/abc', entities: [{ type: 'url', offset: 0, length: 24 }] } };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(upd2) }), env2, fakeCtxAd);
@@ -4842,7 +4894,7 @@ console.log('\n[71] 域名白名单热更新');
 	});
 	const db = makeFakeDB([]);
 	// 先学一条该域名的样本(模拟误学),再把域名加进白名单
-	db._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('https://myblog.example/post1')], count: 1 }));
+	db._store.set('ad_samples', JSON.stringify(trustedSampleData(['https://myblog.example/post1'])));
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	// 主人私聊把 myblog.example 加进白名单
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/addword whitelist myblog.example' } }) }), env, fakeCtxAd);
@@ -5137,9 +5189,9 @@ console.log('\n[81] 短正文引用广告自动拦截');
 		}
 	}) }), env, fakeCtxAd);
 	let bl = JSON.parse(db._store.get('blacklist') || '[]');
-	assert('短正文引用广告 → 加黑当前发送者', bl.some((e) => e.id === '91001' && e.reason === 'ad_auto'));
+	assert('短正文引用广告 → 第一次只观察、不加黑当前发送者', !bl.some((e) => e.id === '91001'));
 	assert('短正文引用广告 → 删除当前消息', callsOf('deleteMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 900));
-	assert('短正文引用广告 → 全群踢当前发送者', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '91001'));
+	assert('短正文引用广告 → 第一次不全群踢当前发送者', callsOf('banChatMember').length === 0);
 	const ownerDm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
 	assert('短正文引用广告 → 通知包含引用内容', ownerDm.some((c) => c.body.text.includes('引用内容') && c.body.text.includes('揾逼赚钱')));
 
@@ -5215,9 +5267,9 @@ console.log('\n[81] 短正文引用广告自动拦截');
 		}
 	}) }), env, fakeCtxAd);
 	bl = JSON.parse(db._store.get('blacklist') || '[]');
-	assert('短正文引用单个高危词 → 加黑当前发送者', bl.some((e) => e.id === '91003' && e.reason === 'ad_auto'));
+	assert('短正文引用单个高危词 → 第一次只观察、不加黑当前发送者', !bl.some((e) => e.id === '91003'));
 	assert('短正文引用单个高危词 → 删除当前消息', callsOf('deleteMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 902));
-	assert('短正文引用单个高危词 → 全群踢当前发送者', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '91003'));
+	assert('短正文引用单个高危词 → 第一次不全群踢当前发送者', callsOf('banChatMember').length === 0);
 
 	resetCalls();
 	db = makeFakeDB([]);
@@ -5239,9 +5291,9 @@ console.log('\n[81] 短正文引用广告自动拦截');
 		}
 	}) }), env, fakeCtxAd);
 	bl = JSON.parse(db._store.get('blacklist') || '[]');
-	assert('ASCII包装引用卡片广告 → 加黑当前发送者', bl.some((e) => e.id === '91004' && e.reason === 'ad_auto'));
+	assert('ASCII包装引用卡片广告 → 第一次只观察、不加黑当前发送者', !bl.some((e) => e.id === '91004'));
 	assert('ASCII包装引用卡片广告 → 删除当前消息', callsOf('deleteMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 903));
-	assert('ASCII包装引用卡片广告 → 全群踢当前发送者', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '91004'));
+	assert('ASCII包装引用卡片广告 → 第一次不全群踢当前发送者', callsOf('banChatMember').length === 0);
 
 	resetCalls();
 	db = makeFakeDB([]);
@@ -5264,7 +5316,7 @@ console.log('\n[81] 短正文引用广告自动拦截');
 	}) }), env, fakeCtxAd);
 	bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('中文正常短回复引用卡片广告 → 不误杀当前发送者', !bl.some((e) => e.id === '91008'));
-	assert('中文正常短回复引用卡片广告 → 不删当前消息', callsOf('deleteMessage').length === 0);
+	assert('中文正常短回复引用卡片广告 → 删除当前含广告引用的消息', callsOf('deleteMessage').some((c) => c.body.message_id === 906));
 	assert('中文正常短回复引用卡片广告 → 不全群踢', callsOf('banChatMember').length === 0);
 
 	resetCalls();
@@ -5282,7 +5334,244 @@ console.log('\n[81] 短正文引用广告自动拦截');
 	}) }), env, fakeCtxAd);
 	bl = JSON.parse(db._store.get('blacklist') || '[]');
 	assert('长正文讨论引用广告 → 不误杀当前发送者', !bl.some((e) => e.id === '91002'));
-	assert('长正文讨论引用广告 → 不删当前消息', callsOf('deleteMessage').length === 0);
+	assert('长正文讨论引用广告 → 删除当前含广告引用的消息', callsOf('deleteMessage').some((c) => c.body.message_id === 901));
+}
+
+// ---------- [81b] 引用广告归属：第一次观察、原作者封禁、第二次升级 ----------
+console.log('\n[81b] 引用广告归属与观察升级');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => String(b.chat_id).startsWith('-')
+			? ({ ok: true, result: { id: Number(b.chat_id), title: '广告归属测试群', type: 'supergroup' } })
+			: ({ ok: true, result: { id: Number(b.chat_id), first_name: '正常用户', type: 'private' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const db = makeAdD1({ porn: ['大婆啦'], general: ['揾逼赚钱'] });
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,998', SUPER_ADMINS: '7777', AD_FILTER_ENABLED: 'true', DB: db };
+	const relayMessage = (messageId, outer = 'p', actorId = 94001) => ({
+		message_id: messageId,
+		chat: { id: -1001, type: 'supergroup', title: '广告归属测试群' },
+		from: { id: actorId, is_bot: false, first_name: '正常回复者' },
+		...(outer === null ? { sticker: { file_id: 'sticker-1', emoji: '👍' } } : { text: outer }),
+		reply_to_message: {
+			message_id: 800,
+			from: { id: 94002, is_bot: false, first_name: '原广告作者' },
+			text: '📢 大婆啦 我的妈 揾逼赚钱',
+		},
+	});
+
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: relayMessage(94010) }) }), env, fakeCtxAd);
+	assert('第一次 p 回复广告 → 当前回复者不进全局黑名单', !db._rows.has('94001'));
+	assert('第一次 p 回复广告 → 原作者有 TGID 时照常进全局黑名单', db._rows.get('94002')?.reason === 'ad_auto');
+	assert('第一次 p 回复广告 → 只全群封禁原作者', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '94002'));
+	assert('第一次 p 回复广告 → 删除当前含广告引用的消息', callsOf('deleteMessage').some((c) => c.body.message_id === 94010));
+	assert('第一次 p 回复广告 → D1 观察次数为 1', db._relayObservations.get('94001')?.occurrences === 1);
+	const firstNotice = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('观察完整通知 → 第一主人收到当前回复者、原作者和处理结果', !!firstNotice && firstNotice.body.text.includes('广告引用观察') && firstNotice.body.text.includes('94001') && firstNotice.body.text.includes('94002'));
+	assert('观察完整通知 → 群内、副主人、超管、回复者均不接收', callsOf('sendMessage').every((c) => String(c.body.chat_id) === '999'));
+
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: relayMessage(94010) }) }), env, fakeCtxAd);
+	assert('同一 Telegram 消息重试 → 观察次数仍为 1', db._relayObservations.get('94001')?.occurrences === 1);
+	assert('同一 Telegram 消息重试 → 当前回复者仍不封禁', !db._rows.has('94001'));
+
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: relayMessage(94011, 'k') }) }), env, fakeCtxAd);
+	assert('第二次不同消息传播广告 → 当前回复者升级全局黑名单', db._rows.get('94001')?.reason === 'ad_auto');
+	assert('第二次不同消息传播广告 → 观察次数为 2', db._relayObservations.get('94001')?.occurrences === 2);
+	const repeatTargets = new Set(callsOf('banChatMember').map((c) => String(c.body.user_id)));
+	assert('第二次传播 → 当前回复者和原作者均执行全群封禁且按 TGID 去重', callsOf('banChatMember').length === 4 && repeatTargets.size === 2 && repeatTargets.has('94001') && repeatTargets.has('94002'));
+	assert('第二次传播通知 → 仍只发第一主人', callsOf('sendMessage').every((c) => String(c.body.chat_id) === '999'));
+
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: relayMessage(94012, null, 94003) }) }), env, fakeCtxAd);
+	assert('贴纸误回复广告 → 第一次只观察、不封当前回复者', !db._rows.has('94003') && db._relayObservations.get('94003')?.occurrences === 1);
+	assert('贴纸误回复广告 → 删除当前消息并继续处理原作者', callsOf('deleteMessage').some((c) => c.body.message_id === 94012) && callsOf('banChatMember').every((c) => String(c.body.user_id) === '94002'));
+}
+
+// ---------- [81c] 原作者隐藏、自引用与转发归属 ----------
+console.log('\n[81c] 原作者隐藏、自引用与转发归属');
+{
+	const baseRoutes = {
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: String(b.chat_id).startsWith('-') ? '归属测试群' : undefined, first_name: '正常用户', type: String(b.chat_id).startsWith('-') ? 'supergroup' : 'private' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	};
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock(baseRoutes);
+	let db = makeAdD1({ porn: ['大婆啦'] });
+	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 94100, chat: { id: -1001, type: 'supergroup' }, from: { id: 94100, is_bot: false, first_name: '正常用户' },
+		text: 'p', quote: { text: '📢 大婆啦 广告内容' },
+	} }) }), env, fakeCtxAd);
+	assert('原作者 TGID 隐藏 → 不按昵称猜测、不执行任何封禁', !db._rows.has('94100') && callsOf('banChatMember').length === 0);
+	const hiddenNotice = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('原作者 TGID 隐藏 → 主人通知明确说明未提供可验证 TGID', !!hiddenNotice && hiddenNotice.body.text.includes('未提供可验证 TGID'));
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock(baseRoutes);
+	db = makeAdD1({ porn: ['大婆啦'] });
+	env = { ...env, DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 94110, chat: { id: -1001, type: 'supergroup' }, from: { id: 94110, is_bot: false, first_name: '自引用者' }, text: 'p',
+		reply_to_message: { message_id: 700, from: { id: 94110, is_bot: false, first_name: '自引用者' }, text: '📢 大婆啦 广告内容' },
+	} }) }), env, fakeCtxAd);
+	assert('自己引用自己的广告 → 立即全局封禁当前发送者', db._rows.get('94110')?.reason === 'ad_auto' && callsOf('banChatMember').length === 2);
+	assert('自己引用自己的广告 → 不写普通误回复观察', !db._relayObservations.has('94110'));
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock(baseRoutes);
+	db = makeAdD1();
+	env = { ...env, DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 94120, chat: { id: -1001, type: 'supergroup' }, from: { id: 94120, is_bot: false, first_name: '转发者' },
+		text: '专业出u承兑日入过万',
+		forward_origin: { type: 'user', sender_user: { id: 94121, is_bot: false, first_name: '原作者' } },
+		forward_from: { id: 94121, is_bot: false, first_name: '原作者' },
+	} }) }), env, fakeCtxAd);
+	const forwardTargets = new Set(callsOf('banChatMember').map((c) => String(c.body.user_id)));
+	assert('直接转发广告 → 当前传播者与原作者都进全局黑名单', db._rows.has('94120') && db._rows.has('94121'));
+	assert('直接转发广告 → 重复来源字段按 TGID 去重，仅执行 2 人×2群', callsOf('banChatMember').length === 4 && forwardTargets.size === 2);
+}
+
+// ---------- [81d] legacy 污染样本与新可信样本 ----------
+console.log('\n[81d] legacy 污染样本与可信样本');
+{
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	let db = makeFakeDB([]);
+	db._store.set('ad_samples', JSON.stringify({ fingerprints: [normalizeFp('我 秦始皇 打钱')], count: 1 }));
+	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 94200, chat: { id: -1001, type: 'supergroup' }, from: { id: 94200, is_bot: false, first_name: '正常用户' }, text: '我 秦始皇 打钱' } }) }), env, fakeCtxAd);
+	assert('旧裸样本“我秦始皇打钱” → 无额外广告证据时不再误杀', !db._rows.has('94200') && callsOf('deleteMessage').length === 0 && callsOf('banChatMember').length === 0);
+
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	db = makeFakeDB([]);
+	db._store.set('ad_samples', JSON.stringify(trustedSampleData(['人工确认广告样本ABC123'])));
+	env = { ...env, DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 94201, chat: { id: -1001, type: 'supergroup' }, from: { id: 94201, is_bot: false, first_name: '广告用户' }, text: '人工确认广告样本ABC123' } }) }), env, fakeCtxAd);
+	assert('新可信样本精确匹配 → 仍自动加黑并全群封禁', db._rows.get('94201')?.reason === 'ad_auto' && callsOf('banChatMember').length === 2);
+}
+
+// ---------- [81e] Telegram bio 与 sender_chat 身份广告 ----------
+console.log('\n[81e] bio 与 sender_chat 身份广告');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => String(b.chat_id) === '94300'
+			? ({ ok: true, result: { id: 94300, first_name: '正常名字', bio: '约炮资源入口', type: 'private' } })
+			: ({ ok: true, result: { id: Number(b.chat_id), title: '测试群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	let db = makeAdD1({ identity: ['约炮'] });
+	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 94300, chat: { id: -1001, type: 'supergroup' }, from: { id: 94300, is_bot: false, first_name: '正常名字' }, text: '大家好' } }) }), env, fakeCtxAd);
+	assert('Telegram getChat 可返回 bio 时 → bio 身份广告立即封禁', db._rows.get('94300')?.reason === 'ad_auto' && callsOf('banChatMember').length === 2);
+
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	db = makeAdD1({ identity: ['裸聊'] });
+	env = { ...env, DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 94301, chat: { id: -1001, type: 'supergroup' }, from: { id: 94301, is_bot: false, first_name: '普通用户' },
+		sender_chat: { id: -100998, type: 'channel', title: '裸聊资源入口' }, text: '正常正文',
+	} }) }), env, fakeCtxAd);
+	assert('sender_chat 名称含身份广告词 → 当前发送者立即封禁', db._rows.get('94301')?.reason === 'ad_auto' && callsOf('banChatMember').length === 2);
+}
+
+// ---------- [81f] /spam 学习真实广告载体与身份资料防污染 ----------
+console.log('\n[81f] /spam 学习载体归属');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), first_name: '普通用户', title: String(b.chat_id).startsWith('-') ? '测试群' : undefined, type: String(b.chat_id).startsWith('-') ? 'supergroup' : 'private' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	let db = makeAdD1({ porn: ['大婆啦'] });
+	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 94400, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/spam',
+		reply_to_message: { message_id: 94401, from: { id: 94401, is_bot: false, first_name: '包装传播者' }, text: 'p', quote: { text: '📢 大婆啦 真实广告正文' } },
+	} }) }), env, fakeCtxAd);
+	let samples = JSON.parse(db._store.get('ad_samples') || '{"fingerprints":[],"entries":[]}');
+	assert('/spam 引用包装广告 → 学习引用中的真实广告而不是外层 p', samples.fingerprints.includes(normalizeFp('📢 大婆啦 真实广告正文')) && !samples.fingerprints.includes(normalizeFp('p')));
+	const quotedEntry = samples.entries?.find((entry) => entry.fingerprint === normalizeFp('📢 大婆啦 真实广告正文'));
+	assert('/spam 引用学习 → 保存可信来源、操作者、消息与内容预览', quotedEntry?.trusted === true && quotedEntry.source === 'spam:quoted-ad' && quotedEntry.operatorId === '999' && quotedEntry.sourceMessageId === '94401' && quotedEntry.preview.includes('真实广告正文'));
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => String(b.chat_id) === '94411'
+			? ({ ok: true, result: { id: 94411, first_name: '正常名字', bio: '约炮资源入口', type: 'private' } })
+			: ({ ok: true, result: { id: Number(b.chat_id), first_name: '主人', title: String(b.chat_id).startsWith('-') ? '测试群' : undefined, type: String(b.chat_id).startsWith('-') ? 'supergroup' : 'private' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	db = makeAdD1({ identity: ['约炮'] });
+	env = { ...env, DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 94410, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/spam',
+		reply_to_message: { message_id: 94411, from: { id: 94411, is_bot: false, first_name: '正常名字' }, text: '你好，刚进群' },
+	} }) }), env, fakeCtxAd);
+	assert('/spam 仅资料是广告 → 账号照常封禁', db._rows.has('94411'));
+	assert('/spam 仅资料是广告 → 不学习当前正常正文', !db._store.has('ad_samples'));
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => String(b.chat_id) === '94421'
+			? ({ ok: true, result: { id: 94421, first_name: '正常名字', bio: '专属担保 代收黑钱入口', type: 'private' } })
+			: ({ ok: true, result: { id: Number(b.chat_id), first_name: '主人', title: String(b.chat_id).startsWith('-') ? '测试群' : undefined, type: String(b.chat_id).startsWith('-') ? 'supergroup' : 'private' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	db = makeAdD1({ fraud: ['专属担保', '代收黑钱'] });
+	env = { ...env, DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 94420, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/spam',
+		reply_to_message: { message_id: 94421, from: { id: 94421, is_bot: false, first_name: '正常名字' }, text: '今天路过打个招呼' },
+	} }) }), env, fakeCtxAd);
+	assert('/spam 资料通过普通广告词评分命中 → 账号照常封禁', db._rows.has('94421'));
+	assert('/spam 资料通过普通广告词评分命中 → 不学习当前正常正文', !db._store.has('ad_samples'));
+}
+
+// ---------- [81g] 主人私聊失败不影响 D1 观察与原作者封禁 ----------
+console.log('\n[81g] 观察通知失败隔离');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), first_name: '普通用户', title: '测试群', type: String(b.chat_id).startsWith('-') ? 'supergroup' : 'private' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: false, description: 'Forbidden: bot was blocked by the user' }),
+	});
+	const db = makeAdD1({ porn: ['大婆啦'] });
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,998', AD_FILTER_ENABLED: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 94500, chat: { id: -1001, type: 'supergroup' }, from: { id: 94500, is_bot: false, first_name: '正常回复者' }, text: 'p',
+		reply_to_message: { message_id: 600, from: { id: 94501, is_bot: false, first_name: '原作者' }, text: '📢 大婆啦 广告内容' },
+	} }) }), env, fakeCtxAd);
+	assert('第一主人私聊失败 → D1 观察记录仍保留', db._relayObservations.get('94500')?.occurrences === 1);
+	assert('第一主人私聊失败 → 原作者仍写黑名单并全群封禁', db._rows.has('94501') && callsOf('banChatMember').length === 2);
+	assert('第一主人私聊失败 → 不回退发送给副主人或群聊', callsOf('sendMessage').length === 1 && String(callsOf('sendMessage')[0].body.chat_id) === '999');
 }
 
 // ---------- [82] identity词库导入 ----------
@@ -5426,11 +5715,7 @@ console.log('\n[83] 代理相关内容绝对豁免与安全边界');
 	sandbox.fetch = adFetchMock();
 	db = makeAdD1();
 	const learnedProxyText = 'socks5://888:888@47.243.87.133:1080 假钞交流群';
-	db._store.set('ad_samples', JSON.stringify({
-		fingerprints: [normalizeFp(learnedProxyText)],
-		count: 1,
-		updatedAt: '2026-07-23T00:00:00.000Z',
-	}));
+	db._store.set('ad_samples', JSON.stringify(trustedSampleData([learnedProxyText], 'proxy-test')));
 	env = makeProxyTestEnv(db);
 	await dispatchMessage({
 		message_id: 93200,
@@ -5467,8 +5752,8 @@ console.log('\n[83] 代理相关内容绝对豁免与安全边界');
 		text: 'k',
 		quote: { text: '@promo_bot @promo_bot @promo_bot 高薪兼职' },
 	}, env);
-	assert('非代理重复 Telegram @账号引流 → 仍加黑并全群封禁',
-		db._rows.has('93202') && callsOf('banChatMember').length === 2);
+	assert('非代理重复 Telegram @账号引流 → 第一次只观察、不全群封禁',
+		!db._rows.has('93202') && callsOf('banChatMember').length === 0 && db._relayObservations.get('93202')?.occurrences === 1);
 
 	// 黑名单拦截在代理豁免之前：已在 D1 的用户发代理内容仍必须删消息并踢出当前群。
 	resetCalls();
