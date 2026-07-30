@@ -5116,7 +5116,9 @@ function summarizeQuoteStructures(message) {
 }
 
 function isShortQuoteWrapperText(text) {
-	const raw = String(text || '').trim();
+	const raw = String(text || '')
+		.replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '')
+		.trim();
 	if (!raw) return true;
 	const normalized = normalizeForFingerprint(raw);
 	if (!normalized) return true;
@@ -5124,6 +5126,27 @@ function isShortQuoteWrapperText(text) {
 	// 正常中文短回复(如"那还挺好的""好的谢谢")不能触发引用广告封禁。
 	if (!/^[a-z0-9]+$/i.test(normalized)) return false;
 	return normalized.length <= 8 && /^[a-z0-9\W_]{1,16}$/i.test(raw);
+}
+
+function isHighConfidenceQuotedAdEvidence(quoteAd) {
+	if (!quoteAd) return false;
+	if (quoteAd.sampleTrusted === true) return true;
+	return [
+		'引用内容高危词',
+		'引用@引流泛滥',
+		'引用内容@bot+诱导词',
+	].includes(String(quoteAd.strong || ''));
+}
+
+function isImmediateQuotedAdRelay(message, quoteAd) {
+	if (!isHighConfidenceQuotedAdEvidence(quoteAd)) return false;
+	// 贴纸可能只是正常用户误触回复，继续走首次观察；这里只首杀文字/标题里的无意义包装。
+	if (message?.sticker) return false;
+	const wrapper = typeof message?.text === 'string'
+		? message.text
+		: (typeof message?.caption === 'string' ? message.caption : null);
+	if (wrapper === null) return false;
+	return isShortQuoteWrapperText(wrapper);
 }
 
 function logQuoteAdDiagnostic(message, quoteText, detail = {}) {
@@ -5820,23 +5843,32 @@ async function notifyOwnerAdRelayObservation(message, adResult, context = {}) {
 	} catch (_) {}
 
 	const observation = context.observation || {};
+	const immediateRelayBan = context.immediateRelayBan === true;
 	const upgraded = Boolean(context.currentResult);
 	const lines = [
-		'🧭 <b>广告引用观察</b>',
-		`🎬 动作:${context.deleteResult?.ok ? '已删除当前含广告引用的消息' : '删除当前消息失败'} + ${upgraded ? '重复传播升级全局封禁' : '当前回复者暂不全局封禁'}`,
+		immediateRelayBan ? '🚫 <b>高置信引用广告首杀</b>' : '🧭 <b>广告引用观察</b>',
+		`🎬 动作:${context.deleteResult?.ok ? '已删除当前含广告引用的消息' : '删除当前消息失败'} + ${immediateRelayBan ? '无意义短包装主动传播，首次直接全局封禁' : (upgraded ? '重复传播升级全局封禁' : '当前回复者暂不全局封禁')}`,
 		`👤 当前回复者:${actor} <code>${escapeHtml(actorId)}</code>`,
 		`📍 触发群:${groupLabel}`,
-		`🧾 观察次数:${observation.ok ? observation.occurrences : '写入失败'}`,
+	];
+	if (!immediateRelayBan) lines.push(`🧾 观察次数:${observation.ok ? observation.occurrences : '写入失败'}`);
+	lines.push(
 		`💬 外层内容:${escapeHtml(String(wrapper).slice(0, 100))}`,
 		`📢 引用广告:${escapeHtml(String(adResult?.quoteAd?.quotePreview || '').slice(0, 160))}`,
 		`🔍 判定依据:${escapeHtml([adResult?.quoteAd?.strong, ...(adResult?.quoteAd?.hits || [])].filter(Boolean).join(' / '))}`,
-	];
-	if (!observation.ok) lines.push(`⚠️ D1 观察记录失败:${escapeHtml(observation.error || '未知错误')}`);
-	else if (observation.duplicate) lines.push('ℹ️ 同一 Telegram 消息重试，观察次数未重复累计');
-	else if (!upgraded) lines.push('✅ 第一次观察已留档；当前回复者未加入全局黑名单');
+	);
+	if (!immediateRelayBan) {
+		if (!observation.ok) lines.push(`⚠️ D1 观察记录失败:${escapeHtml(observation.error || '未知错误')}`);
+		else if (observation.duplicate) lines.push('ℹ️ 同一 Telegram 消息重试，观察次数未重复累计');
+		else if (!upgraded) lines.push('✅ 第一次观察已留档；当前回复者未加入全局黑名单');
+	}
 	if (context.currentResult) {
 		lines.push('');
-		await appendAutomaticAdTargetDetail(lines, '🚫 当前回复者升级处理', context.currentResult);
+		await appendAutomaticAdTargetDetail(
+			lines,
+			immediateRelayBan ? '🚫 当前传播者首次处理' : '🚫 当前回复者升级处理',
+			context.currentResult,
+		);
 	}
 	lines.push('');
 	if ((context.originalResults || []).length === 0) {
@@ -5884,9 +5916,16 @@ async function handleAutomaticAdDecision(message, adResult, env) {
 	}
 	const selfQuotedAd = quoteAd && originalMap.has(currentId);
 	originalMap.delete(currentId);
+	const immediateRelayBan = Boolean(
+		quoteAd
+		&& !directAd
+		&& !selfQuotedAd
+		&& !isForwardedMessage(message)
+		&& isImmediateQuotedAdRelay(message, quoteAd)
+	);
 
 	let observation = null;
-	let shouldBanCurrent = directAd || selfQuotedAd || (quoteAd && isForwardedMessage(message));
+	let shouldBanCurrent = directAd || selfQuotedAd || (quoteAd && isForwardedMessage(message)) || immediateRelayBan;
 	if (quoteAd && !shouldBanCurrent) {
 		observation = await recordAdRelayObservation(env, {
 			actorId: currentId,
@@ -5906,7 +5945,7 @@ async function handleAutomaticAdDecision(message, adResult, env) {
 		currentResult = await enforceAutomaticAdTarget({
 			id: currentId,
 			user: message.from,
-			source: directAd ? '当前广告发送者' : '重复引用传播者',
+			source: directAd ? '当前广告发送者' : (immediateRelayBan ? '高置信短包装广告传播者' : '重复引用传播者'),
 		}, env, { skipAdminCheck: true });
 	}
 
@@ -5919,6 +5958,7 @@ async function handleAutomaticAdDecision(message, adResult, env) {
 		await notifyOwnerAdRelayObservation(message, adResult, {
 			deleteResult,
 			observation: observation || { ok: true, occurrences: AD_RELAY_REPEAT_THRESHOLD },
+			immediateRelayBan,
 			currentResult,
 			originalResults,
 		});

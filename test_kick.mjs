@@ -5213,11 +5213,39 @@ console.log('\n[81] 短正文引用广告自动拦截');
 		}
 	}) }), env, fakeCtxAd);
 	let bl = JSON.parse(db._store.get('blacklist') || '[]');
-	assert('短正文引用广告 → 第一次只观察、不加黑当前发送者', !bl.some((e) => e.id === '91001'));
-	assert('短正文引用广告 → 删除当前消息', callsOf('deleteMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 900));
-	assert('短正文引用广告 → 第一次不全群踢当前发送者', callsOf('banChatMember').length === 0);
+	assert('短正文引用高危广告 → 第一次直接加黑当前传播者', bl.some((e) => e.id === '91001'));
+	assert('短正文引用高危广告 → 删除当前消息', callsOf('deleteMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 900));
+	assert('短正文引用高危广告 → 第一次全群封禁当前传播者', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '91001'));
+	assert('短正文引用高危广告 → 不写 D1 观察档案', !db._relayObservations.has('91001'));
 	const ownerDm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
-	assert('短正文引用广告 → 通知包含引用内容', ownerDm.some((c) => c.body.text.includes('引用内容') && c.body.text.includes('揾逼赚钱')));
+	assert('短正文引用高危广告 → 通知标明首杀且不显示观察次数', ownerDm.some((c) => c.body.text.includes('高置信引用广告首杀') && c.body.text.includes('揾逼赚钱') && !c.body.text.includes('观察次数')));
+
+	const strongWrapperCases = [
+		{ label: 'j', text: 'j' },
+		{ label: 'v', text: 'v' },
+		{ label: 'n', text: 'n' },
+		{ label: '零宽字符', text: '\u200B' },
+	];
+	for (const [index, wrapperCase] of strongWrapperCases.entries()) {
+		resetCalls();
+		db = makeFakeDB([]);
+		db._store.set('ad_keywords_custom', JSON.stringify({ porn: ['探花'], fraud: ['提供设备'] }));
+		env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+		const actorId = String(91100 + index);
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({
+			message: {
+				message_id: 91100 + index,
+				chat: { id: -1001, type: 'supergroup', title: '广告测试群' },
+				from: { id: Number(actorId), is_bot: false, first_name: '包装广告号' },
+				text: wrapperCase.text,
+				quote: { text: '摄影赚钱 招探花9000一单，提供设备' },
+			}
+		}) }), env, fakeCtxAd);
+		bl = JSON.parse(db._store.get('blacklist') || '[]');
+		assert(`${wrapperCase.label} 包装明确高危广告 → 首次直接全局加黑`, bl.some((entry) => entry.id === actorId));
+		assert(`${wrapperCase.label} 包装明确高危广告 → 当前传播者执行全部 GROUP_ID 封禁`, callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((call) => String(call.body.user_id) === actorId));
+		assert(`${wrapperCase.label} 包装明确高危广告 → 不进入观察表`, !db._relayObservations.has(actorId));
+	}
 
 	resetCalls();
 	db = makeFakeDB([]);
@@ -5291,9 +5319,10 @@ console.log('\n[81] 短正文引用广告自动拦截');
 		}
 	}) }), env, fakeCtxAd);
 	bl = JSON.parse(db._store.get('blacklist') || '[]');
-	assert('短正文引用单个高危词 → 第一次只观察、不加黑当前发送者', !bl.some((e) => e.id === '91003'));
+	assert('短正文引用单个高危词 → 第一次直接加黑当前传播者', bl.some((e) => e.id === '91003'));
 	assert('短正文引用单个高危词 → 删除当前消息', callsOf('deleteMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 902));
-	assert('短正文引用单个高危词 → 第一次不全群踢当前发送者', callsOf('banChatMember').length === 0);
+	assert('短正文引用单个高危词 → 第一次全群封禁当前传播者', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '91003'));
+	assert('短正文引用单个高危词 → 不写观察档案', !db._relayObservations.has('91003'));
 
 	resetCalls();
 	db = makeFakeDB([]);
@@ -5315,9 +5344,10 @@ console.log('\n[81] 短正文引用广告自动拦截');
 		}
 	}) }), env, fakeCtxAd);
 	bl = JSON.parse(db._store.get('blacklist') || '[]');
-	assert('ASCII包装引用卡片广告 → 第一次只观察、不加黑当前发送者', !bl.some((e) => e.id === '91004'));
+	assert('ASCII包装引用卡片广告 → 第一次直接加黑当前传播者', bl.some((e) => e.id === '91004'));
 	assert('ASCII包装引用卡片广告 → 删除当前消息', callsOf('deleteMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 903));
-	assert('ASCII包装引用卡片广告 → 第一次不全群踢当前发送者', callsOf('banChatMember').length === 0);
+	assert('ASCII包装引用卡片广告 → 第一次全群封禁当前传播者', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '91004'));
+	assert('ASCII包装引用卡片广告 → 不写观察档案', !db._relayObservations.has('91004'));
 
 	resetCalls();
 	db = makeFakeDB([]);
@@ -5342,6 +5372,7 @@ console.log('\n[81] 短正文引用广告自动拦截');
 	assert('中文正常短回复引用卡片广告 → 不误杀当前发送者', !bl.some((e) => e.id === '91008'));
 	assert('中文正常短回复引用卡片广告 → 删除当前含广告引用的消息', callsOf('deleteMessage').some((c) => c.body.message_id === 906));
 	assert('中文正常短回复引用卡片广告 → 不全群踢', callsOf('banChatMember').length === 0);
+	assert('中文正常短回复引用卡片广告 → 第一次仍写观察档案', db._relayObservations.get('91008')?.occurrences === 1);
 
 	resetCalls();
 	db = makeFakeDB([]);
@@ -5376,7 +5407,7 @@ console.log('\n[81b] 引用广告归属与观察升级');
 	});
 	const db = makeAdD1({ porn: ['大婆啦'], general: ['揾逼赚钱'] });
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,998', SUPER_ADMINS: '7777', AD_FILTER_ENABLED: 'true', DB: db };
-	const relayMessage = (messageId, outer = 'p', actorId = 94001) => ({
+	const relayMessage = (messageId, outer = '这是什么', actorId = 94001) => ({
 		message_id: messageId,
 		chat: { id: -1001, type: 'supergroup', title: '广告归属测试群' },
 		from: { id: actorId, is_bot: false, first_name: '正常回复者' },
@@ -5389,11 +5420,11 @@ console.log('\n[81b] 引用广告归属与观察升级');
 	});
 
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: relayMessage(94010) }) }), env, fakeCtxAd);
-	assert('第一次 p 回复广告 → 当前回复者不进全局黑名单', !db._rows.has('94001'));
-	assert('第一次 p 回复广告 → 原作者有 TGID 时照常进全局黑名单', db._rows.get('94002')?.reason === 'ad_auto');
-	assert('第一次 p 回复广告 → 只全群封禁原作者', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '94002'));
-	assert('第一次 p 回复广告 → 删除当前含广告引用的消息', callsOf('deleteMessage').some((c) => c.body.message_id === 94010));
-	assert('第一次 p 回复广告 → D1 观察次数为 1', db._relayObservations.get('94001')?.occurrences === 1);
+	assert('第一次正常文字回复广告 → 当前回复者不进全局黑名单', !db._rows.has('94001'));
+	assert('第一次正常文字回复广告 → 原作者有 TGID 时照常进全局黑名单', db._rows.get('94002')?.reason === 'ad_auto');
+	assert('第一次正常文字回复广告 → 只全群封禁原作者', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '94002'));
+	assert('第一次正常文字回复广告 → 删除当前含广告引用的消息', callsOf('deleteMessage').some((c) => c.body.message_id === 94010));
+	assert('第一次正常文字回复广告 → D1 观察次数为 1', db._relayObservations.get('94001')?.occurrences === 1);
 	const firstNotice = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('观察完整通知 → 第一主人收到当前回复者、原作者和处理结果', !!firstNotice && firstNotice.body.text.includes('广告引用观察') && firstNotice.body.text.includes('94001') && firstNotice.body.text.includes('94002'));
 	assert('观察完整通知 → 群内、副主人、超管、回复者均不接收', callsOf('sendMessage').every((c) => String(c.body.chat_id) === '999'));
@@ -5404,7 +5435,7 @@ console.log('\n[81b] 引用广告归属与观察升级');
 	assert('同一 Telegram 消息重试 → 当前回复者仍不封禁', !db._rows.has('94001'));
 
 	resetCalls();
-	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: relayMessage(94011, 'k') }) }), env, fakeCtxAd);
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: relayMessage(94011, '别发广告') }) }), env, fakeCtxAd);
 	assert('第二次不同消息传播广告 → 当前回复者升级全局黑名单', db._rows.get('94001')?.reason === 'ad_auto');
 	assert('第二次不同消息传播广告 → 观察次数为 2', db._relayObservations.get('94001')?.occurrences === 2);
 	const repeatTargets = new Set(callsOf('banChatMember').map((c) => String(c.body.user_id)));
@@ -5434,7 +5465,7 @@ console.log('\n[81c] 原作者隐藏、自引用与转发归属');
 	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
 		message_id: 94100, chat: { id: -1001, type: 'supergroup' }, from: { id: 94100, is_bot: false, first_name: '正常用户' },
-		text: 'p', quote: { text: '📢 大婆啦 广告内容' },
+		text: '这是广告吗', quote: { text: '📢 大婆啦 广告内容' },
 	} }) }), env, fakeCtxAd);
 	assert('原作者 TGID 隐藏 → 不按昵称猜测、不执行任何封禁', !db._rows.has('94100') && callsOf('banChatMember').length === 0);
 	const hiddenNotice = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
@@ -5590,7 +5621,7 @@ console.log('\n[81g] 观察通知失败隔离');
 	const db = makeAdD1({ porn: ['大婆啦'] });
 	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,998', AD_FILTER_ENABLED: 'true', DB: db };
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
-		message_id: 94500, chat: { id: -1001, type: 'supergroup' }, from: { id: 94500, is_bot: false, first_name: '正常回复者' }, text: 'p',
+		message_id: 94500, chat: { id: -1001, type: 'supergroup' }, from: { id: 94500, is_bot: false, first_name: '正常回复者' }, text: '这是什么',
 		reply_to_message: { message_id: 600, from: { id: 94501, is_bot: false, first_name: '原作者' }, text: '📢 大婆啦 广告内容' },
 	} }) }), env, fakeCtxAd);
 	assert('第一主人私聊失败 → D1 观察记录仍保留', db._relayObservations.get('94500')?.occurrences === 1);
@@ -5613,7 +5644,7 @@ console.log('\n[81h] D1 schema v3 自动迁移与缺表自愈');
 		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
 			message_id: scenario.actorId, chat: { id: -1001, type: 'supergroup' },
 			from: { id: scenario.actorId, is_bot: false, first_name: '正常回复者' },
-			text: 'p', quote: { text: '📢 大婆啦 广告内容' },
+			text: '这是什么', quote: { text: '📢 大婆啦 广告内容' },
 		} }) }), env, fakeCtxAd);
 		const ownerNotice = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
 		assert(`${scenario.label} → 自动升级 schema 到 v3`, db._schema.version === 3);
@@ -5802,8 +5833,8 @@ console.log('\n[83] 代理相关内容绝对豁免与安全边界');
 		text: 'k',
 		quote: { text: '@promo_bot @promo_bot @promo_bot 高薪兼职' },
 	}, env);
-	assert('非代理重复 Telegram @账号引流 → 第一次只观察、不全群封禁',
-		!db._rows.has('93202') && callsOf('banChatMember').length === 0 && db._relayObservations.get('93202')?.occurrences === 1);
+	assert('非代理重复 Telegram @账号引流 + 无意义包装 → 第一次直接全局封禁且不观察',
+		db._rows.has('93202') && callsOf('banChatMember').length === 2 && !db._relayObservations.has('93202'));
 
 	// 黑名单拦截在代理豁免之前：已在 D1 的用户发代理内容仍必须删消息并踢出当前群。
 	resetCalls();
