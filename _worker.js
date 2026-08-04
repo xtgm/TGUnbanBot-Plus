@@ -5130,6 +5130,7 @@ function isShortQuoteWrapperText(text) {
 
 function isHighConfidenceQuotedAdEvidence(quoteAd) {
 	if (!quoteAd) return false;
+	if (quoteAd.originalAuthorBanSafe === true) return true;
 	if (quoteAd.sampleTrusted === true) return true;
 	return [
 		'引用内容高危词',
@@ -5207,6 +5208,67 @@ function scoreHighRiskAdWords(text) {
 	return hits;
 }
 
+function analyzeQuotedHighRiskIntent(text, highRiskHits = []) {
+	let scan = String(text || '').toLowerCase();
+	try {
+		scan = scan.normalize('NFKC');
+	} catch (_) {}
+
+	const passiveOrWarningPatterns = [
+		['他人向本人私信/推销', /(?:有人|别人|对方|陌生人|广告号|骗子|[一二两三四五六七八九十\d]+个?人).{0,20}(?:给|向)?我.{0,10}(?:私信|私聊|发消息|发广告|推销|推荐)/i],
+		['他人主动私信本人', /(?:有人|别人|对方|陌生人|广告号|骗子|[一二两三四五六七八九十\d]+个?人).{0,12}(?:私信|私聊|发消息|推销|推荐).{0,6}(?:我|本人)/i],
+		['本人收到骚扰/广告', /(?:我|本人).{0,8}(?:收到|收到了|遇到|碰到|被).{0,24}(?:私信|私聊|消息|广告|推销|骚扰|骗子|诈骗)/i],
+		['被诈骗经历', /我.{0,30}(?:被骗|受骗|上当|被坑|被骚扰)/i],
+		['收到或发现广告', /(?:收到|遇到|碰到|看见|看到|发现).{0,24}(?:广告|推销|骚扰|骗子|诈骗)/i],
+		['举报/曝光/警告', /(?:举报|曝光|通报|提醒|警惕|小心|谨防).{0,24}(?:骗子|诈骗|广告|引流|推广|别信|勿信|不要信|上当|受骗)/i],
+		['明确指出是广告/诈骗', /(?:这是|这个是|那是|那个是|属于).{0,10}(?:骗子|诈骗|广告|引流|推广)/i],
+		['明确劝阻', /(?:骗子|诈骗|广告|引流|推广).{0,12}(?:别信|勿信|不要信|小心|警惕|别联系|别加|别点|别扫码)/i],
+		['明确禁止互动', /(?:别|不要|请勿|勿)(?:相信|信|联系(?:他|她|他们|对方)|加(?:他|她|他们|对方)|点击|扫码|转账|付款|上当|理会|回复)/i],
+	];
+	const contextHits = passiveOrWarningPatterns
+		.filter(([, pattern]) => pattern.test(scan))
+		.map(([label]) => label);
+
+	const contactPattern = /(?:联系|私信|私聊|加|添加|找)(?:我|本人|客服|商家|店主|老板|代理|频道|群|微信|微|v|vx|tg|telegram)/i;
+	const accountPattern = /(?:https?:\/\/|t\.me\/|telegram\.me\/|@[a-z][\w]{3,})/i;
+	const questionPattern = /(?:怎么|如何|为什么|是否|是不是|哪里|哪儿|多少(?:钱)?|什么(?:材料|手续|流程|条件|意思)|哪些(?:材料|手续)|需要(?:什么|哪些)|要准备什么|合法吗|真的假的|靠谱吗)/i;
+	if (questionPattern.test(scan) && !contactPattern.test(scan) && !accountPattern.test(scan)) {
+		contextHits.push('咨询/提问语境');
+	}
+
+	const intentPatterns = [
+		['主动联系方式', contactPattern],
+		['账号或链接入口', accountPattern],
+		['主动提供/招揽', /(?:专业|长期|大量|稳定|低价|特价|优惠|一手|靠谱|诚信|快速|秒出|包过|保真|无风险|可办|能办|代办|承接|供应|提供|出售|售卖|接单|招募|招聘|诚招|招代理|合作代理|全套服务|上门服务)/i],
+		['价格/交易/收益', /(?:价格|售价|报价|费用|一单|每单|佣金|返利|日入|月入|赚钱|下单|购买|包邮|设备免费|[¥￥$]\s*\d|\d+(?:\.\d+)?\s*(?:元|块|rmb|u|usdt|k|w|万))/i],
+		['广告载体/营销动作', /(?:📢|📣|🔞|💰|💵|💸|点击下方|扫码|二维码|进群|频道入口|资源入口|广告位|影院大全|完整版|在线(?:看|观看)|免费(?:看|观看|领取))/i],
+	];
+	const intentHits = intentPatterns
+		.filter(([, pattern]) => pattern.test(scan))
+		.map(([label]) => label);
+
+	for (const hit of highRiskHits) {
+		const separator = String(hit).indexOf(':');
+		const word = separator >= 0 ? String(hit).slice(separator + 1) : '';
+		if (!word) continue;
+		let offset = scan.indexOf(word);
+		while (offset >= 0) {
+			const around = scan.slice(Math.max(0, offset - 12), Math.min(scan.length, offset + word.length + 12));
+			if (/(?:招|收|出|卖|接|代办|办理|可办|能办|提供|承接|出售|售卖|供应)/i.test(around)) {
+				intentHits.push(`高危词附近交易动词:${word}`);
+				break;
+			}
+			offset = scan.indexOf(word, offset + word.length);
+		}
+	}
+
+	return {
+		isPromotional: contextHits.length === 0 && intentHits.length > 0,
+		contextHits: [...new Set(contextHits)],
+		intentHits: [...new Set(intentHits)],
+	};
+}
+
 // 检测"发言人身份"(名字/用户名/简介)里的广告特征。
 // 【重要】只匹配明确的广告词(色情/卖号/卡网/赌博话术),不碰链接/@提及/域名 ——
 //   因为正常用户简介里放双向机器人 @xxxBot、github 链接、个人频道 t.me/xxx、主页域名
@@ -5240,6 +5302,7 @@ function detectQuotedAdEvidence(message, quoteText) {
 		strong,
 		source: '引用内容',
 		quotePreview,
+		originalAuthorBanSafe: false,
 		...extra,
 	});
 
@@ -5247,7 +5310,7 @@ function detectQuotedAdEvidence(message, quoteText) {
 	if (mention.maxRepeat >= 3 || mention.distinct >= 4) {
 		const hits = [`引用@引流泛滥:不同${mention.distinct}个/最多重复${mention.maxRepeat}次`];
 		logQuoteAdDiagnostic(message, quoteText, { decision: 'quote_ad_mention_flood', score: 99, hits });
-		return makeResult('引用@引流泛滥', hits);
+		return makeResult('引用@引流泛滥', hits, 99, { originalAuthorBanSafe: true });
 	}
 
 	const quoteNorm = normalizeForFingerprint(quoteText);
@@ -5256,14 +5319,36 @@ function detectQuotedAdEvidence(message, quoteText) {
 	if (sampleMatch?.trusted && !quoteUrlsAllWhite) {
 		const hits = ['引用内容可信学习样本精确匹配'];
 		logQuoteAdDiagnostic(message, quoteText, { decision: 'quote_ad_trusted_sample', score: 99, hits });
-		return makeResult('引用内容广告', hits, 99, { sampleTrusted: true });
+		return makeResult('引用内容广告', hits, 99, { sampleTrusted: true, originalAuthorBanSafe: true });
 	}
 
 	const highRiskHits = scoreHighRiskAdWords(quoteForScan);
 	if (highRiskHits.length > 0) {
-		const hits = highRiskHits.map((hit) => `引用内容高危:${hit}`);
-		logQuoteAdDiagnostic(message, quoteText, { decision: 'quote_ad_high_risk', score: 99, hits });
-		return makeResult('引用内容高危词', hits, 99, { legacySampleCorroborated: sampleMatch?.legacy === true });
+		const intent = analyzeQuotedHighRiskIntent(quoteForScan, highRiskHits);
+		if (!intent.isPromotional) {
+			logQuoteAdDiagnostic(message, quoteText, {
+				decision: intent.contextHits.length > 0 ? 'quote_high_risk_normal_context' : 'quote_high_risk_without_ad_intent',
+				score: 0,
+				hits: highRiskHits,
+				contextHits: intent.contextHits,
+				intentHits: intent.intentHits,
+			});
+			return null;
+		}
+		const hits = [
+			...highRiskHits.map((hit) => `引用内容高危:${hit}`),
+			...intent.intentHits.map((hit) => `引用内容广告意图:${hit}`),
+		];
+		logQuoteAdDiagnostic(message, quoteText, {
+			decision: 'quote_ad_high_risk_with_intent',
+			score: 99,
+			hits,
+			intentHits: intent.intentHits,
+		});
+		return makeResult('引用内容高危词', hits, 99, {
+			legacySampleCorroborated: sampleMatch?.legacy === true,
+			originalAuthorBanSafe: true,
+		});
 	}
 
 	const mentionsBot = /@[a-z][\w]{2,}bot\b/i.test(quoteForScan);
@@ -5271,7 +5356,10 @@ function detectQuotedAdEvidence(message, quoteText) {
 	if (mentionsBot && hasLure) {
 		const hits = ['引用内容@bot+诱导词'];
 		logQuoteAdDiagnostic(message, quoteText, { decision: 'quote_ad_bot_lure', score: 99, hits });
-		return makeResult('引用内容@bot+诱导词', hits, 99, { legacySampleCorroborated: sampleMatch?.legacy === true });
+		return makeResult('引用内容@bot+诱导词', hits, 99, {
+			legacySampleCorroborated: sampleMatch?.legacy === true,
+			originalAuthorBanSafe: true,
+		});
 	}
 
 	if (!AD_STRICT_MODE) {
@@ -5871,8 +5959,13 @@ async function notifyOwnerAdRelayObservation(message, adResult, context = {}) {
 		);
 	}
 	lines.push('');
+	const quotedAuthors = Array.isArray(context.quoteAuthors) ? context.quoteAuthors : [];
 	if ((context.originalResults || []).length === 0) {
-		lines.push('👤 原广告作者:Telegram 未提供可验证 TGID，未按昵称猜测、未误封');
+		if (quotedAuthors.length > 0 && context.originalAuthorBanSafe === false) {
+			lines.push('👤 原消息作者:已识别 Telegram TGID，但当前仅为弱评分证据，未自动联动封禁');
+		} else {
+			lines.push('👤 原广告作者:Telegram 未提供可验证 TGID，未按昵称猜测、未误封');
+		}
 	} else {
 		for (const result of context.originalResults) {
 			await appendAutomaticAdTargetDetail(lines, '🎯 原广告作者处理', result);
@@ -5907,14 +6000,16 @@ async function handleAutomaticAdDecision(message, adResult, env) {
 
 	const deleteResult = await deleteMessage(message.chat.id, message.message_id);
 	const quoteAuthors = quoteAd ? collectOriginalAuthors(message, 'quote') : [];
+	const originalAuthorBanSafe = quoteAd ? isHighConfidenceQuotedAdEvidence(quoteAd) : false;
+	const linkedQuoteAuthors = originalAuthorBanSafe ? quoteAuthors : [];
 	const forwardAuthors = directAd && isForwardedMessage(message)
 		? collectOriginalAuthors(message, 'forward')
 		: [];
 	const originalMap = new Map();
-	for (const candidate of [...quoteAuthors, ...forwardAuthors]) {
+	for (const candidate of [...linkedQuoteAuthors, ...forwardAuthors]) {
 		if (!originalMap.has(candidate.id)) originalMap.set(candidate.id, candidate);
 	}
-	const selfQuotedAd = quoteAd && originalMap.has(currentId);
+	const selfQuotedAd = quoteAd && originalAuthorBanSafe && originalMap.has(currentId);
 	originalMap.delete(currentId);
 	const immediateRelayBan = Boolean(
 		quoteAd
@@ -5960,6 +6055,8 @@ async function handleAutomaticAdDecision(message, adResult, env) {
 			observation: observation || { ok: true, occurrences: AD_RELAY_REPEAT_THRESHOLD },
 			immediateRelayBan,
 			currentResult,
+			quoteAuthors,
+			originalAuthorBanSafe,
 			originalResults,
 		});
 	} else {

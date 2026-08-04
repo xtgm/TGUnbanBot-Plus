@@ -5655,6 +5655,142 @@ console.log('\n[81h] D1 schema v3 自动迁移与缺表自愈');
 	}
 }
 
+// ---------- [81i] 引用高危词语境、广告意图与原作者安全门 ----------
+console.log('\n[81i] 引用高危词语境与原作者安全门');
+{
+	const routes = {
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => String(b.chat_id).startsWith('-')
+			? ({ ok: true, result: { id: Number(b.chat_id), title: '引用语境测试群', type: 'supergroup' } })
+			: ({ ok: true, result: { id: Number(b.chat_id), first_name: '正常用户', type: 'private' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	};
+	const makeEnv = (db) => ({
+		TOKEN,
+		BOT_TOKEN: '0:fake',
+		GROUP_ID: '-1001,-1002',
+		OWNER_IDS: '999',
+		AD_FILTER_ENABLED: 'true',
+		DB: db,
+	});
+	const dispatch = async (message, env) => {
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message }),
+		}), env, fakeCtxAd);
+	};
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock(routes);
+	let db = makeAdD1({ fraud: ['办证'] });
+	let env = makeEnv(db);
+	await dispatch({
+		message_id: 94700,
+		chat: { id: -1001, type: 'supergroup', title: '引用语境测试群' },
+		from: { id: 6221059640, is_bot: false, first_name: 'John Smith' },
+		text: 'tg嘛',
+		reply_to_message: {
+			message_id: 94699,
+			from: { id: 1335910695, is_bot: false, first_name: 'My fuhrer' },
+			text: '后面马上有两个人给我私信办证的',
+		},
+	}, env);
+	assert('本次误封原话 → 当前回复者不加黑', !db._rows.has('6221059640'));
+	assert('本次误封原话 → 被引用原作者不加黑', !db._rows.has('1335910695'));
+	assert('本次误封原话 → 不删除、不观察、不执行全群封禁', callsOf('deleteMessage').length === 0 && !db._relayObservations.has('6221059640') && callsOf('banChatMember').length === 0);
+	assert('本次误封原话 → 不产生广告处理通知', callsOf('sendMessage').length === 0);
+
+	const normalContextCases = [
+		{ label: '被动收到私信', quote: '有人给我私信办证' },
+		{ label: '收到广告经历', quote: '我收到办证广告了' },
+		{ label: '材料提问', quote: '办证需要什么材料' },
+		{ label: '举报警告', quote: '这是骗子，别信' },
+		{ label: '中性讨论', quote: '我刚才只是提到办证这个词' },
+	];
+	for (const [index, scenario] of normalContextCases.entries()) {
+		resetCalls();
+		sandbox.fetch = makeFetchMock(routes);
+		db = makeAdD1({ fraud: ['办证', '骗子'] });
+		env = makeEnv(db);
+		const actorId = String(94710 + index * 2);
+		const originalId = String(94711 + index * 2);
+		await dispatch({
+			message_id: 94710 + index,
+			chat: { id: -1001, type: 'supergroup', title: '引用语境测试群' },
+			from: { id: Number(actorId), is_bot: false, first_name: '正常回复者' },
+			text: '这句话什么意思',
+			reply_to_message: {
+				message_id: 94600 + index,
+				from: { id: Number(originalId), is_bot: false, first_name: '正常讨论者' },
+				text: scenario.quote,
+			},
+		}, env);
+		assert(`${scenario.label} → 当前回复者与原作者均不加黑`, !db._rows.has(actorId) && !db._rows.has(originalId));
+		assert(`${scenario.label} → 不删除、不观察、不全群封禁`, callsOf('deleteMessage').length === 0 && !db._relayObservations.has(actorId) && callsOf('banChatMember').length === 0);
+	}
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock(routes);
+	db = makeAdD1({ fraud: ['办证'] });
+	env = makeEnv(db);
+	await dispatch({
+		message_id: 94730,
+		chat: { id: -1001, type: 'supergroup', title: '引用语境测试群' },
+		from: { id: 94730, is_bot: false, first_name: '正常回复者' },
+		text: '这是什么',
+		reply_to_message: {
+			message_id: 94729,
+			from: { id: 94731, is_bot: false, first_name: '广告原作者' },
+			text: '专业办证500元，联系我',
+		},
+	}, env);
+	assert('高危词+专业/价格/联系方式 → 原作者立即写入全局黑名单', db._rows.get('94731')?.reason === 'ad_auto');
+	assert('高危词+专业/价格/联系方式 → 当前首次普通回复只观察不加黑', !db._rows.has('94730') && db._relayObservations.get('94730')?.occurrences === 1);
+	assert('高危词+专业/价格/联系方式 → 删除引用消息并只全群封禁原作者', callsOf('deleteMessage').some((call) => call.body.message_id === 94730) && callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((call) => String(call.body.user_id) === '94731'));
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock(routes);
+	db = makeAdD1({ fraud: ['办证'] });
+	env = makeEnv(db);
+	await dispatch({
+		message_id: 94740,
+		chat: { id: -1001, type: 'supergroup', title: '引用语境测试群' },
+		from: { id: 94740, is_bot: false, first_name: '包装传播者' },
+		text: 'p',
+		reply_to_message: {
+			message_id: 94739,
+			from: { id: 94741, is_bot: false, first_name: '广告原作者' },
+			text: '专业办证500元，联系我',
+		},
+	}, env);
+	const immediateTargets = new Set(callsOf('banChatMember').map((call) => String(call.body.user_id)));
+	assert('p 包装明确办证广告 → 当前传播者与原作者首次都加黑', db._rows.has('94740') && db._rows.has('94741'));
+	assert('p 包装明确办证广告 → 两人都执行全部 GROUP_ID 封禁', callsOf('banChatMember').length === 4 && immediateTargets.size === 2 && immediateTargets.has('94740') && immediateTargets.has('94741'));
+	assert('p 包装明确办证广告 → 当前传播者不进入观察表', !db._relayObservations.has('94740'));
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock(routes);
+	db = makeAdD1({ general: ['代办业务', '证件渠道'] });
+	env = makeEnv(db);
+	await dispatch({
+		message_id: 94750,
+		chat: { id: -1001, type: 'supergroup', title: '引用语境测试群' },
+		from: { id: 94750, is_bot: false, first_name: '普通回复者' },
+		text: '这是什么',
+		reply_to_message: {
+			message_id: 94749,
+			from: { id: 94751, is_bot: false, first_name: '原消息作者' },
+			text: '代办业务 证件渠道',
+		},
+	}, env);
+	const weakNotice = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
+	assert('仅普通词库弱评分 → 原作者不自动加黑或全群封禁', !db._rows.has('94751') && callsOf('banChatMember').length === 0);
+	assert('仅普通词库弱评分 → 当前回复者只删除并观察', !db._rows.has('94750') && db._relayObservations.get('94750')?.occurrences === 1 && callsOf('deleteMessage').some((call) => call.body.message_id === 94750));
+	assert('仅普通词库弱评分 → 主人通知明确说明未联动原作者', !!weakNotice && weakNotice.body.text.includes('当前仅为弱评分证据，未自动联动封禁'));
+}
+
 // ---------- [82] identity词库导入 ----------
 console.log('\n[82] identity词库导入');
 {
