@@ -386,6 +386,14 @@ function makeFakeDB(seed = [], options = {}) {
 						syncBlacklist();
 						return { results: options.reverseReturning ? results.reverse() : results };
 					}
+					if (sql.startsWith('SELECT id FROM blacklist WHERE id IN')) {
+						return {
+							results: bound
+								.map((rawId) => String(rawId))
+								.filter((id) => rows.has(id))
+								.map((id) => ({ id }))
+						};
+					}
 					if (sql.startsWith('PRAGMA table_info(blacklist)')) {
 						return { results: ['id', 'reason', 'by_user', 'at', 'note'].map((name) => ({ name })) };
 					}
@@ -1582,7 +1590,7 @@ console.log('\n[11a2] 小批量 /unban 身份、原子块与资料查询');
 	});
 	const env = {
 		...baseEnv,
-		DB: makeFakeDB(ids.map((id) => ({ id, reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' })))
+		DB: makeFakeDB([])
 	};
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
@@ -1591,7 +1599,8 @@ console.log('\n[11a2] 小批量 /unban 身份、原子块与资料查询');
 	assert('小批量 /unban 保持同步且不创建 Queue', env.DB._jobs.size === 0);
 	assertExactProfileQueries('小批量 /unban 每个 TGID 只查询首群一次', ids, '-1001');
 	assert('小批量 /unban 执行 12×2 次群解封', callsOf('unbanChatMember').length === 24);
-	assert('小批量 /unban D1 只执行一条 DELETE mutation', env.DB._mutationCalls.length === 1 && env.DB._mutationCalls[0].type === 'delete');
+	assert('小批量 /unban 不执行 D1 删除 mutation', env.DB._mutationCalls.length === 0 && env.DB._rows.size === 0);
+	assert('小批量 /unban 每次请求携带 only_if_banned', callsOf('unbanChatMember').every((call) => call.body.only_if_banned === true));
 	assert('小批量 /unban 逐群详情共享群名 Map', callsOf('getChat').length === 2);
 	const chunks = callsOf('sendMessage').filter((call) => String(call.body.chat_id) === '999').map((call) => String(call.body.text || ''));
 	const combined = chunks.join('\n\n');
@@ -1599,6 +1608,39 @@ console.log('\n[11a2] 小批量 /unban 身份、原子块与资料查询');
 	assert('小批量 /unban 完整身份只在汇总出现一次', ids.every((id) => combined.split(`>解封用户${id}</a>`).length - 1 === 1 && combined.includes(`<code>@unban_${id}</code> <code>${id}</code>`)));
 	assert('小批量 /unban 逐群明细使用精简身份', ids.every((id) => combined.split(`<b>用户</b> <a href="tg://user?id=${id}">${id}</a>`).length - 1 === 1));
 	assert('小批量 /unban 分块不丢用户内容', ids.every((id) => combined.includes(id)));
+}
+
+// ---------- [11a3] 小批量 /unban 混合 D1 黑名单资格 ----------
+console.log('\n[11a3] 小批量 /unban 混合 D1 黑名单资格');
+{
+	resetCalls();
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	const ids = ['57100', '57101', '57102'];
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (body) => ({
+			ok: true,
+			result: { status: 'member', user: { id: Number(body.user_id), first_name: `混合用户${body.user_id}` } }
+		}),
+		getChat: (body) => ({ ok: true, result: { id: Number(body.chat_id), title: `混合群${body.chat_id}`, type: 'supergroup' } }),
+		unbanChatMember: (body) => body.only_if_banned === true
+			? ({ ok: true, result: true })
+			: ({ ok: false, error_code: 400, description: 'unsafe unban request' }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([{ id: '57101', reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' }])
+	};
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 803, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: `/unban ${ids.join(',')}` } })
+	}), env, fakeCtx);
+	assert('混合 /unban 只解封不在 D1 的 2 个目标（覆盖 2 群）', callsOf('unbanChatMember').length === 4);
+	assert('混合 /unban D1 黑名单目标记录保留', env.DB._rows.has('57101'));
+	assert('混合 /unban 不执行 D1 删除 mutation', env.DB._mutationCalls.length === 0);
+	assert('混合 /unban 所有 Telegram 请求带 only_if_banned', callsOf('unbanChatMember').every((call) => call.body.only_if_banned === true));
+	const dmText = callsOf('sendMessage').filter((call) => String(call.body.chat_id) === '999').map((call) => call.body.text).join('\n');
+	assert('混合 /unban 回执明确拒绝 D1 黑名单目标', dmText.includes('D1 黑名单拒绝') && dmText.includes('57101'));
 }
 
 // ---------- [11b] 群内 /ban 20 个 TGID → D1 批量任务 ----------
@@ -2159,7 +2201,7 @@ console.log('\n[11h] 50/51 人边界');
 		BOT_TOKEN: '0:fake',
 		GROUP_ID: '-1001',
 		OWNER_IDS: '999',
-		DB: makeFakeDB(fifty.map((id) => ({ id, reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' })))
+		DB: makeFakeDB([])
 	};
 	sandbox.fetch = makeFetchMock({
 		unbanChatMember: () => ({ ok: true, result: true }),
@@ -2173,8 +2215,10 @@ console.log('\n[11h] 50/51 人边界');
 	await drainPending(unbanPending);
 	const acceptedUnbanJob = JSON.parse([...unbanEnv.DB._jobs.values()][0].payload);
 	assert('/unban 50 人允许创建 Queue 任务并完成', acceptedUnbanJob.status === 'done' && acceptedUnbanJob.cursor === 50);
-	assert('/unban 50 人按 20/20/10 使用 3 条 D1 mutation', unbanEnv.DB._mutationCalls.length === 3);
+	assert('/unban 50 人按 20/20/10 完成 D1 只读资格检查', acceptedUnbanJob.stats.unbanEligible === 50 && acceptedUnbanJob.stats.unbanBlacklisted === 0);
+	assert('/unban 50 人不执行任何 D1 mutation', unbanEnv.DB._mutationCalls.length === 0);
 	assert('/unban 50 人 Queue 执行 50 次群解封', callsOf('unbanChatMember').length === 50);
+	assert('/unban 50 人 Queue 全部请求带 only_if_banned', callsOf('unbanChatMember').every((call) => call.body.only_if_banned === true));
 
 	for (const command of ['/ban', '/spam', '/unban']) {
 		resetCalls();
@@ -2205,7 +2249,7 @@ console.log('\n[11i] /unban Queue 与按需资料');
 	const ids = Array.from({ length: 20 }, (_, i) => String(54000 + i));
 	let env = {
 		...baseEnv,
-		DB: makeFakeDB(ids.map((id) => ({ id, reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' })))
+		DB: makeFakeDB(ids.slice(0, 5).map((id) => ({ id, reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' })))
 	};
 	sandbox.fetch = makeFetchMock({
 		unbanChatMember: () => ({ ok: true, result: true }),
@@ -2220,10 +2264,12 @@ console.log('\n[11i] /unban Queue 与按需资料');
 	await drainPending(pending);
 	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
 	assert('/unban 20 人创建 unban Queue 任务', job.action === 'unban' && job.command === '/unban');
-	assert('/unban Queue 完成 D1 移除', job.status === 'done' && job.stats.removed === 20 && env.DB._rows.size === 0);
-	assert('/unban 40 个群操作按 24 上限分 2 次 Queue', job.autoRunCount === 2);
-	assert('/unban Queue 每 20 人只执行 1 条 DELETE mutation', env.DB._mutationCalls.length === 1 && env.DB._mutationCalls[0].type === 'delete');
-	assert('/unban Queue 执行 20×2 次群解封', callsOf('unbanChatMember').length === 40);
+	assert('/unban Queue 混合资格完成且保留 5 条 D1', job.status === 'done' && job.stats.unbanEligible === 15 && job.stats.unbanBlacklisted === 5 && env.DB._rows.size === 5);
+	assert('/unban 30 个群操作按 24 上限分 2 次 Queue', job.autoRunCount === 2);
+	assert('/unban Queue 不执行 DELETE mutation', env.DB._mutationCalls.length === 0);
+	assert('/unban Queue 仅执行 15×2 次群解封', callsOf('unbanChatMember').length === 30);
+	assert('/unban Queue 全部请求带 only_if_banned', callsOf('unbanChatMember').every((call) => call.body.only_if_banned === true));
+	assert('/unban Queue 失败明细记录 D1 黑名单拒绝', job.failures.filter((failure) => failure.phase === 'unban_blocked').length === 5);
 	assert('/unban Queue 执行和完成通知资料查询为 0', callsOf('getChatMember').length === 0);
 
 	resetCalls();
@@ -2546,13 +2592,14 @@ console.log('\n[11k] Telegram 瞬态错误重试');
 		BOT_TOKEN: '0:fake',
 		GROUP_ID: '-1001',
 		OWNER_IDS: '999',
-		DB: makeFakeDB([{ id: '56003', reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' }])
+		DB: makeFakeDB([])
 	};
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({ message: { message_id: 858, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/unban 56003' } })
 	}), env);
 	assert('/unban 网络错误仅延迟重试一次并成功', callsOf('unbanChatMember').length === 2 && env.DB._rows.size === 0);
+	assert('/unban 重试请求始终携带 only_if_banned', callsOf('unbanChatMember').every((call) => call.body.only_if_banned === true));
 }
 
 // ---------- [12] 群内 /unban 单条 ----------
@@ -2563,8 +2610,11 @@ console.log('\n[12] 群内 /unban 单条');
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: (b) => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
 		getChatMember: (b) => String(b.chat_id) === '-1002'
-			? { ok: true, result: { status: 'left', user: { id: Number(b.user_id), first_name: '群内解封用户', username: 'unban8888' } } }
+			? { ok: true, result: { status: 'member', user: { id: Number(b.user_id), first_name: '群内解封用户', username: 'unban8888' } } }
 			: { ok: false, error_code: 400, description: 'Bad Request: user not found' },
+		unbanChatMember: (b) => b.only_if_banned === true
+			? ({ ok: true, result: true })
+			: ({ ok: false, error_code: 400, description: 'unsafe unban request' }),
 		sendMessage: () => ({ ok: true, result: { message_id: 666 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
 	});
@@ -2579,12 +2629,12 @@ console.log('\n[12] 群内 /unban 单条');
 	};
 	const env = {
 		...baseEnv,
-		DB: makeFakeDB([{ id: '8888', reason: 'sa', by: '999', at: '2026-05-01T00:00:00Z' }]),
+		DB: makeFakeDB([]),
 	};
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
-	assert('8888 已从黑名单移除', !blacklist.some((e) => e.id === '8888'));
+	assert('群内 /unban 不修改 D1 黑名单', !blacklist.some((e) => e.id === '8888') && env.DB._mutationCalls.length === 0);
 
 	// /unban 不调 banChatMember，但会对 GROUP_ID 配置群执行 unbanChatMember
 	assert('banChatMember 没调用', callsOf('banChatMember').length === 0);
@@ -2592,12 +2642,13 @@ console.log('\n[12] 群内 /unban 单条');
 	assert('/unban 调用 unbanChatMember 2 次（两个群）', unbanCalls.length === 2);
 	assert('/unban 解封用户 ID 都是 8888', unbanCalls.every((c) => String(c.body.user_id) === '8888'));
 	assert('/unban 解封覆盖两个配置群', JSON.stringify(unbanCalls.map((c) => String(c.body.chat_id)).sort()) === JSON.stringify(['-1001', '-1002']));
+	assert('/unban 当前仍在群内的成员使用 only_if_banned 安全解封', unbanCalls.every((c) => c.body.only_if_banned === true));
 	assertExactProfileQueries('群内单用户 /unban 只查询命令来源群一次', ['8888'], '-1002');
 
 	const sendCalls = callsOf('sendMessage');
 	assert('sendMessage 调用 2 次（闪屏+私聊）', sendCalls.length === 2);
 	const groupSend = sendCalls.find((c) => String(c.body.chat_id) === '-1002');
-	assert('群内闪屏含"已移黑并解封"', groupSend.body.text.includes('已移黑并解封'));
+	assert('群内闪屏说明 D1 检查通过并尝试解封', groupSend.body.text.includes('D1 检查通过') && groupSend.body.text.includes('已尝试群解封'));
 	const dmSend = sendCalls.find((c) => String(c.body.chat_id) === '999');
 	assert('/unban 私聊详情含 Telegram 群解封结果', dmSend.body.text.includes('Telegram 群解封结果'));
 	assert('群内单用户 /unban 私聊详情显示来源群姓名', dmSend.body.text.includes('<a href="tg://user?id=8888">群内解封用户</a>'));
@@ -2636,14 +2687,15 @@ console.log('\n[12a] 私聊 /unban 单条 + 部分群解封失败');
 	};
 	const env = {
 		...baseEnv,
-		DB: makeFakeDB([{ id: '8890', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' }]),
+		DB: makeFakeDB([]),
 	};
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env);
 
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
-	assert('私聊 /unban 已从 D1 黑名单移除', !blacklist.some((e) => e.id === '8890'));
+	assert('私聊 /unban 不修改 D1 黑名单', !blacklist.some((e) => e.id === '8890') && env.DB._mutationCalls.length === 0);
 	const unbanCalls = callsOf('unbanChatMember');
 	assert('私聊 /unban 对两个配置群执行解封', unbanCalls.length === 2);
+	assert('私聊 /unban 全部请求带 only_if_banned', unbanCalls.every((c) => c.body.only_if_banned === true));
 	assertExactProfileQueries('私聊单用户 /unban 只查询首个 GROUP_ID 一次', ['8890'], '-1001');
 	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('私聊单用户 /unban 不读取后续群资料', !dmSend.body.text.includes('不应读取的副群资料'));
@@ -2653,7 +2705,7 @@ console.log('\n[12a] 私聊 /unban 单条 + 部分群解封失败');
 	assert('私聊 /unban 管理员目标失败建议手动检查', dmSend.body.text.includes('无需通过 bot 解封') && dmSend.body.text.includes('手动检查'));
 }
 
-// ---------- [12a1] 群内 /unban 特殊 TGID: D1 移除成功但 Telegram 无法识别 ----------
+// ---------- [12a1] 群内 /unban 特殊 TGID: D1 检查通过但 Telegram 无法识别 ----------
 console.log('\n[12a1] 群内 /unban 特殊 TGID');
 {
 	resetCalls();
@@ -2675,21 +2727,49 @@ console.log('\n[12a1] 群内 /unban 特殊 TGID');
 	};
 	const env = {
 		...baseEnv,
-		DB: makeFakeDB([{ id: '7070447913', reason: 'manual', by: '999', at: '2026-06-23T00:00:00Z' }]),
+		DB: makeFakeDB([]),
 	};
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
-	assert('特殊 TGID /unban:D1 黑名单已移除', !blacklist.some((e) => e.id === '7070447913'));
+	assert('特殊 TGID /unban:D1 保持不变', !blacklist.some((e) => e.id === '7070447913') && env.DB._mutationCalls.length === 0);
 	assert('特殊 TGID /unban:仍对配置群执行 Telegram 解封', callsOf('unbanChatMember').length === 2);
+	assert('特殊 TGID /unban:失败请求仍携带 only_if_banned', callsOf('unbanChatMember').every((c) => c.body.only_if_banned === true));
 	const groupFlash = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '-1001');
 	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('特殊 TGID /unban:群内短提示说明 Telegram 暂无法识别', !!groupFlash && groupFlash.body.text.includes('D1已处理') && groupFlash.body.text.includes('Telegram暂无法识别TGID'));
+	assert('特殊 TGID /unban:群内短提示说明 Telegram 暂无法识别', !!groupFlash && groupFlash.body.text.includes('D1检查通过') && groupFlash.body.text.includes('Telegram暂无法识别TGID'));
 	assert('特殊 TGID /unban:群内短提示不误报 bot 管理员权限', !!groupFlash && !groupFlash.body.text.includes('请检查 bot 是否为群管理员'));
 	assert('特殊 TGID /unban:私聊详情说明 Telegram 当前无法识别', !!dmSend && dmSend.body.text.includes('Telegram 当前无法识别该 TGID'));
 	assert('特殊 TGID /unban:私聊详情不误报 TGID 格式错误', !!dmSend && !dmSend.body.text.includes('TGID 格式错误'));
-	assert('特殊 TGID /unban:私聊详情说明 D1 移除不受影响', !!dmSend && dmSend.body.text.includes('D1 移除结果不受影响'));
+	assert('特殊 TGID /unban:私聊详情说明 D1 资格检查不受影响', !!dmSend && dmSend.body.text.includes('D1 黑名单资格检查结果不受影响'));
 	assert('特殊 TGID /unban:删除群内命令', callsOf('deleteMessage').some((c) => c.body.message_id === 915));
+}
+
+// ---------- [12a1b] 单条 /unban 命中 D1 黑名单必须拒绝 ----------
+console.log('\n[12a1b] 单条 /unban 命中 D1 拒绝');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (body) => ({
+			ok: true,
+			result: { status: 'kicked', user: { id: Number(body.user_id), first_name: 'D1黑名单用户' } }
+		}),
+		unbanChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([{ id: '7070447001', reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 916, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/unban 7070447001' } })
+	}), env);
+	assert('D1 命中 /unban 保留黑名单记录', env.DB._rows.has('7070447001'));
+	assert('D1 命中 /unban 不执行任何 D1 mutation', env.DB._mutationCalls.length === 0);
+	assert('D1 命中 /unban 不调用 Telegram 解封', callsOf('unbanChatMember').length === 0);
+	const dmSend = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
+	assert('D1 命中 /unban 明确返回拒绝原因', !!dmSend && dmSend.body.text.includes('仍在 D1 黑名单') && dmSend.body.text.includes('未调用 Telegram 解封接口'));
 }
 
 // ---------- [12a2] 匿名管理员仅有 /ban /spam，不允许 /unban ----------
@@ -3564,7 +3644,7 @@ console.log('\n[22b] OWNER_IDS 通知范围:主人全量,副主人仅 /ban /spam
 	env = {
 		TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,1000',
 		SUPER_ADMINS: '7777',
-		DB: makeFakeDB([{ id: '555', reason: 'manual', by: '7777', at: '2026-05-01T00:00:00Z' }]),
+		DB: makeFakeDB([]),
 	};
 	await handler.fetch(new Request(`https://x.com/`, {
 		method: 'POST',
@@ -3572,7 +3652,7 @@ console.log('\n[22b] OWNER_IDS 通知范围:主人全量,副主人仅 /ban /spam
 	}), env, fakeCtx);
 	ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	deputyDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '1000');
-	assert('超级管理员 /unban → 主人收到通知', !!ownerDm && ownerDm.body.text.includes('从黑名单中移除'));
+	assert('超级管理员 /unban → 主人收到通知', !!ownerDm && ownerDm.body.text.includes('目标不在 D1 黑名单'));
 	assert('/unban → 副主人不收到通知', !deputyDm);
 	assert('超级管理员 /unban → 群内零机器人回执', callsOf('sendMessage').every((c) => Number(c.body.chat_id) > 0));
 }

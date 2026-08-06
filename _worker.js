@@ -1098,8 +1098,8 @@ async function banUserFromAllGroups(userId, options = {}) {
 	return results;
 }
 
-// 把用户从所有配置群解除 Telegram 封禁，逐群结果数组返回
-// 删除 D1 黑名单后调用，用于让用户真正能重新加入 GROUP_ID 配置的群。
+// 把用户从所有配置群解除 Telegram 原生/手动封禁，逐群结果数组返回。
+// 调用方必须先严格确认目标不在 D1 黑名单；本函数本身不修改 D1。
 async function unbanUserFromAllGroups(userId) {
 	const results = [];
 	for (const groupId of GROUP_IDS) {
@@ -1225,7 +1225,7 @@ function translateTelegramError(description, options = {}) {
 			if (isUnbanAction) {
 				return {
 					中文: 'Telegram 当前无法识别该 TGID',
-					建议: `D1 移除结果不受影响；Telegram 无法对该 TGID 执行群解封。若该用户仍无法进群，请在对应群封禁列表手动检查，或稍后重试 ${retryCommand}。`
+					建议: `D1 黑名单资格检查结果不受影响；Telegram 无法对该 TGID 执行群解封。若该用户仍无法进群，请在对应群封禁列表手动检查，或稍后重试 ${retryCommand}。`
 				};
 			}
 			return {
@@ -1241,7 +1241,7 @@ function translateTelegramError(description, options = {}) {
 			if (isUnbanAction) {
 				return {
 					中文: 'Telegram 当前无法识别该 TGID',
-					建议: `D1 移除结果不受影响；Telegram 无法对该 TGID 执行群解封。若该用户仍无法进群，请在对应群封禁列表手动检查，或稍后重试 ${retryCommand}。`
+					建议: `D1 黑名单资格检查结果不受影响；Telegram 无法对该 TGID 执行群解封。若该用户仍无法进群，请在对应群封禁列表手动检查，或稍后重试 ${retryCommand}。`
 				};
 			}
 			return {
@@ -1443,7 +1443,7 @@ function renderUnbanResults(unbanResults) {
 	const lookupFailCount = unbanResults.filter((r) => !r.ok && isTelegramUserUnresolvableError(r.error)).length;
 	if (total === 0) return 'ℹ️ 未配置 GROUP_ID，未执行群解封';
 	if (okCount === total) return `✅ 已解除全部 ${total} 个群的 Telegram 封禁`;
-	if (okCount === 0 && lookupFailCount === total) return '⚠️ D1已处理，Telegram暂无法识别TGID';
+	if (okCount === 0 && lookupFailCount === total) return '⚠️ D1检查通过，Telegram暂无法识别TGID';
 	if (okCount === 0) return `⚠️ 全部 ${total} 个群解封失败（请检查 bot 是否为群管理员）`;
 	return `✅ 已解除 ${okCount}/${total} 个群的 Telegram 封禁（${total - okCount} 个失败）`;
 }
@@ -1820,6 +1820,44 @@ async function addManyToBlacklist(ids, env, options = {}) {
 	return results;
 }
 
+// 批量 /unban 资格检查：D1 黑名单是硬闸门，仅未命中的 TGID 可以执行 Telegram 原生解封。
+// 每 20 个 TGID 一条只读 SELECT，不删除或更新任何 D1 记录；查询失败时严格拒绝对应目标。
+async function checkManyUnbanEligibility(ids, env) {
+	const results = { eligible: [], blacklisted: [], failed: [] };
+	const uniqueIds = normalizeBatchMutationIds(ids);
+	if (!env.DB) {
+		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间，无法确认解封资格' })));
+		return results;
+	}
+	if (uniqueIds.length === 0) return results;
+
+	try {
+		await ensureD1Table(env);
+	} catch (error) {
+		results.failed.push(...uniqueIds.map((id) => ({ id, msg: `❌ 无法确认 D1 黑名单状态: ${error.message || error}` })));
+		return results;
+	}
+
+	for (const chunk of chunkBatchItems(uniqueIds)) {
+		try {
+			const placeholders = chunk.map(() => '?').join(', ');
+			const response = await env.DB
+				.prepare(`SELECT id FROM blacklist WHERE id IN (${placeholders})`)
+				.bind(...chunk)
+				.all();
+			const blocked = new Set((response?.results || []).map((row) => String(row.id)));
+			for (const id of chunk) {
+				if (blocked.has(id)) results.blacklisted.push(id);
+				else results.eligible.push(id);
+			}
+		} catch (error) {
+			console.error('批量检查 /unban D1 资格时出错:', error);
+			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 无法确认 D1 黑名单状态: ${error.message || error}` })));
+		}
+	}
+	return results;
+}
+
 // 批量移除：每 20 个 TGID 一条 DELETE ... RETURNING，无需逐条预查询。
 async function removeManyFromBlacklist(ids, env) {
 	const results = { success: [], notFound: [], failed: [] };
@@ -1888,6 +1926,22 @@ function renderBatchRemoveResult(results, invalid, userProfiles = null) {
 	lines.push('', '<b>详情</b>:');
 	for (const id of results.success) lines.push(`✅ ${formatBatchUserTarget(id, userProfiles)} 已移除`);
 	for (const id of results.notFound) lines.push(`⚠️ ${formatBatchUserTarget(id, userProfiles)} 不在黑名单`);
+	for (const id of invalid) lines.push(`❌ <code>${escapeHtml(id)}</code> 格式错误`);
+	for (const f of results.failed) lines.push(`❌ ${formatBatchUserTarget(f.id, userProfiles)} ${escapeHtml(f.msg)}`);
+
+	return lines.join('\n');
+}
+
+function renderBatchUnbanEligibilityResult(results, invalid, userProfiles = null) {
+	const lines = ['🔎 <b>批量解封资格检查完成</b>', ''];
+	lines.push(`✅ 可执行 Telegram 解封: ${results.eligible.length}`);
+	if (results.blacklisted.length) lines.push(`⛔ D1 黑名单拒绝: ${results.blacklisted.length}`);
+	if (invalid.length) lines.push(`❌ 格式错误: ${invalid.length}`);
+	if (results.failed.length) lines.push(`❌ D1 检查失败: ${results.failed.length}`);
+
+	lines.push('', '<b>详情</b>:');
+	for (const id of results.eligible) lines.push(`✅ ${formatBatchUserTarget(id, userProfiles)} 不在 D1 黑名单，可执行群解封`);
+	for (const id of results.blacklisted) lines.push(`⛔ ${formatBatchUserTarget(id, userProfiles)} 在 D1 黑名单，拒绝解封（记录已保留）`);
 	for (const id of invalid) lines.push(`❌ <code>${escapeHtml(id)}</code> 格式错误`);
 	for (const f of results.failed) lines.push(`❌ ${formatBatchUserTarget(f.id, userProfiles)} ${escapeHtml(f.msg)}`);
 
@@ -2109,6 +2163,9 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 			removed: 0,
 			notFound: 0,
 			removeFailed: 0,
+			unbanEligible: 0,
+			unbanBlacklisted: 0,
+			unbanCheckFailed: 0,
 			unbanOk: 0,
 			unbanFailed: 0
 		},
@@ -2153,6 +2210,9 @@ function pushBulkJobFailure(job, failure) {
 
 function formatBulkJobFailureLine(failure) {
 	const groupText = failure.groupId ? ` 群 <code>${escapeHtml(failure.groupId)}</code>` : '';
+	if (failure.phase === 'unban_blocked') {
+		return `⛔ <code>${escapeHtml(failure.userId || '')}</code>: D1 黑名单拒绝解封，记录已保留，未调用 Telegram`;
+	}
 	const rawError = failure.error || failure.message || '失败';
 	const isUnban = failure.phase === 'unban' || failure.phase === 'remove';
 	const { 中文, 建议 } = translateTelegramError(rawError, {
@@ -2179,7 +2239,10 @@ function formatBulkJobStatus(job) {
 
 function formatBulkJobAction(job) {
 	const action = normalizeBulkJobAction(job.action);
-	if (action === 'unban') return '移出黑名单并群解封(/unban)';
+	if (action === 'unban') {
+		const eligibilityAware = Object.prototype.hasOwnProperty.call(job?.stats || {}, 'unbanEligible');
+		return eligibilityAware ? '仅解封非 D1 黑名单用户(/unban)' : '移出黑名单并群解封(/unban，历史任务)';
+	}
 	return action === 'spam' ? '举报加黑(/spam)' : '加入黑名单(/ban)';
 }
 
@@ -2219,13 +2282,24 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 		lines.push(`当前 20 人批次群操作:${job.activeBatch.operationCursor || 0}/${job.activeBatch.totalOperations || 0}`, '');
 	}
 	if (job.action === 'unban') {
-		lines.push(
-			`移黑成功:${job.stats?.removed || 0}`,
-			`原本不在黑名单:${job.stats?.notFound || 0}`,
-			`移黑失败:${job.stats?.removeFailed || 0}`,
-			`群解封成功:${job.stats?.unbanOk || 0}`,
-			`群解封失败:${job.stats?.unbanFailed || 0}`
-		);
+		const eligibilityAware = Object.prototype.hasOwnProperty.call(job?.stats || {}, 'unbanEligible');
+		if (eligibilityAware) {
+			lines.push(
+				`D1 资格通过:${job.stats?.unbanEligible || 0}`,
+				`D1 黑名单拒绝:${job.stats?.unbanBlacklisted || 0}`,
+				`D1 检查失败:${job.stats?.unbanCheckFailed || 0}`,
+				`群解封成功:${job.stats?.unbanOk || 0}`,
+				`群解封失败:${job.stats?.unbanFailed || 0}`
+			);
+		} else {
+			lines.push(
+				`移黑成功:${job.stats?.removed || 0}`,
+				`原本不在黑名单:${job.stats?.notFound || 0}`,
+				`移黑失败:${job.stats?.removeFailed || 0}`,
+				`群解封成功:${job.stats?.unbanOk || 0}`,
+				`群解封失败:${job.stats?.unbanFailed || 0}`
+			);
+		}
 	} else {
 		lines.push(
 			`加黑成功:${job.stats?.added || 0}`,
@@ -2317,7 +2391,7 @@ async function performBulkJobD1Mutation(job, env, ids) {
 	let lastResults = null;
 	for (let attempt = 0; attempt <= BULK_TASK_D1_RETRY_LIMIT; attempt += 1) {
 		lastResults = job.action === 'unban'
-			? await removeManyFromBlacklist(ids, env)
+			? await checkManyUnbanEligibility(ids, env)
 			: await addManyToBlacklist(ids, env, {
 				reason: job.reason,
 				by: job.createdBy,
@@ -2329,6 +2403,9 @@ async function performBulkJobD1Mutation(job, env, ids) {
 		}
 	}
 	const preview = lastResults?.failed?.[0]?.msg || '未知 D1 错误';
+	if (job.action === 'unban') {
+		incrementBulkJobStat(job, 'unbanCheckFailed', lastResults?.failed?.length || ids.length);
+	}
 	throw new Error(`批量 D1 操作连续失败，未推进任务游标: ${preview}`);
 }
 
@@ -2350,13 +2427,19 @@ async function prepareBulkJobActiveBatch(job, env) {
 	const results = await performBulkJobD1Mutation(job, env, ids);
 	const isUnban = job.action === 'unban';
 	const actionableIds = isUnban
-		? [...results.success, ...results.notFound]
+		? [...results.eligible]
 		: [...results.success, ...results.exists];
 	const activeGroupIds = getBulkJobConfiguredGroupIds(job);
 
 	if (isUnban) {
-		incrementBulkJobStat(job, 'removed', results.success.length);
-		incrementBulkJobStat(job, 'notFound', results.notFound.length);
+		incrementBulkJobStat(job, 'unbanEligible', results.eligible.length);
+		incrementBulkJobStat(job, 'unbanBlacklisted', results.blacklisted.length);
+		for (const id of results.blacklisted) {
+			pushBulkJobFailure(job, {
+				userId: id,
+				phase: 'unban_blocked'
+			});
+		}
 	} else {
 		incrementBulkJobStat(job, 'added', results.success.length);
 		incrementBulkJobStat(job, 'exists', results.exists.length);
@@ -4163,7 +4246,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 		await notifyOwnerChatMemberAction(chatMember, '封禁（未加入全局黑名单）', oldStatus, newStatus);
 	} else if (oldStatus === 'kicked') {
 		// 群内手动解封：D1 黑名单是权威封禁，禁止经此被绕过/清除。
-		// 仅 /unban 指令(群管理员/超管/主人/副主人鉴权)可移出 D1 黑名单。
+		// /unban 仅能解封不在 D1 黑名单中的目标，绝不删除 D1 记录。
 		const blacklistCheck = await checkBlacklist(targetIdStr, env);
 		if (blacklistCheck.isBlacklisted) {
 			// 仍在 D1 黑名单 → 撤销本次群内手动解封，立即封回，绝不删除黑名单记录
@@ -7387,38 +7470,58 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			// 单条且无格式错误
 			if (valid.length === 1 && invalid.length === 0) {
-				const result = await removeFromBlacklist(valid[0], env);
-				const shouldUnbanGroups = result.success || result.code === 'NOT_FOUND';
-				const unbanResults = shouldUnbanGroups ? await unbanUserFromAllGroups(valid[0]) : [];
-				const userProfiles = await resolveBatchUserProfiles([valid[0]], chatId);
-				const targetMention = formatBatchUserTarget(valid[0], userProfiles);
+				const targetId = valid[0];
+				const eligibility = await checkManyUnbanEligibility([targetId], env);
+				const userProfiles = await resolveBatchUserProfiles([targetId], chatId);
+				const targetMention = formatBatchUserTarget(targetId, userProfiles);
 				const lines = [
-					`🎬 操作:移出黑名单 + Telegram 群解封`,
+					`🎬 操作:D1 黑名单资格检查 + Telegram 原生群解封`,
 					`🎯 目标用户:${targetMention}`,
 					'',
 				];
-				if (result.code === 'NOT_FOUND') {
-					lines.push('ℹ️ <b>该用户原本就不在黑名单,无需移除</b>');
-				} else {
-					lines.push(result.message);
+
+				if (eligibility.blacklisted.includes(targetId)) {
+					lines.push('⛔ <b>目标仍在 D1 黑名单，已拒绝解封</b>', 'ℹ️ D1 记录保持不变，未调用 Telegram 解封接口。');
+					await replyToAdmin(message, ctx, {
+						flashText: `⛔ <code>${targetId}</code> 在 D1 黑名单，已拒绝解封`,
+						detailText: lines.join('\n'),
+						isInGroup
+					});
+					return;
 				}
-				if (shouldUnbanGroups) {
-					lines.push('', '<b>Telegram 群解封结果</b>:');
-					lines.push(await renderUnbanResultsDetail(unbanResults, null, { userId: valid[0], retryCommand: '/unban' }));
+
+				if (!eligibility.eligible.includes(targetId)) {
+					const failure = eligibility.failed.find((item) => item.id === targetId);
+					const failureText = failure?.msg || '❌ 无法确认 D1 黑名单状态，已拒绝解封';
+					lines.push(escapeHtml(failureText), 'ℹ️ 为避免绕过全局黑名单，本次未调用 Telegram 解封接口。');
+					await replyToAdmin(message, ctx, {
+						flashText: `❌ <code>${targetId}</code> 无法确认 D1 状态，已拒绝解封`,
+						detailText: lines.join('\n'),
+						isInGroup
+					});
+					return;
 				}
-				const flashText = result.success
-					? `✅ 已移黑并解封 <code>${valid[0]}</code>\n${renderUnbanResults(unbanResults)}`
-					: result.code === 'NOT_FOUND'
-						? `ℹ️ <code>${valid[0]}</code> 不在黑名单，已尝试群解封\n${renderUnbanResults(unbanResults)}`
-						: `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
-				await replyToAdmin(message, ctx, { flashText, detailText: lines.join('\n'), isInGroup });
+
+				const unbanResults = await unbanUserFromAllGroups(targetId);
+				lines.push(
+					'✅ <b>目标不在 D1 黑名单，允许执行 Telegram 原生解封</b>',
+					'ℹ️ 本次未修改任何 D1 记录。',
+					'',
+					'<b>Telegram 群解封结果</b>:',
+					await renderUnbanResultsDetail(unbanResults, null, { userId: targetId, retryCommand: '/unban' })
+				);
+				await replyToAdmin(message, ctx, {
+					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封\n${renderUnbanResults(unbanResults)}`,
+					detailText: lines.join('\n'),
+					isInGroup
+				});
 				return;
 			}
 
-			// 批量：D1 每 20 人一条 SQL；资料每个 TGID 最多查询一次；群解封并发最多 3 个用户。
-			const results = await removeManyFromBlacklist(valid, env);
-			const idsToUnban = [...results.success, ...results.notFound];
-			const userProfiles = await resolveBatchUserProfiles(idsToUnban, chatId);
+			// 批量：D1 每 20 人一条只读资格查询；仅非黑名单目标执行群解封，并发最多 3 个用户。
+			const results = await checkManyUnbanEligibility(valid, env);
+			const idsToUnban = [...results.eligible];
+			const userProfiles = await resolveBatchUserProfiles(valid, chatId);
 			const unbanSummary = { okAll: 0, partial: 0, failedAll: 0 };
 			const perUserUnbanResults = await mapWithConcurrency(
 				idsToUnban,
@@ -7432,8 +7535,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				else unbanSummary.partial += 1;
 			}
 			const failedCount = invalid.length + results.failed.length;
-			const flashText = `✅ 批量移黑：成功 ${results.success.length}${results.notFound.length ? ` / 不在黑名单 ${results.notFound.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
-			let detailText = renderBatchRemoveResult(results, invalid, userProfiles);
+			const flashText = `🔓 批量解封：允许 ${results.eligible.length}${results.blacklisted.length ? ` / D1拒绝 ${results.blacklisted.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+			let detailText = renderBatchUnbanEligibilityResult(results, invalid, userProfiles);
 			if (idsToUnban.length > 0) {
 				const unbanHeaderLines = ['<b>Telegram 群解封结果</b>:', `✅ 全部群解封成功: ${unbanSummary.okAll}`];
 				if (unbanSummary.partial) unbanHeaderLines.push(`⚠️ 部分群解封: ${unbanSummary.partial}`);
@@ -7880,7 +7983,8 @@ async function unbanUser(userId, groupId = GROUP_ID) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`;
 	const body = {
 		chat_id: groupId,
-		user_id: Number(userId)
+		user_id: Number(userId),
+		only_if_banned: true
 	};
 	let lastFailure = null;
 	let attempts = 0;
