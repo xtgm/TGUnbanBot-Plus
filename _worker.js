@@ -6634,7 +6634,7 @@ async function getAdVoteInitiatorRole(message, env) {
 	if (isPrivilegedManager(userId)) return classifyOperatorRole(userId, '高级管理员');
 	if (await checkIfUserIsAdminInGroup(userId, message.chat.id)) return '群管理员';
 	if (await isAdVoteAllowlisted(env, userId)) return '举报白名单成员';
-	if (await userHasActiveChatBoost(message.chat.id, userId)) return '群助推者';
+	// Telegram 助推仅代表为群提供 Boost，不属于可信管理权限；普通成员和助推者只能参与投票。
 	return '';
 }
 
@@ -6761,7 +6761,13 @@ async function handleAdCommand(message, env, ctx) {
 		return true;
 	}
 
-	const sent = await sendTelegramMessage(message.chat.id, buildAdVoteMessageText(state), buildAdVoteInlineKeyboard(state));
+	// 与源代码一致：回复目标发起时，投票卡片继续回复原被举报消息；TGID 模式则发送独立投票卡片。
+	const sent = await sendTelegramMessage(
+		message.chat.id,
+		buildAdVoteMessageText(state),
+		buildAdVoteInlineKeyboard(state),
+		state.reportedMessageId,
+	);
 	const voteMessageId = Number(sent?.result?.message_id) || 0;
 	if (!sent?.ok || !voteMessageId) {
 		const failedState = { ...state, finalized: true, result: 'send_failed' };
@@ -6840,6 +6846,57 @@ async function notifyOwnerAdVoteApproved(state, blacklistResult, banResults, del
 	await notifyAllOwners(lines.join('\n'), null, false);
 }
 
+async function notifyOwnerAdVoteClosed(state) {
+	if (!OWNER_IDS.length || !state?.finalized || state.result === 'approved') return;
+	const resultMeta = {
+		rejected: {
+			title: '广告举报投票已被否决',
+			result: '反对方胜出',
+			action: '目标未写入 D1、未执行全群封禁、未删除被举报消息。',
+		},
+		cancelled: {
+			title: '广告举报投票已取消',
+			result: '投票被有权限的用户取消',
+			action: '目标未写入 D1、未执行全群封禁、未删除被举报消息。',
+		},
+		expired: {
+			title: '广告举报投票已过期',
+			result: '超过 1 小时截止时间',
+			action: '目标未写入 D1、未执行全群封禁、未删除被举报消息。',
+		},
+	};
+	const meta = resultMeta[state.result] || {
+		title: '广告举报投票已结束',
+		result: String(state.result || '未知结果'),
+		action: '本次未执行 D1 写入或全群封禁。',
+	};
+	const lines = [
+		'🗳️ <b>' + escapeHtml(meta.title) + '</b>',
+		'📌 结果:' + escapeHtml(meta.result),
+		'🎯 目标:' + formatAdVoteUser(state.targetUserSnapshot, state.targetUserId)
+			+ ' <code>' + escapeHtml(state.targetUserId) + '</code>',
+		'👤 发起人:' + formatAdVoteUser(state.creatorUserSnapshot, state.creatorUserId)
+			+ '（' + escapeHtml(state.initiatorRole || '未知身份') + '）',
+		'📍 来源群:<code>' + escapeHtml(state.chatId) + '</code>',
+		'⏰ 截止时间:<code>' + escapeHtml(formatBeijingTimeFromSeconds(state.deadlineAt)) + '</code>',
+		'📊 最终票数:赞成 ' + state.approvers.length + ' / 反对 ' + state.rejecters.length,
+		'✅ 赞成人:' + formatAdVoteVoters(state.approvers),
+		'❎ 反对人:' + formatAdVoteVoters(state.rejecters),
+		'📝 举报原因:' + escapeHtml(state.reason || '未填写'),
+	];
+	if (state.vetoedBy) {
+		lines.push('⚡ 管理员裁决:' + formatAdVoteUser(state.vetoedBy, state.vetoedBy.id)
+			+ (state.result === 'rejected' ? ' 一票否决' : ' 一票通过'));
+	} else if (state.result === 'rejected') {
+		lines.push('⚖️ 结束方式:反对票达到 ' + state.threshold + ' 票阈值');
+	}
+	if (state.cancelledBy) {
+		lines.push('🚫 取消人:' + formatAdVoteUser(state.cancelledBy, state.cancelledBy.id));
+	}
+	lines.push('', 'ℹ️ 处理结果:' + escapeHtml(meta.action));
+	await notifyAllOwners(lines.join('\n'), null, false);
+}
+
 async function enforceApprovedAdVote(env, state) {
 	if (state.enforcementComplete) return;
 	const blacklistResult = await addToBlacklist(state.targetUserId, env, {
@@ -6873,6 +6930,7 @@ async function finalizeAdVote(env, state, result, decisionBy = null) {
 	try {
 		await editAdVoteMessage(next.chatId, next.messageId, next);
 		if (result === 'approved') await enforceApprovedAdVote(env, next);
+		else await notifyOwnerAdVoteClosed(next);
 	} finally {
 		await unpinAdVoteMessage(next.chatId, next.messageId);
 	}
@@ -7872,11 +7930,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'<code>/learnlast 序号</code> <b>仅私聊</b>,按快照序号学指纹(只入库,不踢人)。如 /learnlast 1,3',
 			'',
 			'<b>━━ 群内广告举报投票 ━━</b>',
-			'<code>/ad [原因]</code> 回复目标消息发起；或 <code>/ad TGID [原因]</code>。群管理员、群助推者或白名单成员可发起',
+			'<code>/ad [原因]</code> 回复目标消息发起；或 <code>/ad TGID [原因]</code>。主人/副主人/超级管理员、当前群管理员或 /add_ad_admin 白名单成员可发起',
 			'• 发起后自动置顶；发起人自动计 1 票；赞成或反对达到 6 票结束；当前群管理员点击可一票通过或一票否决',
 			'• 发起人、当前群管理员或高级管理员可点“取消投票”；通过/否决/过期/取消后均自动取消置顶',
 			'• 通过后写入 D1 全局黑名单并遍历全部 GROUP_ID 封禁，revoke_messages=true 撤回各群历史发言；不写广告学习库',
-			'<code>/add_ad_admin TGID</code> / <code>/del_ad_admin TGID</code> 增删 /ad 发起白名单（仅第一主人）',
+			'<code>/add_ad_admin TGID</code> / <code>/del_ad_admin TGID</code> 管理 /ad 发起白名单（仅第一主人）；普通成员和助推者只能参与投票',
 			'',
 			'<b>━━ 样本库管理(私聊)━━</b>',
 			'<code>/listsamples</code> 查看已学指纹(最近50条+总数)',
@@ -8792,7 +8850,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 }
 
 // 发送 Telegram 消息
-async function sendTelegramMessage(chatId, text, replyMarkup) {
+async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId = null) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
 	const body = {
 		chat_id: chatId,
@@ -8802,6 +8860,10 @@ async function sendTelegramMessage(chatId, text, replyMarkup) {
 	};
 	if (replyMarkup) {
 		body.reply_markup = replyMarkup;
+	}
+	if (replyToMessageId) {
+		// 保持源代码 /ad 回复发起行为；其他既有调用未传该参数，行为完全不变。
+		body.reply_to_message_id = Number(replyToMessageId);
 	}
 
 	try {

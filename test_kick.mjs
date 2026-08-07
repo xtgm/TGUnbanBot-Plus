@@ -4858,7 +4858,7 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('主人 /help → 不再显示旧短命令', !!dm && !dm.body.text.includes(removedBanCommand) && !dm.body.text.includes(removedSpamCommand));
 	assert('主人 /help → 含 /admins 权限名单说明', !!dm && dm.body.text.includes('/admins') && dm.body.text.includes('权限名单'));
 	assert('主人 /help → 含 /groups 群组查询说明', !!dm && dm.body.text.includes('/groups') && dm.body.text.includes('GROUP_ID'));
-	assert('主人 /help → 含 /ad 原因、自动置顶、取消投票与 revoke_messages 说明', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('自动置顶') && dm.body.text.includes('取消投票') && dm.body.text.includes('revoke_messages=true'));
+	assert('主人 /help → 含 /ad 安全发起权限、原因、自动置顶、取消投票与 revoke_messages 说明', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('/add_ad_admin 白名单成员可发起') && dm.body.text.includes('普通成员和助推者只能参与投票') && dm.body.text.includes('自动置顶') && dm.body.text.includes('取消投票') && dm.body.text.includes('revoke_messages=true'));
 	// 群管理员(非主人)私聊 /help → 权限不足,不泄漏指令
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/help' } }) }), env, fakeCtxAd);
@@ -6352,7 +6352,7 @@ console.log('\n[84] /ad 投票主链');
 				},
 			};
 		},
-		getUserChatBoosts: () => ({ ok: true, result: { boosts: [] } }),
+		getUserChatBoosts: () => ({ ok: true, result: { boosts: [{ boost_id: 'paid-but-not-trusted' }] } }),
 		getChat: (body) => ({ ok: true, result: { id: Number(body.chat_id), title: String(body.chat_id).startsWith('-') ? '投票测试群' : undefined, first_name: '普通用户', type: String(body.chat_id).startsWith('-') ? 'supergroup' : 'private' } }),
 		sendMessage: (body) => ({
 			ok: true,
@@ -6364,7 +6364,7 @@ console.log('\n[84] /ad 投票主链');
 		banChatMember: () => ({ ok: true, result: true }),
 	});
 	const db = makeAdD1();
-	db._adVoteAllowlist.set('95000', { user_id: '95000', by_user: '999', at: '2026-08-06T00:00:00.000Z' });
+	db._adVoteAllowlist.set('95000', { user_id: '95000', by_user: '999', at: '2026-08-07T00:00:00.000Z' });
 	const env = {
 		TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002',
 		OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db,
@@ -6373,6 +6373,14 @@ console.log('\n[84] /ad 投票主链');
 		method: 'POST',
 		body: JSON.stringify(update),
 	}), env, fakeCtxAd);
+	await dispatch({ message: {
+		message_id: 94999,
+		chat: { id: -1001, type: 'supergroup', title: '投票测试群' },
+		from: { id: 95099, is_bot: false, first_name: '群助推普通成员' },
+		text: '/ad 95010 无权发起测试',
+	} });
+	assert('/ad 助推普通成员未进白名单 → 不能发起且群内完全静默', db._adVotes.size === 0 && callsOf('sendMessage').length === 0 && callsOf('pinChatMessage').length === 0);
+	resetCalls();
 	await dispatch({ message: {
 		message_id: 95000,
 		chat: { id: -1001, type: 'supergroup', title: '投票测试群' },
@@ -6385,11 +6393,13 @@ console.log('\n[84] /ad 投票主链');
 			text: '被举报的广告内容',
 		},
 	} });
-	assert('/ad 白名单成员 → 成功创建一条 D1 投票', db._adVotes.size === 1);
+	assert('/ad 第一主人白名单成员 → 成功创建一条 D1 投票', db._adVotes.size === 1);
 	const voteRow = [...db._adVotes.values()][0];
 	let voteState = JSON.parse(voteRow.state_json);
+	assert('/ad 白名单成员发起 → 身份记录为举报白名单成员', voteState.initiatorRole === '举报白名单成员');
 	assert('/ad 发起者 → 自动计入第一张赞成票且阈值为 6', voteState.approvers.length === 1 && voteState.approvers[0].id === '95000' && voteState.threshold === 6);
 	assert('/ad 回复模式 → 举报原因写入 D1 状态并显示在投票消息', voteState.reason === '广告引流' && callsOf('sendMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.text.includes('举报原因') && call.body.text.includes('广告引流')));
+	assert('/ad 回复模式 → 投票卡片回复原被举报消息', callsOf('sendMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.reply_to_message_id === 95010));
 	assert('/ad 成功投票消息 → 是非主人群静默规则的唯一可见投票回执并含取消按钮', callsOf('sendMessage').filter((call) => Number(call.body.chat_id) < 0).length === 1 && callsOf('sendMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.reply_markup?.inline_keyboard?.length === 2 && call.body.reply_markup.inline_keyboard.flat().some((button) => button.callback_data === 'adv:C:' + voteState.voteToken)));
 	assert('/ad 创建成功 → 自动静默置顶投票消息', callsOf('pinChatMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.message_id === voteState.messageId && call.body.disable_notification === true));
 
@@ -6465,7 +6475,7 @@ console.log('\n[84b] /ad 防滥用边界');
 			banChatMember: () => ({ ok: true, result: true }),
 		});
 		const db = makeAdD1();
-		db._adVoteAllowlist.set('96000', { user_id: '96000', by_user: '999', at: '2026-08-06T00:00:00.000Z' });
+		db._adVoteAllowlist.set('96000', { user_id: '96000', by_user: '999', at: '2026-08-07T00:00:00.000Z' });
 		const env = {
 			TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002',
 			OWNER_IDS: '999,998', SUPER_ADMINS: '7777',
@@ -6505,6 +6515,8 @@ console.log('\n[84b] /ad 防滥用边界');
 	assert('/ad 当前群管理员反对 → 一票否决并结束投票', state.finalized === true && state.result === 'rejected' && callsOf('answerCallbackQuery').some((call) => call.body.text.includes('一票否决')));
 	assert('/ad 管理员一票否决 → 不加黑、不删被举报消息、不执行全群封禁', !harness.db._rows.has('96010') && !callsOf('deleteMessage').some((call) => call.body.message_id === 96011) && callsOf('banChatMember').length === 0);
 	assert('/ad 管理员一票否决 → 自动取消投票消息置顶', callsOf('unpinChatMessage').some((call) => call.body.message_id === state.messageId));
+	const rejectedOwnerDm = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999' && call.body.text.includes('广告举报投票已被否决'));
+	assert('/ad 否决 → 完整结果只私聊第一主人', !!rejectedOwnerDm && rejectedOwnerDm.body.text.includes('96010') && rejectedOwnerDm.body.text.includes('小孩哥') && rejectedOwnerDm.body.text.includes('一票否决') && rejectedOwnerDm.body.text.includes('未写入 D1') && !callsOf('sendMessage').some((call) => String(call.body.chat_id) === '998' && call.body.text.includes('广告举报投票已被否决')));
 
 	harness = makeVoteHarness();
 	await harness.start(96020, 96021);
@@ -6518,6 +6530,8 @@ console.log('\n[84b] /ad 防滥用边界');
 	assert('/ad 超过 1 小时 → 自动结束为 expired', state.finalized === true && state.result === 'expired' && callsOf('answerCallbackQuery').some((call) => call.body.text.includes('超过 1 小时')));
 	assert('/ad 过期 → 目标不加黑、不删除、不全群封禁', !harness.db._rows.has('96020') && !callsOf('deleteMessage').some((call) => call.body.message_id === 96021) && callsOf('banChatMember').length === 0);
 	assert('/ad 过期 → 自动取消投票消息置顶', callsOf('unpinChatMessage').some((call) => call.body.message_id === state.messageId));
+	const expiredOwnerDm = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999' && call.body.text.includes('广告举报投票已过期'));
+	assert('/ad 过期 → 完整结果只私聊第一主人', !!expiredOwnerDm && expiredOwnerDm.body.text.includes('96020') && expiredOwnerDm.body.text.includes('最终票数') && expiredOwnerDm.body.text.includes('未写入 D1') && !callsOf('sendMessage').some((call) => String(call.body.chat_id) === '998' && call.body.text.includes('广告举报投票已过期')));
 
 	harness = makeVoteHarness();
 	await harness.start(96030, 96031, '小孩哥');
@@ -6530,6 +6544,8 @@ console.log('\n[84b] /ad 防滥用边界');
 	assert('/ad 取消 → 不加黑、不删除被举报消息、不执行全群封禁', !harness.db._rows.has('96030') && !callsOf('deleteMessage').some((call) => call.body.message_id === 96031) && callsOf('banChatMember').length === 0);
 	assert('/ad 取消 → 最终消息保留举报原因并显示已取消', callsOf('editMessageText').some((call) => call.body.text.includes('举报原因') && call.body.text.includes('小孩哥') && call.body.text.includes('投票已取消')));
 	assert('/ad 取消 → 自动取消投票消息置顶', callsOf('unpinChatMessage').some((call) => call.body.message_id === state.messageId));
+	const cancelledOwnerDm = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999' && call.body.text.includes('广告举报投票已取消'));
+	assert('/ad 取消 → 完整结果只私聊第一主人', !!cancelledOwnerDm && cancelledOwnerDm.body.text.includes('96030') && cancelledOwnerDm.body.text.includes('小孩哥') && cancelledOwnerDm.body.text.includes('取消人') && cancelledOwnerDm.body.text.includes('未写入 D1') && !callsOf('sendMessage').some((call) => String(call.body.chat_id) === '998' && call.body.text.includes('广告举报投票已取消')));
 
 	harness = makeVoteHarness({ pinFails: true });
 	await harness.dispatch({ message: {
@@ -6540,6 +6556,7 @@ console.log('\n[84b] /ad 防滥用边界');
 	} });
 	state = harness.readState();
 	assert('/ad TGID 模式 → 正确解析目标与举报原因', state.targetUserId === '96040' && state.reason === '小孩哥');
+	assert('/ad TGID 模式 → 投票卡片为独立消息，不设置回复目标', callsOf('sendMessage').some((call) => Number(call.body.chat_id) === -1001 && !Object.prototype.hasOwnProperty.call(call.body, 'reply_to_message_id')));
 	assert('/ad 置顶权限不足 → 投票仍创建并保持进行中', harness.db._adVotes.size === 1 && state.finalized === false && callsOf('pinChatMessage').length === 1);
 
 	harness = makeVoteHarness();
