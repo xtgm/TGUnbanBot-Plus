@@ -148,6 +148,7 @@ const AD_SIMILARITY_MAX_CANONICAL_LENGTH = 2000;
 const AD_RELAY_REPEAT_THRESHOLD = 2;
 const AD_VOTE_THRESHOLD = 6;
 const AD_VOTE_DURATION_SECONDS = 60 * 60;
+const AD_VOTE_COMMAND_MAX_AGE_SECONDS = 30;
 const AD_VOTE_RETENTION_SECONDS = 7 * 24 * 60 * 60;
 const AD_VOTE_BUTTON_PREFIX = 'adv:';
 const AD_IDENTITY_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -4930,6 +4931,10 @@ function d1MutationChanges(result) {
 	return Number.isFinite(changes) ? changes : 0;
 }
 
+function normalizeAdVoteChatTitle(value) {
+	return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 255);
+}
+
 function normalizeAdVoteState(value) {
 	if (!value || typeof value !== 'object') return null;
 	const voteToken = String(value.voteToken || '').trim();
@@ -4941,9 +4946,12 @@ function normalizeAdVoteState(value) {
 		...value,
 		voteToken,
 		chatId,
+		chatTitle: normalizeAdVoteChatTitle(value.chatTitle),
 		targetUserId,
 		creatorUserId,
 		messageId: Number(value.messageId) || null,
+		commandMessageId: Number(value.commandMessageId) || null,
+		commandDate: Number(value.commandDate) || 0,
 		reportedMessageId: Number(value.reportedMessageId) || null,
 		approvers: Array.isArray(value.approvers) ? value.approvers : [],
 		reason: String(value.reason || '').replace(/\s+/g, ' ').trim().slice(0, 200),
@@ -6822,6 +6830,38 @@ function createAdVoteToken() {
 	return (Date.now().toString(36) + Math.random().toString(36).slice(2, 10)).slice(0, 20);
 }
 
+function getAdVoteCommandDate(message) {
+	const value = Number(message?.date);
+	return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function getAdVoteCommandIgnoreReason(message, nowSeconds, existingState = null) {
+	const commandDate = getAdVoteCommandDate(message);
+	const now = Math.max(0, Number(nowSeconds) || 0);
+	if (commandDate > 0 && now > commandDate && now - commandDate > AD_VOTE_COMMAND_MAX_AGE_SECONDS) {
+		return `命令已延迟 ${now - commandDate} 秒，超过 ${AD_VOTE_COMMAND_MAX_AGE_SECONDS} 秒安全窗口`;
+	}
+	if (!existingState) return '';
+	const commandMessageId = Number(message?.message_id) || 0;
+	if (commandMessageId > 0 && Number(existingState.commandMessageId) === commandMessageId) {
+		return '相同 message_id 的命令已处理';
+	}
+	if (commandDate > 0 && Number(existingState.createdAt) > 0 && commandDate < Number(existingState.createdAt)) {
+		return '命令原始发送时间早于现有投票创建时间';
+	}
+	return '';
+}
+
+function logIgnoredAdVoteCommand(message, reason) {
+	console.warn(
+		'[/ad] 已静默忽略延迟或重复命令: ' + reason
+		+ '; chat=' + String(message?.chat?.id || '')
+		+ '; message=' + String(message?.message_id || '')
+		+ '; from=' + String(getMessageActorId(message) || '')
+		+ '; command_date=' + String(getAdVoteCommandDate(message) || 0)
+	);
+}
+
 async function sendAdVoteCommandFeedback(message, ctx, text) {
 	await sendModerationCommandFeedback(message, ctx, {
 		flashText: text,
@@ -6831,37 +6871,48 @@ async function sendAdVoteCommandFeedback(message, ctx, text) {
 
 async function handleAdCommand(message, env, ctx) {
 	if (!isConfiguredGroup(message?.chat?.id) || message?.chat?.type === 'private') return true;
+	const now = Math.floor(Date.now() / 1000);
+	const staleReason = getAdVoteCommandIgnoreReason(message, now);
+	if (staleReason) {
+		logIgnoredAdVoteCommand(message, staleReason);
+		return true;
+	}
 	const role = await getAdVoteInitiatorRole(message, env);
 	if (!role) return true;
 
-	await deleteAuthorizedGroupCommandMessage(message, '/ad');
-	if (!env.DB) {
-		await sendAdVoteCommandFeedback(message, ctx, '❌ 未绑定 D1，无法发起广告举报投票。');
+	const deleteAndReply = async (text) => {
+		await deleteAuthorizedGroupCommandMessage(message, '/ad');
+		await sendAdVoteCommandFeedback(message, ctx, text);
 		return true;
+	};
+	if (!env.DB) {
+		return deleteAndReply('❌ 未绑定 D1，无法发起广告举报投票。');
 	}
 	if (!(await ensureAdVoteTables(env))) {
-		await sendAdVoteCommandFeedback(message, ctx, '❌ D1 投票存储初始化失败，请稍后重试。');
-		return true;
+		return deleteAndReply('❌ D1 投票存储初始化失败，请稍后重试。');
 	}
 	await pruneExpiredAdVotes(env);
 
 	const target = getAdVoteTargetFromMessage(message);
 	if (!/^\d+$/.test(target.targetUserId)) {
-		await sendAdVoteCommandFeedback(message, ctx, '❌ 用法：回复目标消息发送 <code>/ad [举报原因]</code>，或发送 <code>/ad TGID [举报原因]</code>。');
-		return true;
+		return deleteAndReply('❌ 用法：回复目标消息发送 <code>/ad [举报原因]</code>，或发送 <code>/ad TGID [举报原因]</code>。');
 	}
 	const protection = await resolveAdVoteTargetProtection(message, target);
 	if (protection.protected) {
-		await sendAdVoteCommandFeedback(message, ctx, '⚠️ ' + escapeHtml(protection.reason));
-		return true;
+		return deleteAndReply('⚠️ ' + escapeHtml(protection.reason));
 	}
-	const now = Math.floor(Date.now() / 1000);
 	const existing = await findActiveAdVote(env, message.chat.id, target.targetUserId, now);
 	if (existing?.vote_token) {
-		await sendAdVoteCommandFeedback(message, ctx, '⚠️ 当前群已存在针对该用户的进行中投票，请勿重复发起。');
-		return true;
+		const existingState = await readAdVoteState(env, existing.vote_token);
+		const duplicateReason = getAdVoteCommandIgnoreReason(message, now, existingState);
+		if (duplicateReason) {
+			logIgnoredAdVoteCommand(message, duplicateReason);
+			return true;
+		}
+		return deleteAndReply('⚠️ 当前群已存在针对该用户的进行中投票，请勿重复发起。');
 	}
 
+	await deleteAuthorizedGroupCommandMessage(message, '/ad');
 	const creatorId = getMessageActorId(message);
 	const creatorSnapshot = isAnonymousAdminMessage(message)
 		? snapshotAdVoteUser(null, {
@@ -6873,8 +6924,11 @@ async function handleAdCommand(message, env, ctx) {
 	const state = normalizeAdVoteState({
 		voteToken: createAdVoteToken(),
 		messageId: null,
+		commandMessageId: Number(message.message_id) || null,
+		commandDate: getAdVoteCommandDate(message),
 		reportedMessageId: target.reportedMessageId,
 		chatId: String(message.chat.id),
+		chatTitle: message.chat.title || '',
 		targetUserId: target.targetUserId,
 		creatorUserId: creatorId,
 		targetUserSnapshot: target.targetUserSnapshot,
@@ -6951,15 +7005,31 @@ async function saveFinalizedAdVoteDetails(env, state) {
 	return false;
 }
 
+async function formatAdVoteSourceGroup(state) {
+	const chatId = String(state?.chatId || '').trim();
+	let chatTitle = normalizeAdVoteChatTitle(state?.chatTitle);
+	if (!chatTitle && chatId && isConfiguredGroup(chatId)) {
+		try {
+			const info = await getChatInfoFromId(chatId);
+			chatTitle = normalizeAdVoteChatTitle(info?.title);
+		} catch (error) {
+			console.warn('[/ad] 补查来源群名称失败: ' + (error?.message || error));
+		}
+	}
+	const idLabel = `<code>${escapeHtml(chatId || '未知群组')}</code>`;
+	return chatTitle ? `<b>${escapeHtml(chatTitle)}</b> ${idLabel}` : idLabel;
+}
+
 async function notifyOwnerAdVoteApproved(state, blacklistResult, banResults, deleteResult) {
 	if (!OWNER_IDS.length) return;
+	const sourceGroup = await formatAdVoteSourceGroup(state);
 	const lines = [
 		'🗳️ <b>广告举报投票已通过</b>',
 		'🎯 目标:' + formatAdVoteUser(state.targetUserSnapshot, state.targetUserId)
 			+ ' <code>' + escapeHtml(state.targetUserId) + '</code>',
 		'👤 发起人:' + formatAdVoteUser(state.creatorUserSnapshot, state.creatorUserId)
 			+ '（' + escapeHtml(state.initiatorRole || '未知身份') + '）',
-		'📍 来源群:<code>' + escapeHtml(state.chatId) + '</code>',
+		'📍 来源群:' + sourceGroup,
 		'📊 票数:赞成 ' + state.approvers.length + ' / 反对 ' + state.rejecters.length,
 		'📝 举报原因:' + escapeHtml(state.reason || '未填写'),
 		'',
@@ -6984,6 +7054,7 @@ async function notifyOwnerAdVoteApproved(state, blacklistResult, banResults, del
 
 async function notifyOwnerAdVoteClosed(state) {
 	if (!OWNER_IDS.length || !state?.finalized || state.result === 'approved') return;
+	const sourceGroup = await formatAdVoteSourceGroup(state);
 	const resultMeta = {
 		rejected: {
 			title: '广告举报投票已被否决',
@@ -7013,7 +7084,7 @@ async function notifyOwnerAdVoteClosed(state) {
 			+ ' <code>' + escapeHtml(state.targetUserId) + '</code>',
 		'👤 发起人:' + formatAdVoteUser(state.creatorUserSnapshot, state.creatorUserId)
 			+ '（' + escapeHtml(state.initiatorRole || '未知身份') + '）',
-		'📍 来源群:<code>' + escapeHtml(state.chatId) + '</code>',
+		'📍 来源群:' + sourceGroup,
 		'⏰ 截止时间:<code>' + escapeHtml(formatBeijingTimeFromSeconds(state.deadlineAt)) + '</code>',
 		'📊 最终票数:赞成 ' + state.approvers.length + ' / 反对 ' + state.rejecters.length,
 		'✅ 赞成人:' + formatAdVoteVoters(state.approvers),
