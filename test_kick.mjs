@@ -98,9 +98,13 @@ function makeFakeDB(seed = [], options = {}) {
 	const store = new Map();
 	const batchJobs = new Map();
 	const relayObservations = new Map();
+	const adVotes = new Map();
+	const adVoteAllowlist = new Map();
 	const schemaState = {
-		version: Number.isFinite(Number(options.schemaVersion)) ? Number(options.schemaVersion) : 3,
+		version: Number.isFinite(Number(options.schemaVersion)) ? Number(options.schemaVersion) : 4,
 		relayTableExists: options.relayTableExists !== false,
+		voteTableExists: options.voteTableExists !== false,
+		voteAllowlistTableExists: options.voteAllowlistTableExists !== false,
 		schemaExecCount: 0,
 	};
 	const preparedSql = [];
@@ -155,13 +159,22 @@ function makeFakeDB(seed = [], options = {}) {
 		_store: store,
 		_jobs: batchJobs,
 		_relayObservations: relayObservations,
+		_adVotes: adVotes,
+		_adVoteAllowlist: adVoteAllowlist,
 		_schema: schemaState,
 		_sql: preparedSql,
 		_mutationCalls: mutationCalls,
 		exec: async (sql) => {
-			if (String(sql).includes('CREATE TABLE IF NOT EXISTS ad_relay_observations')) {
+			const ddl = String(sql);
+			if (
+				ddl.includes('CREATE TABLE IF NOT EXISTS ad_relay_observations')
+				|| ddl.includes('CREATE TABLE IF NOT EXISTS ad_votes')
+				|| ddl.includes('CREATE TABLE IF NOT EXISTS ad_vote_allowlist')
+			) {
 				schemaState.schemaExecCount += 1;
 				schemaState.relayTableExists = true;
+				schemaState.voteTableExists = true;
+				schemaState.voteAllowlistTableExists = true;
 			}
 		},
 		prepare(sql) {
@@ -173,8 +186,14 @@ function makeFakeDB(seed = [], options = {}) {
 					if (sql.startsWith('SELECT version FROM schema_meta')) {
 						return { version: schemaState.version };
 					}
-					if (sql.includes("FROM sqlite_master") && sql.includes("ad_relay_observations")) {
-						return schemaState.relayTableExists ? { name: 'ad_relay_observations' } : null;
+					if (sql.includes("FROM sqlite_master") && sql.includes("name = ?")) {
+						const table = String(bound[0] || '');
+						const exists = table === 'ad_relay_observations'
+							? schemaState.relayTableExists
+							: (table === 'ad_votes'
+								? schemaState.voteTableExists
+								: (table === 'ad_vote_allowlist' ? schemaState.voteAllowlistTableExists : false));
+						return exists ? { name: table } : null;
 					}
 					if (sql.startsWith('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ?')) {
 						const row = rows.get(String(bound[0]));
@@ -209,6 +228,34 @@ function makeFakeDB(seed = [], options = {}) {
 						if (!schemaState.relayTableExists) throw new Error('D1_ERROR: no such table: ad_relay_observations');
 						return relayObservations.get(String(bound[0])) || null;
 					}
+					if (sql.startsWith('SELECT vote_token, state_json, version, finalized, result, deadline_at FROM ad_votes')) {
+						if (!schemaState.voteTableExists) throw new Error('D1_ERROR: no such table: ad_votes');
+						const row = adVotes.get(String(bound[0]));
+						return row ? {
+							vote_token: row.vote_token,
+							state_json: row.state_json,
+							version: row.version,
+							finalized: row.finalized,
+							result: row.result,
+							deadline_at: row.deadline_at,
+						} : null;
+					}
+					if (sql.startsWith('SELECT vote_token FROM ad_votes WHERE chat_id = ?')) {
+						if (!schemaState.voteTableExists) throw new Error('D1_ERROR: no such table: ad_votes');
+						const [chatId, targetUserId, nowSeconds] = bound;
+						const hit = [...adVotes.values()]
+							.filter((row) => String(row.chat_id) === String(chatId)
+								&& String(row.target_user_id) === String(targetUserId)
+								&& Number(row.finalized) === 0
+								&& Number(row.deadline_at) > Number(nowSeconds))
+							.sort((a, b) => Number(b.created_at) - Number(a.created_at))[0];
+						return hit ? { vote_token: hit.vote_token } : null;
+					}
+					if (sql.startsWith('SELECT user_id FROM ad_vote_allowlist WHERE user_id = ?')) {
+						if (!schemaState.voteAllowlistTableExists) throw new Error('D1_ERROR: no such table: ad_vote_allowlist');
+						const row = adVoteAllowlist.get(String(bound[0]));
+						return row ? { user_id: row.user_id } : null;
+					}
 
 					if (sql.startsWith('SELECT id, type, status, payload FROM batch_jobs WHERE id = ?')) {
 						return batchJobs.get(bound[0]) || null;
@@ -219,6 +266,81 @@ function makeFakeDB(seed = [], options = {}) {
 					if (sql.startsWith('INSERT OR REPLACE INTO schema_meta')) {
 						schemaState.version = Number(bound[0]) || 0;
 						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('INSERT INTO ad_votes')) {
+						if (!schemaState.voteTableExists) throw new Error('D1_ERROR: no such table: ad_votes');
+						const [voteToken, chatId, voteMessageId, reportedMessageId, targetUserId, creatorUserId, stateJson, createdAt, deadlineAt, updatedAt] = bound;
+						if (adVotes.has(String(voteToken))) throw new Error('UNIQUE constraint failed: ad_votes.vote_token');
+						adVotes.set(String(voteToken), {
+							vote_token: String(voteToken),
+							chat_id: String(chatId),
+							vote_message_id: voteMessageId,
+							reported_message_id: reportedMessageId,
+							target_user_id: String(targetUserId),
+							creator_user_id: String(creatorUserId),
+							state_json: stateJson,
+							version: 1,
+							finalized: 0,
+							result: null,
+							created_at: Number(createdAt),
+							deadline_at: Number(deadlineAt),
+							updated_at: updatedAt,
+						});
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('UPDATE ad_votes SET vote_message_id')) {
+						const [voteMessageId, stateJson, nextVersion, finalized, resultValue, deadlineAt, updatedAt, voteToken, expectedVersion] = bound;
+						const row = adVotes.get(String(voteToken));
+						if (!row || Number(row.version) !== Number(expectedVersion) || Number(row.finalized) !== 0) {
+							return { meta: { changes: 0 } };
+						}
+						adVotes.set(String(voteToken), {
+							...row,
+							vote_message_id: voteMessageId,
+							state_json: stateJson,
+							version: Number(nextVersion),
+							finalized: Number(finalized),
+							result: resultValue,
+							deadline_at: Number(deadlineAt),
+							updated_at: updatedAt,
+						});
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('UPDATE ad_votes SET state_json')) {
+						const [stateJson, nextVersion, resultValue, updatedAt, voteToken] = bound;
+						const row = adVotes.get(String(voteToken));
+						if (!row || Number(row.finalized) !== 1) return { meta: { changes: 0 } };
+						adVotes.set(String(voteToken), {
+							...row,
+							state_json: stateJson,
+							version: Number(nextVersion),
+							result: resultValue,
+							updated_at: updatedAt,
+						});
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('DELETE FROM ad_votes WHERE created_at < ?')) {
+						let changes = 0;
+						for (const [key, row] of adVotes) {
+							if (Number(row.created_at) < Number(bound[0])) {
+								adVotes.delete(key);
+								changes += 1;
+							}
+						}
+						return { meta: { changes } };
+					}
+					if (sql.startsWith('INSERT OR REPLACE INTO ad_vote_allowlist')) {
+						const [userId, byUser, at] = bound;
+						adVoteAllowlist.set(String(userId), {
+							user_id: String(userId),
+							by_user: String(byUser || ''),
+							at,
+						});
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('DELETE FROM ad_vote_allowlist WHERE user_id = ?')) {
+						const existed = adVoteAllowlist.delete(String(bound[0]));
+						return { meta: { changes: existed ? 1 : 0 } };
 					}
 					if (sql.startsWith('INSERT OR IGNORE INTO blacklist')) {
 						const [rawId, reason, by, at, note] = bound;
@@ -1131,8 +1253,8 @@ console.log('\n[8g] /{TOKEN}/purge groups 参数只扫可清扫群');
 	assert('banChatMember 调用 2 次', callsOf('banChatMember').length === 2);
 }
 
-// ---------- [8h] /{TOKEN}/purge 默认只清扫 /ban + /spam ----------
-console.log('\n[8h] /{TOKEN}/purge 默认只清扫 /ban + /spam');
+// ---------- [8h] /{TOKEN}/purge 默认清扫 /ban + /spam + /ad 投票 ----------
+console.log('\n[8h] /{TOKEN}/purge 默认清扫 /ban + /spam + /ad 投票');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
@@ -1148,17 +1270,18 @@ console.log('\n[8h] /{TOKEN}/purge 默认只清扫 /ban + /spam');
 			{ id: '8103', reason: 'spam', by: '1000', at: '2026-05-03T00:00:00Z' },
 			{ id: '8104', reason: 'ad_auto', by: 'system', at: '2026-05-04T00:00:00Z' },
 			{ id: '8105', reason: 'manual_ban', by: '999', at: '2026-05-05T00:00:00Z' },
+			{ id: '8106', reason: 'ad_vote', by: 'system', at: '2026-05-06T00:00:00Z' },
 		]),
 	};
 	const res = await handler.fetch(new Request(`https://x.com/${TOKEN}/purge?limit=20`), env);
 	const json = await res.json();
 
 	assert('默认清扫 200', res.status === 200);
-	assert('默认范围是 /ban + /spam（兼容旧 spam reason）', json.reasons === 'manual,sa,spam' && json.清扫范围 === '/ban + /spam');
-	assert('默认统计 manual/spam/spam 3 条', json.黑名单总数 === 3);
-	assert('默认总任务数 6', json.总任务数 === 6);
-	assert('默认不扫 ad_auto/manual_ban', callsOf('banChatMember').every((c) => ['8101', '8102', '8103'].includes(String(c.body.user_id))));
-	assert('默认踢出 6 次', callsOf('banChatMember').length === 6);
+	assert('默认范围包含 /ban + /spam + /ad 投票（兼容旧 spam reason）', json.reasons === 'manual,sa,spam,ad_vote' && json.清扫范围 === '/ban + /spam + /ad 投票');
+	assert('默认统计 manual/sa/spam/ad_vote 4 条', json.黑名单总数 === 4);
+	assert('默认总任务数 8', json.总任务数 === 8);
+	assert('默认不扫 ad_auto/manual_ban', callsOf('banChatMember').every((c) => ['8101', '8102', '8103', '8106'].includes(String(c.body.user_id))));
+	assert('默认踢出 8 次', callsOf('banChatMember').length === 8);
 }
 
 // ---------- [8i] /{TOKEN}/purge?reasons=all 全量清扫兜底 ----------
@@ -3691,8 +3814,8 @@ console.log('\n[23] 一键代发链路已移除');
 	const commandCall = callsOf('setMyCommands')[0];
 	const registeredCommands = commandCall?.body?.commands?.map((item) => item.command) || [];
 	assert('Webhook 初始化 → 成功', initResult.status === 200 && !!webhookCall);
-	assert('Webhook 初始化 → 仅订阅 message/chat_member', JSON.stringify(webhookCall?.body?.allowed_updates) === JSON.stringify(['message', 'chat_member']));
-	assert('Webhook 初始化 → 不再订阅 callback_query', !webhookCall?.body?.allowed_updates?.includes('callback_query'));
+	assert('Webhook 初始化 → 订阅 message/chat_member/callback_query', JSON.stringify(webhookCall?.body?.allowed_updates) === JSON.stringify(['message', 'chat_member', 'callback_query']));
+	assert('Webhook 初始化 → /ad 投票按钮回调已启用', webhookCall?.body?.allowed_updates?.includes('callback_query'));
 	assert('BotFather 菜单统一注册 ban/spam', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'spam', 'check', 'blacklist']));
 }
 
@@ -4706,11 +4829,12 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	const expectedHelpCommands = [
 		'/importdefault', '/addword', '/delword', '/listwords',
 		'/spam', '/learn', '/recent', '/learnlast',
+		'/ad', '/add_ad_admin', '/del_ad_admin',
 		'/listsamples', '/delsample', '/clearsamples',
 		'/admins', '/groups', '/leavegroup',
 	];
 	const missingHelpCommands = expectedHelpCommands.filter((command) => !dm?.body?.text?.includes(command));
-	assert('主人 /help → 全部 14 个指令齐全', missingHelpCommands.length === 0, `缺少 ${missingHelpCommands.join(',')}`);
+	assert('主人 /help → 全部 17 个指令齐全', missingHelpCommands.length === 0, `缺少 ${missingHelpCommands.join(',')}`);
 	const mentionParseOk = expectedHelpCommands.every((command) => (
 		sandbox.parseTelegramCommand(`${command}@TestBot`).head === command
 	));
@@ -4734,6 +4858,7 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('主人 /help → 不再显示旧短命令', !!dm && !dm.body.text.includes(removedBanCommand) && !dm.body.text.includes(removedSpamCommand));
 	assert('主人 /help → 含 /admins 权限名单说明', !!dm && dm.body.text.includes('/admins') && dm.body.text.includes('权限名单'));
 	assert('主人 /help → 含 /groups 群组查询说明', !!dm && dm.body.text.includes('/groups') && dm.body.text.includes('GROUP_ID'));
+	assert('主人 /help → 含 /ad 原因、自动置顶、取消投票与 revoke_messages 说明', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('自动置顶') && dm.body.text.includes('取消投票') && dm.body.text.includes('revoke_messages=true'));
 	// 群管理员(非主人)私聊 /help → 权限不足,不泄漏指令
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/help' } }) }), env, fakeCtxAd);
@@ -5304,6 +5429,7 @@ console.log('\n[81] 短正文引用广告自动拦截');
 		{ label: 'j', text: 'j' },
 		{ label: 'v', text: 'v' },
 		{ label: 'n', text: 'n' },
+		{ label: '爽', text: '爽' },
 		{ label: '零宽字符', text: '\u200B' },
 	];
 	for (const [index, wrapperCase] of strongWrapperCases.entries()) {
@@ -5449,10 +5575,10 @@ console.log('\n[81] 短正文引用广告自动拦截');
 		}
 	}) }), env, fakeCtxAd);
 	bl = JSON.parse(db._store.get('blacklist') || '[]');
-	assert('中文正常短回复引用卡片广告 → 不误杀当前发送者', !bl.some((e) => e.id === '91008'));
-	assert('中文正常短回复引用卡片广告 → 删除当前含广告引用的消息', callsOf('deleteMessage').some((c) => c.body.message_id === 906));
-	assert('中文正常短回复引用卡片广告 → 不全群踢', callsOf('banChatMember').length === 0);
-	assert('中文正常短回复引用卡片广告 → 第一次仍写观察档案', db._relayObservations.get('91008')?.occurrences === 1);
+	assert('牛比包装高置信卡片广告 → 当前传播者首次直接加黑', bl.some((e) => e.id === '91008'));
+	assert('牛比包装高置信卡片广告 → 删除当前含广告引用的消息', callsOf('deleteMessage').some((c) => c.body.message_id === 906));
+	assert('牛比包装高置信卡片广告 → 当前传播者遍历全部 GROUP_ID 封禁', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '91008'));
+	assert('牛比包装高置信卡片广告 → 不进入观察表', !db._relayObservations.has('91008'));
 
 	resetCalls();
 	db = makeFakeDB([]);
@@ -5472,8 +5598,50 @@ console.log('\n[81] 短正文引用广告自动拦截');
 	assert('长正文讨论引用广告 → 删除当前含广告引用的消息', callsOf('deleteMessage').some((c) => c.body.message_id === 901));
 }
 
-// ---------- [81b] 引用广告归属：第一次观察、原作者封禁、第二次升级 ----------
+// ---------- [81a2] 删除竞态或权限失败不能阻断广告传播者全局封禁 ----------
+console.log('\n[81a2] 广告引用删除结果与封禁决策解耦');
+{
+	const scenarios = [
+		{
+			label: '消息已被其他机器人删除',
+			actorId: 93990,
+			error: 'Bad Request: message to delete not found',
+			noticeText: '已被其他机器人或管理员删除，等效成功',
+		},
+		{
+			label: '机器人缺少删除权限',
+			actorId: 93991,
+			error: 'Bad Request: CHAT_ADMIN_REQUIRED',
+			noticeText: 'bot 必须是群管理员',
+		},
+	];
+	for (const scenario of scenarios) {
+		resetCalls();
+		sandbox.fetch = makeFetchMock({
+			getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+			getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '删除竞态测试群', type: 'supergroup' } }),
+			banChatMember: () => ({ ok: true, result: true }),
+			deleteMessage: () => ({ ok: false, description: scenario.error }),
+			sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		});
+		const db = makeAdD1({ porn: ['大婆啦'] });
+		const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+			message_id: scenario.actorId,
+			chat: { id: -1001, type: 'supergroup', title: '删除竞态测试群' },
+			from: { id: scenario.actorId, is_bot: false, first_name: '广告传播者' },
+			text: '爽',
+			quote: { text: '📢 大婆啦 真实广告内容' },
+		} }) }), env, fakeCtxAd);
+		const ownerNotice = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
+		assert(scenario.label + ' → 当前传播者仍写入 D1 全局黑名单', db._rows.get(String(scenario.actorId))?.reason === 'ad_auto');
+		assert(scenario.label + ' → 仍遍历全部 GROUP_ID 封禁', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((call) => String(call.body.user_id) === String(scenario.actorId)));
+		assert(scenario.label + ' → 删除结果给主人显示真实中文状态', !!ownerNotice && ownerNotice.body.text.includes(scenario.noticeText));
+		assert(scenario.label + ' → 不进入首次观察漏封路径', !db._relayObservations.has(String(scenario.actorId)));
+	}
+}
 console.log('\n[81b] 引用广告归属与观察升级');
+// ---------- [81b] 引用广告归属：误触观察、正常语境保护与原作者封禁 ----------
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
@@ -5506,7 +5674,7 @@ console.log('\n[81b] 引用广告归属与观察升级');
 	assert('第一次正常文字回复广告 → 删除当前含广告引用的消息', callsOf('deleteMessage').some((c) => c.body.message_id === 94010));
 	assert('第一次正常文字回复广告 → D1 观察次数为 1', db._relayObservations.get('94001')?.occurrences === 1);
 	const firstNotice = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('观察完整通知 → 第一主人收到当前回复者、原作者和处理结果', !!firstNotice && firstNotice.body.text.includes('广告引用观察') && firstNotice.body.text.includes('94001') && firstNotice.body.text.includes('94002'));
+	assert('保护判定完整通知 → 第一主人收到当前回复者、原作者和处理结果', !!firstNotice && firstNotice.body.text.includes('广告引用保护判定') && firstNotice.body.text.includes('94001') && firstNotice.body.text.includes('94002'));
 	assert('观察完整通知 → 群内、副主人、超管、回复者均不接收', callsOf('sendMessage').every((c) => String(c.body.chat_id) === '999'));
 
 	resetCalls();
@@ -5516,11 +5684,10 @@ console.log('\n[81b] 引用广告归属与观察升级');
 
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: relayMessage(94011, '别发广告') }) }), env, fakeCtxAd);
-	assert('第二次不同消息传播广告 → 当前回复者升级全局黑名单', db._rows.get('94001')?.reason === 'ad_auto');
-	assert('第二次不同消息传播广告 → 观察次数为 2', db._relayObservations.get('94001')?.occurrences === 2);
-	const repeatTargets = new Set(callsOf('banChatMember').map((c) => String(c.body.user_id)));
-	assert('第二次传播 → 当前回复者和原作者均执行全群封禁且按 TGID 去重', callsOf('banChatMember').length === 4 && repeatTargets.size === 2 && repeatTargets.has('94001') && repeatTargets.has('94002'));
-	assert('第二次传播通知 → 仍只发第一主人', callsOf('sendMessage').every((c) => String(c.body.chat_id) === '999'));
+	assert('明确劝阻语境重复出现 → 当前回复者仍不进全局黑名单', !db._rows.has('94001'));
+	assert('明确劝阻语境重复出现 → 观察次数不累计', db._relayObservations.get('94001')?.occurrences === 1);
+	assert('明确劝阻语境重复出现 → 原作者仍执行全部 GROUP_ID 封禁', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '94002'));
+	assert('明确劝阻语境通知 → 仍只发第一主人', callsOf('sendMessage').every((c) => String(c.body.chat_id) === '999'));
 
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: relayMessage(94012, null, 94003) }) }), env, fakeCtxAd);
@@ -5687,8 +5854,96 @@ console.log('\n[81f] /spam 学习载体归属');
 	assert('/spam 资料通过普通广告词评分命中 → 不学习当前正常正文', !db._store.has('ad_samples'));
 }
 
-// ---------- [81g] 主人私聊失败不影响 D1 观察与原作者封禁 ----------
+// ---------- [81f2] 只有第一主人 /spam 才写广告学习样本 ----------
+console.log('\n[81f2] /spam 学习权限严格限制第一主人');
+{
+	const roleCases = [
+		{ label: '副主人', actorId: 998, targetId: 94431 },
+		{ label: '超级管理员', actorId: 7777, targetId: 94432 },
+		{ label: '当前群普通管理员', actorId: 6666, targetId: 94433 },
+	];
+	for (const scenario of roleCases) {
+		resetCalls();
+		sandbox.fetch = makeFetchMock({
+			getChatAdministrators: (body) => ({
+				ok: true,
+				result: String(body.chat_id) === '-1001'
+					? [
+						{ user: { id: 999 }, status: 'creator' },
+						{ user: { id: 6666 }, status: 'administrator' },
+					]
+					: [{ user: { id: 999 }, status: 'creator' }],
+			}),
+			getChatMember: (body) => ({
+				ok: true,
+				result: String(body.chat_id) === '-1001' && String(body.user_id) === '6666'
+					? { status: 'administrator', user: { id: 6666, is_bot: false } }
+					: { status: 'member', user: { id: Number(body.user_id), is_bot: false } },
+			}),
+			getChat: (body) => ({ ok: true, result: { id: Number(body.chat_id), first_name: '普通用户', title: String(body.chat_id).startsWith('-') ? '测试群' : undefined, type: String(body.chat_id).startsWith('-') ? 'supergroup' : 'private' } }),
+			banChatMember: () => ({ ok: true, result: true }),
+			deleteMessage: () => ({ ok: true, result: true }),
+			sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		});
+		const db = makeAdD1({ porn: ['大婆啦'] });
+		const env = {
+			TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002',
+			OWNER_IDS: '999,998', SUPER_ADMINS: '7777',
+			AD_FILTER_ENABLED: 'true', DB: db,
+		};
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+			message_id: scenario.targetId - 1, chat: { id: -1001, type: 'supergroup', title: '测试群' },
+			from: { id: scenario.actorId, is_bot: false, first_name: scenario.label }, text: '/spam',
+			reply_to_message: { message_id: scenario.targetId, from: { id: scenario.targetId, is_bot: false, first_name: '广告用户' }, text: '📢 大婆啦 真实广告正文' },
+		} }) }), env, fakeCtxAd);
+		assert(scenario.label + ' /spam → 封禁功能照常写入黑名单并遍历全部 GROUP_ID', db._rows.get(String(scenario.targetId))?.reason === 'spam' && callsOf('banChatMember').length === 2);
+		assert(scenario.label + ' /spam → 不写广告学习样本', !db._store.has('ad_samples'));
+	}
+}
 console.log('\n[81g] 观察通知失败隔离');
+
+// ---------- [81f3] 第一主人学习后的相似广告变体查杀 ----------
+console.log('\n[81f3] 学习样本屏蔽账号、电话、金额、URL 与排版变量');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (body) => ({ ok: true, result: { id: Number(body.chat_id), first_name: '普通用户', title: String(body.chat_id).startsWith('-') ? '学习测试群' : undefined, type: String(body.chat_id).startsWith('-') ? 'supergroup' : 'private' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const db = makeAdD1();
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	const learnedText = '承接社群值守服务，长期招募合作伙伴，每月500元，联系 @service_old，详情 https://t.me/service_old，电话13800138000';
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 94440, chat: { id: -1001, type: 'supergroup', title: '学习测试群' },
+		from: { id: 999, is_bot: false, first_name: '主人' }, text: '/spam',
+		reply_to_message: { message_id: 94441, from: { id: 94441, is_bot: false, first_name: '广告样本账号' }, text: learnedText },
+	} }) }), env, fakeCtxAd);
+	const learned = JSON.parse(db._store.get('ad_samples') || '{"entries":[]}');
+	const learnedEntry = learned.entries?.find((entry) => entry.fingerprint === normalizeFp(learnedText));
+	assert('第一主人 /spam → 样本带可信相似签名入库', learnedEntry?.trusted === true && learnedEntry?.similarityTrusted === true && learnedEntry?.signature?.canonical);
+
+	resetCalls();
+	const variantText = '承接社群值守服务\n长期招募合作伙伴\n每月 900 元\n联系 @service_new\n详情 https://t.me/service_new\n电话 13900139000';
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 94442, chat: { id: -1001, type: 'supergroup', title: '学习测试群' },
+		from: { id: 94442, is_bot: false, first_name: '更换资料的广告账号' }, text: variantText,
+	} }) }), env, fakeCtxAd);
+	const ownerNotice = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
+	assert('相似广告更换账号、电话、金额、URL 和排版 → 首次自动全局封禁', db._rows.get('94442')?.reason === 'ad_auto' && callsOf('banChatMember').length === 2);
+	assert('相似广告变体 → 主人通知明确由可信学习样本相似命中', !!ownerNotice && ownerNotice.body.text.includes('学习样本(相似)'));
+
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 94443, chat: { id: -1001, type: 'supergroup', title: '学习测试群' },
+		from: { id: 94443, is_bot: false, first_name: '正常讨论者' }, text: '我们社群值守服务的排班已经确定，大家按月开会讨论合作安排',
+	} }) }), env, fakeCtxAd);
+	assert('共享部分业务词但没有广告意图的正常讨论 → 不被相似样本误杀', !db._rows.has('94443') && callsOf('deleteMessage').length === 0 && callsOf('banChatMember').length === 0);
+}
+
+// ---------- [81g] 主人私聊失败不影响 D1 观察与原作者封禁 ----------
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
@@ -5709,29 +5964,30 @@ console.log('\n[81g] 观察通知失败隔离');
 	assert('第一主人私聊失败 → 不回退发送给副主人或群聊', callsOf('sendMessage').length === 1 && String(callsOf('sendMessage')[0].body.chat_id) === '999');
 }
 
-// ---------- [81h] D1 schema v3 自动迁移与缺表自愈 ----------
-console.log('\n[81h] D1 schema v3 自动迁移与缺表自愈');
+// ---------- [81h] D1 schema v4 自动迁移与三张必需表自愈 ----------
+console.log('\n[81h] D1 schema v4 自动迁移与三张必需表自愈');
 {
 	const scenarios = [
 		{ label: '旧 schema v2', schemaVersion: 2, actorId: 94600 },
 		{ label: 'schema v3 元数据与实际表不一致', schemaVersion: 3, actorId: 94610 },
+		{ label: 'schema v4 元数据与实际表不一致', schemaVersion: 4, actorId: 94620 },
 	];
 	for (const scenario of scenarios) {
 		resetCalls();
 		sandbox.fetch = adFetchMock();
-		const db = makeAdD1({ porn: ['大婆啦'] }, { schemaVersion: scenario.schemaVersion, relayTableExists: false });
+		const db = makeAdD1({ porn: ['大婆啦'] }, { schemaVersion: scenario.schemaVersion, relayTableExists: false, voteTableExists: false, voteAllowlistTableExists: false });
 		const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
 		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
 			message_id: scenario.actorId, chat: { id: -1001, type: 'supergroup' },
 			from: { id: scenario.actorId, is_bot: false, first_name: '正常回复者' },
-			text: '这是什么', quote: { text: '📢 大婆啦 广告内容' },
+			sticker: { file_id: 'schema-observation-sticker', emoji: '👍' }, reply_to_message: { message_id: scenario.actorId - 1, from: { id: scenario.actorId + 1, is_bot: false, first_name: '原广告作者' }, text: '📢 大婆啦 广告内容' },
 		} }) }), env, fakeCtxAd);
 		const ownerNotice = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
-		assert(`${scenario.label} → 自动升级 schema 到 v3`, db._schema.version === 3);
-		assert(`${scenario.label} → 自动补建引用观察表且只执行一次 schema DDL`, db._schema.relayTableExists && db._schema.schemaExecCount === 1);
+		assert(`${scenario.label} → 自动升级或保持 schema v4`, db._schema.version === 4);
+		assert(`${scenario.label} → 自动补建三张必需表且只执行一次 schema DDL`, db._schema.relayTableExists && db._schema.voteTableExists && db._schema.voteAllowlistTableExists && db._schema.schemaExecCount === 1);
 		assert(`${scenario.label} → 首次引用观察成功写入 D1`, db._relayObservations.get(String(scenario.actorId))?.occurrences === 1);
 		assert(`${scenario.label} → 主人通知显示观察次数 1、无缺表错误`, !!ownerNotice && ownerNotice.body.text.includes('观察次数:1') && !ownerNotice.body.text.includes('D1 观察记录失败'));
-		assert(`${scenario.label} → 当前正常回复者仍不进入全局黑名单`, !db._rows.has(String(scenario.actorId)) && callsOf('banChatMember').length === 0);
+		assert(`${scenario.label} → 贴纸误触者受保护，原广告作者照常全群封禁`, !db._rows.has(String(scenario.actorId)) && db._rows.get(String(scenario.actorId + 1))?.reason === 'ad_auto' && callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((call) => String(call.body.user_id) === String(scenario.actorId + 1)));
 	}
 }
 
@@ -5867,7 +6123,7 @@ console.log('\n[81i] 引用高危词语境与原作者安全门');
 	}, env);
 	const weakNotice = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
 	assert('仅普通词库弱评分 → 原作者不自动加黑或全群封禁', !db._rows.has('94751') && callsOf('banChatMember').length === 0);
-	assert('仅普通词库弱评分 → 当前回复者只删除并观察', !db._rows.has('94750') && db._relayObservations.get('94750')?.occurrences === 1 && callsOf('deleteMessage').some((call) => call.body.message_id === 94750));
+	assert('仅普通词库弱评分 → 当前回复者只删除，不观察、不封禁', !db._rows.has('94750') && !db._relayObservations.has('94750') && callsOf('deleteMessage').some((call) => call.body.message_id === 94750));
 	assert('仅普通词库弱评分 → 主人通知明确说明未联动原作者', !!weakNotice && weakNotice.body.text.includes('当前仅为弱评分证据，未自动联动封禁'));
 }
 
@@ -6069,6 +6325,262 @@ console.log('\n[83] 代理相关内容绝对豁免与安全边界');
 		callsOf('banChatMember').some((call) => String(call.body.user_id) === '93203'));
 }
 
+
+// ---------- [84] /ad 六票通过、改投、去重与全群封禁 ----------
+console.log('\n[84] /ad 投票主链');
+{
+	let nextVoteMessageId = 5000;
+	const groupAdmins = new Set(['999']);
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getMe: () => ({ ok: true, result: { id: 123456789, is_bot: true, username: 'TestBot' } }),
+		getChatAdministrators: () => ({
+			ok: true,
+			result: [...groupAdmins].map((id) => ({
+				user: { id: Number(id), is_bot: false, first_name: id === '999' ? '主人' : '群管理员' },
+				status: id === '999' ? 'creator' : 'administrator',
+			})),
+		}),
+		getChatMember: (body) => {
+			const id = String(body.user_id);
+			const isAdmin = groupAdmins.has(id);
+			return {
+				ok: true,
+				result: {
+					status: isAdmin ? (id === '999' ? 'creator' : 'administrator') : 'member',
+					user: { id: Number(id), is_bot: false, first_name: isAdmin ? '群管理员' : '普通成员' },
+				},
+			};
+		},
+		getUserChatBoosts: () => ({ ok: true, result: { boosts: [] } }),
+		getChat: (body) => ({ ok: true, result: { id: Number(body.chat_id), title: String(body.chat_id).startsWith('-') ? '投票测试群' : undefined, first_name: '普通用户', type: String(body.chat_id).startsWith('-') ? 'supergroup' : 'private' } }),
+		sendMessage: (body) => ({
+			ok: true,
+			result: { message_id: Number(body.chat_id) < 0 ? nextVoteMessageId++ : 9000 },
+		}),
+		editMessageText: () => ({ ok: true, result: true }),
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		banChatMember: () => ({ ok: true, result: true }),
+	});
+	const db = makeAdD1();
+	db._adVoteAllowlist.set('95000', { user_id: '95000', by_user: '999', at: '2026-08-06T00:00:00.000Z' });
+	const env = {
+		TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002',
+		OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db,
+	};
+	const dispatch = async (update) => handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify(update),
+	}), env, fakeCtxAd);
+	await dispatch({ message: {
+		message_id: 95000,
+		chat: { id: -1001, type: 'supergroup', title: '投票测试群' },
+		from: { id: 95000, is_bot: false, first_name: '白名单发起人' },
+		text: '/ad 广告引流',
+		reply_to_message: {
+			message_id: 95010,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 95010, is_bot: false, first_name: '被举报用户' },
+			text: '被举报的广告内容',
+		},
+	} });
+	assert('/ad 白名单成员 → 成功创建一条 D1 投票', db._adVotes.size === 1);
+	const voteRow = [...db._adVotes.values()][0];
+	let voteState = JSON.parse(voteRow.state_json);
+	assert('/ad 发起者 → 自动计入第一张赞成票且阈值为 6', voteState.approvers.length === 1 && voteState.approvers[0].id === '95000' && voteState.threshold === 6);
+	assert('/ad 回复模式 → 举报原因写入 D1 状态并显示在投票消息', voteState.reason === '广告引流' && callsOf('sendMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.text.includes('举报原因') && call.body.text.includes('广告引流')));
+	assert('/ad 成功投票消息 → 是非主人群静默规则的唯一可见投票回执并含取消按钮', callsOf('sendMessage').filter((call) => Number(call.body.chat_id) < 0).length === 1 && callsOf('sendMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.reply_markup?.inline_keyboard?.length === 2 && call.body.reply_markup.inline_keyboard.flat().some((button) => button.callback_data === 'adv:C:' + voteState.voteToken)));
+	assert('/ad 创建成功 → 自动静默置顶投票消息', callsOf('pinChatMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.message_id === voteState.messageId && call.body.disable_notification === true));
+
+	await dispatch({ message: {
+		message_id: 95001,
+		chat: { id: -1001, type: 'supergroup', title: '投票测试群' },
+		from: { id: 95000, is_bot: false, first_name: '白名单发起人' },
+		text: '/ad 广告引流',
+		reply_to_message: { message_id: 95010, from: { id: 95010, is_bot: false, first_name: '被举报用户' }, text: '被举报的广告内容' },
+	} });
+	assert('/ad 同群同目标重复发起 → 仍只有一条进行中投票', db._adVotes.size === 1);
+
+	const voteToken = voteState.voteToken;
+	const voteMessageId = voteState.messageId;
+	const click = async (userId, action, suffix) => dispatch({ callback_query: {
+		id: 'vote-' + suffix,
+		from: { id: userId, is_bot: false, first_name: '投票成员' + userId },
+		message: { message_id: voteMessageId, chat: { id: -1001, type: 'supergroup' } },
+		data: 'adv:' + action + ':' + voteToken,
+	} });
+	await click(95001, 'A', 'a1');
+	await click(95001, 'R', 'r1');
+	voteState = JSON.parse([...db._adVotes.values()][0].state_json);
+	assert('/ad 普通成员改投 → 从赞成移到反对且不重复计票', voteState.approvers.length === 1 && voteState.rejecters.length === 1 && voteState.rejecters[0].id === '95001');
+	await click(95001, 'A', 'a2');
+	for (const voterId of [95002, 95003, 95004, 95005]) await click(voterId, 'A', String(voterId));
+
+	voteState = JSON.parse([...db._adVotes.values()][0].state_json);
+	assert('/ad 达到 6 票 → 投票结束并记录 approved/enforcementComplete', voteState.finalized === true && voteState.result === 'approved' && voteState.enforcementComplete === true);
+	assert('/ad 通过 → 目标写入 D1 全局黑名单，原因 ad_vote', db._rows.get('95010')?.reason === 'ad_vote');
+	assert('/ad 通过 → 举报原因写入 D1 黑名单备注', db._rows.get('95010')?.note?.includes('广告引流'));
+	assert('/ad 通过 → 遍历全部 GROUP_ID 封禁目标并撤回各群全部历史发言', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((call) => String(call.body.user_id) === '95010' && call.body.revoke_messages === true));
+	assert('/ad 通过 → 删除最初被举报消息', callsOf('deleteMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.message_id === 95010));
+	assert('/ad 通过 → 完整结果只私聊第一主人并说明原因与历史发言撤回', callsOf('sendMessage').some((call) => String(call.body.chat_id) === '999' && call.body.text.includes('广告举报投票已通过') && call.body.text.includes('95010') && call.body.text.includes('广告引流') && call.body.text.includes('revoke_messages=true')));
+	assert('/ad 通过完成 → 自动取消投票消息置顶', callsOf('unpinChatMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.message_id === voteState.messageId));
+}
+
+// ---------- [84b] /ad 管理员否决、过期与保护目标 ----------
+console.log('\n[84b] /ad 防滥用边界');
+{
+	const makeVoteHarness = (options = {}) => {
+		let nextVoteMessageId = 6000;
+		const adminIds = new Set(['999', '6666']);
+		resetCalls();
+		sandbox.fetch = makeFetchMock({
+			getMe: () => ({ ok: true, result: { id: 123456789, is_bot: true, username: 'TestBot' } }),
+			getChatAdministrators: () => ({
+				ok: true,
+				result: [
+					{ user: { id: 999, is_bot: false, first_name: '主人' }, status: 'creator' },
+					{ user: { id: 6666, is_bot: false, first_name: '群管理员' }, status: 'administrator' },
+				],
+			}),
+			getChatMember: (body) => {
+				const id = String(body.user_id);
+				const isAdmin = adminIds.has(id);
+				return {
+					ok: true,
+					result: {
+						status: isAdmin ? (id === '999' ? 'creator' : 'administrator') : 'member',
+						user: { id: Number(id), is_bot: id === '123456789', first_name: isAdmin ? '群管理员' : '普通成员' },
+					},
+				};
+			},
+			getUserChatBoosts: () => ({ ok: true, result: { boosts: [] } }),
+			getChat: (body) => ({ ok: true, result: { id: Number(body.chat_id), title: String(body.chat_id).startsWith('-') ? '投票边界群' : undefined, first_name: '普通用户', type: String(body.chat_id).startsWith('-') ? 'supergroup' : 'private' } }),
+			sendMessage: (body) => ({ ok: true, result: { message_id: Number(body.chat_id) < 0 ? nextVoteMessageId++ : 9100 } }),
+			editMessageText: () => ({ ok: true, result: true }),
+			answerCallbackQuery: () => ({ ok: true, result: true }),
+			pinChatMessage: () => options.pinFails ? ({ ok: false, description: 'Bad Request: not enough rights to pin a message' }) : ({ ok: true, result: true }),
+			unpinChatMessage: () => ({ ok: true, result: true }),
+			deleteMessage: () => ({ ok: true, result: true }),
+			banChatMember: () => ({ ok: true, result: true }),
+		});
+		const db = makeAdD1();
+		db._adVoteAllowlist.set('96000', { user_id: '96000', by_user: '999', at: '2026-08-06T00:00:00.000Z' });
+		const env = {
+			TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002',
+			OWNER_IDS: '999,998', SUPER_ADMINS: '7777',
+			AD_FILTER_ENABLED: 'true', DB: db,
+		};
+		const dispatch = async (update) => handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify(update),
+		}), env, fakeCtxAd);
+		const start = async (targetId, messageId, reason = '小孩哥') => dispatch({ message: {
+			message_id: messageId - 1,
+			chat: { id: -1001, type: 'supergroup', title: '投票边界群' },
+			from: { id: 96000, is_bot: false, first_name: '白名单发起人' },
+			text: '/ad ' + reason,
+			reply_to_message: { message_id: messageId, from: { id: targetId, is_bot: false, first_name: '被举报用户' }, text: '被举报内容' },
+		} });
+		const readState = () => {
+			const row = [...db._adVotes.values()][0];
+			return row ? JSON.parse(row.state_json) : null;
+		};
+		const click = async (userId, action, suffix) => {
+			const state = readState();
+			return dispatch({ callback_query: {
+				id: 'edge-' + suffix,
+				from: { id: userId, is_bot: false, first_name: '投票者' },
+				message: { message_id: state.messageId, chat: { id: -1001, type: 'supergroup' } },
+				data: 'adv:' + action + ':' + state.voteToken,
+			} });
+		};
+		return { db, env, dispatch, start, readState, click };
+	};
+
+	let harness = makeVoteHarness();
+	await harness.start(96010, 96011);
+	await harness.click(6666, 'R', 'admin-veto');
+	let state = harness.readState();
+	assert('/ad 当前群管理员反对 → 一票否决并结束投票', state.finalized === true && state.result === 'rejected' && callsOf('answerCallbackQuery').some((call) => call.body.text.includes('一票否决')));
+	assert('/ad 管理员一票否决 → 不加黑、不删被举报消息、不执行全群封禁', !harness.db._rows.has('96010') && !callsOf('deleteMessage').some((call) => call.body.message_id === 96011) && callsOf('banChatMember').length === 0);
+	assert('/ad 管理员一票否决 → 自动取消投票消息置顶', callsOf('unpinChatMessage').some((call) => call.body.message_id === state.messageId));
+
+	harness = makeVoteHarness();
+	await harness.start(96020, 96021);
+	const expiredRow = [...harness.db._adVotes.values()][0];
+	const expiredState = JSON.parse(expiredRow.state_json);
+	expiredState.deadlineAt = Math.floor(Date.now() / 1000) - 1;
+	expiredRow.deadline_at = expiredState.deadlineAt;
+	expiredRow.state_json = JSON.stringify(expiredState);
+	await harness.click(96001, 'A', 'expired');
+	state = harness.readState();
+	assert('/ad 超过 1 小时 → 自动结束为 expired', state.finalized === true && state.result === 'expired' && callsOf('answerCallbackQuery').some((call) => call.body.text.includes('超过 1 小时')));
+	assert('/ad 过期 → 目标不加黑、不删除、不全群封禁', !harness.db._rows.has('96020') && !callsOf('deleteMessage').some((call) => call.body.message_id === 96021) && callsOf('banChatMember').length === 0);
+	assert('/ad 过期 → 自动取消投票消息置顶', callsOf('unpinChatMessage').some((call) => call.body.message_id === state.messageId));
+
+	harness = makeVoteHarness();
+	await harness.start(96030, 96031, '小孩哥');
+	await harness.click(96001, 'C', 'unauthorized-cancel');
+	state = harness.readState();
+	assert('/ad 普通成员不能恶意取消他人发起的投票', state.finalized === false && callsOf('answerCallbackQuery').some((call) => call.body.text.includes('仅发起人')));
+	await harness.click(96000, 'C', 'creator-cancel');
+	state = harness.readState();
+	assert('/ad 发起人取消 → 记录 cancelled 和取消人并结束投票', state.finalized === true && state.result === 'cancelled' && state.cancelledBy?.id === '96000');
+	assert('/ad 取消 → 不加黑、不删除被举报消息、不执行全群封禁', !harness.db._rows.has('96030') && !callsOf('deleteMessage').some((call) => call.body.message_id === 96031) && callsOf('banChatMember').length === 0);
+	assert('/ad 取消 → 最终消息保留举报原因并显示已取消', callsOf('editMessageText').some((call) => call.body.text.includes('举报原因') && call.body.text.includes('小孩哥') && call.body.text.includes('投票已取消')));
+	assert('/ad 取消 → 自动取消投票消息置顶', callsOf('unpinChatMessage').some((call) => call.body.message_id === state.messageId));
+
+	harness = makeVoteHarness({ pinFails: true });
+	await harness.dispatch({ message: {
+		message_id: 96039,
+		chat: { id: -1001, type: 'supergroup', title: '投票边界群' },
+		from: { id: 96000, is_bot: false, first_name: '白名单发起人' },
+		text: '/ad 96040 小孩哥',
+	} });
+	state = harness.readState();
+	assert('/ad TGID 模式 → 正确解析目标与举报原因', state.targetUserId === '96040' && state.reason === '小孩哥');
+	assert('/ad 置顶权限不足 → 投票仍创建并保持进行中', harness.db._adVotes.size === 1 && state.finalized === false && callsOf('pinChatMessage').length === 1);
+
+	harness = makeVoteHarness();
+	const protectedTargets = ['96000', '999', '998', '7777', '6666', '123456789'];
+	for (const [index, targetId] of protectedTargets.entries()) {
+		await harness.dispatch({ message: {
+			message_id: 96100 + index,
+			chat: { id: -1001, type: 'supergroup', title: '投票边界群' },
+			from: { id: 96000, is_bot: false, first_name: '白名单发起人' },
+			text: '/ad ' + targetId,
+		} });
+	}
+	assert('/ad 不能举报自己、主人、副主人、超级管理员、当前群管理员或机器人', harness.db._adVotes.size === 0);
+}
+
+// ---------- [84c] /ad 发起白名单仅第一主人管理 ----------
+console.log('\n[84c] /ad 发起白名单权限');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		sendMessage: () => ({ ok: true, result: { message_id: 9200 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+	const db = makeAdD1();
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,998', SUPER_ADMINS: '7777', DB: db };
+	const dispatch = async (fromId, text) => handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: {
+			message_id: fromId,
+			chat: { id: fromId, type: 'private' },
+			from: { id: fromId, is_bot: false, first_name: fromId === 999 ? '主人' : '副主人' },
+			text,
+		} }),
+	}), env, fakeCtxAd);
+	await dispatch(999, '/add_ad_admin 97000');
+	assert('/add_ad_admin → 第一主人可加入发起白名单', db._adVoteAllowlist.has('97000'));
+	await dispatch(998, '/add_ad_admin 97001');
+	assert('/add_ad_admin → 副主人无权修改发起白名单', !db._adVoteAllowlist.has('97001'));
+	await dispatch(999, '/del_ad_admin 97000');
+	assert('/del_ad_admin → 第一主人可移除发起白名单', !db._adVoteAllowlist.has('97000'));
+}
 
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
