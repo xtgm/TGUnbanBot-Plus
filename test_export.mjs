@@ -63,6 +63,7 @@ function makeFakeDB(seed = []) {
 				},
 				async run() { return { meta: { changes: 0 } }; },
 				async all() {
+					if (sql.startsWith('PRAGMA table_info(blacklist)')) { 						return { results: ['id', 'reason', 'by_user', 'at', 'note'].map((name) => ({ name })) }; 					}
 					const results = [...rows.values()].map((r) => ({
 						id: String(r.id),
 						reason: r.reason ?? null,

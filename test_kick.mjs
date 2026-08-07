@@ -102,6 +102,7 @@ function makeFakeDB(seed = [], options = {}) {
 	const adVoteAllowlist = new Map();
 	const schemaState = {
 		version: Number.isFinite(Number(options.schemaVersion)) ? Number(options.schemaVersion) : 4,
+		coreTablesExist: options.coreTablesExist !== false,
 		relayTableExists: options.relayTableExists !== false,
 		voteTableExists: options.voteTableExists !== false,
 		voteAllowlistTableExists: options.voteAllowlistTableExists !== false,
@@ -111,6 +112,7 @@ function makeFakeDB(seed = [], options = {}) {
 	const mutationCalls = [];
 	let mutationCallIndex = 0;
 	const failMutationCalls = new Set(options.failMutationCalls || []);
+	const failSchemaSqlIncludes = Array.isArray(options.failSchemaSqlIncludes) ? options.failSchemaSqlIncludes.map((value) => String(value)) : [];
 	let recentSeq = Math.max(1, Number(options.recentSeq) || 1);
 	let moderationSeq = Math.max(1, Number(options.moderationSeq) || 1);
 	const syncBlacklist = () => {
@@ -166,14 +168,21 @@ function makeFakeDB(seed = [], options = {}) {
 		_mutationCalls: mutationCalls,
 		exec: async (sql) => {
 			const ddl = String(sql);
-			if (
-				ddl.includes('CREATE TABLE IF NOT EXISTS ad_relay_observations')
-				|| ddl.includes('CREATE TABLE IF NOT EXISTS ad_votes')
-				|| ddl.includes('CREATE TABLE IF NOT EXISTS ad_vote_allowlist')
-			) {
+			const failedFragment = failSchemaSqlIncludes.find((fragment) => ddl.includes(fragment));
+			if (failedFragment) throw new Error('forced schema failure: ' + failedFragment);
+			if (ddl.includes('CREATE TABLE IF NOT EXISTS schema_meta') || ddl.includes('CREATE TABLE IF NOT EXISTS blacklist')) {
+				schemaState.coreTablesExist = true;
+			}
+			if (ddl.includes('CREATE TABLE IF NOT EXISTS ad_relay_observations')) {
 				schemaState.schemaExecCount += 1;
 				schemaState.relayTableExists = true;
+			}
+			if (ddl.includes('CREATE TABLE IF NOT EXISTS ad_votes')) {
+				schemaState.schemaExecCount += 1;
 				schemaState.voteTableExists = true;
+			}
+			if (ddl.includes('CREATE TABLE IF NOT EXISTS ad_vote_allowlist')) {
+				schemaState.schemaExecCount += 1;
 				schemaState.voteAllowlistTableExists = true;
 			}
 		},
@@ -188,11 +197,13 @@ function makeFakeDB(seed = [], options = {}) {
 					}
 					if (sql.includes("FROM sqlite_master") && sql.includes("name = ?")) {
 						const table = String(bound[0] || '');
-						const exists = table === 'ad_relay_observations'
-							? schemaState.relayTableExists
-							: (table === 'ad_votes'
-								? schemaState.voteTableExists
-								: (table === 'ad_vote_allowlist' ? schemaState.voteAllowlistTableExists : false));
+						const exists = table === 'schema_meta' || table === 'blacklist'
+							? schemaState.coreTablesExist
+							: (table === 'ad_relay_observations'
+								? schemaState.relayTableExists
+								: (table === 'ad_votes'
+									? schemaState.voteTableExists
+									: (table === 'ad_vote_allowlist' ? schemaState.voteAllowlistTableExists : false)));
 						return exists ? { name: table } : null;
 					}
 					if (sql.startsWith('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ?')) {
@@ -5964,8 +5975,8 @@ console.log('\n[81f3] 学习样本屏蔽账号、电话、金额、URL 与排版
 	assert('第一主人私聊失败 → 不回退发送给副主人或群聊', callsOf('sendMessage').length === 1 && String(callsOf('sendMessage')[0].body.chat_id) === '999');
 }
 
-// ---------- [81h] D1 schema v4 自动迁移与三张必需表自愈 ----------
-console.log('\n[81h] D1 schema v4 自动迁移与三张必需表自愈');
+// ---------- [81h] D1 schema v4 自动迁移与引用观察表按需自愈 ----------
+console.log('\n[81h] D1 schema v4 自动迁移与引用观察表按需自愈');
 {
 	const scenarios = [
 		{ label: '旧 schema v2', schemaVersion: 2, actorId: 94600 },
@@ -5984,13 +5995,63 @@ console.log('\n[81h] D1 schema v4 自动迁移与三张必需表自愈');
 		} }) }), env, fakeCtxAd);
 		const ownerNotice = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
 		assert(`${scenario.label} → 自动升级或保持 schema v4`, db._schema.version === 4);
-		assert(`${scenario.label} → 自动补建三张必需表且只执行一次 schema DDL`, db._schema.relayTableExists && db._schema.voteTableExists && db._schema.voteAllowlistTableExists && db._schema.schemaExecCount === 1);
+		assert(`${scenario.label} → 引用观察表按需补建且只执行一次专用 DDL`, db._schema.relayTableExists && !db._schema.voteTableExists && !db._schema.voteAllowlistTableExists && db._schema.schemaExecCount === 1);
 		assert(`${scenario.label} → 首次引用观察成功写入 D1`, db._relayObservations.get(String(scenario.actorId))?.occurrences === 1);
 		assert(`${scenario.label} → 主人通知显示观察次数 1、无缺表错误`, !!ownerNotice && ownerNotice.body.text.includes('观察次数:1') && !ownerNotice.body.text.includes('D1 观察记录失败'));
 		assert(`${scenario.label} → 贴纸误触者受保护，原广告作者照常全群封禁`, !db._rows.has(String(scenario.actorId)) && db._rows.get(String(scenario.actorId + 1))?.reason === 'ad_auto' && callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((call) => String(call.body.user_id) === String(scenario.actorId + 1)));
 	}
 }
 
+// ---------- [81h2] D1 投票表独立迁移与失败阻断 ----------
+console.log('\n[81h2] D1 投票表独立迁移与失败阻断');
+{
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	const db = makeAdD1({}, {
+		schemaVersion: 3,
+		relayTableExists: true,
+		voteTableExists: false,
+		voteAllowlistTableExists: false,
+		failSchemaSqlIncludes: ['CREATE INDEX IF NOT EXISTS idx_blacklist_at_id'],
+	});
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	const response = await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: {
+			message_id: 94690,
+			chat: { id: -1001, type: 'supergroup', title: 'D1迁移测试群' },
+			from: { id: 999, is_bot: false, first_name: '主人' },
+			text: '/ad 94691 D1旧库迁移测试',
+		} }),
+	}), env, fakeCtxAd);
+	assert('旧 schema v3 的可选旧索引失败 → webhook 仍返回成功', response.status === 200);
+	assert('旧 schema v3 的可选旧索引失败 → 独立补建 D1 投票表与白名单表', db._schema.version === 4 && db._schema.voteTableExists && db._schema.voteAllowlistTableExists);
+	assert('旧 schema v3 的可选旧索引失败 → /ad 仍成功写入 D1 投票', db._adVotes.size === 1 && callsOf('sendMessage').some((call) => call.body.text.includes('广告举报投票')));
+
+	resetCalls();
+	sandbox.fetch = adFetchMock();
+	const brokenDb = makeAdD1({}, {
+		schemaVersion: 4,
+		relayTableExists: true,
+		voteTableExists: false,
+		voteAllowlistTableExists: false,
+		failSchemaSqlIncludes: ['CREATE TABLE IF NOT EXISTS ad_votes'],
+	});
+	const brokenEnv = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: brokenDb };
+	const brokenResponse = await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: {
+			message_id: 94692,
+			chat: { id: -1001, type: 'supergroup', title: 'D1失败测试群' },
+			from: { id: 999, is_bot: false, first_name: '主人' },
+			text: '/ad 94693 D1失败阻断测试',
+		} }),
+	}), brokenEnv, fakeCtxAd);
+	const queriedMissingVoteTable = brokenDb._sql.some((sql) => sql.includes('FROM ad_votes') || sql.startsWith('INSERT INTO ad_votes'));
+	assert('D1 投票表建表失败 → webhook 受控返回且不抛 no such table 500', brokenResponse.status === 200 && brokenDb._adVotes.size === 0);
+	assert('D1 投票表建表失败 → 停止查询缺失表并返回明确提示', !queriedMissingVoteTable && callsOf('sendMessage').some((call) => call.body.text.includes('D1 投票存储初始化失败')));
+	assert('投票持久化保持纯 D1 → Worker 不包含 env.KV', !src.includes('env.KV') && src.includes('CREATE TABLE IF NOT EXISTS ad_votes'));
+}
 // ---------- [81i] 引用高危词语境、广告意图与原作者安全门 ----------
 console.log('\n[81i] 引用高危词语境与原作者安全门');
 {

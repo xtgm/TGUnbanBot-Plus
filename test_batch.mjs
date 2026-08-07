@@ -150,6 +150,7 @@ function makeFakeDB(options = {}) {
 					return { meta: { changes: 0 } };
 				},
 				async all() {
+					if (sql.startsWith('PRAGMA table_info(blacklist)')) { 						return { results: ['id', 'reason', 'by_user', 'at', 'note'].map((name) => ({ name })) }; 					}
 					if (sql.startsWith('INSERT OR IGNORE INTO blacklist') && sql.includes('RETURNING id')) {
 						mutationCallIndex += 1;
 						mutationCalls.push({ index: mutationCallIndex, type: 'insert', sql, bound: [...bound] });

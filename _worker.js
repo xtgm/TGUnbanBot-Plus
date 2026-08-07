@@ -712,6 +712,8 @@ const D1_SCHEMA_VERSION = 4;
 const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
+const D1_AD_RELAY_INIT_PROMISES = new WeakMap();
+const D1_AD_VOTE_INIT_PROMISES = new WeakMap();
 const D1_AD_KEYWORDS_CACHE = new WeakMap();
 const D1_AD_SAMPLES_CACHE = new WeakMap();
 
@@ -774,13 +776,66 @@ async function d1TableExists(env, table) {
 	return String(row?.name || '') === String(table);
 }
 
-async function d1RequiredTablesExist(env) {
-	const checks = await Promise.all([
-		d1TableExists(env, 'ad_relay_observations'),
-		d1TableExists(env, 'ad_votes'),
-		d1TableExists(env, 'ad_vote_allowlist'),
-	]);
-	return checks.every(Boolean);
+async function d1TablesExist(env, tables) {
+	for (const table of tables) {
+		if (!(await d1TableExists(env, table))) return false;
+	}
+	return true;
+}
+
+async function d1CoreTablesExist(env) {
+	return d1ColumnExists(env, 'blacklist', 'note');
+}
+
+async function d1AdRelayTablesExist(env) {
+	return d1TablesExist(env, ['ad_relay_observations']);
+}
+
+async function d1AdVoteTablesExist(env) {
+	return d1TablesExist(env, ['ad_votes', 'ad_vote_allowlist']);
+}
+
+function formatD1SchemaError(error) {
+	const name = String(error?.name || '').trim();
+	const message = String(error?.message || '').trim();
+	const cause = String(error?.cause?.message || error?.cause || '').trim();
+	const stack = String(error?.stack || '').trim();
+	const primary = [name, message].filter(Boolean).join(': ') || String(error || '未知错误');
+	const causeText = cause && cause !== message ? '; cause=' + cause : '';
+	const stackText = stack ? '; stack=' + stack : '';
+	return (primary + causeText + stackText).slice(0, 2000);
+}
+
+function isTransientD1SchemaError(error) {
+	const message = String(error?.message || '').trim();
+	const detail = formatD1SchemaError(error).toLowerCase();
+	return detail.includes('sqlite_busy')
+		|| detail.includes('database is locked')
+		|| detail.includes('database table is locked')
+		|| detail.includes('temporarily unavailable')
+		|| (!message && detail.includes('cloudflare-internal:d1-api'));
+}
+
+async function runD1SchemaStatement(env, label, sql, options = {}) {
+	const optional = options.optional === true;
+	const maxAttempts = Math.max(1, Math.min(Number(options.maxAttempts) || 3, 3));
+	let lastError = null;
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		try {
+			await env.DB.exec(sql);
+			return true;
+		} catch (error) {
+			lastError = error;
+			if (attempt >= maxAttempts || !isTransientD1SchemaError(error)) break;
+			await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+		}
+	}
+	const detail = formatD1SchemaError(lastError);
+	if (optional) {
+		console.warn('D1 可选结构创建失败 [' + label + ']: ' + detail);
+		return false;
+	}
+	throw new Error('D1 结构创建失败 [' + label + ']: ' + detail);
 }
 
 async function readD1SchemaVersion(env) {
@@ -800,80 +855,67 @@ async function ensureD1Table(env) {
 	const initPromise = (async () => {
 		try {
 			const version = await readD1SchemaVersion(env);
-			if (version >= D1_SCHEMA_VERSION && await d1RequiredTablesExist(env)) {
+			const coreReady = await d1CoreTablesExist(env);
+			if (version >= D1_SCHEMA_VERSION && coreReady) {
 				return true;
 			}
 
-			await env.DB.exec(`
-				CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, updated_at TEXT);
-				CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT);
-				CREATE TABLE IF NOT EXISTS ad_keywords (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
-				CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
-				CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);
-				CREATE TABLE IF NOT EXISTS moderation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, from_id TEXT, created_at TEXT);
-				CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);
-				CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT);
-				CREATE INDEX IF NOT EXISTS idx_blacklist_at_id ON blacklist(at, id);
-				CREATE TABLE IF NOT EXISTS ad_relay_observations (
-					actor_id TEXT PRIMARY KEY,
-					occurrences INTEGER NOT NULL DEFAULT 1,
-					first_seen_at TEXT NOT NULL,
-					last_seen_at TEXT NOT NULL,
-					last_chat_id TEXT,
-					last_message_id TEXT,
-					last_original_author_id TEXT,
-					last_quote_fingerprint TEXT,
-					quote_preview TEXT,
-					wrapper_preview TEXT,
-					evidence TEXT
-				);
-				CREATE TABLE IF NOT EXISTS ad_votes (
-					vote_token TEXT PRIMARY KEY,
-					chat_id TEXT NOT NULL,
-					vote_message_id INTEGER,
-					reported_message_id INTEGER,
-					target_user_id TEXT NOT NULL,
-					creator_user_id TEXT NOT NULL,
-					state_json TEXT NOT NULL,
-					version INTEGER NOT NULL DEFAULT 1,
-					finalized INTEGER NOT NULL DEFAULT 0,
-					result TEXT,
-					created_at INTEGER NOT NULL,
-					deadline_at INTEGER NOT NULL,
-					updated_at TEXT NOT NULL
-				);
-				CREATE TABLE IF NOT EXISTS ad_vote_allowlist (
-					user_id TEXT PRIMARY KEY,
-					by_user TEXT,
-					at TEXT NOT NULL
-				);
-				CREATE INDEX IF NOT EXISTS idx_blacklist_reason_at_id ON blacklist(reason, at, id);
-				CREATE INDEX IF NOT EXISTS idx_moderation_chat_from_id ON moderation_messages(chat_id, from_id, id);
-				CREATE INDEX IF NOT EXISTS idx_ad_relay_observations_last_seen ON ad_relay_observations(last_seen_at);
-				CREATE INDEX IF NOT EXISTS idx_ad_votes_active_target ON ad_votes(chat_id, target_user_id, finalized, deadline_at);
-				CREATE INDEX IF NOT EXISTS idx_ad_votes_created_at ON ad_votes(created_at);
-			`);
+			const tableStatements = [
+				['schema_meta', 'CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, updated_at TEXT);'],
+				['blacklist', 'CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT);'],
+				['ad_keywords', 'CREATE TABLE IF NOT EXISTS ad_keywords (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
+				['ad_samples', 'CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
+				['recent_messages', 'CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);'],
+				['moderation_messages', 'CREATE TABLE IF NOT EXISTS moderation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, from_id TEXT, created_at TEXT);'],
+				['learn_snapshot', 'CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
+				['batch_jobs', 'CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT);'],
+			];
+			for (const [label, sql] of tableStatements) {
+				await runD1SchemaStatement(env, label, sql);
+			}
+
+			const optionalIndexes = [
+				['idx_blacklist_at_id', 'CREATE INDEX IF NOT EXISTS idx_blacklist_at_id ON blacklist(at, id);'],
+				['idx_blacklist_reason_at_id', 'CREATE INDEX IF NOT EXISTS idx_blacklist_reason_at_id ON blacklist(reason, at, id);'],
+				['idx_moderation_chat_from_id', 'CREATE INDEX IF NOT EXISTS idx_moderation_chat_from_id ON moderation_messages(chat_id, from_id, id);'],
+			];
+			for (const [label, sql] of optionalIndexes) {
+				await runD1SchemaStatement(env, label, sql, { optional: true });
+			}
 
 			try {
 				if (!(await d1ColumnExists(env, 'blacklist', 'note'))) {
-					await env.DB.exec('ALTER TABLE blacklist ADD COLUMN note TEXT;');
+					await runD1SchemaStatement(env, 'blacklist.note', 'ALTER TABLE blacklist ADD COLUMN note TEXT;');
 				}
 			} catch (error) {
-				const message = String(error?.message || error).toLowerCase();
+				const message = formatD1SchemaError(error).toLowerCase();
 				if (!message.includes('duplicate') && !message.includes('exists')) {
 					throw error;
 				}
 			}
 
-			await env.DB.prepare('INSERT OR REPLACE INTO schema_meta (id, version, updated_at) VALUES (1, ?, ?)')
-				.bind(D1_SCHEMA_VERSION, new Date().toISOString())
-				.run();
-			if (!(await d1RequiredTablesExist(env))) {
-				throw new Error('D1 schema migration incomplete: one or more required tables are missing');
+			try {
+				await env.DB.prepare('INSERT OR REPLACE INTO schema_meta (id, version, updated_at) VALUES (1, ?, ?)')
+					.bind(D1_SCHEMA_VERSION, new Date().toISOString())
+					.run();
+			} catch (error) {
+				throw new Error('D1 schema_meta 版本写入失败: ' + formatD1SchemaError(error));
+			}
+
+			if (!(await d1CoreTablesExist(env))) {
+				throw new Error('D1 核心结构迁移不完整');
 			}
 			return true;
 		} catch (error) {
-			console.error('D1 建表失败:', error);
+			console.error('D1 核心结构初始化失败: ' + formatD1SchemaError(error));
+			try {
+				if (await d1CoreTablesExist(env)) {
+					console.warn('D1 核心表可用，附属迁移失败不阻断现有数据访问。');
+					return true;
+				}
+			} catch (verifyError) {
+				console.error('D1 核心结构复核失败: ' + formatD1SchemaError(verifyError));
+			}
 			return false;
 		}
 	})();
@@ -883,6 +925,88 @@ async function ensureD1Table(env) {
 	return initialized;
 }
 
+async function ensureAdRelayTables(env) {
+	if (!env.DB) return false;
+	const cached = D1_AD_RELAY_INIT_PROMISES.get(env.DB);
+	if (cached) return cached;
+
+	const initPromise = (async () => {
+		try {
+			if (!(await ensureD1Table(env))) {
+				throw new Error('D1 核心结构不可用');
+			}
+			await runD1SchemaStatement(
+				env,
+				'ad_relay_observations',
+				'CREATE TABLE IF NOT EXISTS ad_relay_observations (actor_id TEXT PRIMARY KEY, occurrences INTEGER NOT NULL DEFAULT 1, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, last_chat_id TEXT, last_message_id TEXT, last_original_author_id TEXT, last_quote_fingerprint TEXT, quote_preview TEXT, wrapper_preview TEXT, evidence TEXT);',
+			);
+			await runD1SchemaStatement(
+				env,
+				'idx_ad_relay_observations_last_seen',
+				'CREATE INDEX IF NOT EXISTS idx_ad_relay_observations_last_seen ON ad_relay_observations(last_seen_at);',
+				{ optional: true },
+			);
+			if (!(await d1AdRelayTablesExist(env))) {
+				throw new Error('D1 引用观察表迁移不完整');
+			}
+			return true;
+		} catch (error) {
+			console.error('D1 引用观察表初始化失败: ' + formatD1SchemaError(error));
+			return false;
+		}
+	})();
+	D1_AD_RELAY_INIT_PROMISES.set(env.DB, initPromise);
+	const initialized = await initPromise;
+	if (!initialized) D1_AD_RELAY_INIT_PROMISES.delete(env.DB);
+	return initialized;
+}
+
+async function ensureAdVoteTables(env) {
+	if (!env.DB) return false;
+	const cached = D1_AD_VOTE_INIT_PROMISES.get(env.DB);
+	if (cached) return cached;
+
+	const initPromise = (async () => {
+		try {
+			if (!(await ensureD1Table(env))) {
+				throw new Error('D1 核心结构不可用');
+			}
+			await runD1SchemaStatement(
+				env,
+				'ad_votes',
+				'CREATE TABLE IF NOT EXISTS ad_votes (vote_token TEXT PRIMARY KEY, chat_id TEXT NOT NULL, vote_message_id INTEGER, reported_message_id INTEGER, target_user_id TEXT NOT NULL, creator_user_id TEXT NOT NULL, state_json TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, finalized INTEGER NOT NULL DEFAULT 0, result TEXT, created_at INTEGER NOT NULL, deadline_at INTEGER NOT NULL, updated_at TEXT NOT NULL);',
+			);
+			await runD1SchemaStatement(
+				env,
+				'ad_vote_allowlist',
+				'CREATE TABLE IF NOT EXISTS ad_vote_allowlist (user_id TEXT PRIMARY KEY, by_user TEXT, at TEXT NOT NULL);',
+			);
+			await runD1SchemaStatement(
+				env,
+				'idx_ad_votes_active_target',
+				'CREATE INDEX IF NOT EXISTS idx_ad_votes_active_target ON ad_votes(chat_id, target_user_id, finalized, deadline_at);',
+				{ optional: true },
+			);
+			await runD1SchemaStatement(
+				env,
+				'idx_ad_votes_created_at',
+				'CREATE INDEX IF NOT EXISTS idx_ad_votes_created_at ON ad_votes(created_at);',
+				{ optional: true },
+			);
+			if (!(await d1AdVoteTablesExist(env))) {
+				throw new Error('D1 投票表迁移不完整');
+			}
+			return true;
+		} catch (error) {
+			console.error('D1 投票表初始化失败: ' + formatD1SchemaError(error));
+			return false;
+		}
+	})();
+	D1_AD_VOTE_INIT_PROMISES.set(env.DB, initPromise);
+	const initialized = await initPromise;
+	if (!initialized) D1_AD_VOTE_INIT_PROMISES.delete(env.DB);
+	return initialized;
+}
 async function readD1Blacklist(env) {
 	await ensureD1Table(env);
 	const stmt = env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at ASC, id ASC');
@@ -4754,7 +4878,9 @@ async function recordAdRelayObservation(env, details = {}) {
 	const messageId = String(details.messageId || '');
 	const now = new Date().toISOString();
 	try {
-		await ensureD1Table(env);
+		if (!(await ensureAdRelayTables(env))) {
+			return { ok: false, occurrences: 0, duplicate: false, error: 'D1 引用观察表初始化失败' };
+		}
 		const existing = await env.DB.prepare(
 			'SELECT actor_id, occurrences, first_seen_at, last_chat_id, last_message_id FROM ad_relay_observations WHERE actor_id = ? LIMIT 1'
 		).bind(actorId).first();
@@ -4833,7 +4959,7 @@ function normalizeAdVoteState(value) {
 
 async function readAdVoteState(env, voteToken) {
 	if (!env.DB) return null;
-	await ensureD1Table(env);
+	if (!(await ensureAdVoteTables(env))) return null;
 	const row = await env.DB.prepare(
 		'SELECT vote_token, state_json, version, finalized, result, deadline_at FROM ad_votes WHERE vote_token = ? LIMIT 1'
 	).bind(String(voteToken || '')).first();
@@ -4857,7 +4983,9 @@ async function createAdVoteState(env, state) {
 	const normalized = normalizeAdVoteState(state);
 	if (!normalized) return { ok: false, error: '投票状态无效' };
 	try {
-		await ensureD1Table(env);
+		if (!(await ensureAdVoteTables(env))) {
+			return { ok: false, error: 'D1 投票表初始化失败' };
+		}
 		const nowIso = new Date().toISOString();
 		const result = await env.DB.prepare(
 			'INSERT INTO ad_votes (vote_token, chat_id, vote_message_id, reported_message_id, target_user_id, creator_user_id, state_json, version, finalized, result, created_at, deadline_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, NULL, ?, ?, ?)'
@@ -4884,6 +5012,9 @@ async function updateAdVoteState(env, state, expectedVersion) {
 	const normalized = normalizeAdVoteState(state);
 	if (!env.DB || !normalized) return { ok: false, conflict: false, error: '投票状态无效' };
 	try {
+		if (!(await ensureAdVoteTables(env))) {
+			return { ok: false, conflict: false, error: 'D1 投票表初始化失败' };
+		}
 		const nextVersion = Math.max(1, Number(expectedVersion) || 1) + 1;
 		const nextState = { ...normalized, version: nextVersion };
 		const result = await env.DB.prepare(
@@ -4909,7 +5040,7 @@ async function updateAdVoteState(env, state, expectedVersion) {
 
 async function findActiveAdVote(env, chatId, targetUserId, nowSeconds) {
 	if (!env.DB) return null;
-	await ensureD1Table(env);
+	if (!(await ensureAdVoteTables(env))) return null;
 	return env.DB.prepare(
 		'SELECT vote_token FROM ad_votes WHERE chat_id = ? AND target_user_id = ? AND finalized = 0 AND deadline_at > ? ORDER BY created_at DESC LIMIT 1'
 	).bind(String(chatId), String(targetUserId), Number(nowSeconds) || 0).first();
@@ -4918,7 +5049,7 @@ async function findActiveAdVote(env, chatId, targetUserId, nowSeconds) {
 async function pruneExpiredAdVotes(env, nowSeconds = Math.floor(Date.now() / 1000)) {
 	if (!env.DB) return;
 	try {
-		await ensureD1Table(env);
+		if (!(await ensureAdVoteTables(env))) return;
 		await env.DB.prepare('DELETE FROM ad_votes WHERE created_at < ?')
 			.bind((Number(nowSeconds) || 0) - AD_VOTE_RETENTION_SECONDS)
 			.run();
@@ -4929,7 +5060,7 @@ async function pruneExpiredAdVotes(env, nowSeconds = Math.floor(Date.now() / 100
 
 async function isAdVoteAllowlisted(env, userId) {
 	if (!env.DB || !/^\d+$/.test(String(userId || ''))) return false;
-	await ensureD1Table(env);
+	if (!(await ensureAdVoteTables(env))) return false;
 	const row = await env.DB.prepare('SELECT user_id FROM ad_vote_allowlist WHERE user_id = ? LIMIT 1')
 		.bind(String(userId))
 		.first();
@@ -4940,7 +5071,7 @@ async function setAdVoteAllowlist(env, userId, enabled, byUser) {
 	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
 	const id = String(userId || '').trim();
 	if (!/^\d+$/.test(id)) return { ok: false, error: 'TGID 必须是纯数字' };
-	await ensureD1Table(env);
+	if (!(await ensureAdVoteTables(env))) return { ok: false, error: 'D1 投票表初始化失败' };
 	try {
 		if (enabled) {
 			await env.DB.prepare('INSERT OR REPLACE INTO ad_vote_allowlist (user_id, by_user, at) VALUES (?, ?, ?)')
@@ -6708,6 +6839,10 @@ async function handleAdCommand(message, env, ctx) {
 		await sendAdVoteCommandFeedback(message, ctx, '❌ 未绑定 D1，无法发起广告举报投票。');
 		return true;
 	}
+	if (!(await ensureAdVoteTables(env))) {
+		await sendAdVoteCommandFeedback(message, ctx, '❌ D1 投票存储初始化失败，请稍后重试。');
+		return true;
+	}
 	await pruneExpiredAdVotes(env);
 
 	const target = getAdVoteTargetFromMessage(message);
@@ -6794,6 +6929,7 @@ function isEligibleAdVoterMember(member) {
 async function saveFinalizedAdVoteDetails(env, state) {
 	if (!env.DB) return false;
 	try {
+		if (!(await ensureAdVoteTables(env))) return false;
 		const nextVersion = Math.max(1, Number(state.version) || 1) + 1;
 		const nextState = { ...state, version: nextVersion };
 		const result = await env.DB.prepare(
