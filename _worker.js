@@ -6210,9 +6210,38 @@ async function detectAdLegacy(message, env) {
 	const mentionsBot = /@[a-z][\w]{2,}bot\b/i.test(fullText);
 	const hasLure = /(点击下方|完整版|免费(看|观看|领)|加我(看|领)|资源(群|站)|看完整|扫码|进群看)/.test(fullText);
 
+	// 强特征 5:账号资料卡(名字/用户名/bio/简介)相似匹配已确认的学习样本 → 直接判广告。
+	//   典型场景:广告号不发言或只发正常话,把广告挂在个人简介里(如"XX地推项目 日结 t.me/xxx")。
+	//   走的是与正文同一套四重门槛(shared≥8 + Dice≥0.82 或 包含率≥0.9 + 广告意图佐证 +
+	//   样本须经第一主人 /spam 确认为 similarityTrusted),精度与"学习样本(相似)"一致,
+	//   所以放在严格模式直杀区;正常人简介里的链接/@bot 不命中样本骨架,不受影响。
+	//   resolveAdIdentityText 已由 detectAd 注入到 from.first_name,此处取同一份文本。
+	const identityScanText = [message.from?.first_name, message.from?.last_name, message.from?.username]
+		.filter(Boolean).join(' ');
+	if (identityScanText.trim()) {
+		const identitySimilar = findSimilarTrustedAdSample(identityScanText);
+		if (identitySimilar) {
+			return {
+				isAd: true,
+				score: 99,
+				hits: ['资料卡学习样本相似匹配:Dice=' + identitySimilar.dice.toFixed(3) + '/包含=' + identitySimilar.containment.toFixed(3)],
+				strong: '资料卡广告(相似样本)',
+			};
+		}
+		const identityNorm = normalizeForFingerprint(identityScanText);
+		if (identityNorm.length >= SAMPLE_FP_EXACT_MIN && getAdSampleMatch(identityNorm)?.trusted) {
+			return {
+				isAd: true,
+				score: 99,
+				hits: ['资料卡学习样本精确匹配'],
+				strong: '资料卡广告(精确样本)',
+			};
+		}
+	}
+
 	// ===== A 严格模式:关闭正文加权评分,只保留高精度强特征 =====
 	//   正文关键词加权累加是"误杀正常人"的主因(聊 usdt/搬砖/套利 的正常用户被弱信号叠加误判)。
-	//   严格模式下上面所有"强特征直杀"仍全部生效(全局库/样本指纹/身份词/名片词/外国号名片/引用@泛滥),
+	//   严格模式下上面所有"强特征直杀"仍全部生效(全局库/样本指纹/身份词/名片词/外国号名片/引用@泛滥/资料卡样本),
 	//   此处只保留同为双条件、高精度的 @bot+诱导词直杀,其余加权评分一律不计 → 误杀趋近于零。
 	if (AD_STRICT_MODE) {
 		if (mentionsBot && hasLure) {
@@ -6322,7 +6351,9 @@ async function resolveAdLearningPayload(message) {
 	const identityText = await resolveAdIdentityText(message || {});
 	const identityHits = getAdIdentityLearningEvidence(identityText);
 	if (identityHits.length > 0 && !hasIndependentAdBodyEvidence(message, bodyText)) {
-		return { text: '', source: 'identity-only', identityHits };
+		// 资料卡(名字/用户名/bio/简介)本身就是广告:学习 identityText 而不是当前正常正文。
+		// 学进来之后,同类资料卡可由"学习样本相似匹配(资料卡)"强特征自动查杀,不必逐词手工加。
+		return { text: identityText, source: 'identity-only', identityHits };
 	}
 	return { text: bodyText, source: 'message-body', identityHits };
 }
@@ -7800,7 +7831,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					if (learn.fpAdded) learnLines.push('✅ 指纹已入库(以后相同广告自动秒杀)');
 					else if (learn.fpUpgraded) learnLines.push('✅ 旧样本已由人工确认并升级为可信样本');
 					else learnLines.push('ℹ️ 可信指纹已存在,未重复入库');
-					learnLines.push(`🧭 学习来源:${escapeHtml(learning.source === 'quoted-ad' ? '引用中的真实广告' : '当前广告正文')}`);
+					learnLines.push(`🧭 学习来源:${escapeHtml(learning.source === 'quoted-ad' ? '引用中的真实广告' : (learning.source === 'identity-only' ? '账号资料卡(名字/用户名/简介)' : '当前广告正文'))}`);
 					if (learn.suggestedKeywords.length > 0) {
 						learnLines.push(`💡 建议词(不会自动入库,需手动加):${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
 						learnLines.push(`   要加进词库请发:<code>/addword general ${escapeHtml(learn.suggestedKeywords.join(' '))}</code>`);
@@ -7808,7 +7839,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					learnLines.push(`📊 当前样本库共 ${learn.sampleCount} 条`);
 					lines.push(...learnLines);
 				} else if (learning.source === 'identity-only') {
-					lines.push('', 'ℹ️ 仅账号资料命中广告；已封账号，但未把当前正常正文写入学习样本。');
+					lines.push('', 'ℹ️ 账号资料卡命中广告，但资料文本过短未达指纹长度，未写入学习样本。');
 				} else if (learning.source === 'proxy-exempt') {
 					lines.push('', 'ℹ️ 代理相关内容按绝对豁免口径不写入广告学习样本。');
 				}

@@ -5843,7 +5843,15 @@ console.log('\n[81f] /spam 学习载体归属');
 		reply_to_message: { message_id: 94411, from: { id: 94411, is_bot: false, first_name: '正常名字' }, text: '你好，刚进群' },
 	} }) }), env, fakeCtxAd);
 	assert('/spam 仅资料是广告 → 账号照常封禁', db._rows.has('94411'));
-	assert('/spam 仅资料是广告 → 不学习当前正常正文', !db._store.has('ad_samples'));
+	{
+		// 资料卡本身是广告时：学习 identityText（资料卡文本），而不是当前这条正常正文。
+		// 学进样本库后，同类资料卡可由"资料卡学习样本相似匹配"强特征自动查杀。
+		const raw = db._store.get('ad_samples');
+		const parsed = raw ? JSON.parse(raw) : { entries: [] };
+		const learned = (parsed.entries || []).map((s) => String(s.preview || '')).join(' | ');
+		assert('/spam 仅资料是广告 → 学习资料卡文本入库', /约炮|看我主页/.test(learned));
+		assert('/spam 仅资料是广告 → 不学习当前正常正文', !/你好，刚进群/.test(learned));
+	}
 
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
@@ -5862,7 +5870,13 @@ console.log('\n[81f] /spam 学习载体归属');
 		reply_to_message: { message_id: 94421, from: { id: 94421, is_bot: false, first_name: '正常名字' }, text: '今天路过打个招呼' },
 	} }) }), env, fakeCtxAd);
 	assert('/spam 资料通过普通广告词评分命中 → 账号照常封禁', db._rows.has('94421'));
-	assert('/spam 资料通过普通广告词评分命中 → 不学习当前正常正文', !db._store.has('ad_samples'));
+	{
+		const raw = db._store.get('ad_samples');
+		const parsed = raw ? JSON.parse(raw) : { entries: [] };
+		const learned = (parsed.entries || []).map((s) => String(s.preview || '')).join(' | ');
+		assert('/spam 资料通过普通广告词评分命中 → 学习资料卡文本入库', /专属担保|代收黑钱/.test(learned));
+		assert('/spam 资料通过普通广告词评分命中 → 不学习当前正常正文', !/今天路过打个招呼/.test(learned));
+	}
 }
 
 // ---------- [81f2] 只有第一主人 /spam 才写广告学习样本 ----------
