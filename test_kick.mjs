@@ -4009,7 +4009,7 @@ function normalizeFp(text) {
 		return String(text || '').toLowerCase().replace(/\s+/g, '');
 	}
 }
-function trustedSampleData(texts, source = 'test-confirmed') {
+function trustedSampleData(texts, source = 'test-confirmed', scopes = null) {
 	const fingerprints = texts.map(normalizeFp);
 	return {
 		fingerprints,
@@ -4017,6 +4017,7 @@ function trustedSampleData(texts, source = 'test-confirmed') {
 			fingerprint,
 			trusted: true,
 			source,
+			...(Array.isArray(scopes) ? { scopes } : {}),
 			operatorId: '999',
 			learnedAt: '2026-07-29T00:00:00.000Z',
 			preview: String(texts[index] || ''),
@@ -6722,6 +6723,284 @@ console.log('\n[84c] /ad 发起白名单权限');
 	assert('/add_ad_admin → 副主人无权修改发起白名单', !db._adVoteAllowlist.has('97001'));
 	await dispatch(999, '/del_ad_admin 97000');
 	assert('/del_ad_admin → 第一主人可移除发起白名单', !db._adVoteAllowlist.has('97000'));
+}
+
+// ---------- [85] 正文与资料卡分源：ECH / 传话机器人不误封 ----------
+console.log('\n[85] 正文与资料卡分源误封保护');
+{
+	const safeCases = [
+		{ id: 98001, text: 'ech', bio: '传话筒@Uncleyu_bot需要三角洲扫号号的私信我' },
+		{ id: 98002, text: '今天正常聊天', bio: '双向传话机器人 @RelayBridge_bot 私信我' },
+		{ id: 98003, text: 'ECH 是什么？', bio: '@Uncleyu_bot 私信我' },
+	];
+	const failures = [];
+	for (const scenario of safeCases) {
+		resetCalls();
+		sandbox.fetch = makeFetchMock({
+			getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+			getChat: (body) => {
+				const id = String(body.chat_id);
+				if (id === String(scenario.id)) {
+					return { ok: true, result: { id: scenario.id, first_name: '普通用户', bio: scenario.bio, type: 'private' } };
+				}
+				return { ok: true, result: { id: Number(body.chat_id), title: '资料卡测试群', type: 'supergroup' } };
+			},
+			banChatMember: () => ({ ok: true, result: true }),
+			deleteMessage: () => ({ ok: true, result: true }),
+			sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		});
+		const db = makeAdD1();
+		const env = {
+			TOKEN,
+			BOT_TOKEN: '0:profile-safe-' + scenario.id,
+			GROUP_ID: '-1001,-1002',
+			OWNER_IDS: '999',
+			AD_FILTER_ENABLED: 'true',
+			DB: db,
+		};
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: {
+				message_id: scenario.id,
+				chat: { id: -1001, type: 'supergroup', title: '资料卡测试群' },
+				from: { id: scenario.id, is_bot: false, first_name: '普通用户' },
+				text: scenario.text,
+			} }),
+		}), env, fakeCtxAd);
+		if (db._rows.has(String(scenario.id)) || callsOf('deleteMessage').length > 0 || callsOf('banChatMember').length > 0) {
+			failures.push(String(scenario.id));
+		}
+	}
+	assert('ECH、普通双向机器人、传话机器人及 @bot+私信我 → 均不加黑、不删、不封', failures.length === 0, failures.join(','));
+}
+
+// ---------- [86] 真实广告资料卡独立查杀并强制刷新复核 ----------
+console.log('\n[86] 高置信广告资料卡独立查杀');
+{
+	const adProfiles = [
+		{ id: 98101, bio: '六合彩内幕精准分享群 https://t.me/lhc_secret', marker: '六合彩' },
+		{ id: 98102, bio: '日入一万 公群 https://t.me/income_group 客服 @income_service', marker: '日入一万' },
+	];
+	const failures = [];
+	for (const scenario of adProfiles) {
+		resetCalls();
+		let profileReads = 0;
+		sandbox.fetch = makeFetchMock({
+			getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+			getChat: (body) => {
+				const id = String(body.chat_id);
+				if (id === String(scenario.id)) {
+					profileReads += 1;
+					return { ok: true, result: { id: scenario.id, first_name: '普通名字', bio: scenario.bio, type: 'private' } };
+				}
+				return { ok: true, result: { id: Number(body.chat_id), title: '资料卡广告测试群', type: 'supergroup' } };
+			},
+			banChatMember: () => ({ ok: true, result: true }),
+			deleteMessage: () => ({ ok: true, result: true }),
+			sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		});
+		const db = makeAdD1();
+		const env = {
+			TOKEN,
+			BOT_TOKEN: '0:profile-ad-' + scenario.id,
+			GROUP_ID: '-1001,-1002',
+			OWNER_IDS: '999',
+			AD_FILTER_ENABLED: 'true',
+			DB: db,
+		};
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: {
+				message_id: scenario.id,
+				chat: { id: -1001, type: 'supergroup', title: '资料卡广告测试群' },
+				from: { id: scenario.id, is_bot: false, first_name: '普通名字' },
+				text: '大家好',
+			} }),
+		}), env, fakeCtxAd);
+		const ownerNotice = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
+		const ok = db._rows.get(String(scenario.id))?.reason === 'ad_auto'
+			&& callsOf('banChatMember').length === 2
+			&& callsOf('deleteMessage').some((call) => call.body.message_id === scenario.id)
+			&& profileReads >= 2
+			&& ownerNotice?.body?.text.includes('命中来源:资料卡')
+			&& ownerNotice?.body?.text.includes('最新 Telegram 资料复核仍命中')
+			&& ownerNotice?.body?.text.includes(scenario.marker);
+		if (!ok) failures.push(String(scenario.id));
+	}
+	assert('赌博群与日入招揽资料卡 + 正常正文 → 最新资料复核后加黑并遍历全部 GROUP_ID 封禁', failures.length === 0, failures.join(','));
+}
+
+// ---------- [87] 缓存广告资料已修改或刷新失败时保守放行 ----------
+console.log('\n[87] 资料卡缓存二次确认保护');
+{
+	const scenarios = [
+		{ id: 98201, mode: 'changed' },
+		{ id: 98202, mode: 'failed' },
+	];
+	const failures = [];
+	for (const scenario of scenarios) {
+		resetCalls();
+		let profileReads = 0;
+		sandbox.fetch = makeFetchMock({
+			getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+			getChat: (body) => {
+				const id = String(body.chat_id);
+				if (id !== String(scenario.id)) {
+					return { ok: true, result: { id: Number(body.chat_id), title: '资料复核测试群', type: 'supergroup' } };
+				}
+				profileReads += 1;
+				if (profileReads === 1) {
+					return { ok: true, result: { id: scenario.id, first_name: '普通名字', bio: '六合彩内幕精准分享群 https://t.me/stale_ad', type: 'private' } };
+				}
+				if (scenario.mode === 'failed') return { ok: false, description: 'Bad Request: chat not found' };
+				return { ok: true, result: { id: scenario.id, first_name: '普通名字', bio: '传话筒 @RelayBridge_bot', type: 'private' } };
+			},
+			banChatMember: () => ({ ok: true, result: true }),
+			deleteMessage: () => ({ ok: true, result: true }),
+			sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		});
+		const db = makeAdD1();
+		const env = {
+			TOKEN,
+			BOT_TOKEN: '0:profile-review-' + scenario.id,
+			GROUP_ID: '-1001,-1002',
+			OWNER_IDS: '999',
+			AD_FILTER_ENABLED: 'true',
+			DB: db,
+		};
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: {
+				message_id: scenario.id,
+				chat: { id: -1001, type: 'supergroup', title: '资料复核测试群' },
+				from: { id: scenario.id, is_bot: false, first_name: '普通名字' },
+				text: '正常正文',
+			} }),
+		}), env, fakeCtxAd);
+		const safe = profileReads === 2
+			&& !db._rows.has(String(scenario.id))
+			&& callsOf('deleteMessage').length === 0
+			&& callsOf('banChatMember').length === 0;
+		if (!safe) failures.push(scenario.mode);
+	}
+	assert('缓存资料命中但最新资料已正常或 getChat 刷新失败 → 均取消资料卡封禁', failures.length === 0, failures.join(','));
+}
+
+// ---------- [88] D1 学习样本作用域兼容与严格隔离 ----------
+console.log('\n[88] D1 学习样本作用域隔离');
+{
+	const profileText = '旧资料卡样本甲乙丙丁';
+	const quoteText = '旧引用样本甲乙丙丁';
+	const bodyText = '旧正文样本甲乙丙丁';
+	const db = makeAdD1();
+	const profileFp = normalizeFp(profileText);
+	const quoteFp = normalizeFp(quoteText);
+	const bodyFp = normalizeFp(bodyText);
+	db._store.set('ad_samples', JSON.stringify({
+		fingerprints: [profileFp, quoteFp, bodyFp],
+		entries: [
+			{ fingerprint: profileFp, trusted: true, source: 'spam:identity-only' },
+			{ fingerprint: quoteFp, trusted: true, source: 'spam:quoted-ad' },
+			{ fingerprint: bodyFp, trusted: true, source: 'learn' },
+		],
+		count: 3,
+	}));
+	sandbox.__scopeEnv = { DB: db };
+	await vm.runInContext('mergeAdSamplesFromD1(globalThis.__scopeEnv)', sandbox);
+	const scopeResult = vm.runInContext('({'
+		+ 'profileOwn: !!getAdSampleMatch(' + JSON.stringify(profileFp) + ', "profile")?.trusted,'
+		+ 'profileBody: getAdSampleMatch(' + JSON.stringify(profileFp) + ', "body"),'
+		+ 'quoteOwn: !!getAdSampleMatch(' + JSON.stringify(quoteFp) + ', "quote")?.trusted,'
+		+ 'quoteBody: getAdSampleMatch(' + JSON.stringify(quoteFp) + ', "body"),'
+		+ 'bodyOwn: !!getAdSampleMatch(' + JSON.stringify(bodyFp) + ', "body")?.trusted,'
+		+ 'bodyProfile: getAdSampleMatch(' + JSON.stringify(bodyFp) + ', "profile")'
+		+ '})', sandbox);
+	delete sandbox.__scopeEnv;
+	assert('旧 D1 source 自动推导作用域，正文/资料卡/引用样本不能跨载体精确匹配',
+		scopeResult.profileOwn && !scopeResult.profileBody
+		&& scopeResult.quoteOwn && !scopeResult.quoteBody
+		&& scopeResult.bodyOwn && !scopeResult.bodyProfile);
+}
+
+// ---------- [89] 第一主人 /spam 多载体学习且不污染正常正文 ----------
+console.log('\n[89] 第一主人 /spam 多载体学习');
+{
+	const scenarios = [
+		{
+			label: '仅资料卡广告',
+			targetId: 98301,
+			body: '大家好，刚进群',
+			profile: '六合彩内幕精准分享群 https://t.me/profile_only',
+			expectedScopes: ['profile'],
+		},
+		{
+			label: '仅正文广告',
+			targetId: 98302,
+			body: '承接社群服务 长期招募合作伙伴 每月500元 联系 @body_service',
+			profile: '传话筒 @RelayBridge_bot 私信我',
+			expectedScopes: ['body'],
+		},
+		{
+			label: '正文和资料卡都是广告',
+			targetId: 98303,
+			body: '承接社群服务 长期招募合作伙伴 每月800元 联系 @both_body',
+			profile: '日入一万 公群 https://t.me/both_profile 客服 @both_service',
+			expectedScopes: ['body', 'profile'],
+		},
+	];
+	const failures = [];
+	for (const scenario of scenarios) {
+		resetCalls();
+		sandbox.fetch = makeFetchMock({
+			getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+			getChat: (body) => {
+				const id = String(body.chat_id);
+				if (id === String(scenario.targetId)) {
+					return { ok: true, result: { id: scenario.targetId, first_name: '目标用户', bio: scenario.profile, type: 'private' } };
+				}
+				if (id === '999') return { ok: true, result: { id: 999, first_name: '主人', type: 'private' } };
+				return { ok: true, result: { id: Number(body.chat_id), title: '学习测试群', type: 'supergroup' } };
+			},
+			banChatMember: () => ({ ok: true, result: true }),
+			deleteMessage: () => ({ ok: true, result: true }),
+			sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		});
+		const db = makeAdD1();
+		const env = {
+			TOKEN,
+			BOT_TOKEN: '0:profile-learn-' + scenario.targetId,
+			GROUP_ID: '-1001,-1002',
+			OWNER_IDS: '999',
+			AD_FILTER_ENABLED: 'true',
+			DB: db,
+		};
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: {
+				message_id: scenario.targetId - 1,
+				chat: { id: -1001, type: 'supergroup', title: '学习测试群' },
+				from: { id: 999, is_bot: false, first_name: '主人' },
+				text: '/spam',
+				reply_to_message: {
+					message_id: scenario.targetId,
+					from: { id: scenario.targetId, is_bot: false, first_name: '目标用户' },
+					text: scenario.body,
+				},
+			} }),
+		}), env, fakeCtxAd);
+		const data = JSON.parse(db._store.get('ad_samples') || '{"entries":[]}');
+		const scopes = [...new Set((data.entries || []).flatMap((entry) => entry.scopes || []))].sort();
+		const expected = [...scenario.expectedScopes].sort();
+		const previews = (data.entries || []).map((entry) => String(entry.preview || '')).join(' | ');
+		const normalBodyPolluted = scenario.expectedScopes.length === 1
+			&& scenario.expectedScopes[0] === 'profile'
+			&& previews.includes('大家好，刚进群');
+		const ok = db._rows.get(String(scenario.targetId))?.reason === 'spam'
+			&& JSON.stringify(scopes) === JSON.stringify(expected)
+			&& !normalBodyPolluted;
+		if (!ok) failures.push(scenario.label + ':' + scopes.join('/'));
+	}
+	assert('/spam 仅由第一主人按真实载体分别学习；资料广告不学习正常正文，两处广告分别入库', failures.length === 0, failures.join(','));
 }
 
 // ---------- 总结 ----------

@@ -145,6 +145,7 @@ const AD_SIMILARITY_MIN_SHARED_SHINGLES = 8;
 const AD_SIMILARITY_DICE_THRESHOLD = 0.82;
 const AD_SIMILARITY_CONTAINMENT_THRESHOLD = 0.9;
 const AD_SIMILARITY_MAX_CANONICAL_LENGTH = 2000;
+const AD_SAMPLE_SCOPES = ['body', 'profile', 'quote'];
 const AD_RELAY_REPEAT_THRESHOLD = 2;
 const AD_VOTE_THRESHOLD = 6;
 const AD_VOTE_DURATION_SECONDS = 60 * 60;
@@ -4688,10 +4689,11 @@ function hasAdSimilarityIntent(text) {
 	return /(?:点击下方|扫码|进群|频道入口|资源入口|完整版|免费(?:看|观看|领取)|联系(?:我|客服|商家)|添加(?:我|客服)|私信(?:我|客服)|承接|出售|售卖|供应|招募|招聘|诚招|合作|代理加盟|日入|月入|佣金|返利)/i.test(scan);
 }
 
-function findSimilarTrustedAdSample(text) {
+function findSimilarTrustedAdSample(text, scope = 'body') {
 	const signature = buildAdSimilaritySignature(text);
 	if (!signature || AD_SIMILARITY_SAMPLES.length === 0) return null;
 	for (const sample of AD_SIMILARITY_SAMPLES) {
+		if (!sample.entry?.scopes?.includes(scope)) continue;
 		const metrics = compareAdSimilaritySignatures(signature, sample.signature);
 		if (metrics.shared < AD_SIMILARITY_MIN_SHARED_SHINGLES) continue;
 		const thresholdMatch = metrics.dice >= AD_SIMILARITY_DICE_THRESHOLD
@@ -4704,6 +4706,20 @@ function findSimilarTrustedAdSample(text) {
 		return { ...metrics, signature, entry: sample.entry };
 	}
 	return null;
+}
+
+function inferAdSampleScopes(source) {
+	const value = String(source || '').toLowerCase();
+	if (value.includes('identity-only') || value.includes('profile')) return ['profile'];
+	if (value.includes('quoted-ad') || value.includes('quote')) return ['quote'];
+	return ['body'];
+}
+
+function normalizeAdSampleScopes(scopes, source) {
+	const values = Array.isArray(scopes) ? scopes : inferAdSampleScopes(source);
+	const normalized = [...new Set(values.map((scope) => String(scope || '').toLowerCase()))]
+		.filter((scope) => AD_SAMPLE_SCOPES.includes(scope));
+	return normalized.length > 0 ? normalized : inferAdSampleScopes(source);
 }
 
 // 从广告文本提取特征词组(加入词库 general 分类,抓变体)
@@ -4726,11 +4742,10 @@ function normalizeAdSamplesData(data) {
 	)];
 	const allowed = new Set(fingerprints);
 	const entries = [];
-	const seenEntries = new Set();
+	const entryIndexByFingerprint = new Map();
 	for (const item of Array.isArray(raw.entries) ? raw.entries : []) {
 		const fingerprint = String(item?.fingerprint || '').trim();
-		if (!fingerprint || !allowed.has(fingerprint) || seenEntries.has(fingerprint)) continue;
-		seenEntries.add(fingerprint);
+		if (!fingerprint || !allowed.has(fingerprint)) continue;
 		const storedSignature = item?.signature && typeof item.signature === 'object'
 			? {
 				version: Number(item.signature.version) || AD_SIMILARITY_SIGNATURE_VERSION,
@@ -4740,18 +4755,34 @@ function normalizeAdSamplesData(data) {
 		const signature = storedSignature?.canonical?.length >= AD_SIMILARITY_MIN_CANONICAL_LENGTH
 			? storedSignature
 			: null;
-		entries.push({
+		const normalizedEntry = {
 			fingerprint,
 			trusted: item?.trusted === true,
 			similarityTrusted: item?.trusted === true && item?.similarityTrusted === true && Boolean(signature),
 			signature,
 			source: String(item?.source || 'legacy'),
+			scopes: normalizeAdSampleScopes(item?.scopes, item?.source),
 			operatorId: String(item?.operatorId || ''),
 			sourceChatId: String(item?.sourceChatId || ''),
 			sourceMessageId: String(item?.sourceMessageId || ''),
 			learnedAt: String(item?.learnedAt || ''),
 			preview: String(item?.preview || '').slice(0, 160),
-		});
+		};
+		const existingIndex = entryIndexByFingerprint.get(fingerprint);
+		if (existingIndex === undefined) {
+			entryIndexByFingerprint.set(fingerprint, entries.length);
+			entries.push(normalizedEntry);
+			continue;
+		}
+		const previous = entries[existingIndex];
+		entries[existingIndex] = {
+			...previous,
+			...normalizedEntry,
+			trusted: previous.trusted || normalizedEntry.trusted,
+			similarityTrusted: previous.similarityTrusted || normalizedEntry.similarityTrusted,
+			signature: normalizedEntry.signature || previous.signature,
+			scopes: [...new Set([...previous.scopes, ...normalizedEntry.scopes])],
+		};
 	}
 	return {
 		...raw,
@@ -4761,12 +4792,15 @@ function normalizeAdSamplesData(data) {
 	};
 }
 
-function getAdSampleMatch(fingerprint) {
+function getAdSampleMatch(fingerprint, scope = 'body') {
 	if (!fingerprint || !AD_SAMPLE_FINGERPRINTS.includes(fingerprint)) return null;
 	const entry = AD_SAMPLE_ENTRY_BY_FP.get(fingerprint) || null;
+	const scopes = entry?.scopes || ['body'];
+	if (scope && !scopes.includes(scope)) return null;
 	return {
 		fingerprint,
 		entry,
+		scopes,
 		trusted: entry?.trusted === true,
 		legacy: !entry || entry.trusted !== true,
 	};
@@ -4828,9 +4862,22 @@ async function learnAdSample(env, learnText, metadata = {}) {
 	const fp = normalizeForFingerprint(learnText);
 	const signature = buildAdSimilaritySignature(learnText);
 	const suggestedKeywords = extractAdKeywords(learnText);
+	const requestedScopes = normalizeAdSampleScopes(
+		metadata.scopes || (metadata.scope ? [metadata.scope] : null),
+		metadata.source
+	);
 	if (!fp || fp.length < SAMPLE_FP_EXACT_MIN) {
 		const cur = normalizeAdSamplesData((await loadAdSamplesFromD1(env)) || {});
-		return { ok: true, fingerprint: fp, fpAdded: false, fpUpgraded: false, suggestedKeywords, sampleCount: cur.count };
+		return {
+			ok: true,
+			fingerprint: fp,
+			fpAdded: false,
+			fpUpgraded: false,
+			scopeAdded: false,
+			scopes: requestedScopes,
+			suggestedKeywords,
+			sampleCount: cur.count,
+		};
 	}
 
 	const data = normalizeAdSamplesData((await loadAdSamplesFromD1(env)) || {});
@@ -4841,10 +4888,14 @@ async function learnAdSample(env, learnText, metadata = {}) {
 	const existingIndex = data.entries.findIndex((entry) => entry.fingerprint === fp);
 	const existingEntry = existingIndex >= 0 ? data.entries[existingIndex] : null;
 	const upgraded = !added && existingEntry?.trusted !== true;
+	const existingScopes = existingEntry?.scopes || [];
+	const mergedScopes = [...new Set([...existingScopes, ...requestedScopes])];
+	const scopeAdded = Boolean(existingEntry) && requestedScopes.some((scope) => !existingScopes.includes(scope));
 	const entry = {
 		fingerprint: fp,
 		trusted: true,
 		source: String(metadata.source || 'manual-confirmation'),
+		scopes: mergedScopes,
 		similarityTrusted: Boolean(signature),
 		signature,
 		operatorId: String(metadata.operatorId || ''),
@@ -4865,6 +4916,8 @@ async function learnAdSample(env, learnText, metadata = {}) {
 		fingerprint: fp,
 		fpAdded: added,
 		fpUpgraded: upgraded,
+		scopeAdded,
+		scopes: mergedScopes,
 		suggestedKeywords,
 		sampleCount: data.count,
 	};
@@ -5521,12 +5574,12 @@ function setAdIdentityProfileCache(key, value, ttlMs) {
 	AD_IDENTITY_PROFILE_CACHE.set(key, { value, expiresAt: Date.now() + ttlMs });
 }
 
-async function fetchAdIdentityProfile(chatId) {
+async function fetchAdIdentityProfile(chatId, options = {}) {
 	const id = String(chatId || '').trim();
 	if (!id) return null;
 	const key = `${BOT_TOKEN}:${id}`;
 	const cached = AD_IDENTITY_PROFILE_CACHE.get(key);
-	if (cached && cached.expiresAt > Date.now()) return cached.value;
+	if (!options.forceFresh && cached && cached.expiresAt > Date.now()) return cached.value;
 	try {
 		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
 			method: 'POST',
@@ -5548,32 +5601,62 @@ async function fetchAdIdentityProfile(chatId) {
 	}
 }
 
-async function resolveAdIdentityText(message) {
-	const parts = [
-		message?.from?.first_name,
-		message?.from?.last_name,
-		message?.from?.username,
-		message?.from?.bio,
-		message?.sender_chat?.title,
-		message?.sender_chat?.username,
-		message?.sender_chat?.description,
-	].filter(Boolean);
-	const lookupIds = [];
-	if (message?.from?.id && String(message.from.id) !== ANON_ADMIN_BOT_ID) lookupIds.push(message.from.id);
-	if (message?.sender_chat?.id) lookupIds.push(message.sender_chat.id);
-	const profiles = await Promise.all([...new Set(lookupIds.map(String))].map(fetchAdIdentityProfile));
-	for (const profile of profiles) {
-		if (!profile) continue;
-		parts.push(
-			profile.first_name,
-			profile.last_name,
-			profile.username,
-			profile.title,
-			profile.bio,
-			profile.description
-		);
+async function resolveAdIdentityProfile(message, options = {}) {
+	const specs = [];
+	if (message?.from?.id && String(message.from.id) !== ANON_ADMIN_BOT_ID) {
+		specs.push({
+			key: `user:${message.from.id}`,
+			id: String(message.from.id),
+			kind: 'user',
+			inlineParts: [
+				message.from.first_name,
+				message.from.last_name,
+				message.from.username,
+				message.from.bio,
+			],
+		});
 	}
-	return [...new Set(parts.map((part) => String(part).trim()).filter(Boolean))].join(' ');
+	if (message?.sender_chat?.id) {
+		specs.push({
+			key: `sender_chat:${message.sender_chat.id}`,
+			id: String(message.sender_chat.id),
+			kind: 'sender_chat',
+			inlineParts: [
+				message.sender_chat.title,
+				message.sender_chat.username,
+				message.sender_chat.description,
+			],
+		});
+	}
+
+	const subjects = await Promise.all(specs.map(async (spec) => {
+		const profile = await fetchAdIdentityProfile(spec.id, options);
+		const parts = [
+			...spec.inlineParts,
+			profile?.first_name,
+			profile?.last_name,
+			profile?.username,
+			profile?.title,
+			profile?.bio,
+			profile?.description,
+		];
+		return {
+			key: spec.key,
+			id: spec.id,
+			kind: spec.kind,
+			fetchSucceeded: Boolean(profile),
+			text: [...new Set(parts.map((part) => String(part || '').trim()).filter(Boolean))].join(' '),
+		};
+	}));
+	return {
+		subjects,
+		text: subjects.map((subject) => subject.text).filter(Boolean).join(' '),
+		forceFresh: options.forceFresh === true,
+	};
+}
+
+async function resolveAdIdentityText(message, options = {}) {
+	return (await resolveAdIdentityProfile(message, options)).text;
 }
 
 // ===== 代理相关内容绝对豁免 =====
@@ -5889,6 +5972,145 @@ function detectIdentitySpam(identityText) {
 	return hits;
 }
 
+function collectProfilePatternHits(text, pattern, label) {
+	const hits = [];
+	for (const match of String(text || '').matchAll(pattern)) {
+		const value = String(match[0] || '').trim();
+		if (value) hits.push(`${label}:${value.slice(0, 30)}`);
+	}
+	return [...new Set(hits)];
+}
+
+function detectProfileAdEvidence(identityText) {
+	let scan = String(identityText || '').trim();
+	if (!scan) return { isAd: false, hits: [], strong: null, localIntent: false };
+	try { scan = scan.normalize('NFKC'); } catch (_) {}
+	scan = scan.toLowerCase();
+
+	// 资料卡也遵守代理内容绝对豁免；技术协议、客户端和订阅信息不能成为广告证据。
+	if (isProxyRelatedMessage({ text: scan })) {
+		return { isAd: false, hits: ['资料卡代理内容绝对豁免'], strong: null, localIntent: false };
+	}
+	const normalContext = hasExplicitNormalAdContext(scan)
+		|| /(?:拒绝|谢绝|禁止|请勿|勿|别|不要)(?:任何)?(?:广告|推广|引流|推销|私信|加好友|合作|接单)/i.test(scan)
+		|| /(?:反诈|防骗|谨防诈骗|举报广告|曝光骗子)/i.test(scan);
+	if (normalContext) {
+		return { isAd: false, hits: ['资料卡正常/否定语境保护'], strong: null, localIntent: false };
+	}
+
+	const identityHits = detectIdentitySpam(scan);
+	const rawHighRiskHits = scoreHighRiskAdWords(scan);
+	const highRiskHits = rawHighRiskHits.map((hit) => `资料卡${hit}`);
+	const financeHits = AD_KEYWORDS_FINANCE.filter((word) => word && scan.includes(word));
+	const revenueHits = collectProfilePatternHits(
+		scan,
+		/(?:日入|月入|佣金|返利|稳赚|躺赚|收益|一单|每单|高薪|兼职|赚钱|出u|接u|承兑|跑分|刷流水)/gi,
+		'资料卡收益/交易'
+	);
+	const businessHits = collectProfilePatternHits(
+		scan,
+		/(?:出售|售卖|供应|承接|接单|代办|招募|招聘|诚招|招代理|代理加盟|合作代理|全套服务|内幕|精准计划|红单推荐)/gi,
+		'资料卡业务招揽'
+	);
+	const marketingHits = collectProfilePatternHits(
+		scan,
+		/(?:分享群|交流群|资源群|公群|频道|客服|联系(?:我|客服)|私信(?:我|客服)|加(?:我|客服)|找(?:我|客服)|咨询(?:我|客服)|点击下方|扫码|进群|入口|免费(?:看|观看|领取)|完整版|内幕|精准)/gi,
+		'资料卡营销结构'
+	);
+	const mentions = [...scan.matchAll(/@[a-z][\w]{2,}/gi)].map((match) => match[0].toLowerCase());
+	const nonBotMentions = [...new Set(mentions.filter((mention) => !mention.endsWith('bot')))];
+	const botMentions = [...new Set(mentions.filter((mention) => mention.endsWith('bot')))];
+	const telegramTargets = [...scan.matchAll(/(?:t\.me|telegram\.me)\/([a-z0-9_+\-/]+)/gi)]
+		.map((match) => String(match[1] || '').replace(/^\+/, '').split('/')[0].toLowerCase())
+		.filter(Boolean);
+	const nonBotTelegramTargets = [...new Set(telegramTargets.filter((target) => !target.endsWith('bot')))];
+	const urls = collectUrls({ text: scan });
+	const nonWhitelistedUrls = urls.filter((url) => !allUrlsWhitelisted([url]));
+	const phoneOrSocialHandle = /(?:微信|微|vx|v信|qq)\s*[:：]?\s*[a-z0-9_-]{4,}|\+?\d[\d\s().-]{7,}\d/i.test(scan);
+	const destinationHits = [
+		...nonBotMentions.map((value) => `资料卡联系账号:${value}`),
+		...nonBotTelegramTargets.map((value) => `资料卡Telegram入口:${value}`),
+		...nonWhitelistedUrls.slice(0, 3).map((value) => `资料卡外链:${String(value).slice(0, 50)}`),
+		...(phoneOrSocialHandle ? ['资料卡电话/社交账号'] : []),
+	];
+	const directSolicitation = /(?:联系|私信|私聊|加|添加|找|咨询)(?:我|本人|客服|商家|店主|老板|代理)/i.test(scan);
+	const intent = analyzeQuotedHighRiskIntent(scan, [
+		...rawHighRiskHits,
+		...identityHits,
+	]);
+	const explicitRisk = highRiskHits.length > 0 || identityHits.length > 0;
+	const pairedHighRisk = highRiskHits.length >= 2;
+	const financePromotion = financeHits.length >= 2
+		&& /(?:爆u|出u|接u|承兑.{0,12}usdt|usdt.{0,12}承兑)/i.test(scan)
+		&& /(?:项目|代理|合作|招募|联系|私信|加|日入)/i.test(scan);
+	const explicitAdLabel = /(?:广告|推广|引流|招商|频道主|资源主)/i.test(scan);
+	const explicitAdStructure = explicitAdLabel
+		&& (destinationHits.length > 0 || marketingHits.length > 0);
+	const riskWithPromotion = explicitRisk
+		&& (pairedHighRisk || intent.isPromotional || marketingHits.length > 0 || destinationHits.length > 0);
+	const structuredBusiness = (revenueHits.length > 0 || businessHits.length > 0)
+		&& (destinationHits.length > 0 || directSolicitation)
+		|| financePromotion;
+	const identityComposite = identityHits.length > 0
+		&& destinationHits.length > 0
+		&& marketingHits.length > 0;
+	const localIntent = riskWithPromotion || structuredBusiness || identityComposite || explicitAdStructure;
+
+	const fingerprint = normalizeForFingerprint(scan);
+	const exactSample = fingerprint.length >= SAMPLE_FP_EXACT_MIN
+		? getAdSampleMatch(fingerprint, 'profile')
+		: null;
+	const similarSample = findSimilarTrustedAdSample(scan, 'profile');
+	const sampleHits = [];
+	if (exactSample?.trusted && localIntent) sampleHits.push('资料卡可信学习样本精确匹配');
+	if (similarSample && localIntent) {
+		sampleHits.push(
+			'资料卡可信学习样本相似匹配:Dice='
+			+ similarSample.dice.toFixed(3)
+			+ '/包含='
+			+ similarSample.containment.toFixed(3)
+		);
+	}
+
+	if (sampleHits.length > 0) {
+		return {
+			isAd: true,
+			score: 99,
+			hits: sampleHits,
+			strong: exactSample?.trusted ? '资料卡广告(精确样本)' : '资料卡广告(相似样本)',
+			localIntent,
+			sampleTrusted: true,
+			sampleSimilarityTrusted: Boolean(similarSample),
+		};
+	}
+	if (!localIntent) {
+		const neutralBotHits = botMentions.length > 0
+			? [`资料卡普通Bot提及(不作为广告证据):${botMentions.join(',')}`]
+			: [];
+		return {
+			isAd: false,
+			score: 0,
+			hits: neutralBotHits,
+			strong: null,
+			localIntent: false,
+		};
+	}
+	return {
+		isAd: true,
+		score: 99,
+		hits: [...new Set([
+			...identityHits,
+			...highRiskHits,
+			...revenueHits,
+			...businessHits,
+			...marketingHits,
+			...destinationHits,
+		])],
+		strong: explicitRisk ? '资料卡高危业务+推广结构' : '资料卡交易招揽+联系方式',
+		localIntent: true,
+	};
+}
+
 // 广告检测(多维度评分 + 强特征直杀)
 // 返回 { isAd, score, hits: string[], strong: string|null }
 function detectQuotedAdEvidence(message, quoteText) {
@@ -5916,14 +6138,14 @@ function detectQuotedAdEvidence(message, quoteText) {
 	}
 
 	const quoteNorm = normalizeForFingerprint(quoteText);
-	const sampleMatch = quoteNorm.length >= SAMPLE_FP_EXACT_MIN ? getAdSampleMatch(quoteNorm) : null;
+	const sampleMatch = quoteNorm.length >= SAMPLE_FP_EXACT_MIN ? getAdSampleMatch(quoteNorm, 'quote') : null;
 	const quoteUrlsAllWhite = allUrlsWhitelisted(collectUrls({ text: quoteText }));
 	if (sampleMatch?.trusted && !quoteUrlsAllWhite) {
 		const hits = ['引用内容可信学习样本精确匹配'];
 		logQuoteAdDiagnostic(message, quoteText, { decision: 'quote_ad_trusted_sample', score: 99, hits });
 		return makeResult('引用内容广告', hits, 99, { sampleTrusted: true, originalAuthorBanSafe: true });
 	}
-	const similarityMatch = !quoteUrlsAllWhite ? findSimilarTrustedAdSample(quoteText) : null;
+	const similarityMatch = !quoteUrlsAllWhite ? findSimilarTrustedAdSample(quoteText, 'quote') : null;
 	if (similarityMatch) {
 		const hits = ['引用内容可信学习样本相似匹配:Dice=' + similarityMatch.dice.toFixed(3) + '/包含=' + similarityMatch.containment.toFixed(3)];
 		logQuoteAdDiagnostic(message, quoteText, { decision: 'quote_ad_similar_sample', score: 99, hits });
@@ -5998,20 +6220,11 @@ async function detectAdLegacy(message, env) {
 	// 代理相关内容整条绝对豁免：不进入词库、学习样本、引用 @、短文本包装等任何自动广告规则。
 	if (isProxyRelatedMessage(message)) return { isAd: false, score: 0, hits: [], strong: null };
 
-	const contactText = getContactText(message); // 名片广告内容(名字/电话/vcard)
 	const quoteText = getQuoteText(message);
-	const textParts = [
-		message.text,
-		message.caption,
-		message.from?.first_name,
-		message.from?.last_name,
-		message.from?.username,
-		contactText,
-	].filter(Boolean);
-	const fullText = textParts.join(' ').toLowerCase();
-	// 仅正文(text+caption+名片内容),用于学习样本指纹比对 —— 与 /spam /learn /learnlast 学习入口口径一致,
-	// 不混入发送者用户名,保证"同一条广告不同人发"也能精确命中。名片广告也能被 /spam 学习指纹。
+	// 正文检测只接收消息自身载体，不再混入姓名、用户名、bio 或 sender_chat 资料。
+	// 名片和内联按钮仍属于消息正文载体，继续保留原有检测行为。
 	const bodyText = getAdDetectionBodyText(message).toLowerCase();
+	const fullText = bodyText;
 	const hits = [];
 
 	// 白名单:把白名单词从计分文本里挖掉(命中也不计分)
@@ -6024,16 +6237,6 @@ async function detectAdLegacy(message, env) {
 	// 链接分级:纯白名单链接(github/google等)放行;含可疑短链单独加分
 	const urlsAllWhite = allUrlsWhitelisted(urls);
 	const urlsSuspicious = hasSuspiciousUrl(urls);
-
-	// 强特征 0:发言人身份(名字/用户名)含引流特征 → 直接判广告。
-	//   只查身份字段,不碰正文,所以正常人聊 chatgpt/发 t.me 链接都不受影响。
-	//   抓"名字本身是广告"的号(如 сЛuВы Со ВпucoК、名字里塞 t.me/网址/卡网)。
-	const identityName = [message.from?.first_name, message.from?.last_name, message.from?.username]
-		.filter(Boolean).join(' ');
-	const nameHits = detectIdentitySpam(identityName);
-	if (nameHits.length > 0) {
-		return { isAd: true, score: 99, hits: ['发言人名字引流:' + nameHits.join('/')], strong: '发言人名字含广告' };
-	}
 
 	// 强特征 0.5:外国号名片直杀(双条件,压误杀)。
 	//   条件① 分享的是名片(contact) 且 电话是非 +86 的外国号;
@@ -6113,6 +6316,7 @@ async function detectAdLegacy(message, env) {
 			for (const fp of AD_SAMPLE_FINGERPRINTS) {
 				if (!fp || fp.length < SAMPLE_FP_EXACT_MIN) continue;
 				if (quoteNorm === fp) {
+					if (!getAdSampleMatch(fp, 'quote')?.trusted) continue;
 					logQuoteAdDiagnostic(message, quoteText, {
 						decision: 'kill_sample_exact',
 						score: 99,
@@ -6210,38 +6414,9 @@ async function detectAdLegacy(message, env) {
 	const mentionsBot = /@[a-z][\w]{2,}bot\b/i.test(fullText);
 	const hasLure = /(点击下方|完整版|免费(看|观看|领)|加我(看|领)|资源(群|站)|看完整|扫码|进群看)/.test(fullText);
 
-	// 强特征 5:账号资料卡(名字/用户名/bio/简介)相似匹配已确认的学习样本 → 直接判广告。
-	//   典型场景:广告号不发言或只发正常话,把广告挂在个人简介里(如"XX地推项目 日结 t.me/xxx")。
-	//   走的是与正文同一套四重门槛(shared≥8 + Dice≥0.82 或 包含率≥0.9 + 广告意图佐证 +
-	//   样本须经第一主人 /spam 确认为 similarityTrusted),精度与"学习样本(相似)"一致,
-	//   所以放在严格模式直杀区;正常人简介里的链接/@bot 不命中样本骨架,不受影响。
-	//   resolveAdIdentityText 已由 detectAd 注入到 from.first_name,此处取同一份文本。
-	const identityScanText = [message.from?.first_name, message.from?.last_name, message.from?.username]
-		.filter(Boolean).join(' ');
-	if (identityScanText.trim()) {
-		const identitySimilar = findSimilarTrustedAdSample(identityScanText);
-		if (identitySimilar) {
-			return {
-				isAd: true,
-				score: 99,
-				hits: ['资料卡学习样本相似匹配:Dice=' + identitySimilar.dice.toFixed(3) + '/包含=' + identitySimilar.containment.toFixed(3)],
-				strong: '资料卡广告(相似样本)',
-			};
-		}
-		const identityNorm = normalizeForFingerprint(identityScanText);
-		if (identityNorm.length >= SAMPLE_FP_EXACT_MIN && getAdSampleMatch(identityNorm)?.trusted) {
-			return {
-				isAd: true,
-				score: 99,
-				hits: ['资料卡学习样本精确匹配'],
-				strong: '资料卡广告(精确样本)',
-			};
-		}
-	}
-
 	// ===== A 严格模式:关闭正文加权评分,只保留高精度强特征 =====
 	//   正文关键词加权累加是"误杀正常人"的主因(聊 usdt/搬砖/套利 的正常用户被弱信号叠加误判)。
-	//   严格模式下上面所有"强特征直杀"仍全部生效(全局库/样本指纹/身份词/名片词/外国号名片/引用@泛滥/资料卡样本),
+	//   严格模式下上面所有正文强特征仍生效(样本指纹/名片词/外国号名片/引用@泛滥),
 	//   此处只保留同为双条件、高精度的 @bot+诱导词直杀,其余加权评分一律不计 → 误杀趋近于零。
 	if (AD_STRICT_MODE) {
 		if (mentionsBot && hasLure) {
@@ -6276,26 +6451,85 @@ async function detectAd(message, env) {
 
 	const quoteText = getQuoteText(message);
 	const quoteAd = detectQuotedAdEvidence(message, quoteText);
-	const identityText = await resolveAdIdentityText(message);
-	const identityEvidence = detectIdentitySpam(identityText);
 	const directMessage = {
 		...message,
 		quote: undefined,
 		reply_to_message: undefined,
 		external_reply: undefined,
 	};
-	if (message.from) {
-		directMessage.from = {
-			...message.from,
-			first_name: identityText || message.from.first_name,
+	const directResult = await detectAdLegacy(directMessage, env);
+	const cachedProfile = await resolveAdIdentityProfile(message);
+	let candidate = null;
+	for (const subject of cachedProfile.subjects) {
+		const evidence = detectProfileAdEvidence(subject.text);
+		if (evidence.isAd) {
+			candidate = { subject, evidence };
+			break;
+		}
+	}
+
+	let profileEvidence = null;
+	let profileReview = {
+		status: candidate ? 'candidate' : 'not_candidate',
+		candidateText: candidate?.subject?.text || '',
+		latestText: '',
+	};
+	if (candidate) {
+		const latestProfile = await resolveAdIdentityProfile(message, { forceFresh: true });
+		const latestSubject = latestProfile.subjects.find((subject) => subject.key === candidate.subject.key);
+		profileReview.latestText = latestSubject?.text || '';
+		if (!latestSubject?.fetchSucceeded) {
+			profileReview.status = 'fresh_lookup_failed';
+		} else {
+			const latestEvidence = detectProfileAdEvidence(latestSubject.text);
+			if (latestEvidence.isAd) {
+				profileReview.status = 'confirmed';
+				profileEvidence = {
+					...latestEvidence,
+					subjectKey: latestSubject.key,
+					subjectKind: latestSubject.kind,
+					text: latestSubject.text,
+				};
+			} else {
+				profileReview.status = 'cleared_by_fresh_profile';
+			}
+		}
+	}
+
+	let result = {
+		...directResult,
+		source: directResult.isAd ? (directResult.source || '正文') : directResult.source,
+	};
+	if (profileEvidence && !directResult.isAd) {
+		result = {
+			isAd: true,
+			score: profileEvidence.score,
+			hits: profileEvidence.hits,
+			strong: profileEvidence.strong,
+			source: '资料卡',
+		};
+	} else if (profileEvidence && directResult.isAd) {
+		result = {
+			...directResult,
+			score: Math.max(directResult.score || 0, profileEvidence.score || 0),
+			hits: [...new Set([...(directResult.hits || []), ...(profileEvidence.hits || [])])],
+			source: '正文+资料卡',
 		};
 	}
-	const directResult = await detectAdLegacy(directMessage, env);
 	return {
-		...directResult,
+		...result,
 		quoteAd,
 		quoteText,
-		identityEvidence,
+		identityEvidence: profileEvidence?.hits || candidate?.evidence?.hits || [],
+		identityText: profileEvidence?.text || cachedProfile.text,
+		profileEvidence,
+		profileReview,
+		bodyEvidence: directResult.isAd ? {
+			score: directResult.score,
+			hits: directResult.hits,
+			strong: directResult.strong,
+			text: getAdDetectionBodyText(directMessage),
+		} : null,
 	};
 }
 
@@ -6306,56 +6540,62 @@ function getAdLearningBodyText(message) {
 function hasIndependentAdBodyEvidence(message, bodyText) {
 	if (!bodyText || isProxyRelatedMessage({ ...message, quote: undefined, reply_to_message: undefined, external_reply: undefined })) return false;
 	const norm = normalizeForFingerprint(bodyText);
-	if (norm.length >= SAMPLE_FP_EXACT_MIN && getAdSampleMatch(norm)?.trusted) return true;
-	if (findSimilarTrustedAdSample(bodyText)) return true;
+	if (norm.length >= SAMPLE_FP_EXACT_MIN && getAdSampleMatch(norm, 'body')?.trusted) return true;
+	if (findSimilarTrustedAdSample(bodyText, 'body')) return true;
 	const scan = bodyText.toLowerCase();
-	if (scoreHighRiskAdWords(scan).length > 0) return true;
+	const highRiskHits = scoreHighRiskAdWords(scan);
+	if (highRiskHits.length > 0 && analyzeQuotedHighRiskIntent(scan, highRiskHits).isPromotional) return true;
 	const mentionsBot = /@[a-z][\w]{2,}bot\b/i.test(scan);
 	const hasLure = /(点击下方|完整版|免费(看|观看|领)|加我(看|领)|资源(群|站)|看完整|扫码|进群看)/.test(scan);
 	if (mentionsBot && hasLure) return true;
+	const hasBodyAdStructure = /(?:@[a-z][\w]{2,}|https?:\/\/|t\.me\/|telegram\.me\/|联系|私信|私聊|加我|客服|电话|微信|vx)/i.test(scan)
+		&& /(?:承接|出售|售卖|供应|接单|招募|招聘|日入|月入|佣金|返利|赚钱|约炮|裸聊|资源|广告|推广|进群|频道|出u|接u|usdt|承兑)/i.test(scan);
+	if (hasAdSimilarityIntent(scan) && hasBodyAdStructure) return true;
 	if (!AD_STRICT_MODE) {
 		const scored = scoreAdWords(scan);
-		if (scored.score >= AD_SCORE_THRESHOLD || scored.hits.length >= 2) return true;
+		if (!hasExplicitNormalAdContext(scan) && (scored.score >= AD_SCORE_THRESHOLD || scored.hits.length >= 2)) return true;
 	}
 	return false;
 }
 
-function getAdIdentityLearningEvidence(identityText) {
-	let scan = String(identityText || '').toLowerCase();
-	if (!scan.trim()) return [];
-	const hits = [...detectIdentitySpam(scan)];
-	for (const w of AD_WHITELIST) {
-		if (w) scan = scan.split(w).join('');
-	}
-	const mentionsBot = /@[a-z][\w]{2,}bot\b/i.test(scan);
-	const hasLure = /(点击下方|完整版|免费(看|观看|领)|加我(看|领)|资源(群|站)|看完整|扫码|进群看)/.test(scan);
-	if (mentionsBot && hasLure) hits.push('身份资料:@bot+诱导词');
-	if (!AD_STRICT_MODE) {
-		const scored = scoreAdWords(scan);
-		if (scored.score >= AD_SCORE_THRESHOLD) {
-			hits.push(...scored.hits.map((hit) => `身份资料:${hit}`));
-		}
-	}
-	return [...new Set(hits)];
-}
-
 async function resolveAdLearningPayload(message) {
-	if (isProxyRelatedMessage(message)) return { text: '', source: 'proxy-exempt', identityHits: [] };
+	if (isProxyRelatedMessage(message)) {
+		return { samples: [], source: 'proxy-exempt', skippedReason: '代理相关内容绝对豁免' };
+	}
+	const samples = [];
+	const seen = new Set();
+	const addSample = (scope, text, source, evidence = []) => {
+		const value = String(text || '').trim();
+		const fingerprint = normalizeForFingerprint(value);
+		const key = `${scope}:${fingerprint}`;
+		if (!value || !fingerprint || seen.has(key)) return;
+		seen.add(key);
+		samples.push({ scope, text: value, source, evidence });
+	};
 	const bodyText = getAdLearningBodyText(message);
 	const quoteText = getQuoteText(message || {});
 	const quoteEvidence = quoteText ? detectQuotedAdEvidence(message, quoteText) : null;
-	if (quoteText && (quoteEvidence || isShortQuoteWrapperText(message?.text || message?.caption || ''))) {
-		return { text: quoteText, source: 'quoted-ad', quoteEvidence };
+	if (quoteText && quoteEvidence) {
+		addSample('quote', quoteText, 'quoted-ad', [quoteEvidence.strong, ...(quoteEvidence.hits || [])].filter(Boolean));
 	}
 
-	const identityText = await resolveAdIdentityText(message || {});
-	const identityHits = getAdIdentityLearningEvidence(identityText);
-	if (identityHits.length > 0 && !hasIndependentAdBodyEvidence(message, bodyText)) {
-		// 资料卡(名字/用户名/bio/简介)本身就是广告:学习 identityText 而不是当前正常正文。
-		// 学进来之后,同类资料卡可由"学习样本相似匹配(资料卡)"强特征自动查杀,不必逐词手工加。
-		return { text: identityText, source: 'identity-only', identityHits };
+	const profile = await resolveAdIdentityProfile(message || {}, { forceFresh: true });
+	for (const subject of profile.subjects) {
+		if (!subject.fetchSucceeded) continue;
+		const evidence = detectProfileAdEvidence(subject.text);
+		if (evidence.isAd) {
+			addSample('profile', subject.text, 'identity-only', [evidence.strong, ...(evidence.hits || [])].filter(Boolean));
+		}
 	}
-	return { text: bodyText, source: 'message-body', identityHits };
+	if (hasIndependentAdBodyEvidence(message, bodyText)) {
+		addSample('body', bodyText, 'message-body', ['正文具备独立广告证据']);
+	}
+	return {
+		samples,
+		source: samples.length > 0 ? 'multi-carrier' : 'ambiguous',
+		skippedReason: samples.length > 0 ? '' : '没有任何载体达到独立广告证据门槛',
+		profileLookupFailed: profile.subjects.some((subject) => !subject.fetchSucceeded),
+	};
 }
 
 // 广告拦截后通知主人
@@ -6370,6 +6610,16 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 	const reason = adResult.strong
 		? `强特征命中:${adResult.strong}`
 		: `评分 ${adResult.score}（${adResult.hits.slice(0, 6).join('、')}）`;
+	const source = adResult.source || '正文';
+	const profilePreview = adResult.profileEvidence?.text
+		? escapeHtml(adResult.profileEvidence.text.slice(0, 160))
+		: '';
+	const reviewLabels = {
+		confirmed: '缓存初筛命中，最新 Telegram 资料复核仍命中',
+		cleared_by_fresh_profile: '缓存初筛命中，但最新资料已无广告证据',
+		fresh_lookup_failed: '缓存初筛命中，但最新资料读取失败，资料卡未参与封禁',
+		not_candidate: '资料卡未达到候选门槛',
+	};
 
 	// 拉群名
 	let groupLabel = `<code>${escapeHtml(String(message.chat.id))}</code>`;
@@ -6383,8 +6633,13 @@ async function notifyOwnerAdDetection(message, adResult, banResults) {
 		`🎬 操作:自动删消息 + 加黑 + 全群踢`,
 		`👤 广告账号:${operator} <code>${escapeHtml(String(fromUser?.id || '未知'))}</code>`,
 		`📍 触发群:${groupLabel}`,
+		`🧭 命中来源:${escapeHtml(source)}`,
 		`🔍 判定依据:${escapeHtml(reason)}`,
-		`📝 内容预览:${preview}`,
+		`📝 内容预览(正文):${preview}`,
+		...(profilePreview ? [`👤 资料卡预览:${profilePreview}`] : []),
+		...(adResult.profileReview?.status && adResult.profileReview.status !== 'not_candidate'
+			? [`🔄 资料复核:${escapeHtml(reviewLabels[adResult.profileReview.status] || adResult.profileReview.status)}`]
+			: []),
 		...(quotePreview ? [`💬 引用内容:${quotePreview}`] : []),
 		'',
 		await renderBanResultsDetail(banResults),
@@ -7819,29 +8074,46 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			if (isOwnerSpam && env.DB) {
 				await Promise.all([mergeAdKeywordsFromD1(env), mergeAdSamplesFromD1(env)]);
 				const learning = await resolveAdLearningPayload(repliedMsg);
-				if (learning.text.trim()) {
-					const learn = await learnAdSample(env, learning.text, {
-						source: `spam:${learning.source}`,
-						operatorId,
-						sourceChatId: chatId,
-						sourceMessageId: repliedMsg.message_id,
-						preview: learning.text,
-					});
+				if (learning.samples.length > 0) {
 					const learnLines = ['', '📖 <b>已学习此广告样本</b>'];
-					if (learn.fpAdded) learnLines.push('✅ 指纹已入库(以后相同广告自动秒杀)');
-					else if (learn.fpUpgraded) learnLines.push('✅ 旧样本已由人工确认并升级为可信样本');
-					else learnLines.push('ℹ️ 可信指纹已存在,未重复入库');
-					learnLines.push(`🧭 学习来源:${escapeHtml(learning.source === 'quoted-ad' ? '引用中的真实广告' : (learning.source === 'identity-only' ? '账号资料卡(名字/用户名/简介)' : '当前广告正文'))}`);
-					if (learn.suggestedKeywords.length > 0) {
-						learnLines.push(`💡 建议词(不会自动入库,需手动加):${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
-						learnLines.push(`   要加进词库请发:<code>/addword general ${escapeHtml(learn.suggestedKeywords.join(' '))}</code>`);
+					let sampleCount = 0;
+					const scopeLabels = {
+						body: '当前广告正文',
+						profile: '账号资料卡(姓名/用户名/bio/简介)',
+						quote: '引用中的真实广告',
+					};
+					for (const sample of learning.samples) {
+						const learn = await learnAdSample(env, sample.text, {
+							source: `spam:${sample.source}`,
+							scope: sample.scope,
+							operatorId,
+							sourceChatId: chatId,
+							sourceMessageId: repliedMsg.message_id,
+							preview: sample.text,
+						});
+						sampleCount = learn.sampleCount;
+						learnLines.push('', `🧭 学习载体:${escapeHtml(scopeLabels[sample.scope] || sample.scope)}`);
+						if (learn.fpAdded) learnLines.push('✅ 指纹已入库(只在同类载体中自动匹配)');
+						else if (learn.fpUpgraded) learnLines.push('✅ 旧样本已由人工确认并升级为可信样本');
+						else if (learn.scopeAdded) learnLines.push('✅ 已给现有指纹补充此载体作用域');
+						else learnLines.push('ℹ️ 此载体的可信指纹已存在,未重复入库');
+						if (sample.evidence.length > 0) {
+							learnLines.push(`🔍 载体依据:${escapeHtml(sample.evidence.slice(0, 4).join(' / '))}`);
+						}
+						if (learn.suggestedKeywords.length > 0) {
+							learnLines.push(`💡 建议词(不会自动入库,需手动加):${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
+							learnLines.push(`   要加进词库请发:<code>/addword general ${escapeHtml(learn.suggestedKeywords.join(' '))}</code>`);
+						}
 					}
-					learnLines.push(`📊 当前样本库共 ${learn.sampleCount} 条`);
+					learnLines.push('', `📊 本次学习 ${learning.samples.length} 个独立载体；当前样本库共 ${sampleCount} 条`);
 					lines.push(...learnLines);
-				} else if (learning.source === 'identity-only') {
-					lines.push('', 'ℹ️ 账号资料卡命中广告，但资料文本过短未达指纹长度，未写入学习样本。');
 				} else if (learning.source === 'proxy-exempt') {
 					lines.push('', 'ℹ️ 代理相关内容按绝对豁免口径不写入广告学习样本。');
+				} else {
+					lines.push('', 'ℹ️ 本次封禁照常执行，但正文、资料卡和引用均未达到独立广告证据门槛，未写入学习样本，避免污染样本库。');
+					if (learning.profileLookupFailed) {
+						lines.push('⚠️ 最新资料卡读取失败，本次没有用缓存资料写入学习样本。');
+					}
 				}
 			}
 
@@ -8473,8 +8745,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			} else {
 				// 最多展示最近 50 条,避免消息超长
 				const show = fps.slice(-50);
+				const entriesByFingerprint = new Map((data.entries || []).map((entry) => [entry.fingerprint, entry]));
 				show.forEach((fp, i) => {
-					lines.push(`${fps.length - show.length + i + 1}. <code>${escapeHtml(fp.slice(0, 60))}</code>`);
+					const scopes = entriesByFingerprint.get(fp)?.scopes || ['body'];
+					const scopeLabel = scopes.map((scope) => ({
+						body: '正文',
+						profile: '资料卡',
+						quote: '引用',
+					}[scope] || scope)).join('/');
+					lines.push(`${fps.length - show.length + i + 1}. [${escapeHtml(scopeLabel)}] <code>${escapeHtml(fp.slice(0, 60))}</code>`);
 				});
 				if (fps.length > 50) lines.unshift(`(仅显示最近 50 条)`);
 			}
