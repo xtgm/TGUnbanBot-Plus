@@ -1769,12 +1769,13 @@ console.log('\n[11a3] 小批量 /unban 混合 D1 黑名单资格');
 		method: 'POST',
 		body: JSON.stringify({ message: { message_id: 803, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: `/unban ${ids.join(',')}` } })
 	}), env, fakeCtx);
-	assert('混合 /unban 只解封不在 D1 的 2 个目标（覆盖 2 群）', callsOf('unbanChatMember').length === 4);
-	assert('混合 /unban D1 黑名单目标记录保留', env.DB._rows.has('57101'));
-	assert('混合 /unban 不执行 D1 删除 mutation', env.DB._mutationCalls.length === 0);
+	assert('混合 /unban 管理层解封全部 3 个目标（覆盖 2 群）', callsOf('unbanChatMember').length === 6);
+	assert('混合 /unban 管理层移除 D1 黑名单目标', !env.DB._rows.has('57101'));
+	assert('混合 /unban 对命中目标执行一次 D1 删除 mutation', env.DB._mutationCalls.filter((call) => call.type === 'delete').length === 1);
 	assert('混合 /unban 所有 Telegram 请求带 only_if_banned', callsOf('unbanChatMember').every((call) => call.body.only_if_banned === true));
+	assert('混合 /unban 绝不调用封禁接口', callsOf('banChatMember').length === 0);
 	const dmText = callsOf('sendMessage').filter((call) => String(call.body.chat_id) === '999').map((call) => call.body.text).join('\n');
-	assert('混合 /unban 回执明确拒绝 D1 黑名单目标', dmText.includes('D1 黑名单拒绝') && dmText.includes('57101'));
+	assert('混合 /unban 回执明确说明 D1 记录已移除', dmText.includes('D1 黑名单记录已移除') && dmText.includes('57101'));
 }
 
 // ---------- [11b] 群内 /ban 20 个 TGID → D1 批量任务 ----------
@@ -2398,12 +2399,12 @@ console.log('\n[11i] /unban Queue 与按需资料');
 	await drainPending(pending);
 	const job = JSON.parse([...env.DB._jobs.values()][0].payload);
 	assert('/unban 20 人创建 unban Queue 任务', job.action === 'unban' && job.command === '/unban');
-	assert('/unban Queue 混合资格完成且保留 5 条 D1', job.status === 'done' && job.stats.unbanEligible === 15 && job.stats.unbanBlacklisted === 5 && env.DB._rows.size === 5);
-	assert('/unban 30 个群操作按 24 上限分 2 次 Queue', job.autoRunCount === 2);
-	assert('/unban Queue 不执行 DELETE mutation', env.DB._mutationCalls.length === 0);
-	assert('/unban Queue 仅执行 15×2 次群解封', callsOf('unbanChatMember').length === 30);
+	assert('/unban Queue 管理层移除 5 条 D1 后全部资格通过', job.status === 'done' && job.stats.unbanEligible === 20 && job.stats.unbanBlacklisted === 0 && env.DB._rows.size === 0);
+	assert('/unban 40 个群操作按 24 上限分 2 次 Queue', job.autoRunCount === 2);
+	assert('/unban Queue 对 5 个命中目标执行一次批量 DELETE', env.DB._mutationCalls.filter((call) => call.type === 'delete').length === 1);
+	assert('/unban Queue 执行全部 20×2 次群解封', callsOf('unbanChatMember').length === 40);
 	assert('/unban Queue 全部请求带 only_if_banned', callsOf('unbanChatMember').every((call) => call.body.only_if_banned === true));
-	assert('/unban Queue 失败明细记录 D1 黑名单拒绝', job.failures.filter((failure) => failure.phase === 'unban_blocked').length === 5);
+	assert('/unban Queue 不产生 D1 黑名单拒绝失败', job.failures.filter((failure) => failure.phase === 'unban_blocked').length === 0);
 	assert('/unban Queue 执行和完成通知资料查询为 0', callsOf('getChatMember').length === 0);
 
 	resetCalls();
@@ -2879,8 +2880,8 @@ console.log('\n[12a1] 群内 /unban 特殊 TGID');
 	assert('特殊 TGID /unban:删除群内命令', callsOf('deleteMessage').some((c) => c.body.message_id === 915));
 }
 
-// ---------- [12a1b] 单条 /unban 命中 D1 黑名单必须拒绝 ----------
-console.log('\n[12a1b] 单条 /unban 命中 D1 拒绝');
+// ---------- [12a1b] 管理层单条 /unban 命中 D1：先移除再解封 ----------
+console.log('\n[12a1b] 管理层单条 /unban 命中 D1');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
@@ -2899,11 +2900,113 @@ console.log('\n[12a1b] 单条 /unban 命中 D1 拒绝');
 		method: 'POST',
 		body: JSON.stringify({ message: { message_id: 916, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/unban 7070447001' } })
 	}), env);
-	assert('D1 命中 /unban 保留黑名单记录', env.DB._rows.has('7070447001'));
-	assert('D1 命中 /unban 不执行任何 D1 mutation', env.DB._mutationCalls.length === 0);
-	assert('D1 命中 /unban 不调用 Telegram 解封', callsOf('unbanChatMember').length === 0);
+	assert('第一主人 /unban 移除 D1 黑名单记录', !env.DB._rows.has('7070447001'));
+	assert('第一主人 /unban 执行一次 D1 删除', env.DB._mutationCalls.filter((call) => call.type === 'delete').length === 1);
+	assert('第一主人 /unban 遍历两个配置群解封', callsOf('unbanChatMember').length === 2);
+	assert('第一主人 /unban 全部请求携带 only_if_banned', callsOf('unbanChatMember').every((call) => call.body.only_if_banned === true));
+	assert('第一主人 /unban 绝不调用封禁接口', callsOf('banChatMember').length === 0);
 	const dmSend = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
-	assert('D1 命中 /unban 明确返回拒绝原因', !!dmSend && dmSend.body.text.includes('仍在 D1 黑名单') && dmSend.body.text.includes('未调用 Telegram 解封接口'));
+	assert('第一主人 /unban 回执说明先移除 D1 再原生解封', !!dmSend && dmSend.body.text.includes('目标原在 D1 黑名单') && dmSend.body.text.includes('D1 黑名单记录已删除'));
+}
+
+// ---------- [12a1c] 副主人、超级管理员同样可解除 D1 后解封 ----------
+console.log('\n[12a1c] 副主人和超级管理员解除 D1 后解封');
+for (const scenario of [
+	{ label: '副主人', actorId: 998, targetId: '7070447002' },
+	{ label: '超级管理员', actorId: 7777, targetId: '7070447003' },
+]) {
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (body) => ({
+			ok: true,
+			result: { status: 'kicked', user: { id: Number(body.user_id), first_name: 'D1黑名单用户' } }
+		}),
+		unbanChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const env = {
+		...baseEnv,
+		OWNER_IDS: '999,998',
+		SUPER_ADMINS: '7777',
+		DB: makeFakeDB([{ id: scenario.targetId, reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({
+			message: {
+				message_id: Number(scenario.targetId),
+				chat: { id: scenario.actorId, type: 'private' },
+				from: { id: scenario.actorId, is_bot: false, first_name: scenario.label },
+				text: '/unban ' + scenario.targetId,
+			}
+		})
+	}), env);
+	assert(scenario.label + ' /unban 移除 D1 黑名单记录', !env.DB._rows.has(scenario.targetId));
+	assert(scenario.label + ' /unban 遍历两个配置群解封', callsOf('unbanChatMember').length === 2);
+	assert(scenario.label + ' /unban 绝不调用封禁接口', callsOf('banChatMember').length === 0);
+}
+
+// ---------- [12a1d] D1 删除失败时管理层也必须拒绝解封 ----------
+console.log('\n[12a1d] D1 删除失败严格拒绝解封');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatMember: (body) => ({
+			ok: true,
+			result: { status: 'kicked', user: { id: Number(body.user_id), first_name: '删除失败用户' } }
+		}),
+		unbanChatMember: () => ({ ok: true, result: true }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB(
+			[{ id: '7070447004', reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' }],
+			{ failMutationCalls: [1] }
+		),
+	};
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 917, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/unban 7070447004' } })
+	}), env);
+	assert('D1 删除失败保留黑名单记录', env.DB._rows.has('7070447004'));
+	assert('D1 删除失败不调用 Telegram 解封', callsOf('unbanChatMember').length === 0);
+	assert('D1 删除失败也不调用 Telegram 封禁', callsOf('banChatMember').length === 0);
+	const failureDm = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
+	assert('D1 删除失败明确返回拒绝原因', !!failureDm && failureDm.body.text.includes('D1 黑名单移除失败') && failureDm.body.text.includes('未调用 Telegram 解封接口'));
+}
+
+// ---------- [12a1e] 普通 Telegram 群管理员不能解除 D1 ----------
+console.log('\n[12a1e] 普通群管理员拒绝解除 D1');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 6666 }, status: 'administrator' }] }),
+		unbanChatMember: () => ({ ok: true, result: true }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+	});
+	const env = {
+		...baseEnv,
+		DB: makeFakeDB([{ id: '7070447005', reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({
+			message: {
+				message_id: 918,
+				chat: { id: -1001, type: 'supergroup', title: '普通管理员测试群' },
+				from: { id: 6666, is_bot: false, first_name: '普通管理员' },
+				text: '/unban 7070447005',
+			}
+		})
+	}), env);
+	assert('普通群管理员 /unban 保留 D1 黑名单记录', env.DB._rows.has('7070447005'));
+	assert('普通群管理员 /unban 不执行 D1 删除', env.DB._mutationCalls.length === 0);
+	assert('普通群管理员 /unban 不调用 Telegram 解封', callsOf('unbanChatMember').length === 0);
+	assert('普通群管理员 /unban 绝不调用 Telegram 封禁', callsOf('banChatMember').length === 0);
 }
 
 // ---------- [12a2] 匿名管理员仅有 /ban /spam，不允许 /unban ----------
@@ -3861,6 +3964,42 @@ console.log('\n[24] chat_member 手动 ban:主人收审计');
 	// 状态变更已翻译为中文
 	assert('审计含中文状态"普通成员"', ownerDm.body.text.includes('普通成员'));
 	assert('审计含中文状态"已踢出"', ownerDm.body.text.includes('已踢出'));
+}
+
+// ---------- [24a] 普通管理员原生解封 D1 用户:黑名单保留并立即封回 ----------
+console.log('\n[24a] 普通管理员原生解封 D1 用户:独立保护链封回');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getMe: () => ({ ok: true, result: { id: 424242, is_bot: true, username: 'test_bot' } }),
+		getChat: (body) => ({ ok: true, result: { id: Number(body.chat_id), title: '主群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const cmUpdate = {
+		chat_member: {
+			chat: { id: -1001, type: 'supergroup', title: '主群' },
+			from: { id: 7777, is_bot: false, first_name: '普通管理员' },
+			old_chat_member: { user: { id: 5555, is_bot: false, first_name: '黑名单用户' }, status: 'kicked' },
+			new_chat_member: { user: { id: 5555, is_bot: false, first_name: '黑名单用户' }, status: 'left' },
+			date: Math.floor(Date.now() / 1000),
+		},
+	};
+	const env = {
+		TOKEN,
+		BOT_TOKEN: '0:fake',
+		GROUP_ID: '-1001,-1002',
+		OWNER_IDS: '999',
+		DB: makeFakeDB([{ id: '5555', reason: 'manual', by: '999', at: '2026-05-01T00:00:00Z' }]),
+	};
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(cmUpdate) }), env);
+
+	assert('普通管理员原生解封后 D1 记录保持', env.DB._rows.has('5555'));
+	assert('独立保护链只封回事件所在群一次', callsOf('banChatMember').length === 1 && String(callsOf('banChatMember')[0].body.chat_id) === '-1001');
+	assert('独立保护链封回正确用户', String(callsOf('banChatMember')[0].body.user_id) === '5555');
+	assert('原生解封保护链不调用 unbanChatMember', callsOf('unbanChatMember').length === 0);
+	const ownerDm = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
+	assert('第一主人收到原生解封拦截通知', !!ownerDm && ownerDm.body.text.includes('群内手动解封拦截'));
 }
 
 // ---------- [25] 重复添加已黑用户:不报 D1 唯一约束错误,仍继续踢出 ----------

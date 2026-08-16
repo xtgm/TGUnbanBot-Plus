@@ -1272,7 +1272,8 @@ async function banUserFromAllGroups(userId, options = {}) {
 }
 
 // 把用户从所有配置群解除 Telegram 原生/手动封禁，逐群结果数组返回。
-// 调用方必须先严格确认目标不在 D1 黑名单；本函数本身不修改 D1。
+// 调用方必须先确认目标不在 D1 黑名单；管理层命中 D1 时应先成功移除记录。
+// 本函数本身不修改 D1，也绝不调用封禁接口。
 async function unbanUserFromAllGroups(userId) {
 	const results = [];
 	for (const groupId of GROUP_IDS) {
@@ -1993,10 +1994,12 @@ async function addManyToBlacklist(ids, env, options = {}) {
 	return results;
 }
 
-// 批量 /unban 资格检查：D1 黑名单是硬闸门，仅未命中的 TGID 可以执行 Telegram 原生解封。
-// 每 20 个 TGID 一条只读 SELECT，不删除或更新任何 D1 记录；查询失败时严格拒绝对应目标。
-async function checkManyUnbanEligibility(ids, env) {
-	const results = { eligible: [], blacklisted: [], failed: [] };
+// 批量 /unban 资格检查：
+// - 普通权限只读检查，D1 命中即拒绝；
+// - 第一主人、副主人、超级管理员可显式传 allowD1Removal，先移除 D1 再允许 Telegram 解封。
+// 查询或移除失败时严格拒绝对应目标，任何分支都不调用 Telegram 封禁接口。
+async function checkManyUnbanEligibility(ids, env, options = {}) {
+	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [] };
 	const uniqueIds = normalizeBatchMutationIds(ids);
 	if (!env.DB) {
 		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间，无法确认解封资格' })));
@@ -2027,6 +2030,22 @@ async function checkManyUnbanEligibility(ids, env) {
 			console.error('批量检查 /unban D1 资格时出错:', error);
 			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 无法确认 D1 黑名单状态: ${error.message || error}` })));
 		}
+	}
+	if (options.allowD1Removal !== true || results.blacklisted.length === 0) {
+		return results;
+	}
+
+	const removal = await removeManyFromBlacklist(results.blacklisted, env);
+	const eligibleSet = new Set([...results.eligible, ...removal.success, ...removal.notFound]);
+	results.d1Removed = [...removal.success];
+	results.d1RemovalFailed = removal.failed.map((item) => String(item.id));
+	results.eligible = uniqueIds.filter((id) => eligibleSet.has(id));
+	results.blacklisted = [];
+	for (const failure of removal.failed) {
+		results.failed.push({
+			id: String(failure.id),
+			msg: `❌ D1 黑名单移除失败，已拒绝解封: ${failure.msg || '未知错误'}`
+		});
 	}
 	return results;
 }
@@ -2113,7 +2132,13 @@ function renderBatchUnbanEligibilityResult(results, invalid, userProfiles = null
 	if (results.failed.length) lines.push(`❌ D1 检查失败: ${results.failed.length}`);
 
 	lines.push('', '<b>详情</b>:');
-	for (const id of results.eligible) lines.push(`✅ ${formatBatchUserTarget(id, userProfiles)} 不在 D1 黑名单，可执行群解封`);
+	const removedIds = new Set(results.d1Removed || []);
+	for (const id of results.eligible) {
+		const status = removedIds.has(id)
+			? 'D1 黑名单记录已移除，可执行群解封'
+			: '不在 D1 黑名单，可执行群解封';
+		lines.push(`✅ ${formatBatchUserTarget(id, userProfiles)} ${status}`);
+	}
 	for (const id of results.blacklisted) lines.push(`⛔ ${formatBatchUserTarget(id, userProfiles)} 在 D1 黑名单，拒绝解封（记录已保留）`);
 	for (const id of invalid) lines.push(`❌ <code>${escapeHtml(id)}</code> 格式错误`);
 	for (const f of results.failed) lines.push(`❌ ${formatBatchUserTarget(f.id, userProfiles)} ${escapeHtml(f.msg)}`);
@@ -2309,6 +2334,7 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 		note: normalizeActionNote(note),
 		groupIds,
 		createdBy: getMessageActorId(message),
+		unbanAllowD1Removal: isUnban && isPrivilegedManager(getMessageActorId(message)),
 		operator,
 		operatorRole: classifyMessageOperatorRole(message, message.chat?.type === 'private' ? '管理员' : '群管理员'),
 		sourceChatId: String(message.chat?.id ?? ''),
@@ -2562,9 +2588,11 @@ function incrementBulkJobStat(job, key, amount = 1) {
 
 async function performBulkJobD1Mutation(job, env, ids) {
 	let lastResults = null;
+	const allowD1Removal = job.unbanAllowD1Removal === true
+		|| (job.unbanAllowD1Removal == null && isPrivilegedManager(job.createdBy));
 	for (let attempt = 0; attempt <= BULK_TASK_D1_RETRY_LIMIT; attempt += 1) {
 		lastResults = job.action === 'unban'
-			? await checkManyUnbanEligibility(ids, env)
+			? await checkManyUnbanEligibility(ids, env, { allowD1Removal })
 			: await addManyToBlacklist(ids, env, {
 				reason: job.reason,
 				by: job.createdBy,
@@ -4418,8 +4446,9 @@ async function handleChatMemberUpdate(chatMember, env) {
 		console.log('[chat_member] 群内手动封禁，按规则不同步加黑:', JSON.stringify(logCommon));
 		await notifyOwnerChatMemberAction(chatMember, '封禁（未加入全局黑名单）', oldStatus, newStatus);
 	} else if (oldStatus === 'kicked') {
-		// 群内手动解封：D1 黑名单是权威封禁，禁止经此被绕过/清除。
-		// /unban 仅能解封不在 D1 黑名单中的目标，绝不删除 D1 记录。
+		// 群内原生手动解封：D1 黑名单是权威封禁，禁止普通管理员经此绕过或清除。
+		// 管理层必须通过 /unban TGID 先移除 D1 再解封；该命令路径不会进入这里的封回逻辑。
+		// 普通管理员直接使用 Telegram 原生解封时，D1 仍在，因此继续由独立保护链封回。
 		const blacklistCheck = await checkBlacklist(targetIdStr, env);
 		if (blacklistCheck.isBlacklisted) {
 			// 仍在 D1 黑名单 → 撤销本次群内手动解封，立即封回，绝不删除黑名单记录
@@ -9154,7 +9183,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 单条且无格式错误
 			if (valid.length === 1 && invalid.length === 0) {
 				const targetId = valid[0];
-				const eligibility = await checkManyUnbanEligibility([targetId], env);
+				const eligibility = await checkManyUnbanEligibility([targetId], env, { allowD1Removal: isAdmin });
 				const userProfiles = await resolveBatchUserProfiles([targetId], chatId);
 				const targetMention = formatBatchUserTarget(targetId, userProfiles);
 				const lines = [
@@ -9185,10 +9214,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					return;
 				}
 
+				const d1RecordRemoved = eligibility.d1Removed.includes(targetId);
 				const unbanResults = await unbanUserFromAllGroups(targetId);
 				lines.push(
-					'✅ <b>目标不在 D1 黑名单，允许执行 Telegram 原生解封</b>',
-					'ℹ️ 本次未修改任何 D1 记录。',
+					d1RecordRemoved
+						? '✅ <b>目标原在 D1 黑名单，已由管理层移除记录并允许解封</b>'
+						: '✅ <b>目标不在 D1 黑名单，允许执行 Telegram 原生解封</b>',
+					d1RecordRemoved
+						? 'ℹ️ D1 黑名单记录已删除；本次仅调用 Telegram 原生解封接口。'
+						: 'ℹ️ 本次未修改任何 D1 记录。',
 					'',
 					'<b>Telegram 群解封结果</b>:',
 					await renderUnbanResultsDetail(unbanResults, null, { userId: targetId, retryCommand: '/unban' })
@@ -9201,8 +9235,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				return;
 			}
 
-			// 批量：D1 每 20 人一条只读资格查询；仅非黑名单目标执行群解封，并发最多 3 个用户。
-			const results = await checkManyUnbanEligibility(valid, env);
+			// 批量：管理层先移除命中的 D1 记录，再对全部资格通过目标执行群解封。
+			const results = await checkManyUnbanEligibility(valid, env, { allowD1Removal: isAdmin });
 			const idsToUnban = [...results.eligible];
 			const userProfiles = await resolveBatchUserProfiles(valid, chatId);
 			const unbanSummary = { okAll: 0, partial: 0, failedAll: 0 };
