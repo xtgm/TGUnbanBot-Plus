@@ -6824,6 +6824,27 @@ console.log('\n[84b] /ad 防滥用边界');
 	assert('/ad TGID 模式 → 投票卡片为独立消息，不设置回复目标', callsOf('sendMessage').some((call) => Number(call.body.chat_id) === -1001 && !Object.prototype.hasOwnProperty.call(call.body, 'reply_to_message_id')));
 	assert('/ad 置顶权限不足 → 投票仍创建并保持进行中', harness.db._adVotes.size === 1 && state.finalized === false && callsOf('pinChatMessage').length === 1);
 
+	// TGID 模式通过：撤回参数保留，并对来源群缓存消息执行有限兜底
+	harness = makeVoteHarness();
+	await harness.dispatch({ message: {
+		message_id: 96049,
+		chat: { id: -1001, type: 'supergroup', title: '投票边界群' },
+		from: { id: 96000, is_bot: false, first_name: '白名单发起人' },
+		text: '/ad 96050 TGID广告',
+	} });
+	state = harness.readState();
+	assert('/ad TGID 成功投票 → 没有 reportedMessageId，走历史撤回主路径', state.targetUserId === '96050' && state.reportedMessageId === null);
+	await harness.db.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)').bind(96051, '-1001', '96050', new Date().toISOString()).run();
+	await harness.db.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)').bind(96052, '-1001', '96050', new Date().toISOString()).run();
+	await harness.db.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)').bind(96053, '-1001', '96051', new Date().toISOString()).run();
+	await harness.click(6666, 'A', 'tgid-approved');
+	state = harness.readState();
+	assert('/ad TGID 通过 → D1 加黑并遍历全部 GROUP_ID 且启用 revoke_messages', harness.db._rows.get('96050')?.reason === 'ad_vote' && callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((call) => call.body.revoke_messages === true));
+	const tgidDeleteIds = callsOf('deleteMessage').map((call) => Number(call.body.message_id));
+	assert('/ad TGID 通过 → 来源群缓存的目标消息执行兜底删除', tgidDeleteIds.includes(96051) && tgidDeleteIds.includes(96052));
+	assert('/ad TGID 通过 → 不删除其他用户的消息', !tgidDeleteIds.includes(96053));
+	assert('/ad TGID 通过 → 记录兜底删除结果', state.historyFallback?.attempted === true && state.historyFallback.total === 2 && state.historyFallback.ok === 2);
+
 	harness = makeVoteHarness();
 	const protectedTargets = ['96000', '999', '998', '7777', '6666', '123456789'];
 	for (const [index, targetId] of protectedTargets.entries()) {

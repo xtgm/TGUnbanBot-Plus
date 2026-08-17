@@ -152,6 +152,7 @@ const AD_VOTE_DURATION_SECONDS = 60 * 60;
 const AD_VOTE_COMMAND_MAX_AGE_SECONDS = 30;
 const AD_VOTE_RETENTION_SECONDS = 7 * 24 * 60 * 60;
 const AD_VOTE_BUTTON_PREFIX = 'adv:';
+const AD_VOTE_HISTORY_FALLBACK_LIMIT = 20;
 const AD_IDENTITY_CACHE_TTL_MS = 10 * 60 * 1000;
 const AD_IDENTITY_FAILURE_CACHE_TTL_MS = 60 * 1000;
 const AD_IDENTITY_CACHE_MAX = 500;
@@ -5359,6 +5360,38 @@ async function cleanupCurrentChatUserMessages(env, chatId, userId, fallbackMessa
 	return { total: uniqueIds.length, ok, failed, errors };
 }
 
+// TGID 投票没有可引用的原消息 ID；Telegram revoke_messages 是全量主路径，
+// 这里仅对来源群已缓存的少量消息做兜底，避免 Telegram 对不在群目标的撤回不生效时完全漏删。
+async function cleanupAdVoteSourceChatMessages(env, chatId, userId) {
+	const result = { attempted: false, total: 0, ok: 0, failed: 0, errors: [] };
+	const normalizedChatId = String(chatId || '').trim();
+	const normalizedUserId = String(userId || '').trim();
+	if (!env?.DB || !isConfiguredGroup(normalizedChatId) || !isPureTgid(normalizedUserId)) return result;
+	result.attempted = true;
+	try {
+		await ensureD1Table(env);
+		const { results } = await env.DB.prepare('SELECT mid FROM moderation_messages WHERE chat_id = ? AND from_id = ? ORDER BY id DESC LIMIT ?')
+			.bind(normalizedChatId, normalizedUserId, AD_VOTE_HISTORY_FALLBACK_LIMIT)
+			.all();
+		const messageIds = [...new Set((results || []).map((row) => Number(row?.mid)).filter((mid) => Number.isInteger(mid) && mid > 0))];
+		result.total = messageIds.length;
+		for (const messageId of messageIds) {
+			const deletion = await deleteMessage(normalizedChatId, messageId);
+			const outcome = classifyAdDeleteOutcome(deletion);
+			if (outcome.effective) result.ok += 1;
+			else {
+				result.failed += 1;
+				result.errors.push({ messageId, error: deletion.error || '未知错误' });
+			}
+		}
+	} catch (error) {
+		result.failed += 1;
+		result.errors.push({ messageId: null, error: error.message || String(error) });
+		console.error('[/ad] TGID 来源群缓存兜底清理失败:', error);
+	}
+	return result;
+}
+
 function renderCurrentChatCleanupResult(cleanup) {
 	if (!cleanup || cleanup.total === 0) return '🧹 当前群近期消息清扫:未找到缓存消息';
 	const suffix = cleanup.failed ? `，失败 ${cleanup.failed}` : '';
@@ -7427,6 +7460,10 @@ async function enforceApprovedAdVote(env, state) {
 		note: ('群内 /ad 举报投票通过' + (state.reason ? '：' + state.reason : '')).slice(0, 500),
 	});
 	const banResults = await banUserFromAllGroups(state.targetUserId, { probeMembership: true, revokeMessages: true });
+	const historyFallback = state.reportedMessageId
+		? null
+		: await cleanupAdVoteSourceChatMessages(env, state.chatId, state.targetUserId);
+	if (historyFallback) state.historyFallback = historyFallback;
 	const deleteResult = state.reportedMessageId
 		? await deleteMessage(state.chatId, state.reportedMessageId)
 		: null;
