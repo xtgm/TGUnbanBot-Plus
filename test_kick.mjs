@@ -6619,7 +6619,7 @@ console.log('\n[84] /ad 投票主链');
 	assert('/ad 回复模式 → 举报原因写入 D1 状态并显示在投票消息', voteState.reason === '广告引流' && callsOf('sendMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.text.includes('举报原因') && call.body.text.includes('广告引流')));
 	assert('/ad 回复模式 → 投票卡片回复原被举报消息', callsOf('sendMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.reply_to_message_id === 95010));
 	assert('/ad 成功投票消息 → 是非主人群静默规则的唯一可见投票回执并含取消按钮', callsOf('sendMessage').filter((call) => Number(call.body.chat_id) < 0).length === 1 && callsOf('sendMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.reply_markup?.inline_keyboard?.length === 2 && call.body.reply_markup.inline_keyboard.flat().some((button) => button.callback_data === 'adv:C:' + voteState.voteToken)));
-	assert('/ad 创建成功 → 自动静默置顶投票消息', callsOf('pinChatMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.message_id === voteState.messageId && call.body.disable_notification === true));
+	assert('/ad 创建成功 → 自动按 Telegram 默认通知成员置顶投票消息', callsOf('pinChatMessage').some((call) => Number(call.body.chat_id) === -1001 && call.body.message_id === voteState.messageId && !Object.prototype.hasOwnProperty.call(call.body, 'disable_notification')));
 
 	const replayCounts = {
 		send: callsOf('sendMessage').length,
@@ -6822,6 +6822,7 @@ console.log('\n[84b] /ad 防滥用边界');
 	state = harness.readState();
 	assert('/ad TGID 模式 → 正确解析目标与举报原因', state.targetUserId === '96040' && state.reason === '小孩哥');
 	assert('/ad TGID 模式 → 投票卡片为独立消息，不设置回复目标', callsOf('sendMessage').some((call) => Number(call.body.chat_id) === -1001 && !Object.prototype.hasOwnProperty.call(call.body, 'reply_to_message_id')));
+	assert('/ad TGID 模式 → 自动置顶同样使用 Telegram 默认成员通知', callsOf('pinChatMessage').some((call) => Number(call.body.chat_id) === -1001 && !Object.prototype.hasOwnProperty.call(call.body, 'disable_notification')));
 	assert('/ad 置顶权限不足 → 投票仍创建并保持进行中', harness.db._adVotes.size === 1 && state.finalized === false && callsOf('pinChatMessage').length === 1);
 
 	// TGID 模式通过：撤回参数保留，并对来源群缓存消息执行有限兜底

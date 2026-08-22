@@ -7044,7 +7044,6 @@ async function setAdVotePinned(chatId, messageId, pinned) {
 		chat_id: chatId,
 		message_id: messageId,
 	};
-	if (pinned) body.disable_notification = true;
 	try {
 		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/' + method, {
 			method: 'POST',
