@@ -6050,14 +6050,30 @@ function detectProfileAdEvidence(identityText) {
 	scan = scan.toLowerCase();
 
 	// 资料卡也遵守代理内容绝对豁免；技术协议、客户端和订阅信息不能成为广告证据。
-	if (isProxyRelatedMessage({ text: scan })) {
+	// 例外(仅资料卡):PROXY_CONTENT_PATTERNS 含裸词"代理/订阅/节点"，是技术与广告的歧义词
+	// ——技术语境指网络代理，广告语境指"招代理/代理加盟"。广告号只要写"代理"就能拿到
+	// 永久免疫(实测"专业推广引流 招代理加盟 佣金日结"被整条豁免)。因此当资料卡同时出现
+	// 【广告服务标签】与【商业招揽动作】时不再豁免；纯技术代理讨论不含这两者，仍完全豁免。
+	const adServiceSolicitation = /(?:广告|推广|引流|招商)/i.test(scan)
+		&& /(?:招|承接|出售|售卖|代发|投放|加盟|佣金|返利|日入|月入|日结|结算|接单)/i.test(scan);
+	if (!adServiceSolicitation && isProxyRelatedMessage({ text: scan })) {
 		return { isAd: false, hits: ['资料卡代理内容绝对豁免'], strong: null, localIntent: false };
 	}
-	const normalContext = hasExplicitNormalAdContext(scan)
-		|| /(?:拒绝|谢绝|禁止|请勿|勿|别|不要)(?:任何)?(?:广告|推广|引流|推销|私信|加好友|合作|接单)/i.test(scan)
-		|| /(?:反诈|防骗|谨防诈骗|举报广告|曝光骗子)/i.test(scan);
+	// 反广告/反诈工具与声明的语义方向与广告相反，必须在评分前整条豁免。
+	// 典型误杀:"Cloudflare验证+广告屏蔽测试客服机器人"——它是【屏蔽广告】的工具，
+	// 却因同时含"广告"字样与"客服"结构被判成【发广告】。此处显式识别反向语境。
+	const antiAdContext = /(?:屏蔽|拦截|过滤|检测|识别|清理|删除|举报|反|防|禁)\s*(?:广告|推广|引流|垃圾消息|垃圾信息|spam)/i.test(scan)
+		|| /(?:广告|推广|引流|垃圾消息|垃圾信息|spam)\s*(?:屏蔽|拦截|过滤|检测|识别|清理|删除|举报|防护|机器人|bot)/i.test(scan)
+		|| /(?:反广告|反诈|反骗|防诈|防骗|谨防诈骗|举报广告|曝光骗子|验证机器人|验证bot)/i.test(scan);
+	// 主动声明"拒绝私聊/广告骚扰"是正常用户的自我保护，不是招揽。
+	// 覆盖"拉黑/屏蔽/免打扰"等原词表缺失的表达（本次误杀卡写的是"私聊直接拉黑"）。
+	const refusalContext = /(?:拒绝|谢绝|禁止|请勿|勿|别|不要|不接|退订)(?:任何)?(?:广告|推广|引流|推销|私信|私聊|加好友|合作|接单|骚扰)/i.test(scan)
+		|| /(?:私聊|私信|广告|推销|推广|陌生人|骚扰)(?:的人)?.{0,10}(?:直接)?(?:拉黑|屏蔽|举报|删除|不回|免打扰|勿扰)/i.test(scan)
+		|| /(?:拉黑|屏蔽|免打扰|勿扰|不回)(?:所有|任何)?(?:私聊|私信|广告|推销|推广|骚扰)/i.test(scan);
+	const normalContext = hasExplicitNormalAdContext(scan) || antiAdContext || refusalContext;
 	if (normalContext) {
-		return { isAd: false, hits: ['资料卡正常/否定语境保护'], strong: null, localIntent: false };
+		const label = antiAdContext ? '资料卡反广告/反诈语境保护' : '资料卡正常/否定语境保护';
+		return { isAd: false, hits: [label], strong: null, localIntent: false };
 	}
 
 	const identityHits = detectIdentitySpam(scan);
@@ -6105,9 +6121,15 @@ function detectProfileAdEvidence(identityText) {
 	const financePromotion = financeHits.length >= 2
 		&& /(?:爆u|出u|接u|承兑.{0,12}usdt|usdt.{0,12}承兑)/i.test(scan)
 		&& /(?:项目|代理|合作|招募|联系|私信|加|日入)/i.test(scan);
-	const explicitAdLabel = /(?:广告|推广|引流|招商|频道主|资源主)/i.test(scan);
+	// 只保留【广告服务本身】的标签词。原先含"频道主|资源主"——那是身份描述不是招揽，
+	// 正常频道主在简介里放自己频道链接会被判成广告(实测误杀)，故移除。
+	// 真正的频道主广告一定伴随 招商/合作/日入 等词，由其余分支覆盖。
+	const explicitAdLabel = /(?:广告|推广|引流|招商)/i.test(scan);
+	// 收紧:仅"含广告字样 + 营销词"不足以定罪——描述自身功能(如"广告屏蔽测试客服机器人")
+	// 会同时命中两者却零引流意图。真广告必然给出可达的落地点(非 bot 账号/外链/电话)
+	// 或明确招揽动作，故此处与 structuredBusiness 对齐要求，纯 bot 提及不算落地点。
 	const explicitAdStructure = explicitAdLabel
-		&& (destinationHits.length > 0 || marketingHits.length > 0);
+		&& (destinationHits.length > 0 || directSolicitation);
 	const riskWithPromotion = explicitRisk
 		&& (pairedHighRisk || intent.isPromotional || marketingHits.length > 0 || destinationHits.length > 0);
 	const structuredBusiness = (revenueHits.length > 0 || businessHits.length > 0)

@@ -7164,6 +7164,44 @@ console.log('\n[89] 第一主人 /spam 多载体学习');
 	assert('/spam 仅由第一主人按真实载体分别学习；资料广告不学习正常正文，两处广告分别入库', failures.length === 0, failures.join(','));
 }
 
+// ---------- [90] 资料卡判定回归：反广告工具/拒绝声明不误杀，真广告仍必杀 ----------
+// 真实误杀案例（TGID 5768851426）：简介写"Cloudflare验证+广告屏蔽测试客服机器人"，
+// 被旧 explicitAdStructure（含"广告"字样 + 命中"客服" → 无需任何落地点即定罪）判为广告。
+// 语义完全相反：他是【屏蔽广告】的工具号。此段锁定修复，防止回归。
+console.log('\n[90] 资料卡判定回归（误杀防护 + 真广告必杀）');
+{
+	const probe = sandbox.detectProfileAdEvidence;
+	const mustPass = {
+		'反广告工具号(真实误杀案例)': '私聊直接拉黑，请通过私信助手联系 ✉ @AGsykin_bot Cloudflare验证+广告屏蔽测试客服机器人 @bosskinbot',
+		'反广告志愿者': '反广告志愿者 | 举报广告请私信助手 @myhelperbot',
+		'广告检测bot作者': '我写的广告检测机器人 @spamguardbot 欢迎测试',
+		'拒绝私聊声明': '私聊直接拉黑 有事群里说',
+		'谢绝广告声明': '本人谢绝任何广告推广，私聊直接屏蔽',
+		'频道主无招揽': '频道主 分享技术文章 t.me/techchannel',
+		'双向bot用户': '有事请找 @mynoticebot 主页 t.me/mychannel',
+		'代理技术讨论': 'clash/mihomo 折腾爱好者 订阅转换 节点分享 t.me/proxych',
+		'机场主技术交流': '自建机场 代理节点 socks5 vless 交流群 t.me/airportch',
+		'公司客服': '公司客服 工作时间9-18点 频道公告 t.me/notice',
+	};
+	const mustKill = {
+		'广告位招租': '广告位招租 长期合作 联系我 @adseller123 日入过千',
+		'承兑跑分': '承兑出U 接U 跑分 稳定水房 私信我 @usdtboss888',
+		'推广招代理(含"代理"歧义词)': '专业推广引流 招代理加盟 佣金日结 联系我 @promoter666',
+		'广告代发': '各大群广告代发 承接投放 价格优惠 @adposter001',
+		'引流招商': '专业引流招商 效果付费 日结佣金 详询 @liulaoban',
+		'兼职刷单': '正规兼职刷单 日入300+ 加微信 vx123456 咨询客服',
+		'广告投放外链': '承接广告投放 效果保证 详询 https://ad-agency.example.com',
+	};
+	const wrongKill = Object.entries(mustPass)
+		.filter(([, text]) => probe(text).isAd === true)
+		.map(([label]) => label);
+	const wrongPass = Object.entries(mustKill)
+		.filter(([, text]) => probe(text).isAd !== true)
+		.map(([label]) => label);
+	assert('资料卡：反广告工具/拒绝声明/代理技术讨论一律不判广告', wrongKill.length === 0, '误杀:' + wrongKill.join(','));
+	assert('资料卡：真广告(含"代理"歧义词绕过)仍全部查杀', wrongPass.length === 0, '漏杀:' + wrongPass.join(','));
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);
