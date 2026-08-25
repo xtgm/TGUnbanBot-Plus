@@ -7252,6 +7252,45 @@ console.log('\n[91] 杀神全局库与 D1 黑名单分离');
 	assert('杀神命中：GKY_SYNC_BLACKLIST=true 时写入 D1 且 reason=gky_global', db._rows.get('77001')?.reason === 'gky_global');
 }
 
+// ---------- [92] 反混淆:词内插空格/标点/零宽字符不再绕过词库 ----------
+// 用户反馈"自动检测感觉像正则一样"。实测确认:词库用 includes 子串比对,广告号只要在词
+// 中间插一个空格/标点/零宽字符,includes 立即失效(9 个变体漏 4 个)。现改为原文 + 去混淆
+// 文本双路比对。去混淆只压"连续 >=3 个单字符 + 分隔符"的逐字分隔签名,不无条件删空白,
+// 避免把相邻正常词拼成广告词(如"今日 入门" -> "今日入门" 误命中"日入")。
+console.log('\n[92] 反混淆扫描（插隔符绕过防护）');
+{
+	const probe = sandbox.detectProfileAdEvidence;
+	const evasions = {
+		'词内插空格': '广 告 位 招 租 长期合作 联 系 我 @adseller123 日 入 过千',
+		'词内插标点': '广-告-位-招-租 长期合作 联·系·我 @adseller123 日/入/过千',
+		'零宽字符分隔': '广​告​位​招​租 联​系​我 @adseller123 日​入过千',
+		'emoji分隔': '广🔥告🔥位🔥招🔥租 联系我 @adseller123 日入过千',
+		'全角分隔': '广告位招租　长期合作　联系我　＠adseller123　日入过千',
+	};
+	const escaped = Object.entries(evasions)
+		.filter(([, text]) => probe(text).isAd !== true)
+		.map(([label]) => label);
+	assert('反混淆:插空格/标点/零宽/emoji/全角的广告仍被查杀', escaped.length === 0, '绕过:' + escaped.join(','));
+
+	// 关键防线:压缩不能把相邻正常词拼成广告词
+	const mustPass = {
+		'逐字强调-今日入门': '今 日 入 门 教 程 分享给大家',
+		'逐字强调-每单元': '每 单 元 都 有 练 习',
+		'逐字强调-出u盘': '出 u 盘 坏 了 求 助',
+		'正常慢速打字': '我 今 天 有 点 累',
+		'逐字强调-欢迎': '欢 迎 大 家 来 玩',
+	};
+	const overkill = Object.entries(mustPass)
+		.filter(([, text]) => probe(text).isAd === true)
+		.map(([label]) => label);
+	assert('反混淆:逐字强调的正常文本不被压出广告词', overkill.length === 0, '误杀:' + overkill.join(','));
+
+	// 指纹归一化必须消掉零宽字符，否则学习样本会被零宽绕过
+	const fp = sandbox.normalizeForFingerprint;
+	assert('指纹归一化:零宽字符被消除，与无零宽原文一致',
+		fp('广​告​位​招​租') === fp('广告位招租'));
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);

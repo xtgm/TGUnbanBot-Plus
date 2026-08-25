@@ -4659,9 +4659,64 @@ async function getAdKeywordsRaw(env) {
 // ===== 广告学习样本(第一主人 /spam 上报 → 指纹入库 → 精准查杀)=====
 
 // 归一化:把文本"洗"成标准指纹,抓"加空格/标点/全半角"变体
+// ===== 反混淆扫描文本(治"词内插空格/标点/零宽字符"绕过)=====
+// 背景:词库匹配用的是 includes 子串比对,广告号只要在词中间插一个空格或标点
+//   ("广 告 位 招 租"、"联·系·我"),includes 立即失效 —— 实测 9 个变体漏 4 个。
+// 这里生成一份"去混淆"文本与原文一起参与匹配,任一命中即算,补掉最常见的绕过手法。
+//
+// 【关键取舍】不能无条件删掉所有空白/标点 —— 那会把相邻词拼起来造成误杀
+//   (如"今日 入门" → "今日入门" 会凭空命中"日入")。因此只处理"逐字分隔"这一种
+//   明确的混淆签名:连续 ≥3 个单字符、每个后面都跟一个分隔符。正常语句不会长这样。
+const INVISIBLE_SCAN_CHARS = /[\p{Cf}\u180e\ufe00-\ufe0f]/gu;
+// 逐字分隔签名:至少 3 个"单字符 + 单个分隔符"连续出现
+const SPACED_OUT_RUN = /(?:[\p{L}\p{N}][\s\p{P}\p{S}])(?:[\p{L}\p{N}][\s\p{P}\p{S}]){1,}[\p{L}\p{N}]/gu;
+
+function stripInvisibleScanChars(text) {
+	// 零宽/格式控制字符正常文本绝不会出现，可无条件删除，零误杀风险。
+	try {
+		return String(text || '').replace(INVISIBLE_SCAN_CHARS, '');
+	} catch (_) {
+		return String(text || '').replace(/[\u200b-\u200f\u2060\ufeff]/g, '');
+	}
+}
+
+function collapseSpacedOutRuns(text) {
+	// 仅把"逐字分隔"的片段压回连续文本，其余空白与标点原样保留。
+	try {
+		return String(text || '').replace(SPACED_OUT_RUN, (run) => run.replace(/[\s\p{P}\p{S}]/gu, ''));
+	} catch (_) {
+		return String(text || '');
+	}
+}
+
+// 返回参与关键词匹配的文本变体(已去重)。原文永远在第一项，行为完全向后兼容。
+function buildAdScanVariants(text) {
+	const raw = String(text || '');
+	const variants = [raw];
+	const deobfuscated = collapseSpacedOutRuns(stripInvisibleScanChars(raw));
+	if (deobfuscated && deobfuscated !== raw) variants.push(deobfuscated);
+	return variants;
+}
+
+function adScanIncludes(variants, word) {
+	if (!word) return false;
+	for (const variant of variants) {
+		if (variant.includes(word)) return true;
+	}
+	return false;
+}
+
+function adScanMatches(variants, pattern) {
+	for (const variant of variants) {
+		pattern.lastIndex = 0;
+		if (pattern.test(variant)) return true;
+	}
+	return false;
+}
+
 function normalizeForFingerprint(text) {
 	try {
-		return String(text || '')
+		return stripInvisibleScanChars(text)   // 先去零宽/格式字符(\p{Cf} 不被下面两条覆盖)
 			.normalize('NFKC')             // 全角半角归一
 			.toLowerCase()
 			.replace(/\s+/g, '')           // 去所有空白
@@ -5947,12 +6002,14 @@ function logQuoteAdDiagnostic(message, quoteText, detail = {}) {
 function scoreAdWords(text) {
 	let score = 0;
 	const hits = [];
+	// 词库匹配同时比对原文与"去混淆"文本，堵住词内插空格/标点/零宽字符的绕过。
+	const variants = buildAdScanVariants(text);
 	// 跨分类去重:同一个词无论出现在几个词库,只计一次分/一个 hit
 	const seen = new Set();
 	const scan = (words, weight, label) => {
 		for (const w of words) {
 			if (!w || seen.has(w)) continue;
-			if (text.includes(w)) { seen.add(w); score += weight; hits.push(`${label}:${w}`); }
+			if (adScanIncludes(variants, w)) { seen.add(w); score += weight; hits.push(`${label}:${w}`); }
 		}
 	};
 	// 金融词先收集命中，但不立即加分:需要 ≥2 个金融词才入计分
@@ -5961,7 +6018,7 @@ function scoreAdWords(text) {
 	const financeSeen = new Set();
 	for (const w of AD_KEYWORDS_FINANCE) {
 		if (!w || financeSeen.has(w)) continue;
-		if (text.includes(w)) { financeSeen.add(w); financeHits.push(`金融:${w}`); }
+		if (adScanIncludes(variants, w)) { financeSeen.add(w); financeHits.push(`金融:${w}`); }
 	}
 	// ≥2 个金融词叠加才计入评分
 	if (financeHits.length >= 2) {
@@ -5980,10 +6037,12 @@ function scoreAdWords(text) {
 
 function scoreHighRiskAdWords(text) {
 	const hits = [];
+	// 同时比对原文与去混淆文本，防止"约·炮""六 合 彩"这类插隔符绕过高危词直杀。
+	const variants = buildAdScanVariants(text);
 	// 金融词(如 usdt/usdc/承兑)在正常讨论里很常见，不能单词直杀引用回复者。
 	// 普通自定义词也可能是宽泛词，只走 scoreAdWords 的多词/达阈值规则。
-	for (const w of AD_KEYWORDS_PORN) if (w && text.includes(w)) hits.push(`色情:${w}`);
-	for (const w of AD_KEYWORDS_FRAUD) if (w && text.includes(w)) hits.push(`诈骗:${w}`);
+	for (const w of AD_KEYWORDS_PORN) if (w && adScanIncludes(variants, w)) hits.push(`色情:${w}`);
+	for (const w of AD_KEYWORDS_FRAUD) if (w && adScanIncludes(variants, w)) hits.push(`诈骗:${w}`);
 	return hits;
 }
 
@@ -6058,19 +6117,22 @@ function detectIdentitySpam(identityText) {
 	const t = String(identityText || '');
 	if (!t.trim()) return [];
 	const hits = [];
-	const lower = t.toLowerCase();
+	// 同时比对原文与去混淆文本，防止身份词被插空格/标点/零宽字符绕过。
+	const variants = buildAdScanVariants(t.toLowerCase());
 	// 仅匹配明确广告词(卡网/卖号/色情/赌博等)。链接、@提及、域名一律不算广告。
 	for (const w of IDENTITY_SPAM_WORDS) {
-		if (w && lower.includes(w)) hits.push(`身份广告词:${w}`);
+		if (w && adScanIncludes(variants, w)) hits.push(`身份广告词:${w}`);
 	}
 	return hits;
 }
 
-function collectProfilePatternHits(text, pattern, label) {
+function collectProfilePatternHits(variants, pattern, label) {
 	const hits = [];
-	for (const match of String(text || '').matchAll(pattern)) {
-		const value = String(match[0] || '').trim();
-		if (value) hits.push(`${label}:${value.slice(0, 30)}`);
+	for (const text of Array.isArray(variants) ? variants : [variants]) {
+		for (const match of String(text || '').matchAll(pattern)) {
+			const value = String(match[0] || '').trim();
+			if (value) hits.push(`${label}:${value.slice(0, 30)}`);
+		}
 	}
 	return [...new Set(hits)];
 }
@@ -6080,29 +6142,34 @@ function detectProfileAdEvidence(identityText) {
 	if (!scan) return { isAd: false, hits: [], strong: null, localIntent: false };
 	try { scan = scan.normalize('NFKC'); } catch (_) {}
 	scan = scan.toLowerCase();
+	// 反混淆扫描文本:原文 + 去零宽字符/压逐字分隔片段。所有词库与意图正则都按两份文本比对，
+	// 任一命中即算，堵住"广 告 位 招 租""联·系·我"这类插隔符绕过。
+	// 豁免类判断同样使用两份文本:豁免本就可用明文触发，反混淆不新增绕过能力，
+	// 但能保护"反 广 告 志 愿 者"这类用逐字强调的正常用户不被反混淆后的词库反咬。
+	const scanVariants = buildAdScanVariants(scan);
 
 	// 资料卡也遵守代理内容绝对豁免；技术协议、客户端和订阅信息不能成为广告证据。
 	// 例外(仅资料卡):PROXY_CONTENT_PATTERNS 含裸词"代理/订阅/节点"，是技术与广告的歧义词
 	// ——技术语境指网络代理，广告语境指"招代理/代理加盟"。广告号只要写"代理"就能拿到
 	// 永久免疫(实测"专业推广引流 招代理加盟 佣金日结"被整条豁免)。因此当资料卡同时出现
 	// 【广告服务标签】与【商业招揽动作】时不再豁免；纯技术代理讨论不含这两者，仍完全豁免。
-	const adServiceSolicitation = /(?:广告|推广|引流|招商)/i.test(scan)
-		&& /(?:招|承接|出售|售卖|代发|投放|加盟|佣金|返利|日入|月入|日结|结算|接单)/i.test(scan);
+	const adServiceSolicitation = adScanMatches(scanVariants, /(?:广告|推广|引流|招商)/i)
+		&& adScanMatches(scanVariants, /(?:招|承接|出售|售卖|代发|投放|加盟|佣金|返利|日入|月入|日结|结算|接单)/i);
 	if (!adServiceSolicitation && isProxyRelatedMessage({ text: scan })) {
 		return { isAd: false, hits: ['资料卡代理内容绝对豁免'], strong: null, localIntent: false };
 	}
 	// 反广告/反诈工具与声明的语义方向与广告相反，必须在评分前整条豁免。
 	// 典型误杀:"Cloudflare验证+广告屏蔽测试客服机器人"——它是【屏蔽广告】的工具，
 	// 却因同时含"广告"字样与"客服"结构被判成【发广告】。此处显式识别反向语境。
-	const antiAdContext = /(?:屏蔽|拦截|过滤|检测|识别|清理|删除|举报|反|防|禁)\s*(?:广告|推广|引流|垃圾消息|垃圾信息|spam)/i.test(scan)
-		|| /(?:广告|推广|引流|垃圾消息|垃圾信息|spam)\s*(?:屏蔽|拦截|过滤|检测|识别|清理|删除|举报|防护|机器人|bot)/i.test(scan)
-		|| /(?:反广告|反诈|反骗|防诈|防骗|谨防诈骗|举报广告|曝光骗子|验证机器人|验证bot)/i.test(scan);
+	const antiAdContext = adScanMatches(scanVariants, /(?:屏蔽|拦截|过滤|检测|识别|清理|删除|举报|反|防|禁)\s*(?:广告|推广|引流|垃圾消息|垃圾信息|spam)/i)
+		|| adScanMatches(scanVariants, /(?:广告|推广|引流|垃圾消息|垃圾信息|spam)\s*(?:屏蔽|拦截|过滤|检测|识别|清理|删除|举报|防护|机器人|bot)/i)
+		|| adScanMatches(scanVariants, /(?:反广告|反诈|反骗|防诈|防骗|谨防诈骗|举报广告|曝光骗子|验证机器人|验证bot)/i);
 	// 主动声明"拒绝私聊/广告骚扰"是正常用户的自我保护，不是招揽。
 	// 覆盖"拉黑/屏蔽/免打扰"等原词表缺失的表达（本次误杀卡写的是"私聊直接拉黑"）。
-	const refusalContext = /(?:拒绝|谢绝|禁止|请勿|勿|别|不要|不接|退订)(?:任何)?(?:广告|推广|引流|推销|私信|私聊|加好友|合作|接单|骚扰)/i.test(scan)
-		|| /(?:私聊|私信|广告|推销|推广|陌生人|骚扰)(?:的人)?.{0,10}(?:直接)?(?:拉黑|屏蔽|举报|删除|不回|免打扰|勿扰)/i.test(scan)
-		|| /(?:拉黑|屏蔽|免打扰|勿扰|不回)(?:所有|任何)?(?:私聊|私信|广告|推销|推广|骚扰)/i.test(scan);
-	const normalContext = hasExplicitNormalAdContext(scan) || antiAdContext || refusalContext;
+	const refusalContext = adScanMatches(scanVariants, /(?:拒绝|谢绝|禁止|请勿|勿|别|不要|不接|退订)(?:任何)?(?:广告|推广|引流|推销|私信|私聊|加好友|合作|接单|骚扰)/i)
+		|| adScanMatches(scanVariants, /(?:私聊|私信|广告|推销|推广|陌生人|骚扰)(?:的人)?.{0,10}(?:直接)?(?:拉黑|屏蔽|举报|删除|不回|免打扰|勿扰)/i)
+		|| adScanMatches(scanVariants, /(?:拉黑|屏蔽|免打扰|勿扰|不回)(?:所有|任何)?(?:私聊|私信|广告|推销|推广|骚扰)/i);
+	const normalContext = scanVariants.some((variant) => hasExplicitNormalAdContext(variant)) || antiAdContext || refusalContext;
 	if (normalContext) {
 		const label = antiAdContext ? '资料卡反广告/反诈语境保护' : '资料卡正常/否定语境保护';
 		return { isAd: false, hits: [label], strong: null, localIntent: false };
@@ -6111,19 +6178,19 @@ function detectProfileAdEvidence(identityText) {
 	const identityHits = detectIdentitySpam(scan);
 	const rawHighRiskHits = scoreHighRiskAdWords(scan);
 	const highRiskHits = rawHighRiskHits.map((hit) => `资料卡${hit}`);
-	const financeHits = AD_KEYWORDS_FINANCE.filter((word) => word && scan.includes(word));
+	const financeHits = AD_KEYWORDS_FINANCE.filter((word) => word && adScanIncludes(scanVariants, word));
 	const revenueHits = collectProfilePatternHits(
-		scan,
+		scanVariants,
 		/(?:日入|月入|佣金|返利|稳赚|躺赚|收益|一单|每单|高薪|兼职|赚钱|出u|接u|承兑|跑分|刷流水)/gi,
 		'资料卡收益/交易'
 	);
 	const businessHits = collectProfilePatternHits(
-		scan,
+		scanVariants,
 		/(?:出售|售卖|供应|承接|接单|代办|招募|招聘|诚招|招代理|代理加盟|合作代理|全套服务|内幕|精准计划|红单推荐)/gi,
 		'资料卡业务招揽'
 	);
 	const marketingHits = collectProfilePatternHits(
-		scan,
+		scanVariants,
 		/(?:分享群|交流群|资源群|公群|频道|客服|联系(?:我|客服)|私信(?:我|客服)|加(?:我|客服)|找(?:我|客服)|咨询(?:我|客服)|点击下方|扫码|进群|入口|免费(?:看|观看|领取)|完整版|内幕|精准)/gi,
 		'资料卡营销结构'
 	);
@@ -6136,14 +6203,14 @@ function detectProfileAdEvidence(identityText) {
 	const nonBotTelegramTargets = [...new Set(telegramTargets.filter((target) => !target.endsWith('bot')))];
 	const urls = collectUrls({ text: scan });
 	const nonWhitelistedUrls = urls.filter((url) => !allUrlsWhitelisted([url]));
-	const phoneOrSocialHandle = /(?:微信|微|vx|v信|qq)\s*[:：]?\s*[a-z0-9_-]{4,}|\+?\d[\d\s().-]{7,}\d/i.test(scan);
+	const phoneOrSocialHandle = adScanMatches(scanVariants, /(?:微信|微|vx|v信|qq)\s*[:：]?\s*[a-z0-9_-]{4,}|\+?\d[\d\s().-]{7,}\d/i);
 	const destinationHits = [
 		...nonBotMentions.map((value) => `资料卡联系账号:${value}`),
 		...nonBotTelegramTargets.map((value) => `资料卡Telegram入口:${value}`),
 		...nonWhitelistedUrls.slice(0, 3).map((value) => `资料卡外链:${String(value).slice(0, 50)}`),
 		...(phoneOrSocialHandle ? ['资料卡电话/社交账号'] : []),
 	];
-	const directSolicitation = /(?:联系|私信|私聊|加|添加|找|咨询)(?:我|本人|客服|商家|店主|老板|代理)/i.test(scan);
+	const directSolicitation = adScanMatches(scanVariants, /(?:联系|私信|私聊|加|添加|找|咨询)(?:我|本人|客服|商家|店主|老板|代理)/i);
 	const intent = analyzeQuotedHighRiskIntent(scan, [
 		...rawHighRiskHits,
 		...identityHits,
@@ -6156,7 +6223,7 @@ function detectProfileAdEvidence(identityText) {
 	// 只保留【广告服务本身】的标签词。原先含"频道主|资源主"——那是身份描述不是招揽，
 	// 正常频道主在简介里放自己频道链接会被判成广告(实测误杀)，故移除。
 	// 真正的频道主广告一定伴随 招商/合作/日入 等词，由其余分支覆盖。
-	const explicitAdLabel = /(?:广告|推广|引流|招商)/i.test(scan);
+	const explicitAdLabel = adScanMatches(scanVariants, /(?:广告|推广|引流|招商)/i);
 	// 收紧:仅"含广告字样 + 营销词"不足以定罪——描述自身功能(如"广告屏蔽测试客服机器人")
 	// 会同时命中两者却零引流意图。真广告必然给出可达的落地点(非 bot 账号/外链/电话)
 	// 或明确招揽动作，故此处与 structuredBusiness 对齐要求，纯 bot 提及不算落地点。
