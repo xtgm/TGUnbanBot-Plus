@@ -7351,6 +7351,76 @@ console.log('\n[94] 职业身份陈述豁免');
 	assert('职业身份:职业词+交易招揽仍全部查杀（含"代理"歧义词绕过）', wrongPass.length === 0, '漏杀:' + wrongPass.join(','));
 }
 
+// ---------- [95] 自助解封成功回执：主群联系按钮与四级降级 ----------
+// 原文案"请点击 {username} 返回群组"在私有群里会渲染成"请点击 -100xxx 返回群组"——
+// 纯文本点不动，且本项目解封走全群、封禁走全群，bot 无法知道用户原本在哪个群被封，
+// "返回某个群"本身语义就不对。改为：告知全部群组限制已解除 + 主群作为联系入口内联按钮。
+console.log('\n[95] 自助解封回执与主群联系按钮');
+{
+	const savedFetch = sandbox.fetch;
+	const mkFetch = (chatResult) => async (url) => {
+		if (String(url).includes('getChat')) {
+			return {
+				ok: true, status: 200,
+				async json() { return chatResult ? { ok: true, result: chatResult } : { ok: false, description: 'Bad Request' }; },
+			};
+		}
+		return { ok: true, status: 200, async json() { return { ok: true, result: true }; } };
+	};
+	const build = async (chatResult, envExtra = {}) => {
+		sandbox.fetch = mkFetch(chatResult);
+		sandbox.applyRuntimeConfig(sandbox.loadRequiredConfig({
+			TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002,-1003', ...envExtra,
+		}));
+		return sandbox.buildSelfUnbanApprovedReply();
+	};
+
+	// 链接优先级：公开群 username 胜过 invite_link；非 https://t.me/ 的链接一律丢弃
+	assert('解封回执:公开群优先用 username 链接',
+		sandbox.resolveChatInviteUrl({ username: 'pub', invite_link: 'https://t.me/+other' }) === 'https://t.me/pub');
+	assert('解封回执:私有群回退 getChat 返回的 invite_link',
+		sandbox.resolveChatInviteUrl({ invite_link: 'https://t.me/+AbCd' }) === 'https://t.me/+AbCd');
+	assert('解封回执:非 t.me 链接不采用',
+		sandbox.resolveChatInviteUrl({ invite_link: 'http://evil.example.com/x' }) === '');
+
+	const pub = await build({ username: 'mygroup', title: '我的主群' });
+	const pubBtn = pub.replyMarkup?.inline_keyboard?.[0]?.[0];
+	assert('解封回执:公开主群 → 按钮为 emoji+群名并指向 t.me 链接',
+		pubBtn?.text === '💬 我的主群' && pubBtn?.url === 'https://t.me/mygroup');
+	assert('解封回执:正文不出现 -100 裸 ID', !/-100\d/.test(pub.text));
+	assert('解封回执:群组数量占位符已替换', pub.text.includes('全部 3 个配置群组'));
+	assert('解封回执:保留结尾风险提示', pub.text.includes('请注意：解封后请遵守群规'));
+
+	const priv = await build({ title: '私密主群', invite_link: 'https://t.me/+XyZ123' });
+	assert('解封回执:私有主群 → 按钮用邀请链接',
+		priv.replyMarkup?.inline_keyboard?.[0]?.[0]?.url === 'https://t.me/+XyZ123');
+
+	const noLink = await build({ title: '无链接主群' });
+	assert('解封回执:拿不到链接 → 不附按钮且文案去掉"点击下方按钮"',
+		noLink.replyMarkup === null && !noLink.text.includes('点击下方按钮'));
+
+	const failed = await build(null);
+	assert('解封回执:getChat 失败 → 同样降级且不出现裸 ID',
+		failed.replyMarkup === null && !/-100\d/.test(failed.text));
+
+	// SELF_UNBAN_CONTACT_GROUP 校验
+	const pick = (envExtra) => sandbox.loadRequiredConfig({
+		TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002,-1003', ...envExtra,
+	}).SELF_UNBAN_CONTACT_GROUP;
+	assert('联系主群:未设置 → 回落 GROUP_IDS[0]', pick({}) === '-1001');
+	assert('联系主群:设为配置群内的 ID → 生效', pick({ SELF_UNBAN_CONTACT_GROUP: '-1003' }) === '-1003');
+	assert('联系主群:设为配置外的 ID → 忽略并回落主群', pick({ SELF_UNBAN_CONTACT_GROUP: '-1009' }) === '-1001');
+
+	// 旧自定义文案兼容
+	const legacy = await build({ username: 'mygroup', title: '我的主群' }, {
+		SELF_UNBAN_APPROVED: '✅ 已解封\n\n请点击 {username} 返回群组',
+	});
+	assert('解封回执:旧自定义文案 {username} 仍渲染为群名且照样附按钮',
+		legacy.text.includes('我的主群') && !legacy.text.includes('{username}') && Boolean(legacy.replyMarkup));
+
+	sandbox.fetch = savedFetch;
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);

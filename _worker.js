@@ -24,9 +24,37 @@ const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>{t
 	<code>{keyword}</code>`;
 
 // 3) 用户输入正确确认句、解封请求被同意时回复的提示。
-//    占位符：{username}（主群 @用户名 或主群 ID）。
+//    本项目解封走全群、封禁也走全群，bot 无法知道用户原本在哪个群被封，
+//    因此不再说"返回某个群"，而是告知"全部群组限制已解除"，并把主群定位为【联系管理员的入口】。
+//    占位符：
+//      {groupcount} → 配置群组数量（GROUP_IDS.length）
+//      {groupname}  → 联系主群名称（纯文本，按钮上会再显示一次，正文一般不用）
+//      {username}   → 兼容旧配置：等价于 {groupname}，老的自定义文案不会失效
+//    主群链接以 Telegram 内联按钮呈现（按钮文字 = 💬 + 群名），拿不到链接时按钮不出现并自动换用
+//    DEFAULT_SELF_UNBAN_APPROVED_NOLINK，避免出现"点击一个点不动的东西"。
 //    环境变量名：SELF_UNBAN_APPROVED
-const DEFAULT_SELF_UNBAN_APPROVED = `✅ 已同意给予解封\n\n请点击 {username} 返回群组\n\n⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`;
+const DEFAULT_SELF_UNBAN_APPROVED = `✅ 已同意给予解封
+
+📋 解封范围：全部 {groupcount} 个配置群组
+   您的封禁与禁言限制已全部解除，现在可以正常发言。
+
+💬 如有疑问，可点击下方按钮前往主群联系管理员。
+
+⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`;
+
+// 3.1) 拿不到主群链接时使用的降级文案（不含"点击下方按钮"字样，也不会附带按钮）。
+//    环境变量名：SELF_UNBAN_APPROVED_NOLINK
+const DEFAULT_SELF_UNBAN_APPROVED_NOLINK = `✅ 已同意给予解封
+
+📋 解封范围：全部 {groupcount} 个配置群组
+   您的封禁与禁言限制已全部解除，现在可以正常发言。
+
+💬 如有疑问，请前往主群联系管理员。
+
+⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`;
+
+// 3.2) 主群联系入口按钮的文字前缀（emoji）。按钮完整文字 = 该前缀 + 群名。
+const SELF_UNBAN_CONTACT_BUTTON_PREFIX = '💬 ';
 
 // 4) /blacklist 命令单次最多展示多少条（按时间倒序，最新在前）。
 //    环境变量名：BLACKLIST_PAGE_LIMIT （要求是正整数）
@@ -118,6 +146,12 @@ const DEFAULT_GKY_ACTIVE_CHECK = false;
 //    环境变量名:GKY_SYNC_BLACKLIST(默认 false)
 const DEFAULT_GKY_SYNC_BLACKLIST = false;
 
+// 10) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
+//    留空 → 用 GROUP_IDS[0]（主群），与原行为一致。
+//    填了但该群不在 GROUP_ID 配置里 → 忽略并回落主群 + 打日志，避免把用户导向 bot 管不到的群。
+//    环境变量名：SELF_UNBAN_CONTACT_GROUP
+const DEFAULT_SELF_UNBAN_CONTACT_GROUP = '';
+
 // =============================================================================
 // =结束= 普通使用者一般无需修改下方任何内容
 // =============================================================================
@@ -206,6 +240,8 @@ const AD_STOPWORDS = [
 let SELF_UNBAN_KEYWORD;
 let SELF_UNBAN_PROMPT;
 let SELF_UNBAN_APPROVED;
+let SELF_UNBAN_APPROVED_NOLINK;
+let SELF_UNBAN_CONTACT_GROUP;
 let BLACKLIST_PAGE_LIMIT;
 let BLACKLIST_REASON_LABELS;
 let GKY_BANLIST_ENDPOINT;
@@ -273,6 +309,8 @@ function applyRuntimeConfig(config) {
 	SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
 	SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
 	SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
+	SELF_UNBAN_APPROVED_NOLINK = config.SELF_UNBAN_APPROVED_NOLINK;
+	SELF_UNBAN_CONTACT_GROUP = config.SELF_UNBAN_CONTACT_GROUP;
 	BLACKLIST_PAGE_LIMIT = config.BLACKLIST_PAGE_LIMIT;
 	BLACKLIST_REASON_LABELS = config.BLACKLIST_REASON_LABELS;
 	GKY_BANLIST_ENDPOINT = config.GKY_BANLIST_ENDPOINT;
@@ -440,6 +478,19 @@ function loadRequiredConfig(env) {
 	const selfUnbanKeyword = pickStr(env.SELF_UNBAN_KEYWORD, DEFAULT_SELF_UNBAN_KEYWORD);
 	const selfUnbanPrompt = pickStr(env.SELF_UNBAN_PROMPT, DEFAULT_SELF_UNBAN_PROMPT);
 	const selfUnbanApproved = pickStr(env.SELF_UNBAN_APPROVED, DEFAULT_SELF_UNBAN_APPROVED);
+	const selfUnbanApprovedNoLink = pickStr(env.SELF_UNBAN_APPROVED_NOLINK, DEFAULT_SELF_UNBAN_APPROVED_NOLINK);
+	// 联系主群：留空用 GROUP_IDS[0]；填了但不在配置群列表里则忽略并回落主群（防止导向 bot 管不到的群）
+	let selfUnbanContactGroup = uniqueGroupIds[0];
+	const rawContactGroup = pickStr(env.SELF_UNBAN_CONTACT_GROUP, DEFAULT_SELF_UNBAN_CONTACT_GROUP).trim();
+	if (rawContactGroup) {
+		if (uniqueGroupIds.includes(rawContactGroup)) {
+			selfUnbanContactGroup = rawContactGroup;
+		} else {
+			console.error(
+				`SELF_UNBAN_CONTACT_GROUP=${rawContactGroup} 不在 GROUP_ID 配置列表中，已回落主群 ${uniqueGroupIds[0]}`
+			);
+		}
+	}
 
 	let blacklistPageLimit = DEFAULT_BLACKLIST_PAGE_LIMIT;
 	if (env.BLACKLIST_PAGE_LIMIT !== undefined && env.BLACKLIST_PAGE_LIMIT !== null && String(env.BLACKLIST_PAGE_LIMIT).trim() !== '') {
@@ -515,6 +566,8 @@ function loadRequiredConfig(env) {
 		SELF_UNBAN_KEYWORD: selfUnbanKeyword,
 		SELF_UNBAN_PROMPT: selfUnbanPrompt,
 		SELF_UNBAN_APPROVED: selfUnbanApproved,
+		SELF_UNBAN_APPROVED_NOLINK: selfUnbanApprovedNoLink,
+		SELF_UNBAN_CONTACT_GROUP: selfUnbanContactGroup,
 		BLACKLIST_PAGE_LIMIT: blacklistPageLimit,
 		BLACKLIST_REASON_LABELS: blacklistReasonLabels,
 		GKY_BANLIST_ENDPOINT: gkyEndpoint
@@ -9556,8 +9609,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env)) {
 			return;
 		}
-		const groupInfo = await getGroupInfo();
-		await sendTelegramMessage(chatId, SELF_UNBAN_APPROVED.replaceAll('{username}', groupInfo.username));
+		const approvedReply = await buildSelfUnbanApprovedReply();
+		await sendTelegramMessage(chatId, approvedReply.text, approvedReply.replyMarkup);
 
 		// 遍历所有配置群组，按用户在每个群的状态分别尝试解封/解禁
 		const perGroupResults = [];
@@ -9632,6 +9685,38 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			console.error('查询 GKY 封禁记录失败:', error);
 		}
 	}
+}
+
+// 构造自助解封成功回执：文案 + 主群联系入口按钮。
+// 主群（SELF_UNBAN_CONTACT_GROUP，默认 GROUP_IDS[0]）在本项目里是"回家的入口" ——
+// 解封走全群、封禁也走全群，bot 无法知道用户原本在哪个群被封，所以不说"返回某个群"，
+// 而是告知"全部群组限制已解除"，并给一个能联系到管理员的主群按钮。
+// 拿不到群链接时使用降级文案（无"点击下方按钮"字样）且不附按钮，绝不出现点不动的假链接。
+async function buildSelfUnbanApprovedReply() {
+	const contactGroupId = SELF_UNBAN_CONTACT_GROUP || GROUP_ID;
+	let title = '';
+	let link = '';
+	try {
+		const info = await getChatInfoFromId(contactGroupId);
+		title = String(info?.title || '').trim();
+		link = String(info?.link || '').trim();
+	} catch (error) {
+		console.error('[自助解封] 获取联系主群信息失败:', error?.message || error);
+	}
+	const groupCount = Array.isArray(GROUP_IDS) ? GROUP_IDS.length : 0;
+	const clickable = Boolean(link && title);
+	const template = clickable ? SELF_UNBAN_APPROVED : SELF_UNBAN_APPROVED_NOLINK;
+	const groupName = title || String(contactGroupId);
+	const text = String(template)
+		.replaceAll('{groupcount}', String(groupCount))
+		.replaceAll('{groupname}', groupName)
+		.replaceAll('{groupid}', String(contactGroupId))
+		// 兼容旧自定义文案里的 {username}：等价于 {groupname}，老配置不会失效
+		.replaceAll('{username}', groupName);
+	const replyMarkup = clickable
+		? { inline_keyboard: [[{ text: SELF_UNBAN_CONTACT_BUTTON_PREFIX + groupName, url: link }]] }
+		: null;
+	return { text, replyMarkup };
 }
 
 // 发送 Telegram 消息
@@ -10165,6 +10250,17 @@ async function getBotUsername() {
 }
 
 // 获取群组信息
+// 从 getChat 结果里解析出可点击的群链接。
+// 优先公开群用户名（永久稳定），其次 bot 为管理员时 getChat 直接返回的主邀请链接。
+// 刻意不调用 exportChatInviteLink —— 那会撤销并重建主邀请链接，导致群内所有人手上的旧链接失效。
+function resolveChatInviteUrl(chatResult) {
+	const username = String(chatResult?.username || '').trim();
+	if (username) return `https://t.me/${username}`;
+	const inviteLink = String(chatResult?.invite_link || '').trim();
+	if (/^https:\/\/t\.me\//i.test(inviteLink)) return inviteLink;
+	return '';
+}
+
 async function getGroupInfo() {
 	// 如果已经缓存，直接返回
 	if (GROUP_TITLE && GROUP_USERNAME) {
@@ -10347,6 +10443,10 @@ async function getChatInfoFromId(chatId) {
 			// 如果有用户名，构建链接
 			if (username) {
 				info.link = `https://t.me/${username}`;
+			} else {
+				// 私有群没有 username，但 bot 是管理员时 getChat 会直接返回主邀请链接。
+				const inviteUrl = resolveChatInviteUrl(result.result);
+				if (inviteUrl) info.link = inviteUrl;
 			}
 
 			return info;
