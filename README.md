@@ -188,6 +188,10 @@
 
 > **配置优先级**：环境变量 > `_worker.js` 顶部 `=可修改=` 区段的硬编码默认值。
 > 也就是说，你既可以直接改源码顶部默认值，也可以在 Cloudflare 后台填环境变量临时覆盖；两者同时存在时**环境变量胜出**。
+>
+> 📌 **只想快速跑起来？** 本章是完整参数字典（逐项详细说明）。想要**照抄就能用的填写示例**，直接看 [部署 → 5. 设置环境变量](#5-设置环境变量)，那里按「最小配置 / 推荐 / 可选」分档给了具体示例值和取值来源。
+>
+> ⚡ **主群怎么定？** 主群 = `GROUP_ID` 的**第一个**群，固定规则，无需单独配置。二次审核提醒、解封联系入口默认都指向它。
 
 ### 必填（缺失会返回 500）
 
@@ -297,21 +301,130 @@ wrangler queues create tg-unban-bot-plus-bulk
 
 ### 5. 设置环境变量
 
+#### 5.1 最小可用配置（3 个必填项）
+
+只填这三个就能跑起来。**在 Cloudflare Dashboard → 你的 Worker → 设置 → 变量和机密 → 添加**，或用命令行：
+
 ```bash
-wrangler secret put TOKEN
-wrangler secret put BOT_TOKEN
-wrangler secret put GROUP_ID
-wrangler secret put SUPER_ADMINS    # 可选
-# 以下全部可选；不填则使用 _worker.js 顶部 =可修改= 区段的默认值
-# wrangler secret put SELF_UNBAN_KEYWORD
-# wrangler secret put SELF_UNBAN_PROMPT
-# wrangler secret put SELF_UNBAN_APPROVED
-# wrangler secret put BLACKLIST_PAGE_LIMIT
-# wrangler secret put BLACKLIST_REASON_LABELS
-# wrangler secret put GKY_BANLIST_ENDPOINT
+wrangler secret put TOKEN        # 输入：一串你自己定的随机字符串，用作 HTTP 接口密码
+wrangler secret put BOT_TOKEN    # 输入：BotFather 给的 token
+wrangler secret put GROUP_ID     # 输入：-1001234567890
 ```
 
-也可以在 Cloudflare Dashboard 的 Worker 设置页中添加同名变量。
+具体填什么值：
+
+| 变量 | 填什么 | 示例值 | 从哪来 |
+| --- | --- | --- | --- |
+| `TOKEN` | 你自己编的随机字符串（当 HTTP 接口密码用，越长越好） | `k7Xm9pQ2vR8nL4wZ` | 自己想一个，或用密码生成器 |
+| `BOT_TOKEN` | Telegram Bot Token | `7123456789:AAH1x-yZabcdefGHIJklmnOPqrsTUVwxyz` | Telegram 找 [@BotFather](https://t.me/BotFather) → `/newbot` |
+| `GROUP_ID` | 群组 ID，**多个用逗号分隔**，**第一个是主群** | 单群：`-1001234567890`<br>多群：`-1001234567890,-1009876543210` | 见下方「怎么拿群组 ID」 |
+
+> **怎么拿群组 ID**：把 bot 拉进群并设为管理员，群里随便发一句话，然后打开 Cloudflare Workers Logs，日志里会打印 `聊天ID: -100xxxxxxxxxx`。也可以把 [@getidsbot](https://t.me/getidsbot) 拉进群用 `/id`。**超级群组 ID 一定是 `-100` 开头**。
+
+#### 5.2 推荐加上（强烈建议）
+
+| 变量 | 填什么 | 示例值 | 不填的后果 |
+| --- | --- | --- | --- |
+| `OWNER_IDS` | 你自己的 TGID。**第一个是主人**，后面是副主人，逗号分隔 | 单人：`123456789`<br>多人：`123456789,987654321` | 收不到任何私聊通知，所有隐藏指令（`/addgroup` `/learn` `/addword` 等）全部不可用 |
+
+> **怎么拿自己的 TGID**：私聊 [@userinfobot](https://t.me/userinfobot) 发任意消息，它会回你的 ID。
+> **必须先私聊过 bot 一次**（发个 `/start`），否则 bot 无法给你发私信，通知会投递失败。
+
+#### 5.3 广告检测（可选，默认全关）
+
+**新部署建议先这样填，观察一周再调**：
+
+| 变量 | 建议值 | 说明 |
+| --- | --- | --- |
+| `AD_FILTER_ENABLED` | `true` | 开启广告自动检测。**不填 = 关闭**，广告功能完全不工作 |
+| `AD_STRICT_MODE` | `true` | **强烈建议开**。关闭正文加权评分，只留高精度强特征，误杀趋近于零。实测关掉它会误杀聊 `usdt/搬砖/套利` 的正常用户 |
+| `GKY_ACTIVE_CHECK` | `true` | 新成员进群时查一次杀神全局封禁库，白嫖跨群信誉数据 |
+| `GKY_SYNC_BLACKLIST` | **不填**（默认 `false`） | 保持默认。杀神命中不写你的 D1 黑名单，避免第三方误标变成你这边的永久封禁 |
+
+填写方式一律是字符串 `true` / `false`（小写）。
+
+#### 5.4 自助解封文案与主群（可选）
+
+| 变量 | 填什么 | 示例值 | 不填的后果 |
+| --- | --- | --- | --- |
+| `SELF_UNBAN_CONTACT_GROUP` | 解封成功后「联系管理员」按钮指向哪个群。**必须是 `GROUP_ID` 里已有的群** | `-1001234567890` | 用 `GROUP_ID` 的**第一个群**（即主群），大多数人不需要填 |
+| `SELF_UNBAN_KEYWORD` | 用户必须逐字粘贴的确认句 | `我不是广告狗，我是误封的，希望可以解封。` | 用内置默认句 |
+| `SELF_UNBAN_APPROVED` | 解封成功文案（**能拿到群链接时用**） | 见 5.6 完整示例 | 用内置默认文案 |
+| `SELF_UNBAN_APPROVED_NOLINK` | 解封成功文案（**拿不到群链接时的降级版**） | 见 5.6 完整示例 | 用内置默认文案 |
+
+> **主群怎么设？** 主群 = `GROUP_ID` 的**第一个**群，这是固定规则，不需要单独配置。
+> `SELF_UNBAN_CONTACT_GROUP` 只在你希望「联系入口」指向**非第一个**群时才需要填。
+> 例：`GROUP_ID = -1001111,-1002222`，主群是 `-1001111`；若你想让解封用户去 `-1002222` 找你，就填 `SELF_UNBAN_CONTACT_GROUP = -1002222`。
+
+#### 5.5 其它可选项
+
+| 变量 | 示例值 | 说明 |
+| --- | --- | --- |
+| `SUPER_ADMINS` | `123456789,987654321` | 超级管理员 TGID，逗号分隔。可跨群使用管理命令 |
+| `BLACKLIST_PAGE_LIMIT` | `30` | `/blacklist` 单次展示条数，正整数 |
+| `MSG_CACHE_SIZE` | `50`（多群建议 `200`） | 疑似广告消息缓存条数，1~500 |
+| `AD_KEYWORDS` | `赌场,套利,刷单` | 追加自定义广告词，逗号分隔 |
+| `AD_WHITELIST` | `usdt,搬砖` | 白名单词（币圈群可把 `usdt` 加进来），命中不计分 |
+| `AD_SCORE_THRESHOLD` | `3` | 评分阈值。**开了 `AD_STRICT_MODE` 时此项不生效** |
+| `BLACKLIST_REASON_LABELS` | `{"spam":"群内举报"}` | JSON 字符串，自定义原因中文映射 |
+| `GKY_BANLIST_ENDPOINT` | `https://gkybot.gmeow.cc/banlist` | GKY 查询后端，一般不改 |
+
+#### 5.6 完整配置示例（可直接照抄改值）
+
+假设你有两个群、TGID 是 `123456789`：
+
+```
+TOKEN                    = k7Xm9pQ2vR8nL4wZ
+BOT_TOKEN                = 7123456789:AAH1x-yZabcdefGHIJklmnOPqrsTUVwxyz
+GROUP_ID                 = -1001234567890,-1009876543210
+OWNER_IDS                = 123456789
+AD_FILTER_ENABLED        = true
+AD_STRICT_MODE           = true
+GKY_ACTIVE_CHECK         = true
+MSG_CACHE_SIZE           = 200
+```
+
+这套配置的效果：`-1001234567890` 是主群；你是主人，收全部通知；广告检测开启且用严格模式（误杀趋近于零）；新成员进群查杀神库但不并入你的黑名单。
+
+**自定义解封文案示例**（如果你想改文案，两个都要填，占位符可用 `{groupcount}` `{groupname}` `{groupid}`）：
+
+```
+SELF_UNBAN_APPROVED = ✅ 已同意给予解封
+
+📋 解封范围：全部 {groupcount} 个配置群组
+   您的封禁与禁言限制已全部解除，现在可以正常发言。
+
+💬 如有疑问，可点击下方按钮前往主群联系管理员。
+
+⚠️ 请注意：解封后请遵守群规，避免再次被封禁。
+```
+
+```
+SELF_UNBAN_APPROVED_NOLINK = ✅ 已同意给予解封
+
+📋 解封范围：全部 {groupcount} 个配置群组
+   您的封禁与禁言限制已全部解除，现在可以正常发言。
+
+💬 如有疑问，请前往主群联系管理员。
+
+⚠️ 请注意：解封后请遵守群规，避免再次被封禁。
+```
+
+> 两者的差别只有一句：有链接时说「可点击下方按钮」并附群名按钮，没链接时说「请前往主群」且不附按钮 —— 避免出现「点击一个点不动的东西」。
+> **只想改文案的话，填 `SELF_UNBAN_APPROVED` 一个就够了**，另一个是兜底，公开群基本用不到。
+
+#### 5.7 老部署升级需要做什么
+
+| 项目 | 要不要动 |
+| --- | --- |
+| D1 表结构 | ❌ **不用**。代码自动迁移（schema v4→v5，只新建 `dynamic_groups` 表，不碰现有数据） |
+| 已有环境变量 | ❌ **不用改**。全部向后兼容，旧的 `SELF_UNBAN_APPROVED` 里的 `{username}` 继续有效 |
+| 新增变量 | ⭕ **可选**。都不填就用内置默认，行为与升级前一致 |
+| 部署 | ✅ 只需 `wrangler deploy` 一次 |
+
+升级后验证：私聊 bot 发 `/listgroups`，能返回群组列表说明新表已建好。
+
+也可以在 Cloudflare Dashboard 的 Worker 设置页中添加同名变量（改完**不需要**重新部署，新请求立即读到新值）。
 
 ### 6. 部署 Worker
 
