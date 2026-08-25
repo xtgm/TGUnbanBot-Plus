@@ -106,6 +106,18 @@ const DEFAULT_AD_STRICT_MODE = false;
 //    环境变量名:GKY_ACTIVE_CHECK(默认 false,需显式开)
 const DEFAULT_GKY_ACTIVE_CHECK = false;
 
+// 9.3) 杀神命中是否写入【本项目 D1 黑名单】。默认 false —— 两套库必须分开。
+//    杀神全局库是第三方的跨群信誉数据,不是本项目的封禁决定:
+//      * 命中仍然照常处置(删消息 + 全群封禁/预封),保护群不受影响;
+//      * 但【不写】D1 黑名单 —— D1 的唯一来源仍是真人 /ban、/spam、/ad 投票。
+//    为什么必须分开:
+//      ① 第三方误标会直接变成你这边的永久黑名单,且用户无法自助解封;
+//      ② D1 有记录 → 用户复入群时又触发一次"复入群拦截"通知,与杀神处置通知重复轰炸主人;
+//      ③ 杀神那边撤销标记后,你的 D1 记录不会跟着撤销,污染无法自动回收。
+//    仍想把杀神结果并入自己黑名单的,显式设 GKY_SYNC_BLACKLIST=true。
+//    环境变量名:GKY_SYNC_BLACKLIST(默认 false)
+const DEFAULT_GKY_SYNC_BLACKLIST = false;
+
 // =============================================================================
 // =结束= 普通使用者一般无需修改下方任何内容
 // =============================================================================
@@ -214,6 +226,7 @@ let AD_FILTER_ENABLED = false;
 let AD_SCORE_THRESHOLD = 3;
 let AD_STRICT_MODE = false;      // 严格模式:关闭正文加权评分,只留强特征(A 开关)
 let GKY_ACTIVE_CHECK = false;    // 新成员进群主动查杀神全局库(B 方案)
+let GKY_SYNC_BLACKLIST = false;  // 杀神命中是否写入本项目 D1 黑名单(默认不写,两套库分开)
 let AD_KEYWORDS = [];          // 环境变量追加的自定义广告词
 let AD_WHITELIST = [];         // 白名单词(命中不计分)
 let AD_KEYWORDS_FINANCE = [];
@@ -248,6 +261,7 @@ function applyRuntimeConfig(config) {
 	AD_SCORE_THRESHOLD = config.AD_SCORE_THRESHOLD;
 	AD_STRICT_MODE = config.AD_STRICT_MODE;
 	GKY_ACTIVE_CHECK = config.GKY_ACTIVE_CHECK;
+	GKY_SYNC_BLACKLIST = config.GKY_SYNC_BLACKLIST;
 	AD_KEYWORDS = config.AD_KEYWORDS;
 	AD_WHITELIST = config.AD_WHITELIST;
 	AD_KEYWORDS_FINANCE = config.AD_KEYWORDS_FINANCE;
@@ -460,6 +474,7 @@ function loadRequiredConfig(env) {
 	const adFilterEnabled = parseBool(env.AD_FILTER_ENABLED, DEFAULT_AD_FILTER_ENABLED);
 	const adStrictMode = parseBool(env.AD_STRICT_MODE, DEFAULT_AD_STRICT_MODE);
 	const gkyActiveCheck = parseBool(env.GKY_ACTIVE_CHECK, DEFAULT_GKY_ACTIVE_CHECK);
+	const gkySyncBlacklist = parseBool(env.GKY_SYNC_BLACKLIST, DEFAULT_GKY_SYNC_BLACKLIST);
 	let adScoreThreshold = DEFAULT_AD_SCORE_THRESHOLD;
 	if (env.AD_SCORE_THRESHOLD !== undefined && env.AD_SCORE_THRESHOLD !== null && String(env.AD_SCORE_THRESHOLD).trim() !== '') {
 		const n = parseInt(String(env.AD_SCORE_THRESHOLD).trim(), 10);
@@ -488,6 +503,7 @@ function loadRequiredConfig(env) {
 		AD_SCORE_THRESHOLD: adScoreThreshold,
 		AD_STRICT_MODE: adStrictMode,
 		GKY_ACTIVE_CHECK: gkyActiveCheck,
+		GKY_SYNC_BLACKLIST: gkySyncBlacklist,
 		AD_KEYWORDS: adKeywords,
 		AD_WHITELIST: adWhitelist,
 		AD_KEYWORDS_FINANCE: lower(DEFAULT_AD_KEYWORDS_FINANCE),
@@ -4329,8 +4345,19 @@ async function checkGkyGlobalBanAndPunish(userId, chat, env, ctx, options = {}) 
 		if (options.messageId && chat?.id != null) {
 			await deleteMessage(chat.id, options.messageId);
 		}
-		// 加黑(全局,永久) + 全群踢/预封
-		await addToBlacklist(userIdStr, env, { reason: 'gky_global', by: 'system', note: `杀神全局库命中${data.reason ? ':' + data.reason : ''}` });
+		// 杀神库与本项目 D1 黑名单是两套独立状态,默认【不合并】:
+		//   命中仍照常全群封禁/预封(保护群),但不写 D1 —— D1 的唯一来源仍是真人 /ban /spam /ad 投票。
+		//   第三方误标不会变成本项目的永久黑名单,也不会再触发"复入群拦截"重复通知。
+		//   显式设 GKY_SYNC_BLACKLIST=true 才并入 D1。
+		let syncedToBlacklist = false;
+		if (GKY_SYNC_BLACKLIST) {
+			const addResult = await addToBlacklist(userIdStr, env, {
+				reason: 'gky_global',
+				by: 'system',
+				note: `杀神全局库命中${data.reason ? ':' + data.reason : ''}`,
+			});
+			syncedToBlacklist = addResult?.success === true || addResult?.code === 'EXISTS';
+		}
 		const banResults = await banUserFromAllGroups(userIdStr);
 		// 通知主人
 		if (OWNER_IDS.length) {
@@ -4338,11 +4365,16 @@ async function checkGkyGlobalBanAndPunish(userId, chat, env, ctx, options = {}) 
 			const target = options.user
 				? (formatUserMention(options.user) || `<code>${escapeHtml(userIdStr)}</code>`)
 				: `<code>${escapeHtml(userIdStr)}</code>`;
+			const blacklistLine = GKY_SYNC_BLACKLIST
+				? `🚫 已加黑(gky_global) + 全群封禁 ${okCount}/${banResults.length}`
+				: `🚫 全群封禁/预封 ${okCount}/${banResults.length}\n`
+					+ `📂 未写入本地 D1 黑名单(杀神库独立记账)\n`
+					+ `ℹ️ 如确认是广告号需永久加黑,请手动 <code>/ban ${escapeHtml(userIdStr)}</code>`;
 			const auditText = `🌐 <b>杀神全局库命中处置</b>\n` +
 				`🎬 触发:${escapeHtml(options.trigger || '新成员进群')}\n` +
 				`🎯 用户:${target}\n` +
 				`📋 全局库原因:${escapeHtml(String(data.reason || '未提供'))}\n` +
-				`🚫 已加黑(gky_global) + 全群封禁 ${okCount}/${banResults.length}`;
+				blacklistLine;
 			await notifyAllOwners(auditText, null);
 		}
 		return true;

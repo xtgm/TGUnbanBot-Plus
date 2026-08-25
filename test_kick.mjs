@@ -7202,6 +7202,56 @@ console.log('\n[90] 资料卡判定回归（误杀防护 + 真广告必杀）');
 	assert('资料卡：真广告(含"代理"歧义词绕过)仍全部查杀', wrongPass.length === 0, '漏杀:' + wrongPass.join(','));
 }
 
+// ---------- [91] 杀神全局库与本地 D1 黑名单分离记账 ----------
+// 用户反馈：杀神命中的号会自动进入本项目 D1 黑名单，导致 ① 第三方误标变成本地永久
+// 黑名单且用户无法自助解封；② D1 有记录后复入群又触发"复入群拦截"通知，与杀神处置
+// 通知重复轰炸主人。现默认不写 D1（仍照常全群封禁），GKY_SYNC_BLACKLIST=true 才并入。
+console.log('\n[91] 杀神全局库与 D1 黑名单分离');
+{
+	const GKY_HTML = '<strong>TGID:</strong> 77001<br><strong>ChatID:</strong> -1001<br><strong>Reason:</strong> 违规图片<br>';
+	const gkyFetch = () => async function (url, init) {
+		const u = String(url);
+		if (u.includes('api.telegram.org')) {
+			const method = u.split('/').pop();
+			const body = init?.body ? JSON.parse(init.body) : null;
+			apiCalls.push({ method, body });
+			if (method === 'getChatAdministrators') return { ok: true, status: 200, async json() { return { ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }; } };
+			if (method === 'getChat') return { ok: true, status: 200, async json() { return { ok: true, result: { id: Number(body?.chat_id), title: '测试群', type: 'supergroup' } }; } };
+			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
+		}
+		if (u.includes('banlist')) return { ok: true, status: 200, async text() { return GKY_HTML; } };
+		throw new Error('Unexpected fetch: ' + u);
+	};
+	const joinUpdate = () => ({
+		message: {
+			message_id: 7701,
+			chat: { id: -1001, type: 'supergroup', title: '测试群' },
+			from: { id: 77001, is_bot: false, first_name: 'newcomer' },
+			new_chat_members: [{ id: 77001, is_bot: false, first_name: 'newcomer' }],
+		},
+	});
+
+	// 默认（未设 GKY_SYNC_BLACKLIST）：照常封禁，但不写 D1
+	resetCalls();
+	sandbox.fetch = gkyFetch();
+	let db = makeFakeDB([]);
+	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', GKY_ACTIVE_CHECK: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(joinUpdate()) }), env, fakeCtxAd);
+	const bannedDefault = apiCalls.filter((c) => c.method === 'banChatMember' && String(c.body?.user_id) === '77001').length;
+	const ownerNoteDefault = apiCalls.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === '999').map((c) => c.body.text).join('\n');
+	assert('杀神命中：默认仍全群封禁/预封', bannedDefault >= 1);
+	assert('杀神命中：默认不写入本地 D1 黑名单', !db._rows.has('77001'));
+	assert('杀神命中：通知说明未写入 D1 并给出手动加黑指引', /未写入本地 D1 黑名单/.test(ownerNoteDefault) && /\/ban 77001/.test(ownerNoteDefault));
+
+	// 显式开启 GKY_SYNC_BLACKLIST=true：恢复并入 D1 的旧行为
+	resetCalls();
+	sandbox.fetch = gkyFetch();
+	db = makeFakeDB([]);
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', GKY_ACTIVE_CHECK: 'true', GKY_SYNC_BLACKLIST: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(joinUpdate()) }), env, fakeCtxAd);
+	assert('杀神命中：GKY_SYNC_BLACKLIST=true 时写入 D1 且 reason=gky_global', db._rows.get('77001')?.reason === 'gky_global');
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);
