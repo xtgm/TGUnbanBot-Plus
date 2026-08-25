@@ -7291,6 +7291,66 @@ console.log('\n[92] 反混淆扫描（插隔符绕过防护）');
 		fp('广​告​位​招​租') === fp('广告位招租'));
 }
 
+// ---------- [93] 投票通过后被举报人昵称脱敏 ----------
+// 广告号的昵称本身常就是广告（"广告位招租 @xxx"），投票通过后原样展示等于借 bot 的
+// 投票卡片把广告再广播一次。通过后脱敏为"首字***尾字"；进行中/否决/到期仍显示全名，
+// 因为群成员必须看清目标才能判断怎么投。
+console.log('\n[93] 投票通过后昵称脱敏');
+{
+	const mask = sandbox.maskAdVoteDisplayName;
+	assert('脱敏:多字符取首尾', mask('广告位招租') === '广***租');
+	assert('脱敏:单字符整体隐藏', mask('A') === '***');
+	assert('脱敏:空值返回空串', mask('') === '' && mask(null) === '' && mask(undefined) === '');
+
+	const snapshot = { id: '5768851426', firstName: '广告位招租', lastName: '@adseller123', username: 'adseller', isBot: false };
+	const baseState = {
+		voteToken: 'tk_mask', chatId: '-1001', targetUserId: '5768851426', creatorUserId: '999',
+		targetUserSnapshot: snapshot, creatorUserSnapshot: { id: '999', firstName: '主人', isBot: false },
+		approvers: [], rejecters: [], threshold: 6, createdAt: 1, deadlineAt: 2,
+	};
+	const targetLine = (extra) => {
+		const state = sandbox.normalizeAdVoteState({ ...baseState, ...extra });
+		return sandbox.buildAdVoteMessageText(state).split('\n').find((line) => line.includes('被举报人')) || '';
+	};
+	assert('脱敏:投票通过 → 昵称脱敏且保留 TGID 与可点击链接',
+		targetLine({ finalized: true, result: 'approved' }).includes('广***3')
+		&& targetLine({ finalized: true, result: 'approved' }).includes('tg://user?id=5768851426')
+		&& !targetLine({ finalized: true, result: 'approved' }).includes('广告位招租'));
+	assert('脱敏:进行中 → 显示完整昵称', targetLine({ finalized: false, result: null }).includes('广告位招租'));
+	assert('脱敏:被否决 → 显示完整昵称', targetLine({ finalized: true, result: 'rejected' }).includes('广告位招租'));
+	assert('脱敏:已到期 → 显示完整昵称', targetLine({ finalized: true, result: 'expired' }).includes('广告位招租'));
+}
+
+// ---------- [94] 职业身份陈述豁免 + "代理"歧义词二次收窄 ----------
+// 借鉴 AI 版 prompt 约束"不得依据身份/职业等正常信息判定违规"。资料卡写"客服/运营/
+// 博主/自由职业"是在介绍自己是谁，但这些词恰好落在 marketing/business 词表里。
+// 仅当【职业身份句式】且【无任何交易招揽信号】时豁免；一旦出现收益/招募/落地点即不豁免。
+console.log('\n[94] 职业身份陈述豁免');
+{
+	const probe = sandbox.detectProfileAdEvidence;
+	const mustPass = {
+		'在职客服': '在职客服 上班摸鱼 @somebot',
+		'公司客服': '公司客服 工作时间9-18点 频道公告 t.me/notice',
+		'自由职业': '自由职业 接单设计 有需要私信',
+		'程序员': '程序员 | github.com/someone',
+		'摄影师': '摄影师 约拍请私信 @photo',
+		'机场主技术': '自建机场 代理节点 socks5 vless 交流群 t.me/airportch',
+		'搭代理教程': '分享搭代理教程 用代理科学上网 t.me/tutorial',
+		'订阅转换开发': 'subconverter 二次开发 有问题找客服 @subbot',
+	};
+	const mustKill = {
+		'客服+日结佣金': '专业客服外包 日结佣金 招代理 联系我 @kefu888',
+		'博主+推广报价': '美食博主 广告推广报价私聊 承接投放 @blogger666',
+		'运营+诚招代理(无"广告"字样)': '运营团队 诚招代理加盟 日入过千 详询 @yunying001',
+		'设计师+全套服务': '设计师 全套服务 保真无风险 加微信 vx123456',
+		'客服+招代理': '客服团队 招代理 佣金日结 @kf001',
+	};
+	const wrongKill = Object.entries(mustPass).filter(([, t]) => probe(t).isAd === true).map(([k]) => k);
+	const wrongPass = Object.entries(mustKill).filter(([, t]) => probe(t).isAd !== true).map(([k]) => k);
+	assert('职业身份:纯身份陈述与代理技术讨论一律放行', wrongKill.length === 0, '误杀:' + wrongKill.join(','));
+	assert('职业身份:职业词+交易招揽仍全部查杀（含"代理"歧义词绕过）', wrongPass.length === 0, '漏杀:' + wrongPass.join(','));
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);

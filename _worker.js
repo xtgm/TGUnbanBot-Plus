@@ -6151,11 +6151,18 @@ function detectProfileAdEvidence(identityText) {
 	// 资料卡也遵守代理内容绝对豁免；技术协议、客户端和订阅信息不能成为广告证据。
 	// 例外(仅资料卡):PROXY_CONTENT_PATTERNS 含裸词"代理/订阅/节点"，是技术与广告的歧义词
 	// ——技术语境指网络代理，广告语境指"招代理/代理加盟"。广告号只要写"代理"就能拿到
-	// 永久免疫(实测"专业推广引流 招代理加盟 佣金日结"被整条豁免)。因此当资料卡同时出现
-	// 【广告服务标签】与【商业招揽动作】时不再豁免；纯技术代理讨论不含这两者，仍完全豁免。
+	// 永久免疫(实测"专业推广引流 招代理加盟 佣金日结"被整条豁免)。因此下列两种情形不再豁免；
+	// 纯技术代理讨论不含这些结构，仍完全豁免。
 	const adServiceSolicitation = adScanMatches(scanVariants, /(?:广告|推广|引流|招商)/i)
 		&& adScanMatches(scanVariants, /(?:招|承接|出售|售卖|代发|投放|加盟|佣金|返利|日入|月入|日结|结算|接单)/i);
-	if (!adServiceSolicitation && isProxyRelatedMessage({ text: scan })) {
+	// 情形二:"代理"以【商业代理招募】句式出现(招代理/诚招代理/代理加盟/代理分成…)。
+	// 这类文本可能完全不含"广告/推广"字样(如"运营团队 诚招代理加盟 日入过千")，
+	// 上面那条判不出来，但它显然不是网络代理讨论。技术语境说的是"用代理/搭代理/代理节点"，
+	// 不会说"招代理""代理加盟""代理佣金"。
+	const agentRecruitment = adScanMatches(scanVariants, /(?:招|收|诚招|招募|寻|找)\s*(?:各级|一级|二级|总)?代理/i)
+		|| adScanMatches(scanVariants, /代理\s*(?:加盟|入驻|分成|佣金|返点|返利|日结|月结|合作(?:伙伴)?)/i)
+		|| adScanMatches(scanVariants, /(?:一手|全国|长期)\s*代理(?:商)?/i);
+	if (!adServiceSolicitation && !agentRecruitment && isProxyRelatedMessage({ text: scan })) {
 		return { isAd: false, hits: ['资料卡代理内容绝对豁免'], strong: null, localIntent: false };
 	}
 	// 反广告/反诈工具与声明的语义方向与广告相反，必须在评分前整条豁免。
@@ -6169,9 +6176,28 @@ function detectProfileAdEvidence(identityText) {
 	const refusalContext = adScanMatches(scanVariants, /(?:拒绝|谢绝|禁止|请勿|勿|别|不要|不接|退订)(?:任何)?(?:广告|推广|引流|推销|私信|私聊|加好友|合作|接单|骚扰)/i)
 		|| adScanMatches(scanVariants, /(?:私聊|私信|广告|推销|推广|陌生人|骚扰)(?:的人)?.{0,10}(?:直接)?(?:拉黑|屏蔽|举报|删除|不回|免打扰|勿扰)/i)
 		|| adScanMatches(scanVariants, /(?:拉黑|屏蔽|免打扰|勿扰|不回)(?:所有|任何)?(?:私聊|私信|广告|推销|推广|骚扰)/i);
-	const normalContext = scanVariants.some((variant) => hasExplicitNormalAdContext(variant)) || antiAdContext || refusalContext;
+	// 身份/职业陈述不是招揽。资料卡写"客服""运营""博主""自由职业"是在介绍自己是谁，
+	// 而不是在推销什么 —— 但这些词恰好落在 marketingHits/businessHits 的词表里
+	// （"客服""接单""合作"），单靠词表无法区分。此处显式豁免"纯身份陈述"：
+	// 只有当这些词以【职业身份句式】出现、且资料卡内没有任何交易招揽信号时才豁免；
+	// 一旦同时出现收益/价格/招募/落地点，说明不是自我介绍而是揽客，不豁免。
+	const occupationStatement = adScanMatches(
+		scanVariants,
+		/(?:^|[\s|、,，/·\-—(（【[])(?:在职|前|资深|公司|企业|专职|全职|兼任)?(?:客服|运营|销售|市场|公关|编辑|记者|博主|up主|自由职业|设计师|程序员|开发者|工程师|运维|站长|作者|译者|摄影师|讲师|老师|学生|研究员|分析师)(?:$|[\s|、,，/·\-—)）】\]])/i,
+	);
+	const solicitationSignal = adScanMatches(
+		scanVariants,
+		/(?:日入|月入|佣金|返利|稳赚|躺赚|一单|每单|日结|结算|报价|价格|费用|优惠|招募|招聘|诚招|招代理|代理加盟|加盟|代发|投放|承接|出售|售卖|供应|包过|保真|无风险|上门服务|全套服务)/i,
+	);
+	const occupationOnlyContext = occupationStatement && !solicitationSignal;
+	const normalContext = scanVariants.some((variant) => hasExplicitNormalAdContext(variant))
+		|| antiAdContext
+		|| refusalContext
+		|| occupationOnlyContext;
 	if (normalContext) {
-		const label = antiAdContext ? '资料卡反广告/反诈语境保护' : '资料卡正常/否定语境保护';
+		const label = antiAdContext
+			? '资料卡反广告/反诈语境保护'
+			: (occupationOnlyContext ? '资料卡职业身份陈述保护' : '资料卡正常/否定语境保护');
 		return { isAd: false, hits: [label], strong: null, localIntent: false };
 	}
 
@@ -7050,12 +7076,40 @@ function adVoteSnapshotToUser(snapshot) {
 	};
 }
 
+// 把显示名脱敏成"首字***尾字"。单字符无首尾之分，整体隐藏最安全。
+// 用途：投票通过、确认目标是广告号之后，其昵称本身很可能就是广告
+// （如"广告位招租 @xxx"），原样显示等于借 bot 的投票卡片把广告又广播一次。
+function maskAdVoteDisplayName(name) {
+	const chars = Array.from(String(name ?? ''));
+	if (chars.length === 0) return '';
+	if (chars.length === 1) return '***';
+	return chars[0] + '***' + chars[chars.length - 1];
+}
+
 function formatAdVoteUser(snapshot, fallbackId = '') {
 	if (snapshot?.anonymous) return '<b>匿名管理员</b>';
 	const user = adVoteSnapshotToUser(snapshot);
 	if (user) return formatUserMention(user) || '<code>' + escapeHtml(String(user.id)) + '</code>';
 	const id = String(snapshot?.id || fallbackId || '未知');
 	return '<a href="tg://user?id=' + escapeHtml(id) + '">' + escapeHtml(id) + '</a>';
+}
+
+// 被举报人显示文本。
+// mask=false：显示完整名称 —— 投票进行中群成员必须看清目标才能判断怎么投；被否决时也应还原。
+// mask=true ：仅在"投票通过"后启用，昵称脱敏防广告二次传播。
+//             脱敏后仍保留 tg://user 链接，管理员照样可点进去核对。
+function formatAdVoteTarget(snapshot, fallbackId = '', mask = false) {
+	if (!mask) return formatAdVoteUser(snapshot, fallbackId);
+	if (snapshot?.anonymous) return '<b>匿名管理员</b>';
+	const id = String(snapshot?.id || fallbackId || '');
+	const displayName = [snapshot?.firstName, snapshot?.lastName].filter(Boolean).join(' ')
+		|| snapshot?.username
+		|| '';
+	// 没有显示名时回退 TGID：纯数字不含广告内容，无需脱敏。
+	if (!displayName) return formatAdVoteUser(snapshot, fallbackId);
+	const masked = escapeHtml(maskAdVoteDisplayName(displayName));
+	if (!/^\d+$/.test(id)) return '<b>' + masked + '</b>';
+	return '<a href="tg://user?id=' + escapeHtml(id) + '">' + masked + '</a>';
 }
 
 function formatAdVoteVoters(voters) {
@@ -7071,7 +7125,10 @@ function formatBeijingTimeFromSeconds(seconds) {
 }
 
 function buildAdVoteMessageText(state) {
-	const target = formatAdVoteUser(state.targetUserSnapshot, state.targetUserId);
+	// 投票通过 = 已确认目标是广告号 → 其昵称本身可能就是广告，脱敏后再展示。
+	// 进行中 / 否决 / 到期 / 取消一律显示完整名称，群成员需要看清才能判断。
+	const maskTarget = state.finalized === true && state.result === 'approved';
+	const target = formatAdVoteTarget(state.targetUserSnapshot, state.targetUserId, maskTarget);
 	const creator = formatAdVoteUser(state.creatorUserSnapshot, state.creatorUserId);
 	let status = '<i>进行中，1 小时后截止。</i>';
 	if (state.finalized && state.result === 'approved') {
@@ -7291,7 +7348,21 @@ async function resolveAdVoteTargetProtection(message, target) {
 	if (await checkIfUserIsAdminInGroup(targetId, message.chat.id)) {
 		return { protected: true, reason: '不能举报当前群管理员' };
 	}
-	return { protected: false };
+	// 顺带把已查到的群内状态带出去，供重复举报预检复用，避免再打一次 getChatMember。
+	return { protected: false, memberStatus: member?.status || null, member };
+}
+
+// 重复举报预检：目标【已在本群被封禁/禁言】且【已在 D1 全局黑名单】时，本次举报没有任何
+// 增量意义，直接跳过，避免群里刷出一张注定通过的投票卡片。
+// 必须两个条件同时成立才跳过 —— 只满足其一说明处置还不完整（例如已加黑但没踢掉、
+// 或群内踢了但没进全局黑名单），仍应走投票把处置补齐。
+// memberStatus 复用 resolveAdVoteTargetProtection 已查到的结果，不额外调用 Telegram。
+async function isRedundantAdVoteTarget(env, targetUserId, memberStatus) {
+	const status = String(memberStatus || '').toLowerCase();
+	const bannedOrMuted = status === 'kicked' || status === 'restricted';
+	if (!bannedOrMuted) return false;
+	const blacklistCheck = await checkBlacklist(targetUserId, env);
+	return blacklistCheck.isBlacklisted === true;
 }
 
 function createAdVoteToken() {
@@ -7368,6 +7439,12 @@ async function handleAdCommand(message, env, ctx) {
 	const protection = await resolveAdVoteTargetProtection(message, target);
 	if (protection.protected) {
 		return deleteAndReply('⚠️ ' + escapeHtml(protection.reason));
+	}
+	// 已被封禁/禁言且已在全局黑名单 → 本次举报无增量意义，直接跳过不刷投票卡片。
+	if (await isRedundantAdVoteTarget(env, target.targetUserId, protection.memberStatus)) {
+		logIgnoredAdVoteCommand(message, '目标已被本群封禁/禁言且已在 D1 全局黑名单，无需重复举报');
+		await deleteAuthorizedGroupCommandMessage(message, '/ad');
+		return true;
 	}
 	const existing = await findActiveAdVote(env, message.chat.id, target.targetUserId, now);
 	if (existing?.vote_token) {
