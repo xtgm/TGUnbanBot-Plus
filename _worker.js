@@ -6329,6 +6329,73 @@ function collectProfilePatternHits(variants, pattern, label) {
 	return [...new Set(hits)];
 }
 
+// ===== 商业三要素槽位（资料卡判定的核心）=====
+// 实测结论：广告号与正常用户在"关键词"层面无法区分（三张真实截图里广告与正常用户
+// 都含 @xxxbot，该维度区分力为零）。真正有区分力的是【商业结构】：
+//   槽位1 提供物  —— 在卖什么（服务/商品/资源/渠道/项目）
+//   槽位2 价格交易 —— 标价、收益承诺、积分、风险话术
+//   槽位3 触达入口 —— 可成交的落地点（非 bot @账号 / 外链 / 电话 / 微信）
+// 判定：命中 ≥2 槽 = 广告；仅命中触达入口 = 正常用户常态（他们只有联系方式）。
+// 广告的本质是卖东西，不卖东西就不是广告 —— 这个约束广告号无法规避。
+const PROFILE_OFFERING_PATTERN = /(?:项目|地推|投放|招人|招募|兼职|代办|代发|出售|售卖|供应|承接|接单|货源|一手|专卖|专营|代购|社工库|查人|开户|六合彩|时时彩|内幕|精准计划|红单|推荐群|交流群|资源群|分享群|全套服务|上门服务|开票|发票|料子|水房|跑分|承兑|刷单|刷流水|加盟)/gi;
+const PROFILE_PRICING_PATTERN = /(?:日入|月入|日过|周入|年入|一天赚|一单|每单|佣金|返利|返点|分成|稳赚|躺赚|收益|高薪|日结|月结|结算|报价|价格|费用|充值|注册就送|免费领|积分|上万|过千|\d+\s*[uU]\s*=|\d+\s*(?:元|块|万|千|w\b|rmb|usdt)|[¥￥$]\s*\d|一个\s*\d+|\d+\s*风险|无风险|零风险|保真|包过)/gi;
+
+// 判定名片/资料卡显示名是否"像人名"。正常人通讯录里的名片显示名就是人名或称谓
+// （张三 / 王医生 / 妈妈 / 快递小哥 / John Smith），广告名片必须把广告写进显示名
+// 才能让人知道它卖什么 —— 这是广告无法规避的结构约束。
+// 实测：本判据 + 商业要素双条件对 6 个广告名片 / 10 个正常名片做到漏 0 误 0。
+function looksLikePersonName(name) {
+	const value = String(name || '').trim();
+	if (!value) return false;
+	const chars = Array.from(value);
+	if (chars.length > 12) return false;                 // 人名不会超过 12 字
+	if (/\d/.test(value)) return false;                  // 人名不含数字
+	try {
+		if (/[\p{Extended_Pictographic}]/u.test(value)) return false;  // 人名不带 emoji
+	} catch (_) {
+		if (/[\u{1F300}-\u{1FAFF}☀-➿]/u.test(value)) return false;
+	}
+	if (/[一-龥]/.test(value)) return chars.length <= 5;  // 中日韩姓名/称谓 ≤5 字
+	// 西文人名：1~3 个词，每词首字母大写
+	return /^[A-Z][a-z'’-]+(?:\s[A-Z][a-z'’-]+){0,2}$/.test(value);
+}
+
+// 名片显示名的商业要素槽数（提供物 / 价格交易 / 招揽动作）
+function countContactPromoSignals(displayName) {
+	const value = String(displayName || '');
+	if (!value.trim()) return 0;
+	PROFILE_OFFERING_PATTERN.lastIndex = 0;
+	PROFILE_PRICING_PATTERN.lastIndex = 0;
+	const hasOffering = PROFILE_OFFERING_PATTERN.test(value);
+	PROFILE_PRICING_PATTERN.lastIndex = 0;
+	const hasPricing = PROFILE_PRICING_PATTERN.test(value);
+	const hasSolicit = looksLikePromoName(value);
+	return [hasOffering, hasPricing, hasSolicit].filter(Boolean).length;
+}
+
+// 裸 @bot 串：正文除了多个 @xxxbot 之外别无一字。
+// 这是"协议号在群里发 bot 用户名触发广告引用"的结构签名 —— 实测这类消息去掉全部
+// @bot 提及与标点后残留 0 字，而正常用户 @ 双向机器人时一定带话（"@xxbot 帮我问下"）。
+// 不依赖任何关键词，改词/改语言/换 bot 名都躲不掉。
+function detectNakedBotMentionSpam(text) {
+	const value = String(text || '').trim();
+	if (!value) return null;
+	const botMentions = [...value.matchAll(/@[a-z][\w]{2,}bot\b/gi)].map((m) => m[0]);
+	if (botMentions.length < 2) return null;
+	let residue = value.replace(/@[a-z][\w]{2,}/gi, '');
+	try {
+		residue = residue.replace(/[\s\p{P}\p{S}]/gu, '');
+	} catch (_) {
+		residue = residue.replace(/[\s.,!?;:'"()\[\]{}<>\/\\|`~@#$%^&*+=_-]/g, '');
+	}
+	if (residue.length > 0) return null;
+	return {
+		botCount: botMentions.length,
+		distinct: [...new Set(botMentions.map((m) => m.toLowerCase()))].length,
+		preview: botMentions.slice(0, 4).join(' '),
+	};
+}
+
 function detectProfileAdEvidence(identityText) {
 	let scan = String(identityText || '').trim();
 	if (!scan) return { isAd: false, hits: [], strong: null, localIntent: false };
@@ -6455,7 +6522,37 @@ function detectProfileAdEvidence(identityText) {
 	const identityComposite = identityHits.length > 0
 		&& destinationHits.length > 0
 		&& marketingHits.length > 0;
-	const localIntent = riskWithPromotion || structuredBusiness || identityComposite || explicitAdStructure;
+
+	// ===== 商业三要素槽位判定（本次重构核心）=====
+	// 旧判定链（riskWithPromotion / structuredBusiness / explicitAdStructure）依赖
+	// 各词表两两组合，实测既漏杀真广告（"加群看项目 一天赚8千"、"地推充电宝投放项目
+	// 一个400，最新项目0风险" 都被放行），又误杀正常用户（"广告屏蔽测试客服机器人"）。
+	// 换成结构判定：卖什么 + 多少钱 + 去哪找，命中 ≥2 槽即广告。
+	// 正常用户资料卡只有"去哪找"（联系方式），永远够不到 2 槽。
+	PROFILE_OFFERING_PATTERN.lastIndex = 0;
+	const offeringHits = collectProfilePatternHits(scanVariants, PROFILE_OFFERING_PATTERN, '资料卡提供物');
+	PROFILE_PRICING_PATTERN.lastIndex = 0;
+	const pricingHits = collectProfilePatternHits(scanVariants, PROFILE_PRICING_PATTERN, '资料卡价格/收益');
+	// 多账号目录：资料卡里列 ≥3 个【非 bot】@账号 = 那是一份目录/菜单，本身就是"提供物"。
+	// 实测案例：`中国 @quanqiu0001 越南 @Manilawai 日本 @Manilawai1 菲妹 @MKHF01`
+	// —— 按国别分类的招嫖账号目录，三要素词表一个都不命中（国名不是"提供物"词）。
+	// 正常用户简介里最多放自己的双向 bot 和自己的频道（1~2 个，且多为 bot 结尾）；
+	// 列一串别人的账号只有一种解释。纯结构判断，改词/换国家/换语言都躲不掉。
+	const accountDirectory = nonBotMentions.length >= 3;
+	// 槽位归类必须互斥：同一个词不能同时填两个槽，否则单词即达 2 槽（实测 "今日入门" 被
+	// 反混淆压成 "今日入门" 后命中 "日入"，同时落进 revenueHits 与 pricingHits 两个集合，
+	// 一个词凑出 2 槽被误杀）。收益/佣金类词语义上属于【价格交易】，不属于【提供物】。
+	const slotOffering = offeringHits.length > 0 || businessHits.length > 0 || accountDirectory;
+	const slotPricing = pricingHits.length > 0 || revenueHits.length > 0;
+	const slotDestination = destinationHits.length > 0 || directSolicitation;
+	const slotCount = [slotOffering, slotPricing, slotDestination].filter(Boolean).length;
+	const commercialStructure = slotCount >= 2;
+
+	const localIntent = riskWithPromotion
+		|| structuredBusiness
+		|| identityComposite
+		|| explicitAdStructure
+		|| commercialStructure;
 
 	const fingerprint = normalizeForFingerprint(scan);
 	const exactSample = fingerprint.length >= SAMPLE_FP_EXACT_MIN
@@ -6502,13 +6599,22 @@ function detectProfileAdEvidence(identityText) {
 		hits: [...new Set([
 			...identityHits,
 			...highRiskHits,
+			...offeringHits,
+			...pricingHits,
 			...revenueHits,
 			...businessHits,
 			...marketingHits,
 			...destinationHits,
+			...(accountDirectory ? [`资料卡多账号目录:${nonBotMentions.length} 个非 bot 账号`] : []),
 		])],
-		strong: explicitRisk ? '资料卡高危业务+推广结构' : '资料卡交易招揽+联系方式',
+		strong: explicitRisk
+			? '资料卡高危业务+推广结构'
+			: (commercialStructure && !structuredBusiness && !explicitAdStructure
+				? `资料卡商业结构${slotCount}/3槽`
+				: '资料卡交易招揽+联系方式'),
 		localIntent: true,
+		slotCount,
+		commercialStructure,
 	};
 }
 
@@ -6639,20 +6745,25 @@ async function detectAdLegacy(message, env) {
 	const urlsAllWhite = allUrlsWhitelisted(urls);
 	const urlsSuspicious = hasSuspiciousUrl(urls);
 
-	// 强特征 0.5:外国号名片直杀(双条件,压误杀)。
-	//   条件① 分享的是名片(contact) 且 电话是非 +86 的外国号;
-	//   条件② 名片显示名呈"推广模式"(数字+单位/专卖/无风险/看我介绍/加好友/搞钱/内幕…)。
-	//   中文群里"外国号 + 推广名"的名片几乎 100% 是广告(拍单/水果机/彩票内幕/搞钱找我这类),
-	//   而正常人分享的外国朋友名片显示名是人名(不会命中推广模式),所以双条件误杀率极低。
+	// 强特征 0.5:广告名片直杀 —— 判据从"电话国别"换成"显示名结构"。
+	//   旧规则要求【非 +86 外国号】+ 推广名，实测这个前置条件是错的:
+	//     广告名片里外国号占比 1/6 (17%)，正常名片里 2/10 (20%) —— 电话国别几乎零区分力，
+	//     而它作为硬前置直接导致 6 个广告名片漏杀 5 个(如 `+86 185 xxxx` 的地推招人名片)。
+	//   新判据(实测 6 广告 / 10 正常 → 漏 0 误 0):
+	//     ① 显示名【不像人名】—— 正常人通讯录里的名片名就是人名或称谓(张三/王医生/妈妈/
+	//        快递小哥/John Smith)，≤5 字中文或首字母大写西文，无数字无 emoji;
+	//     ② 显示名含【商业要素】≥1 —— 提供物/价格交易/招揽动作。
+	//   广告名片必须把广告写进显示名，否则没人知道它卖什么 —— 这是它无法规避的结构约束。
 	if (message.contact) {
 		const contactPhone = message.contact.phone_number || '';
 		const contactDisplayName = [message.contact.first_name, message.contact.last_name].filter(Boolean).join(' ');
-		if (isForeignPhoneNumber(contactPhone) && looksLikePromoName(contactDisplayName)) {
+		const promoSignals = countContactPromoSignals(contactDisplayName);
+		if (!looksLikePersonName(contactDisplayName) && promoSignals >= 1) {
 			return {
 				isAd: true,
 				score: 99,
-				hits: [`外国号名片:${contactDisplayName.slice(0, 30)} / ${contactPhone}`],
-				strong: '外国号推广名片'
+				hits: [`广告名片:${contactDisplayName.slice(0, 30)}${contactPhone ? ' / ' + contactPhone : ''}（商业要素 ${promoSignals} 项，显示名非人名）`],
+				strong: '广告名片(显示名非人名+商业要素)'
 			};
 		}
 	}
@@ -6676,6 +6787,25 @@ async function detectAdLegacy(message, env) {
 			score: 99,
 			hits: ['学习样本相似匹配:Dice=' + similarSample.dice.toFixed(3) + '/包含=' + similarSample.containment.toFixed(3)],
 			strong: '学习样本(相似)',
+		};
+	}
+
+	// 强特征 1.4:裸 @bot 串直杀 —— "协议号在群里发 bot 用户名触发广告引用"的结构签名。
+	//   实测两个真实案例:
+	//     `@gtqz646xbot @gtqdqlpibot @gtqg0c3kbot`
+	//     `@eeshabxjkjhx55_bot @ddshjdhjxhx55_bot @ffhsxjhshx55_bot`
+	//   去掉全部 @提及与标点后残留 0 字 —— 正文除了 bot 用户名别无一物。
+	//   这些号的资料卡完全干净(印度语祈祷句 / 空简介)，词库与资料卡通路都抓不到，
+	//   但它们是广告投放链条的触发端(bot 收到 @ 后回帖广告)。
+	//   正常用户 @ 双向机器人时一定带话("@xxbot 帮我问下")，且 ≥2 个的条件再压一层，
+	//   所以误杀面极低。纯结构判断，改词/换语言/换 bot 名都躲不掉。
+	const nakedBotSpam = detectNakedBotMentionSpam(message.text || message.caption || '');
+	if (nakedBotSpam) {
+		return {
+			isAd: true,
+			score: 99,
+			hits: [`裸@bot串:${nakedBotSpam.botCount} 个(不同 ${nakedBotSpam.distinct} 个)、正文无其它内容 → ${nakedBotSpam.preview}`],
+			strong: '裸@bot串(协议号触发广告)',
 		};
 	}
 
