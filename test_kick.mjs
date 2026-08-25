@@ -100,8 +100,9 @@ function makeFakeDB(seed = [], options = {}) {
 	const relayObservations = new Map();
 	const adVotes = new Map();
 	const adVoteAllowlist = new Map();
+	const dynamicGroups = new Map(options.dynamicGroups ? Object.entries(options.dynamicGroups) : []);
 	const schemaState = {
-		version: Number.isFinite(Number(options.schemaVersion)) ? Number(options.schemaVersion) : 4,
+		version: Number.isFinite(Number(options.schemaVersion)) ? Number(options.schemaVersion) : 5,
 		coreTablesExist: options.coreTablesExist !== false,
 		relayTableExists: options.relayTableExists !== false,
 		voteTableExists: options.voteTableExists !== false,
@@ -163,6 +164,7 @@ function makeFakeDB(seed = [], options = {}) {
 		_relayObservations: relayObservations,
 		_adVotes: adVotes,
 		_adVoteAllowlist: adVoteAllowlist,
+		_dynamicGroups: dynamicGroups,
 		_schema: schemaState,
 		_sql: preparedSql,
 		_mutationCalls: mutationCalls,
@@ -274,6 +276,19 @@ function makeFakeDB(seed = [], options = {}) {
 					return null;
 				},
 				async run() {
+					if (sql.startsWith('INSERT OR IGNORE INTO dynamic_groups')) {
+						const [chatId, title, addedBy, addedAt, note] = bound;
+						const key = String(chatId);
+						if (dynamicGroups.has(key)) return { meta: { changes: 0 } };
+						dynamicGroups.set(key, { title: title ?? null, addedBy: String(addedBy), addedAt: String(addedAt), note: note ?? null });
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('DELETE FROM dynamic_groups')) {
+						const key = String(bound[0]);
+						if (!dynamicGroups.has(key)) return { meta: { changes: 0 } };
+						dynamicGroups.delete(key);
+						return { meta: { changes: 1 } };
+					}
 					if (sql.startsWith('INSERT OR REPLACE INTO schema_meta')) {
 						schemaState.version = Number(bound[0]) || 0;
 						return { meta: { changes: 1 } };
@@ -525,6 +540,19 @@ function makeFakeDB(seed = [], options = {}) {
 								.map((rawId) => String(rawId))
 								.filter((id) => rows.has(id))
 								.map((id) => ({ id }))
+						};
+					}
+					if (sql.includes('FROM dynamic_groups')) {
+						return {
+							results: [...dynamicGroups.entries()]
+								.map(([chatId, row]) => ({
+									chat_id: String(chatId),
+									title: row?.title ?? null,
+									added_by: row?.addedBy ?? row?.added_by ?? '999',
+									added_at: row?.addedAt ?? row?.added_at ?? '2026-01-01T00:00:00Z',
+									note: row?.note ?? null,
+								}))
+								.sort((a, b) => String(a.added_at).localeCompare(String(b.added_at)) || String(a.chat_id).localeCompare(String(b.chat_id)))
 						};
 					}
 					if (sql.startsWith('PRAGMA table_info(blacklist)')) {
@@ -975,10 +1003,12 @@ console.log('\n[4a] D1 高频路径低请求验证');
 	const steadyMessageSql = db._sql
 		.slice(sqlCountBeforeSteadyMessage)
 		.map((sql) => sql.replace(/\s+/g, ' ').trim());
-	assert('稳定态普通群消息仅执行 2 条必要 D1 SQL', steadyMessageSql.length === 2, JSON.stringify(steadyMessageSql));
-	assert('稳定态 D1 SQL = 消息缓存写入 + 黑名单主键查询', (
+	// 稳定态 3 条：动态群组读取（15 秒运行时缓存，同请求只读一次）+ 黑名单主键查询 + 消息缓存写入
+	assert('稳定态普通群消息仅执行 3 条必要 D1 SQL', steadyMessageSql.length === 3, JSON.stringify(steadyMessageSql));
+	assert('稳定态 D1 SQL = 动态群组读取 + 黑名单主键查询 + 消息缓存写入', (
 		steadyMessageSql.some((sql) => sql.startsWith('INSERT INTO moderation_messages')) &&
-		steadyMessageSql.includes('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ? LIMIT 1')
+		steadyMessageSql.includes('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ? LIMIT 1') &&
+		steadyMessageSql.some((sql) => sql.includes('FROM dynamic_groups'))
 	), JSON.stringify(steadyMessageSql));
 }
 
@@ -6148,7 +6178,7 @@ console.log('\n[81h] D1 schema v4 自动迁移与引用观察表按需自愈');
 			sticker: { file_id: 'schema-observation-sticker', emoji: '👍' }, reply_to_message: { message_id: scenario.actorId - 1, from: { id: scenario.actorId + 1, is_bot: false, first_name: '原广告作者' }, text: '📢 大婆啦 广告内容' },
 		} }) }), env, fakeCtxAd);
 		const ownerNotice = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
-		assert(`${scenario.label} → 自动升级或保持 schema v4`, db._schema.version === 4);
+		assert(`${scenario.label} → 自动升级或保持 schema v5`, db._schema.version === 5);
 		assert(`${scenario.label} → 引用观察表按需补建且只执行一次专用 DDL`, db._schema.relayTableExists && !db._schema.voteTableExists && !db._schema.voteAllowlistTableExists && db._schema.schemaExecCount === 1);
 		assert(`${scenario.label} → 首次引用观察成功写入 D1`, db._relayObservations.get(String(scenario.actorId))?.occurrences === 1);
 		assert(`${scenario.label} → 主人通知显示观察次数 1、无缺表错误`, !!ownerNotice && ownerNotice.body.text.includes('观察次数:1') && !ownerNotice.body.text.includes('D1 观察记录失败'));
@@ -6179,7 +6209,7 @@ console.log('\n[81h2] D1 投票表独立迁移与失败阻断');
 		} }),
 	}), env, fakeCtxAd);
 	assert('旧 schema v3 的可选旧索引失败 → webhook 仍返回成功', response.status === 200);
-	assert('旧 schema v3 的可选旧索引失败 → 独立补建 D1 投票表与白名单表', db._schema.version === 4 && db._schema.voteTableExists && db._schema.voteAllowlistTableExists);
+	assert('旧 schema v3 的可选旧索引失败 → 独立补建 D1 投票表与白名单表', db._schema.version === 5 && db._schema.voteTableExists && db._schema.voteAllowlistTableExists);
 	assert('旧 schema v3 的可选旧索引失败 → /ad 仍成功写入 D1 投票', db._adVotes.size === 1 && callsOf('sendMessage').some((call) => call.body.text.includes('广告举报投票')));
 
 	resetCalls();
@@ -7419,6 +7449,127 @@ console.log('\n[95] 自助解封回执与主群联系按钮');
 		legacy.text.includes('我的主群') && !legacy.text.includes('{username}') && Boolean(legacy.replyMarkup));
 
 	sandbox.fetch = savedFetch;
+}
+
+// ---------- [96] 动态群组 /addgroup /delgroup /listgroups ----------
+// Worker 无法写自己的环境变量，所以指令加的群只存 D1，与 GROUP_ID 天然分离。
+// 合并顺序固定「环境变量群在前、动态群在后」，动态群不会顶替 GROUP_IDS[0] 主群。
+// 合并必须发生在路由分发之前，否则 isConfiguredGroup 会把动态群当成非配置群忽略。
+console.log('\n[96] 动态群组管理');
+{
+	const OWNER = '999';
+	// BOT_ID 是模块级缓存，前面的测试段已经缓存过 bot id，此处 getMe 不会再被调用。
+	// 因此管理员列表必须包含【当前已缓存的 bot id】，硬编码会导致权限预检永远失败。
+	sandbox.fetch = async (url) => (String(url).includes('getMe')
+		? { ok: true, status: 200, async json() { return { ok: true, result: { id: 12345678, username: 'testbot' } }; } }
+		: { ok: true, status: 200, async json() { return { ok: true, result: true }; } });
+	const CACHED_BOT_ID = String(await sandbox.getBotId() || 12345678);
+	const mkFetch = (adminIds = [OWNER, CACHED_BOT_ID]) => async (url, init) => {
+		const u = String(url);
+		if (u.includes('api.telegram.org')) {
+			const method = u.split('/').pop();
+			const body = init?.body ? JSON.parse(init.body) : null;
+			apiCalls.push({ method, body });
+			if (method === 'getMe') return { ok: true, status: 200, async json() { return { ok: true, result: { id: 12345678, username: 'testbot' } }; } };
+			if (method === 'getChatAdministrators') {
+				return {
+					ok: true, status: 200,
+					async json() {
+						return { ok: true, result: adminIds.map((id) => ({ user: { id: Number(id) }, status: String(id) === CACHED_BOT_ID ? 'administrator' : 'creator', can_restrict_members: true })) };
+					},
+				};
+			}
+			if (method === 'getChat') return { ok: true, status: 200, async json() { return { ok: true, result: { id: Number(body?.chat_id), title: '新群 ' + body?.chat_id, type: 'supergroup' } }; } };
+			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
+		}
+		throw new Error('Unexpected fetch: ' + u);
+	};
+	const run = async (db, text, from = { id: Number(OWNER), is_bot: false, first_name: '主人' }, chat = { id: Number(OWNER), type: 'private' }) => {
+		resetCalls();
+		sandbox.fetch = mkFetch();
+		const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: OWNER, DB: db };
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: { message_id: 1, chat, from, text } }),
+		}), env, fakeCtxAd);
+		return callsOf('sendMessage').map((c) => c.body.text).join('\n');
+	};
+
+	// 添加成功
+	let db = makeFakeDB([]);
+	let out = await run(db, '/addgroup -1003904078173 测试新群');
+	assert('动态群组:第一主人私聊 /addgroup 成功写入 D1',
+		db._dynamicGroups.has('-1003904078173') && out.includes('已添加动态群组'));
+	assert('动态群组:回执包含群名与 bot 身份', out.includes('新群 -1003904078173') && out.includes('bot 身份'));
+
+	// 格式校验
+	db = makeFakeDB([]);
+	out = await run(db, '/addgroup 12345');
+	assert('动态群组:非 -100 开头的 ID 被拒绝', db._dynamicGroups.size === 0 && out.includes('-100'));
+
+	// 与环境变量群重复
+	db = makeFakeDB([]);
+	out = await run(db, '/addgroup -1001');
+	assert('动态群组:已在 GROUP_ID 环境变量中的群被拒绝', db._dynamicGroups.size === 0 && out.includes('GROUP_ID 环境变量'));
+
+	// bot 不是管理员 → 拒绝
+	db = makeFakeDB([]);
+	resetCalls();
+	sandbox.fetch = mkFetch([OWNER]); // admin 列表不含 bot 自身
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1, chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false, first_name: '主人' }, text: '/addgroup -1003904078173' } }),
+	}), { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: OWNER, DB: db }, fakeCtxAd);
+	assert('动态群组:bot 不是目标群管理员时拒绝添加',
+		db._dynamicGroups.size === 0
+		&& callsOf('sendMessage').some((c) => c.body.text.includes('无法添加') && c.body.text.includes('管理员')));
+
+	// 非第一主人无权限
+	db = makeFakeDB([]);
+	out = await run(db, '/addgroup -1003904078173', { id: 55555, is_bot: false, first_name: '路人' }, { id: 55555, type: 'private' });
+	assert('动态群组:非第一主人被拒绝且不写库', db._dynamicGroups.size === 0 && out.includes('权限不足'));
+
+	// 移除
+	db = makeFakeDB([], { dynamicGroups: { '-1003904078173': { title: '旧群' } } });
+	out = await run(db, '/delgroup -1003904078173');
+	assert('动态群组:/delgroup 移除成功', !db._dynamicGroups.has('-1003904078173') && out.includes('已移除动态群组'));
+
+	// 环境变量群不可用指令移除
+	db = makeFakeDB([]);
+	out = await run(db, '/delgroup -1001');
+	assert('动态群组:环境变量群拒绝指令移除并引导改后台', out.includes('无法用指令移除'));
+
+	// /listgroups 分段展示
+	db = makeFakeDB([], { dynamicGroups: { '-1003904078173': { title: '动态群A', note: '备注A' } } });
+	out = await run(db, '/listgroups');
+	assert('动态群组:/listgroups 分段列出环境变量群与指令添加群',
+		out.includes('环境变量群') && out.includes('指令添加群') && out.includes('动态群A') && out.includes('备注A'));
+	assert('动态群组:/listgroups 标注主群且合计正确', out.includes('主群') && out.includes('合计生效群组:3 个'));
+
+	// 关键：动态群参与全群封禁（合并生效验证）
+	db = makeFakeDB([], { dynamicGroups: { '-1003904078173': { title: '动态群A' } } });
+	resetCalls();
+	sandbox.fetch = mkFetch();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1, chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false, first_name: '主人' }, text: '/ban 88888 广告' } }),
+	}), { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: OWNER, DB: db }, fakeCtxAd);
+	const bannedGroups = callsOf('banChatMember').map((c) => String(c.body.chat_id));
+	assert('动态群组:/ban 覆盖环境变量群 + 动态群（合并已生效）',
+		bannedGroups.includes('-1001') && bannedGroups.includes('-1002') && bannedGroups.includes('-1003904078173'),
+		JSON.stringify(bannedGroups));
+
+	// 脏数据防护：非法 chat_id 不得进入 GROUP_IDS
+	db = makeFakeDB([], { dynamicGroups: { 'not-a-group': { title: '脏数据' }, '-1003904078173': { title: '正常群' } } });
+	resetCalls();
+	sandbox.fetch = mkFetch();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1, chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false, first_name: '主人' }, text: '/ban 88889' } }),
+	}), { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: OWNER, DB: db }, fakeCtxAd);
+	const targets = callsOf('banChatMember').map((c) => String(c.body.chat_id));
+	assert('动态群组:D1 中非法 chat_id 被过滤，不参与封禁',
+		!targets.includes('not-a-group') && targets.includes('-1003904078173'), JSON.stringify(targets));
 }
 
 // ---------- 总结 ----------

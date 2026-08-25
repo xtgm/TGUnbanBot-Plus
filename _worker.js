@@ -253,6 +253,11 @@ let BOT_TOKEN;
 let GROUP_ID;
 // 全部配置群组ID列表（支持 GROUP_ID 环境变量逗号分隔多群组）
 let GROUP_IDS = [];
+// GROUP_ID 环境变量原始群列表（不含 /addgroup 动态群）。用于 /listgroups 分段展示、
+// 以及禁止把环境变量里已有的群重复加进动态表。
+let ENV_GROUP_IDS = [];
+// D1 dynamic_groups 里合并进来的群（每请求由 mergeDynamicGroupsFromD1 重建）
+let DYNAMIC_GROUP_IDS = [];
 // 超级管理员 TGID 白名单（用于普通管理命令）
 let SUPER_ADMINS = [];
 // 主人 TGID 列表:第一个是主人,后续是副主人。空数组 = 未配置,禁用通知
@@ -290,6 +295,10 @@ function applyRuntimeConfig(config) {
 	TOKEN = config.TOKEN;
 	BOT_TOKEN = config.BOT_TOKEN;
 	GROUP_IDS = config.GROUP_IDS;
+	// 每请求把动态群基线重置为空：GROUP_IDS 此刻只含环境变量群，
+	// 随后 mergeDynamicGroupsFromD1 再按 D1 内容追加，避免 isolate 复用时残留上次的群。
+	ENV_GROUP_IDS = [...config.GROUP_IDS];
+	DYNAMIC_GROUP_IDS = [];
 	GROUP_ID = config.GROUP_ID;
 	SUPER_ADMINS = config.SUPER_ADMINS;
 	OWNER_IDS = config.OWNER_IDS;
@@ -329,6 +338,9 @@ export default {
 				error: error.message
 			}, 500);
 		}
+		// 必须在任何路由分发之前合并 /addgroup 动态群：isConfiguredGroup 及其 26 个调用点
+		// 都依赖 GROUP_IDS，晚于分发会导致动态群被当成"非配置群"直接忽略。
+		await mergeDynamicGroupsFromD1(env);
 
 		if (url.pathname === "/banlist" && url.searchParams.has('tgid') && url.searchParams.get('tgid') != '') {
 			const tgid = url.searchParams.get('tgid');
@@ -399,6 +411,10 @@ export default {
 			console.error('[批量任务] Queue 初始化失败:', error);
 			throw error;
 		}
+		// 与 fetch 入口同样必须合并：getBulkJobConfiguredGroupIds 会用 isConfiguredGroup
+		// 重新校验任务里存的 groupIds，此处不合并会把动态群静默丢弃 ——
+		// 任务回执显示成功，但那些群实际没有执行封禁。
+		await mergeDynamicGroupsFromD1(env);
 
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
@@ -780,7 +796,7 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 // 读取并归一化黑名单
 // === D1 工具函数 ===
 // 首次访问 D1 时建表（幂等），避免人工建表步骤
-const D1_SCHEMA_VERSION = 4;
+const D1_SCHEMA_VERSION = 5;
 const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
@@ -788,6 +804,7 @@ const D1_AD_RELAY_INIT_PROMISES = new WeakMap();
 const D1_AD_VOTE_INIT_PROMISES = new WeakMap();
 const D1_AD_KEYWORDS_CACHE = new WeakMap();
 const D1_AD_SAMPLES_CACHE = new WeakMap();
+const D1_DYNAMIC_GROUPS_CACHE = new WeakMap();
 
 function cloneD1RuntimeValue(value) {
 	if (value === null || value === undefined) return value;
@@ -941,6 +958,9 @@ async function ensureD1Table(env) {
 				['moderation_messages', 'CREATE TABLE IF NOT EXISTS moderation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, from_id TEXT, created_at TEXT);'],
 				['learn_snapshot', 'CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
 				['batch_jobs', 'CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT);'],
+				// 动态群组：第一主人用 /addgroup 加进来的群。与 GROUP_ID 环境变量彻底分离
+				// （Worker 无法写自己的环境变量），合并时环境变量群永远在前，主群身份不受影响。
+				['dynamic_groups', 'CREATE TABLE IF NOT EXISTS dynamic_groups (chat_id TEXT PRIMARY KEY, title TEXT, added_by TEXT NOT NULL, added_at TEXT NOT NULL, note TEXT);'],
 			];
 			for (const [label, sql] of tableStatements) {
 				await runD1SchemaStatement(env, label, sql);
@@ -1079,6 +1099,125 @@ async function ensureAdVoteTables(env) {
 	if (!initialized) D1_AD_VOTE_INIT_PROMISES.delete(env.DB);
 	return initialized;
 }
+// ===== 动态群组（/addgroup 加入，存 D1，与 GROUP_ID 环境变量分离）=====
+// Worker 无法写自己的环境变量，所以指令加的群必然只在 D1；两套数据天然不会混。
+// 合并顺序固定为「环境变量群在前、动态群在后」，动态群永远不会顶替 GROUP_IDS[0] 主群。
+// 合并进 GROUP_IDS 之后，isConfiguredGroup 的全部调用点（封禁/踢人/广告检测/purge/
+// 批量任务/投票）自动生效，无需逐处改动。
+async function loadDynamicGroupsFromD1(env) {
+	if (!env.DB) return [];
+	try {
+		if (!(await ensureD1Table(env))) return [];
+		const { results } = await env.DB
+			.prepare('SELECT chat_id, title, added_by, added_at, note FROM dynamic_groups ORDER BY added_at ASC, chat_id ASC')
+			.all();
+		// 严格校验 chat_id 格式：只接受 -100 开头的超级群组 ID。
+		// 任何脏数据（手工改库、schema 漂移、误写）都不得进入 GROUP_IDS ——
+		// 那会让全群封禁对一个不存在的 chat 反复报错，且污染"配置群"语义。
+		return (results || [])
+			.filter((row) => isSupergroupChatId(row?.chat_id))
+			.map((row) => ({
+				chatId: String(row.chat_id),
+				title: row.title ?? null,
+				addedBy: row.added_by ?? null,
+				addedAt: row.added_at ?? null,
+				note: row.note ?? null,
+			}));
+	} catch (error) {
+		console.error('[动态群组] 读 D1 失败:', error);
+		return [];
+	}
+}
+
+async function loadDynamicGroupsCachedFromD1(env) {
+	const value = await loadD1RuntimeCachedValue(env, D1_DYNAMIC_GROUPS_CACHE, loadDynamicGroupsFromD1);
+	return Array.isArray(value) ? value : [];
+}
+
+// 把 D1 动态群并入运行期 GROUP_IDS。必须在路由分发之前调用（fetch 与 queue 两个入口都要），
+// 否则 getBulkJobConfiguredGroupIds 会用 isConfiguredGroup 把动态群静默过滤掉，
+// 造成批量任务显示成功但那些群实际未执行。
+async function mergeDynamicGroupsFromD1(env) {
+	if (!env?.DB) return;
+	// 环境变量群基线由 applyRuntimeConfig 每请求重置，这里只做追加。
+	ENV_GROUP_IDS = [...GROUP_IDS];
+	try {
+		const rows = await loadDynamicGroupsCachedFromD1(env);
+		if (rows.length === 0) {
+			DYNAMIC_GROUP_IDS = [];
+			return;
+		}
+		const envSet = new Set(GROUP_IDS.map((id) => String(id)));
+		const extra = [];
+		for (const row of rows) {
+			const id = String(row.chatId || '').trim();
+			if (!id || envSet.has(id)) continue;
+			envSet.add(id);
+			extra.push(id);
+		}
+		DYNAMIC_GROUP_IDS = extra;
+		if (extra.length > 0) GROUP_IDS = [...GROUP_IDS, ...extra];
+	} catch (error) {
+		// 读失败时保持环境变量群不变，绝不因此丢群
+		console.error('[动态群组] 合并失败，仅使用 GROUP_ID 环境变量:', error);
+		DYNAMIC_GROUP_IDS = [];
+	}
+}
+
+function isDynamicGroup(chatId) {
+	const idStr = String(chatId ?? '');
+	return DYNAMIC_GROUP_IDS.some((id) => String(id) === idStr);
+}
+
+function isSupergroupChatId(value) {
+	return /^-100\d{6,}$/.test(String(value || '').trim());
+}
+
+async function addDynamicGroup(env, chatId, options = {}) {
+	if (!env.DB) return { ok: false, code: 'NO_DB', message: '未绑定 D1 存储空间' };
+	const id = String(chatId || '').trim();
+	if (!isSupergroupChatId(id)) {
+		return { ok: false, code: 'INVALID', message: '群组 ID 格式错误，必须是 -100 开头的超级群组 ID' };
+	}
+	// 已在环境变量里的群不允许重复加入，避免两套数据来源打架
+	if (ENV_GROUP_IDS.some((g) => String(g) === id)) {
+		return { ok: false, code: 'ENV_DUPLICATE', message: '该群已在 GROUP_ID 环境变量中，无需重复添加' };
+	}
+	try {
+		await ensureD1Table(env);
+		const title = options.title != null ? String(options.title).slice(0, 200) : null;
+		const note = options.note ? String(options.note).slice(0, 500) : null;
+		const result = await env.DB
+			.prepare('INSERT OR IGNORE INTO dynamic_groups (chat_id, title, added_by, added_at, note) VALUES (?, ?, ?, ?, ?)')
+			.bind(id, title, String(options.addedBy || 'unknown'), new Date().toISOString(), note)
+			.run();
+		const changed = result?.meta?.changes ?? result?.changes ?? 0;
+		if (!changed) return { ok: false, code: 'EXISTS', message: '该群已在动态群组列表中' };
+		D1_DYNAMIC_GROUPS_CACHE.delete(env.DB);
+		return { ok: true, code: 'ADDED' };
+	} catch (error) {
+		console.error('[动态群组] 写入失败:', error);
+		return { ok: false, code: 'ERROR', message: error.message || String(error) };
+	}
+}
+
+async function removeDynamicGroup(env, chatId) {
+	if (!env.DB) return { ok: false, code: 'NO_DB', message: '未绑定 D1 存储空间' };
+	const id = String(chatId || '').trim();
+	if (!id) return { ok: false, code: 'INVALID', message: '群组 ID 不能为空' };
+	try {
+		await ensureD1Table(env);
+		const result = await env.DB.prepare('DELETE FROM dynamic_groups WHERE chat_id = ?').bind(id).run();
+		const changed = result?.meta?.changes ?? result?.changes ?? 0;
+		if (!changed) return { ok: false, code: 'NOT_FOUND', message: '该群不在动态群组列表中' };
+		D1_DYNAMIC_GROUPS_CACHE.delete(env.DB);
+		return { ok: true, code: 'REMOVED' };
+	} catch (error) {
+		console.error('[动态群组] 删除失败:', error);
+		return { ok: false, code: 'ERROR', message: error.message || String(error) };
+	}
+}
+
 async function readD1Blacklist(env) {
 	await ensureD1Table(env);
 	const stmt = env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at ASC, id ASC');
@@ -8873,6 +9012,150 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		} else {
 			await sendTelegramMessage(chatId, `⚠️ 退出请求已发送，但无法确认最终状态\n${groupLines}\n原因:${escapeHtml(translateLeaveChatError(afterLeave.error))}`);
 		}
+		return;
+	}
+
+	// ===== 动态群组管理命令（仅第一主人、仅私聊）=====
+	// /addgroup -100xxxx [备注] | /delgroup -100xxxx | /listgroups
+	// 加进来的群与 GROUP_ID 环境变量分离存放（Worker 无法写自己的环境变量），
+	// 但合并后享受完全相同的治理能力：封禁/踢人/广告检测/黑名单拦截/purge/批量任务。
+	if (text && /^\/(addgroup|delgroup|listgroups)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		// 群内一律静默（避免泄漏命令存在），私聊才给权限提示
+		if (!isPrimaryOwner(userId)) {
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n动态群组管理仅限第一主人使用。');
+			}
+			return;
+		}
+		if (isInGroup) {
+			// 群组管理是全局配置，强制私聊执行，避免群内误操作与信息外泄
+			await deleteAuthorizedGroupCommandMessage(message, '/groups');
+			await sendTelegramMessage(userId, 'ℹ️ 动态群组管理命令请在私聊中使用。');
+			return;
+		}
+		if (!env.DB) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间，无法管理动态群组。');
+			return;
+		}
+
+		const { head, rest } = parseTelegramCommand(text);
+
+		if (head === '/listgroups') {
+			const rows = await loadDynamicGroupsFromD1(env);
+			const lines = ['🗂️ <b>当前生效的群组</b>', ''];
+			lines.push(`<b>环境变量群（GROUP_ID，共 ${ENV_GROUP_IDS.length} 个）</b>`);
+			if (ENV_GROUP_IDS.length === 0) {
+				lines.push('  （空）');
+			} else {
+				ENV_GROUP_IDS.forEach((id, index) => {
+					const mark = index === 0 ? ' ⭐ 主群' : '';
+					lines.push(`  ${index + 1}. <code>${escapeHtml(String(id))}</code>${mark}`);
+				});
+			}
+			lines.push('', `<b>指令添加群（D1，共 ${rows.length} 个）</b>`);
+			if (rows.length === 0) {
+				lines.push('  （空）', '', '用 <code>/addgroup -100xxxx 备注</code> 添加。');
+			} else {
+				rows.forEach((row, index) => {
+					const title = row.title ? escapeHtml(row.title) : '未知群名';
+					lines.push(`  ${index + 1}. <b>${title}</b> <code>${escapeHtml(row.chatId)}</code>`);
+					const meta = [];
+					if (row.note) meta.push(`备注:${escapeHtml(row.note)}`);
+					if (row.addedAt) meta.push(`添加于 ${escapeHtml(row.addedAt)}`);
+					if (meta.length) lines.push(`     ${meta.join(' · ')}`);
+				});
+			}
+			lines.push('', `📊 合计生效群组:${ENV_GROUP_IDS.length + rows.length} 个`);
+			lines.push('ℹ️ 主群固定为 GROUP_ID 第一个群，指令添加的群不会顶替主群。');
+			await sendTelegramMessageChunks(chatId, lines.join('\n'));
+			return;
+		}
+
+		const groupArg = String(rest || '').trim();
+		const [rawId, ...noteParts] = groupArg.split(/\s+/);
+		const targetGroupId = String(rawId || '').trim();
+
+		if (head === '/delgroup') {
+			if (!targetGroupId) {
+				await sendTelegramMessage(chatId, '用法:<code>/delgroup -100xxxx</code>');
+				return;
+			}
+			if (ENV_GROUP_IDS.some((g) => String(g) === targetGroupId)) {
+				await sendTelegramMessage(chatId, `⚠️ <code>${escapeHtml(targetGroupId)}</code> 来自 GROUP_ID 环境变量，无法用指令移除。\n请到 Cloudflare 后台修改 GROUP_ID。`);
+				return;
+			}
+			const removed = await removeDynamicGroup(env, targetGroupId);
+			await sendTelegramMessage(
+				chatId,
+				removed.ok
+					? `✅ 已移除动态群组 <code>${escapeHtml(targetGroupId)}</code>\nℹ️ bot 仍在该群内，如需退群请用 <code>/leavegroup ${escapeHtml(targetGroupId)}</code>。`
+					: `❌ 移除失败:${escapeHtml(removed.message || '未知错误')}`,
+			);
+			return;
+		}
+
+		// /addgroup
+		// 先查"是否已配置"再查格式：已在配置里的群回一句"无需重复添加"比"格式错误"有用得多，
+		// 也兼容历史上 GROUP_ID 里填过非 -100 群组 ID 的部署。
+		if (ENV_GROUP_IDS.some((g) => String(g) === targetGroupId)) {
+			await sendTelegramMessage(chatId, `⚠️ <code>${escapeHtml(targetGroupId)}</code> 已在 GROUP_ID 环境变量中，无需重复添加。`);
+			return;
+		}
+		if (isDynamicGroup(targetGroupId)) {
+			await sendTelegramMessage(chatId, `⚠️ <code>${escapeHtml(targetGroupId)}</code> 已在动态群组列表中。`);
+			return;
+		}
+		if (!isSupergroupChatId(targetGroupId)) {
+			await sendTelegramMessage(chatId, '用法:<code>/addgroup -100xxxx [备注]</code>\n群组 ID 必须是 <code>-100</code> 开头的超级群组 ID。');
+			return;
+		}
+		// 硬性前置：bot 必须已是该群管理员且具备封禁权限，否则加进来只会全程报错。
+		// 复用 /purge 预检逻辑，同时顺带拿到群名存库。
+		const botId = await getBotId();
+		if (!botId) {
+			await sendTelegramMessage(chatId, '❌ 无法获取机器人 ID，暂时无法校验群权限，请稍后重试。');
+			return;
+		}
+		const access = await checkPurgeGroupAccess(targetGroupId, botId);
+		if (!access.ok) {
+			await sendTelegramMessage(
+				chatId,
+				`❌ 无法添加 <code>${escapeHtml(targetGroupId)}</code>\n原因:${escapeHtml(access.reason || '未知')}\n\n请先把 bot 拉进该群、设为管理员并开启「封禁用户」权限。`,
+			);
+			return;
+		}
+		let groupTitle = '';
+		try {
+			const info = await getChatInfoFromId(targetGroupId);
+			groupTitle = String(info?.title || '').trim();
+		} catch (_) { /* 群名获取失败不阻断添加 */ }
+
+		const added = await addDynamicGroup(env, targetGroupId, {
+			title: groupTitle || null,
+			addedBy: String(userId),
+			note: noteParts.join(' ').trim(),
+		});
+		if (!added.ok) {
+			await sendTelegramMessage(chatId, `❌ 添加失败:${escapeHtml(added.message || '未知错误')}`);
+			return;
+		}
+		const totalGroups = ENV_GROUP_IDS.length + DYNAMIC_GROUP_IDS.length + 1;
+		await sendTelegramMessage(
+			chatId,
+			[
+				`✅ <b>已添加动态群组</b>`,
+				`🏷️ 群名:${groupTitle ? `<b>${escapeHtml(groupTitle)}</b>` : '未知'}`,
+				`🆔 群 ID:<code>${escapeHtml(targetGroupId)}</code>`,
+				`🤖 bot 身份:${escapeHtml(access.status || '管理员')}`,
+				noteParts.length ? `📝 备注:${escapeHtml(noteParts.join(' ').trim())}` : '',
+				'',
+				`📊 当前生效群组:${totalGroups} 个（环境变量 ${ENV_GROUP_IDS.length} + 指令添加 ${DYNAMIC_GROUP_IDS.length + 1}）`,
+				'',
+				'ℹ️ 该群已纳入全套治理:黑名单拦截、复入群踢回、广告自动检测、/ban /spam 全群封禁、/purge 清扫、批量任务。',
+				'⚠️ 群数增加会线性放大全群操作的耗时与请求数，批量任务会更早转为异步执行。',
+			].filter(Boolean).join('\n'),
+		);
 		return;
 	}
 
