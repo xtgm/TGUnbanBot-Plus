@@ -11,8 +11,11 @@ const DEFAULT_SELF_UNBAN_KEYWORD = '我不是广告狗，我是误封的，希�
 // 2) /unban、/start 命令收到时返回的欢迎/检查清单。
 //    支持 HTML 子集（<b>、换行等）。占位符：{userId}、{title}、{keyword}。
 //    {keyword} 会自动填入当前生效的 SELF_UNBAN_KEYWORD（来自环境变量或默认值）。
+//    {title} 仍可用（会被替换成主群名称），但默认文案刻意【不使用】它 ——
+//    主群若是私密群，显示真实群名等于把私人群名暴露给任何触发者，因此默认写固定品牌名。
+//    需要显示群名的部署者可在环境变量 SELF_UNBAN_PROMPT 里自行写 {title}。
 //    环境变量名：SELF_UNBAN_PROMPT
-const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>{title}</b> 的 自助解封机器人
+const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>杀神搭配专用解封</b> 的 自助解封机器人
 
 🔍 <b>请自行检查以下内容：</b>
 
@@ -10042,6 +10045,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		(startCommand.head === '/start' && !startCommand.rest) ||
 		(unbanCommand.head === '/unban' && !unbanCommand.rest)
 	) {
+		// 群聊里的自助解封入口只对第一主人开放：任何其他人（普通成员、群管理员、
+		// 超级管理员、副主人、匿名管理员）在配置群发无参 /start 或 /unban 一律【纯静默】——
+		// 不回欢迎语、不撤回命令、不私聊主人、不产生任何 Telegram 请求。
+		// 原因：这段欢迎语是给「被封禁用户私聊 bot」用的自助流程，任何人都能在群里
+		// 把它刷出来会污染群消息流，且欢迎语里含解封确认整句，等于公开教学如何触发解封。
+		// 私聊完全不进此判定，权限与行为保持原样。
+		if (message.chat.type !== 'private' && !isPrimaryOwner(getMessageActorId(message))) {
+			return;
+		}
+
 		const quietManagerCommand = await isNonPrimaryConfiguredGroupManager(message, userId);
 		if (quietManagerCommand) {
 			await deleteAuthorizedGroupCommandMessage(message, startCommand.head === '/start' ? '/start' : '/unban');

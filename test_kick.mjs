@@ -5097,53 +5097,114 @@ console.log('\n[67a] 副主人隐藏命令群聊静默 + 私聊不变');
 	assert('副主人群内 /listwords 删除命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 23));
 }
 
-// ---------- [67a2] 普通管理员全部群聊指令静默；第一主人不受影响 ----------
-console.log('\n[67a2] 普通管理员 /start 群聊静默 + 主人不受影响');
+// ---------- [67a2] 群聊 /start 与无参 /unban 仅第一主人可触发；私聊不受影响 ----------
+// 用户实测：任何人在配置群发 /start 都能把自助解封欢迎语刷出来（普通成员直接在群里
+// 收到完整欢迎语，群管理员则触发"私聊主人"通路）。该欢迎语本是给【被封用户私聊 bot】
+// 用的自助流程，且正文含解封确认整句，等于公开教学如何触发解封，还污染群消息流。
+// 现改为：群聊里只有第一主人能触发，其他任何身份一律【纯静默】——不回、不撤、不通知，
+// 零 Telegram 请求。私聊权限与行为完全不变。
+console.log('\n[67a2] 群聊 /start 仅第一主人；私聊不变');
 {
-	resetCalls();
-	sandbox.fetch = makeFetchMock({
+	const groupSilentEnv = () => ({ TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,888', SUPER_ADMINS: '7778', DB: makeFakeDB([]) });
+	const silentRoutes = {
 		getChatAdministrators: (b) => ({ ok: true, result: String(b.chat_id) === '-1001' ? [{ user: { id: 7777 }, status: 'administrator' }] : [] }),
 		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '测试主群', username: 'test_group', type: 'supergroup' } }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 		deleteMessage: () => ({ ok: true, result: true }),
-	});
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([]) };
-	await handler.fetch(new Request('https://x.com/', {
-		method: 'POST',
-		body: JSON.stringify({ message: { message_id: 30, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '普通管理员' }, text: '/start' } }),
-	}), env, fakeCtxAd);
-	let groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	let ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	let triggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
-	assert('普通管理员群内 /start 零机器人回执', groupSends.length === 0);
-	assert('普通管理员群内 /start 完整欢迎结果发给主人', !!ownerDm && ownerDm.body.text.includes('自助解封机器人'));
-	assert('普通管理员群内 /start 不私聊发令者', !triggerDm);
-	assert('普通管理员群内 /start 只鉴权当前群', callsOf('getChatAdministrators').length === 1 && String(callsOf('getChatAdministrators')[0].body.chat_id) === '-1001');
-	assert('普通管理员群内 /start 删除命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 30));
-
-	resetCalls();
-	const blacklistedEnv = {
-		...env,
-		DB: makeFakeDB([{ id: '7777', reason: 'manual', by: '999', at: '2026-07-21T00:00:00Z' }]),
 	};
+
+	// 群聊里各类非第一主人身份 × 两个入口，全部必须零 API 调用
+	const silentCases = [
+		{ label: '普通成员', from: { id: 5555, is_bot: false, first_name: '普通成员' } },
+		{ label: '普通群管理员', from: { id: 7777, is_bot: false, first_name: '普通管理员' } },
+		{ label: '超级管理员', from: { id: 7778, is_bot: false, first_name: '超级管理员' } },
+		{ label: '副主人', from: { id: 888, is_bot: false, first_name: '副主人' } },
+	];
+	const silentFailures = [];
+	for (const [i, scenario] of silentCases.entries()) {
+		for (const [j, cmd] of ['/start', '/start@TestBot', '/unban'].entries()) {
+			resetCalls();
+			sandbox.fetch = makeFetchMock(silentRoutes);
+			const silentEnv = groupSilentEnv();
+			await handler.fetch(new Request('https://x.com/', {
+				method: 'POST',
+				body: JSON.stringify({ message: { message_id: 3000 + i * 10 + j, chat: { id: -1001, type: 'supergroup' }, from: scenario.from, text: cmd } }),
+			}), silentEnv, fakeCtxAd);
+			if (apiCalls.length !== 0) silentFailures.push(`${scenario.label}:${cmd}(${apiCalls.map((c) => c.method).join('/')})`);
+		}
+	}
+	assert('群聊非第一主人发 /start 与无参 /unban 一律零 Telegram 请求', silentFailures.length === 0, silentFailures.join(', '));
+
+	// 匿名管理员（GroupAnonymousBot）同样不得触发
+	resetCalls();
+	sandbox.fetch = makeFetchMock(silentRoutes);
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
-		body: JSON.stringify({ message: { message_id: 32, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '普通管理员' }, text: '/start' } }),
+		body: JSON.stringify({ message: {
+			message_id: 3100,
+			chat: { id: -1001, type: 'supergroup', title: '测试主群' },
+			from: { id: 1087968824, is_bot: true, first_name: 'GroupAnonymousBot' },
+			sender_chat: { id: -1001, type: 'supergroup', title: '测试主群' },
+			text: '/start',
+		} }),
+	}), groupSilentEnv(), fakeCtxAd);
+	assert('群聊匿名管理员发 /start 也零 Telegram 请求', apiCalls.length === 0, apiCalls.map((c) => c.method).join('/'));
+
+	// 黑名单用户在群里发 /start：由【黑名单兜底拦截】先行处理（删消息 + 踢人 + 通知主人），
+	// 在 /start 分支之前就 return，因此绝不会弹出欢迎语。这是既有安全行为，本次改动不触碰。
+	resetCalls();
+	sandbox.fetch = makeFetchMock({ ...silentRoutes, banChatMember: () => ({ ok: true, result: true }) });
+	const blacklistedEnv = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([{ id: '5558', reason: 'manual', by: '999', at: '2026-07-21T00:00:00Z' }]) };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 3200, chat: { id: -1001, type: 'supergroup' }, from: { id: 5558, is_bot: false, first_name: '黑名单用户' }, text: '/start' } }),
 	}), blacklistedEnv, fakeCtxAd);
-	groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('黑名单普通管理员群内 /start 拦截仍零机器人回执', groupSends.length === 0);
-	assert('黑名单普通管理员群内 /start 拦截仍通知主人', !!ownerDm && ownerDm.body.text.includes('黑名单'));
-	assert('黑名单普通管理员群内 /start 仍删除命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 32));
+	assert('群聊黑名单用户发 /start 不弹欢迎语', !callsOf('sendMessage').some((c) => String(c.body.text || '').includes('自助解封机器人')));
+	assert('群聊黑名单用户发 /start 仍被兜底拦截删消息并踢出', callsOf('deleteMessage').some((c) => c.body.message_id === 3200) && callsOf('banChatMember').some((c) => String(c.body.user_id) === '5558'));
+
+	// 第一主人群内保持原行为
+	resetCalls();
+	sandbox.fetch = makeFetchMock(silentRoutes);
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 3300, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/start' } }),
+	}), groupSilentEnv(), fakeCtxAd);
+	const ownerGroupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
+	assert('第一主人群内 /start 保持原完整群回复', ownerGroupSends.length === 1 && ownerGroupSends[0].body.text.includes('自助解封机器人'));
+	assert('第一主人群内 /start 不删命令消息', !callsOf('deleteMessage').some((c) => c.body.message_id === 3300));
+
+	// 私聊行为完全不变：普通用户、黑名单用户各自照旧
+	resetCalls();
+	sandbox.fetch = makeFetchMock(silentRoutes);
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 3400, chat: { id: 5555, type: 'private' }, from: { id: 5555, is_bot: false, first_name: '普通用户' }, text: '/start' } }),
+	}), groupSilentEnv(), fakeCtxAd);
+	const privateReply = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '5555');
+	assert('私聊普通用户 /start 仍正常收到欢迎语', !!privateReply && privateReply.body.text.includes('自助解封机器人'));
 
 	resetCalls();
+	sandbox.fetch = makeFetchMock(silentRoutes);
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
-		body: JSON.stringify({ message: { message_id: 31, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/start' } }),
-	}), env, fakeCtxAd);
-	groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	assert('第一主人群内 /start 保持原完整群回复', groupSends.length === 1 && groupSends[0].body.text.includes('自助解封机器人'));
-	assert('第一主人群内 /start 不走普通管理员鉴权或删命令', callsOf('getChatAdministrators').length === 0 && !callsOf('deleteMessage').some((c) => c.body.message_id === 31));
+		body: JSON.stringify({ message: { message_id: 3401, chat: { id: 5556, type: 'private' }, from: { id: 5556, is_bot: false, first_name: '普通用户' }, text: '/unban' } }),
+	}), groupSilentEnv(), fakeCtxAd);
+	const privateUnbanReply = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '5556');
+	assert('私聊普通用户无参 /unban 仍正常收到欢迎语', !!privateUnbanReply && privateUnbanReply.body.text.includes('自助解封机器人'));
+
+	resetCalls();
+	sandbox.fetch = makeFetchMock(silentRoutes);
+	const privateBlacklistedEnv = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([{ id: '5557', reason: 'manual', by: '999', at: '2026-07-21T00:00:00Z' }]) };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 3402, chat: { id: 5557, type: 'private' }, from: { id: 5557, is_bot: false, first_name: '黑名单用户' }, text: '/start' } }),
+	}), privateBlacklistedEnv, fakeCtxAd);
+	const privateBlockReply = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '5557');
+	const appealDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('私聊黑名单用户 /start 仍被拒并通知主人申诉', !!privateBlockReply && privateBlockReply.body.text.includes('黑名单') && !!appealDm && appealDm.body.text.includes('申诉'));
+
+	// 欢迎语不再暴露主群真实名称（主群可能是私密群）
+	assert('欢迎语使用固定品牌名，不显示主群名', !!privateReply && privateReply.body.text.includes('杀神搭配专用解封') && !privateReply.body.text.includes('测试主群'));
 }
 
 // ---------- [67b] /admins 仅主人查看权限名单 ----------
