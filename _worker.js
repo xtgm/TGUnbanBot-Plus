@@ -8373,7 +8373,25 @@ async function handleAutomaticAdDecision(message, adResult, env) {
 	return true;
 }
 
+// 频道帖自动转发到关联讨论群:Telegram 用 is_automatic_forward=true 标记这类消息,
+// 其 sender_chat 是来源频道、from 是 Telegram 服务账号(如 777000),内容是频道原文。
+// 它【不是】群成员发言,绝不能进入任何治理路径 —— 否则:
+//   ① 频道资料/正文一旦命中广告判据,机器人会删掉这条转发帖;
+//   ② 被删的若正是被置顶的那条,Telegram 因置顶目标消失而【自动取消置顶】。
+// 这与"真人以本群匿名管理员身份发言"(sender_chat.id === chat.id)是两回事,后者必须保留;
+// 也与"真人用外部频道身份发广告"不同,那类没有 is_automatic_forward 标记。
+// 因此唯一精确信号就是 is_automatic_forward,单点判定,不牵连其它场景。
+function isChannelAutoForward(message) {
+	return message?.is_automatic_forward === true && Boolean(message?.sender_chat);
+}
+
 async function handleMessage(message, env, ctx, requestUrl = '') {
+	// 频道关联群自动转发帖直接放行:不删、不缓存、不参与广告检测、不当命令。
+	// 放在最顶部,先于一切治理逻辑,保证任意频道内容(不只是像广告的)都不被误删误取消置顶。
+	if (isChannelAutoForward(message)) {
+		return;
+	}
+
 	// B 方案:新成员进群时主动查杀神全局封禁库(真人)。放在 bot 处理之前,
 	//   因为 handleNewChatMemberBots 遇到 new_chat_members 会 return true 提前结束。
 	await handleNewMemberGkyCheck(message, env, ctx);

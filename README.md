@@ -984,6 +984,62 @@ GET /{TOKEN}/purge/run
 
 **要根治同义改写和语义方向问题**,需要引入语义判断(如接 Cloudflare Workers AI 做意图分类)。那是独立增量功能,需额外开通、每次判定增加几百毫秒延迟,并需设计成本控制与降级策略,当前未实现。
 
+### Q31：管理员置顶消息后，置顶被 bot 删除并取消了
+
+**已在 v2 修复**。如果你还在旧版本，升级后需要额外清一次存量缓存。
+
+**根因**：Telegram 在有人置顶消息时会推送一条 `pinned_message` **服务消息**，它的 `from` 是置顶操作者、`message_id` 是这条服务消息自身。旧版清扫缓存的入库条件只排除了机器人和斜杠命令，而服务消息没有 `text` 字段，因此照样被写进 `moderation_messages`。之后该用户一旦被 `/spam` 引用清扫或 `/ad` 投票通过，清扫逻辑就会删掉这条服务消息 —— 而**删除 `pinned_message` 服务消息，Telegram 的表现正是「取消置顶」**。频道关联群里「Channel 置顶了信息」被删也是同一原因。
+
+**修复内容**：新增服务消息识别（覆盖置顶、入群/退群、改群名、话题、视频通话、支付等 28 类），在三处排除：① 清扫缓存入库（调用点 + 函数内双保险）；② 广告自动检测入口（否则置顶一条含广告词的消息会让**置顶者**被当成广告发布者加黑）；③ `/recent` 学习候选。
+
+**投票置顶不受影响**：本项目的 `pin`/`unpin` 只对 bot 自己发出的投票卡片操作（3 个调用点全部带 `state.messageId`），投票发起时置顶、通过/否决/到期/取消时取消置顶，绝不碰群里其它置顶。
+
+**升级后必做**：旧版已经把一批置顶服务消息 ID 写进了 D1，不清掉的话它们在下次清扫时仍会被删一次，你会误以为修复没生效。在 Cloudflare D1 控制台执行：
+
+```sql
+DELETE FROM moderation_messages;
+```
+
+该表仅为清扫缓存（记录"某用户在某群发过哪些消息 ID"，供 `/spam` 引用清扫用），清空**不影响**黑名单、词库、学习样本与投票数据。
+
+### Q32：Windows 下 `git push` 报 `ServicePointManager 不支持具有 socks5 方案的代理`
+
+这不是本项目的问题，但用 v2rayN / Clash 等代理推送本仓库时很常见，记录在此。
+
+**原因**：Git Credential Manager 是 .NET 程序，其 `ServicePointManager` **只支持 `http://` 方案的代理，不支持 `socks5://`**。若把 git 代理配成 socks5，GCM 无法完成浏览器授权，会退化成密码认证，而 GitHub 已停用密码认证，最终报 `Password authentication is not supported`。
+
+**解决**：把 git 代理改成 `http://` 方案。v2rayN 的 SOCKS 端口（默认 10808）在新版本通常也接受 HTTP CONNECT，可直接复用：
+
+```bash
+git config --global http.proxy  http://127.0.0.1:10808
+git config --global https.proxy http://127.0.0.1:10808
+```
+
+若不生效，在 v2rayN「设置 → 参数设置」里确认 `本地http端口`（默认 10809）已启用，然后改用该端口。验证连通：
+
+```bash
+git ls-remote origin        # 能列出 refs 即代理可用
+```
+
+**另外两个 Windows 常见坑**：
+
+- `fatal: detected dubious ownership` —— 仓库目录所有者 SID 与当前用户不一致（拷盘/换用户后常见）。执行 `git config --global --add safe.directory <仓库绝对路径>`。
+- Git Bash 里粘贴出现 `bash: $'\E[200~git': command not found` —— 这是「括号粘贴」控制字符被当成命令名。改用**右键 → Paste** 或 **Shift+Insert**，或执行 `echo 'set enable-bracketed-paste off' >> ~/.inputrc` 后重开终端。
+
+### Q33：频道置顶的内容在关联讨论群被 bot 删除并取消置顶（与 Q31 不同的第二个成因）
+
+Q31 修的是 `pinned_message` **服务消息**被清扫缓存误删。本条是另一个独立成因：**频道帖自动转发到关联讨论群的那条消息本身**被广告检测删掉。两者都表现为「频道置顶被取消」，但触发路径完全不同。
+
+**根因**：频道发帖后，Telegram 会把它自动转发进关联讨论群，这条转发消息带 `is_automatic_forward: true`、`sender_chat`（来源频道）、`from`（Telegram 服务账号，如 `777000`，`is_bot` 为 falsy）。它有正文、没有 `pinned_message` 等服务消息字段，因此 `isTelegramServiceMessage` 挡不住；又因为有 `from` 且非 bot，会穿过入口早退进入广告检测。检测时 `resolveAdIdentityProfile` 把 `sender_chat`（频道）当作检测对象，**频道名/简介一旦命中广告身份判据，就删掉这条转发帖**——被删的若正是被置顶那条，Telegram 因置顶目标消失而自动取消置顶。关闭「信息署名」的频道，转发帖的 `from` 就是服务账号而非频道管理员，更易命中。
+
+**关键区别**：这与内容像不像广告无关。哪怕频道发的是任意正常内容，只要频道资料命中判据，转发帖就会被删。所以修复不是「广告判据豁免」，而是从入口直接放行整类消息。
+
+**修复内容**：新增 `isChannelAutoForward` 判定（唯一信号 = `is_automatic_forward === true` 且存在 `sender_chat`），在 `handleMessage` 最顶部单点早退——先于黑名单拦截、缓存、广告检测、命令分发的一切治理逻辑。频道自动转发帖不是群成员发言，一律不删、不缓存、不检测、不当命令。
+
+**不牵连的场景**：真人以本群匿名管理员身份发言（`sender_chat.id === chat.id`）、真人用外部频道身份发广告（没有 `is_automatic_forward` 标记）——这两类没有该标记，行为不变。
+
+**无需清库**：本条修复只改运行时判定，不涉及历史 D1 数据，升级后 `wrangler deploy` 一次即可，不必执行任何 SQL。
+
 ## License
 
 本项目沿用原项目 MIT License。

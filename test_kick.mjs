@@ -7689,6 +7689,38 @@ console.log('\n[97] 服务消息不进清扫缓存');
 			callsOf('deleteMessage').length === 0 && callsOf('banChatMember').length === 0);
 	}
 
+	// 真实自动转发帖:Telegram 用 from=777000（服务账号，is_bot 为 falsy）+ sender_chat（来源频道）
+	// + is_automatic_forward=true 投递到关联讨论群。它有 from 且非 bot、有正文、无服务消息字段，
+	// 会穿过 handleMessage 顶部早退进入广告检测；resolveAdIdentityProfile 把 sender_chat（频道）
+	// 当检测对象，频道名一旦像广告就删掉这条转发帖 —— 被删的若正是被置顶那条，Telegram 自动取消置顶。
+	// 这是用户实测「频道置顶被机器人删除并取消」的真实成因（旧 [97] 用例没带 from，靠早退侥幸挡住，未暴露）。
+	// 用【会命中广告身份判据的频道名】做最强验证：即便内容像广告，自动转发帖也绝不被治理。
+	{
+		resetCalls();
+		const afDb = makeAdD1({ identity: ['约炮'] });
+		const afEnv = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', MSG_CACHE_ENABLED: 'true', AD_FILTER_ENABLED: 'true', DB: afDb };
+		sandbox.fetch = adFetchMock();
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: {
+				message_id: 9201,
+				chat: { id: -1001, type: 'supergroup', title: '关联讨论群' },
+				from: { id: 777000, is_bot: false, first_name: 'Telegram' },
+				sender_chat: { id: -1009999999, type: 'channel', title: '约炮资源频道', username: 'adchannel' },
+				is_automatic_forward: true,
+				text: '约炮资源 加频道看',
+			} }),
+		}), afEnv, fakeCtxAd);
+		assert('频道自动转发:带 from=777000 的广告身份转发帖不被删除',
+			callsOf('deleteMessage').length === 0);
+		assert('频道自动转发:不封禁来源频道或服务账号',
+			callsOf('banChatMember').length === 0 && !afDb._rows.has('777000') && !afDb._rows.has('-1009999999'));
+		const afCache = afDb._store.get('moderation_messages');
+		const afRecent = afDb._store.get('recent_messages');
+		assert('频道自动转发:不进清扫缓存也不进疑似广告缓存',
+			!afCache && !afRecent);
+	}
+
 	sandbox.fetch = savedFetch;
 }
 
