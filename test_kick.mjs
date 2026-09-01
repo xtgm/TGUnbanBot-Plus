@@ -7572,6 +7572,126 @@ console.log('\n[96] 动态群组管理');
 		!targets.includes('not-a-group') && targets.includes('-1003904078173'), JSON.stringify(targets));
 }
 
+// ---------- [97] 服务消息不进清扫缓存（置顶不被取消） ----------
+// 用户反馈：任何有置顶权限的管理员置顶任意消息，该置顶都会被本项目删除并取消。
+// 根因：Telegram 推送的 pinned_message 服务消息，from 是置顶者、message_id 是服务消息
+// 自身；旧缓存条件只排除 bot 与斜杠命令，服务消息没有 text 所以照样被写进
+// moderation_messages。之后该用户一旦被 /spam 引用清扫或 /ad 投票通过，清扫会删掉这条
+// 服务消息 —— 删除 pinned_message 服务消息在群里的表现正是「取消置顶」。
+// 本项目只应对自己发出的投票卡片做 pin/unpin，绝不碰群里其它置顶。
+console.log('\n[97] 服务消息不进清扫缓存');
+{
+	const savedFetch = sandbox.fetch;
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '测试群', type: 'supergroup' } }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const db = makeFakeDB([]);
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', MSG_CACHE_ENABLED: 'true', DB: db };
+	const post = (message) => handler.fetch(new Request('https://x.com/', {
+		method: 'POST', body: JSON.stringify({ message }),
+	}), env, fakeCtxAd);
+
+	// 管理员置顶一条消息 → Telegram 推送 pinned_message 服务消息
+	resetCalls();
+	await post({
+		message_id: 8800,
+		chat: { id: -1001, type: 'supergroup', title: '测试群' },
+		from: { id: 555, is_bot: false, first_name: '置顶管理员' },
+		pinned_message: { message_id: 8790, chat: { id: -1001, type: 'supergroup' }, from: { id: 777, is_bot: false }, text: 'test' },
+	});
+	const modCache = db._store.get('moderation_messages');
+	const cachedIds = modCache ? (JSON.parse(modCache).items || []).map((it) => Number(it.mid)) : [];
+	assert('服务消息:置顶服务消息不写入 moderation_messages', !cachedIds.includes(8800), JSON.stringify(cachedIds));
+
+	// 同一用户的正常发言仍应缓存（不能因为修复而漏掉真实发言）
+	resetCalls();
+	await post({
+		message_id: 8801,
+		chat: { id: -1001, type: 'supergroup', title: '测试群' },
+		from: { id: 555, is_bot: false, first_name: '置顶管理员' },
+		text: '大家好',
+	});
+	const modCache2 = db._store.get('moderation_messages');
+	const cachedIds2 = modCache2 ? (JSON.parse(modCache2).items || []).map((it) => Number(it.mid)) : [];
+	assert('服务消息:同一用户的正常发言仍正常缓存', cachedIds2.includes(8801), JSON.stringify(cachedIds2));
+
+	// 入群/退群服务消息同样不得进缓存
+	resetCalls();
+	await post({
+		message_id: 8802,
+		chat: { id: -1001, type: 'supergroup', title: '测试群' },
+		from: { id: 556, is_bot: false, first_name: '路人' },
+		left_chat_member: { id: 778, is_bot: false, first_name: '离群者' },
+	});
+	const modCache3 = db._store.get('moderation_messages');
+	const cachedIds3 = modCache3 ? (JSON.parse(modCache3).items || []).map((it) => Number(it.mid)) : [];
+	assert('服务消息:退群服务消息不写入 moderation_messages', !cachedIds3.includes(8802), JSON.stringify(cachedIds3));
+
+	// 置顶【含广告词】的消息，置顶者不得被当成广告发布者处置
+	resetCalls();
+	const adDb = makeAdD1({ general: ['广告位招租'] });
+	const adEnvLocal = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: adDb };
+	sandbox.fetch = adFetchMock();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: {
+			message_id: 8810,
+			chat: { id: -1001, type: 'supergroup', title: '测试群' },
+			from: { id: 557, is_bot: false, first_name: '置顶管理员' },
+			pinned_message: { message_id: 8805, chat: { id: -1001, type: 'supergroup' }, from: { id: 779, is_bot: false }, text: '广告位招租 日入过千 联系我 @adseller123' },
+		} }),
+	}), adEnvLocal, fakeCtxAd);
+	assert('服务消息:置顶含广告词的消息，置顶者不被加黑',
+		!adDb._rows.has('557') && !adDb._rows.has('779'));
+	assert('服务消息:置顶含广告词的消息，不触发封禁', callsOf('banChatMember').length === 0);
+
+	// 频道关联群组：频道消息自动转发进群、以及这类消息被置顶，都不得进缓存或被处置。
+	// 频道身份发言用 sender_chat 而非 from，缓存条件要求 from 存在，天然被排除；
+	// 这里显式锁定该行为，防止将来有人放宽条件时把频道置顶重新拖进清扫范围。
+	{
+		const chDb = makeFakeDB([]);
+		const chEnv = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', MSG_CACHE_ENABLED: 'true', AD_FILTER_ENABLED: 'true', DB: chDb };
+		const CHANNEL_ID = -1009999999;
+		const chPost = (message) => handler.fetch(new Request('https://x.com/', {
+			method: 'POST', body: JSON.stringify({ message }),
+		}), chEnv, fakeCtxAd);
+
+		resetCalls();
+		// 频道消息自动转发到关联群
+		await chPost({
+			message_id: 9101,
+			chat: { id: -1001, type: 'supergroup', title: '测试群' },
+			sender_chat: { id: CHANNEL_ID, type: 'channel', title: '我的频道' },
+			is_automatic_forward: true,
+			text: '频道公告：本周活动开始',
+		});
+		// 该自动转发消息被管理员置顶
+		await chPost({
+			message_id: 9102,
+			chat: { id: -1001, type: 'supergroup', title: '测试群' },
+			from: { id: 558, is_bot: false, first_name: '置顶管理员' },
+			pinned_message: {
+				message_id: 9101,
+				chat: { id: -1001, type: 'supergroup' },
+				sender_chat: { id: CHANNEL_ID, type: 'channel', title: '我的频道' },
+				is_automatic_forward: true,
+				text: '频道公告：本周活动开始',
+			},
+		});
+		const chCache = chDb._store.get('moderation_messages');
+		const chIds = chCache ? (JSON.parse(chCache).items || []).map((it) => Number(it.mid)) : [];
+		assert('服务消息:频道自动转发消息与其置顶服务消息都不进清扫缓存',
+			!chIds.includes(9101) && !chIds.includes(9102), JSON.stringify(chIds));
+		assert('服务消息:频道关联群场景不触发删除与封禁',
+			callsOf('deleteMessage').length === 0 && callsOf('banChatMember').length === 0);
+	}
+
+	sandbox.fetch = savedFetch;
+}
+
 // ---------- 总结 ----------
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);

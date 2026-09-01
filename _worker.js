@@ -5503,6 +5503,8 @@ async function loadLearnSnapshot(env) {
 
 // 预筛:是否"疑似广告"消息(只缓存这些,省 D1 写入)
 function looksLikeAdCandidate(message) {
+	// 服务消息（置顶/入群/改群名等）不是用户发言，不进 /recent 学习候选。
+	if (isTelegramServiceMessage(message)) return false;
 	// 代理相关内容按用户口径整条绝对豁免，不进入 /recent 疑似广告缓存。
 	if (isProxyRelatedMessage(message)) return false;
 	// 名片(分享联系人)直接算疑似广告候选 —— 名片广告无 text,但内容藏在 contact 里
@@ -5579,7 +5581,36 @@ async function cacheRecentMessage(env, message) {
 
 // 当前群清扫缓存：保存普通用户近期消息 ID，供 /spam 引用回复时清扫该用户当前群近期消息。
 // 与 recent_messages 分开，避免 /recent 学习列表被普通聊天污染。
+// Telegram 服务消息（置顶/入群/退群/改群名等）不是用户发言，绝不能进清扫缓存。
+// 根因案例：管理员置顶任意消息时，Telegram 推送一条 pinned_message 服务消息，
+// 它的 from 是置顶者、message_id 是服务消息自身。旧逻辑只排除 bot 与斜杠命令，
+// 服务消息没有 text 所以照样被写进 moderation_messages；之后该用户一旦被
+// /spam 引用清扫或 /ad 投票通过，清扫会删掉这条服务消息 ——
+// 而删除置顶服务消息，Telegram 的表现正是【取消置顶】。
+// 本项目只应在投票流程里对自己发出的投票卡片做 pin/unpin，绝不碰群里其它置顶。
+const TELEGRAM_SERVICE_MESSAGE_KEYS = [
+	'pinned_message',
+	'new_chat_members', 'left_chat_member',
+	'new_chat_title', 'new_chat_photo', 'delete_chat_photo',
+	'group_chat_created', 'supergroup_chat_created', 'channel_chat_created',
+	'migrate_to_chat_id', 'migrate_from_chat_id',
+	'message_auto_delete_timer_changed',
+	'forum_topic_created', 'forum_topic_edited', 'forum_topic_closed', 'forum_topic_reopened',
+	'general_forum_topic_hidden', 'general_forum_topic_unhidden',
+	'video_chat_scheduled', 'video_chat_started', 'video_chat_ended', 'video_chat_participants_invited',
+	'proximity_alert_triggered', 'write_access_allowed', 'web_app_data',
+	'successful_payment', 'refunded_payment', 'users_shared', 'chat_shared',
+	'boost_added', 'chat_background_set', 'giveaway_created', 'giveaway_completed',
+];
+
+function isTelegramServiceMessage(message) {
+	if (!message || typeof message !== 'object') return false;
+	return TELEGRAM_SERVICE_MESSAGE_KEYS.some((key) => message[key] !== undefined && message[key] !== null);
+}
+
 async function cacheModerationMessage(env, message) {
+	// 双保险：即使调用点漏判，这里也拒绝服务消息进入清扫缓存。
+	if (isTelegramServiceMessage(message)) return;
 	if (!env.DB || !message?.message_id || !message?.from?.id) return;
 	try {
 		await ensureD1Table(env);
@@ -8456,10 +8487,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 
 	// 缓存配置群普通用户消息 ID，供 /spam 引用回复后只清扫当前群、该用户的近期消息。
+	// 必须排除服务消息（置顶/入群/改群名等）：它们不是用户发言，被缓存后会在清扫时
+	// 连带删除 —— 删掉 pinned_message 服务消息在群里就表现为「取消置顶」。
 	if (
 		env.DB && isConfiguredGroup(chatId) &&
 		message.from && !message.from.is_bot &&
 		message.message_id &&
+		!isTelegramServiceMessage(message) &&
 		!(text && text.startsWith('/'))
 	) {
 		if (ctx && typeof ctx.waitUntil === 'function') {
@@ -8484,7 +8518,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 	// 广告自动检测：普通成员发的疑似广告 → 删消息 + 加黑 + 全群踢 + 通知主人
 	// 在黑名单拦截之后、命令分发之前；管理员豁免
-	if (AD_FILTER_ENABLED && isConfiguredGroup(chatId) && message.from && !message.from.is_bot) {
+	// 服务消息（置顶/入群/改群名等）不是用户发言，不参与广告判定 ——
+	// 否则置顶一条含广告词的消息会让【置顶者】被当成广告发布者处置。
+	if (AD_FILTER_ENABLED && isConfiguredGroup(chatId) && message.from && !message.from.is_bot
+		&& !isTelegramServiceMessage(message)) {
 		// 先把 D1 自定义词库与学习样本 merge 进来(detectAd 之前)
 		await Promise.all([
 			mergeAdKeywordsFromD1(env),
