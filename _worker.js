@@ -168,13 +168,23 @@ const RECOMMENDED_AD_KEYWORDS = {
 	spam: [],
 	fraud: ['假' + '钞', '假' + '币', '代开' + '发票', '黑客' + '接单', '网' + '赚', '菠' + '菜',
 		'无' + '风险', '拍' + '单', '刷' + '信誉', '一单' + '无风险', '收' + '视频', '提供' + '设备',
-		'拍商家' + '码', '六' + '合彩', '世界杯' + '内幕', 'pc' + '28', '加群' + '手', '红包' + '福利'],
+		'拍商家' + '码', '六' + '合彩', '世界杯' + '内幕', 'pc' + '28', '加群' + '手', '红包' + '福利',
+		// 洗钱/资金类：实测漏杀话术"来洗钱 一天8K""来做小额洗钱 一小时三千"的核心词
+		'洗' + '钱', '洗' + '资', '过' + '账', '代' + '收款', '收' + '款码', '四方' + '支付',
+		// 查档/开盒类：实测 bot 引用广告"人人查查档""刑侦查档"的业务词，正常群聊不会出现
+		'查' + '档', '开' + '盒', '社工' + '库', '网' + '逃', '户' + '籍', '开房' + '记录',
+		'手机' + '定位', '身份证' + '反查', '微信' + '流水', '银行' + '流水', '通话' + '记录',
+		'口供' + '笔录', '名下' + '车辆', '司法' + '冻结', '立案' + '案情', '同住' + '记录',
+		'征信' + '报告', '实名' + '反查', '外卖' + '地址', '快递' + '地址', '车主' + '信息'],
 	// identity:只用于检测发言人"名字/简介",不碰正文。色情/赌博露骨话术。
 	//   注意:只放正常用户绝不会用的露骨词,不放链接/@/域名(那些会误杀双向bot/技术讨论)。
 	identity: ['出租' + '淫妻', '淫' + '妻', '性' + '奴', '约' + '炮', '裸' + '聊', '楼' + '凤',
 		'小' + '姐', '上门' + '服务', '特殊' + '服务', '援' + '交', '菠' + '菜', '博' + '彩',
 		'赌' + '场', '六' + '合彩', '时时' + '彩', '网' + '赌',
-		'看我' + '介绍', '看我' + '主页', '搞钱' + '找我', '正品水果' + '專卖店', '正品水果' + '专卖店'],
+		'看我' + '介绍', '看我' + '主页', '搞钱' + '找我', '正品水果' + '專卖店', '正品水果' + '专卖店',
+		// 查档/洗钱类身份词：这类账号常把业务直接写进名字或简介（"人人查查档""刑侦查档"），
+		// 正常用户绝不会用；identity 走直杀通路，严格模式下同样生效。
+		'查' + '档', '开' + '盒', '社工' + '库', '洗' + '钱', '代收' + '黑钱', '网' + '逃'],
 };
 
 // /recent 冻结快照 D1 表(供 /learnlast 按固定序号引用,根治序号漂移)
@@ -196,6 +206,27 @@ const AD_SIMILARITY_CONTAINMENT_THRESHOLD = 0.9;
 const AD_SIMILARITY_MAX_CANONICAL_LENGTH = 2000;
 const AD_SAMPLE_SCOPES = ['body', 'profile', 'quote'];
 const AD_RELAY_REPEAT_THRESHOLD = 2;
+
+// ===== 甲:账号信誉库查询缓存 =====
+// checkGkyGlobalBanAndPunish 原本只在 new_chat_members 触发,存量老号发言从不查 ——
+// 用户实测漏杀的号大多早就在群里。补到"发言时也查"后必须加缓存,否则每条消息一次外部请求。
+// 干净号 TTL 给得长(6 小时):绝大多数发言者是正常人,查一次就够,大幅压请求量。
+const GKY_REPUTATION_CACHE = new Map();
+const GKY_REPUTATION_CACHE_MAX = 500;
+const GKY_REPUTATION_HIT_TTL_MS = 30 * 60 * 1000;      // 命中广告库:30 分钟
+const GKY_REPUTATION_CLEAN_TTL_MS = 6 * 60 * 60 * 1000; // 干净号:6 小时
+const GKY_REPUTATION_FAIL_TTL_MS = 5 * 60 * 1000;       // 查询失败:5 分钟后可重试
+
+// ===== 乙:跨群刷屏检测 =====
+// 同一 TGID 在 ≥N 个不同配置群、时间窗内发出高度相似内容 → 刷屏广告。
+// 纯行为判据,不看文案写什么,改词/繁体/插空格都躲不掉。
+// 只对 looksLikeAdCandidate 命中的疑似消息记指纹(含链接/@提及/长数字/名片),
+// 正常闲聊完全不写库 —— 这是免费版 D1 每日 10 万写入额度下的关键成本闸门。
+const CROSS_GROUP_SPAM_WINDOW_MS = 30 * 60 * 1000;      // 时间窗 30 分钟
+const CROSS_GROUP_SPAM_DICE_THRESHOLD = 0.9;            // 比学习样本 0.82 更严
+const CROSS_GROUP_SPAM_HISTORY_LIMIT = 40;              // 单次最多回看 40 条历史
+const DEFAULT_CROSS_GROUP_SPAM_CHECK = false;           // 默认关,显式开才生效
+const DEFAULT_CROSS_GROUP_SPAM_MIN_GROUPS = 2;          // 跨 ≥2 群即判定
 const AD_VOTE_THRESHOLD = 6;
 const AD_VOTE_DURATION_SECONDS = 60 * 60;
 const AD_VOTE_COMMAND_MAX_AGE_SECONDS = 30;
@@ -271,6 +302,8 @@ let AD_SCORE_THRESHOLD = 3;
 let AD_STRICT_MODE = false;      // 严格模式:关闭正文加权评分,只留强特征(A 开关)
 let GKY_ACTIVE_CHECK = false;    // 新成员进群主动查杀神全局库(B 方案)
 let GKY_SYNC_BLACKLIST = false;  // 杀神命中是否写入本项目 D1 黑名单(默认不写,两套库分开)
+let CROSS_GROUP_SPAM_CHECK = false;      // 乙:跨群刷屏检测总开关
+let CROSS_GROUP_SPAM_MIN_GROUPS = 2;     // 乙:跨几个群算刷屏
 let AD_KEYWORDS = [];          // 环境变量追加的自定义广告词
 let AD_WHITELIST = [];         // 白名单词(命中不计分)
 let AD_KEYWORDS_FINANCE = [];
@@ -310,6 +343,8 @@ function applyRuntimeConfig(config) {
 	AD_STRICT_MODE = config.AD_STRICT_MODE;
 	GKY_ACTIVE_CHECK = config.GKY_ACTIVE_CHECK;
 	GKY_SYNC_BLACKLIST = config.GKY_SYNC_BLACKLIST;
+	CROSS_GROUP_SPAM_CHECK = config.CROSS_GROUP_SPAM_CHECK;
+	CROSS_GROUP_SPAM_MIN_GROUPS = config.CROSS_GROUP_SPAM_MIN_GROUPS;
 	AD_KEYWORDS = config.AD_KEYWORDS;
 	AD_WHITELIST = config.AD_WHITELIST;
 	AD_KEYWORDS_FINANCE = config.AD_KEYWORDS_FINANCE;
@@ -545,6 +580,14 @@ function loadRequiredConfig(env) {
 	const adStrictMode = parseBool(env.AD_STRICT_MODE, DEFAULT_AD_STRICT_MODE);
 	const gkyActiveCheck = parseBool(env.GKY_ACTIVE_CHECK, DEFAULT_GKY_ACTIVE_CHECK);
 	const gkySyncBlacklist = parseBool(env.GKY_SYNC_BLACKLIST, DEFAULT_GKY_SYNC_BLACKLIST);
+	// 乙:跨群刷屏检测。默认关,其他部署者升级后行为零变化。
+	const crossGroupSpamCheck = parseBool(env.CROSS_GROUP_SPAM_CHECK, DEFAULT_CROSS_GROUP_SPAM_CHECK);
+	let crossGroupSpamMinGroups = DEFAULT_CROSS_GROUP_SPAM_MIN_GROUPS;
+	if (env.CROSS_GROUP_SPAM_MIN_GROUPS !== undefined && env.CROSS_GROUP_SPAM_MIN_GROUPS !== null
+		&& String(env.CROSS_GROUP_SPAM_MIN_GROUPS).trim() !== '') {
+		const n = parseInt(String(env.CROSS_GROUP_SPAM_MIN_GROUPS).trim(), 10);
+		if (Number.isInteger(n) && n >= 2) crossGroupSpamMinGroups = n;
+	}
 	let adScoreThreshold = DEFAULT_AD_SCORE_THRESHOLD;
 	if (env.AD_SCORE_THRESHOLD !== undefined && env.AD_SCORE_THRESHOLD !== null && String(env.AD_SCORE_THRESHOLD).trim() !== '') {
 		const n = parseInt(String(env.AD_SCORE_THRESHOLD).trim(), 10);
@@ -574,6 +617,8 @@ function loadRequiredConfig(env) {
 		AD_STRICT_MODE: adStrictMode,
 		GKY_ACTIVE_CHECK: gkyActiveCheck,
 		GKY_SYNC_BLACKLIST: gkySyncBlacklist,
+		CROSS_GROUP_SPAM_CHECK: crossGroupSpamCheck,
+		CROSS_GROUP_SPAM_MIN_GROUPS: crossGroupSpamMinGroups,
 		AD_KEYWORDS: adKeywords,
 		AD_WHITELIST: adWhitelist,
 		AD_KEYWORDS_FINANCE: lower(DEFAULT_AD_KEYWORDS_FINANCE),
@@ -799,7 +844,7 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 // 读取并归一化黑名单
 // === D1 工具函数 ===
 // 首次访问 D1 时建表（幂等），避免人工建表步骤
-const D1_SCHEMA_VERSION = 5;
+const D1_SCHEMA_VERSION = 6;
 const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
@@ -959,6 +1004,9 @@ async function ensureD1Table(env) {
 				['ad_samples', 'CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
 				['recent_messages', 'CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);'],
 				['moderation_messages', 'CREATE TABLE IF NOT EXISTS moderation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, from_id TEXT, created_at TEXT);'],
+				// 乙:跨群刷屏检测。只记 looksLikeAdCandidate 命中的疑似消息指纹,正常闲聊不入库。
+				// canonical 是 normalizeForAdSimilarity 洗掉链接/数字/@/金额后的骨架,供相似比对。
+				['cross_group_posts', 'CREATE TABLE IF NOT EXISTS cross_group_posts (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT, chat_id TEXT, fingerprint TEXT, canonical TEXT, created_at TEXT);'],
 				['learn_snapshot', 'CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
 				['batch_jobs', 'CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT);'],
 				// 动态群组：第一主人用 /addgroup 加进来的群。与 GROUP_ID 环境变量彻底分离
@@ -973,6 +1021,7 @@ async function ensureD1Table(env) {
 				['idx_blacklist_at_id', 'CREATE INDEX IF NOT EXISTS idx_blacklist_at_id ON blacklist(at, id);'],
 				['idx_blacklist_reason_at_id', 'CREATE INDEX IF NOT EXISTS idx_blacklist_reason_at_id ON blacklist(reason, at, id);'],
 				['idx_moderation_chat_from_id', 'CREATE INDEX IF NOT EXISTS idx_moderation_chat_from_id ON moderation_messages(chat_id, from_id, id);'],
+				['idx_cross_group_from_created', 'CREATE INDEX IF NOT EXISTS idx_cross_group_from_created ON cross_group_posts(from_id, created_at);'],
 			];
 			for (const [label, sql] of optionalIndexes) {
 				await runD1SchemaStatement(env, label, sql, { optional: true });
@@ -4580,6 +4629,173 @@ async function checkGkyGlobalBanAndPunish(userId, chat, env, ctx, options = {}) 
 	}
 }
 
+// 甲:带缓存的账号信誉查询。判断某 TGID 是否已被杀神全局库标记为广告号。
+// 缓存分三档 TTL:命中 30 分钟 / 干净 6 小时 / 查询失败 5 分钟。
+// 干净号 TTL 长是关键 —— 群里绝大多数发言者是正常人,查一次记 6 小时,把外部请求量压到极低。
+// 返回 true 表示"已确认是广告号"（缓存或实时查询）；其余情况一律 false（绝不误伤）。
+async function isGkyFlaggedSpammer(userId) {
+	const userIdStr = String(userId || '').trim();
+	if (!/^\d+$/.test(userIdStr)) return false;
+	const key = `${BOT_TOKEN}:${userIdStr}`;
+	const cached = GKY_REPUTATION_CACHE.get(key);
+	if (cached && cached.expiresAt > Date.now()) return cached.flagged === true;
+
+	let flagged = false;
+	let ttl = GKY_REPUTATION_FAIL_TTL_MS;
+	try {
+		const data = JSON.parse(await handleBanlist(userIdStr));
+		if (data && data.success) {
+			flagged = data.banned === true;
+			ttl = flagged ? GKY_REPUTATION_HIT_TTL_MS : GKY_REPUTATION_CLEAN_TTL_MS;
+		}
+	} catch (error) {
+		// 查询失败绝不误伤:按"未命中"处理,短 TTL 后可重试
+		console.error(`[信誉库] 查询失败 用户=${userIdStr}:`, error.message || error);
+	}
+
+	if (GKY_REPUTATION_CACHE.size >= GKY_REPUTATION_CACHE_MAX && !GKY_REPUTATION_CACHE.has(key)) {
+		const oldest = GKY_REPUTATION_CACHE.keys().next().value;
+		if (oldest !== undefined) GKY_REPUTATION_CACHE.delete(oldest);
+	}
+	GKY_REPUTATION_CACHE.set(key, { flagged, expiresAt: Date.now() + ttl });
+	return flagged;
+}
+
+// 甲:发言时的信誉检查。存量老号在群里发广告 —— 消息本身可能毫无广告特征
+// (实测:只发一条 @xxx_bot,GKY/nmBot 都杀了、本项目漏),但这个号在别的群已有前科。
+// 只对 looksLikeAdCandidate 命中的疑似消息查,正常闲聊不触发,免费版也不会撞额度。
+async function checkSpeakerReputationAndPunish(message, env, ctx) {
+	if (!GKY_ACTIVE_CHECK) return false;
+	const chat = message?.chat;
+	if (!chat || !isConfiguredGroup(chat.id)) return false;
+	if (!message.from || message.from.is_bot) return false;
+	if (isTelegramServiceMessage(message)) return false;
+	if (!looksLikeAdCandidate(message)) return false;
+
+	const userId = String(message.from.id || '');
+	if (!/^\d+$/.test(userId)) return false;
+	if (!(await isGkyFlaggedSpammer(userId))) return false;
+
+	return checkGkyGlobalBanAndPunish(userId, chat, env, ctx, {
+		user: message.from,
+		messageId: message.message_id,
+		trigger: '发言时信誉库命中',
+	});
+}
+
+// ===== 乙:跨群刷屏检测 =====
+// 判据:同一 TGID 在 ≥CROSS_GROUP_SPAM_MIN_GROUPS 个不同配置群、时间窗内发出高度相似内容。
+// 正常人不会在你好几个群贴几乎一样的话;广告号的投放方式必然如此 —— 这是行为特征,
+// 不是文案特征,所以改词、换繁体、插空格、加 emoji 全都躲不掉。
+// 成本闸门:只记 looksLikeAdCandidate 命中的疑似消息(含链接/@提及/长数字/名片),
+// 正常闲聊完全不写库,免费版 D1 每日 10 万写入额度下安全。
+async function checkCrossGroupSpamAndPunish(message, env, ctx) {
+	if (!CROSS_GROUP_SPAM_CHECK || !env.DB) return false;
+	const chat = message?.chat;
+	if (!chat || !isConfiguredGroup(chat.id)) return false;
+	if (!message.from || message.from.is_bot) return false;
+	if (isTelegramServiceMessage(message)) return false;
+	// 代理内容整条豁免,与项目既有口径一致
+	if (isProxyRelatedMessage(message)) return false;
+	// 只处理疑似消息:这是免费版额度的关键闸门
+	if (!looksLikeAdCandidate(message)) return false;
+
+	const userId = String(message.from.id || '');
+	if (!/^\d+$/.test(userId)) return false;
+
+	const bodyText = getAdDetectionBodyText(message);
+	const fingerprint = normalizeForFingerprint(bodyText);
+	const canonical = normalizeForAdSimilarity(bodyText);
+	// 太短的内容不参与:避免"在吗""好的"这类短句在多群出现被误判
+	if (canonical.length < AD_SIMILARITY_MIN_CANONICAL_LENGTH) return false;
+
+	const chatIdStr = String(chat.id);
+	const nowMs = Date.now();
+	const windowStart = new Date(nowMs - CROSS_GROUP_SPAM_WINDOW_MS).toISOString();
+
+	try {
+		await ensureD1Table(env);
+		// 查该号在时间窗内、其它群的历史指纹
+		const { results } = await env.DB.prepare(
+			'SELECT chat_id, fingerprint, canonical FROM cross_group_posts WHERE from_id = ? AND created_at >= ? ORDER BY id DESC LIMIT ?'
+		).bind(userId, windowStart, CROSS_GROUP_SPAM_HISTORY_LIMIT).all();
+
+		// 统计"内容相似且群不同"的命中群集合
+		const matchedGroups = new Set([chatIdStr]);
+		const currentSignature = { version: AD_SIMILARITY_SIGNATURE_VERSION, canonical };
+		for (const row of results || []) {
+			const rowChatId = String(row?.chat_id || '');
+			if (!rowChatId || rowChatId === chatIdStr) continue;
+			// 指纹完全相同 → 直接算命中(同一条广告原文)
+			if (fingerprint && String(row?.fingerprint || '') === fingerprint) {
+				matchedGroups.add(rowChatId);
+				continue;
+			}
+			// 骨架高度相似 → 算命中(换了链接/金额/@账号的变体)
+			const rowCanonical = String(row?.canonical || '');
+			if (rowCanonical.length < AD_SIMILARITY_MIN_CANONICAL_LENGTH) continue;
+			const metrics = compareAdSimilaritySignatures(currentSignature, {
+				version: AD_SIMILARITY_SIGNATURE_VERSION,
+				canonical: rowCanonical,
+			});
+			if (metrics.shared >= AD_SIMILARITY_MIN_SHARED_SHINGLES
+				&& metrics.dice >= CROSS_GROUP_SPAM_DICE_THRESHOLD) {
+				matchedGroups.add(rowChatId);
+			}
+		}
+
+		// 记录本条(无论是否达阈值,后续消息要靠它比对)
+		const insertResult = await env.DB.prepare(
+			'INSERT INTO cross_group_posts (from_id, chat_id, fingerprint, canonical, created_at) VALUES (?, ?, ?, ?, ?)'
+		).bind(userId, chatIdStr, fingerprint, canonical, new Date(nowMs).toISOString()).run();
+		if (shouldPruneD1Cache(insertResult)) {
+			await env.DB.prepare('DELETE FROM cross_group_posts WHERE created_at < ?')
+				.bind(new Date(nowMs - CROSS_GROUP_SPAM_WINDOW_MS * 4).toISOString())
+				.run();
+		}
+
+		if (matchedGroups.size < CROSS_GROUP_SPAM_MIN_GROUPS) return false;
+
+		// 管理员豁免:防误伤在多群发同一条公告的管理员
+		if (await checkIfUserIsAdmin(userId)) {
+			console.log(`[跨群刷屏] 命中但为管理员,豁免: ${userId}`);
+			return false;
+		}
+
+		console.log(`[跨群刷屏] 命中: 用户=${userId} 群数=${matchedGroups.size} 群=${[...matchedGroups].join(',')}`);
+		await deleteMessage(chat.id, message.message_id);
+		// 这是本项目自己的判定(不是第三方数据),按用户口径写入 D1 黑名单
+		const blacklistResult = await addToBlacklist(userId, env, {
+			reason: 'cross_group_spam',
+			by: 'system',
+			note: `跨群刷屏:${matchedGroups.size} 个群发相似内容`,
+		});
+		const banResults = await banUserFromAllGroups(userId, { revokeMessages: true });
+
+		if (OWNER_IDS.length) {
+			const okCount = banResults.filter((r) => r.ok).length;
+			const target = formatUserMention(message.from) || `<code>${escapeHtml(userId)}</code>`;
+			const lines = [
+				'🌐 <b>跨群刷屏广告处置</b>',
+				`🎬 触发:同一账号在 ${matchedGroups.size} 个配置群发出高度相似内容`,
+				`🎯 用户:${target} <code>${escapeHtml(userId)}</code>`,
+				`📍 命中群:${escapeHtml([...matchedGroups].join(', '))}`,
+				`📝 内容预览:${escapeHtml(bodyText.slice(0, 120))}`,
+				blacklistResult?.success
+					? '✅ 已写入 D1 黑名单(cross_group_spam)'
+					: (blacklistResult?.code === 'EXISTS' ? 'ℹ️ 已在 D1 黑名单,本次继续全群封禁' : `⚠️ D1 写入:${escapeHtml(blacklistResult?.message || '失败')}`),
+				`🚫 全群封禁/预封 ${okCount}/${banResults.length}`,
+			];
+			await notifyAllOwners(lines.join('\n'), null);
+		}
+		return true;
+	} catch (error) {
+		// 任何异常一律放行,绝不因检测故障误伤或阻断消息处理
+		console.error('[跨群刷屏] 检测异常:', error.message || error);
+		return false;
+	}
+}
+
 // 新成员进群(真人)批量查杀神全局库。bot 由 handleNewChatMemberBots 单独处理,这里跳过 bot。
 async function handleNewMemberGkyCheck(message, env, ctx) {
 	if (!GKY_ACTIVE_CHECK) return;
@@ -6110,7 +6326,30 @@ function isProxyRelatedMessage(message) {
 		scanText = scanText.normalize('NFKC');
 	} catch (_) {}
 	if (!scanText) return false;
+	// 「代理」是技术与广告的歧义词：技术语境指网络代理（搭代理/代理节点），
+	// 广告语境指商业代理（招代理/代理加盟/长期招代理）。PROXY_CONTENT_PATTERNS 含裸词
+	// 「代理/订阅/节点」，广告号只要写「长期招代理」就能拿到整条永久免疫 ——
+	// 实测查档广告「人人查查档…长期招代理…司法冻结 网逃 手机定位」正因此被全量放行。
+	// 资料卡路径（detectProfileAdEvidence）早已有这层例外，此处为正文路径补齐，两边口径一致。
+	// 纯技术代理讨论不含这些商业招募/违法业务结构，仍完全豁免。
+	if (isCommercialAgentOrIllegalBiz(scanText)) return false;
 	return PROXY_CONTENT_PATTERNS.some((pattern) => pattern.test(scanText)) || hasProxyEndpointSyntax(scanText);
+}
+
+// 商业代理招募 或 违法业务标的：命中则不给代理豁免。
+// 与 detectProfileAdEvidence 里的 adServiceSolicitation / agentRecruitment 同源判据。
+function isCommercialAgentOrIllegalBiz(text) {
+	const scan = String(text || '');
+	// ① 广告服务招揽：含广告/推广/引流/招商 且 含招募/承接/出售/投放/加盟/佣金/日结等
+	const adServiceSolicitation = /(?:广告|推广|引流|招商)/i.test(scan)
+		&& /(?:招|承接|出售|售卖|代发|投放|加盟|佣金|返利|日入|月入|日结|结算|接单)/i.test(scan);
+	// ② 商业代理招募句式：招代理 / 代理加盟 / 一手代理 等（技术语境不会这样说）
+	const agentRecruitment = /(?:招|收|诚招|招募|寻|找|长期)\s*(?:各级|一级|二级|总)?代理/i.test(scan)
+		|| /代理\s*(?:加盟|入驻|分成|佣金|返点|返利|日结|月结|合作(?:伙伴)?)/i.test(scan)
+		|| /(?:一手|全国|长期)\s*代理(?:商)?/i.test(scan);
+	// ③ 违法业务标的：洗钱/查档/开盒类业务词，与代理技术讨论毫无交集
+	const illegalBiz = /(?:洗\s*钱|洗\s*资|跑\s*分|水\s*房|四方支付|查\s*档|开\s*盒|社工库|网\s*逃|户\s*籍|开房记录|手机定位|身份证反查|微信流水|银行流水|通话记录|口供笔录|名下车辆|司法冻结|征信报告|实名反查)/i.test(scan);
+	return adServiceSolicitation || agentRecruitment || illegalBiz;
 }
 
 function hasQuoteLikeStructure(message) {
@@ -6146,6 +6385,11 @@ function summarizeQuoteStructures(message) {
 	};
 }
 
+// 正常短回复白名单：群里对任意消息的常见即时反应，绝不能被当成"引用广告包装"。
+// 与 isHarmlessAccidentalQuoteReply 的词表同源，额外补入实测中出现的正常反应词
+// （牛逼/厉害/可以/卧槽/666 等）——单独出现只是情绪表达，不构成广告传播意图。
+const HARMLESS_SHORT_REPLY_PATTERN = /^(?:好的?|谢谢|谢了|多谢|收到|嗯+|哦+|噢+|啊+|哈+|呵+|啥|什么|这是什么|怎么了|怎么回事|为什么|真的吗?|是吗|对吗|可以|行|好吧|算了|牛逼|牛批|牛|厉害|强|6+|草|卧槽|我去|离谱|绝了|懂了|明白|知道了|没事|不用|不客气|辛苦了|加油|晚安|早|在吗?|来了|[?？!！。.…~]+)$/i;
+
 function isShortQuoteWrapperText(text) {
 	const raw = String(text || '')
 		.replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '')
@@ -6153,10 +6397,17 @@ function isShortQuoteWrapperText(text) {
 	if (!raw) return true;
 	const normalized = normalizeForFingerprint(raw);
 	if (!normalized) return true;
-	// 只把 t/k/1/ok 这类无意义 ASCII 包装当作"引用广告包装"。
-	// 正常中文短回复(如"那还挺好的""好的谢谢")不能触发引用广告封禁。
-	if (!/^[a-z0-9]+$/i.test(normalized)) return false;
-	return normalized.length <= 8 && /^[a-z0-9\W_]{1,16}$/i.test(raw);
+	// 正常短回复一律不算包装（先于长度判定，中英文都适用）。
+	if (HARMLESS_SHORT_REPLY_PATTERN.test(raw)) return false;
+	// ASCII 无意义包装（t/k/1/ok/p 之类）：保持原有 ≤8 字规则不变。
+	if (/^[a-z0-9]+$/i.test(normalized)) {
+		return normalized.length <= 8 && /^[a-z0-9\W_]{1,16}$/i.test(raw);
+	}
+	// 非 ASCII（含中文）包装：实测广告号用"射了""牛比"这类极短中文当外壳，把广告藏进引用框
+	// 规避正文检测（GKY/nmBot 能杀、本项目漏杀的正是这类）。放宽到归一化 ≤4 字 ——
+	// 比 ASCII 的 8 字更严，且已先过白名单，正常中文短回复（好的/谢谢/牛逼/卧槽…）不会命中。
+	// 仍需引用内容【高置信命中广告】才会真正处置，本函数只判"外层是否像包装"。
+	return normalized.length <= 4;
 }
 
 function isHighConfidenceQuotedAdEvidence(quoteAd) {
@@ -6415,7 +6666,7 @@ function detectNakedBotMentionSpam(text) {
 	const value = String(text || '').trim();
 	if (!value) return null;
 	const botMentions = [...value.matchAll(/@[a-z][\w]{2,}bot\b/gi)].map((m) => m[0]);
-	if (botMentions.length < 2) return null;
+	if (botMentions.length < 1) return null;
 	let residue = value.replace(/@[a-z][\w]{2,}/gi, '');
 	try {
 		residue = residue.replace(/[\s\p{P}\p{S}]/gu, '');
@@ -6698,9 +6949,16 @@ function detectQuotedAdEvidence(message, quoteText) {
 	}
 
 	const highRiskHits = scoreHighRiskAdWords(quoteForScan);
+	// 纯露骨色情内容自证广告：≥2 个色情高危词同时命中时，内容本身就是广告载体，
+	// 不再要求额外的招揽意图（联系方式/价格/招揽动作）。
+	// 实测漏杀形态：外层"射了" + 引用框里整段露骨描述 —— 描述里没有任何联系方式，
+	// analyzeQuotedHighRiskIntent 因此判 isPromotional=false，把这条高置信广告放过了。
+	// 正常用户不会在群里发这类整段露骨描述，且要求 ≥2 词、且已排除举报/受害语境，误杀面极低。
+	const pornHitCount = highRiskHits.filter((hit) => String(hit).startsWith('色情:')).length;
+	const selfEvidentPorn = pornHitCount >= 2 && !hasExplicitNormalAdContext(quoteForScan);
 	if (highRiskHits.length > 0) {
 		const intent = analyzeQuotedHighRiskIntent(quoteForScan, highRiskHits);
-		if (!intent.isPromotional) {
+		if (!intent.isPromotional && !selfEvidentPorn) {
 			logQuoteAdDiagnostic(message, quoteText, {
 				decision: intent.contextHits.length > 0 ? 'quote_high_risk_normal_context' : 'quote_high_risk_without_ad_intent',
 				score: 0,
@@ -6840,6 +7098,31 @@ async function detectAdLegacy(message, env) {
 			score: 99,
 			hits: [`裸@bot串:${nakedBotSpam.botCount} 个(不同 ${nakedBotSpam.distinct} 个)、正文无其它内容 → ${nakedBotSpam.preview}`],
 			strong: '裸@bot串(协议号触发广告)',
+		};
+	}
+
+	// 强特征 1.45:违法业务三要素直杀 —— 不依赖单个词的分值，只看【结构】。
+	//   实测漏杀："来做小额洗钱 一小时三千 @zhifu86""来做洗钱 每天8千 @xianghuo"
+	//   单个"洗钱"只有 2 分、阈值 3，差 1 分永远漏；靠堆词凑分不可靠（换个措辞就失效）。
+	//   真实结构恒定为三要素：① 违法业务标的 ② 收益/价格承诺 ③ 触达入口（@账号/链接/加我）。
+	//   三者同时出现才判定 —— 正常人不会同时说"洗钱""一小时三千""@某账号"。
+	//   与资料卡的商业三槽判定同源，区别是这里的业务标的限定为【违法类】，
+	//   所以只要两要素（标的+收益 或 标的+入口）即可，无需三者全齐。
+	//   作为强特征，在 AD_STRICT_MODE 下同样生效（加权分类词在严格模式下不计分）。
+	const illegalBizScan = fullText;
+	const hasIllegalOffering = /(?:洗\s*钱|洗\s*资|过\s*账|跑\s*分|水\s*房|承\s*兑|四方支付|代收款|收款码|查\s*档|开\s*盒|社工库|网\s*逃|户\s*籍|开房记录|手机定位|身份证反查|微信流水|银行流水|通话记录|口供笔录|名下车辆|司法冻结|征信报告|实名反查)/i.test(illegalBizScan);
+	const hasRevenuePromise = /(?:日\s*入|月\s*入|一天|每天|一小时|每小时|日\s*结|月\s*结|佣\s*金|返\s*利|分\s*成|提\s*成|收\s*益|赚\s*钱|一单|每单|\d+\s*[kK万千百]|[一二三四五六七八九十百千万]+\s*[kK千万]|\d+\s*(?:元|块|u\b|usdt))/i.test(illegalBizScan);
+	const hasReachEntry = /(?:@[a-z][\w]{2,}|https?:\/\/|t\.me\/|telegram\.me\/|加\s*我|联\s*系|私\s*聊|私\s*信|详\s*聊|咨\s*询|微\s*信|vx|来\s*找我)/i.test(illegalBizScan);
+	if (hasIllegalOffering && (hasRevenuePromise || hasReachEntry)) {
+		const bizHits = [];
+		if (hasIllegalOffering) bizHits.push('违法业务标的');
+		if (hasRevenuePromise) bizHits.push('收益/价格承诺');
+		if (hasReachEntry) bizHits.push('触达入口');
+		return {
+			isAd: true,
+			score: 99,
+			hits: [`违法业务结构:${bizHits.join('+')}`],
+			strong: '违法业务三要素(洗钱/查档类)',
 		};
 	}
 
@@ -8284,6 +8567,35 @@ async function handleAutomaticAdDecision(message, adResult, env) {
 	const quoteAd = adResult?.quoteAd || null;
 	if (!directAd && !quoteAd) return false;
 
+	// 发消息的是 bot（协议号 @ 出来的广告投放 bot）：只删消息 + 处置【被引用的原作者】，
+	// 绝不把 bot 自己写进黑名单或封禁 —— 群里正常的双向/工具 bot 必须零影响。
+	// 实测形态：协议号发一条纯 @xxx_bot，该 bot 随即【引用】它并在【自己正文】里发查档广告。
+	// 注意判据方向：广告在 bot 的正文（directAd），引用框里只是那条无害的 @xxx_bot，
+	// 所以这里必须看 directAd，不能看 quoteAd —— 引用内容永远不会命中广告。
+	const senderIsBot = message?.from?.is_bot === true;
+	if (senderIsBot) {
+		// bot 正文本身必须命中广告；仅有引用结构、正文正常的 bot 消息一律放行。
+		if (!directAd) return false;
+		const deleteResult = await deleteMessage(message.chat.id, message.message_id);
+		const botQuoteAuthors = collectOriginalAuthors(message, 'quote');
+		const originalResults = [];
+		for (const candidate of botQuoteAuthors) {
+			if (String(candidate.id) === String(message.from.id)) continue;
+			originalResults.push(await enforceAutomaticAdTarget(candidate, env));
+		}
+		await notifyOwnerAdRelayObservation(message, adResult, {
+			deleteResult,
+			observation: null,
+			immediateRelayBan: false,
+			relayDecision: { shouldBan: false, mode: 'bot_relay', reason: 'bot 正文发广告并引用协议号消息，只处置被引用的原作者，不处置 bot' },
+			currentResult: null,
+			quoteAuthors: botQuoteAuthors,
+			originalAuthorBanSafe: true,
+			originalResults,
+		});
+		return true;
+	}
+
 	const currentId = String(message?.from?.id || '');
 	if (!/^\d+$/.test(currentId)) return false;
 	if (await checkIfUserIsAdmin(currentId)) return false;
@@ -8462,6 +8774,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 	}
 
+	// 甲:发言时查账号信誉库(跨群发现)。存量老号在群里发广告时,消息本身可能毫无广告特征,
+	// 但这个号在别的群已被标记过 —— 这是"某个号在别的群发过广告就被全局标记"的实现。
+	// 只对疑似消息查 + 结果缓存,不看文案内容,零正则、无误封面。
+	if (await checkSpeakerReputationAndPunish(message, env, ctx)) return;
+
+	// 乙:跨群刷屏检测(用自己的配置群做跨群发现)。同一号在 ≥N 个群发相似内容 → 广告。
+	// 纯行为判据,改词/繁体/插空格都躲不掉;只记疑似消息指纹,免费版 D1 额度安全。
+	if (await checkCrossGroupSpamAndPunish(message, env, ctx)) return;
+
 	// /add_ad_admin、/del_ad_admin：第一主人管理 /ad 发起白名单。
 	if (text && /^\/(add_ad_admin|del_ad_admin)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
@@ -8541,7 +8862,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 在黑名单拦截之后、命令分发之前；管理员豁免
 	// 服务消息（置顶/入群/改群名等）不是用户发言，不参与广告判定 ——
 	// 否则置顶一条含广告词的消息会让【置顶者】被当成广告发布者处置。
-	if (AD_FILTER_ENABLED && isConfiguredGroup(chatId) && message.from && !message.from.is_bot
+	// bot 发的消息【只在带引用时】参与：广告投放链条是"协议号发纯 @xxx_bot → 该 bot 引用它发广告"，
+	// 广告由 bot 发出，真正该处置的是被引用的协议号。handleAutomaticAdDecision 里对 bot
+	// 有专门分支：只删消息 + 处置被引用原作者，绝不处置 bot 自己，群里正常 bot 零影响。
+	const botRelayCandidate = message.from?.is_bot === true && hasQuoteLikeStructure(message);
+	if (AD_FILTER_ENABLED && isConfiguredGroup(chatId) && message.from
+		&& (!message.from.is_bot || botRelayCandidate)
 		&& !isTelegramServiceMessage(message)) {
 		// 先把 D1 自定义词库与学习样本 merge 进来(detectAd 之前)
 		await Promise.all([

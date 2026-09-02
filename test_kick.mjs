@@ -91,6 +91,9 @@ vm.createContext(sandbox);
 vm.runInContext(stripExportDefault(src), sandbox, { filename: '_worker.js' });
 
 const handler = sandbox.__handler;
+// 直接从 _worker.js 读取当前 schema 版本，避免测试写死数字后与实现脱节
+// （新增表必须升 D1_SCHEMA_VERSION 才能触发老部署迁移，此前写死 5 导致升级即报错）。
+const CURRENT_SCHEMA_VERSION = Number(src.match(/const D1_SCHEMA_VERSION = (\d+);/)?.[1] || 0);
 
 // ---------- 伪 D1 ----------
 function makeFakeDB(seed = [], options = {}) {
@@ -116,6 +119,7 @@ function makeFakeDB(seed = [], options = {}) {
 	const failSchemaSqlIncludes = Array.isArray(options.failSchemaSqlIncludes) ? options.failSchemaSqlIncludes.map((value) => String(value)) : [];
 	let recentSeq = Math.max(1, Number(options.recentSeq) || 1);
 	let moderationSeq = Math.max(1, Number(options.moderationSeq) || 1);
+	let crossGroupSeq = Math.max(1, Number(options.crossGroupSeq) || 1);
 	const syncBlacklist = () => {
 		store.set('blacklist', JSON.stringify([...rows.values()].map((r) => ({
 			id: String(r.id),
@@ -463,6 +467,29 @@ function makeFakeDB(seed = [], options = {}) {
 						setJson('recent_messages', data);
 						return { meta: { changes: 1, last_row_id: id } };
 					}
+					if (sql.startsWith('INSERT INTO cross_group_posts')) {
+						const [fromId, chatId, fingerprint, canonical, createdAt] = bound;
+						const data = getJson('cross_group_posts', { items: [] });
+						const id = crossGroupSeq++;
+						data.items.push({
+							id,
+							fromId: String(fromId),
+							chatId: String(chatId),
+							fingerprint: String(fingerprint || ''),
+							canonical: String(canonical || ''),
+							at: createdAt,
+						});
+						setJson('cross_group_posts', data);
+						return { meta: { changes: 1, last_row_id: id } };
+					}
+					if (sql.startsWith('DELETE FROM cross_group_posts WHERE created_at <')) {
+						const cutoff = String(bound[0]);
+						const data = getJson('cross_group_posts', { items: [] });
+						const before = data.items.length;
+						data.items = data.items.filter((it) => String(it.at) >= cutoff);
+						setJson('cross_group_posts', data);
+						return { meta: { changes: before - data.items.length } };
+					}
 					if (sql.startsWith('INSERT INTO moderation_messages')) {
 						const [mid, chatId, fromId, createdAt] = bound;
 						const data = getJson('moderation_messages', { items: [] });
@@ -567,6 +594,18 @@ function makeFakeDB(seed = [], options = {}) {
 							return { results: ordered.slice(offset, offset + limit) };
 						}
 						return { results: ordered };
+					}
+					if (sql.startsWith('SELECT chat_id, fingerprint, canonical FROM cross_group_posts')) {
+						const [fromId, windowStart, limitValue] = bound;
+						const limit = Number(limitValue) || 40;
+						const data = getJson('cross_group_posts', { items: [] });
+						return {
+							results: data.items
+								.filter((it) => String(it.fromId) === String(fromId) && String(it.at) >= String(windowStart))
+								.sort((a, b) => b.id - a.id)
+								.slice(0, limit)
+								.map((it) => ({ chat_id: it.chatId, fingerprint: it.fingerprint, canonical: it.canonical }))
+						};
 					}
 					if (sql.startsWith('SELECT mid FROM moderation_messages')) {
 						const [chatId, fromId, limitValue] = bound;
@@ -6239,7 +6278,7 @@ console.log('\n[81h] D1 schema v4 自动迁移与引用观察表按需自愈');
 			sticker: { file_id: 'schema-observation-sticker', emoji: '👍' }, reply_to_message: { message_id: scenario.actorId - 1, from: { id: scenario.actorId + 1, is_bot: false, first_name: '原广告作者' }, text: '📢 大婆啦 广告内容' },
 		} }) }), env, fakeCtxAd);
 		const ownerNotice = callsOf('sendMessage').find((call) => String(call.body.chat_id) === '999');
-		assert(`${scenario.label} → 自动升级或保持 schema v5`, db._schema.version === 5);
+		assert(`${scenario.label} → 自动升级或保持最新 schema`, db._schema.version === CURRENT_SCHEMA_VERSION);
 		assert(`${scenario.label} → 引用观察表按需补建且只执行一次专用 DDL`, db._schema.relayTableExists && !db._schema.voteTableExists && !db._schema.voteAllowlistTableExists && db._schema.schemaExecCount === 1);
 		assert(`${scenario.label} → 首次引用观察成功写入 D1`, db._relayObservations.get(String(scenario.actorId))?.occurrences === 1);
 		assert(`${scenario.label} → 主人通知显示观察次数 1、无缺表错误`, !!ownerNotice && ownerNotice.body.text.includes('观察次数:1') && !ownerNotice.body.text.includes('D1 观察记录失败'));
@@ -6270,7 +6309,7 @@ console.log('\n[81h2] D1 投票表独立迁移与失败阻断');
 		} }),
 	}), env, fakeCtxAd);
 	assert('旧 schema v3 的可选旧索引失败 → webhook 仍返回成功', response.status === 200);
-	assert('旧 schema v3 的可选旧索引失败 → 独立补建 D1 投票表与白名单表', db._schema.version === 5 && db._schema.voteTableExists && db._schema.voteAllowlistTableExists);
+	assert('旧 schema v3 的可选旧索引失败 → 独立补建 D1 投票表与白名单表', db._schema.version === CURRENT_SCHEMA_VERSION && db._schema.voteTableExists && db._schema.voteAllowlistTableExists);
 	assert('旧 schema v3 的可选旧索引失败 → /ad 仍成功写入 D1 投票', db._adVotes.size === 1 && callsOf('sendMessage').some((call) => call.body.text.includes('广告举报投票')));
 
 	resetCalls();
@@ -7783,6 +7822,363 @@ console.log('\n[97] 服务消息不进清扫缓存');
 	}
 
 	sandbox.fetch = savedFetch;
+}
+
+// ---------- [98] 方案C：协议号 @bot 投放链条与洗钱/查档话术查杀 ----------
+// 用户实测漏杀（GKY / nmBot 能杀、本项目漏）的四类真实形态：
+//   ① 协议号发【单个】纯 @xxx_bot（@RRCCD04_bot / @xchwh0254bot / @gtq77zhkbot）
+//      —— 旧 detectNakedBotMentionSpam 要求 ≥2 个 bot 才判，单个一律漏
+//   ② 该 bot 随即【引用】协议号那条消息，发出查档/色情广告
+//      —— 旧入口 !message.from.is_bot 让 bot 发的消息完全不进检测
+//   ③ 外层是极短【中文】包装（"射了"）+ 引用框里是色情广告
+//      —— 旧 isShortQuoteWrapperText 遇非 ASCII 直接 return false，引用通路不启动
+//   ④ 洗钱话术变体（"来做小额洗钱 一小时三千 @zhifu86"）
+//      —— "洗钱/查档"类词内置词库一个都没有
+console.log('\n[98] 协议号 @bot 投放链条与洗钱/查档话术');
+{
+	const chainRoutes = {
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '投放测试群', type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	};
+	const chainEnv = (db) => ({
+		TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002',
+		OWNER_IDS: '999', AD_FILTER_ENABLED: 'true', DB: db,
+	});
+	const post = async (message, db) => handler.fetch(new Request('https://x.com/', {
+		method: 'POST', body: JSON.stringify({ message }),
+	}), chainEnv(db), fakeCtxAd);
+
+	// ① 单个裸 @bot 用户名 → 直杀发送者（真实 4 例形态）
+	const nakedFailures = [];
+	for (const [i, botName] of ['@RRCCD04_bot', '@ZZZCCC04_bot', '@xchwh0254bot', '@gtq77zhkbot'].entries()) {
+		resetCalls();
+		sandbox.fetch = makeFetchMock(chainRoutes);
+		const db = makeAdD1();
+		const actorId = String(98400 + i);
+		await post({
+			message_id: 98400 + i,
+			chat: { id: -1001, type: 'supergroup', title: '投放测试群' },
+			from: { id: Number(actorId), is_bot: false, first_name: '协议号' },
+			text: botName,
+		}, db);
+		const ok = db._rows.get(actorId)?.reason === 'ad_auto'
+			&& callsOf('deleteMessage').some((c) => c.body.message_id === 98400 + i)
+			&& callsOf('banChatMember').length === 2;
+		if (!ok) nakedFailures.push(botName);
+	}
+	assert('单个裸 @bot 用户名 → 直接加黑并全群封禁发送者', nakedFailures.length === 0, nakedFailures.join(','));
+
+	// ① 反向：@bot 带正常说话内容 → 绝不误杀（保住既有 [85] 的保护）
+	resetCalls();
+	sandbox.fetch = makeFetchMock(chainRoutes);
+	let db = makeAdD1();
+	await post({
+		message_id: 98410,
+		chat: { id: -1001, type: 'supergroup', title: '投放测试群' },
+		from: { id: 98410, is_bot: false, first_name: '正常用户' },
+		text: '@somehelper_bot 帮我问一下这个怎么弄',
+	}, db);
+	assert('@bot 带正常说话内容 → 不加黑不删不封', !db._rows.has('98410') && callsOf('deleteMessage').length === 0 && callsOf('banChatMember').length === 0);
+
+	// ② bot 引用协议号消息发查档广告 → 处置被引用的协议号，绝不处置 bot 自己
+	resetCalls();
+	sandbox.fetch = makeFetchMock(chainRoutes);
+	db = makeAdD1();
+	await post({
+		message_id: 98420,
+		chat: { id: -1001, type: 'supergroup', title: '投放测试群' },
+		from: { id: 7000001, is_bot: true, first_name: '人人查查档04' },
+		text: '人人查查档包含多种查询业务-长期招代理\n司法冻结 网逃犯罪 手机定位 开房记录 微信流水\n人工咨询 @QNCCC1 双向联系 @renrencha001bot',
+		reply_to_message: {
+			message_id: 98419,
+			from: { id: 98421, is_bot: false, first_name: 'youlou Maya-Mae' },
+			text: '@RRCCD04_bot',
+		},
+	}, db);
+	assert('bot 引用发查档广告 → 删除该广告消息', callsOf('deleteMessage').some((c) => c.body.message_id === 98420));
+	assert('bot 引用发查档广告 → 绝不封禁 bot 自己', !db._rows.has('7000001') && !callsOf('banChatMember').some((c) => String(c.body.user_id) === '7000001'));
+
+	// ② 反向：群里正常 bot 的引用消息（非广告）→ 零处置
+	resetCalls();
+	sandbox.fetch = makeFetchMock(chainRoutes);
+	db = makeAdD1();
+	await post({
+		message_id: 98430,
+		chat: { id: -1001, type: 'supergroup', title: '投放测试群' },
+		from: { id: 7000002, is_bot: true, first_name: '正常工具Bot' },
+		text: '已收到你的反馈，编号 12345',
+		reply_to_message: {
+			message_id: 98429,
+			from: { id: 98431, is_bot: false, first_name: '普通用户' },
+			text: '帮我查一下进度',
+		},
+	}, db);
+	assert('正常 bot 的引用消息 → 不删不封零处置', callsOf('deleteMessage').length === 0 && callsOf('banChatMember').length === 0 && db._rows.size === 0);
+
+	// ③ 极短中文包装 + 引用框色情广告 → 杀当前传播者
+	resetCalls();
+	sandbox.fetch = makeFetchMock(chainRoutes);
+	db = makeAdD1({ porn: ['打桩', '冒白浆'] });
+	await post({
+		message_id: 98440,
+		chat: { id: -1001, type: 'supergroup', title: '投放测试群' },
+		from: { id: 98440, is_bot: false, first_name: 'Andrew Butler' },
+		text: '射了',
+		quote: { text: '高颜值眼镜御姐白嫩J跪趴翘臀受训，粉嫩白虎迎击猛烈打桩，浪叫冒白浆。' },
+	}, db);
+	assert('极短中文包装 + 引用色情广告 → 加黑并全群封禁传播者', db._rows.get('98440')?.reason === 'ad_auto' && callsOf('banChatMember').length === 2);
+
+	// ③ 反向：正常中文短回复引用普通消息 → 绝不误杀（白名单保护）
+	const replyFailures = [];
+	for (const [i, reply] of ['好的', '谢谢', '收到', '牛逼', '卧槽', '哈哈哈', '什么'].entries()) {
+		resetCalls();
+		sandbox.fetch = makeFetchMock(chainRoutes);
+		const rdb = makeAdD1({ finance: ['usdt'] });
+		const actorId = String(98450 + i);
+		await post({
+			message_id: 98450 + i,
+			chat: { id: -1001, type: 'supergroup', title: '投放测试群' },
+			from: { id: Number(actorId), is_bot: false, first_name: '正常用户' },
+			text: reply,
+			reply_to_message: { message_id: 98449, from: { id: 98460, is_bot: false, first_name: '群友' }, text: '大佬 冲usdc 还是usdt' },
+		}, rdb);
+		if (rdb._rows.has(actorId) || callsOf('banChatMember').length > 0) replyFailures.push(reply);
+	}
+	assert('正常中文短回复引用普通消息 → 一律不误杀', replyFailures.length === 0, replyFailures.join(','));
+
+	// ④ 洗钱话术变体 → 加黑并全群封禁
+	const launderFailures = [];
+	for (const [i, text] of [
+		'来做小额洗钱 一小时三千 @zhifu86',
+		'来做洗钱 每天8千 @xianghuo',
+		'来洗钱 一天8K',
+	].entries()) {
+		resetCalls();
+		sandbox.fetch = makeFetchMock(chainRoutes);
+		const ldb = makeAdD1();
+		const actorId = String(98470 + i);
+		await post({
+			message_id: 98470 + i,
+			chat: { id: -1001, type: 'supergroup', title: '投放测试群' },
+			from: { id: Number(actorId), is_bot: false, first_name: '洗钱号' },
+			text,
+		}, ldb);
+		if (ldb._rows.get(actorId)?.reason !== 'ad_auto' || callsOf('banChatMember').length !== 2) launderFailures.push(text);
+	}
+	assert('洗钱话术三种变体 → 全部加黑并全群封禁', launderFailures.length === 0, launderFailures.join(' | '));
+
+	// ④ 查档广告正文（协议号直接发，非 bot 引用）→ 加黑
+	resetCalls();
+	sandbox.fetch = makeFetchMock(chainRoutes);
+	db = makeAdD1();
+	await post({
+		message_id: 98480,
+		chat: { id: -1001, type: 'supergroup', title: '投放测试群' },
+		from: { id: 98480, is_bot: false, first_name: '查档号' },
+		text: '开房记录 手机定位 网逃 户籍 全都可查 联系 @chadang001',
+	}, db);
+	assert('查档业务正文 → 加黑并全群封禁', db._rows.get('98480')?.reason === 'ad_auto' && callsOf('banChatMember').length === 2);
+
+	// ④ 反向：正常技术/生活讨论含相近字样 → 不误杀
+	const normalFailures = [];
+	for (const [i, text] of [
+		'我昨天去派出所办了户籍迁移手续',
+		'手机定位功能怎么关掉啊 太耗电了',
+		'这个快递地址填错了 帮我改一下',
+	].entries()) {
+		resetCalls();
+		sandbox.fetch = makeFetchMock(chainRoutes);
+		const ndb = makeAdD1();
+		const actorId = String(98490 + i);
+		await post({
+			message_id: 98490 + i,
+			chat: { id: -1001, type: 'supergroup', title: '投放测试群' },
+			from: { id: Number(actorId), is_bot: false, first_name: '正常用户' },
+			text,
+		}, ndb);
+		if (ndb._rows.has(actorId) || callsOf('banChatMember').length > 0) normalFailures.push(text);
+	}
+	assert('正常生活讨论含查档相近字样 → 不误杀', normalFailures.length === 0, normalFailures.join(' | '));
+}
+
+// ---------- [99] 方案丙：跨群发现（信誉库发言时查 + 跨群刷屏检测）----------
+// 用户核心需求："某个号在别的群发过广告就被全局标记"。
+// 此前 checkGkyGlobalBanAndPunish 只在 new_chat_members 触发，存量老号发言从不查 ——
+// 实测漏杀的号大多早就在群里（图 5：只发一条 @xchwh0254bot，消息本身零广告特征，
+// GKY/nmBot 都杀了、本项目漏）。两条能力都不看文案内容，零正则、抗改词。
+console.log('\n[99] 跨群发现：信誉库发言查 + 跨群刷屏');
+{
+	const GKY_BANNED = '<strong>TGID:</strong> 99001<br><strong>ChatID:</strong> -1001<br><strong>Reason:</strong> SpamGP<br>';
+	const GKY_CLEAN = 'This TG account has no ban record';
+	const makeRepFetch = (bannedIds = []) => async function (url, init) {
+		const u = String(url);
+		if (u.includes('api.telegram.org')) {
+			const method = u.split('/').pop();
+			const body = init?.body ? JSON.parse(init.body) : null;
+			apiCalls.push({ method, body });
+			if (method === 'getChatAdministrators') return { ok: true, status: 200, async json() { return { ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }; } };
+			if (method === 'getChat') return { ok: true, status: 200, async json() { return { ok: true, result: { id: Number(body?.chat_id), title: '信誉测试群', type: 'supergroup' } }; } };
+			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
+		}
+		if (u.includes('banlist')) {
+			const tgid = new URL(u).searchParams.get('tgid');
+			apiCalls.push({ method: 'banlist', body: { tgid } });
+			return { ok: true, status: 200, async text() { return bannedIds.includes(String(tgid)) ? GKY_BANNED.replace('99001', String(tgid)) : GKY_CLEAN; } };
+		}
+		throw new Error('Unexpected fetch: ' + u);
+	};
+
+	// 甲-1：老号发言且信誉库有前科 → 全群封禁（消息本身无广告特征）
+	resetCalls();
+	sandbox.fetch = makeRepFetch(['99001']);
+	let db = makeAdD1();
+	let env = { TOKEN, BOT_TOKEN: '0:rep-1', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', GKY_ACTIVE_CHECK: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 99001, chat: { id: -1001, type: 'supergroup', title: '信誉测试群' }, from: { id: 99001, is_bot: false, first_name: '老号' }, text: '@xchwh0254bot' } }),
+	}), env, fakeCtxAd);
+	assert('甲：信誉库有前科的老号发言 → 全群封禁', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => String(c.body.user_id) === '99001'));
+	assert('甲：删除该消息', callsOf('deleteMessage').some((c) => c.body.message_id === 99001));
+	assert('甲：默认不写 D1（第三方数据独立记账）', !db._rows.has('99001'));
+
+	// 甲-2：干净号发疑似消息 → 查库但不处置
+	resetCalls();
+	sandbox.fetch = makeRepFetch([]);
+	db = makeAdD1();
+	env = { TOKEN, BOT_TOKEN: '0:rep-2', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', GKY_ACTIVE_CHECK: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 99010, chat: { id: -1001, type: 'supergroup' }, from: { id: 99010, is_bot: false, first_name: '正常用户' }, text: '这个 @somebot 挺好用的 大家试试' } }),
+	}), env, fakeCtxAd);
+	assert('甲：干净号 → 查了库但不封禁不加黑', callsOf('banlist').length >= 1 && callsOf('banChatMember').length === 0 && !db._rows.has('99010'));
+
+	// 甲-3：正常闲聊（非疑似）→ 完全不查库，零外部请求
+	resetCalls();
+	sandbox.fetch = makeRepFetch(['99020']);
+	db = makeAdD1();
+	env = { TOKEN, BOT_TOKEN: '0:rep-3', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', GKY_ACTIVE_CHECK: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 99020, chat: { id: -1001, type: 'supergroup' }, from: { id: 99020, is_bot: false, first_name: '闲聊用户' }, text: '今天天气不错' } }),
+	}), env, fakeCtxAd);
+	assert('甲：正常闲聊不触发信誉查询（免费版额度闸门）', callsOf('banlist').length === 0);
+
+	// 甲-4：开关关闭 → 完全不生效
+	resetCalls();
+	sandbox.fetch = makeRepFetch(['99030']);
+	db = makeAdD1();
+	env = { TOKEN, BOT_TOKEN: '0:rep-4', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: db };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 99030, chat: { id: -1001, type: 'supergroup' }, from: { id: 99030, is_bot: false, first_name: '广告号' }, text: '@somebot' } }),
+	}), env, fakeCtxAd);
+	assert('甲：GKY_ACTIVE_CHECK 关闭时零查询零处置', callsOf('banlist').length === 0 && callsOf('banChatMember').length === 0);
+
+	// 乙-1：同一号在 2 个群发相同内容 → 跨群刷屏，加黑 + 全群封禁
+	resetCalls();
+	sandbox.fetch = makeRepFetch([]);
+	db = makeAdD1();
+	env = { TOKEN, BOT_TOKEN: '0:cg-1', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', CROSS_GROUP_SPAM_CHECK: 'true', DB: db };
+	const spamText = '专业接单长期合作 详情私聊 @spamboss001 有需要的老板联系我';
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 99100, chat: { id: -1001, type: 'supergroup' }, from: { id: 99100, is_bot: false, first_name: '刷屏号' }, text: spamText } }),
+	}), env, fakeCtxAd);
+	assert('乙：第一个群仅记录不处置', !db._rows.has('99100') && callsOf('banChatMember').length === 0);
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 99101, chat: { id: -1002, type: 'supergroup' }, from: { id: 99100, is_bot: false, first_name: '刷屏号' }, text: spamText } }),
+	}), env, fakeCtxAd);
+	assert('乙：第二个群发相同内容 → 判定跨群刷屏并加黑', db._rows.get('99100')?.reason === 'cross_group_spam');
+	assert('乙：全群封禁并撤回历史发言', callsOf('banChatMember').length === 2 && callsOf('banChatMember').every((c) => c.body.revoke_messages === true));
+	assert('乙：删除当前消息', callsOf('deleteMessage').some((c) => c.body.message_id === 99101));
+
+	// 乙-2：换链接/金额/@账号的变体仍被相似度抓到（抗改词）
+	resetCalls();
+	sandbox.fetch = makeRepFetch([]);
+	db = makeAdD1();
+	env = { TOKEN, BOT_TOKEN: '0:cg-2', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', CROSS_GROUP_SPAM_CHECK: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 99110, chat: { id: -1001, type: 'supergroup' }, from: { id: 99110, is_bot: false, first_name: '变体号' }, text: '承接社群推广业务长期合作每月500元联系 @agentA001 详情看主页' } }),
+	}), env, fakeCtxAd);
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 99111, chat: { id: -1002, type: 'supergroup' }, from: { id: 99110, is_bot: false, first_name: '变体号' }, text: '承接社群推广业务长期合作每月900元联系 @agentB002 详情看主页' } }),
+	}), env, fakeCtxAd);
+	assert('乙：换金额换@账号的变体仍被跨群相似度抓到', db._rows.get('99110')?.reason === 'cross_group_spam');
+
+	// 乙-3：同一群内重复发 → 不算跨群，不处置
+	resetCalls();
+	sandbox.fetch = makeRepFetch([]);
+	db = makeAdD1();
+	env = { TOKEN, BOT_TOKEN: '0:cg-3', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', CROSS_GROUP_SPAM_CHECK: 'true', DB: db };
+	for (const mid of [99120, 99121, 99122]) {
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: { message_id: mid, chat: { id: -1001, type: 'supergroup' }, from: { id: 99120, is_bot: false, first_name: '同群重复' }, text: '我这边有资源需要的私聊我 @onlyone001 谢谢大家支持' } }),
+		}), env, fakeCtxAd);
+	}
+	assert('乙：同一群内重复发不算跨群 → 不处置', !db._rows.has('99120') && callsOf('banChatMember').length === 0);
+
+	// 乙-4：不同内容分别在两群发 → 不误判
+	resetCalls();
+	sandbox.fetch = makeRepFetch([]);
+	db = makeAdD1();
+	env = { TOKEN, BOT_TOKEN: '0:cg-4', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', CROSS_GROUP_SPAM_CHECK: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 99130, chat: { id: -1001, type: 'supergroup' }, from: { id: 99130, is_bot: false, first_name: '正常用户' }, text: '请问这个功能怎么开启啊 我看文档 @helper_bot 没写清楚' } }),
+	}), env, fakeCtxAd);
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 99131, chat: { id: -1002, type: 'supergroup' }, from: { id: 99130, is_bot: false, first_name: '正常用户' }, text: '刚才那个部署问题已经解决了 感谢 @someone123 的帮助' } }),
+	}), env, fakeCtxAd);
+	assert('乙：不同内容跨群发言 → 不误判', !db._rows.has('99130') && callsOf('banChatMember').length === 0);
+
+	// 乙-5：正常闲聊（非疑似）不入库，免费版额度闸门
+	resetCalls();
+	sandbox.fetch = makeRepFetch([]);
+	db = makeAdD1();
+	env = { TOKEN, BOT_TOKEN: '0:cg-5', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', CROSS_GROUP_SPAM_CHECK: 'true', DB: db };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 99140, chat: { id: -1001, type: 'supergroup' }, from: { id: 99140, is_bot: false, first_name: '闲聊' }, text: '大家早上好啊今天心情不错' } }),
+	}), env, fakeCtxAd);
+	assert('乙：正常闲聊不写 cross_group_posts（额度闸门）', !db._store.has('cross_group_posts'));
+
+	// 乙-6：开关关闭 → 完全不生效
+	resetCalls();
+	sandbox.fetch = makeRepFetch([]);
+	db = makeAdD1();
+	env = { TOKEN, BOT_TOKEN: '0:cg-6', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: db };
+	for (const [mid, chatId] of [[99150, -1001], [99151, -1002]]) {
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: { message_id: mid, chat: { id: chatId, type: 'supergroup' }, from: { id: 99150, is_bot: false, first_name: '刷屏号' }, text: '专业接单长期合作 详情私聊 @spamboss002 有需要的老板联系我' } }),
+		}), env, fakeCtxAd);
+	}
+	assert('乙：CROSS_GROUP_SPAM_CHECK 关闭时不写库不处置', !db._store.has('cross_group_posts') && !db._rows.has('99150'));
+
+	// 乙-7：代理内容跨群讨论 → 豁免（技术群常态）
+	resetCalls();
+	sandbox.fetch = makeRepFetch([]);
+	db = makeAdD1();
+	env = { TOKEN, BOT_TOKEN: '0:cg-7', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', CROSS_GROUP_SPAM_CHECK: 'true', DB: db };
+	const proxyText = 'socks5://user:pass@47.243.87.133:1080 这个节点延迟怎么样 大家测测';
+	for (const [mid, chatId] of [[99160, -1001], [99161, -1002]]) {
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: { message_id: mid, chat: { id: chatId, type: 'supergroup' }, from: { id: 99160, is_bot: false, first_name: '技术用户' }, text: proxyText } }),
+		}), env, fakeCtxAd);
+	}
+	assert('乙：代理内容跨群讨论 → 整条豁免不误判', !db._rows.has('99160') && callsOf('banChatMember').length === 0);
 }
 
 // ---------- 总结 ----------
