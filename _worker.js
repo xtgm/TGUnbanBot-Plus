@@ -3660,7 +3660,46 @@ async function handlePurge(env, url) {
 	return jsonResponse({ 成功: true, ...summary });
 }
 
+// 把 ISO 时间戳压成 "2026-09-02 23:40:47"（去掉 T、毫秒与结尾 Z）。
+// 保留到秒：同一分钟内批量加黑的多条记录靠秒数才能分出先后顺序。
+// 时区仍是 UTC（写入用的是 new Date().toISOString()），由渲染函数在末尾统一标注一次。
+function formatBlacklistTime(at) {
+	const raw = String(at || '').trim();
+	if (!raw) return '';
+	const m = raw.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+	return m ? `${m[1]} ${m[2]}` : raw;
+}
+
+// 把 by_user 字段翻译成可读的操作人标签。
+// 【刻意只做本地判断，不查 Telegram 昵称】translateBlacklistOperator 会为每个操作人调
+// 一次 getChat，30 条记录就是 30 次子请求，直接撞 Cloudflare 的子请求上限。这里只用
+// 本地已有的 OWNER_IDS / SUPER_ADMINS 与字段前缀判断角色，零 API 调用。
+// 需要昵称等完整信息时用 /check TGID，那条路径本来就只查一个人。
+function renderBlacklistOperator(byId) {
+	const raw = String(byId || '').trim();
+	if (!raw) return '未知';
+	if (raw === 'system') return '🤖 系统自动';
+
+	const anonymous = raw.match(/^anonymous_admin:(-?\d+)$/);
+	if (anonymous) {
+		return `🕵️ 匿名管理员（来源群 <code>${escapeHtml(anonymous[1])}</code>）`;
+	}
+
+	// 纯数字才是真实用户 ID，才能做 tg://user 跳转；其它形态原样展示避免生成死链接。
+	if (!/^\d+$/.test(raw)) return `<code>${escapeHtml(raw)}</code>`;
+
+	let roleTag = '👤 群管理员';
+	if (isPrimaryOwner(raw)) roleTag = '👑 主人';
+	else if (isSecondaryOwner(raw)) roleTag = '👤 副主人';
+	else if (SUPER_ADMINS.includes(raw)) roleTag = '🛡️ 超级管理员';
+	return `${roleTag} <a href="tg://user?id=${escapeHtml(raw)}">${escapeHtml(raw)}</a>`;
+}
+
 // 渲染黑名单为 HTML 文本（用于 /blacklist 命令展示）
+// 排版为「每条记录一段、字段各占一行」：旧版把 4 个字段用 " · " 拼成一行，
+// Telegram 按屏宽随机折行，长的 anonymous_admin:-100xxx 一出现整行就被撑爆，读起来很乱。
+// 竖排后折行位置固定，且记录之间的空行正好是 splitTelegramHtmlBlocks 的切分点，
+// 条数调大触发分块时不会把某一条记录劈成两半。
 function renderBlacklist(blacklist, options = {}) {
 	const limit = options.limit ?? BLACKLIST_PAGE_LIMIT;
 	const alreadyRecent = Boolean(options.alreadyRecent);
@@ -3672,25 +3711,30 @@ function renderBlacklist(blacklist, options = {}) {
 
 	const reasonLabels = BLACKLIST_REASON_LABELS;
 	const visible = alreadyRecent ? blacklist.slice(0, limit) : blacklist.slice(-limit).reverse(); // 最近添加的排前面
-	const limitedText = total > visible.length ? `，仅显示最近 ${visible.length} 条` : '';
+	const limitedText = total > visible.length ? ` · 显示最近 ${visible.length} 条` : '';
+	// 序号右对齐：两位数与一位数混排时左侧不会参差。
+	const indexWidth = String(visible.length).length;
 
-	let lines = [`📋 <b>当前黑名单</b>（共 ${total} 条${limitedText}）`, ''];
+	const lines = [`📋 <b>当前黑名单</b>（共 ${total} 条${limitedText}）`, ''];
 
-	for (const entry of visible) {
+	visible.forEach((entry, index) => {
+		const seq = String(index + 1).padStart(indexWidth, ' ');
 		const idLink = `<a href="tg://user?id=${escapeHtml(entry.id)}">${escapeHtml(entry.id)}</a>`;
-		const parts = [`• ${idLink}`];
+		const block = [`${seq}. TGID：${idLink}`];
 		if (entry.reason) {
-			parts.push(`原因：${escapeHtml(reasonLabels[entry.reason] || entry.reason)}`);
+			block.push(`　　原因：${escapeHtml(reasonLabels[entry.reason] || entry.reason)}`);
 		}
 		if (entry.by) {
-			parts.push(`操作人：<code>${escapeHtml(entry.by)}</code>`);
+			block.push(`　　操作人：${renderBlacklistOperator(entry.by)}`);
 		}
-		if (entry.at) {
-			parts.push(`时间：${escapeHtml(entry.at)}`);
+		const at = formatBlacklistTime(entry.at);
+		if (at) {
+			block.push(`　　时间：${escapeHtml(at)}`);
 		}
-		lines.push(parts.join(' · '));
-	}
+		lines.push(block.join('\n'), '');
+	});
 
+	lines.push('ℹ️ 时间为 UTC · 点 TGID 或操作人可直接打开该用户');
 	return lines.join('\n');
 }
 
@@ -3767,8 +3811,18 @@ function isSuperAdmin(userId) {
 	return SUPER_ADMINS.some((id) => id === idStr);
 }
 
+// 清掉会让 Telegram 直接返回 400 的非法字符。
+// 旧实现是 replace(/[\uD800-\uDFFF]/g, '')，把【所有】代理对码元一律删除 —— 但合法的
+// 星平面字符（U+10000 以上，几乎所有 emoji）在 JS 里正是以「高位代理 + 低位代理」这一对
+// 码元存储的，于是 📋🔐🗂️🤖🕵️🌐 等 emoji 会被整体抹掉，只在原位留下一个多余空格，
+// 而 ✅❌ℹ️ 这些落在 BMP 内的符号却安然无恙 —— 表现为 emoji 时有时无。
+// 真正非法的只有【孤立代理】：高位后面没跟低位，或低位前面没有高位。成对的必须保留。
 function sanitizeTelegramText(value) {
-	return String(value ?? '').replace(/[\uD800-\uDFFF]/g, '');
+	return String(value ?? '')
+		// 高位代理（U+D800~U+DBFF）后面没有紧跟低位代理 → 孤立，删掉
+		.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
+		// 低位代理（U+DC00~U+DFFF）前面不是高位代理 → 孤立，删掉（保留前一个字符）
+		.replace(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '$1');
 }
 
 function truncateTelegramText(value, maxLength) {
@@ -6417,6 +6471,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			getD1BlacklistCount(env),
 			readD1BlacklistRecent(env, BLACKLIST_PAGE_LIMIT)
 		]);
+		// 保持单条发送：分块函数的 sanitizeTelegramText 会剥离全部代理对码元（📋👑🕵️ 等
+		// emoji 全没），且阈值按 HTML 原文长度算（30 条原文 4823 字符 > 3500），会把本来
+		// 发得出去的一条消息无谓拆成两条。默认 30 条可见字符仅约 2790，远低于 Telegram
+		// 的 4096 上限，单条足够。若把 BLACKLIST_PAGE_LIMIT 调到 45 条以上再考虑分块。
 		await sendTelegramMessage(chatId, renderBlacklist(blacklist, { total, alreadyRecent: true }));
 		return;
 	}

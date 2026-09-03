@@ -3507,6 +3507,127 @@ console.log('\n[12d] /blacklist 展示兼容历史 sa reason');
 	assert('/blacklist 不裸露内部 reason 值', !dm.body.text.includes('原因：spam') && !dm.body.text.includes('原因：sa'));
 }
 
+// ---------- [12d0] sanitizeTelegramText 只剥离孤立代理，合法 emoji 必须保留 ----------
+// 旧实现 replace(/[\uD800-\uDFFF]/g, '') 把所有代理对码元一律删除，导致星平面 emoji
+// （📋🔐🗂️🤖🕵️🌐 等）被整体抹掉、只留一个多余空格，而 BMP 内的 ✅❌ℹ️ 却安然无恙。
+// 该函数被 escapeHtml / telegramMessageLength / truncateTelegramText / sendTelegramMessage
+// 等 10 处调用，是全项目 emoji 显示的总闸门，单独锁住行为。
+console.log('\n[12d0] sanitizeTelegramText 保留合法 emoji、剥离孤立代理');
+{
+	const san = sandbox.sanitizeTelegramText;
+	// 合法星平面字符（emoji）必须原样保留
+	const keep = ['📋', '🔐', '🗂️', '🤖', '🕵️', '🌐', '🗳️', '📊', '🔔', '🎯', '👑', '🛡️'];
+	const stripped = keep.filter((e) => san(e) !== e);
+	assert('星平面 emoji 全部保留', stripped.length === 0, `被剥离：${stripped.join(' ')}`);
+
+	// BMP 内符号本来就正常，不能被改坏
+	const bmp = ['✅', '❌', 'ℹ️', '⚠️', '•', '　'];
+	assert('BMP 符号保持不变', bmp.every((c) => san(c) === c));
+
+	// 真实文案：emoji 后面的空格不再变成孤零零的前导空格
+	assert('表头 emoji 不再被吃掉', san('📋 当前黑名单') === '📋 当前黑名单');
+	assert('带变体选择符的 emoji 不再只剩 U+FE0F', san('🗳️ 群内投票举报') === '🗳️ 群内投票举报');
+
+	// 孤立代理（真正会让 Telegram 返回 400 的非法字符）仍必须被清掉
+	assert('孤立高位代理被清除', san('正常\uD83D文本') === '正常文本');
+	assert('孤立低位代理被清除', san('正常\uDCCB文本') === '正常文本');
+	assert('单独的高位代理被清除', san('\uD83D') === '');
+	assert('单独的低位代理被清除', san('\uDCCB') === '');
+	assert('emoji 紧邻孤立代理时只清孤立的那个', san('好\uD83D📋好') === '好📋好');
+	assert('连续两个孤立高位代理都被清除', san('a\uD83D\uD83Db') === 'ab');
+
+	// 空值与非字符串入参
+	assert('null / undefined 返回空串', san(null) === '' && san(undefined) === '');
+	assert('数字入参转字符串', san(12345) === '12345');
+
+	// 长度计算：Telegram 的 4096 上限按 UTF-16 码元算，emoji 占 2
+	assert('emoji 计入长度为 2 个码元', sandbox.telegramMessageLength('📋') === 2);
+	assert('纯 ASCII 长度不变', sandbox.telegramMessageLength('abcde') === 5);
+
+	// 按码点截断，绝不把 emoji 劈成半个
+	assert('截断按码点进行，不产生半个 emoji', sandbox.truncateTelegramText('📋📋📋', 2) === '📋📋');
+	assert('escapeHtml 保留 emoji 同时转义尖括号', sandbox.escapeHtml('📋 <b>') === '📋 &lt;b&gt;');
+}
+
+// ---------- [12d1] /blacklist 竖排排版：字段各占一行、时间去噪、操作人本地翻译 ----------
+// 旧版把 4 个字段用 " · " 拼成一行，Telegram 按屏宽随机折行；长的
+// anonymous_admin:-100xxx 一出现整行就被撑爆。本段锁住竖排格式不被改回单行。
+console.log('\n[12d1] /blacklist 竖排排版');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const env = {
+		...baseEnv,
+		OWNER_IDS: '999,888',
+		SUPER_ADMINS: '7777',
+		DB: makeFakeDB([
+			{ id: '5001', reason: 'spam', by: '999', at: '2026-09-02T23:40:47.004Z' },
+			{ id: '5002', reason: 'spam', by: 'anonymous_admin:-1001883549197', at: '2026-09-02T23:22:34.806Z' },
+			{ id: '5003', reason: 'ad_auto', by: 'system', at: '2026-09-02T23:21:48.067Z' },
+			{ id: '5004', reason: 'manual', by: '888', at: '2026-09-01T18:04:12.331Z' },
+			{ id: '5005', reason: 'ad_vote', by: '7777', at: '2026-09-01T15:38:09.117Z' },
+		]),
+	};
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1210, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/blacklist' } }),
+	}), env, { waitUntil: () => {} });
+	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	const text = dm?.body?.text || '';
+	const plain = text.replace(/<[^>]+>/g, '');
+
+	assert('竖排：每条以「序号. TGID：」起头', (plain.match(/^\s*\d+\. TGID：\d+$/gm) || []).length === 5);
+	assert('竖排：原因/操作人/时间各自独占一行', (plain.match(/^　　原因：/gm) || []).length === 5
+		&& (plain.match(/^　　操作人：/gm) || []).length === 5
+		&& (plain.match(/^　　时间：/gm) || []).length === 5);
+	assert('竖排：不再把字段用 " · " 拼成一行', !/TGID：\d+ · /.test(plain));
+
+	assert('时间：去掉 T、毫秒与结尾 Z，保留到秒', plain.includes('时间：2026-09-02 23:40:47')
+		&& !plain.includes('23:40:47.004') && !/时间：\d{4}-\d{2}-\d{2}T/.test(plain));
+
+	assert('操作人：第一主人标记为主人并可点击', /操作人：👑 主人 <a href="tg:\/\/user\?id=999">999<\/a>/.test(text));
+	assert('操作人：副主人识别正确', /操作人：👤 副主人 <a href="tg:\/\/user\?id=888">888<\/a>/.test(text));
+	assert('操作人：超级管理员识别正确', /操作人：🛡️ 超级管理员 <a href="tg:\/\/user\?id=7777">7777<\/a>/.test(text));
+	assert('操作人：system 翻译为系统自动，不裸露 system', plain.includes('操作人：🤖 系统自动') && !plain.includes('操作人：system'));
+	assert('操作人：匿名管理员翻译并带出来源群，不裸露 anonymous_admin 前缀',
+		plain.includes('操作人：🕵️ 匿名管理员（来源群 -1001883549197）') && !plain.includes('anonymous_admin:'));
+
+	assert('TGID 保持可点击跳转', /1\. TGID：<a href="tg:\/\/user\?id=5001">5001<\/a>/.test(text));
+	assert('末尾附 UTC 与可点击说明', plain.includes('时间为 UTC') && plain.includes('点 TGID 或操作人可直接打开该用户'));
+
+	// 单条发送：默认 30 条可见字符远低于 4096，不该被拆成多条
+	assert('默认条数下只发一条消息', callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').length === 1);
+	assert('可见字符未超 Telegram 4096 上限', plain.length <= 4096);
+
+	// 空黑名单与缺字段的边界
+	resetCalls();
+	const emptyEnv = { ...baseEnv, OWNER_IDS: '999', DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1211, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/blacklist' } }),
+	}), emptyEnv, { waitUntil: () => {} });
+	const emptyDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('空黑名单仍回「（空）」不报错', !!emptyDm && emptyDm.body.text.includes('（空）'));
+
+	resetCalls();
+	const partialEnv = {
+		...baseEnv,
+		OWNER_IDS: '999',
+		DB: makeFakeDB([{ id: '5100', reason: null, by: null, at: null }]),
+	};
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1212, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/blacklist' } }),
+	}), partialEnv, { waitUntil: () => {} });
+	const partialDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	const partialPlain = (partialDm?.body?.text || '').replace(/<[^>]+>/g, '');
+	assert('原因/操作人/时间全缺时只输出 TGID 行，不留空字段', partialPlain.includes('1. TGID：5100')
+		&& !partialPlain.includes('原因：\n') && !/时间：\s*$/m.test(partialPlain));
+}
+
 // ---------- [12d2] 超级管理员群内 /blacklist 静默，私聊行为不变 ----------
 console.log('\n[12d2] 超级管理员 /blacklist 群聊静默 + 私聊不变');
 {
