@@ -4263,6 +4263,9 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 
 	let responseMessage = '';
 	let canCopyGkyCommand = false;
+	// 记录是否属于本部署的 GROUP_ID 配置群：决定 GKY 代码的语义是「移出本群黑名单」
+	// 还是「加 GKY 全局白名单」，两者影响面差别很大，必须在提示里说清。
+	let gkyRecordInConfiguredGroup = false;
 
 	if (!banlistData.success) {
 		responseMessage = `❌ <b>GKY 查询失败</b>\n\n${escapeHtml(banlistData.error || '未知错误')}${localBlacklistInfo}`;
@@ -4300,14 +4303,16 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 
 		const recordTgid = String(banlistData.tgid || '');
 		if (recordTgid !== queryTgid) {
+			// 这道门必须留：GKY 返回的记录与查询目标不是同一个人，此时给按钮会给错人加白名单。
 			responseMessage += '\n\n⚠️ 当前 GKY 返回记录的 TGID 无法与查询目标核对，因此不提供 GKY 复制按钮。请稍后重新使用 <code>/check</code>。';
 		} else {
-			const recordChatId = String(banlistData.chatId || '');
-			if (!isConfiguredGroup(recordChatId)) {
-				responseMessage += '\n\n⚠️ 此 GKY 封禁记录不属于当前 <b>GROUP_ID</b> 配置群，因此不提供 GKY 复制按钮。请使用 GKY 官方网页处理全局解封。';
-			} else {
-				canCopyGkyCommand = true;
-			}
+			// 与源项目对齐：只要 GKY 判定被封就提供复制按钮，chatId 只决定"移出黑名单"还是
+			// "添加白名单"两种语义，而不是决定给不给按钮。
+			// 早前版本在这里加了"记录必须属于 GROUP_ID 配置群"的门，导致查到别群记录时
+			// 按钮被整个吞掉、只能去 GKY 官网操作 —— 而 GKYbotSave 本就是发给 GKYbot 的
+			// 全局指令，别群记录同样能处理，没有拦的必要。
+			canCopyGkyCommand = true;
+			gkyRecordInConfiguredGroup = isConfiguredGroup(String(banlistData.chatId || ''));
 		}
 	}
 
@@ -4323,11 +4328,26 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 
 	const inlineKeyboard = [];
 	if (canCopyGkyCommand) {
-		responseMessage += '\n\nℹ️ GKY 与本地 D1 黑名单相互独立。下方按钮只复制 GKY 添加白名单代码，必须由真人管理员在封禁记录对应的配置群发送。';
-		inlineKeyboard.push([{
-			text: '📋 点击复制 GKY 添加白名单代码',
-			copy_text: { text: `GKYbotSave\n${queryTgid}` }
-		}]);
+		if (gkyRecordInConfiguredGroup) {
+			// 记录就在自己的配置群：语义是把该号从该群的 GKY 黑名单里移出。
+			responseMessage += '\n\nℹ️ GKY 与本地 D1 黑名单相互独立。下方按钮只复制 GKY 移出黑名单代码，必须由真人管理员在封禁记录对应的配置群发送。';
+			inlineKeyboard.push([{
+				text: '📋 点击复制 GKY 移出黑名单代码',
+				copy_text: { text: `GKYbotSave\n${queryTgid}` }
+			}]);
+		} else {
+			// 记录来自别的群：GKYbotSave 此时的效果是给该号加 GKY【全局】白名单，
+			// 该号在所有接入 GKYbot 的群都会被放行 —— 影响面远大于"解封我这个群"，
+			// 按钮文字四个字说不清，必须在提示里写明，否则容易被当成本地白名单。
+			responseMessage += '\n\n⚠️ 此 GKY 封禁记录<b>不属于</b>你的 <b>GROUP_ID</b> 配置群（来源群 <code>'
+				+ escapeHtml(String(banlistData.chatId || '未知'))
+				+ '</code>）。下方代码的效果是给该号加 <b>GKY 全局白名单</b> —— 对所有接入 GKYbot 的群生效，不只是你的群，请确认后再发送。'
+				+ '\nℹ️ GKY 与本地 D1 黑名单相互独立，此代码不会改动你的 D1 黑名单；需由真人管理员发送才生效。';
+			inlineKeyboard.push([{
+				text: '📋 点击复制 GKY 添加全局白名单代码',
+				copy_text: { text: `GKYbotSave\n${queryTgid}` }
+			}]);
+		}
 	}
 
 	if (localCheck.isBlacklisted) {

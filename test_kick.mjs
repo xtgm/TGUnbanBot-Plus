@@ -4988,7 +4988,7 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 
 	const basicCases = [
 		{ name: '两边正常', gky: GKY_NONE, seed: [], copies: [] },
-		{ name: '仅 GKY 封禁', gky: GKY_CONFIGURED, seed: [], copies: ['GKYbotSave\n' + TARGET_ID] },
+		{ name: '仅 GKY 封禁', gky: GKY_CONFIGURED, seed: [], copies: ['GKYbotSave\n' + TARGET_ID], gkyButtonText: '移出黑名单' },
 		{ name: '仅本地封禁', gky: GKY_NONE, seed: [localEntry], copies: ['/unban ' + TARGET_ID] },
 		{ name: 'GKY + 本地都封禁', gky: GKY_CONFIGURED, seed: [localEntry], copies: ['GKYbotSave\n' + TARGET_ID, '/unban ' + TARGET_ID] },
 	];
@@ -4997,12 +4997,34 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 		const check = await runCheck({ gky: item.gky, env });
 		assert(item.name + ' → 复制按钮数量与内容正确', JSON.stringify(check.copies) === JSON.stringify(item.copies));
 		assert(item.name + ' → 所有按钮只有 copy_text', check.buttons.every((button) => !!button.copy_text?.text && !Object.prototype.hasOwnProperty.call(button, 'callback_data')));
+		// 记录就在自己的配置群时，语义是「移出该群 GKY 黑名单」，按钮文字必须这么写；
+		// 别群记录走的是「加 GKY 全局白名单」，见下方外部群用例。
+		if (item.gkyButtonText) {
+			assert(item.name + ' → GKY 按钮文字为「' + item.gkyButtonText + '」',
+				check.buttons.some((b) => String(b.text || '').includes(item.gkyButtonText)));
+			assert(item.name + ' → 配置群记录不出现全局白名单字样',
+				!String(check.result?.body.text || '').includes('全局白名单'));
+		}
 		if (item.seed.length) assert(item.name + ' → /check 不直接修改 D1', env.DB._rows.has(TARGET_ID) && callsOf('unbanChatMember').length === 0);
 	}
 
 	let check = await runCheck({ gky: GKY_EXTERNAL, env: makeCheckEnv([localEntry]) });
-	assert('外部群 GKY 封禁 + 本地封禁 → 提示 GKY 官网', String(check.result?.body.text || '').includes('GKY 官方网页'));
-	assert('外部群 GKY 封禁 + 本地封禁 → 仅保留本地复制', JSON.stringify(check.copies) === JSON.stringify(['/unban ' + TARGET_ID]));
+	// 与源项目对齐：GKY 判定被封就给按钮，记录属于哪个群只决定语义（移出黑名单 / 加全局白名单），
+	// 而不是决定给不给按钮。早前版本在别群记录时把按钮整个吞掉，只能去 GKY 官网操作。
+	assert('外部群 GKY 封禁 + 本地封禁 → GKY 与本地两个复制按钮都在',
+		JSON.stringify(check.copies) === JSON.stringify(['GKYbotSave\n' + TARGET_ID, '/unban ' + TARGET_ID]));
+	assert('外部群记录 → 按钮文字标明是全局白名单',
+		check.buttons.some((b) => String(b.text || '').includes('全局白名单')));
+	assert('外部群记录 → 提示写明不属于配置群并带出来源群 ID',
+		String(check.result?.body.text || '').includes('不属于')
+		&& String(check.result?.body.text || '').includes('-1009999999'));
+	assert('外部群记录 → 提示写明影响所有接入 GKYbot 的群',
+		String(check.result?.body.text || '').includes('GKY 全局白名单')
+		&& String(check.result?.body.text || '').includes('对所有接入 GKYbot 的群生效'));
+	assert('外部群记录 → 提示写明不改动本地 D1',
+		String(check.result?.body.text || '').includes('不会改动你的 D1 黑名单'));
+	assert('外部群记录 → 不再引导去 GKY 官方网页',
+		!String(check.result?.body.text || '').includes('GKY 官方网页'));
 
 	check = await runCheck({ gky: GKY_MISMATCHED, env: makeCheckEnv([localEntry]) });
 	assert('GKY TGID 不一致 → 只禁用 GKY 复制', String(check.result?.body.text || '').includes('TGID 无法与查询目标核对') && JSON.stringify(check.copies) === JSON.stringify(['/unban ' + TARGET_ID]));
@@ -5039,7 +5061,9 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 	assert('非 GROUP_ID 来源群 → 仅查询且无复制按钮', String(check.result?.body.text || '').includes('不提供任何复制按钮') && check.buttons.length === 0);
 
 	check = await runCheck({ gky: GKY_EXTERNAL, env: makeCheckEnv([localEntry]), chat: { id: -2001, type: 'supergroup', title: '未配置群' }, text: '/check', replyTo: { message_id: 3, from: { id: Number(TARGET_ID), is_bot: false, first_name: '目标用户' } } });
-	assert('非 GROUP_ID 来源群回复 /check → 官网提示且无按钮', String(check.result?.body.text || '').includes('GKY 官方网页') && check.buttons.length === 0);
+	// 这道门与「记录属于哪个群」无关，防的是在陌生群里能查能复制 —— 不能松。
+	assert('非 GROUP_ID 来源群回复 /check → 仍无任何按钮',
+		String(check.result?.body.text || '').includes('不提供任何复制按钮') && check.buttons.length === 0);
 
 	check = await runCheck({ gky: GKY_NONE, env: makeCheckEnv(), chat: { id: 5555, type: 'private' }, from: { id: 5555, is_bot: false }, adminIds: [999] });
 	assert('非管理员私聊 /check TGID → 权限不足', String(check.result?.body.text || '').includes('权限不足'));
