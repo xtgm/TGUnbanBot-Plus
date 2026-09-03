@@ -3670,12 +3670,96 @@ function formatBlacklistTime(at) {
 	return m ? `${m[1]} ${m[2]}` : raw;
 }
 
+// ===== /blacklist 操作人用户名解析 =====
+// 为什么需要：操作人原本只输出 <a href="tg://user?id=X">X</a>，而 Telegram 官方在
+// ChatFullInfo.has_private_forwards 里写明——对方若把「隐私和安全 → 转发消息」设为
+// 非「所有人」，tg://user?id= 链接【只在与该用户本人的聊天里】才生效，别处退化成灰色
+// 纯文本点不动。管理员出于隐私常改这个设置，于是出现「被封的广告号能点、管理员点不动」。
+// 解法照搬 /admins：纯文本 @username 由 Telegram 自动识别为用户链接，不受该设置约束。
+//
+// 成本控制（这是关键，否则 30 条记录会打爆子请求配额）：
+//   ① 先对操作人集合【去重】——30 条记录通常只有 2~5 个不同操作人；
+//   ② 用 getChatAdministrators 【按群】拉取，一次拿回该群全部管理员，
+//      而不是按人逐个 getChat。操作人几乎必然是管理员，G 次调用即可全部解析；
+//   ③ 结果进运行期缓存，同一 isolate 内重复执行 /blacklist 不再查；
+//   ④ 全程 try/catch 静默降级：查不到就回落 tg://user?id=，绝不因此让命令失败。
+const BLACKLIST_OPERATOR_CACHE = new Map();
+const BLACKLIST_OPERATOR_CACHE_TTL_MS = 10 * 60 * 1000;
+const BLACKLIST_OPERATOR_CACHE_MAX = 200;
+
+function readBlacklistOperatorCache(id) {
+	const hit = BLACKLIST_OPERATOR_CACHE.get(id);
+	if (!hit) return undefined;
+	if (Date.now() - hit.at > BLACKLIST_OPERATOR_CACHE_TTL_MS) {
+		BLACKLIST_OPERATOR_CACHE.delete(id);
+		return undefined;
+	}
+	return hit.username;
+}
+
+function writeBlacklistOperatorCache(id, username) {
+	// 简单 LRU：超上限时丢掉最早写入的一批，避免 isolate 长期存活后无限增长
+	if (BLACKLIST_OPERATOR_CACHE.size >= BLACKLIST_OPERATOR_CACHE_MAX) {
+		for (const key of [...BLACKLIST_OPERATOR_CACHE.keys()].slice(0, 50)) {
+			BLACKLIST_OPERATOR_CACHE.delete(key);
+		}
+	}
+	BLACKLIST_OPERATOR_CACHE.set(id, { username: username || '', at: Date.now() });
+}
+
+// 返回 Map<TGID, username>；username 为空串表示查过但该账号没设用户名。
+async function resolveBlacklistOperatorUsernames(entries) {
+	const wanted = new Set();
+	for (const entry of entries || []) {
+		const raw = String(entry?.by || '').trim();
+		// system / anonymous_admin:-100xxx 不是用户 ID，不需要查
+		if (/^\d+$/.test(raw)) wanted.add(raw);
+	}
+	const result = new Map();
+	for (const id of wanted) {
+		const cached = readBlacklistOperatorCache(id);
+		if (cached !== undefined) result.set(id, cached);
+	}
+	const missing = [...wanted].filter((id) => !result.has(id));
+	if (missing.length === 0) return result;
+
+	// 按群批量拉管理员：一次调用覆盖该群所有管理员，远比按人查省
+	for (const groupId of GROUP_IDS) {
+		if (missing.every((id) => result.has(id))) break;
+		try {
+			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ chat_id: groupId }),
+			});
+			const data = await response.json();
+			if (!response.ok || !data?.ok || !Array.isArray(data.result)) continue;
+			for (const member of data.result) {
+				const uid = member?.user?.id ? String(member.user.id) : '';
+				if (!uid || !wanted.has(uid) || result.has(uid)) continue;
+				const username = member.user.username ? String(member.user.username) : '';
+				result.set(uid, username);
+				writeBlacklistOperatorCache(uid, username);
+			}
+		} catch (error) {
+			console.error(`[黑名单] 拉取群管理员失败 group=${groupId}:`, error);
+		}
+	}
+
+	// 仍没解析到的（如已被降权、已退群）记成空串，避免下次再白查一轮
+	for (const id of missing) {
+		if (!result.has(id)) {
+			result.set(id, '');
+			writeBlacklistOperatorCache(id, '');
+		}
+	}
+	return result;
+}
+
 // 把 by_user 字段翻译成可读的操作人标签。
-// 【刻意只做本地判断，不查 Telegram 昵称】translateBlacklistOperator 会为每个操作人调
-// 一次 getChat，30 条记录就是 30 次子请求，直接撞 Cloudflare 的子请求上限。这里只用
-// 本地已有的 OWNER_IDS / SUPER_ADMINS 与字段前缀判断角色，零 API 调用。
-// 需要昵称等完整信息时用 /check TGID，那条路径本来就只查一个人。
-function renderBlacklistOperator(byId) {
+// usernames 由 resolveBlacklistOperatorUsernames 预先解析好后传入（同步渲染，不在这里发请求）；
+// 不传则退化为纯本地渲染，行为与解析失败时一致。
+function renderBlacklistOperator(byId, usernames) {
 	const raw = String(byId || '').trim();
 	if (!raw) return '未知';
 	if (raw === 'system') return '🤖 系统自动';
@@ -3692,6 +3776,13 @@ function renderBlacklistOperator(byId) {
 	if (isPrimaryOwner(raw)) roleTag = '👑 主人';
 	else if (isSecondaryOwner(raw)) roleTag = '👤 副主人';
 	else if (SUPER_ADMINS.includes(raw)) roleTag = '🛡️ 超级管理员';
+
+	// 有用户名就用纯文本 @xxx：Telegram 自动识别为用户链接，不受对方隐私设置影响。
+	// TGID 仍然照常给出，方便直接复制去 /check、/unban。
+	const username = usernames?.get?.(raw);
+	if (username) {
+		return `${roleTag} @${escapeHtml(username)}（<code>${escapeHtml(raw)}</code>）`;
+	}
 	return `${roleTag} <a href="tg://user?id=${escapeHtml(raw)}">${escapeHtml(raw)}</a>`;
 }
 
@@ -3710,6 +3801,7 @@ function renderBlacklist(blacklist, options = {}) {
 	}
 
 	const reasonLabels = BLACKLIST_REASON_LABELS;
+	const usernames = options.operatorUsernames;
 	const visible = alreadyRecent ? blacklist.slice(0, limit) : blacklist.slice(-limit).reverse(); // 最近添加的排前面
 	const limitedText = total > visible.length ? ` · 显示最近 ${visible.length} 条` : '';
 	// 序号右对齐：两位数与一位数混排时左侧不会参差。
@@ -3725,7 +3817,7 @@ function renderBlacklist(blacklist, options = {}) {
 			block.push(`　　原因：${escapeHtml(reasonLabels[entry.reason] || entry.reason)}`);
 		}
 		if (entry.by) {
-			block.push(`　　操作人：${renderBlacklistOperator(entry.by)}`);
+			block.push(`　　操作人：${renderBlacklistOperator(entry.by, usernames)}`);
 		}
 		const at = formatBlacklistTime(entry.at);
 		if (at) {
@@ -3734,7 +3826,7 @@ function renderBlacklist(blacklist, options = {}) {
 		lines.push(block.join('\n'), '');
 	});
 
-	lines.push('ℹ️ 时间为 UTC · 点 TGID 或操作人可直接打开该用户');
+	lines.push('ℹ️ 时间为 UTC · 点 TGID 或操作人可打开该用户；操作人显示为灰色数字说明对方隐私设置不允许跳转，可复制 TGID 用 /check 查');
 	return lines.join('\n');
 }
 
@@ -6448,9 +6540,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				getD1BlacklistCount(env),
 				readD1BlacklistRecent(env, BLACKLIST_PAGE_LIMIT)
 			]);
+			const operatorUsernames = await resolveBlacklistOperatorUsernames(blacklist);
 			await replyToAdmin(message, ctx, {
 				flashText: `📋 黑名单共 ${total} 条，完整结果已发送给主人`,
-				detailText: renderBlacklist(blacklist, { total, alreadyRecent: true }),
+				detailText: renderBlacklist(blacklist, { total, alreadyRecent: true, operatorUsernames }),
 				isInGroup: true,
 			});
 			return;
@@ -6471,11 +6564,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			getD1BlacklistCount(env),
 			readD1BlacklistRecent(env, BLACKLIST_PAGE_LIMIT)
 		]);
-		// 保持单条发送：分块函数的 sanitizeTelegramText 会剥离全部代理对码元（📋👑🕵️ 等
-		// emoji 全没），且阈值按 HTML 原文长度算（30 条原文 4823 字符 > 3500），会把本来
-		// 发得出去的一条消息无谓拆成两条。默认 30 条可见字符仅约 2790，远低于 Telegram
-		// 的 4096 上限，单条足够。若把 BLACKLIST_PAGE_LIMIT 调到 45 条以上再考虑分块。
-		await sendTelegramMessage(chatId, renderBlacklist(blacklist, { total, alreadyRecent: true }));
+		const operatorUsernames = await resolveBlacklistOperatorUsernames(blacklist);
+		// 保持单条发送：splitTelegramHtmlBlocks 的阈值按 HTML 原文长度算（30 条原文约
+		// 4800 字符 > 3500），会把本来发得出去的一条消息无谓拆成两条。默认 30 条可见字符
+		// 仅约 2800，远低于 Telegram 的 4096 上限，单条足够。
+		// 若把 BLACKLIST_PAGE_LIMIT 调到 45 条以上，再改用 sendTelegramMessageChunks。
+		await sendTelegramMessage(chatId, renderBlacklist(blacklist, { total, alreadyRecent: true, operatorUsernames }));
 		return;
 	}
 
@@ -6497,28 +6591,30 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await sendFlashMessage(chatId, 'ℹ️ 请私聊我发送 /help 查看 OWNER_IDS 专属指令。', ctx, 6000);
 			return;
 		}
+		// 命令一律【裸文本】不包 <code>：Telegram 只会把纯文本里的 /xxx 识别成 bot_command
+		// 实体、渲染成蓝色链接并支持「点一下直接发送」；一旦包进 <code>，点击就只是复制。
 		const helpLines = [
 			'🔐 <b>第一主人专属指令</b>（其他人无反应，也不出现在命令菜单里）',
 			'',
 			'<b>━━ 人工封禁 ━━</b>',
-			'<code>/ban TGID [原因]</code>　加入全局黑名单 + 全群封禁',
-			'<code>/spam</code>　回复广告使用：删消息 + 全群封禁 + 撤回其历史发言',
-			'<code>/unban TGID</code>　移出黑名单 + 全群解封',
+			'/ban TGID [原因]　加入全局黑名单 + 全群封禁',
+			'/spam　回复广告使用：删消息 + 全群封禁 + 撤回其历史发言',
+			'/unban TGID　移出黑名单 + 全群解封',
 			'',
 			'<b>━━ 广告举报投票 ━━</b>',
-			'<code>/ad [原因]</code>　回复广告发起群内投票，通过后加黑并全群封禁',
-			'<code>/add_ad_admin TGID</code>　允许该成员发起 /ad 投票',
-			'<code>/del_ad_admin TGID</code>　取消该成员的发起权限',
+			'/ad [原因]　回复广告发起群内投票，通过后加黑并全群封禁',
+			'/add_ad_admin TGID　允许该成员发起 /ad 投票',
+			'/del_ad_admin TGID　取消该成员的发起权限',
 			'',
 			'<b>━━ 动态群组（仅私聊）━━</b>',
-			'<code>/addgroup -100xxx [备注]</code>　新增治理群组，不用改环境变量',
-			'<code>/delgroup -100xxx</code>　不再治理该群，bot 仍留在群里',
-			'<code>/listgroups</code>　列出全部生效群组',
+			'/addgroup -100xxx [备注]　新增治理群组，不用改环境变量',
+			'/delgroup -100xxx　不再治理该群，bot 仍留在群里',
+			'/listgroups　列出全部生效群组',
 			'',
 			'<b>━━ 查询与退群（仅私聊）━━</b>',
-			'<code>/admins</code>　查看主人 / 副主人 / 超级管理员名单',
-			'<code>/groups</code>　查看当前生效群组信息',
-			'<code>/leavegroup -100xxx</code>　让 bot 退出该群',
+			'/admins　查看主人 / 副主人 / 超级管理员名单',
+			'/groups　查看当前生效群组信息',
+			'/leavegroup -100xxx　让 bot 退出该群',
 		];
 		await sendTelegramMessageChunks(chatId, helpLines.join('\n'));
 		return;

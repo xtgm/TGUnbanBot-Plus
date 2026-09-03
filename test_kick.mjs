@@ -3549,6 +3549,98 @@ console.log('\n[12d0] sanitizeTelegramText 保留合法 emoji、剥离孤立代�
 	assert('escapeHtml 保留 emoji 同时转义尖括号', sandbox.escapeHtml('📋 <b>') === '📋 &lt;b&gt;');
 }
 
+// ---------- [12d1b] /blacklist 操作人用 @username（不受对方隐私设置影响）----------
+// tg://user?id= 链接受对方「隐私和安全 → 转发消息」设置限制（官方 ChatFullInfo
+// .has_private_forwards），设为非「所有人」时只在与他本人的聊天里可点，别处是死文本。
+// 纯文本 @username 由 Telegram 自动识别，不受该设置约束 —— 与 /admins 同一套路子。
+console.log('\n[12d1b] /blacklist 操作人 @username 解析');
+{
+	resetCalls();
+	let adminCalls = 0;
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => {
+			adminCalls += 1;
+			return {
+				ok: true,
+				result: [
+					{ user: { id: 91001, username: 'ownerName' }, status: 'creator' },
+					{ user: { id: 91003, username: 'superName' }, status: 'administrator' },
+					// 91002 是管理员但没设用户名，必须回落 tg://user?id=
+					{ user: { id: 91002 }, status: 'administrator' },
+				],
+			};
+		},
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const env = {
+		...baseEnv,
+		GROUP_ID: '-1001,-1002',
+		OWNER_IDS: '91001,91002',
+		SUPER_ADMINS: '91003',
+		DB: makeFakeDB([
+			{ id: '6001', reason: 'spam', by: '91001', at: '2026-09-03T10:00:05.000Z' },
+			{ id: '6002', reason: 'spam', by: '91001', at: '2026-09-03T10:00:04.000Z' },
+			{ id: '6003', reason: 'manual', by: '91002', at: '2026-09-03T10:00:03.000Z' },
+			{ id: '6004', reason: 'spam', by: '91003', at: '2026-09-03T10:00:02.000Z' },
+			{ id: '6005', reason: 'spam', by: '91004', at: '2026-09-03T10:00:01.000Z' },
+			{ id: '6006', reason: 'ad_auto', by: 'system', at: '2026-09-03T10:00:00.000Z' },
+			{ id: '6007', reason: 'spam', by: 'anonymous_admin:-1001', at: '2026-09-02T09:00:00.000Z' },
+		]),
+	};
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1220, chat: { id: 91001, type: 'private' }, from: { id: 91001, is_bot: false }, text: '/blacklist' } }),
+	}), env, { waitUntil: () => {} });
+	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '91001');
+	const text = dm?.body?.text || '';
+	const plain = text.replace(/<[^>]+>/g, '');
+
+	assert('有用户名的操作人输出纯文本 @username', plain.includes('👑 主人 @ownerName')
+		&& plain.includes('🛡️ 超级管理员 @superName'));
+	assert('@username 不被包进 <a> 或 <code>，交给 Telegram 自动识别',
+		!/<a[^>]*>@ownerName/.test(text) && !/<code>@ownerName/.test(text));
+	assert('用 @username 时仍给出 TGID 便于复制去 /check', /@ownerName（<code>91001<\/code>）/.test(text));
+	assert('没设用户名的操作人回落 tg://user?id=', /👤 副主人 <a href="tg:\/\/user\?id=91002">91002<\/a>/.test(text));
+	assert('查不到的操作人回落 tg://user?id=', /👤 群管理员 <a href="tg:\/\/user\?id=91004">91004<\/a>/.test(text));
+	assert('system 与匿名管理员不参与查询，渲染不变', plain.includes('🤖 系统自动')
+		&& plain.includes('🕵️ 匿名管理员（来源群 -1001）'));
+
+	// 成本：按群查而非按人查。7 条记录里有 4 个不同的数字操作人，但只应按群调用
+	assert('按群批量拉取，调用次数不超过配置群数', adminCalls <= 2, `实际调用 ${adminCalls} 次`);
+
+	// 运行期缓存：同一 isolate 内再执行一次不应重复查
+	const before = adminCalls;
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1221, chat: { id: 91001, type: 'private' }, from: { id: 91001, is_bot: false }, text: '/blacklist' } }),
+	}), env, { waitUntil: () => {} });
+	assert('第二次执行命中缓存，零新增 getChatAdministrators 调用', adminCalls === before,
+		`第一次 ${before} 次，第二次后累计 ${adminCalls} 次`);
+	const dm2 = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '91001');
+	assert('缓存命中后 @username 仍正确输出', (dm2?.body?.text || '').includes('@ownerName'));
+
+	// API 全挂时必须静默降级，不能让 /blacklist 失败
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => { throw new Error('boom'); },
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const env2 = {
+		...baseEnv,
+		GROUP_ID: '-1003',
+		OWNER_IDS: '91005',
+		DB: makeFakeDB([{ id: '6100', reason: 'spam', by: '91005', at: '2026-09-03T11:00:00.000Z' }]),
+	};
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 1222, chat: { id: 91005, type: 'private' }, from: { id: 91005, is_bot: false }, text: '/blacklist' } }),
+	}), env2, { waitUntil: () => {} });
+	const dm3 = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '91005');
+	assert('查询异常时静默降级，命令照常返回名单', !!dm3 && dm3.body.text.includes('6100'));
+	assert('降级后操作人回落 tg://user?id=', /<a href="tg:\/\/user\?id=91005">91005<\/a>/.test(dm3.body.text));
+}
+
 // ---------- [12d1] /blacklist 竖排排版：字段各占一行、时间去噪、操作人本地翻译 ----------
 // 旧版把 4 个字段用 " · " 拼成一行，Telegram 按屏宽随机折行；长的
 // anonymous_admin:-100xxx 一出现整行就被撑爆。本段锁住竖排格式不被改回单行。
@@ -3596,7 +3688,7 @@ console.log('\n[12d1] /blacklist 竖排排版');
 		plain.includes('操作人：🕵️ 匿名管理员（来源群 -1001883549197）') && !plain.includes('anonymous_admin:'));
 
 	assert('TGID 保持可点击跳转', /1\. TGID：<a href="tg:\/\/user\?id=5001">5001<\/a>/.test(text));
-	assert('末尾附 UTC 与可点击说明', plain.includes('时间为 UTC') && plain.includes('点 TGID 或操作人可直接打开该用户'));
+	assert('末尾附 UTC 与可点击说明', plain.includes('时间为 UTC') && plain.includes('点 TGID 或操作人可打开该用户'));
 
 	// 单条发送：默认 30 条可见字符远低于 4096，不该被拆成多条
 	assert('默认条数下只发一条消息', callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').length === 1);
@@ -4431,9 +4523,12 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('主人 /help → 含 /ad 投票与白名单管理', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('/add_ad_admin') && dm.body.text.includes('/del_ad_admin'));
 	assert('主人 /help → 含动态群组三条', !!dm && dm.body.text.includes('/addgroup') && dm.body.text.includes('/delgroup') && dm.body.text.includes('/listgroups'));
 	assert('主人 /help → 含查询与退群三条', !!dm && dm.body.text.includes('/admins') && dm.body.text.includes('/groups') && dm.body.text.includes('/leavegroup'));
-	const helpCommandLines = dm.body.text.split('\n').filter((l) => l.startsWith('<code>/'));
-	assert('主人 /help → 每条指令都带用途说明', helpCommandLines.length >= 12
-		&& helpCommandLines.every((l) => l.replace(/<[^>]+>/g, '').replace(/^\/[a-z_]+/, '').replace(/^[^\u4e00-\u9fa5]*/, '').trim().length >= 4));
+	// 命令必须是裸文本（不包 <code>），Telegram 只对纯文本里的 /xxx 给「点击发送」
+	const helpCommandLines = dm.body.text.split('\n').filter((l) => /^\/[a-z_]/.test(l));
+	assert('主人 /help → 命令为裸文本，可点击直接发送',
+		helpCommandLines.length >= 12 && !/<code>\//.test(dm.body.text));
+	assert('主人 /help → 每条指令都带用途说明',
+		helpCommandLines.every((l) => l.replace(/<[^>]+>/g, '').replace(/^\/[a-z_]+/, '').replace(/^[^\u4e00-\u9fa5]*/, '').trim().length >= 4));
 	// 群管理员(非主人)私聊 /help → 权限不足,不泄漏指令
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/help' } }) }), env, fakeCtxAd);
