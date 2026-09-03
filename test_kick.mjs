@@ -758,6 +758,93 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 当前群近期消息清扫
 	assert('/spam 回复模式含命令来源', dmSends[0].body.text.includes('命令来源') && dmSends[0].body.text.includes('-1001'));
 	assert('/spam 回复模式含执行原因', dmSends[0].body.text.includes('执行原因:广告引流'));
 }
+
+// ---------- [1a2] 群内 /ban TGID 也清扫该 TGID 在当前群的消息（与 /spam 对齐）----------
+// Telegram 的 revoke_messages 只对【仍在群里】的成员生效，目标若已退群/已被别人踢过
+// 就变成预封、历史发言一条都撤不掉。所以 /ban 也要有 moderation_messages 兜底。
+console.log('\n[1a2] 群内 /ban TGID 清扫该用户当前群消息');
+{
+	resetCalls();
+	const pending = [];
+	const fakeCtx = { waitUntil: (p) => { pending.push(Promise.resolve(p)); } };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'administrator' }, { user: { id: 888 }, status: 'creator' }] }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: `群${b.chat_id}`, type: 'supergroup' } }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 999 } }),
+	});
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	// 先让 6001 在当前群 -1001 发 3 条、在别群 -1002 发 1 条；另有别人的消息作对照
+	for (const msg of [
+		{ message_id: 70, chat: { id: -1001, type: 'supergroup' }, from: { id: 6001, is_bot: false }, text: '广告一' },
+		{ message_id: 71, chat: { id: -1001, type: 'supergroup' }, from: { id: 6001, is_bot: false }, text: '广告二' },
+		{ message_id: 72, chat: { id: -1001, type: 'supergroup' }, from: { id: 6001, is_bot: false }, text: '广告三' },
+		{ message_id: 73, chat: { id: -1001, type: 'supergroup' }, from: { id: 6002, is_bot: false }, text: '无关用户的消息' },
+		{ message_id: 74, chat: { id: -1002, type: 'supergroup' }, from: { id: 6001, is_bot: false }, text: '别群消息' },
+	]) {
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: msg }) }), env, fakeCtx);
+	}
+	await drainPending(pending);
+	resetCalls();
+
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 200, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/ban 6001 广告引流' } }),
+	}), env, fakeCtx);
+	await drainPending(pending);
+
+	const del = callsOf('deleteMessage');
+	assert('/ban 删除该用户当前群消息 70', del.some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 70));
+	assert('/ban 删除该用户当前群消息 71', del.some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 71));
+	assert('/ban 删除该用户当前群消息 72', del.some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 72));
+	assert('/ban 不删无关用户的消息 73', !del.some((c) => c.body.message_id === 73));
+	assert('/ban 不删该用户在别群的消息 74', !del.some((c) => c.body.message_id === 74));
+	assert('/ban 仍撤回命令消息本身 200', del.some((c) => c.body.message_id === 200));
+	assert('/ban 仍全群封禁并带 revoke_messages', callsOf('banChatMember').length === 2
+		&& callsOf('banChatMember').every((c) => c.body.revoke_messages === true));
+	const banDm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
+	assert('/ban 详情含当前群清扫结果', banDm.length > 0 && banDm.some((c) => c.body.text.includes('当前群近期消息清扫')));
+	assert('/ban 详情显示 3/3 清扫成功', banDm.some((c) => c.body.text.includes('成功 3/3')));
+
+	// 私聊 /ban 不做当前群清扫（私聊没有"当前群"概念）
+	resetCalls();
+	const env2 = { ...baseEnv, DB: makeFakeDB([]) };
+	for (const msg of [
+		{ message_id: 80, chat: { id: -1001, type: 'supergroup' }, from: { id: 6003, is_bot: false }, text: '消息' },
+	]) {
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: msg }) }), env2, fakeCtx);
+	}
+	await drainPending(pending);
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 201, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/ban 6003' } }),
+	}), env2, fakeCtx);
+	await drainPending(pending);
+	assert('私聊 /ban 不清扫群消息', !callsOf('deleteMessage').some((c) => c.body.message_id === 80));
+	const privDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('私聊 /ban 详情不含当前群清扫字样', !!privDm && !privDm.body.text.includes('当前群近期消息清扫'));
+
+	// 批量 /ban 不做清扫（N 目标 × 200 条会撞 Cloudflare 子请求上限）
+	resetCalls();
+	const env3 = { ...baseEnv, DB: makeFakeDB([]) };
+	for (const msg of [
+		{ message_id: 90, chat: { id: -1001, type: 'supergroup' }, from: { id: 6004, is_bot: false }, text: '消息' },
+		{ message_id: 91, chat: { id: -1001, type: 'supergroup' }, from: { id: 6005, is_bot: false }, text: '消息' },
+	]) {
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: msg }) }), env3, fakeCtx);
+	}
+	await drainPending(pending);
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 202, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/ban 6004,6005' } }),
+	}), env3, fakeCtx);
+	await drainPending(pending);
+	assert('批量 /ban 不清扫群消息', !callsOf('deleteMessage').some((c) => c.body.message_id === 90 || c.body.message_id === 91));
+}
+
 // ---------- [1b] /spam bot 不是管理员 + 删消息失败:错误翻译 ----------
 console.log('\n[1b] /spam 错误翻译:CHAT_ADMIN_REQUIRED + 删消息失败');
 {
@@ -4673,6 +4760,39 @@ console.log('\n[67a2] 群聊 /start 仅第一主人；私聊不变');
 	}), groupSilentEnv(), fakeCtxAd);
 	const privateReply = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '5555');
 	assert('私聊普通用户 /start 仍正常收到欢迎语', !!privateReply && privateReply.body.text.includes('自助解封机器人'));
+	// /start 与 /unban 已拆开：/start 是机器人介绍，【绝不能】含解封确认整句。
+	// 这是拆分的核心目的 —— 第一主人在群里发 /start 曾把这句口令明文贴进群，
+	// 等于公开教学如何触发解封。
+	assert('/start 介绍语不含解封确认整句', !!privateReply
+		&& !privateReply.body.text.includes('我不是广告狗')
+		&& !privateReply.body.text.includes('请输入以下内容'));
+	assert('/start 介绍语不含自助解封检查清单', !!privateReply
+		&& !privateReply.body.text.includes('请自行检查以下内容'));
+	assert('/start 介绍语说明用途并引导去 /unban', !!privateReply
+		&& privateReply.body.text.includes('我是做什么的')
+		&& privateReply.body.text.includes('发送 /unban 开始自助解封'));
+	assert('/start 里的 /unban 是裸文本，可点击直接发送', !!privateReply
+		&& !/<code>\/unban/.test(privateReply.body.text));
+	assert('/start 介绍语含防钓鱼声明', !!privateReply
+		&& privateReply.body.text.includes('不会主动私聊任何人')
+		&& privateReply.body.text.includes('不会索要账号'));
+	assert('/start 只发一条消息，不额外触发解封流程',
+		callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '5555').length === 1);
+
+	// 无参 /unban 仍然是自助解封清单，一个字没变
+	resetCalls();
+	sandbox.fetch = makeFetchMock(silentRoutes);
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 3405, chat: { id: 5558, type: 'private' }, from: { id: 5558, is_bot: false, first_name: '普通用户' }, text: '/unban' } }),
+	}), groupSilentEnv(), fakeCtxAd);
+	const unbanPrompt = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '5558');
+	assert('无参 /unban 仍给出自助解封检查清单', !!unbanPrompt
+		&& unbanPrompt.body.text.includes('请自行检查以下内容'));
+	assert('无参 /unban 仍给出解封确认整句', !!unbanPrompt
+		&& unbanPrompt.body.text.includes('我不是广告狗'));
+	assert('无参 /unban 不再是机器人介绍语', !!unbanPrompt
+		&& !unbanPrompt.body.text.includes('我是做什么的'));
 
 	resetCalls();
 	sandbox.fetch = makeFetchMock(silentRoutes);
@@ -4692,7 +4812,36 @@ console.log('\n[67a2] 群聊 /start 仅第一主人；私聊不变');
 	}), privateBlacklistedEnv, fakeCtxAd);
 	const privateBlockReply = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '5557');
 	const appealDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('私聊黑名单用户 /start 仍被拒并通知主人申诉', !!privateBlockReply && privateBlockReply.body.text.includes('黑名单') && !!appealDm && appealDm.body.text.includes('申诉'));
+	// /start 已拆成纯自我介绍：黑名单用户照样看得到「这是什么 bot」，不再被当场拒绝；
+	// 拒绝闸门守在 /unban 上（见下一段）。但「黑名单用户来了」的信号不丢，仍通报主人，
+	// 且文案与真正尝试解封时区分开，主人一眼能分清对方做了什么。
+	assert('私聊黑名单用户 /start 收到介绍语而非拒绝', !!privateBlockReply
+		&& privateBlockReply.body.text.includes('自助解封机器人')
+		&& !privateBlockReply.body.text.includes('您的TGID在黑名单中'));
+	assert('私聊黑名单用户 /start 仍通报主人，文案标为「打开了机器人」', !!appealDm
+		&& appealDm.body.text.includes('黑名单用户打开了机器人')
+		&& appealDm.body.text.includes('尚未尝试解封')
+		&& !appealDm.body.text.includes('黑名单用户申诉'));
+	assert('/start 通报里带出加黑方式与可复制的解封指令', !!appealDm
+		&& appealDm.body.text.includes('管理员 /ban 指令加黑')
+		&& appealDm.body.text.includes('/unban 5557'));
+
+	// 拒绝闸门仍在 /unban 上：同一个黑名单用户发 /unban 必须被拒，且通报文案是「申诉」
+	resetCalls();
+	sandbox.fetch = makeFetchMock(silentRoutes);
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 3403, chat: { id: 5557, type: 'private' }, from: { id: 5557, is_bot: false, first_name: '黑名单用户' }, text: '/unban' } }),
+	}), privateBlacklistedEnv, fakeCtxAd);
+	const unbanBlockReply = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '5557');
+	const unbanAppealDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('私聊黑名单用户 /unban 仍被拒绝', !!unbanBlockReply && unbanBlockReply.body.text.includes('您的TGID在黑名单中'));
+	assert('私聊黑名单用户 /unban 不发出自助解封清单', !!unbanBlockReply
+		&& !unbanBlockReply.body.text.includes('请自行检查以下内容'));
+	assert('私聊黑名单用户 /unban 通报文案标为「申诉」', !!unbanAppealDm
+		&& unbanAppealDm.body.text.includes('黑名单用户申诉')
+		&& unbanAppealDm.body.text.includes('正尝试自助解封但被黑名单阻止')
+		&& !unbanAppealDm.body.text.includes('打开了机器人'));
 
 	// 欢迎语不再暴露主群真实名称（主群可能是私密群）
 	assert('欢迎语使用固定品牌名，不显示主群名', !!privateReply && privateReply.body.text.includes('杀神搭配专用解封') && !privateReply.body.text.includes('测试主群'));

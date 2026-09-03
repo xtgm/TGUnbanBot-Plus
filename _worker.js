@@ -8,7 +8,34 @@
 //    环境变量名：SELF_UNBAN_KEYWORD
 const DEFAULT_SELF_UNBAN_KEYWORD = '我不是广告狗，我是误封的，希望可以解封。';
 
-// 2) /unban、/start 命令收到时返回的欢迎/检查清单。
+// 2) /start 收到时返回的机器人介绍欢迎语（仅 /start，不含解封确认整句）。
+//    为什么和下面的 SELF_UNBAN_PROMPT 拆开：/start 是 Telegram 在用户首次打开 bot 时
+//    自动发送的命令，任何人第一眼看到的就是它；而解封清单里含 {keyword} 确认整句，
+//    第一主人在群里发 /start 会把这句口令明文贴进群，等于公开教学如何触发解封。
+//    拆开后 /start 只做自我介绍并把用户引导到 /unban，群里发也无害。
+//    支持 HTML 子集（<b>、换行等）。占位符：{userId}、{title}。
+//    {title} 会替换成主群名称，默认文案刻意不使用它（主群可能是私密群，会泄漏群名）。
+//    /unban 写成裸文本而非 <code>：Telegram 只对纯文本里的 /xxx 给「点一下直接发送」。
+//    环境变量名：START_WELCOME
+const DEFAULT_START_WELCOME = `👋 <b>你好，{userId}</b>
+
+我是 <b>杀神搭配专用解封</b> 的自助解封机器人。
+
+<b>━━ 我是做什么的 ━━</b>
+如果你在群里被封禁或被禁言，又确认自己没有违规，
+可以在这里自己完成解封，不需要等管理员处理。
+
+<b>━━ 你现在可以做什么 ━━</b>
+🔓 被封禁 / 被禁言了 → 发送 /unban 开始自助解封
+💬 解封后仍无法发言 → 请到群内联系管理员
+
+<b>━━ 请注意 ━━</b>
+• 我不会主动私聊任何人，也不会索要账号、验证码或任何信息
+• 自助解封仅限「误封」情形；确实违规的账号会被拒绝
+• 恶意重复尝试会被记入全局黑名单，届时无法再自助解封`;
+
+// 3) /unban 收到时返回的自助解封检查清单。
+//    仅 /unban 使用（/start 已改用上面的 START_WELCOME）。
 //    支持 HTML 子集（<b>、换行等）。占位符：{userId}、{title}、{keyword}。
 //    {keyword} 会自动填入当前生效的 SELF_UNBAN_KEYWORD（来自环境变量或默认值）。
 //    {title} 仍可用（会被替换成主群名称），但默认文案刻意【不使用】它 ——
@@ -26,7 +53,7 @@ const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>�
 ✅ <b>如果你确定没有违反以上内容，请输入以下内容：</b>
 	<code>{keyword}</code>`;
 
-// 3) 用户输入正确确认句、解封请求被同意时回复的提示。
+// 4) 用户输入正确确认句、解封请求被同意时回复的提示。
 //    本项目解封走全群、封禁也走全群，bot 无法知道用户原本在哪个群被封，
 //    因此不再说"返回某个群"，而是告知"全部群组限制已解除"，并把主群定位为【联系管理员的入口】。
 //    占位符：
@@ -45,7 +72,7 @@ const DEFAULT_SELF_UNBAN_APPROVED = `✅ 已同意给予解封
 
 ⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`;
 
-// 3.1) 拿不到主群链接时使用的降级文案（不含"点击下方按钮"字样，也不会附带按钮）。
+// 4.1) 拿不到主群链接时使用的降级文案（不含"点击下方按钮"字样，也不会附带按钮）。
 //    环境变量名：SELF_UNBAN_APPROVED_NOLINK
 const DEFAULT_SELF_UNBAN_APPROVED_NOLINK = `✅ 已同意给予解封
 
@@ -56,10 +83,10 @@ const DEFAULT_SELF_UNBAN_APPROVED_NOLINK = `✅ 已同意给予解封
 
 ⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`;
 
-// 3.2) 主群联系入口按钮的文字前缀（emoji）。按钮完整文字 = 该前缀 + 群名。
+// 4.2) 主群联系入口按钮的文字前缀（emoji）。按钮完整文字 = 该前缀 + 群名。
 const SELF_UNBAN_CONTACT_BUTTON_PREFIX = '💬 ';
 
-// 4) /blacklist 命令单次最多展示多少条（按时间倒序，最新在前）。
+// 5) /blacklist 命令单次最多展示多少条（按时间倒序，最新在前）。
 //    环境变量名：BLACKLIST_PAGE_LIMIT （要求是正整数）
 const DEFAULT_BLACKLIST_PAGE_LIMIT = 30;
 
@@ -72,7 +99,7 @@ const PURGE_RUN_DELAY_MS = 250;
 const PURGE_DEFAULT_REASONS = ['manual', 'sa', 'spam', 'ad_vote'];
 const TG_MUTATION_RETRY_DELAY_MS = 350;
 
-// 5) /blacklist 列表中"原因"字段的中文映射。
+// 6) /blacklist 列表中"原因"字段的中文映射。
 //    spam 表示 /spam 举报，manual 表示 /ban 手动添加；历史 reason=sa 继续按 /spam 展示。
 //    ad_auto / ad_learn / gky_global 已无写入方（自动广告治理与杀神主动查杀均已移除），
 //    但 D1 里的历史封禁记录仍带这些 reason，标签必须保留，否则旧记录会显示成裸字符串。
@@ -88,11 +115,11 @@ const DEFAULT_BLACKLIST_REASON_LABELS = {
 	gky_global: '🌐 杀神全局封禁库命中（历史记录）'
 };
 
-// 6) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
+// 7) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
 //    环境变量名：GKY_BANLIST_ENDPOINT
 const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
 
-// 7) 超级管理员 TGID 白名单。用于普通管理命令鉴权，支持多个 TGID。
+// 8) 超级管理员 TGID 白名单。用于普通管理命令鉴权，支持多个 TGID。
 //    环境变量名：SUPER_ADMINS （字符串形式，逗号分隔）
 //    例：'123456,789012'
 //    硬编码这里写数组形式，留空数组表示默认无超管。
@@ -101,7 +128,7 @@ const DEFAULT_SUPER_ADMINS = [
 	// '987654321',
 ];
 
-// 8) 主人 TGID(项目所有者),用于"主人审计通知"系统
+// 9) 主人 TGID(项目所有者),用于"主人审计通知"系统
 //    所有管理员/超管在群里使用 /ban /unban /spam 命令、
 //    群内手动 ban/unban 时,主人会收到一份带操作人标记的私聊审计通知
 //    环境变量 OWNER_IDS(逗号分隔,中英文逗号均可):第一个是主人,后续是副主人
@@ -110,7 +137,7 @@ const DEFAULT_SUPER_ADMINS = [
 //    填了主人/副主人ID但账号从未私聊过 bot → 通知会投递失败,Worker 日志可见
 const DEFAULT_OWNER_IDS = [];
 
-// 9) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
+// 10) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
 //    留空 → 用 GROUP_IDS[0]（主群），与原行为一致。
 //    填了但该群不在 GROUP_ID 配置里 → 忽略并回落主群 + 打日志，避免把用户导向 bot 管不到的群。
 //    环境变量名：SELF_UNBAN_CONTACT_GROUP
@@ -134,6 +161,7 @@ const AD_VOTE_HISTORY_FALLBACK_LIMIT = 20;
 
 // 运行期生效的可配置项（每次请求开始时由 loadRequiredConfig 写入）
 let SELF_UNBAN_KEYWORD;
+let START_WELCOME;
 let SELF_UNBAN_PROMPT;
 let SELF_UNBAN_APPROVED;
 let SELF_UNBAN_APPROVED_NOLINK;
@@ -180,6 +208,7 @@ function applyRuntimeConfig(config) {
 	OWNER_IDS = config.OWNER_IDS;
 	MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
 	SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
+	START_WELCOME = config.START_WELCOME;
 	SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
 	SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
 	SELF_UNBAN_APPROVED_NOLINK = config.SELF_UNBAN_APPROVED_NOLINK;
@@ -356,6 +385,7 @@ function loadRequiredConfig(env) {
 	};
 
 	const selfUnbanKeyword = pickStr(env.SELF_UNBAN_KEYWORD, DEFAULT_SELF_UNBAN_KEYWORD);
+	const startWelcome = pickStr(env.START_WELCOME, DEFAULT_START_WELCOME);
 	const selfUnbanPrompt = pickStr(env.SELF_UNBAN_PROMPT, DEFAULT_SELF_UNBAN_PROMPT);
 	const selfUnbanApproved = pickStr(env.SELF_UNBAN_APPROVED, DEFAULT_SELF_UNBAN_APPROVED);
 	const selfUnbanApprovedNoLink = pickStr(env.SELF_UNBAN_APPROVED_NOLINK, DEFAULT_SELF_UNBAN_APPROVED_NOLINK);
@@ -412,6 +442,7 @@ function loadRequiredConfig(env) {
 		OWNER_IDS: ownerIds,
 		MSG_CACHE_SIZE: msgCacheSize,
 		SELF_UNBAN_KEYWORD: selfUnbanKeyword,
+		START_WELCOME: startWelcome,
 		SELF_UNBAN_PROMPT: selfUnbanPrompt,
 		SELF_UNBAN_APPROVED: selfUnbanApproved,
 		SELF_UNBAN_APPROVED_NOLINK: selfUnbanApprovedNoLink,
@@ -5109,7 +5140,12 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 }
 
 // 黑名单用户尝试自助解封时通知主人（申诉提醒）
-async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
+// 通知主人：黑名单用户在跟 bot 互动。
+// kind 区分两种信号强度，避免主人分不清对方到底做了什么：
+//   'appeal'（默认）—— 发了 /unban 或粘贴确认整句，是【真的在尝试解封】并被闸门拒绝；
+//   'start'         —— 只是打开了 bot（Telegram 自动发 /start），可能只是误触，
+//                      /start 现在只回自我介绍、不拒绝，所以这条纯属知情通报。
+async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo, kind = 'appeal') {
 	if (!OWNER_IDS.length) return;
 	const target = fromUser
 		? formatUserMention(fromUser)
@@ -5120,15 +5156,18 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
 	const reason = translateBlacklistReason(entry?.reason);
 	const operator = await translateBlacklistOperator(entry?.by);
 	const addedAt = entry?.at ? escapeHtml(entry.at) : '未知';
+	const isStart = kind === 'start';
 
 	const lines = [
-		`📢 <b>黑名单用户申诉</b>`,
+		isStart ? '📬 <b>黑名单用户打开了机器人</b>' : '📢 <b>黑名单用户申诉</b>',
 		`👤 用户:${target} <code>${escapeHtml(targetId)}</code>`,
 		`📋 加黑方式:${reason}`,
 		`🔧 加黑操作人:${operator}`,
 		`🕐 加黑时间:${addedAt}`,
 		'',
-		`该用户正尝试自助解封但被黑名单阻止。`,
+		isStart
+			? '该用户刚发送 /start 打开机器人，只收到了自我介绍，尚未尝试解封。'
+			: '该用户正尝试自助解封但被黑名单阻止。',
 		`如确认误封，请执行: <code>/unban ${escapeHtml(targetId)}</code>`,
 	];
 
@@ -6599,7 +6638,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'<b>━━ 人工封禁 ━━</b>',
 			'/ban TGID [原因]　加入全局黑名单 + 全群封禁',
 			'/spam　回复广告使用：删消息 + 全群封禁 + 撤回其历史发言',
-			'/unban TGID　移出黑名单 + 全群解封',
+			'/unban TGID　移出黑名单 + 全群解封（裸发 /unban 是自己走自助解封，不是解封别人）',
 			'',
 			'<b>━━ 广告举报投票 ━━</b>',
 			'/ad [原因]　回复广告发起群内投票，通过后加黑并全群封禁',
@@ -6918,6 +6957,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			let flashText;
 			if (result.success || alreadyExists) {
 				const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
+				// 与 /spam 对齐：Telegram 的 revoke_messages 只对【仍在群里】的成员生效，
+				// 目标若已退群/已被别人踢过就变成预封，历史发言一条都撤不掉。
+				// 这里补一层兜底：从 moderation_messages 捞出该 TGID 在【当前群】缓存的消息 ID
+				// 逐条 deleteMessage。仅群内执行时做 —— 私聊没有"当前群"的概念；
+				// 批量路径也不做，N 个目标 × 最多 200 条会直接撞 Cloudflare 子请求上限。
+				const cleanupResult = isInGroup
+					? await cleanupCurrentChatUserMessages(env, chatId, valid[0])
+					: null;
 				targetMention = formatTargetFromBanResults(valid[0], banResults);
 				lines.push(`🎯 目标用户:${targetMention}`);
 				lines.push('');
@@ -6925,6 +6972,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
 				}
 				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/ban' }));
+				if (cleanupResult) {
+					lines.push(renderCurrentChatCleanupResult(cleanupResult));
+					if (cleanupResult.failed > 0 && cleanupResult.errors.length > 0) {
+						const previews = cleanupResult.errors.slice(0, 3).map((item) => {
+							const { 中文, 建议 } = translateTelegramError(item.error);
+							return `<code>${escapeHtml(String(item.messageId))}</code>:${escapeHtml(中文)}；建议:${escapeHtml(建议)}`;
+						});
+						lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
+					}
+				}
 				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
@@ -7133,16 +7190,47 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 	}
 
-	// 处理 /start 和 /unban 命令 - 显示欢迎消息
-	if (
-		(startCommand.head === '/start' && !startCommand.rest) ||
-		(unbanCommand.head === '/unban' && !unbanCommand.rest)
-	) {
+	// ===== 无参 /start —— 机器人介绍欢迎语 =====
+	// 与下面 /unban 的自助解封清单【刻意拆开】：/start 是 Telegram 在用户首次打开 bot 时
+	// 自动发送的命令，任何人第一眼看到的就是它；而解封清单含 {keyword} 确认整句，
+	// 第一主人在群里发 /start 会把这句口令明文贴进群，等于公开教学如何触发解封。
+	// 拆开后 /start 只做自我介绍并引导用户去 /unban，群里发也无害。
+	if (startCommand.head === '/start' && !startCommand.rest) {
+		// 群聊权限与拆分前完全一致：只有第一主人能触发，其他任何人（普通成员、群管理员、
+		// 超级管理员、副主人、匿名管理员）一律【纯静默】—— 不回、不撤回、不通知主人、
+		// 零 Telegram 请求。私聊不进此判定，任何人都能看到介绍语。
+		if (message.chat.type !== 'private' && !isPrimaryOwner(getMessageActorId(message))) {
+			return;
+		}
+		// 刻意【不】走 blockSelfUnbanIfBlacklisted：这段只是自我介绍，黑名单用户也该看得到
+		// "这是什么 bot"；等他发 /unban 时再由那道闸门拒绝，闸门本身一点没削弱。
+		// 但「黑名单用户来了」这个信号不能丢，仍要报给主人 —— 用 kind='start' 区分文案，
+		// 主人一眼就能分清对方只是打开了 bot，还是真的在尝试解封。
+		// 查询失败（checkFailed）不通报：那是 D1 异常而非用户行为，报了只会误导。
+		try {
+			const startCheck = await checkBlacklist(userId, env, { strict: true });
+			if (startCheck.isBlacklisted && !startCheck.checkFailed) {
+				// 用 waitUntil 异步投递：通知失败不该拖慢或阻断介绍语的回复
+				ctx.waitUntil(notifyOwnerBlacklistAppeal(message.from, startCheck, 'start'));
+			}
+		} catch (error) {
+			console.error('[/start] 黑名单知情通报失败:', error);
+		}
+		// {title} 需要额外一次 getChat，默认文案并不使用它，所以按需才查。
+		const startTitle = START_WELCOME.includes('{title}') ? (await getGroupInfo()).title : '';
+		await sendTelegramMessage(chatId, START_WELCOME
+			.replaceAll('{userId}', String(userId))
+			.replaceAll('{title}', startTitle));
+		return;
+	}
+
+	// 处理无参 /unban - 自助解封检查清单
+	if (unbanCommand.head === '/unban' && !unbanCommand.rest) {
 		// 群聊里的自助解封入口只对第一主人开放：任何其他人（普通成员、群管理员、
-		// 超级管理员、副主人、匿名管理员）在配置群发无参 /start 或 /unban 一律【纯静默】——
+		// 超级管理员、副主人、匿名管理员）在配置群发无参 /unban 一律【纯静默】——
 		// 不回欢迎语、不撤回命令、不私聊主人、不产生任何 Telegram 请求。
-		// 原因：这段欢迎语是给「被封禁用户私聊 bot」用的自助流程，任何人都能在群里
-		// 把它刷出来会污染群消息流，且欢迎语里含解封确认整句，等于公开教学如何触发解封。
+		// 原因：这段清单是给「被封禁用户私聊 bot」用的自助流程，任何人都能在群里
+		// 把它刷出来会污染群消息流，且清单里含解封确认整句，等于公开教学如何触发解封。
 		// 私聊完全不进此判定，权限与行为保持原样。
 		if (message.chat.type !== 'private' && !isPrimaryOwner(getMessageActorId(message))) {
 			return;
@@ -7150,7 +7238,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		const quietManagerCommand = await isNonPrimaryConfiguredGroupManager(message, userId);
 		if (quietManagerCommand) {
-			await deleteAuthorizedGroupCommandMessage(message, startCommand.head === '/start' ? '/start' : '/unban');
+			await deleteAuthorizedGroupCommandMessage(message, '/unban');
 		}
 		// D1 全局黑名单是自助解封的硬闸门：命中任何 reason 都拒绝，且不自动移除黑名单。
 		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env, {
