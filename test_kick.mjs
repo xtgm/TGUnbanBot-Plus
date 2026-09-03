@@ -4305,12 +4305,14 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('/help 全部指令兼容 @机器人名', mentionParseOk && argumentParseOk);
 	const removedBanCommand = '/' + ['b', 'e'].join('');
 	const removedSpamCommand = '/' + ['s', 'a'].join('');
-	assert('主人 /help → 声明不做自动广告检测', !!dm && dm.body.text.includes('不做任何自动广告检测'));
-	assert('主人 /help → 批量与学习说明统一为 ban/spam', !!dm && dm.body.text.includes('/ban TGID') && dm.body.text.includes('/spam'));
+	assert('主人 /help → 人工封禁三条齐全', !!dm && dm.body.text.includes('/ban TGID') && dm.body.text.includes('/spam') && dm.body.text.includes('/unban TGID'));
 	assert('主人 /help → 不再显示旧短命令', !!dm && !dm.body.text.includes(removedBanCommand) && !dm.body.text.includes(removedSpamCommand));
-	assert('主人 /help → 含 /admins 权限名单说明', !!dm && dm.body.text.includes('/admins') && dm.body.text.includes('权限名单'));
-	assert('主人 /help → 含 /groups 群组查询说明', !!dm && dm.body.text.includes('/groups') && dm.body.text.includes('GROUP_ID'));
-	assert('主人 /help → 含 /ad 安全发起权限、原因、自动置顶、取消投票与 revoke_messages 说明', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('/add_ad_admin 白名单成员可发起') && dm.body.text.includes('普通成员和助推者只能参与投票') && dm.body.text.includes('自动置顶') && dm.body.text.includes('取消投票') && dm.body.text.includes('revoke_messages=true'));
+	assert('主人 /help → 含 /ad 投票与白名单管理', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('/add_ad_admin') && dm.body.text.includes('/del_ad_admin'));
+	assert('主人 /help → 含动态群组三条', !!dm && dm.body.text.includes('/addgroup') && dm.body.text.includes('/delgroup') && dm.body.text.includes('/listgroups'));
+	assert('主人 /help → 含查询与退群三条', !!dm && dm.body.text.includes('/admins') && dm.body.text.includes('/groups') && dm.body.text.includes('/leavegroup'));
+	const helpCommandLines = dm.body.text.split('\n').filter((l) => l.startsWith('<code>/'));
+	assert('主人 /help → 每条指令都带用途说明', helpCommandLines.length >= 12
+		&& helpCommandLines.every((l) => l.replace(/<[^>]+>/g, '').replace(/^\/[a-z_]+/, '').replace(/^[^\u4e00-\u9fa5]*/, '').trim().length >= 4));
 	// 群管理员(非主人)私聊 /help → 权限不足,不泄漏指令
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/help' } }) }), env, fakeCtxAd);

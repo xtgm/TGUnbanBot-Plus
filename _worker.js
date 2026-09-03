@@ -6440,29 +6440,29 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 		const helpLines = [
-			'🔐 <b>第一主人专属隐藏指令索引</b>(仅 OWNER_IDS[0] 可展开；其他角色群内静默，私聊仅提示权限不足)',
+			'🔐 <b>第一主人专属指令</b>（其他人无反应，也不出现在命令菜单里）',
 			'',
 			'<b>━━ 人工封禁 ━━</b>',
-			'<code>/ban TGID [原因]</code> 或回复目标消息 <code>/ban</code>：写入 D1 全局黑名单并遍历全部 GROUP_ID 封禁',
-			'<code>/spam</code>(群内回复广告)：删除该消息并全群封禁发送者，撤回其各群历史发言；不学习任何内容',
+			'<code>/ban TGID [原因]</code>　加入全局黑名单 + 全群封禁',
+			'<code>/spam</code>　回复广告使用：删消息 + 全群封禁 + 撤回其历史发言',
+			'<code>/unban TGID</code>　移出黑名单 + 全群解封',
 			'',
-			'<b>━━ 群内广告举报投票 ━━</b>',
-			'<code>/ad [原因]</code> 回复目标消息发起；或 <code>/ad TGID [原因]</code>。主人/副主人/超级管理员、当前群管理员或 /add_ad_admin 白名单成员可发起',
-			'• 发起后自动置顶；发起人自动计 1 票；赞成或反对达到 6 票结束；当前群管理员点击可一票通过或一票否决',
-			'• 发起人、当前群管理员或高级管理员可点“取消投票”；通过/否决/过期/取消后均自动取消置顶',
-			'• 通过后写入 D1 全局黑名单并遍历全部 GROUP_ID 封禁，revoke_messages=true 撤回各群历史发言',
-			'<code>/add_ad_admin TGID</code> / <code>/del_ad_admin TGID</code> 管理 /ad 发起白名单（仅第一主人）；普通成员和助推者只能参与投票',
+			'<b>━━ 广告举报投票 ━━</b>',
+			'<code>/ad [原因]</code>　回复广告发起群内投票，通过后加黑并全群封禁',
+			'<code>/add_ad_admin TGID</code>　允许该成员发起 /ad 投票',
+			'<code>/del_ad_admin TGID</code>　取消该成员的发起权限',
 			'',
-			'<b>━━ 权限名单查询(仅主人私聊)━━</b>',
-			'<code>/admins</code> 查看当前主人/副主人/超级管理员名单,显示 TGID、昵称、用户名、群内身份',
-			'<code>/groups</code> 查看当前 GROUP_ID 配置群组,显示群名、ChatID、类型、用户名',
-			'<code>/leavegroup -1001234567890</code> 让 bot 退出指定群组(仅主人私聊)',
+			'<b>━━ 动态群组（仅私聊）━━</b>',
+			'<code>/addgroup -100xxx [备注]</code>　新增治理群组，不用改环境变量',
+			'<code>/delgroup -100xxx</code>　不再治理该群，bot 仍留在群里',
+			'<code>/listgroups</code>　列出全部生效群组',
 			'',
-			'<b>━━ 说明 ━━</b>',
-			'• 非 OWNER_IDS 用户在群内使用以上指令时静默；私聊会提示权限不足；<code>/admins</code>/<code>/groups</code>/<code>/leavegroup</code> 只允许主人私聊使用',
-			'• 本 bot <b>不做任何自动广告检测</b>：不扫词库、不扫正则、不扫资料卡，封禁一律由真人经 <code>/ban</code>、<code>/spam</code>、<code>/ad</code> 投票发起',
+			'<b>━━ 查询与退群（仅私聊）━━</b>',
+			'<code>/admins</code>　查看主人 / 副主人 / 超级管理员名单',
+			'<code>/groups</code>　查看当前生效群组信息',
+			'<code>/leavegroup -100xxx</code>　让 bot 退出该群',
 		];
-		await sendTelegramMessage(chatId, helpLines.join('\n'));
+		await sendTelegramMessageChunks(chatId, helpLines.join('\n'));
 		return;
 	}
 
