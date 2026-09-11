@@ -191,7 +191,33 @@ check('群数增至 20 时 30 个号会撞硬限（证明上限必要）', e30x2
 const e3 = W.estimateBulkTaskSubrequests(3, 15, {});
 check('3 个号已超同步预算 100 → 连带一律走批量任务', e3.total > 100, e3.total + ' > 100');
 
-console.log('\n=== 11. 同步/批量分流按预算动态判断 ===');
+console.log('\n=== 11. 旧库降级写入（线上事故回归）===');
+// 线上真实故障：D1_SCHEMA_VERSION 没提 → ensureD1Table 在 version >= 目标版本时短路 →
+// text_hash/text_norm 两列没加上 → 带新列的 INSERT 每条都失败 → 消息缓存整体停写。
+// 这里模拟「旧库」：另建一个只有四列的表，验证降级分支能把消息照常写进去。
+{
+	const legacyEnv = { TOKEN: 'T', BOT_TOKEN: '1:x', GROUP_ID: GROUPS.join(','), OWNER_IDS: '10001', DB: makeD1() };
+	// 手动建旧结构（不含 text_hash / text_norm），并把 schema 版本写成已完成，
+	// 让 ensureD1Table 短路 —— 完整复现线上那条路径。
+	await legacyEnv.DB.exec('CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY, version INTEGER, updated_at TEXT)');
+	await legacyEnv.DB.exec('CREATE TABLE IF NOT EXISTS moderation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, from_id TEXT, created_at TEXT)');
+	await legacyEnv.DB.exec('CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT)');
+	await legacyEnv.DB.exec('CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT)');
+	await legacyEnv.DB.exec('CREATE TABLE IF NOT EXISTS dynamic_groups (chat_id TEXT PRIMARY KEY, title TEXT, added_by TEXT NOT NULL, added_at TEXT NOT NULL, note TEXT)');
+	await legacyEnv.DB.prepare('INSERT OR REPLACE INTO schema_meta (id, version, updated_at) VALUES (1, ?, ?)')
+		.bind(99, new Date().toISOString()).run();
+
+	await W.cacheModerationMessage(legacyEnv, {
+		message_id: 7001, chat: { id: GROUPS[0] }, from: { id: '601' }, text: AD_TEXT
+	});
+	const legacyRows = legacyEnv.DB.query('SELECT mid, from_id FROM moderation_messages');
+	check('旧库（无新列）消息仍写入成功，清扫能力不受影响', legacyRows.length === 1 && String(legacyRows[0].from_id) === '601',
+		'写入 ' + legacyRows.length + ' 行');
+	const legacyCols = legacyEnv.DB.query('PRAGMA table_info(moderation_messages)').map((c) => c.name);
+	check('确认走的是降级分支（库里确实没有新列）', !legacyCols.includes('text_hash'));
+}
+
+console.log('\n=== 12. 同步/批量分流按预算动态判断 ===');
 // 当前沙箱只有 3 个群，少群场景下小批量应当可以同步执行。
 check('3 群 + 2 个目标 → 同步执行', W.shouldRunLinkedSpamSync(2) === true);
 check('3 群 + 20 个目标 → 转批量任务', W.shouldRunLinkedSpamSync(20) === false);

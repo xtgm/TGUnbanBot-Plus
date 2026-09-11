@@ -1571,7 +1571,22 @@ section('[11] 回归：既有功能不被广告层吞掉');
 
 	// 核心表与广告表共存：广告建表不能影响既有 schema 版本，也不能挤掉核心 5 表。
 	// ad_votes / ad_vote_allowlist 属投票功能的按需建表，本文件不触发投票流程，故不在必存清单里。
-	assert('核心表 schema 版本保持 6', Number(env.DB.query('SELECT version FROM schema_meta WHERE id = 1')[0]?.version) === 6, JSON.stringify(env.DB.query('SELECT * FROM schema_meta')));
+	// 【7】2026-09-11：moderation_messages 加 text_hash / text_norm（同款广告连带查杀）。
+	// 版本号必须随新增列同步 +1 —— ensureD1Table 在 version >= 目标值时短路返回，
+	// 不提的话存量库永远不重跑迁移，新列加不上，而 INSERT 已带新列 → 每条消息写失败。
+	// 线上真实发生过（每条群消息 INSERT 全失败、消息缓存整体停写）。
+	// 写死数字而非引用常量：_worker.js 里 D1_SCHEMA_VERSION 是 const，不挂 vm 沙箱全局，
+	// 取出来是 undefined。写死的好处是「改了常量必须回来改这里」，
+	// 迫使后来者正面确认一次迁移影响，而不是让断言跟着常量静默滑过去。
+	assert('核心表 schema 版本为 7（moderation_messages 新增 text_hash/text_norm）',
+		Number(env.DB.query('SELECT version FROM schema_meta WHERE id = 1')[0]?.version) === 7,
+		JSON.stringify(env.DB.query('SELECT * FROM schema_meta')));
+	// 新列必须真的存在 —— 版本号写对但列没加上，正是线上那次故障的形态。
+	{
+		const modCols = env.DB.query('PRAGMA table_info(moderation_messages)').map((c) => c.name);
+		assert('moderation_messages 已含 text_hash 列', modCols.includes('text_hash'), modCols.join(','));
+		assert('moderation_messages 已含 text_norm 列', modCols.includes('text_norm'), modCols.join(','));
+	}
 	const tables = env.DB.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").map((r) => r.name);
 	for (const t of ['schema_meta', 'blacklist', 'moderation_messages', 'batch_jobs', 'dynamic_groups', 'ad_fingerprints', 'ad_user_screening', 'ad_sample_embeddings', 'ad_domain_whitelist', 'ad_pending_snapshots', 'ad_confirm_tokens']) {
 		assert('表存在：' + t, tables.includes(t), JSON.stringify(tables));

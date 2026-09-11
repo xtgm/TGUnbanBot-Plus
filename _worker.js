@@ -721,7 +721,13 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 // 读取并归一化黑名单
 // === D1 工具函数 ===
 // 首次访问 D1 时建表（幂等），避免人工建表步骤
-const D1_SCHEMA_VERSION = 6;
+// 【7】2026-09-11：moderation_messages 新增 text_hash / text_norm（同款广告连带查杀）。
+// 必须提版本号 —— ensureD1Table 在 version >= D1_SCHEMA_VERSION 时直接短路返回，
+// 不提的话线上已是 6 的库永远不会重跑迁移，两列加不上，
+// 而 cacheModerationMessage 的 INSERT 已经带上了新列 → 每条群消息都写失败，
+// 消息缓存整体停写、/spam 的历史清扫连带失效（线上实际发生过）。
+// 后来者新增列时务必同步 +1。
+const D1_SCHEMA_VERSION = 7;
 const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
@@ -5090,16 +5096,40 @@ async function cacheModerationMessage(env, message) {
 	try {
 		await ensureD1Table(env);
 		const textKey = buildModerationTextKey(message);
-		const insertResult = await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm) VALUES (?, ?, ?, ?, ?, ?)')
-			.bind(
-				message.message_id,
-				String(message.chat.id),
-				String(message.from.id),
-				new Date().toISOString(),
-				textKey?.hash ?? null,
-				textKey?.norm ?? null
-			)
-			.run();
+		const nowIso = new Date().toISOString();
+		// 带新列写入；若库里还没有 text_hash / text_norm（迁移未跑或跑失败），
+		// 降级成旧的四列 INSERT。
+		// 【为什么要这道容错】moderation_messages 承载的是 /spam 历史消息清扫这项【既有基础能力】，
+		// 不该因为「同款连带」这个新功能的 schema 变更而整体停写 ——
+		// 线上就出现过：版本号没提 → 迁移短路不执行 → 两列不存在 → 每条群消息 INSERT 全失败。
+		// 版本号提升治的是「迁移没跑」，这道降级治的是「迁移跑了但失败」（D1 抖动等），两者互补。
+		let insertResult;
+		try {
+			insertResult = await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm) VALUES (?, ?, ?, ?, ?, ?)')
+				.bind(
+					message.message_id,
+					String(message.chat.id),
+					String(message.from.id),
+					nowIso,
+					textKey?.hash ?? null,
+					textKey?.norm ?? null
+				)
+				.run();
+		} catch (error) {
+			const reason = String(error?.message || error).toLowerCase();
+			// 只对「列不存在」降级；其它错误（约束冲突、D1 不可用）照原样抛给外层日志，
+			// 否则真故障会被这道容错掩盖成「静默成功」。
+			if (!reason.includes('no such column') && !reason.includes('has no column')) throw error;
+			console.error('[清扫缓存] text_hash/text_norm 列缺失，降级为基础写入（同款连带暂不可用，检查 D1 迁移）');
+			insertResult = await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
+				.bind(
+					message.message_id,
+					String(message.chat.id),
+					String(message.from.id),
+					nowIso
+				)
+				.run();
+		}
 		const limit = Math.max(MSG_CACHE_SIZE, 200);
 		if (shouldPruneD1Cache(insertResult)) {
 			await pruneAutoincrementCacheTable(env, 'moderation_messages', limit);
