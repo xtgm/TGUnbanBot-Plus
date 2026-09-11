@@ -131,7 +131,7 @@
 | 命令 | 位置 | 说明 |
 | --- | --- | --- |
 | `/help` | 私聊 | 展开全部 OWNER_IDS 专属隐藏指令清单 |
-| `/admins` | **仅主人私聊** | 查看当前 `OWNER_IDS` / `SUPER_ADMINS` 权限名单，显示 TGID、昵称、用户名、群内身份；群内不支持且静默。<br>⚠️ 昵称与用户名靠 Telegram API 实时查询，而 API **只能查到 bot 所在群的成员** —— 权限人若不在任何配置群里，只会显示 TGID 加「未获取」。两种解法：① 把 bot 拉进此人所在的群（**普通成员即可，无需管理员**）并将该群加入 `GROUP_ID`；② 用 `STATIC_USER_PROFILES` 环境变量填静态资料兜底（bot 与其同群后自动改用实时数据）。 |
+| `/admins` | **仅主人私聊** | 查看当前 `OWNER_IDS` / `SUPER_ADMINS` 权限名单，显示 TGID、昵称、用户名、群内身份；群内不支持且静默。<br>⚠️ 昵称与用户名靠 Telegram API 实时查询，而 API **只能查到 bot 所在群的成员** —— 权限人若不在任何配置群里，只会显示 TGID 加「未获取」。两种解法：① 把 bot 拉进此人所在的群（**普通成员即可，无需管理员**），群 ID 填进 `PROFILE_LOOKUP_GROUPS` —— 该群只供查资料、**不参与治理**，填 `GROUP_ID` 才会开放封禁权限；② 用 `STATIC_USER_PROFILES` 填静态资料兜底（查到实时资料后自动覆盖）。 |
 | `/addgroup -100xxxx [备注]` | **仅第一主人私聊** | **不改环境变量、直接用指令新增治理群组**。写入 D1，与 `GROUP_ID` 环境变量分离存放（Worker 无法写自己的环境变量），但合并后享受**完全相同**的治理能力：黑名单拦截、复入群踢回、`/ban` `/spam` 全群封禁、`/purge` 清扫、批量任务。<br>三道硬校验：① ID 必须 `-100` 开头；② 不得与 `GROUP_ID` 环境变量重复；③ **bot 必须已是该群管理员且有「封禁用户」权限**（复用 `/purge` 预检逻辑），否则拒绝并说明原因 —— 加进来也只会全程报错。 |
 | `/delgroup -100xxxx` | **仅第一主人私聊** | 移除指令添加的群。`GROUP_ID` 环境变量里的群**无法**用指令移除（会提示改 Cloudflare 后台）。移除只是不再治理，bot 仍在群内，需退群用 `/leavegroup`。 |
 | `/listgroups` | **仅第一主人私聊** | 分段列出「环境变量群」与「指令添加群」，标注 ⭐ 主群、显示群名/备注/添加时间与合计数量。 |
@@ -317,6 +317,7 @@ node test_kick.mjs && node test_ad_detection.mjs && node test_ad_bio_gates.mjs \
 | `AD_AI_SIMILARITY_THRESHOLD` | `0.78` | AI 语义相似度**硬命中阈值**（0.1-1）。达到即直接定罪；落在 `[0.65, 该值)` 只加 2 分软加分。调低会显著增加误判。未绑定 AI 时此项无效。 |
 | `AD_FINGERPRINT_MIN_CONFIDENCE` | `0.6` | 指纹参与判定的**最低置信度**（0-1）。置信度 = 命中数 / (命中数 + 误报数)，低于此值的指纹不参与判定但仍留在库里。 |
 | `AD_PROTECTED_USERNAMES` | 空 | **权限人用户名永不学习白名单**。主人 / 副主人 / 超级管理员的 `@handle` 绝不允许进指纹库。逗号分隔（半角 `,` 与全角 `，` 都兼容），`@` 前缀可省，例 `ym94203,suqi_20` 或 `@ym94203，@suqi_20`。<br>只接受合规 Telegram 用户名（5-32 位字母数字下划线），过短 / 空值 / 含非法字符的一律丢弃 —— 防的是空串进列表后 `includes` 全量命中、等于关掉整个指纹层。<br>留空则只靠「username 只比对账号自身 handle」的结构性隔离兜底（已足够，本项是加固而非必需）。填上之后多一层保障：即使主人的 handle 被夹在某条 keyword 截断短语里，也不会入库。 |
+| `PROFILE_LOOKUP_GROUPS` | 空 | **只读资料群**：仅供 `/admins` 查询昵称 / 用户名 / 来源群，**完全不参与治理**。逗号分隔（半角 `,` 与全角 `，` 均可），格式与 `GROUP_ID` 一致，例 `-1002565053719,-1001234567890`。<br>**解决什么问题**：Telegram Bot API 只能查 **bot 所在群**的成员资料，没有任何接口能凭 TGID 直接查任意用户。所以主人 / 副主人 / 超级管理员若不在任何 `GROUP_ID` 配置群里，`/admins` 只能显示 TGID 加「未获取」。把 bot 拉进此人所在的任意一个群、群 ID 填到这里，资料就能实时查到。<br>**bot 不需要管理员权限，普通成员即可** —— `getChatMember` 只要求 bot 在群内。<br>⚠️ **与 `GROUP_ID` 的关键区别**：填到这里的群**不会**被治理 —— 它不进 `isConfiguredGroup`，因此广告检测、封禁、`/ban` `/spam` 命令鉴权、`/purge`、`/ad` 投票**全部天然隔离**，该群的 Telegram 管理员也**不会**因此获得任何命令权限。这正是它与「把群加进 `GROUP_ID`」的本质差别：后者等于把封禁能力一起开放出去。<br>已在 `GROUP_ID` 里的群会自动剔除（本来就在遍历范围内，重复只是多花一次请求）；正数（误填用户 ID）与非法值一律丢弃。<br>与 `STATIC_USER_PROFILES` 互补：静态表是手填兜底，本项是实时查询，**查到实时资料会覆盖静态值**，所以对方改了昵称会自动更新。 |
 | `STATIC_USER_PROFILES` | 空 | **`/admins` 权限名单的静态资料兜底**（JSON 字符串）。Telegram Bot API 只能查到 **bot 所在群**的成员资料 —— 主人 / 副主人 / 超级管理员若不在任何配置群里，`/admins` 只能显示 TGID，昵称与用户名都是「未获取」。<br>格式：`{"TGID":{"first_name":"昵称","username":"用户名"}}`，可含 `first_name` / `last_name` / `username`，`id` 由 key 自动补全，多个用户写成多个键。例：<br>`{"197282502":{"first_name":"威廉","username":"RealNeoMan"}}`<br>**只作兜底、不覆盖实时数据**：`resolvePermissionUserProfiles` 先用本表填充，再依次调 `getChatAdministrators` / `getChatMember`，API 查到就覆盖静态值。所以 bot 一旦和此人同群，显示的永远是 Telegram 实时资料，静态表自动让位。<br>key 必须是纯数字 TGID，非法 key 直接跳过；整段 JSON 解析失败时记一条错误日志并回落空表，不中断启动。 |
 
 > ⚠️ **这 5 个 `AD_*` 变量建议一个都不填**，先用默认值跑几天，看 `/pending` 的复核结果再决定要不要调。调优思路见 [广告检测 → 阈值调优](#阈值调优)。
@@ -487,6 +488,7 @@ wrangler secret put GROUP_ID     # 输入：-1001234567890
 | `BLACKLIST_REASON_LABELS` | `{"spam":"群内举报"}` | JSON 字符串，自定义原因中文映射 |
 | `GKY_BANLIST_ENDPOINT` | `https://gkybot.gmeow.cc/banlist` | GKY 查询后端，一般不改 |
 | `FLASH_MESSAGE_TTL_MS` | `5000`（想看久点填 `10000`） | 群内闪屏几毫秒后自动撤回，0~60000。填 `0` = 永不撤回（不推荐） |
+| `PROFILE_LOOKUP_GROUPS` | `-1002565053719` | 只读资料群，逗号分隔。仅供 `/admins` 查昵称/用户名/来源群，**不参与治理**（不进 `isConfiguredGroup`，封禁/检测/命令权限全部隔离）。bot 只需是普通成员，无需管理员 |
 | `STATIC_USER_PROFILES` | `{"197282502":{"first_name":"威廉","username":"RealNeoMan"}}` | `/admins` 权限名单静态资料兜底，JSON 字符串。用于不在任何配置群的权限人 —— bot 查不到资料时显示这里填的昵称和用户名；bot 与其同群时自动改用实时资料 |
 
 #### 6.5 广告检测阈值（可选，**建议一个都不填**）
@@ -1056,7 +1058,7 @@ Q21 修的是 `pinned_message` **服务消息**被清扫缓存误删。本条是
 
 **解决**（二选一）：
 
-1. **让 bot 与其同群（推荐，资料永远是最新的）**：把 bot 拉进此人所在的任意一个群，再把该群 ID 加进 `GROUP_ID`。<br>**bot 不需要管理员权限，普通成员就够** —— `getChatMember` 只要求 bot 在群里。<br>⚠️ 两个注意点：① 加进 `GROUP_ID` 的群会一并受治理，**该群的 Telegram 管理员也就获得了 `/ban` `/spam` 权限**，不想开放就别加；② 资料是**每次命令实时查**的、没有持久化缓存，**bot 退群后立刻变回「未获取」**，想长期显示就得一直留在群里。
+1. **用 `PROFILE_LOOKUP_GROUPS` 只读资料群（推荐，资料永远最新且不开放任何权限）**：把 bot 拉进此人所在的任意一个群，群 ID 填进 `PROFILE_LOOKUP_GROUPS`（**不是** `GROUP_ID`）。<br>**bot 不需要管理员权限，普通成员就够** —— `getChatMember` 只要求 bot 在群里。<br>**为什么不填 `GROUP_ID`**：填 `GROUP_ID` 等于把那个群纳入治理，**该群的 Telegram 管理员会一并获得 `/ban` `/spam` 权限**，广告检测也会在那里封人。`PROFILE_LOOKUP_GROUPS` 不进 `isConfiguredGroup`，封禁、检测、命令鉴权、`/purge`、`/ad` 投票**全部隔离**，只用来查资料。<br>⚠️ 资料是**每次命令实时查**的、没有持久化缓存，**bot 退群后立刻变回「未获取」**，想长期显示就得一直留在群里。
 2. **用 `STATIC_USER_PROFILES` 填静态资料**：JSON 字符串，例 `{"197282502":{"first_name":"威廉","username":"RealNeoMan"}}`。<br>只作兜底：程序先用它填充，再调 API，**查到实时资料就自动覆盖静态值**，两条路互不干扰。适合权限人确实不方便进任何配置群的情况。<br>⚠️ 静态值是写死的，对方改了昵称不会自动更新，建议只填基本不变的 `username`。
 
 ## License

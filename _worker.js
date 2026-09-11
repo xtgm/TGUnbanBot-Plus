@@ -203,6 +203,11 @@ let OWNER_IDS = [];
 // 格式：TGID 字符串 → { id, first_name, last_name, username }
 // 环境变量 STATIC_USER_PROFILES（JSON 字符串）优先，留空则为空表
 let STATIC_USER_PROFILES = {};
+// 只读资料群：仅用于 /admins 查询用户昵称/用户名/来源群，【完全不参与治理】。
+// 刻意【不并入 GROUP_IDS】—— isConfiguredGroup 看不到这个名单，
+// 因此广告检测、封禁、命令鉴权、/purge、/ad 投票全都不会碰这些群。
+// bot 在里面不需要任何权限，普通成员即可（getChatMember 只要求 bot 在群内）。
+let PROFILE_LOOKUP_GROUPS = [];
 // 清扫回看上限(/spam 按它决定 moderation_messages 回看多少条)
 let MSG_CACHE_SIZE = 50;
 // 机器人用户名缓存
@@ -224,6 +229,7 @@ function applyRuntimeConfig(config) {
 	SUPER_ADMINS = config.SUPER_ADMINS;
 	OWNER_IDS = config.OWNER_IDS;
 	STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
+	PROFILE_LOOKUP_GROUPS = config.PROFILE_LOOKUP_GROUPS || [];
 	AD_PROTECTED_USERNAMES = config.AD_PROTECTED_USERNAMES || [];
 	MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
 	FLASH_MESSAGE_TTL_MS = config.FLASH_MESSAGE_TTL_MS;
@@ -512,6 +518,9 @@ function loadRequiredConfig(env) {
 		BLACKLIST_REASON_LABELS: blacklistReasonLabels,
 		GKY_BANLIST_ENDPOINT: gkyEndpoint,
 		STATIC_USER_PROFILES: parseStaticUserProfiles(env.STATIC_USER_PROFILES),
+		// 只读资料群：与 GROUP_ID 同样的逗号分隔格式，但【绝不并入 uniqueGroupIds】。
+		// 已在 GROUP_ID 里的群自动剔除 —— 那些群本来就会被遍历，重复只是白花请求。
+		PROFILE_LOOKUP_GROUPS: parseProfileLookupGroups(env.PROFILE_LOOKUP_GROUPS, uniqueGroupIds),
 	};
 }
 
@@ -4187,7 +4196,13 @@ async function resolvePermissionUserProfiles(ids) {
 		}
 	}
 
-	for (const groupId of GROUP_IDS) {
+	// 查询范围 = 治理群 + 只读资料群。治理群在前：同一个人在两类群都能查到时，
+	// 来源群优先显示治理群（那是主人更关心的上下文）。
+	// 【只在这个函数里合并】PROFILE_LOOKUP_GROUPS 不进 GROUP_IDS、不进 isConfiguredGroup，
+	// 所以封禁 / 检测 / 命令鉴权 / purge / 投票一个都不会碰到这些群。
+	const lookupGroups = [...GROUP_IDS, ...PROFILE_LOOKUP_GROUPS];
+
+	for (const groupId of lookupGroups) {
 		try {
 			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
 				method: 'POST',
@@ -4215,9 +4230,18 @@ async function resolvePermissionUserProfiles(ids) {
 		}
 	}
 
+	// 逐个补查：上面 getChatAdministrators 只能查到【管理员】，而只读资料群里的目标人
+	// 通常只是普通成员，必须靠 getChatMember 才查得到 —— 这一轨才是只读资料群的主用途。
+	//
+	// 【2026-09-11 修正跳过条件】原来写 `if (profiles.has(id)) continue`，
+	// 而静态表（STATIC_USER_PROFILES）在函数开头就把兜底资料填进了同一个 Map ——
+	// 于是只要某人在静态表里有一条，这一轨就被整个跳过，实时查询永远不执行。
+	// 后果是「静态表只作兜底、查到实时资料就覆盖」这个承诺根本不成立：
+	// 对方改了昵称永远显示旧值，配了只读资料群也白配。
+	// 改为只跳过【已由 API 查到】的，静态兜底不算已解析。
 	for (const id of wanted) {
-		if (profiles.has(id)) continue;
-		for (const groupId of GROUP_IDS) {
+		if (profiles.get(id)?.source === 'getChatAdministrators') continue;
+		for (const groupId of lookupGroups) {
 			try {
 				const result = await checkUserStatus(id, groupId);
 				const user = result?.result?.user;
@@ -9306,6 +9330,27 @@ const AD_FINGERPRINT_TYPES = ['keyword', 'domain', 'username', 'bio'];
 // 留空则只靠方案 A 的结构性移除兜底（已足够，白名单是加固而非必需）。
 const DEFAULT_AD_PROTECTED_USERNAMES = [];
 let AD_PROTECTED_USERNAMES = [];
+
+// 解析只读资料群名单：逗号分隔（半角 , 与全角 ， 均可），格式与 GROUP_ID 一致。
+// 用途单一 —— 只给 /admins 多几个可查资料的群，让不在任何治理群里的权限人也能显示
+// 昵称 / 用户名 / 来源群（Telegram Bot API 只能查 bot 所在群的成员，这是唯一绕法）。
+//
+// 【安全边界】返回值只被 resolvePermissionUserProfiles 使用，绝不并入 GROUP_IDS：
+// isConfiguredGroup 看不到它，于是广告检测、封禁、命令鉴权、/purge、/ad 投票
+// 全部天然隔离 —— 加进来的群不会被治理，群里的管理员也不会因此获得任何权限。
+// 剔除已在 GROUP_ID 里的群：那些群本来就在遍历范围内，重复只是多花一次请求。
+function parseProfileLookupGroups(raw, configuredGroupIds = []) {
+	if (raw == null || String(raw).trim() === '') return [];
+	const configured = new Set((configuredGroupIds || []).map((id) => String(id)));
+	const list = String(raw)
+		.split(/[,，]/)
+		.map((id) => id.trim())
+		// 群 / 频道 ID 必须是负数（-100 开头的超级群或 -xxx 的普通群）。
+		// 拦掉正数与空串：正数是用户 ID，传进 getChatAdministrators 只会白报错。
+		.filter((id) => /^-\d+$/.test(id))
+		.filter((id) => !configured.has(id));
+	return [...new Set(list)];
+}
 
 // 解析静态用户资料表：环境变量 STATIC_USER_PROFILES 格式为 JSON 字符串。
 // 例：{"197282502":{"first_name":"威廉","username":"RealNeoMan"}}
