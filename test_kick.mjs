@@ -4254,7 +4254,10 @@ console.log('\n[22] 群管理员触发:主人收审计,触发者零私信');
 	assert('审计含"群管理员操作通知"标题', ownerDm.body.text.includes('群管理员操作通知'));
 	assert('审计含操作人名"台风"', ownerDm.body.text.includes('台风'));
 	assert('审计含角色标签"群管理员"', ownerDm.body.text.includes('群管理员'));
-assert('审计含"群内"来源标记', ownerDm.body.text.includes('群内'));
+// 【2026-09-11】来源标记从字面量「群内」改为「群名（群ID）」——
+// 多群治理时只写「群内」看不出是哪个群出的事。断言改为验证群 ID 出现在来源行里。
+assert('审计来源含群 ID（替代旧的"群内"字面量）',
+	/📍 来源:.*-100/.test(ownerDm.body.text), ownerDm.body.text.match(/📍 来源:.*/)?.[0]);
 assert('审计含完整详情(群封禁结果)', ownerDm.body.text.includes('Telegram 群封禁/预封成功'));
 }
 

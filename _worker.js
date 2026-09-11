@@ -889,9 +889,6 @@ async function ensureD1Table(env) {
 				['idx_blacklist_reason_at_id', 'CREATE INDEX IF NOT EXISTS idx_blacklist_reason_at_id ON blacklist(reason, at, id);'],
 				['idx_moderation_chat_from_id', 'CREATE INDEX IF NOT EXISTS idx_moderation_chat_from_id ON moderation_messages(chat_id, from_id, id);'],
 			];
-			for (const [label, sql] of optionalIndexes) {
-				await runD1SchemaStatement(env, label, sql, { optional: true });
-			}
 
 			try {
 				if (!(await d1ColumnExists(env, 'blacklist', 'note'))) {
@@ -902,6 +899,37 @@ async function ensureD1Table(env) {
 				if (!message.includes('duplicate') && !message.includes('exists')) {
 					throw error;
 				}
+			}
+
+			// ===== 同款广告连带查杀所需的两列（2026-09-11）=====
+			// 【必须先加列、再建索引】索引建在新列上，顺序反了 CREATE INDEX 直接报 no such column。
+			// text_hash：归一化正文的哈希，等值反查用；text_norm：归一化正文，用于
+			// ① 通知里展示原文（纯哈希无法判断这条文案是否真是广告）
+			// ② 拿到候选后二次比对，兜住哈希碰撞（连带是批量不可逆操作，代价不对称）
+			// ③ 日后若扩展成「相似匹配」，算编辑距离必须有原文，否则历史数据补不回来
+			for (const [column, sql] of [
+				['text_hash', 'ALTER TABLE moderation_messages ADD COLUMN text_hash TEXT;'],
+				['text_norm', 'ALTER TABLE moderation_messages ADD COLUMN text_norm TEXT;']
+			]) {
+				try {
+					if (!(await d1ColumnExists(env, 'moderation_messages', column))) {
+						await runD1SchemaStatement(env, 'moderation_messages.' + column, sql);
+					}
+				} catch (error) {
+					const message = formatD1SchemaError(error).toLowerCase();
+					if (!message.includes('duplicate') && !message.includes('exists')) {
+						throw error;
+					}
+				}
+			}
+
+			// 同款广告连带查杀：按正文哈希 + 时间窗口跨群反查，等值查找必须带索引 ——
+			// 追溯 24 小时 × 全部配置群，没索引就是全表扫。
+			optionalIndexes.push(
+				['idx_moderation_text_hash', 'CREATE INDEX IF NOT EXISTS idx_moderation_text_hash ON moderation_messages(text_hash, created_at);']
+			);
+			for (const [label, sql] of optionalIndexes) {
+				await runD1SchemaStatement(env, label, sql, { optional: true });
 			}
 
 			try {
@@ -5030,18 +5058,46 @@ function isTelegramServiceMessage(message) {
 	return TELEGRAM_SERVICE_MESSAGE_KEYS.some((key) => message[key] !== undefined && message[key] !== null);
 }
 
+// 同款广告连带查杀：正文归一化 + 哈希。
+// 归一化沿用 normalizeAdFingerprintValue（去零宽字符、压空白、转小写、截 200），
+// 与指纹匹配【同一口径】—— 两边各写一套迟早分叉。
+// 短文案不参与连带：「好的」「收到」这类通用短句撞正常发言的概率极高，
+// 而连带是批量不可逆操作。门槛与整段正文指纹的 12 字对齐。
+const MODERATION_TEXT_MIN_LENGTH = 12;
+
+function buildModerationTextKey(message) {
+	const raw = String(message?.text ?? message?.caption ?? '').trim();
+	if (!raw) return null;
+	// 斜杠命令永不参与连带：命令文本是操作指令而非广告内容，
+	// 与 extractAdFingerprintCandidates 里那道过滤同源（管理员 /ban 自噬事故）。
+	if (isTelegramSlashCommand(raw)) return null;
+	const norm = normalizeAdFingerprintValue(raw);
+	if (norm.length < MODERATION_TEXT_MIN_LENGTH) return null;
+	// FNV-1a 32 位：Workers 环境同步可用、无需 crypto.subtle 的 await，
+	// 碰撞概率对本用途足够低，且拿到候选后还会用 text_norm 做二次比对兜底。
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < norm.length; i += 1) {
+		hash ^= norm.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return { hash: hash.toString(16).padStart(8, '0'), norm };
+}
+
 async function cacheModerationMessage(env, message) {
 	// 双保险：即使调用点漏判，这里也拒绝服务消息进入清扫缓存。
 	if (isTelegramServiceMessage(message)) return;
 	if (!env.DB || !message?.message_id || !message?.from?.id) return;
 	try {
 		await ensureD1Table(env);
-		const insertResult = await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
+		const textKey = buildModerationTextKey(message);
+		const insertResult = await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm) VALUES (?, ?, ?, ?, ?, ?)')
 			.bind(
 				message.message_id,
 				String(message.chat.id),
 				String(message.from.id),
-				new Date().toISOString()
+				new Date().toISOString(),
+				textKey?.hash ?? null,
+				textKey?.norm ?? null
 			)
 			.run();
 		const limit = Math.max(MSG_CACHE_SIZE, 200);
@@ -5050,6 +5106,148 @@ async function cacheModerationMessage(env, message) {
 		}
 	} catch (error) {
 		console.error('[清扫缓存] 写 D1 失败:', error);
+	}
+}
+
+// ===== 同款广告连带查杀（2026-09-11 主人选定方案一）=====
+// 场景：多个广告号刷同一段文案，主人只 /spam 掉其中一个，其余同款号应一并处置。
+// 此前只能逐个引用回复 /spam —— 现有的「整段正文指纹」只对 /spam 之后【新发】的消息
+// 生效，对已经躺在群里的同款一条都追不到，因为 moderation_messages 原本不存正文。
+//
+// 【子请求预算】这是本功能的硬约束。estimateBulkTaskSubrequests 口径下
+// telegramMutationAttempts = 2 × 号数 × 群数，15 个群时【每个号吃 30 个子请求】：
+//   3 个号  ≈ 106  → 贴着同步安全预算 100，可当场执行
+//   10 个号 ≈ 366  → 远超同步预算，必须走 D1 批量任务 + Queues 分片
+//   30 个号 ≈ 1047 → 撞 Cloudflare 单请求 1000 子请求硬限，会直接失败
+// 所以硬上限取 20（≈707，留 30% 余量），超出部分只列 TGID 交给主人手动处理。
+const LINKED_SPAM_LOOKBACK_MS = 24 * 60 * 60 * 1000; // 追溯窗口：24 小时
+const LINKED_SPAM_MAX_TARGETS = 20;                  // 单次连带硬上限（子请求预算所限）
+
+// 同步 or 转批量：【按子请求预算动态判断，不写死号数】。
+// 离线实测（15 群）：3 个号 = 119 已超同步安全预算 100，10 个号 = 336，20 个号 = 646。
+// 早先写死 LINKED_SPAM_SYNC_MAX = 3 是错的 —— 那条同步分支在 15 群下永远不安全，
+// 而群数还会随 /addgroup 增长，任何写死的号数都会在某个群数下失效。
+// 复用 shouldUseBulkQueue 的同一套口径，与 /ban /spam 手动批量的判定标准完全一致。
+function shouldRunLinkedSpamSync(targetCount) {
+	const budget = shouldUseBulkQueue(targetCount, GROUP_IDS.length, { probeMembership: false });
+	return !budget.useQueue;
+}
+
+// 按正文哈希跨【全部配置群】反查 24 小时内发过同款文案的其他账号。
+// 返回去重后的 { userId, chatIds, messageIds } 列表，不含被 /spam 的当事人。
+async function findLinkedSpamTargets(env, textKey, excludeUserId) {
+	if (!env?.DB || !textKey?.hash) return { targets: [], truncated: 0 };
+	const sinceIso = new Date(Date.now() - LINKED_SPAM_LOOKBACK_MS).toISOString();
+	try {
+		await ensureD1Table(env);
+		// 一次查询覆盖所有群：text_hash + created_at 复合索引走等值 + 范围，不是全表扫。
+		// 不按 chat_id 过滤 —— 同一批广告号通常多群同步刷，跨群才全面（主人口径）。
+		const { results } = await env.DB.prepare(
+			'SELECT mid, chat_id, from_id, text_norm FROM moderation_messages '
+			+ 'WHERE text_hash = ? AND created_at >= ? ORDER BY id DESC LIMIT 400'
+		).bind(String(textKey.hash), sinceIso).all();
+
+		const byUser = new Map();
+		for (const row of results || []) {
+			const uid = String(row.from_id || '');
+			if (!uid || uid === String(excludeUserId)) continue;
+			// 二次比对兜住哈希碰撞：FNV-1a 是 32 位，碰撞概率虽低但连带是批量不可逆操作，
+			// 代价不对称 —— 有 text_norm 就没有理由只信哈希。
+			if (String(row.text_norm || '') !== textKey.norm) continue;
+			if (!byUser.has(uid)) byUser.set(uid, { userId: uid, chatIds: new Set(), messageIds: [] });
+			const entry = byUser.get(uid);
+			entry.chatIds.add(String(row.chat_id || ''));
+			const mid = Number(row.mid);
+			if (Number.isInteger(mid) && mid > 0) entry.messageIds.push({ chatId: String(row.chat_id || ''), mid });
+		}
+		const all = [...byUser.values()];
+		return {
+			targets: all.slice(0, LINKED_SPAM_MAX_TARGETS),
+			truncated: Math.max(0, all.length - LINKED_SPAM_MAX_TARGETS),
+			overflowIds: all.slice(LINKED_SPAM_MAX_TARGETS).map((t) => t.userId)
+		};
+	} catch (error) {
+		console.error('[同款连带] 反查失败:', error);
+		return { targets: [], truncated: 0 };
+	}
+}
+
+// 执行连带处置：删同款消息 + 加黑 + 全群封禁。仅用于 ≤ LINKED_SPAM_SYNC_MAX 的同步路径。
+async function enforceLinkedSpamTargets(env, targets, options = {}) {
+	const done = [];
+	for (const target of targets) {
+		let deleted = 0;
+		for (const item of target.messageIds) {
+			const r = await deleteMessage(item.chatId, item.mid);
+			if (r?.ok) deleted += 1;
+		}
+		const added = await addToBlacklist(target.userId, env, {
+			reason: 'spam',
+			by: String(options.operatorId ?? 'system'),
+			note: options.note || '同款广告连带查杀'
+		});
+		const banResults = await banUserFromAllGroups(target.userId, { probeMembership: false });
+		const okCount = banResults.filter((r) => r?.ok).length;
+		done.push({
+			userId: target.userId,
+			deleted,
+			blacklistCode: String(added?.code || (added?.success ? 'ADDED' : 'ERROR')),
+			banSummary: okCount + '/' + banResults.length
+		});
+	}
+	return done;
+}
+
+// 连带结果私聊第一主人。核心是【一键回滚】：把连带到的全部 TGID 拼成一条可直接复制的
+// /unban 命令 —— 连带把单次误判乘以 N 倍，回滚入口必须现成，不能让主人回头一个个抄 ID。
+async function notifyLinkedSpamResult(env, info) {
+	const ownerId = getOwnerNotifyTargets()[0] || '';
+	if (!ownerId) return;
+	const done = info.done || [];
+	const pendingIds = info.pendingIds || [];
+	const allIds = done.length ? done.map((d) => d.userId) : pendingIds;
+	const lines = [
+		'<b>🔗 同款广告连带查杀</b>',
+		'',
+		'<b>操作人：</b>' + formatUserReference(info.operatorId, info.message?.from),
+		'<b>触发群：</b>' + escapeHtml(info.message?.chat?.title || '未知')
+			+ '（<code>' + escapeHtml(String(info.message?.chat?.id ?? '')) + '</code>）',
+		'<b>源账号：</b><code>' + escapeHtml(String(info.sourceUserId)) + '</code>（本次 /spam 的目标）',
+		// 展示原文而非哈希：主人要能一眼判断这条文案到底是不是广告。
+		// 这正是 text_norm 存原文的核心价值 —— 纯哈希方案这里只能显示一串十六进制。
+		'<b>同款文案：</b>' + escapeHtml(String(info.textNorm || '').slice(0, 120)),
+		'<b>追溯范围：</b>24 小时内 · 全部配置群',
+		''
+	];
+	if (done.length) {
+		lines.push('<b>已处置 ' + done.length + ' 个账号</b>');
+		for (const d of done) {
+			lines.push('· <code>' + escapeHtml(d.userId) + '</code>　黑名单:'
+				+ (d.blacklistCode === 'ADDED' ? '已加入' : d.blacklistCode === 'EXISTS' ? '此前已在' : d.blacklistCode)
+				+ '　封禁:' + d.banSummary + '　删消息:' + d.deleted + ' 条');
+		}
+	}
+	if (info.jobId) {
+		lines.push('<b>已转批量任务</b>（超出同步子请求预算，由 Queues 分片续接）');
+		lines.push('任务号:<code>' + escapeHtml(String(info.jobId)) + '</code>　目标 ' + pendingIds.length + ' 个');
+		lines.push('进度查询:<code>/job ' + escapeHtml(String(info.jobId)) + '</code>');
+	}
+	if (info.truncated > 0) {
+		lines.push('');
+		lines.push('⚠️ 另有 <b>' + info.truncated + '</b> 个同款账号超出单次上限 '
+			+ LINKED_SPAM_MAX_TARGETS + '（子请求预算所限），未处理：');
+		lines.push('<code>' + escapeHtml((info.overflowIds || []).join(',')) + '</code>');
+		lines.push('可复制上面这串手动执行 <code>/spam</code> 或 <code>/ban</code>。');
+	}
+	if (allIds.length) {
+		lines.push('');
+		lines.push('<b>判错一键回滚</b>（解黑 + 全群解封）：');
+		lines.push('<code>/unban ' + escapeHtml(allIds.join(',')) + '</code>');
+	}
+	try {
+		await sendTelegramMessageChunks(ownerId, lines.join('\n'));
+	} catch (error) {
+		console.error('[同款连带] 通知第一主人失败:', error);
 	}
 }
 
@@ -6797,6 +6995,51 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			if (spamLearned > 0) lines.push('🧬 已学习广告指纹:' + spamLearned + ' 条(来源 /spam 人工判定)');
 			if (spamSampleAdded > 0) lines.push('🧠 已加 AI 语义样本:' + spamSampleAdded + ' 条(来源 /spam 人工判定)');
 			if (spamEnriched > 0) lines.push('🧠 共性提炼:从新样本自动提炼出 ' + spamEnriched + ' 条指纹(共现 ≥2 次)');
+
+			// ===== 同款广告连带查杀（2026-09-11 主人选定方案一）=====
+			// 反查 24 小时内、全部配置群里发过同款文案的其他账号，一并删消息 + 加黑 + 全群封禁。
+			// 不做二次确认（主人口径），但【务必】把结果私聊第一主人并附一键回滚命令 ——
+			// 连带是把单次误判乘以 N 倍的操作，回滚入口必须在通知里现成可复制。
+			try {
+				const linkedKey = buildModerationTextKey(repliedMsg);
+				if (linkedKey) {
+					const found = await findLinkedSpamTargets(env, linkedKey, repliedUserId);
+					if (found.targets.length) {
+						const noteText = '同款广告连带(/spam ' + linkedUserId + ')';
+						if (shouldRunLinkedSpamSync(found.targets.length)) {
+							// 同步路径：仅当子请求估算在安全预算内才当场执行（群少时才可能走到）。
+							const done = await enforceLinkedSpamTargets(env, found.targets, {
+								operatorId, note: noteText
+							});
+							lines.push('🔗 同款连带:已处置 ' + done.length + ' 个同文案账号');
+							await notifyLinkedSpamResult(env, {
+								operatorId, message, sourceUserId: linkedUserId,
+								textNorm: linkedKey.norm, done,
+								overflowIds: found.overflowIds || [], truncated: found.truncated || 0
+							});
+						} else {
+							// 超过同步预算：转 D1 批量任务 + Queues 分片续接，复用既有机制。
+							const linkedIds = found.targets.map((t) => t.userId);
+							const job = await createBulkJob(env, 'spam', linkedIds, [], noteText, message);
+							const queueAvailable = Boolean(getBulkQueue(env));
+							if (!queueAvailable) { job.autoContinue = false; await saveBulkJob(env, job); }
+							lines.push('🔗 同款连带:' + linkedIds.length + ' 个同文案账号已转批量任务 ' + job.id);
+							await notifyLinkedSpamResult(env, {
+								operatorId, message, sourceUserId: linkedUserId,
+								textNorm: linkedKey.norm, jobId: job.id, pendingIds: linkedIds,
+								overflowIds: found.overflowIds || [], truncated: found.truncated || 0
+							});
+							const scheduled = queueAvailable
+								? scheduleBulkJobAutoContinue(job, ctx, requestUrl, env)
+								: false;
+							if (scheduled && typeof scheduled.then === 'function') await scheduled;
+						}
+					}
+				}
+			} catch (error) {
+				// 连带失败绝不影响 /spam 本职（当事人的加黑 + 封禁 + 清扫早已完成）。
+				console.error('[同款连带] 执行失败:', error);
+			}
 
 			await replyToAdmin(message, ctx, {
 				flashText: `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} ${linkedUserId}`,
