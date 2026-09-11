@@ -29,6 +29,11 @@ const sandbox = {
 			} else {
 				payload = { ok: false, description: 'Bad Request: user not found' };
 			}
+		} else if (m === 'getChat') {
+			// -100111 公开群（有 username → 可跳转）；-100222 私密群（无 username 也无 invite_link）
+			payload = String(b?.chat_id) === '-100111'
+				? { ok: true, result: { id: -100111, title: '老王技术交流分享群', type: 'supergroup', username: 'laowang' } }
+				: { ok: true, result: { id: Number(b?.chat_id), title: '私密群', type: 'supergroup' } };
 		} else if (m === 'sendMessage') {
 			payload = { ok: true, result: { message_id: 1 } };
 		}
@@ -130,6 +135,42 @@ const p3 = profiles3.get('7002');
 check('实时查询结果覆盖静态兜底（昵称改了会自动更新）',
 	p3?.user?.first_name === '威廉' && p3?.source === 'getChatMember',
 	'昵称=' + p3?.user?.first_name + ' source=' + p3?.source);
+
+console.log('\n=== 7. 来源群显示群名 + 可点击跳转 ===');
+{
+	// 公开群（有 username）→ t.me 永久链接，一定可跳转
+	const pub = W.renderPermissionGroupText('-100111', { title: '老王技术交流分享群', url: 'https://t.me/laowang' });
+	check('公开群：群名做成超链接', pub.includes('<a href="https://t.me/laowang">老王技术交流分享群</a>'), pub);
+	check('公开群：ID 仍保留（排查时要复制）', pub.includes('<code>-100111</code>'), pub);
+	// 私密群且 bot 非管理员 → 拿不到 invite_link，只显示群名
+	const priv = W.renderPermissionGroupText('-100222', { title: '私密群', url: '' });
+	check('私密群：只显示群名不做链接', priv.includes('私密群') && !priv.includes('<a href'), priv);
+	check('私密群：ID 仍保留', priv.includes('<code>-100222</code>'), priv);
+	// 查不到群资料 → 回落纯 ID，与改动前显示一致
+	const fallback = W.renderPermissionGroupText('-100333', undefined);
+	check('查不到群资料时回落纯 ID（不比改动前更难读）', fallback === '<code>-100333</code>', fallback);
+	// 群名里的 HTML 特殊字符必须转义，否则会破坏 parse_mode=HTML 整条消息
+	const risky = W.renderPermissionGroupText('-100444', { title: '<b>群&名</b>', url: 'https://t.me/x?a=1&b=2' });
+	check('群名 HTML 转义（防破坏整条消息）', risky.includes('&lt;b&gt;群&amp;名&lt;/b&gt;'), risky);
+	check('链接 URL 也转义', risky.includes('a=1&amp;b=2'), risky);
+	// resolveChatInviteUrl 的两条路径
+	check('resolveChatInviteUrl：公开群走 t.me/username',
+		W.resolveChatInviteUrl({ username: 'laowang' }) === 'https://t.me/laowang');
+	check('resolveChatInviteUrl：无 username 时用 invite_link',
+		W.resolveChatInviteUrl({ invite_link: 'https://t.me/+abcdef' }) === 'https://t.me/+abcdef');
+	check('resolveChatInviteUrl：两者都无则返回空（不硬造链接）',
+		W.resolveChatInviteUrl({}) === '');
+	// 去重：同一个群在名单里出现多次，只应查一次
+	calls.length = 0;
+	const labels = await W.resolvePermissionGroupLabels(['-100111', '-100111', '-100111', '-100222']);
+	const getChatCalls = calls.filter((c) => c.method === 'getChat');
+	check('同群去重：3 次重复只查 1 次', getChatCalls.length === 2, 'getChat 调用 ' + getChatCalls.length + ' 次');
+	// 不用 instanceof Map —— vm 沙箱里的 Map 与宿主 realm 的 Map 不是同一个构造器，
+	// instanceof 必然为 false。改成验证实际可用性（鸭子类型），这才是调用方真正依赖的。
+	check('返回值可按群 ID 取到群名', labels?.get?.('-100111')?.title === '老王技术交流分享群',
+		JSON.stringify(labels?.get?.('-100111')));
+	check('返回值可按群 ID 取到跳转链接', labels?.get?.('-100111')?.url === 'https://t.me/laowang');
+}
 
 console.log('\n' + '='.repeat(52));
 console.log('只读资料群验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');

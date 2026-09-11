@@ -4263,7 +4263,44 @@ async function resolvePermissionUserProfiles(ids) {
 	return profiles;
 }
 
-function renderPermissionUserLine(id, profile, index) {
+// /admins 来源群显示：把群 ID 解析成「群名（可点击）+ ID」。
+// 【为什么要去重缓存】同一批权限人往往集中在少数几个群（截图里 6 个人分布在 5 个群），
+// 逐行调 getChat 会把同一个群查好几遍。/admins 是低频命令，但没理由白花请求。
+// 拿不到资料时回落成纯 ID —— 与改动前的显示完全一致，不会因为查询失败反而更难读。
+async function resolvePermissionGroupLabels(groupIds) {
+	const labels = new Map();
+	const unique = [...new Set((groupIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+	for (const groupId of unique) {
+		try {
+			const info = await fetchConfiguredGroupInfo(groupId);
+			if (!info?.ok) continue;
+			const title = String(info.chat?.title || '').trim();
+			// resolveChatInviteUrl：公开群走 t.me/username（永久稳定），
+			// 私密群只能用 getChat 返回的 invite_link，而那个字段仅当 bot 是管理员时才有。
+			// 刻意不调 exportChatInviteLink —— 那会撤销并重建主邀请链接，
+			// 让群内所有人手上的旧链接失效，代价远大于「让一行字可点击」。
+			const url = resolveChatInviteUrl(info.chat);
+			if (title || url) labels.set(groupId, { title, url });
+		} catch (_) {
+			// 单群查询失败不影响其它群，也不影响名单主体 —— 回落纯 ID 显示。
+		}
+	}
+	return labels;
+}
+
+function renderPermissionGroupText(groupId, label) {
+	const idText = '<code>' + escapeHtml(String(groupId)) + '</code>';
+	const title = String(label?.title || '').trim();
+	if (!title) return idText;
+	const safeTitle = escapeHtml(title);
+	const url = String(label?.url || '').trim();
+	// 有链接就把群名做成超链接，点一下直达；没有则纯文本群名。
+	// ID 始终保留 —— 排查时要复制的是它，不该因为有了链接就省掉。
+	const titleText = url ? '<a href="' + escapeHtml(url) + '">' + safeTitle + '</a>' : safeTitle;
+	return titleText + '（' + idText + '）';
+}
+
+function renderPermissionUserLine(id, profile, index, groupLabels) {
 	const user = profile?.user;
 	const fullName = user
 		? ([user.first_name, user.last_name].filter(Boolean).join(' ') || '未设置')
@@ -4286,7 +4323,7 @@ function renderPermissionUserLine(id, profile, index) {
 		lines.push(`   群内身份:${escapeHtml(statusMap[profile.status] || profile.status)}`);
 	}
 	if (profile?.groupId) {
-		lines.push(`   来源群:<code>${escapeHtml(profile.groupId)}</code>`);
+		lines.push('   来源群:' + renderPermissionGroupText(profile.groupId, groupLabels?.get?.(profile.groupId)));
 	}
 	if (!user) {
 		lines.push('   资料状态:未在配置群中获取到用户资料');
@@ -4294,7 +4331,7 @@ function renderPermissionUserLine(id, profile, index) {
 	return lines;
 }
 
-function renderPermissionSection(title, ids, profiles) {
+function renderPermissionSection(title, ids, profiles, groupLabels) {
 	const cleanIds = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))];
 	const lines = [title];
 	if (!cleanIds.length) {
@@ -4303,7 +4340,7 @@ function renderPermissionSection(title, ids, profiles) {
 	}
 	cleanIds.forEach((id, idx) => {
 		if (idx > 0) lines.push('');
-		lines.push(...renderPermissionUserLine(id, profiles.get(id), idx + 1));
+		lines.push(...renderPermissionUserLine(id, profiles.get(id), idx + 1, groupLabels));
 	});
 	return lines;
 }
@@ -4314,16 +4351,22 @@ async function renderPermissionAdminsList() {
 	const superAdmins = SUPER_ADMINS || [];
 	const allIds = [...primaryOwner, ...secondaryOwners, ...superAdmins];
 	const profiles = await resolvePermissionUserProfiles(allIds);
+	// 只查【实际出现在名单里】的来源群，且函数内部去重 ——
+	// 不是遍历全部配置群，那会在群多时白花一堆 getChat。
+	const groupLabels = await resolvePermissionGroupLabels(
+		[...profiles.values()].map((p) => p?.groupId).filter(Boolean)
+	);
 	const lines = [
 		'🔐 <b>权限名单</b>',
 		'',
-		...renderPermissionSection('👑 <b>主人</b>', primaryOwner, profiles),
+		...renderPermissionSection('👑 <b>主人</b>', primaryOwner, profiles, groupLabels),
 		'',
-		...renderPermissionSection('👤 <b>副主人</b>', secondaryOwners, profiles),
+		...renderPermissionSection('👤 <b>副主人</b>', secondaryOwners, profiles, groupLabels),
 		'',
-		...renderPermissionSection('🛡️ <b>超级管理员</b>', superAdmins, profiles),
+		...renderPermissionSection('🛡️ <b>超级管理员</b>', superAdmins, profiles, groupLabels),
 		'',
-		'说明:用户名/昵称来自 Telegram 当前可读取的群成员资料;未获取时仍以 TGID 为准。'
+		'说明:用户名/昵称来自 Telegram 当前可读取的群成员资料;未获取时仍以 TGID 为准。',
+		'来源群名可点击跳转（公开群走 t.me 永久链接；私密群需 bot 为管理员才有邀请链接，否则只显示群名）。'
 	];
 	return lines.join('\n');
 }
