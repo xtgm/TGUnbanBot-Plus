@@ -8989,7 +8989,21 @@ const AD_EXEMPT_KEYWORDS = [
 // 强制 verdict='ban'（删消息 + 全群封禁 + 拉黑 + 学指纹），误伤不可逆，故一律移除。
 // 英文触发词改走词边界正则，避免 bad / road / download / ready 被 'ad' 命中。
 // 否定词永远先于触发词匹配：「不要封」含「要封」、「取消封禁」含「封禁」，靠顺序保证不误封。
-const AD_REPLY_LEARN_TRIGGERS = ['广告', '垃圾', '封了', '封他', '封她', '封掉', '该封', '要封', '封禁'];
+//
+// 【2026-09-11 收紧为完整判定短语】线上事故：管理员在群里回复一句含「广告」二字的吐槽，
+// 触发全群封禁 14 个群，而被封者本人得分只有 -1（远低于阈值 7）——
+// 确认分支强制 verdict='ban' 不受阈值裁决，得分完全不参与决策。
+// 根因是这张词表配 includes 子串匹配：'广告' 会被「这广告真烦」「广告太多了」命中，
+// '垃圾' 会被「垃圾话」「这游戏真垃圾」命中，而这些都是中文群里最自然的日常用语。
+// 上一轮只移除了英文裸 spam（AD_REPLY_LEARN_TRIGGER_PATTERNS 清空），中文词原样留着，
+// 而中文单词误触发概率远高于英文 —— 这次事故正是它。
+// 现在一律要求【带明确判定意图的完整短语】：光提到「广告」不够，得说「这是广告」。
+// 代价是管理员习惯打单字「广告」的话会失效，需要改口 —— 但误封 14 个群不可逆，成本不对称。
+const AD_REPLY_LEARN_TRIGGERS = [
+	'这是广告', '这条广告', '是广告', '广告号', '广告狗',
+	'这是垃圾', '是垃圾广告', '垃圾广告',
+	'封了他', '封了她', '把他封了', '把她封了', '该封他', '该封她', '封掉他', '封掉她'
+];
 // 【2026-09-10】移除裸 spam 触发：管理员忘带 / 随手打 spam 会触发全群封禁，误操作代价太大。
 // /spam 斜杠命令走命令分发分支（isTelegramSlashCommand 守卫），不受此处影响。
 const AD_REPLY_LEARN_TRIGGER_PATTERNS = [];
@@ -9979,8 +9993,17 @@ const AD_QUOTED_KILL_MAX_OWN_TEXT_ASCII = 8;
 // 举报 / 吐槽语义。命中即放行本通道。
 // 前半段复用回复学习触发词（广告 / 垃圾 / 封了 / 封他 / 该封 …），
 // 后半段补的是「不说封、只表态」的常见短回复 —— 举报的人未必用得上「封」字。
+// 【2026-09-11 与 AD_REPLY_LEARN_TRIGGERS 解耦】这里原本写 ...AD_REPLY_LEARN_TRIGGERS 展开复用，
+// 但两张表的语义【方向相反】，共用一张必然有一边出错：
+//   AD_REPLY_LEARN_TRIGGERS 是【封禁指令】，误触发的代价是封错人 → 必须【严】，只认完整短语；
+//   本表是【举报者保护名单】，用于识别「引用广告 + 回一句『广告』警示他人」的群友并放行，
+//   漏收词的代价是把举报者当广告号杀掉 → 必须【宽】，单词、短语都要收。
+// 收紧触发词那次连带把本表也收窄了，直接打穿举报者保护（测试里 4 条门槛二断言当场变红）。
+// 现在本表独立维护、刻意保留全部单词形态，与触发词表各自演进、互不影响。
 const AD_QUOTED_KILL_NEGATORS = [
-	...AD_REPLY_LEARN_TRIGGERS,
+	// 举报语义单词与短语：与封禁触发词刻意重叠，但这里【只用于放行】，不会导致任何封禁。
+	'广告', '垃圾', '封了', '封他', '封她', '封掉', '该封', '要封', '封禁',
+	'这是广告', '这条广告', '是广告', '广告号', '广告狗', '垃圾广告',
 	'骗子', '骗人', '诈骗', '假的', '割韭菜', '别信', '不要信', '小心', '警惕', '注意',
 	'举报', '拉黑', '屏蔽', '踢了', '踢他', '什么鬼', '什么玩意', '傻逼', '滚'
 ];
@@ -10506,7 +10529,12 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 	const name = String(payload?.name ?? '').trim();
 	if (name && (AD_SYMMETRIC_EMOJI_RE.test(name) || AD_NUMERIC_PREFIX_RE.test(name))) push('keyword', name, 1);
 
-	const combined = [payload?.name, payload?.bio, payload?.text].filter(Boolean).join('\n');
+	// 正文是斜杠命令时整体剔除，不参与任何抽取（短语截取、域名扫描都吃 combined）。
+	// 与下面「整段正文兜底」那道过滤同源：命令文本是操作指令而非广告内容，
+	// 只挡整段兜底不挡短语路径的话，`/ban 收购账号 联系我` 仍会截出 24 字片段入库。
+	const rawText = String(payload?.text ?? '').trim();
+	const textForLearning = isTelegramSlashCommand(rawText) ? '' : payload?.text;
+	const combined = [payload?.name, payload?.bio, textForLearning].filter(Boolean).join('\n');
 	// 交易动词与业务关键词【两类】周边都截短语。
 	// 此前只截交易动词周边，于是「操逼赚钱，招探花9000一单，提供设备」这种一个交易动词都不命中的
 	// 正文抽不出任何候选，learnAdFingerprints 直接返回 no_candidate —— 线上表现为「指纹 +0」，
@@ -10534,8 +10562,15 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 	// （normalizeAdFingerprintValue 归一化后完全相等才算命中），只会命中复制同一文案的号，
 	// 误伤面极小，但能让「同一段广告文案第二次出现即被秒杀」成立。
 	// 长度下限 12 是为了避开「有需要私聊」这类过短的通用句式。
+	// 【2026-09-11 斜杠命令永不入库】线上事故：管理员发 /ban 1919451354 封人，
+	// 而 bot 在该群没有管理员权限、删不掉命令消息（deleteAuthorizedGroupCommandMessage 报
+	// message can't be deleted），命令文本于是留在群里被当成普通发言走完广告检测，
+	// 事后 /ignore 回滚时看到学入的指纹正是 [keyword] /ban 1919451354。
+	// 这条指纹权重 1（>= AD_FINGERPRINT_BAN_WEIGHT 0.8），单条命中即定罪、绕过总分与豁免词，
+	// 构成一个自噬循环：管理员用 /ban 封人 → 命令文本入库 → 下次任何人（含管理员自己）
+	// 发相同命令即被秒封全群。命令文本是操作指令、不是广告内容，任何路径都不该学。
 	const text = String(payload?.text ?? '').trim().replace(/\s+/g, ' ');
-	if (text.length >= 12) push('keyword', text.slice(0, 60), 1);
+	if (text.length >= 12 && !isTelegramSlashCommand(text)) push('keyword', text.slice(0, 60), 1);
 
 	const bio = String(payload?.bio ?? '').trim();
 	if (bio.length >= 6) push('bio', bio.slice(0, 60), 0.8);
@@ -13868,7 +13903,13 @@ async function handleAdReplyLearning(message, env, ctx) {
 	profile.status = await fetchAdMemberStatus(chat.id, targetId);
 	const evaluation = await evaluateAdSuspect(env, { profile, text: targetText, quotedText: targetQuotedText, forwardChat }, { config, whitelist });
 	evaluation.verdict = 'ban';
-	evaluation.reasons.push('管理员 ' + operatorId + ' 回复判定为广告');
+	// 【2026-09-11 记录触发原文】触发回复在下面会被 deleteMessage 删掉，被举报消息也一起删，
+	// 于是群里两条痕迹全无，而 Telegram 后台只记管理员动作、不记普通聊天 ——
+	// 线上排查一次误封要翻 Cloudflare 日志逐条展开 update 才能找出谁说了哪句话，
+	// 且日志只留 7 天，过期后彻底无法追溯。把原文写进 reasons 后它随快照进 D1，
+	// /pending 直接可见，追责与复盘不再依赖外部日志。
+	const triggerText = String(message.text ?? '').trim().slice(0, 60);
+	evaluation.reasons.push('管理员 ' + operatorId + ' 回复判定为广告（原文:' + (triggerText || '（空）') + '）');
 
 	// ===== 语义样本取材：正文太短时改用引用体（2026-09-08 项 6）=====
 	// 原实现固定用 name + bio + text。碰上「本人正文只有一个字母 c、广告全在引用块里」
@@ -13928,6 +13969,9 @@ async function handleAdReplyLearning(message, env, ctx) {
 			'',
 			'<b>操作人：</b>' + formatUserReference(operatorId, from),
 			'<b>群组：</b>' + escapeHtml(chat.title || '未知') + '（<code>' + escapeHtml(String(chat.id)) + '</code>）',
+			// 触发原文：这条回复马上会被删除，群内不留痕迹。放在通知顶部而非埋进命中依据里，
+			// 是因为「谁说了哪句话导致封禁」是追责第一现场，比得分和依据更需要一眼看到。
+			'<b>触发原文：</b>' + (triggerText ? escapeHtml(triggerText) : '（空）'),
 			'',
 			'<b>目标：</b><code>' + escapeHtml(targetId) + '</code>',
 			// 不脱敏，与自动判定通知 renderAdDetectionNotice 的口径一致：

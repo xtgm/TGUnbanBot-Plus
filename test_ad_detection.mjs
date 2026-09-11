@@ -458,7 +458,9 @@ section('[1] 结构化评分层（纯函数，零网络）');
 	// 反向钉死：说人话那条路不能被这个特例带走。斜杠必须在【开头】才算命令，
 	// 句中出现的斜杠（「广告/垃圾」这种写法）仍要正常判定。
 	assert('回复学习：说人话仍触发（特例没伤到主路径）', W.classifyAdReplyIntent('这是广告') === 'positive');
-	assert('回复学习：句中斜杠不算命令', W.classifyAdReplyIntent('广告/垃圾号') === 'positive', W.classifyAdReplyIntent('广告/垃圾号'));
+	// 只有【开头】的斜杠才算命令；句中出现斜杠不影响判定。
+	// 触发词收紧为完整短语后，这里改用「广告号」测同一个语义（原用例的「广告」「垃圾号」已不触发）。
+	assert('回复学习：句中斜杠不算命令', W.classifyAdReplyIntent('广告号/骗子') === 'positive', W.classifyAdReplyIntent('广告号/骗子'));
 	assert('回复学习：单独一个斜杠不算命令也不触发', W.classifyAdReplyIntent('/') === '', W.classifyAdReplyIntent('/'));
 }
 
@@ -1645,9 +1647,19 @@ section('[12] 修复项专项：manual 提权 / 自身 username / 回复学习�
 	// 真正的封禁意图仍要判为 positive。
 	assert('C1 「这是广告」仍触发', W.classifyAdReplyIntent('这是广告') === 'positive');
 	assert('C1 「封了他」触发', W.classifyAdReplyIntent('封了他') === 'positive');
-	assert('C1 「该封」触发', W.classifyAdReplyIntent('该封') === 'positive');
-	assert('C1 「封禁吧」触发', W.classifyAdReplyIntent('封禁吧') === 'positive');
-	assert('C1 「垃圾消息」触发', W.classifyAdReplyIntent('垃圾消息') === 'positive');
+	assert('C1 「该封他」触发', W.classifyAdReplyIntent('该封他') === 'positive');
+	assert('C1 「广告号」触发', W.classifyAdReplyIntent('广告号') === 'positive');
+	assert('C1 「垃圾广告」触发', W.classifyAdReplyIntent('垃圾广告') === 'positive');
+	// 【2026-09-11 收紧为完整短语】线上事故：管理员回复一句含「广告」的吐槽，
+	// 把得分 -1（远低于阈值 7）的人封了 14 个群 —— 确认分支强制 ban 不受阈值裁决。
+	// 以下单词/半短语在日常中文对话里出现频率极高，一律不得再触发封禁。
+	assert('C1 裸词「广告」不触发', W.classifyAdReplyIntent('广告') === '');
+	assert('C1 「这广告真烦」不触发', W.classifyAdReplyIntent('这广告真烦') === '');
+	assert('C1 裸词「垃圾」不触发', W.classifyAdReplyIntent('垃圾') === '');
+	assert('C1 「这游戏真垃圾」不触发', W.classifyAdReplyIntent('这游戏真垃圾') === '');
+	assert('C1 「垃圾消息」不再触发', W.classifyAdReplyIntent('垃圾消息') === '');
+	assert('C1 半短语「该封」不触发', W.classifyAdReplyIntent('该封') === '');
+	assert('C1 半短语「封禁吧」不触发', W.classifyAdReplyIntent('封禁吧') === '');
 	// 【2026-09-10】裸 spam / spammer 不再触发：忘带 / 的误操作代价太大，/spam 斜杠命令不受影响。
 	assert('C1 英文 spam 裸词不触发', W.classifyAdReplyIntent('this is spam') === '');
 	assert('C1 spammer 裸词不触发', W.classifyAdReplyIntent('spammer') === '');
