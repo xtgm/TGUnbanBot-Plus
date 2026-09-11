@@ -9598,14 +9598,91 @@ async function removeAdDomainWhitelist(env, rawDomain) {
 // === 第一层：结构化评分 ===
 // 权重全部按真实样本回归而来，命中项同类只计一次，reasons 供快照与私聊通知展示。
 
+// ===== 逐字分隔混淆（2026-09-11 补回实现）=====
+// 词表匹配用 includes 子串比对，广告号只要在每个字之间插一个分隔符就能全身而退：
+//   「pq低.價.出.正.品.水.果.機 pp」——「低價出正品」被点号切碎，任何词表都匹配不到。
+// 线上纯广告群实测这是主流手法，配合首尾随机串还能躲过「同一文案第二次出现即秒杀」。
+//
+// 项目里 4806 行原有一段注释完整描述过这个思路（含「实测 9 个变体漏 4 个」的记录），
+// 但函数体不知何时被删空、只剩注释，等于该能力一直不存在。这里按原设计补回。
+//
+// 【关键取舍】不能无条件删掉所有分隔符 —— 那会把相邻词拼起来造成误杀
+//   （「今日 入门」→「今日入门」凭空命中「日入」）。因此只认「逐字分隔」这一种
+//   明确的混淆签名：连续 ≥3 组「单个字符 + 单个分隔符」。正常语句不会长这样。
+// 分隔符【按性质分两级】—— 这是放宽到「1~2 字一组」后必须做的区分。
+// 顿号与逗号是中文列举的正规标点：「苹果、香蕉、橘子、西瓜」「上海、北京、广州、深圳」
+// 天然就是「2 字 + 分隔符」重复三次以上，离线实测这类正常句子会被整片误伤。
+// 所以两级拆开：
+//   STRICT —— 点号、间隔号、下划线、星号、破折号、波浪号、空白。中文写作【不用】它们
+//             逐字断句，出现即是混淆信号，允许 1~2 字分组。
+//   LOOSE  —— 顿号、逗号。正规列举标点，只在【严格逐字】（每组恰好 1 字）时才算混淆，
+//             「联、系、我、们」这种一个字一个顿号确实反常，但「苹果、香蕉」完全正常。
+const AD_CHAR_SPLIT_SEP_STRICT = '.·・･｡‧∙⋅•_\\-—–~～*\\s';
+const AD_CHAR_SPLIT_SEP_LOOSE = '。､、,，';
+// 两条签名，任一命中即算混淆。都要求【≥3 组连续】—— 偶发一两处不算。
+// 用 CJK 限定字符类，避免英文缩写（「U.S.A」「a.m.」）与版本号（「1.2.3.4」）被当成混淆。
+//
+// 签名一（宽分组 + 严格分隔符）：1~2 个 CJK + STRICT 分隔符。
+//   打「低.價.出.正.品」，也打「sh最新.17水.果僅.需五.千.多 kn」这种多字分组变体 ——
+//   后者在只认单字时整条漏检，而广告号并不严格逐字切，够躲词表就行。
+// 签名二（严格逐字 + 全部分隔符）：恰好 1 个 CJK + STRICT 或 LOOSE 分隔符。
+//   打「联、系、我、们」这类拿顿号逐字切的，同时不碰「苹果、香蕉、橘子」。
+const AD_CHAR_SPLIT_RE_STRICT = new RegExp(
+	'(?:[\\u4e00-\\u9fff]{1,2}[' + AD_CHAR_SPLIT_SEP_STRICT + ']){3,}[\\u4e00-\\u9fff]',
+	'u'
+);
+const AD_CHAR_SPLIT_RE_PERCHAR = new RegExp(
+	'(?:[\\u4e00-\\u9fff][' + AD_CHAR_SPLIT_SEP_STRICT + AD_CHAR_SPLIT_SEP_LOOSE + ']){3,}[\\u4e00-\\u9fff]',
+	'u'
+);
+
+// 是否含逐字分隔混淆签名。用于结构化评分加分（A1）。
+function hasAdCharSplitObfuscation(text) {
+	const source = String(text ?? '');
+	if (!source) return false;
+	return AD_CHAR_SPLIT_RE_STRICT.test(source) || AD_CHAR_SPLIT_RE_PERCHAR.test(source);
+}
+
+// 去混淆：只在命中签名的片段内部剥掉分隔符，签名之外的文本【一个字符都不动】。
+// 这样「今日 入门」（不成签名）保持原样，而「低.價.出.正.品」还原成「低價出正品」。
+// 两条签名各自替换：严格逐字那条只剥它自己匹配到的片段，不会顺手动列举标点。
+function deobfuscateAdCharSplit(text) {
+	const source = String(text ?? '');
+	if (!source) return '';
+	let result = source;
+	const strictSepRe = new RegExp('[' + AD_CHAR_SPLIT_SEP_STRICT + ']+', 'gu');
+	const allSepRe = new RegExp('[' + AD_CHAR_SPLIT_SEP_STRICT + AD_CHAR_SPLIT_SEP_LOOSE + ']+', 'gu');
+	if (AD_CHAR_SPLIT_RE_STRICT.test(result)) {
+		result = result.replace(new RegExp(AD_CHAR_SPLIT_RE_STRICT.source, 'gu'),
+			(segment) => segment.replace(strictSepRe, ''));
+	}
+	if (AD_CHAR_SPLIT_RE_PERCHAR.test(result)) {
+		result = result.replace(new RegExp(AD_CHAR_SPLIT_RE_PERCHAR.source, 'gu'),
+			(segment) => segment.replace(allSepRe, ''));
+	}
+	return result === source ? '' : result;
+}
+
+// 参与词表匹配的文本变体：原文永远在第一项，行为完全向后兼容；
+// 命中混淆签名时追加一份去混淆文本，让【现有全部词表】对这类变体立即生效，
+// 无需为每种变体往词表里加字面量（词表每加一倍就多一倍误封面）。
+function buildAdMatchTexts(text) {
+	const source = String(text ?? '');
+	if (!source) return [];
+	const deobfuscated = deobfuscateAdCharSplit(source);
+	return deobfuscated && deobfuscated !== source ? [source, deobfuscated] : [source];
+}
+
 function countAdKeywordHits(text, keywords) {
 	const source = String(text ?? '');
 	if (!source) return [];
-	const lower = source.toLowerCase();
+	// 原文与去混淆文本都比对，任一命中即算（A2）。这是全项目词表匹配的唯一入口，
+	// 改这一处即让结构评分、指纹抽取、豁免词、引用体查杀全部自动覆盖混淆变体。
+	const variants = buildAdMatchTexts(source).map((v) => v.toLowerCase());
 	const hits = [];
 	for (const word of keywords) {
 		const needle = String(word).toLowerCase();
-		if (needle && lower.includes(needle)) hits.push(word);
+		if (needle && variants.some((v) => v.includes(needle))) hits.push(word);
 		if (hits.length >= 6) break;
 	}
 	return hits;
@@ -10082,6 +10159,9 @@ function scoreAdProfile(profile, options = {}) {
 
 	if (displayName && AD_SYMMETRIC_EMOJI_RE.test(displayName)) add(3, '名称首尾对称 emoji');
 	if (displayName && AD_NUMERIC_PREFIX_RE.test(displayName)) add(1, '名称数字+emoji 前缀');
+	// 昵称同样用逐字分隔躲词表（线上见「✨水果专卖店搞 nyh米点我付叶 ⭐」这类）。
+	// 给 3 分而非正文的 4 分：昵称短、样本少，留一分余量给结构判据组合定罪。
+	if (displayName && hasAdCharSplitObfuscation(displayName)) add(3, '名称逐字分隔混淆（规避词表匹配）');
 
 	// ===== 关键词计分：两类词同现才给分，单类命中一律 0 分 =====
 	// 规则与理由见 AD_KEYWORD_COMBO_SCORE。命中仍然全部写进 reasons ——
@@ -10202,6 +10282,10 @@ function scoreAdMessageText(text, options = {}) {
 
 	if (hasAdSuspiciousLink(source, whitelistSet, { businessHit: businessHits.length > 0 })) add(2, '正文含非白名单引流链接');
 	if (AD_SYMMETRIC_EMOJI_RE.test(source)) add(3, '正文首尾对称 emoji');
+	// 逐字分隔混淆（A1）：这是【规避行为本身】的特征，不依赖任何广告词汇 ——
+	// 广告内容随便换，只要还想躲词表匹配就必须用这个手法。正常人不会在汉字间插点号，
+	// 所以给到接近定罪的分量；配合 A2 的去混淆匹配，两条同时命中基本就是 7 分阈值。
+	if (hasAdCharSplitObfuscation(source)) add(4, '正文逐字分隔混淆（规避词表匹配）');
 	if (hasAdRepeatedSegment(source)) add(1, '正文重复段落');
 
 	const exemptHits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
