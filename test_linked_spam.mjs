@@ -195,6 +195,56 @@ check('群数增至 20 时 30 个号会撞硬限（证明上限必要）', e30x2
 const e3 = W.estimateBulkTaskSubrequests(3, 15, {});
 check('3 个号已超同步预算 100 → 连带一律走批量任务', e3.total > 100, e3.total + ' > 100');
 
+console.log('\n=== 10.2 批量路径也删同款消息（线上漏删回归）===');
+// 线上实测：3 个目标超同步预算 → 走批量任务 → 只加黑封禁，消息原样留在群里。
+// 根因是删消息逻辑只写在 enforceLinkedSpamTargets（同步分支），批量分支完全绕过。
+// 而 banChatMember 的 revoke_messages 兜不住：它只撤 48 小时内、且要求目标仍在群里 ——
+// 线上那个号显示「已注销用户 The account was frozen」，revoke 完全无效。
+{
+	const jobEnv = { TOKEN: 'T', BOT_TOKEN: '1:x', GROUP_ID: GROUPS.join(','), OWNER_IDS: '10001', DB: makeD1() };
+	await W.__h.fetch(new Request('https://x/T/export'), jobEnv, { waitUntil() {} });
+	const msg = { chat: { id: GROUPS[0], title: '测试群', type: 'supergroup' }, from: { id: 10001, first_name: '主人' } };
+	// 模拟连带反查整形出的结构：两个目标，各自在两个群有同款消息
+	const deleteTargets = {
+		'801': { [GROUPS[0]]: [5101, 5102], [GROUPS[1]]: [5103] },
+		'802': { [GROUPS[0]]: [5201] }
+	};
+	const job = await W.createBulkJob(jobEnv, 'spam', ['801', '802'], [], '连带测试', msg, { deleteTargets });
+	check('deleteTargets 写入任务 payload', Boolean(job.deleteTargets), JSON.stringify(job.deleteTargets || null));
+	check('payload 结构为 用户→群→mid列表',
+		Array.isArray(job.deleteTargets?.['801']?.[GROUPS[0]])
+		&& job.deleteTargets['801'][GROUPS[0]].length === 2);
+	// 普通批量（不传 options）不该带这个字段，避免详情里多出空统计行
+	const plainJob = await W.createBulkJob(jobEnv, 'ban', ['901'], [], '普通批量', msg);
+	check('普通 /ban 批量不带 deleteTargets', plainJob.deleteTargets === null || plainJob.deleteTargets === undefined);
+
+	// 实跑一个操作分片，验证封禁之后真的发出了 deleteMessage
+	deleted.length = 0;
+	banned.length = 0;
+	job.status = 'running';
+	// 结构对齐 prepareBulkJobBatch 真实产出（_worker.js:2825）：
+	// actionableIds 是 D1 写库成功/已存在的那批，操作任务 = actionableIds × groupIds。
+	job.activeBatch = {
+		startCursor: 0, userCount: 2,
+		ids: ['801', '802'],
+		actionableIds: ['801', '802'],
+		groupIds: [...GROUPS],
+		operationCursor: 0, totalOperations: 2 * GROUPS.length
+	};
+	await W.processBulkJobOperationSlice(job, jobEnv);
+	check('批量分片发出了 banChatMember', banned.length > 0, banned.length + ' 次');
+	check('批量分片发出了 deleteMessage（此前一次都没有）', deleted.length > 0, deleted.length + ' 次');
+	// 801 在 -100111 有 2 条、-100222 有 1 条；802 在 -100111 有 1 条 → 共 4 条
+	check('删的是精确的那几条同款消息', deleted.includes(GROUPS[0] + ':5101')
+		&& deleted.includes(GROUPS[0] + ':5102')
+		&& deleted.includes(GROUPS[1] + ':5103')
+		&& deleted.includes(GROUPS[0] + ':5201'),
+		deleted.join(' '));
+	check('未误删无关消息（只删 payload 里列出的 mid）', deleted.length === 4, deleted.join(' '));
+	check('删除结果计入统计', Number(job.stats?.linkedMsgDeleted || 0) === 4,
+		'已删 ' + job.stats?.linkedMsgDeleted + ' 失败 ' + (job.stats?.linkedMsgDeleteFailed || 0));
+}
+
 console.log('\n=== 10.5 门槛 4 字：短广告必须能进（线上两次漏放的形态）===');
 // 原先照搬「整段正文指纹」的 12 字门槛是判据错配 —— 那道门槛防的是【自动学习】误伤，
 // 而连带的前提是第一主人亲自 /spam，已经过最强人工判定。

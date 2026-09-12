@@ -2448,7 +2448,7 @@ function estimateBulkAuthorizationRequests(message) {
 	return message?.chat?.type !== 'private' && isConfiguredGroup(message?.chat?.id) ? 1 : 0;
 }
 
-function createBulkJobPayload(action, ids, invalid, note, message) {
+function createBulkJobPayload(action, ids, invalid, note, message, options = {}) {
 	const now = new Date().toISOString();
 	const operator = formatMessageActorMention(message);
 	const groupIds = GROUP_IDS.map((id) => String(id));
@@ -2479,6 +2479,17 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 		notifyTargets: getBulkJobNotifyTargets(message),
 		userBatchSize: BULK_TASK_USER_BATCH_SIZE,
 		concurrency: BULK_TASK_CONCURRENCY,
+		// 同款连带专用：{ "userId": { "chatId": [mid, ...] } }
+		// 【为什么要带进 payload】连带反查（findLinkedSpamTargets）已经把每个目标在每个群里
+		// 那几条同款消息的 mid 全查出来了，不带进来就得在执行时重查一遍 D1。
+		// 更关键的是精确性：这里删的是【那几条同款文案】，不是这个人的全部历史消息。
+		//
+		// 【为什么不能只靠 revoke_messages】banChatMember 的 revoke_messages 有两个硬限制：
+		//   ① 只撤 48 小时内的消息；② 目标必须【仍在群里】—— 已退群 / 已被踢 / 账号已冻结的
+		// 一条都撤不掉。线上实测：连带命中的号显示「已注销用户 The account was frozen」，
+		// revoke 完全无效，消息原样留在群里。deleteMessage 走的是另一条路，
+		// 只要 bot 在该群有删除权限就能删，不看目标账号状态。
+		deleteTargets: options.deleteTargets || null,
 		totals: {
 			users: ids.length,
 			groups: groupIds.length,
@@ -2520,12 +2531,12 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 	return job;
 }
 
-async function createBulkJob(env, action, ids, invalid, note, message) {
+async function createBulkJob(env, action, ids, invalid, note, message, options = {}) {
 	if (!env.DB) {
 		throw new Error('大批量任务需要绑定 D1 存储空间');
 	}
 	await ensureD1Table(env);
-	const job = createBulkJobPayload(action, ids, invalid, note, message);
+	const job = createBulkJobPayload(action, ids, invalid, note, message, options);
 	await env.DB
 		.prepare('INSERT INTO batch_jobs (id, type, status, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
 		.bind(job.id, job.action, job.status, JSON.stringify(job), job.createdAt, job.updatedAt)
@@ -2643,6 +2654,13 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 			`群封禁成功:${job.stats?.kickOk || 0}`,
 			`群封禁失败:${job.stats?.kickFailed || 0}`
 		);
+		// 同款连带才有这两项；普通 /ban /spam 批量没有 deleteTargets，不显示以免空行干扰。
+		if (job.deleteTargets) {
+			lines.push(
+				`同款消息已删:${job.stats?.linkedMsgDeleted || 0}`,
+				`同款消息删除失败:${job.stats?.linkedMsgDeleteFailed || 0}`
+			);
+		}
 	}
 	lines.push(
 		`格式错误:${job.totals?.invalid || 0}`,
@@ -2871,6 +2889,25 @@ async function processBulkJobOperationSlice(job, env) {
 				phase: 'kick',
 				error: result.error || '群封禁失败'
 			});
+		}
+
+		// 同款连带：删掉该目标在【这个群】发的那几条同款消息。
+		// 【放在封禁之后、且不看封禁是否成功】封禁失败常见原因是 bot 在该群没有封禁权限，
+		// 但删消息权限是独立的 —— 两者不该互相拖累，能删一条是一条。
+		// 与 revoke_messages 的关系见 createBulkJobPayload 里 deleteTargets 的注释：
+		// 账号冻结 / 已退群时 revoke 完全无效，这条路才是真正兜住消息删除的那一条。
+		const midList = job.deleteTargets?.[String(task.userId)]?.[String(task.groupId)];
+		if (Array.isArray(midList) && midList.length) {
+			for (const mid of midList) {
+				try {
+					const del = await deleteMessage(task.groupId, mid);
+					if (del?.ok) incrementBulkJobStat(job, 'linkedMsgDeleted');
+					else incrementBulkJobStat(job, 'linkedMsgDeleteFailed');
+				} catch (_) {
+					// 删不掉不影响加黑与封禁（那些已经完成），也不阻塞后续目标。
+					incrementBulkJobStat(job, 'linkedMsgDeleteFailed');
+				}
+			}
 		}
 	});
 
@@ -7138,7 +7175,22 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 						} else {
 							// 超过同步预算：转 D1 批量任务 + Queues 分片续接，复用既有机制。
 							const linkedIds = found.targets.map((t) => t.userId);
-							const job = await createBulkJob(env, 'spam', linkedIds, [], noteText, message);
+							// 把反查已经拿到的 mid 按「用户 → 群 → mid 列表」整形带进任务，
+							// 让批量路径也能删掉那几条同款消息 ——
+							// 此前只有同步路径删消息，批量路径只加黑封禁，消息原样留在群里（线上实测）。
+							const deleteTargets = {};
+							for (const t of found.targets) {
+								const byChat = {};
+								for (const item of t.messageIds || []) {
+									const chatKey = String(item.chatId);
+									if (!byChat[chatKey]) byChat[chatKey] = [];
+									if (!byChat[chatKey].includes(item.mid)) byChat[chatKey].push(item.mid);
+								}
+								if (Object.keys(byChat).length) deleteTargets[String(t.userId)] = byChat;
+							}
+							const job = await createBulkJob(env, 'spam', linkedIds, [], noteText, message, {
+								deleteTargets: Object.keys(deleteTargets).length ? deleteTargets : null
+							});
 							const queueAvailable = Boolean(getBulkQueue(env));
 							if (!queueAvailable) { job.autoContinue = false; await saveBulkJob(env, job); }
 							// 同上：不进 lines，任务号只在第一主人的私聊通知里给出。
