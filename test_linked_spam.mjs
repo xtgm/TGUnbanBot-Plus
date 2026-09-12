@@ -95,7 +95,11 @@ const k2 = W.buildModerationTextKey({ text: '  来跑分一天一万包吃住有
 const k3 = W.buildModerationTextKey({ text: '完全不同的另一段文案内容在这里' });
 check('同文案（带多余空白）哈希一致', k1.hash === k2.hash, k1.hash);
 check('不同文案哈希不同', k1.hash !== k3.hash);
-check('短文案不参与连带（<12 字）', W.buildModerationTextKey({ text: '来跑分 一天1万' }) === null);
+// 【2026-09-11 断言翻转】原为「短文案不参与连带（<12 字）」，而 12 字门槛正是
+// 线上两次漏放的原因（「来跑分 一天1万」「来洗钱 挣8千」都是 8 字，恰好被放过）。
+// 门槛降到 4 字后这条必须能进；下限只防「在吗」这类退化情形，详见第 10.5 组。
+check('8 字短广告可进连带（旧 12 字门槛已废除）', W.buildModerationTextKey({ text: '来跑分 一天1万' }) !== null);
+check('过短文案仍被拦（4 字下限）', W.buildModerationTextKey({ text: '在吗' }) === null);
 check('斜杠命令不参与连带', W.buildModerationTextKey({ text: '/ban 1919451354 广告号' }) === null);
 
 console.log('\n=== 3. 灌入缓存（5 号刷同款 × 2 群 + 2 个正常号）===');
@@ -191,6 +195,17 @@ check('群数增至 20 时 30 个号会撞硬限（证明上限必要）', e30x2
 const e3 = W.estimateBulkTaskSubrequests(3, 15, {});
 check('3 个号已超同步预算 100 → 连带一律走批量任务', e3.total > 100, e3.total + ' > 100');
 
+console.log('\n=== 10.5 门槛 4 字：短广告必须能进（线上两次漏放的形态）===');
+// 原先照搬「整段正文指纹」的 12 字门槛是判据错配 —— 那道门槛防的是【自动学习】误伤，
+// 而连带的前提是第一主人亲自 /spam，已经过最强人工判定。
+// 线上两个真实短广告都是 8 字，全被 12 字门槛放过。
+for (const short of ['来跑分 一天1万', '来洗钱 挣8千', '来洗钱挣8千']) {
+	const k = W.buildModerationTextKey({ text: short });
+	check('短广告可进连带 [' + short + ']', k !== null, k ? '归一化 ' + k.norm.length + ' 字' : '被拒');
+}
+check('4 字下限仍拦住退化情形（「在吗」）', W.buildModerationTextKey({ text: '在吗' }) === null);
+check('恰好 4 字可进', W.buildModerationTextKey({ text: '来洗钱吧' }) !== null);
+
 console.log('\n=== 11. 旧库降级写入（线上事故回归）===');
 // 线上真实故障：D1_SCHEMA_VERSION 没提 → ensureD1Table 在 version >= 目标版本时短路 →
 // text_hash/text_norm 两列没加上 → 带新列的 INSERT 每条都失败 → 消息缓存整体停写。
@@ -215,6 +230,27 @@ console.log('\n=== 11. 旧库降级写入（线上事故回归）===');
 		'写入 ' + legacyRows.length + ' 行');
 	const legacyCols = legacyEnv.DB.query('PRAGMA table_info(moderation_messages)').map((c) => c.name);
 	check('确认走的是降级分支（库里确实没有新列）', !legacyCols.includes('text_hash'));
+}
+
+console.log('\n=== 11.5 连带仅第一主人可触发（核心安全闸）===');
+// 误封的根源不是「代码判得不准」而是「谁有资格触发这个不可逆的批量操作」——
+// 线上那次误封（管理员回复「广告」封了 14 个群）正是触发权开给群管理员的后果。
+// 连带的杀伤力是单次封禁的 N 倍，所以只给第一主人。
+{
+	// 沙箱里 OWNER_IDS = '10001'（第一个即第一主人）
+	check('第一主人 isPrimaryOwner 为真', W.isPrimaryOwner('10001') === true);
+	check('副主人不是第一主人', W.isPrimaryOwner('10002') === false);
+	check('超级管理员不是第一主人', W.isPrimaryOwner('20001') === false);
+	check('群管理员不是第一主人', W.isPrimaryOwner('30001') === false);
+	// isPrimaryOwner 只认 OWNER_IDS[0]，这是连带的唯一准入判据
+	W.applyRuntimeConfig(W.loadRequiredConfig({
+		TOKEN: 'T', BOT_TOKEN: '1:x', GROUP_ID: GROUPS.join(','), OWNER_IDS: '10001,10002'
+	}));
+	check('多主人配置下仍只认第一个', W.isPrimaryOwner('10001') === true && W.isPrimaryOwner('10002') === false);
+	// 还原沙箱配置，避免影响后续用例
+	W.applyRuntimeConfig(W.loadRequiredConfig({
+		TOKEN: 'T', BOT_TOKEN: '1:x', GROUP_ID: GROUPS.join(','), OWNER_IDS: '10001'
+	}));
 }
 
 console.log('\n=== 12. 同步/批量分流按预算动态判断 ===');

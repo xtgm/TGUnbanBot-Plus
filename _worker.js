@@ -5134,9 +5134,21 @@ function isTelegramServiceMessage(message) {
 // 同款广告连带查杀：正文归一化 + 哈希。
 // 归一化沿用 normalizeAdFingerprintValue（去零宽字符、压空白、转小写、截 200），
 // 与指纹匹配【同一口径】—— 两边各写一套迟早分叉。
-// 短文案不参与连带：「好的」「收到」这类通用短句撞正常发言的概率极高，
-// 而连带是批量不可逆操作。门槛与整段正文指纹的 12 字对齐。
-const MODERATION_TEXT_MIN_LENGTH = 12;
+//
+// 【2026-09-11 门槛 12 → 4，判据换人】原先照搬「整段正文指纹」的 12 字门槛，是判据错配：
+//   · 整段正文指纹是【自动学习】写入、权重 1 单条即定罪、没人审过 → 需要长度兜底防误伤；
+//   · 连带查杀的前提是【第一主人亲自 /spam】→ 已经过最强的人工判定。
+// 把「防自动学习误伤」的门槛套到「人工确认后的连带」上，结果是线上两个真实短广告
+// （「来跑分 一天1万」「来洗钱 挣8千」，都是 8 字）全被放过 —— 短文案恰恰是这批号的主流形态。
+//
+// 现在【不做任何内容判断】：判据只有一条 —— 第一主人 /spam 过就算。
+// 理由是任何内容判据（命中词表 / 命中指纹 / 结构分 > 0）都会在某个新形态上失效，
+// 然后又要回来调参数；而误封风险改由「仅第一主人可触发」这道权限闸解决，
+// 那比让代码猜内容有效得多（今天那次误封正是因为触发权开给了群管理员）。
+//
+// 4 字下限不是拍的：removeAdSampleByText 的既有门槛就是 4，保持项目内一致。
+// 它只防一种退化情形 —— /spam 一条内容为「在吗」的消息时，把全群说过这两个字的人连带。
+const MODERATION_TEXT_MIN_LENGTH = 4;
 
 function buildModerationTextKey(message) {
 	const raw = String(message?.text ?? message?.caption ?? '').trim();
@@ -7097,8 +7109,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 反查 24 小时内、全部配置群里发过同款文案的其他账号，一并删消息 + 加黑 + 全群封禁。
 			// 不做二次确认（主人口径），但【务必】把结果私聊第一主人并附一键回滚命令 ——
 			// 连带是把单次误判乘以 N 倍的操作，回滚入口必须在通知里现成可复制。
+			//
+			// 【仅第一主人可触发】连带的杀伤力是单次封禁的 N 倍，而误封的根源不是
+			// 「代码判得不准」而是「谁有资格触发这个不可逆的批量操作」——
+			// 今天那次误封（管理员回复「广告」封了 14 个群）正是触发权开给群管理员的后果。
+			// 副主人 / 超级管理员 / 群管理员的 /spam 照常执行加黑 + 封禁 + 学指纹，只是不连带。
+			// 非第一主人【完全静默】：不提示、不在群里留任何痕迹，不暴露这个能力的存在。
 			try {
-				const linkedKey = buildModerationTextKey(repliedMsg);
+				const linkedKey = isPrimaryOwner(operatorId) ? buildModerationTextKey(repliedMsg) : null;
 				if (linkedKey) {
 					const found = await findLinkedSpamTargets(env, linkedKey, repliedUserId);
 					if (found.targets.length) {
@@ -7108,7 +7126,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 							const done = await enforceLinkedSpamTargets(env, found.targets, {
 								operatorId, note: noteText
 							});
-							lines.push('🔗 同款连带:已处置 ' + done.length + ' 个同文案账号');
+							// 【刻意不写进 lines】lines 走 detailText，而 detailText 会同时投给副主人
+							// （notifySecondaryOwners: true）。连带只属于第一主人，结果也只发给他 ——
+							// 由下面的 notifyLinkedSpamResult 单独私聊。
+							// 群内闪屏（flashText）本来就只有「已加黑 + TGID」、不含 lines，天然不暴露。
 							await notifyLinkedSpamResult(env, {
 								operatorId, message, sourceUserId: linkedUserId,
 								textNorm: linkedKey.norm, done,
@@ -7120,7 +7141,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 							const job = await createBulkJob(env, 'spam', linkedIds, [], noteText, message);
 							const queueAvailable = Boolean(getBulkQueue(env));
 							if (!queueAvailable) { job.autoContinue = false; await saveBulkJob(env, job); }
-							lines.push('🔗 同款连带:' + linkedIds.length + ' 个同文案账号已转批量任务 ' + job.id);
+							// 同上：不进 lines，任务号只在第一主人的私聊通知里给出。
 							await notifyLinkedSpamResult(env, {
 								operatorId, message, sourceUserId: linkedUserId,
 								textNorm: linkedKey.norm, jobId: job.id, pendingIds: linkedIds,
