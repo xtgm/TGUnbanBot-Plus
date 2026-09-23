@@ -739,7 +739,7 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 当前群近期消息清扫
 	assert('两个群 ID 都被覆盖', JSON.stringify(banGroups) === JSON.stringify(['-1001', '-1002']), `实际 ${JSON.stringify(banGroups)}`);
 
 	const delCalls = callsOf('deleteMessage');
-	assert('群内 /spam 指令消息 msgId=100 被删除', delCalls.some((c) => c.body.message_id === 100), `实际 ${delCalls.length}`);
+	assert('群内 /spam 指令消息 msgId=100 撤回', delCalls.some((c) => c.body.message_id === 100));
 	assert('当前群清扫删除 msgId=40', delCalls.some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 40));
 	assert('当前群清扫删除 msgId=41', delCalls.some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 41));
 	assert('当前群清扫删除 msgId=50', delCalls.some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 50));
@@ -749,8 +749,8 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 当前群近期消息清扫
 	const sendCalls = callsOf('sendMessage');
 	const groupSends = sendCalls.filter((c) => String(c.body.chat_id) === '-1001');
 	const dmSends = sendCalls.filter((c) => String(c.body.chat_id) === '999');
-	assert('群内闪屏 sendMessage 至少 1 次', groupSends.length >= 1);
-	assert('闪屏含"已加黑"', groupSends[0].body.text.includes('已加黑'));
+	assert('群内静默、不发 bot 结果（/ban·/spam 主人要求）', !callsOf('sendMessage').some((c) => Number(c.body.chat_id) < 0));
+	assert('完整结果发送第一主人', dmSends.some((c) => c.body.text.includes('8888')));
 	assert('私聊详情 sendMessage 1 次', dmSends.length === 1);
 	assert('私聊详情含当前群近期消息清扫', dmSends[0].body.text.includes('当前群近期消息清扫'));
 	assert('私聊详情显示 3/3 清扫成功', dmSends[0].body.text.includes('成功 3/3'));
@@ -800,7 +800,7 @@ console.log('\n[1a2] 群内 /ban TGID 清扫该用户当前群消息');
 	assert('/ban 删除该用户当前群消息 72', del.some((c) => String(c.body.chat_id) === '-1001' && c.body.message_id === 72));
 	assert('/ban 不删无关用户的消息 73', !del.some((c) => c.body.message_id === 73));
 	assert('/ban 不删该用户在别群的消息 74', !del.some((c) => c.body.message_id === 74));
-	assert('/ban 仍撤回命令消息本身 200', del.some((c) => c.body.message_id === 200));
+	assert('/ban 撤回命令消息本身 200', del.some((c) => c.body.message_id === 200));
 	assert('/ban 仍全群封禁并带 revoke_messages', callsOf('banChatMember').length === 2
 		&& callsOf('banChatMember').every((c) => c.body.revoke_messages === true));
 	const banDm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
@@ -957,7 +957,7 @@ console.log('\n[1c] /spam 大 TGID 不转 Number');
 	assert('/spam 大 TGID 全群踢出', banCalls.length === 2);
 	assert('/spam 大 TGID 传数字', banCalls.every((c) => c.body.user_id === 7965398892));
 	const delCalls = callsOf('deleteMessage').filter((c) => c.body.message_id === 210);
-	assert('/spam TGID 模式删除群内指令消息', delCalls.length >= 1, `实际 ${delCalls.length}`);
+	assert('/spam TGID 模式撤回群内指令消息', delCalls.length === 1);
 	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('/spam TGID 模式含执行原因', !!dmSend && dmSend.body.text.includes('执行原因:广告引流'));
 }
@@ -1481,7 +1481,7 @@ console.log('\n[9] /purge 错误 TOKEN');
 	assert('错误 TOKEN 返回 405', res.status === 405);
 }
 
-// ---------- [10] 群内 /ban 单条:加黑 + 全群踢 + 闪屏 + 私聊详情 ----------
+// ---------- [10] 群内 /ban 单条:加黑 + 全群踢 + 私聊详情 ----------
 console.log('\n[10] 群内 /ban 单条');
 {
 	resetCalls();
@@ -1526,13 +1526,13 @@ console.log('\n[10] 群内 /ban 单条');
 	assert('banChatMember 调用 2 次（两个群）', banCalls.length === 2);
 
 	const sendCalls = callsOf('sendMessage');
-	// 期望 2 条 sendMessage:1 群内闪屏 + 1 私聊详情
-	assert('sendMessage 调用 2 次（闪屏 + 私聊详情）', sendCalls.length === 2, `实际 ${sendCalls.length}`);
+	// 群内永久保留完整详情，同时私聊第一主人。
+	assert('sendMessage 只发主人一份详情（群内静默）', sendCalls.length === 1, `实际 ${sendCalls.length}`);
 
 	const groupSend = sendCalls.find((c) => String(c.body.chat_id) === '-1001');
 	const dmSend = sendCalls.find((c) => String(c.body.chat_id) === '999');
-	assert('群内闪屏发到 -1001', !!groupSend);
-	assert('闪屏文本是简短确认', groupSend.body.text.includes('已加黑'));
+	assert('群内静默、不发 bot 结果（/ban·/spam 主人要求）', !callsOf('sendMessage').some((c) => Number(c.body.chat_id) < 0));
+	assert('第一主人收到完整结果', dmSend?.body.text.includes('Telegram 群封禁/预封成功'));
 	assert('私聊发到管理员 999', !!dmSend);
 	assert('私聊含汇总头', dmSend.body.text.includes('Telegram 群封禁/预封成功 2/2'));
 	assert('私聊详情含群名 主群-技术交流', dmSend.body.text.includes('主群-技术交流'));
@@ -1543,9 +1543,9 @@ console.log('\n[10] 群内 /ban 单条');
 	assert('私聊详情含作用范围', dmSend.body.text.includes('作用范围:全部 2 个配置群'));
 	assert('私聊详情默认原因未填写', dmSend.body.text.includes('执行原因:未填写'));
 	const commandDelCalls = callsOf('deleteMessage').filter((c) => c.body.message_id === 700);
-	assert('群内 /ban 指令消息 msgId=700 被删除', commandDelCalls.length >= 1, `实际 ${commandDelCalls.length}`);
+	assert('群内 /ban 指令消息 msgId=700 撤回一次', commandDelCalls.length === 1);
 
-	assert('ctx.waitUntil 至少调用 1 次（用于撤回闪屏）', ctxCalls.length >= 1);
+	assert('无群内闪屏撤回任务', ctxCalls.length === 0);
 }
 
 // ---------- [10b] 群内 /ban 单条 + 部分群失败:友好错误翻译 ----------
@@ -1657,8 +1657,8 @@ console.log('\n[10b3] 群内 /ban 首次加黑成功但 Telegram 无法识别 TG
 	assert('/ban USER_ID_INVALID 每个群只请求一次', callsOf('banChatMember').length === 2);
 	const groupFlash = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '-1001');
 	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('/ban 无法识别 TGID:群内短提示说明 D1 已生效', !!groupFlash && groupFlash.body.text.includes('D1已生效'));
-	assert('/ban 无法识别 TGID:群内短提示不误报 bot 管理员权限', !!groupFlash && !groupFlash.body.text.includes('请检查 bot 是否为群管理员'));
+	assert('/ban 无法识别 TGID:群内静默（不发 bot 结果）', !groupFlash);
+	assert('/ban 无法识别 TGID:完整错误发给第一主人', !!dmSend);
 	assert('/ban 无法识别 TGID:私聊详情说明 D1 黑名单已生效', !!dmSend && dmSend.body.text.includes('D1 黑名单已生效'));
 	assert('/ban 无法识别 TGID:私聊详情说明 Telegram 当前无法识别', dmSend.body.text.includes('Telegram 当前无法识别该 TGID'));
 	assert('/ban 无法识别 TGID:私聊详情说明后续仍会拦截', dmSend.body.text.includes('后续进群/发言仍会按 D1 黑名单拦截'));
@@ -1796,7 +1796,7 @@ console.log('\n[11] 群内 /ban 批量');
 	assert('banChatMember 调用 6 次', callsOf('banChatMember').length === 6);
 
 	const sendCalls = callsOf('sendMessage');
-	assert('sendMessage 调用 2 次（闪屏+私聊详情）', sendCalls.length === 2);
+	assert('sendMessage 只发主人一份详情（群内静默）', sendCalls.length === 1);
 	const dmSend = sendCalls.find((c) => String(c.body.chat_id) === '999');
 	assert('私聊详情含批量结果', dmSend.body.text.includes('批量添加完成'));
 	assert('私聊详情含每个用户', dmSend.body.text.includes('100') && dmSend.body.text.includes('200') && dmSend.body.text.includes('300'));
@@ -1809,7 +1809,7 @@ console.log('\n[11] 群内 /ban 批量');
 	assert('批量 /ban 数组格式默认原因未填写', dmSend.body.text.includes('执行原因:未填写'));
 	assert('批量 /ban 含作用范围', dmSend.body.text.includes('作用范围:全部 2 个配置群'));
 	const commandDelCalls = callsOf('deleteMessage').filter((c) => c.body.message_id === 800);
-	assert('群内批量 /ban 指令消息 msgId=800 被删除', commandDelCalls.length >= 1, `实际 ${commandDelCalls.length}`);
+	assert('群内批量 /ban 指令消息 msgId=800 撤回', commandDelCalls.length === 1);
 	assert('小批量 /ban 不创建 D1 任务', env.DB._jobs.size === 0);
 }
 
@@ -1968,7 +1968,7 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 	assert('批量 /ban Queue 每 20 人只执行 1 条 D1 mutation', env.DB._mutationCalls.length === 1 && env.DB._mutationCalls[0].bound.length === 100);
 	assert('批量 /ban 自动踢人全部完成', callsOf('banChatMember').length === 40);
 	assert('大批量 /ban Queue 路径不查询用户资料', callsOf('getChatMember').length === 0);
-	assert('批量 /ban 指令消息被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 810));
+	assert('批量 /ban 指令消息撤回', callsOf('deleteMessage').some((c) => c.body.message_id === 810));
 	const sendTexts = callsOf('sendMessage').map((c) => c.body.text).join('\n');
 	assert('批量 /ban 发送任务创建通知', sendTexts.includes('批量任务已创建'));
 	assert('批量 /ban 自动完成后发送完成通知', sendTexts.includes('批量任务完成'));
@@ -2971,13 +2971,13 @@ console.log('\n[12] 群内 /unban 单条');
 	assertExactProfileQueries('群内单用户 /unban 只查询命令来源群一次', ['8888'], '-1002');
 
 	const sendCalls = callsOf('sendMessage');
-	assert('sendMessage 调用 2 次（闪屏+私聊）', sendCalls.length === 2);
+	assert('sendMessage 发送群内和主人两份详情', sendCalls.length === 2);
 	const groupSend = sendCalls.find((c) => String(c.body.chat_id) === '-1002');
-	assert('群内闪屏说明 D1 检查通过并尝试解封', groupSend.body.text.includes('D1 检查通过') && groupSend.body.text.includes('已尝试群解封'));
+	assert('群内 /unban 简洁结果（含目标、无逐群明细）', groupSend?.body.text.includes('8888') && !groupSend.body.text.includes('Telegram 群解封结果'));
 	const dmSend = sendCalls.find((c) => String(c.body.chat_id) === '999');
 	assert('/unban 私聊详情含 Telegram 群解封结果', dmSend.body.text.includes('Telegram 群解封结果'));
 	assert('群内单用户 /unban 私聊详情显示来源群姓名', dmSend.body.text.includes('<a href="tg://user?id=8888">群内解封用户</a>'));
-	assert('群内 /unban 指令消息 msgId=900 被删除', callsOf('deleteMessage').some((c) => c.body.message_id === 900));
+	assert('群内 /unban 指令消息 msgId=900 撤回', callsOf('deleteMessage').some((c) => c.body.message_id === 900));
 }
 
 // ---------- [12a] 私聊 /unban 单条 + 部分群解封失败 ----------
@@ -3062,12 +3062,12 @@ console.log('\n[12a1] 群内 /unban 特殊 TGID');
 	assert('特殊 TGID /unban:失败请求仍携带 only_if_banned', callsOf('unbanChatMember').every((c) => c.body.only_if_banned === true));
 	const groupFlash = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '-1001');
 	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('特殊 TGID /unban:群内短提示说明 Telegram 暂无法识别', !!groupFlash && groupFlash.body.text.includes('D1检查通过') && groupFlash.body.text.includes('Telegram暂无法识别TGID'));
-	assert('特殊 TGID /unban:群内短提示不误报 bot 管理员权限', !!groupFlash && !groupFlash.body.text.includes('请检查 bot 是否为群管理员'));
+	assert('特殊 TGID /unban:群内简洁结果（含目标）', groupFlash?.body.text.includes('7070447913') && !groupFlash.body.text.includes('Telegram 当前无法识别该 TGID'));
+	assert('特殊 TGID /unban:完整错误发给第一主人', !!dmSend);
 	assert('特殊 TGID /unban:私聊详情说明 Telegram 当前无法识别', !!dmSend && dmSend.body.text.includes('Telegram 当前无法识别该 TGID'));
 	assert('特殊 TGID /unban:私聊详情不误报 TGID 格式错误', !!dmSend && !dmSend.body.text.includes('TGID 格式错误'));
 	assert('特殊 TGID /unban:私聊详情说明 D1 资格检查不受影响', !!dmSend && dmSend.body.text.includes('D1 黑名单资格检查结果不受影响'));
-	assert('特殊 TGID /unban:删除群内命令', callsOf('deleteMessage').some((c) => c.body.message_id === 915));
+	assert('特殊 TGID /unban:撤回群内命令', callsOf('deleteMessage').some((c) => c.body.message_id === 915));
 }
 
 // ---------- [12a1b] 管理层单条 /unban 命中 D1：先移除再解封 ----------
@@ -3099,14 +3099,15 @@ console.log('\n[12a1b] 管理层单条 /unban 命中 D1');
 	assert('第一主人 /unban 回执说明先移除 D1 再原生解封', !!dmSend && dmSend.body.text.includes('目标原在 D1 黑名单') && dmSend.body.text.includes('D1 黑名单记录已删除'));
 }
 
-// ---------- [12a1c] 副主人、超级管理员同样可解除 D1 后解封 ----------
-console.log('\n[12a1c] 副主人和超级管理员解除 D1 后解封');
+// ---------- [12a1c] 副主人、Telegram 群管理员同样可解除 D1 后解封 ----------
+console.log('\n[12a1c] 副主人和群管理员解除 D1 后解封');
 for (const scenario of [
 	{ label: '副主人', actorId: 998, targetId: '7070447002' },
-	{ label: '超级管理员', actorId: 7777, targetId: '7070447003' },
+	{ label: '群管理员', actorId: 7777, targetId: '7070447003' },
 ]) {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 7777 }, status: 'administrator' }] }),
 		getChatMember: (body) => ({
 			ok: true,
 			result: { status: 'kicked', user: { id: Number(body.user_id), first_name: 'D1黑名单用户' } }
@@ -3117,7 +3118,7 @@ for (const scenario of [
 	const env = {
 		...baseEnv,
 		OWNER_IDS: '999,998',
-		SUPER_ADMINS: '7777',
+
 		DB: makeFakeDB([{ id: scenario.targetId, reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' }]),
 	};
 	await handler.fetch(new Request('https://x.com/', {
@@ -3167,8 +3168,8 @@ console.log('\n[12a1d] D1 删除失败严格拒绝解封');
 	assert('D1 删除失败明确返回拒绝原因', !!failureDm && failureDm.body.text.includes('D1 黑名单移除失败') && failureDm.body.text.includes('未调用 Telegram 解封接口'));
 }
 
-// ---------- [12a1e] 普通 Telegram 群管理员不能解除 D1 ----------
-console.log('\n[12a1e] 普通群管理员拒绝解除 D1');
+// ---------- [12a1e] Telegram 群管理员先移除 D1 再解封 ----------
+console.log('\n[12a1e] 群管理员解除 D1 后解封');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
@@ -3193,14 +3194,14 @@ console.log('\n[12a1e] 普通群管理员拒绝解除 D1');
 			}
 		})
 	}), env);
-	assert('普通群管理员 /unban 保留 D1 黑名单记录', env.DB._rows.has('7070447005'));
-	assert('普通群管理员 /unban 不执行 D1 删除', env.DB._mutationCalls.length === 0);
-	assert('普通群管理员 /unban 不调用 Telegram 解封', callsOf('unbanChatMember').length === 0);
+	assert('普通群管理员 /unban 移除 D1 黑名单记录', !env.DB._rows.has('7070447005'));
+	assert('普通群管理员 /unban 执行 D1 删除', env.DB._mutationCalls.length > 0);
+	assert('普通群管理员 /unban 遍历两个配置群解封', callsOf('unbanChatMember').length === 2);
 	assert('普通群管理员 /unban 绝不调用 Telegram 封禁', callsOf('banChatMember').length === 0);
 }
 
-// ---------- [12a2] 匿名管理员仅有 /ban /spam，不允许 /unban ----------
-console.log('\n[12a2] 匿名管理员 /unban 拒绝');
+// ---------- [12a2] 匿名管理员 /unban 移除 D1 后解封 ----------
+console.log('\n[12a2] 匿名管理员 /unban');
 {
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
@@ -3230,10 +3231,10 @@ console.log('\n[12a2] 匿名管理员 /unban 拒绝');
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
-	assert('匿名 /unban 不移除 D1', blacklist.some((e) => e.id === '5973367305'));
-	assert('匿名 /unban 不执行 Telegram 群解封', callsOf('unbanChatMember').length === 0);
-	assert('匿名 /unban 不删除群内命令', callsOf('deleteMessage').length === 0);
-	assert('匿名 /unban 群内静默拒绝', callsOf('sendMessage').length === 0);
+	assert('匿名 /unban 移除 D1', !blacklist.some((e) => e.id === '5973367305'));
+	assert('匿名 /unban 执行 Telegram 群解封', callsOf('unbanChatMember').length === 2);
+	assert('匿名 /unban 撤回群内命令一次', callsOf('deleteMessage').length === 1);
+	assert('匿名 /unban 群内和第一主人均收到结果', ['-1001', '999'].every((id) => callsOf('sendMessage').some((c) => String(c.body.chat_id) === id && c.body.text.includes('5973367305'))));
 }
 
 // ---------- [12a3] 匿名管理员 /ban@bot: 不依赖真实 TGID ----------
@@ -3266,7 +3267,7 @@ console.log('\n[12a3] 匿名管理员 /ban@bot');
 	assert('匿名 /ban@bot 执行全群踢出', callsOf('banChatMember').length === 2);
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	assert('匿名 /ban@bot 群内零机器人回执', groupSends.length === 0);
+	assert('匿名 /ban@bot 群内静默、不发 bot 结果', groupSends.length === 0);
 	assert('匿名 /ban@bot 主人收到匿名管理员审计', !!ownerDm && ownerDm.body.text.includes('匿名管理员'));
 }
 
@@ -3300,7 +3301,7 @@ console.log('\n[12a4] 匿名管理员 /spam@bot TGID');
 	assert('匿名 /spam@bot 执行全群踢出', callsOf('banChatMember').length === 2);
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	assert('匿名 /spam@bot 群内零机器人回执', groupSends.length === 0);
+	assert('匿名 /spam@bot 群内静默、不发 bot 结果', groupSends.length === 0);
 	assert('匿名 /spam@bot 主人收到匿名管理员审计', !!ownerDm && ownerDm.body.text.includes('匿名管理员'));
 }
 
@@ -3338,7 +3339,7 @@ console.log('\n[12a5] 匿名管理员回复 /spam');
 	assert('匿名回复 /spam 删除被回复消息', callsOf('deleteMessage').some((c) => c.body.message_id === 5000));
 	assert('匿名回复 /spam 执行全群踢出', callsOf('banChatMember').length === 2);
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	assert('匿名回复 /spam 群内零机器人回执', groupSends.length === 0);
+	assert('匿名回复 /spam 群内静默、不发 bot 结果', groupSends.length === 0);
 }
 
 // ---------- [12a5b] /spam 回复 sender_chat 不当 TGID 加黑 ----------
@@ -3437,7 +3438,7 @@ console.log('\n[12a8] 非 GROUP_ID 群除只读 /check 外的指令完全无效�
 	const db = makeFakeDB([{ id: '999004', reason: 'manual', by: '999', at: '2026-07-08T00:00:00.000Z' }]);
 	db._store.set('ad_keywords_custom', JSON.stringify({ general: ['原词'], fraud: [], finance: [], porn: [], spam: [], whitelist: [] }));
 	db._store.set('ad_samples', JSON.stringify({ fingerprints: ['原样本'], count: 1 }));
-	const env = { ...baseEnv, SUPER_ADMINS: '999', AD_FILTER_ENABLED: 'true', DB: db };
+	const env = { ...baseEnv, AD_FILTER_ENABLED: 'true', DB: db };
 	const beforeKeywords = db._store.get('ad_keywords_custom');
 	const beforeSamples = db._store.get('ad_samples');
 	const commands = [
@@ -3697,7 +3698,7 @@ console.log('\n[12d1b] /blacklist 操作人 @username 解析');
 				ok: true,
 				result: [
 					{ user: { id: 91001, username: 'ownerName' }, status: 'creator' },
-					{ user: { id: 91003, username: 'superName' }, status: 'administrator' },
+					{ user: { id: 91003, username: 'adminName' }, status: 'administrator' },
 					// 91002 是管理员但没设用户名，必须回落 tg://user?id=
 					{ user: { id: 91002 }, status: 'administrator' },
 				],
@@ -3709,7 +3710,7 @@ console.log('\n[12d1b] /blacklist 操作人 @username 解析');
 		...baseEnv,
 		GROUP_ID: '-1001,-1002',
 		OWNER_IDS: '91001,91002',
-		SUPER_ADMINS: '91003',
+
 		DB: makeFakeDB([
 			{ id: '6001', reason: 'spam', by: '91001', at: '2026-09-03T10:00:05.000Z' },
 			{ id: '6002', reason: 'spam', by: '91001', at: '2026-09-03T10:00:04.000Z' },
@@ -3729,7 +3730,7 @@ console.log('\n[12d1b] /blacklist 操作人 @username 解析');
 	const plain = text.replace(/<[^>]+>/g, '');
 
 	assert('有用户名的操作人输出纯文本 @username', plain.includes('👑 主人 @ownerName')
-		&& plain.includes('🛡️ 超级管理员 @superName'));
+		&& plain.includes('👤 群管理员 @adminName'));
 	assert('@username 不被包进 <a> 或 <code>，交给 Telegram 自动识别',
 		!/<a[^>]*>@ownerName/.test(text) && !/<code>@ownerName/.test(text));
 	assert('用 @username 时仍给出 TGID 便于复制去 /check', /@ownerName（<code>91001<\/code>）/.test(text));
@@ -3787,7 +3788,7 @@ console.log('\n[12d1] /blacklist 竖排排版');
 	const env = {
 		...baseEnv,
 		OWNER_IDS: '999,888',
-		SUPER_ADMINS: '7777',
+
 		DB: makeFakeDB([
 			{ id: '5001', reason: 'spam', by: '999', at: '2026-09-02T23:40:47.004Z' },
 			{ id: '5002', reason: 'spam', by: 'anonymous_admin:-1001883549197', at: '2026-09-02T23:22:34.806Z' },
@@ -3815,7 +3816,7 @@ console.log('\n[12d1] /blacklist 竖排排版');
 
 	assert('操作人：第一主人标记为主人并可点击', /操作人：👑 主人 <a href="tg:\/\/user\?id=999">999<\/a>/.test(text));
 	assert('操作人：副主人识别正确', /操作人：👤 副主人 <a href="tg:\/\/user\?id=888">888<\/a>/.test(text));
-	assert('操作人：超级管理员识别正确', /操作人：🛡️ 超级管理员 <a href="tg:\/\/user\?id=7777">7777<\/a>/.test(text));
+	assert('操作人：普通管理操作标记为群管理员', /操作人：👤 群管理员 <a href="tg:\/\/user\?id=7777">7777<\/a>/.test(text));
 	assert('操作人：system 翻译为系统自动，不裸露 system', plain.includes('操作人：🤖 系统自动') && !plain.includes('操作人：system'));
 	assert('操作人：匿名管理员翻译并带出来源群，不裸露 anonymous_admin 前缀',
 		plain.includes('操作人：🕵️ 匿名管理员（来源群 -1001883549197）') && !plain.includes('anonymous_admin:'));
@@ -3853,8 +3854,8 @@ console.log('\n[12d1] /blacklist 竖排排版');
 		&& !partialPlain.includes('原因：\n') && !/时间：\s*$/m.test(partialPlain));
 }
 
-// ---------- [12d2] 超级管理员群内 /blacklist 静默，私聊行为不变 ----------
-console.log('\n[12d2] 超级管理员 /blacklist 群聊静默 + 私聊不变');
+// ---------- [12d2] 旧白名单不再授予 /blacklist 权限 ----------
+console.log('\n[12d2] 旧白名单不能使用 /blacklist');
 {
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
@@ -3871,24 +3872,24 @@ console.log('\n[12d2] 超级管理员 /blacklist 群聊静默 + 私聊不变');
 	};
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
-		body: JSON.stringify({ message: { message_id: 1204, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '超级管理员' }, text: '/blacklist' } }),
+		body: JSON.stringify({ message: { message_id: 1204, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '旧白名单用户' }, text: '/blacklist' } }),
 	}), env, fakeCtx);
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	const triggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
-	assert('超级管理员群内 /blacklist 零机器人回执', groupSends.length === 0);
-	assert('超级管理员群内 /blacklist 完整名单发给主人', !!ownerDm && ownerDm.body.text.includes('8801') && ownerDm.body.text.includes('8802'));
-	assert('超级管理员群内 /blacklist 不私聊发令者', !triggerDm);
-	assert('超级管理员群内 /blacklist 删除命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 1204));
+	assert('旧白名单群内 /blacklist 零机器人回执', groupSends.length === 0);
+	assert('旧白名单群内 /blacklist 不执行、不发送名单', !ownerDm);
+	assert('旧白名单群内 /blacklist 不私聊发令者', !triggerDm);
+	assert('旧白名单群内 /blacklist 不触发删除命令', !callsOf('deleteMessage').some((c) => c.body.message_id === 1204));
 
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
-		body: JSON.stringify({ message: { message_id: 1205, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false, first_name: '超级管理员' }, text: '/blacklist' } }),
+		body: JSON.stringify({ message: { message_id: 1205, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false, first_name: '旧白名单用户' }, text: '/blacklist' } }),
 	}), env, fakeCtx);
 	const privateResult = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
-	assert('超级管理员私聊 /blacklist 仍直接收到完整名单', !!privateResult && privateResult.body.text.includes('8801') && privateResult.body.text.includes('8802'));
-	assert('超级管理员私聊 /blacklist 不触发群闪屏或删消息', callsOf('sendMessage').every((c) => Number(c.body.chat_id) > 0) && callsOf('deleteMessage').length === 0);
+	assert('旧白名单私聊 /blacklist 权限不足且不泄漏名单', !!privateResult && privateResult.body.text.includes('权限不足') && !privateResult.body.text.includes('8801'));
+	assert('旧白名单私聊 /blacklist 不触发群闪屏或删消息', callsOf('sendMessage').every((c) => Number(c.body.chat_id) > 0) && callsOf('deleteMessage').length === 0);
 }
 
 // ---------- [13] 私聊 /ban 单条:行为不变(向后兼容) ----------
@@ -3985,9 +3986,9 @@ console.log('\n[15] 私聊主人投递失败仅日志');
 
 	assert('尝试私聊主人', dmAttempts === 1);
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	// 新行为:私聊失败时,群里只发"闪屏成功提示",不再追加"私聊机器人"二次提示
-	assert('群里仅发 1 次（仅闪屏,不追加二次提示）', groupSends.length === 1, `实际 ${groupSends.length}`);
-	assert('闪屏文本含"已加黑"', groupSends[0].body.text.includes('已加黑'));
+	// 主人投递失败不影响来源群的永久结果。
+	assert('私聊投递失败时群内仍静默（有主人则不兜底）', groupSends.length === 0);
+	assert('私聊投递失败时 D1 处置仍完成', env.DB._rows.has('123'));
 }
 
 // ---------- [16] 普通管理员必须是当前发令群管理员；成功后仍全群封禁 ----------
@@ -4028,9 +4029,9 @@ console.log('\n[16] 普通管理员当前群鉴权 + 全局封禁');
 	assert('B 群鉴权只查询当前 B 群', adminCalls.length === 1 && String(adminCalls[0].body.chat_id) === '-1002');
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1002');
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('普通管理员群内 /ban 零机器人回执', groupSends.length === 0);
-	assert('普通管理员群内 /ban 完整结果只发给主人', !!ownerDm && ownerDm.body.text.includes('Telegram 群封禁/预封成功'));
-	assert('普通管理员群内 /ban 仍删除命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 2));
+	assert('普通管理员群内 /ban 群内静默', groupSends.length === 0);
+	assert('普通管理员群内 /ban 完整结果同时发给主人', !!ownerDm && ownerDm.body.text.includes('Telegram 群封禁/预封成功'));
+	assert('普通管理员群内 /ban 撤回命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 2));
 }
 
 // ---------- [17] 普通用户不是任何群的 admin → 静默忽略 ----------
@@ -4090,8 +4091,8 @@ console.log('\n[18] 当前群查询失败即拒绝，不跨群借权');
 	assert('当前群查询失败 → 群内静默', callsOf('sendMessage').length === 0);
 }
 
-// ---------- [19] SUPER_ADMINS 用户即使不在任何群也能用所有命令 ----------
-console.log('\n[19] SUPER_ADMINS 直接放行');
+// ---------- [19] 旧 SUPER_ADMINS 环境变量不再授予权限 ----------
+console.log('\n[19] 旧环境变量不得授权');
 {
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
@@ -4113,13 +4114,13 @@ console.log('\n[19] SUPER_ADMINS 直接放行');
 	const env = { ...baseEnv, SUPER_ADMINS: '11111', DB: makeFakeDB([]) };
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 	const blacklist = JSON.parse(env.DB._store.get('blacklist') || '[]');
-	assert('SUPER_ADMINS 即使不在群里也能用 /ban', blacklist.length === 1 && blacklist[0].id === '555');
-	// 不应该调 getChatAdministrators(super 短路返回 true)
-	assert('SUPER_ADMINS 路径短路:不查群 admin 列表', callsOf('getChatAdministrators').length === 0);
+	assert('旧 SUPER_ADMINS 不授予 /ban 权限', blacklist.length === 0 && callsOf('banChatMember').length === 0);
+	// 旧配置不能跳过 Telegram 管理员鉴权。
+	assert('旧名单仍需检查配置群管理员', callsOf('getChatAdministrators').length === 2);
 }
 
-// ---------- [19a] 普通 Telegram 管理员不能私聊执行 /ban /spam ----------
-console.log('\n[19a] 普通管理员私聊 /ban /spam 拒绝');
+// ---------- [19a] Telegram 管理员可以私聊执行 /ban /spam ----------
+console.log('\n[19a] 群管理员私聊 /ban /spam');
 {
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
@@ -4135,14 +4136,14 @@ console.log('\n[19a] 普通管理员私聊 /ban /spam 拒绝');
 			body: JSON.stringify({ message: { message_id: messageId, chat: { id: 6666, type: 'private' }, from: { id: 6666, is_bot: false }, text } }),
 		}), env, fakeCtx);
 	}
-	assert('普通管理员私聊 /ban /spam 不写 D1', !env.DB._rows.has('601') && !env.DB._rows.has('602'));
-	assert('普通管理员私聊 /ban /spam 不执行全群封禁', callsOf('banChatMember').length === 0);
-	assert('普通管理员私聊不遍历 GROUP_IDS 借权', callsOf('getChatAdministrators').length === 0);
+	assert('群管理员私聊 /ban /spam 写入 D1', env.DB._rows.has('601') && env.DB._rows.has('602'));
+	assert('群管理员私聊 /ban /spam 执行全群封禁', callsOf('banChatMember').length === 4);
+	assert('群管理员私聊通过配置群管理员鉴权', callsOf('getChatAdministrators').length === 2);
 	const replies = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '6666');
-	assert('普通管理员私聊 /ban /spam 均收到权限不足', replies.length === 2 && replies.every((c) => c.body.text.includes('权限不足')));
+	assert('群管理员私聊 /ban /spam 收到完整结果', replies.length === 2 && replies.every((c) => c.body.text.includes('Telegram 群封禁/预封成功')));
 }
 
-// ---------- [19b] 普通管理员除 /ban /spam 外无其它管理命令权限 ----------
+// ---------- [19b] 群管理员仍无其它隐藏管理命令权限 ----------
 console.log('\n[19b] 普通管理员其它管理命令拒绝');
 {
 	resetCalls();
@@ -4154,7 +4155,7 @@ console.log('\n[19b] 普通管理员其它管理命令拒绝');
 		deleteMessage: () => ({ ok: true, result: true }),
 	});
 	const env = { ...baseEnv, DB: makeFakeDB([{ id: '700', reason: 'manual', by: '999', at: '2026-07-21T00:00:00Z' }]) };
-	const commands = ['/unban 700', '/check 700', '/blacklist', '/job missing'];
+	const commands = ['/blacklist', '/job missing'];
 	for (let i = 0; i < commands.length; i += 1) {
 		await handler.fetch(new Request('https://x.com/', {
 			method: 'POST',
@@ -4182,7 +4183,7 @@ console.log('\n[19b] 普通管理员其它管理命令拒绝');
 // ===== 主人审计通知系统专项测试([20]-[24]) =====
 
 // ---------- [20] OWNER_IDS 未配置 → 不发任何私聊 ----------
-console.log('\n[20] OWNER_IDS 未配置:仅群闪屏,无私聊');
+console.log('\n[20] OWNER_IDS 未配置:无群闪屏、无私聊');
 {
 	resetCalls();
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
@@ -4201,7 +4202,7 @@ console.log('\n[20] OWNER_IDS 未配置:仅群闪屏,无私聊');
 	const dmSends = callsOf('sendMessage').filter((c) => Number(c.body.chat_id) > 0);
 	assert('OWNER_IDS 未配置时无任何私聊', dmSends.length === 0);
 	const groupSends = callsOf('sendMessage').filter((c) => Number(c.body.chat_id) < 0);
-	assert('群闪屏仍然发出', groupSends.length === 1);
+	assert('OWNER_IDS 未配置时群内仍有完整结果', groupSends.some((c) => c.body.text.includes('Telegram 群封禁/预封成功')));
 }
 
 // ---------- [21] OWNER_IDS 已配置 + 主人=触发者 → 含"你自己" ----------
@@ -4248,7 +4249,7 @@ console.log('\n[22] 群管理员触发:主人收审计,触发者零私信');
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	const triggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	assert('群管理员 /ban 群内零机器人回执', groupSends.length === 0);
+	assert('群管理员 /ban 群内静默', groupSends.length === 0);
 	assert('主人 999 收到审计通知', !!ownerDm);
 	assert('触发者 7777 完全不收私信', !triggerDm);
 	assert('审计含"群管理员操作通知"标题', ownerDm.body.text.includes('群管理员操作通知'));
@@ -4281,12 +4282,12 @@ console.log('\n[22b] OWNER_IDS 通知范围:主人全量,副主人仅 /ban /spam
 	let deputyDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '1000');
 	assert('/ban → 主人收到群封禁通知', !!ownerDm && ownerDm.body.text.includes('Telegram 群封禁/预封成功'));
 	assert('/ban → 副主人收到群封禁通知', !!deputyDm && deputyDm.body.text.includes('Telegram 群封禁/预封成功'));
-	assert('/ban → 群内零机器人回执', callsOf('sendMessage').every((c) => Number(c.body.chat_id) > 0));
+	assert('/ban → 群内静默', !callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001'));
 
 	resetCalls();
 	env = {
 		TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,1000',
-		SUPER_ADMINS: '7777',
+
 		DB: makeFakeDB([]),
 	};
 	await handler.fetch(new Request(`https://x.com/`, {
@@ -4295,9 +4296,9 @@ console.log('\n[22b] OWNER_IDS 通知范围:主人全量,副主人仅 /ban /spam
 	}), env, fakeCtx);
 	ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	deputyDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '1000');
-	assert('超级管理员 /unban → 主人收到通知', !!ownerDm && ownerDm.body.text.includes('目标不在 D1 黑名单'));
+	assert('群管理员 /unban → 主人收到通知', !!ownerDm && ownerDm.body.text.includes('目标不在 D1 黑名单'));
 	assert('/unban → 副主人不收到通知', !deputyDm);
-	assert('超级管理员 /unban → 群内零机器人回执', callsOf('sendMessage').every((c) => Number(c.body.chat_id) > 0));
+	assert('群管理员 /unban → 群内简洁结果（含目标）', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001' && c.body.text.includes('555')));
 }
 
 // ---------- [23] 一键代发链路已移除 ----------
@@ -4308,7 +4309,7 @@ console.log('\n[23] 一键代发链路已移除');
 		answerCallbackQuery: () => ({ ok: true, result: true }),
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const env = { ...baseEnv, SUPER_ADMINS: '8888,999', DB: makeFakeDB([]) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
 	const legacyResult = await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({
@@ -4658,7 +4659,9 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('/help 全部指令兼容 @机器人名', mentionParseOk && argumentParseOk);
 	const removedBanCommand = '/' + ['b', 'e'].join('');
 	const removedSpamCommand = '/' + ['s', 'a'].join('');
-	assert('主人 /help → 人工封禁三条齐全', !!dm && dm.body.text.includes('/ban TGID') && dm.body.text.includes('/spam') && dm.body.text.includes('/unban TGID'));
+	assert('主人 /help → 公开管理四条齐全', !!dm && dm.body.text.includes('/ban TGID') && dm.body.text.includes('/spam') && dm.body.text.includes('/unban TGID') && dm.body.text.includes('/check TGID'));
+	assert('主人 /help → 当前权限与回执说明准确', dm.body.text.includes('配置群 Telegram 管理员、主人或副主人') && dm.body.text.includes('完整结果保留在群里并通知第一主人'));
+	assert('主人 /help → 权限名单只有主人与副主人', dm.body.text.includes('/admins　查看主人 / 副主人名单') && !dm.body.text.includes('超级管理员'));
 	assert('主人 /help → 不再显示旧短命令', !!dm && !dm.body.text.includes(removedBanCommand) && !dm.body.text.includes(removedSpamCommand));
 	assert('主人 /help → 含 /ad 投票与白名单管理', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('/add_ad_admin') && dm.body.text.includes('/del_ad_admin'));
 	assert('主人 /help → 含动态群组三条', !!dm && dm.body.text.includes('/addgroup') && dm.body.text.includes('/delgroup') && dm.body.text.includes('/listgroups'));
@@ -4736,7 +4739,7 @@ console.log('\n[67a] 副主人管理命令群聊静默 + 私聊不变');
 // 零 Telegram 请求。私聊权限与行为完全不变。
 console.log('\n[67a2] 群聊 /start 仅第一主人；私聊不变');
 {
-	const groupSilentEnv = () => ({ TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,888', SUPER_ADMINS: '7778', DB: makeFakeDB([]) });
+	const groupSilentEnv = () => ({ TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,888', DB: makeFakeDB([]) });
 	const silentRoutes = {
 		getChatAdministrators: (b) => ({ ok: true, result: String(b.chat_id) === '-1001' ? [{ user: { id: 7777 }, status: 'administrator' }] : [] }),
 		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '测试主群', username: 'test_group', type: 'supergroup' } }),
@@ -4748,7 +4751,7 @@ console.log('\n[67a2] 群聊 /start 仅第一主人；私聊不变');
 	const silentCases = [
 		{ label: '普通成员', from: { id: 5555, is_bot: false, first_name: '普通成员' } },
 		{ label: '普通群管理员', from: { id: 7777, is_bot: false, first_name: '普通管理员' } },
-		{ label: '超级管理员', from: { id: 7778, is_bot: false, first_name: '超级管理员' } },
+		{ label: '普通成员', from: { id: 7778, is_bot: false, first_name: '普通成员' } },
 		{ label: '副主人', from: { id: 888, is_bot: false, first_name: '副主人' } },
 	];
 	const silentFailures = [];
@@ -4912,7 +4915,7 @@ console.log('\n[67b] /admins 主人专属权限名单');
 					result: [
 						{ user: { id: 999, first_name: '主人', username: 'owner_user' }, status: 'creator' },
 						{ user: { id: 888, first_name: '副主人', username: 'deputy_user' }, status: 'administrator' },
-						{ user: { id: 7777, first_name: '超管', last_name: '甲', username: 'super_user' }, status: 'administrator' }
+						{ user: { id: 7777, first_name: '群管理员', last_name: '甲', username: 'super_user' }, status: 'administrator' }
 					]
 				};
 			}
@@ -4935,8 +4938,10 @@ console.log('\n[67b] /admins 主人专属权限名单');
 	assert('/admins 主人可查看权限名单', !!dm && dm.body.text.includes('权限名单'));
 	assert('/admins 显示主人用户名', dm.body.text.includes('@owner_user') && dm.body.text.includes('TGID:<code>999</code>'));
 	assert('/admins 显示副主人用户名', dm.body.text.includes('@deputy_user') && dm.body.text.includes('TGID:<code>888</code>'));
-	assert('/admins 显示超级管理员用户名', dm.body.text.includes('@super_user') && dm.body.text.includes('TGID:<code>7777</code>'));
-	assert('/admins 可用 getChatMember 兜底', dm.body.text.includes('@fallback_user') && dm.body.text.includes('TGID:<code>6666</code>'));
+	assert('/admins 不显示旧白名单用户', !dm.body.text.includes('@super_user') && !dm.body.text.includes('TGID:<code>7777</code>'));
+	assert('/admins 不把旧 SUPER_ADMINS 用户加入权限名单', !dm.body.text.includes('@fallback_user') && !dm.body.text.includes('TGID:<code>6666</code>'));
+	assert('/admins 不单独查询旧白名单用户资料', !callsOf('getChatMember').some((c) => ['7777', '6666'].includes(String(c.body.user_id))));
+	assert('/admins 不再显示超级管理员栏目', !dm.body.text.includes('超级管理员'));
 
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', {
@@ -4966,7 +4971,7 @@ console.log('\n[67c] /groups 主人专属配置群组');
 		},
 		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
 	});
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,888', SUPER_ADMINS: '7777', DB: makeFakeDB([]) };
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,888', DB: makeFakeDB([]) };
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/groups' } })
@@ -5023,7 +5028,7 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 	}
 
 	function makeCheckEnv(seed = []) {
-		return { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '999', DB: makeFakeDB(seed) };
+		return { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB(seed) };
 	}
 
 	async function runCheck({ gky, env, chat = { id: 999, type: 'private' }, from = { id: 999, is_bot: false, first_name: '主人' }, text = '/check ' + TARGET_ID, replyTo, senderChat, adminIds = [999] }) {
@@ -5034,7 +5039,8 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 		if (senderChat) message.sender_chat = senderChat;
 		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message }) }), env, fakeCtxAd);
 		const sent = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === String(chat.id));
-		const result = sent.at(-1);
+		const resultChatId = String(chat.id);
+		const result = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === resultChatId).at(-1);
 		const buttons = (result?.body.reply_markup?.inline_keyboard || []).flat();
 		return { sent, result, buttons, copies: buttons.map((button) => button.copy_text?.text) };
 	}
@@ -5088,28 +5094,26 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 	check = await runCheck({ gky: GKY_CONFIGURED, env: makeCheckEnv([localEntry]), chat: { id: -1001, type: 'supergroup', title: '配置群' } });
 	assert('GROUP_ID 配置群 /check → 双封禁显示两个复制按钮', check.copies.length === 2);
 
-	const superEnv = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMINS: '7777', DB: makeFakeDB([localEntry]) };
+	const adminEnv = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([localEntry]) };
 	check = await runCheck({
 		gky: GKY_CONFIGURED,
-		env: superEnv,
+		env: adminEnv,
 		chat: { id: -1001, type: 'supergroup', title: '配置群' },
-		from: { id: 7777, is_bot: false, first_name: '超级管理员' },
+		from: { id: 7777, is_bot: false, first_name: '群管理员' },
+		adminIds: [999, 7777],
 	});
 	const quietGroupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
 	const ownerCheckResult = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').at(-1);
 	const ownerCheckButtons = (ownerCheckResult?.body.reply_markup?.inline_keyboard || []).flat();
-	const superTriggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
-	assert('超级管理员群内 /check 零机器人回执', quietGroupSends.length === 0);
-	assert('超级管理员群内 /check 完整结果发给主人', !!ownerCheckResult && ownerCheckResult.body.text.includes('封禁查询结果'));
-	assert('超级管理员群内 /check 复制按钮完整发给主人', ownerCheckButtons.length === 2 && ownerCheckButtons.every((button) => !!button.copy_text?.text));
-	assert('超级管理员群内 /check 不私聊发令者', !superTriggerDm);
-	assert('超级管理员群内 /check 不撤回命令消息', callsOf('deleteMessage').length === 0);
+	const adminTriggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
+	assert('群管理员群内 /check 保留完整结果及复制按钮', quietGroupSends.some((c) => c.body.text.includes('封禁查询结果') && JSON.stringify(c.body.reply_markup) === JSON.stringify(ownerCheckResult?.body.reply_markup)));
+	assert('群管理员群内 /check 完整结果发给主人', !!ownerCheckResult && ownerCheckResult.body.text.includes('封禁查询结果'));
+	assert('群管理员群内 /check 复制按钮完整发给主人', ownerCheckButtons.length === 2 && ownerCheckButtons.every((button) => !!button.copy_text?.text));
+	assert('群管理员群内 /check 不私聊发令者', !adminTriggerDm);
+	assert('群管理员群内 /check 群聊不撤回命令', callsOf('deleteMessage').length === 0);
 
-	// 副主人（OWNER_IDS 第二位）与超管同口径：命令消息留在群里，其余静默语义一个字不变。
-	// 【必须单独测一遍，不能只测超管】keepGroupCommandMessage 写的是
-	// `isSecondaryOwner(userId) || isSuperAdmin(userId)` 显式枚举，少测一边就查不出
-	// 有人把某个分支删掉 —— 而删掉的后果是那类角色的命令消息又被悄悄撤回。
-	const deputyEnv = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,888', SUPER_ADMINS: '7777', DB: makeFakeDB([localEntry]) };
+	// 副主人同样撤回群内命令，结果保留在群内。
+	const deputyEnv = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,888', DB: makeFakeDB([localEntry]) };
 	check = await runCheck({
 		gky: GKY_CONFIGURED,
 		env: deputyEnv,
@@ -5119,28 +5123,25 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 	const deputyGroupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
 	const deputyOwnerResult = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').at(-1);
 	const deputyTriggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '888');
-	assert('副主人群内 /check 不撤回命令消息', callsOf('deleteMessage').length === 0);
-	assert('副主人群内 /check 零机器人回执', deputyGroupSends.length === 0);
+	assert('副主人群内 /check 群聊不撤回命令', callsOf('deleteMessage').length === 0);
+	assert('副主人群内 /check 保留完整结果', deputyGroupSends.some((c) => c.body.text.includes('封禁查询结果')));
 	assert('副主人群内 /check 完整结果发给第一主人', !!deputyOwnerResult && deputyOwnerResult.body.text.includes('封禁查询结果'));
 	assert('副主人群内 /check 不私聊发令者', !deputyTriggerDm);
 
-	// 第一主人同样不撤回，但【原因完全不同】：他连 quietGroupCommand 都不成立
-	// （:7669 的 !isPrimaryOwner 把他排除了），走的是往群里发回执的公开路径。
-	// 这条断言锁的就是这个差异 —— 防的是有人把判据简化成 `keep = quietGroupCommand`
-	// 之后又反手去动 quietGroupCommand 的定义，两条路径就一起塌了。
+	// 第一主人同样撤回群内命令，群内和私聊均保留结果。
 	check = await runCheck({
 		gky: GKY_CONFIGURED,
 		env: { ...deputyEnv, DB: makeFakeDB([localEntry]) },
 		chat: { id: -1001, type: 'supergroup', title: '配置群' },
 		from: { id: 999, is_bot: false, first_name: '主人' },
 	});
-	assert('第一主人群内 /check 走公开路径:不撤回且群内有回执',
-		callsOf('deleteMessage').length === 0
-		&& callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001'));
+	assert('第一主人群内 /check 不撤回命令，群内及私聊保留结果',
+		callsOf('deleteMessage').length === 0 && check.result?.body.text.includes('封禁查询结果')
+		&& callsOf('sendMessage').some((c) => String(c.body.chat_id) === '999' && c.body.text.includes('封禁查询结果')));
 
-	check = await runCheck({ gky: GKY_CONFIGURED, env: { ...superEnv, DB: makeFakeDB([localEntry]) }, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false, first_name: '超级管理员' } });
-	assert('超级管理员私聊 /check 仍直接收到完整结果', String(check.result?.body.text || '').includes('封禁查询结果') && check.copies.length === 2);
-	assert('超级管理员私聊 /check 不触发任何群闪屏', callsOf('sendMessage').every((c) => Number(c.body.chat_id) > 0));
+	check = await runCheck({ gky: GKY_CONFIGURED, env: { ...adminEnv, DB: makeFakeDB([localEntry]) }, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false, first_name: '群管理员' }, adminIds: [999, 7777] });
+	assert('群管理员私聊 /check 仍直接收到完整结果', String(check.result?.body.text || '').includes('封禁查询结果') && check.copies.length === 2);
+	assert('群管理员私聊 /check 不触发任何群闪屏', callsOf('sendMessage').every((c) => Number(c.body.chat_id) > 0));
 
 	check = await runCheck({ gky: GKY_CONFIGURED, env: makeCheckEnv([localEntry]), chat: { id: -2001, type: 'supergroup', title: '未配置群' } });
 	assert('非 GROUP_ID 来源群 → 仍返回双库详情', String(check.result?.body.text || '').includes('封禁查询结果') && String(check.result?.body.text || '').includes('本地黑名单:在黑名单中'));
@@ -5523,7 +5524,7 @@ console.log('\n[84b] /ad 防滥用边界');
 	assert('/ad TGID 通过 → 记录兜底删除结果', state.historyFallback?.attempted === true && state.historyFallback.total === 2 && state.historyFallback.ok === 2);
 
 	harness = makeVoteHarness();
-	const protectedTargets = ['96000', '999', '998', '7777', '6666', '123456789'];
+	const protectedTargets = ['96000', '999', '998', '6666', '123456789'];
 	for (const [index, targetId] of protectedTargets.entries()) {
 		await harness.dispatch({ message: {
 			message_id: 96100 + index,
@@ -5532,7 +5533,9 @@ console.log('\n[84b] /ad 防滥用边界');
 			text: '/ad ' + targetId,
 		} });
 	}
-	assert('/ad 不能举报自己、主人、副主人、超级管理员、当前群管理员或机器人', harness.db._adVotes.size === 0);
+	assert('/ad 不能举报自己、主人、副主人、当前群管理员或机器人', harness.db._adVotes.size === 0);
+	await harness.start('7777', 96120);
+	assert('旧白名单用户不再享有投票目标保护', harness.db._adVotes.size === 1);
 }
 
 // ---------- [84c] /ad 发起白名单仅第一主人管理 ----------
@@ -5544,7 +5547,7 @@ console.log('\n[84c] /ad 发起白名单权限');
 		deleteMessage: () => ({ ok: true, result: true }),
 	});
 	const db = makeAdD1();
-	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,998', SUPER_ADMINS: '7777', DB: db };
+	const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,998', DB: db };
 	const dispatch = async (fromId, text) => handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({ message: {
@@ -5933,6 +5936,292 @@ console.log('\n[97] 服务消息不进清扫缓存');
 	}
 
 	sandbox.fetch = savedFetch;
+}
+
+
+// ---------- [98] 四条管理命令：群聊 / 私聊真实权限与回执 ----------
+console.log('\n[98] 四条管理命令权限与回执矩阵');
+{
+	const scenarios = [
+		{ name: '当前群管理员', actor: 6666, group: -1001, allowed: true },
+		{ name: '当前群创建者', actor: 6668, group: -1001, allowed: true },
+		{ name: '其他群管理员不能借权', actor: 7777, group: -1001, allowed: false },
+		{ name: '普通成员群聊', actor: 4444, group: -1001, allowed: false },
+		{ name: '普通成员私聊', actor: 4444, allowed: false },
+		{ name: '第一群管理员私聊', actor: 6666, allowed: true },
+		{ name: '第二群管理员私聊', actor: 7777, allowed: true },
+		{ name: '动态群管理员私聊', actor: 8888, allowed: true },
+		{ name: '动态群管理员群聊', actor: 8888, group: -1003904078173, allowed: true },
+		{ name: '资料群管理员私聊无管理权', actor: 5555, allowed: false },
+		{ name: '资料群群聊无管理权', actor: 5555, group: -1999, allowed: false },
+		{ name: '旧白名单私聊失效', actor: 11111, allowed: false },
+		{ name: '旧白名单群聊失效', actor: 11111, group: -1001, allowed: false },
+		{ name: '第一主人群聊', actor: 999, group: -1001, allowed: true },
+		{ name: '第一主人私聊', actor: 999, allowed: true },
+		{ name: '副主人群聊', actor: 998, group: -1001, allowed: true },
+		{ name: '副主人私聊', actor: 998, allowed: true },
+		{ name: '匿名管理员', actor: 1087968824, group: -1001, anonymous: true, bot: true, allowed: true },
+		{ name: '第三方机器人群聊拒绝', actor: 2222, group: -1001, bot: true, allowed: false },
+		{ name: '第三方机器人私聊拒绝', actor: 2222, bot: true, allowed: false },
+		{ name: '群聊鉴权接口失败', actor: 6666, group: -1001, apiFails: true, allowed: false },
+		{ name: '私聊鉴权接口失败', actor: 6666, apiFails: true, allowed: false },
+		{ name: '首群失败后第二群管理员仍有效', actor: 7777, firstApiFails: true, allowed: true },
+	];
+	for (const command of ['unban', 'ban', 'spam', 'check']) {
+		for (const scenario of scenarios) {
+			resetCalls();
+			const target = '9876543210';
+			const seed = command === 'unban' || command === 'check'
+				? [{ id: target, reason: 'manual', by: '999', at: '2026-09-01T00:00:00Z' }]
+				: [];
+			const env = {
+				...baseEnv, OWNER_IDS: '999,998',
+				// 仅作为负例输入：旧环境变量不再授予权限。
+				SUPER_ADMINS: '11111',
+				PROFILE_LOOKUP_GROUPS: '-1999',
+				DB: makeFakeDB(seed, { dynamicGroups: { '-1003904078173': { title: '动态群' } } }),
+			};
+			let d1RemovedBeforeUnban = true;
+			let remoteChecks = 0;
+			const admins = { '-1001': [6666, 6668, 2222], '-1002': [7777], '-1003904078173': [8888], '-1999': [5555] };
+			sandbox.fetch = makeFetchMock({
+				getChatAdministrators: (body) => {
+					if (scenario.apiFails || (scenario.firstApiFails && String(body.chat_id) === '-1001')) {
+						return { ok: false, description: '测试鉴权失败' };
+					}
+					return { ok: true, result: (admins[String(body.chat_id)] || []).map((id) => ({
+						user: { id, is_bot: id === 2222 },
+						status: id === 6668 ? 'creator' : 'administrator',
+					})) };
+				},
+				getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: Number(body.user_id), first_name: '目标' } } }),
+				getChat: (body) => ({ ok: true, result: { id: Number(body.chat_id), title: '权限测试群', type: 'supergroup' } }),
+				unbanChatMember: (body) => {
+					d1RemovedBeforeUnban &&= !env.DB._rows.has(String(body.user_id));
+					return { ok: true, result: true };
+				},
+				sendMessage: () => ({ ok: true, result: { message_id: 99100 } }),
+			}, {
+				internalHandler: async (url) => {
+					if (!String(url).includes('banlist')) throw new Error('Unexpected fetch: ' + url);
+					remoteChecks++;
+					return { ok: true, status: 200, async text() {
+						return '<strong>TGID:</strong> ' + target + '<br><strong>ChatID:</strong> -1001<br><strong>Reason:</strong> SpamGP<br>';
+					} };
+				},
+			});
+			const chat = scenario.group
+				? { id: scenario.group, type: 'supergroup', title: '权限测试群' }
+				: { id: scenario.actor, type: 'private' };
+			const message = { message_id: 99001, chat, from: { id: scenario.actor, is_bot: Boolean(scenario.bot) }, text: '/' + command.toUpperCase() + '@TestBot ' + target };
+			if (scenario.anonymous) message.sender_chat = { ...chat };
+			const pending = [];
+			await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message }) }), env, { waitUntil: (p) => pending.push(Promise.resolve(p)) });
+			await drainPending(pending);
+			const label = '/' + command + ' · ' + scenario.name;
+			const commandDeletes = callsOf('deleteMessage').filter((c) => c.body.message_id === message.message_id);
+			const groupMessages = callsOf('sendMessage').filter((c) => Number(c.body.chat_id) < 0);
+			const allowedInGroup = scenario.allowed && Boolean(scenario.group);
+			// 群内命令消息撤回：/check 群聊【不撤回】（主人要求，命令与结果都留在群里）；
+			// /ban·/spam·/unban 仍撤回命令消息，行为不变。
+			const expectCommandDelete = allowedInGroup && command !== 'check';
+			assert(label + ' 群内命令撤回符合各命令策略', commandDeletes.length === (expectCommandDelete ? 1 : 0));
+			// 群内 bot 回执按命令分流（主人要求）：/check 完整、/unban 简洁（都发含目标的群内消息）；
+			// /ban·/spam 群内静默（无任何 bot 回执）；非允许 / 私聊一律无群内回执。
+			const expectGroupText = allowedInGroup && command !== 'ban' && command !== 'spam';
+			assert(label + ' 群内回执符合各命令策略', expectGroupText
+				? groupMessages.length > 0 && groupMessages.every((c) => String(c.body.chat_id) === String(scenario.group) && c.body.text.includes(target))
+					&& !callsOf('deleteMessage').some((c) => c.body.message_id === 99100)
+				: groupMessages.length === 0);
+			if (expectCommandDelete) {
+				const deleteIndex = apiCalls.findIndex((c) => c.method === 'deleteMessage' && c.body.message_id === message.message_id);
+				assert(label + ' 命令撤回早于业务操作和结果发送', apiCalls.every((c, index) => !['banChatMember', 'unbanChatMember', 'sendMessage'].includes(c.method) || index > deleteIndex));
+			}
+			const ownerMessages = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
+			if (scenario.allowed) {
+				assert(label + ' 第一主人收到完整结果', ownerMessages.some((c) => c.body.text.includes(target)));
+				if (!scenario.group) assert(label + ' 私聊发令者收到结果', callsOf('sendMessage').some((c) => String(c.body.chat_id) === String(scenario.actor) && c.body.text.includes(target)));
+				if (command === 'unban') {
+					assert(label + ' 先删除 D1 后安全解封全部配置群',
+						!env.DB._rows.has(target) && d1RemovedBeforeUnban
+						&& callsOf('unbanChatMember').length === 3
+						&& callsOf('unbanChatMember').every((c) => c.body.only_if_banned === true));
+				} else if (command === 'check') {
+					const ownerButtons = ownerMessages.flatMap((c) => (c.body.reply_markup?.inline_keyboard || []).flat());
+					if (scenario.group) {
+						const groupButtons = groupMessages.flatMap((c) => (c.body.reply_markup?.inline_keyboard || []).flat());
+						assert(label + ' 群内也保留两种复制按钮', groupButtons.some((b) => b.copy_text?.text === '/unban ' + target) && groupButtons.some((b) => b.copy_text?.text === 'GKYbotSave\n' + target));
+					}
+					assert(label + ' 双库结果与复制按钮完整，D1 只读',
+						remoteChecks === 1 && env.DB._rows.has(target)
+						&& ownerButtons.some((b) => b.copy_text?.text === '/unban ' + target)
+						&& ownerButtons.some((b) => b.copy_text?.text === 'GKYbotSave\n' + target)
+						&& callsOf('unbanChatMember').length === 0);
+				} else {
+					assert(label + ' 加黑与全群封禁业务保持',
+						env.DB._rows.get(target)?.reason === (command === 'spam' ? 'spam' : 'manual')
+						&& callsOf('banChatMember').length === 3
+						&& callsOf('banChatMember').every((c) => c.body.revoke_messages === true));
+					assert(label + ' 保留副主人通知', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '998' && c.body.text.includes(target)));
+				}
+			} else {
+				assert(label + ' 不执行 D1 变更、封禁、解封或双库查询',
+					env.DB._mutationCalls.length === 0 && callsOf('banChatMember').length === 0
+					&& callsOf('unbanChatMember').length === 0 && remoteChecks === 0);
+				assert(label + ' 不泄漏完整结果', ownerMessages.length === 0);
+			}
+		}
+	}
+}
+
+// ---------- [99] 新管理员 /unban：同步和 Queue 的 D1 顺序与失败阻断 ----------
+console.log('\n[99] 群管理员 /unban D1 顺序与失败阻断');
+for (const mode of ['private', 'supergroup']) {
+	for (const count of [1, 3, 20]) {
+		for (const fault of ['none', 'query', 'delete']) {
+			resetCalls();
+			const ids = Array.from({ length: count }, (_, i) => String(990000 + i));
+			const pending = [];
+			const ctx = { waitUntil: (p) => pending.push(Promise.resolve(p)) };
+			const db = makeFakeDB(ids.map((id) => ({ id, reason: 'manual', by: '999', at: '2026-09-01T00:00:00Z' })),
+				{ failMutationCalls: fault === 'delete' ? [1, 2, 3, 4] : [] });
+			if (fault === 'query') {
+				const prepare = db.prepare.bind(db);
+				db.prepare = (sql) => {
+					const statement = prepare(sql);
+					if (sql.startsWith('SELECT id FROM blacklist WHERE id IN')) {
+						statement.all = async () => { throw new Error('测试 D1 资格查询失败'); };
+					}
+					return statement;
+				};
+			}
+			const env = { ...baseEnv, DB: db };
+			env.BULK_QUEUE = makeFakeBulkQueue(() => env, ctx);
+			let d1RemovedBeforeUnban = true;
+			sandbox.fetch = makeFetchMock({
+				getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 6666 }, status: 'administrator' }] }),
+				getChatMember: (body) => ({ ok: true, result: { status: 'kicked', user: { id: Number(body.user_id), first_name: '解封目标' } } }),
+				unbanChatMember: (body) => {
+					d1RemovedBeforeUnban &&= !db._rows.has(String(body.user_id));
+					return { ok: true, result: true };
+				},
+				sendMessage: () => ({ ok: true, result: { message_id: 99200 } }),
+			});
+			await handler.fetch(new Request('https://x.com/', {
+				method: 'POST',
+				body: JSON.stringify({ message: {
+					message_id: 99101, chat: { id: mode === 'private' ? 6666 : -1001, type: mode },
+					from: { id: 6666, is_bot: false }, text: '/unban ' + ids.join(','),
+				} }),
+			}), env, ctx);
+			await drainPending(pending);
+			const label = '管理员 /unban · ' + mode + ' · ' + count + ' 人 · ' + fault;
+			if (fault === 'none') {
+				assert(label + ' 每个 Telegram 解封之前 D1 都已删除',
+					d1RemovedBeforeUnban && db._rows.size === 0 && callsOf('unbanChatMember').length === count * 2);
+				assert(label + ' 每次解封都保留 only_if_banned', callsOf('unbanChatMember').every((c) => c.body.only_if_banned === true));
+			} else {
+				assert(label + ' 失败保留全部 D1，绝不调用 Telegram 解封',
+					db._rows.size === count && callsOf('unbanChatMember').length === 0);
+			}
+			assert(label + ' 不调用封禁接口，只撤回群内命令',
+				callsOf('banChatMember').length === 0
+				&& callsOf('deleteMessage').length === (mode === 'supergroup' ? 1 : 0)
+				&& callsOf('deleteMessage').every((c) => c.body.message_id === 99101));
+			const groupTexts = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001').map((c) => c.body.text).join('\n');
+			assert(label + ' 群内简洁回执、不推逐条明细也不推异步完成', mode === 'private'
+				? groupTexts === ''
+				: count === 1 ? groupTexts.includes(ids[0])
+					: count < 20 ? groupTexts.includes('批量解封完成') && !groupTexts.includes(ids[0])
+						: groupTexts.includes('批量任务已创建') && !groupTexts.includes('批量任务完成'));
+			const ownerTexts = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').map((c) => c.body.text).join('\n');
+			assert(label + ' 第一主人收到最终结果或明确失败', count < 20
+				? ownerTexts.includes(ids[0]) && (fault === 'none' || ownerTexts.includes('失败') || ownerTexts.includes('无法确认'))
+				: ownerTexts.includes(fault === 'none' ? '批量任务完成' : '失败'));
+			if (count === 20) {
+				const job = JSON.parse([...db._jobs.values()][0]?.payload || '{}');
+				assert(label + ' Queue 保留已鉴权的 D1 移除权限', job.unbanAllowD1Removal === true);
+				assert(label + ' Queue 来源群通知已按主人要求关闭', job.notifySourceChat === false);
+				assert(label + ' Queue 完成或失败不推进游标', fault === 'none'
+					? job.status === 'done' && job.cursor === count
+					: job.status === 'failed' && job.cursor === 0);
+			}
+		}
+	}
+}
+
+
+// ---------- [100] 公开批量命令的群内最终回执 ----------
+console.log('\n[100] /ban、/spam Queue 最终回执');
+for (const action of ['ban', 'spam']) {
+	resetCalls();
+	const ids = Array.from({ length: 20 }, (_, i) => String(996000 + i));
+	const pending = [];
+	const ctx = { waitUntil: (p) => pending.push(Promise.resolve(p)) };
+	const env = { ...baseEnv, DB: makeFakeDB([]) };
+	env.BULK_QUEUE = makeFakeBulkQueue(() => env, ctx);
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 6666 }, status: 'administrator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 99400 } }),
+	});
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 99300, chat: { id: -1001, type: 'supergroup' }, from: { id: 6666, is_bot: false }, text: '/' + action + ' ' + ids.join(','),
+	} }) }), env, ctx);
+	await drainPending(pending);
+	const job = JSON.parse([...env.DB._jobs.values()][0]?.payload || '{}');
+	assert('/' + action + ' Queue 业务完成', job.status === 'done' && ids.every((id) => env.DB._rows.has(id)) && callsOf('banChatMember').length === 40);
+	// /ban·/spam 群内静默（主人要求）：源群既不发同步「已创建」也不推异步「完成」；完整回执只私聊第一主人。
+	const groupTexts = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001').map((c) => c.body.text).join('\n');
+	assert('/' + action + ' Queue 群内静默、不送达来源群', groupTexts === '');
+	const ownerTexts = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').map((c) => c.body.text).join('\n');
+	assert('/' + action + ' Queue 创建与最终结果均私聊第一主人', ownerTexts.includes('批量任务已创建') && ownerTexts.includes('批量任务完成'));
+	assert('/' + action + ' Queue 只撤回命令，不撤回创建或完成回执',
+		callsOf('deleteMessage').length === 1 && callsOf('deleteMessage')[0].body.message_id === 99300);
+}
+
+// ---------- [101] 撤回/群回执失败不能阻断业务和主人通知 ----------
+console.log('\n[101] Telegram 消息操作失败隔离');
+for (const fault of ['delete', 'group_reply']) {
+	resetCalls();
+	const pending = [];
+	const env = { ...baseEnv, DB: makeFakeDB([{ id: '997001', reason: 'manual', by: '999', at: '2026-09-01T00:00:00Z' }]) };
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 6666 }, status: 'administrator' }] }),
+		deleteMessage: () => fault === 'delete' ? { ok: false, description: 'Bad Request: not enough rights to delete messages' } : { ok: true, result: true },
+		sendMessage: (body) => fault === 'group_reply' && Number(body.chat_id) < 0
+			? { ok: false, description: 'Forbidden: bot cannot send messages' } : { ok: true, result: { message_id: 99600 } },
+	});
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: {
+		message_id: 99500, chat: { id: -1001, type: 'supergroup' }, from: { id: 6666, is_bot: false }, text: '/unban 997001',
+	} }) }), env, { waitUntil: (p) => pending.push(Promise.resolve(p)) });
+	await drainPending(pending);
+	assert(fault + ' 失败仍完成 D1 移除及全群解封', !env.DB._rows.has('997001') && callsOf('unbanChatMember').length === 2);
+	assert(fault + ' 失败仍给第一主人完整结果', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '999' && c.body.text.includes('997001') && c.body.text.includes('Telegram 群解封结果')));
+	assert(fault + ' 失败不撤回任何结果', callsOf('deleteMessage').length === 1 && callsOf('deleteMessage')[0].body.message_id === 99500);
+}
+
+// ---------- [102] 隐藏和历史批量任务不新增群内通知 ----------
+console.log('\n[102] 批量任务通知范围与失败隔离');
+{
+	const message = { chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false } };
+	const job = sandbox.createBulkJobPayload('spam', ['998001'], [], '隐藏任务', message);
+	for (const legacy of [false, true]) {
+		resetCalls();
+		const payload = { ...job };
+		if (legacy) delete payload.notifySourceChat;
+		sandbox.fetch = makeFetchMock({ sendMessage: () => ({ ok: true, result: { message_id: 99800 } }) });
+		await sandbox.notifyBulkJobTargets(payload, '批量任务最终结果');
+		assert((legacy ? '历史' : '隐藏') + '任务保持私聊通知，不公开到群',
+			callsOf('sendMessage').length > 0 && callsOf('sendMessage').every((c) => Number(c.body.chat_id) > 0));
+	}
+	resetCalls();
+	await sandbox.notifyBulkJobTargets({ ...job, notifySourceChat: true, notifyTargets: [] }, '未配置主人的批量结果');
+	assert('无主人通知目标时来源群仍收到批量结果', callsOf('sendMessage').length === 1 && String(callsOf('sendMessage')[0].body.chat_id) === '-1001');
+	resetCalls();
+	sandbox.fetch = makeFetchMock({ sendMessage: (body) => Number(body.chat_id) < 0
+		? { ok: false, description: 'Forbidden: bot cannot send messages' } : { ok: true, result: { message_id: 99801 } } });
+	await sandbox.notifyBulkJobTargets({ ...job, notifySourceChat: true }, '批量任务最终结果');
+	assert('批量结果群内投递失败仍通知第一主人', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '999' && c.body.text.includes('批量任务最终结果')));
 }
 
 // ---------- 总结 ----------

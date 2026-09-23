@@ -420,5 +420,85 @@ console.log('\n=== 11. 热路径 D1 预算：稳定态不因重发通道多读�
 		reads2.length <= 1, '实际 ' + reads2.length + ' 次');
 }
 
+
+console.log('\n=== 12. 引用已处置广告的四条管理命令先鉴权撤回再执行 ===');
+{
+	const originalFetch = sandbox.fetch;
+	const requests = [];
+	sandbox.fetch = async (url, init) => {
+		const u = String(url);
+		if (!u.includes('api.telegram.org')) {
+			if (!u.includes('banlist')) throw new Error('Unexpected fetch: ' + u);
+			return { ok: true, status: 200, text: async () => 'No records found' };
+		}
+		const method = u.split('/').pop();
+		const body = init?.body ? JSON.parse(init.body) : {};
+		requests.push({ method, body });
+		if (method === 'getChatAdministrators') {
+			return { ok: true, status: 200, json: async () => ({ ok: true, result: [{ user: { id: 6666 }, status: 'administrator' }] }) };
+		}
+		return originalFetch(url, init);
+	};
+	for (const command of ['/unban 88001', '/BAN@TestBot 88001', '/spam', '/CHECK@TestBot']) {
+		const env = { ...baseEnv, DB: makeD1() };
+		await bootEnv(env);
+		await W.recordHandledAdText(env, AD_TEXT);
+		if (command.startsWith('/unban') || command.startsWith('/CHECK')) {
+			await W.addToBlacklist('88001', env, { reason: 'manual', by: '10001' });
+		}
+		resetCalls();
+		requests.length = 0;
+		await drop(env, {
+			message_id: 8400, chat: { id: GROUPS[0], type: 'supergroup', title: '测试群' },
+			from: { id: 6666, is_bot: false, first_name: '群管理员' }, text: command,
+			reply_to_message: { message_id: 8399, from: { id: 88001, is_bot: false }, text: AD_TEXT },
+		});
+		const deletedCommand = requests.filter((r) => r.method === 'deleteMessage' && Number(r.body.message_id) === 8400).length;
+		const commandDeleteIndex = requests.findIndex((r) => r.method === 'deleteMessage' && Number(r.body.message_id) === 8400);
+		const adminIndex = requests.findIndex((r) => r.method === 'getChatAdministrators');
+		const groupSent = requests.some((r) => r.method === 'sendMessage' && String(r.body.chat_id) === String(GROUPS[0]) && r.body.text.includes('88001'));
+		const ownerSent = requests.some((r) => r.method === 'sendMessage' && String(r.body.chat_id) === '10001' && r.body.text.includes('88001'));
+		check(command + ' 不撤回机器人结果', !requests.some((r) => r.method === 'deleteMessage' && ![8400, 8399].includes(Number(r.body.message_id))));
+		if (command.startsWith('/CHECK')) {
+			// /check 群聊【不撤回命令】（主人要求）：群内返回完整结果 + 私聊第一主人。
+			check(command + ' 群聊不撤回命令', deletedCommand === 0);
+			check(command + ' 群内保留完整结果，同时私聊第一主人', groupSent && ownerSent);
+		} else if (command.startsWith('/unban')) {
+			// /unban 群聊撤回命令 + 群内简洁结果（含目标 TGID）+ 私聊第一主人完整。
+			check(command + ' 鉴权后撤回命令一次', deletedCommand === 1);
+			check(command + ' 先完成管理员鉴权再撤回', commandDeleteIndex > adminIndex);
+			check(command + ' 群内简洁结果，同时私聊第一主人', groupSent && ownerSent);
+		} else {
+			// /ban·/spam 群聊撤回命令 + 群内静默（无 bot 结果）+ 私聊第一主人完整。
+			check(command + ' 鉴权后撤回命令一次', deletedCommand === 1);
+			check(command + ' 先完成管理员鉴权再撤回', commandDeleteIndex > adminIndex);
+			check(command + ' 群内静默、只私聊第一主人', !groupSent && ownerSent);
+		}
+		if (command.startsWith('/unban')) {
+			check(command + ' 仍先移除 D1 再全群解封',
+				env.DB.query("SELECT id FROM blacklist WHERE id='88001'").length === 0
+				&& requests.filter((r) => r.method === 'unbanChatMember').length === GROUPS.length);
+		} else if (command.startsWith('/CHECK')) {
+			check(command + ' 双库查询保持只读', sent.some((text) => text.includes('封禁查询结果'))
+				&& env.DB.query("SELECT id FROM blacklist WHERE id='88001'").length === 1);
+		} else {
+			check(command + ' 继续加黑与全群封禁', env.DB.query("SELECT id FROM blacklist WHERE id='88001'").length === 1
+				&& banned.filter((x) => x.endsWith(':88001')).length === GROUPS.length);
+			if (command === '/spam') check('/spam 仍删除被引用的广告消息', deleted.includes(GROUPS[0] + ':8399'));
+		}
+	}
+	const env = { ...baseEnv, DB: makeD1() };
+	await bootEnv(env);
+	await W.recordHandledAdText(env, AD_TEXT);
+	resetCalls();
+	await drop(env, {
+		message_id: 8500, chat: { id: GROUPS[0], type: 'supergroup' },
+		from: { id: 6666, is_bot: false }, text: '/spam_extra',
+		reply_to_message: { message_id: 8399, from: { id: 88001, is_bot: false }, text: AD_TEXT },
+	});
+	check('相似前缀不扩大四条命令的排除范围', deleted.includes(GROUPS[0] + ':8500'));
+	sandbox.fetch = originalFetch;
+}
+
 console.log('\nbot 重发广告（方案三）验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 if (fail > 0) process.exitCode = 1;

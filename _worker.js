@@ -126,17 +126,8 @@ const DEFAULT_BLACKLIST_REASON_LABELS = {
 //    环境变量名：GKY_BANLIST_ENDPOINT
 const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
 
-// 9) 超级管理员 TGID 白名单。用于普通管理命令鉴权，支持多个 TGID。
-//    环境变量名：SUPER_ADMINS （字符串形式，逗号分隔）
-//    例：'123456,789012'
-//    硬编码这里写数组形式，留空数组表示默认无超管。
-const DEFAULT_SUPER_ADMINS = [
-	// '123456789',
-	// '987654321',
-];
-
 // 10) 主人 TGID(项目所有者),用于"主人审计通知"系统
-//    所有管理员/超管在群里使用 /ban /unban /spam 命令、
+//    所有管理员在群里使用 /ban /unban /spam 命令、
 //    群内手动 ban/unban 时,主人会收到一份带操作人标记的私聊审计通知
 //    环境变量 OWNER_IDS(逗号分隔,中英文逗号均可):第一个是主人,后续是副主人
 //    主人收全部通知;副主人只收 /ban、/spam 这类加黑踢人通知
@@ -195,8 +186,6 @@ let GROUP_IDS = [];
 let ENV_GROUP_IDS = [];
 // D1 dynamic_groups 里合并进来的群（每请求由 mergeDynamicGroupsFromD1 重建）
 let DYNAMIC_GROUP_IDS = [];
-// 超级管理员 TGID 白名单（用于普通管理命令）
-let SUPER_ADMINS = [];
 // 主人 TGID 列表:第一个是主人,后续是副主人。空数组 = 未配置,禁用通知
 let OWNER_IDS = [];
 // 静态用户资料表：bot 不在其所在群时作为 /admins 权限名单的兜底显示
@@ -226,7 +215,6 @@ function applyRuntimeConfig(config) {
 	ENV_GROUP_IDS = [...config.GROUP_IDS];
 	DYNAMIC_GROUP_IDS = [];
 	GROUP_ID = config.GROUP_ID;
-	SUPER_ADMINS = config.SUPER_ADMINS;
 	OWNER_IDS = config.OWNER_IDS;
 	STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
 	PROFILE_LOOKUP_GROUPS = config.PROFILE_LOOKUP_GROUPS || [];
@@ -405,20 +393,13 @@ function loadRequiredConfig(env) {
 	// 去重，保持顺序
 	const uniqueGroupIds = [...new Set(groupIds)];
 
-	// SUPER_ADMINS 可选：环境变量优先（字符串，逗号分隔，半角 , 与全角 ， 都兼容）；否则用顶部 DEFAULT_SUPER_ADMINS（数组）
+	// 主人 TGID 去重，并过滤非法 ID。
 	const sanitizeAdmins = (list) =>
 		[...new Set(
 			(list || [])
 				.map((id) => String(id).trim())
 				.filter((id) => /^\d+$/.test(id))
 		)];
-
-	let superAdmins;
-	if (env.SUPER_ADMINS !== undefined && env.SUPER_ADMINS !== null && String(env.SUPER_ADMINS).trim() !== '') {
-		superAdmins = sanitizeAdmins(String(env.SUPER_ADMINS).split(/[,，]/));
-	} else {
-		superAdmins = sanitizeAdmins(DEFAULT_SUPER_ADMINS);
-	}
 
 	// OWNER_IDS 可选：逗号分隔（中英文逗号均可），第一个主人、后续副主人，空 = 禁用主人通知
 	let ownerIds = [];
@@ -504,7 +485,6 @@ function loadRequiredConfig(env) {
 		BOT_TOKEN: String(env.BOT_TOKEN).trim(),
 		GROUP_IDS: uniqueGroupIds,
 		GROUP_ID: uniqueGroupIds[0],
-		SUPER_ADMINS: superAdmins,
 		OWNER_IDS: ownerIds,
 		AD_PROTECTED_USERNAMES: parseAdProtectedUsernames(env.AD_PROTECTED_USERNAMES),
 		MSG_CACHE_SIZE: msgCacheSize,
@@ -1760,8 +1740,7 @@ function renderUnbanResults(unbanResults) {
 	return `✅ 已解除 ${okCount}/${total} 个群的 Telegram 封禁（${total - okCount} 个失败）`;
 }
 
-// 双通道回执：群内场景发闪屏 + 私聊管理员发详情；私聊场景直接发详情
-// 私聊投递失败（管理员从未 /start 过 bot）时，群里追加一条闪屏说明
+// 管理命令按角色鉴权并私聊投递详情；四条公开管理命令使用无闪屏回执。
 
 // GroupAnonymousBot 的固定 TGID：真人开启"匿名管理员"身份发言时 from 会是它，代表真人操作。
 const ANON_ADMIN_BOT_ID = '1087968824';
@@ -1859,11 +1838,10 @@ function isSecondaryOwner(id) {
 	return OWNER_IDS.length > 1 && OWNER_IDS.slice(1).includes(idStr);
 }
 
-// 高级管理员：主人、副主人、SUPER_ADMINS。
-// 这三类角色保留原有全部管理命令和跨群操作权限。
+// 主人、副主人保留原有管理命令和跨群操作权限。
 function isPrivilegedManager(userId) {
 	const idStr = String(userId || '');
-	return isOwner(idStr) || isSuperAdmin(idStr);
+	return isOwner(idStr);
 }
 
 // 只检查用户是否为“指定当前群”的 Telegram 管理员。
@@ -1897,17 +1875,13 @@ async function checkIfUserIsAdminInGroup(userId, groupId) {
 	}
 }
 
-// /ban、/spam 专用权限：
-// - 主人/副主人/超级管理员保持原权限；
-// - 匿名管理员仅能在其当前配置群使用；
-// - 普通 Telegram 管理员必须是当前发令群的管理员，私聊不放行。
-async function checkMessageOperatorCanBan(message, userId) {
+// /unban、/ban、/spam、/check 共用权限：主人/副主人保留原权限；
+// 群内检查当前配置群，私聊检查任一配置群；匿名管理员仅在当前配置群放行。
+async function checkMessageOperatorCanModerate(message, userId) {
+	if (isBotOperator(message?.from)) return false;
 	if (isPrivilegedManager(userId)) return true;
-	if (isAnonymousAdminMessage(message)) {
-		console.log(`[当前群鉴权] 匿名管理员在群 ${message.chat.id} 使用封禁命令 ✅`);
-		return true;
-	}
-	if (message?.chat?.type === 'private') return false;
+	if (isAnonymousAdminMessage(message)) return true;
+	if (message?.chat?.type === 'private') return checkIfUserIsAdmin(userId);
 	return checkIfUserIsAdminInGroup(userId, message?.chat?.id);
 }
 
@@ -1944,18 +1918,17 @@ async function notifyAllOwners(text, excludeId, includeSecondaryOwners = false) 
 	);
 }
 
-// 判定操作人角色,返回中文标签:主人 / 超级管理员 / 群管理员
-// 主人优先级最高;主人之外的 SUPER_ADMINS 是"超级管理员";其余按调用方传入的兜底标签(默认"管理员")
+// 判定操作人角色,返回中文标签:主人 / 副主人 / 群管理员
+// 主人、副主人优先，其余使用调用方传入的角色标签（默认"管理员"）。
 function classifyOperatorRole(userId, fallback = '管理员') {
 	const idStr = String(userId || '');
 	if (isPrimaryOwner(idStr)) return '主人';
 	if (isSecondaryOwner(idStr)) return '副主人';
-	if (isSuperAdmin(idStr)) return '超级管理员';
 	return fallback;
 }
 
 // 渲染主人审计通知:在 detailText 顶部追加"角色 + 操作人 + 来源"标识
-// roleLabel: 由 classifyOperatorRole 生成,通常是"超级管理员"/"群管理员"/"管理员"
+// roleLabel: 由 classifyOperatorRole 生成,通常是"群管理员"/"管理员"
 // sourceLabel: '群内' / '私聊' 等触发场景标记
 function renderAuditNotification(operatorMention, detailText, sourceLabel, roleLabel = '管理员') {
 	if (roleLabel === '匿名管理员') {
@@ -1965,11 +1938,12 @@ function renderAuditNotification(operatorMention, detailText, sourceLabel, roleL
 }
 
 // 双通道回执:
-// - 群内场景:发闪屏给所有人(5 秒自动撤回) + 私聊详情发给主人; /ban、/spam 可额外发给副主人
+// - 通用群内场景:按既有规则发闪屏并私聊通知主人; /ban、/spam 可额外发给副主人
+// - 四条公开管理命令由 replyToModerationAdmin 发送永久群内详情，并继续私聊通知主人
 // - 私聊场景:触发者本人收一份;主人也收一份带操作人标记的副本(触发者是主人则收"你自己"版)
 //
 // 主人通知规则:
-//   * OWNER_IDS 为空 → 跳过私聊投递,仅群闪屏
+//   * OWNER_IDS 为空 → 跳过私聊投递;通用命令保留既有群内闪屏，四条公开命令由专用 wrapper 保留永久群内结果
 //   * 默认只通知 OWNER_IDS[0] 主人
 //   * /ban、/spam 传 notifySecondaryOwners=true 时,副主人也收到加黑踢人回执
 //   * 触发者是收件人本人 → 收"你自己"标记的详情
@@ -2051,7 +2025,7 @@ async function sendTelegramMessageChunks(chatId, text, replyMarkup = null) {
 	return lastResult;
 }
 
-async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, notifySecondaryOwners = false, replyMarkup = null }) {
+async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, notifySecondaryOwners = false, replyMarkup = null, suppressFlash = false }) {
 	const chatId = message.chat.id;
 	const triggerIdStr = getMessageActorId(message);
 	const operator = formatMessageActorMention(message);
@@ -2064,16 +2038,16 @@ async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, no
 			const role = classifyMessageOperatorRole(message, '管理员');
 			await mapWithConcurrency(notifyTargets, BATCH_USER_PROFILE_CONCURRENCY, async (oid) => {
 				const auditText = renderAuditNotification(operator, detailText, '私聊', role);
-				const result = await sendTelegramMessageChunks(oid, auditText);
+				const result = await sendTelegramMessageChunks(oid, auditText, suppressFlash ? replyMarkup : null);
 				if (!result?.ok) console.error(`[审计通知] 私聊主人${oid}失败:${result?.description || result?.error || '未知'}`);
 			});
 		}
 		return;
 	}
 
-	// 第一主人保留现有群聊回执；其余有权限角色在 GROUP_ID 群内只执行并私聊通知，群内零回执。
-	// 未配置 OWNER_IDS 时保留原有群闪屏兜底，避免执行结果无处投递。
-	if (!shouldSilenceAuthorizedGroupCommand(message) || targets.length === 0) {
+	// 默认保留其他功能的群聊回执与未配置 OWNER_IDS 时的闪屏兜底。
+	// 四条公开管理命令由 wrapper 发送永久群内详情，并通过 suppressFlash 关闭闪屏。
+	if (!suppressFlash && (!shouldSilenceAuthorizedGroupCommand(message) || targets.length === 0)) {
 		await sendFlashMessage(chatId, flashText, ctx);
 	}
 	if (targets.length) {
@@ -2088,9 +2062,36 @@ async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, no
 	}
 }
 
-// 已完成权限校验后的通用结果路由：
-// 非第一主人在配置群执行命令时群内零回执，完整结果仅发第一主人；
-// 第一主人群聊以及所有私聊路径继续使用原来的直接回复行为。
+// 四条公开管理命令统一回执：群内完整结果永久保留，同时私聊第一主人。
+// 群内命令在各入口鉴权后撤回；私聊发令者和 /ban、/spam 副主人通知沿用原规则。
+async function replyToModerationAdmin(message, ctx, { flashText, detailText = flashText, groupText, ...options }) {
+	// 群内回执按命令的「群内模式」分流（message.__moderationGroupMode，由各命令入口设定）：
+	//   未设 / 'full' → 群内发完整 detailText（/check 及全部历史调用，行为逐字节不变）
+	//   'silent'      → 群内不发任何 bot 消息（/ban、/spam：主人要求群内静默）
+	//   'brief'       → 群内发简洁 groupText，未传 groupText 时回退 detailText（/unban）
+	// 无论哪种模式，私聊第一主人（及 /ban·/spam 的副主人）【始终】收到完整 detailText，
+	// 主人侧信息量与改动前完全一致。groupText 在此解构掉，不透传给 replyToAdmin。
+	const groupMode = message?.__moderationGroupMode || 'full';
+	// silent 模式的安全网：仅当【没有任何可私聊的主人】（OWNER_IDS 未配置的退化部署）时，
+	// 才在群内兜底发完整结果，避免操作完全无反馈 —— 这是改动前就有的兜底语义，予以保留。
+	// 有主人但私聊投递失败属临时故障，仍保持群内静默（replyToAdmin 内已 console.error 记录）。
+	const hasOwnerTarget = getOwnerNotifyTargets(options.notifySecondaryOwners).length > 0;
+	const silenceGroup = groupMode === 'silent' && hasOwnerTarget;
+	if (message.chat.type !== 'private' && !silenceGroup) {
+		const textForGroup = (groupMode === 'brief' && groupText != null) ? groupText : detailText;
+		const result = await sendTelegramMessageChunks(message.chat.id, textForGroup, options.replyMarkup);
+		if (!result?.ok) console.error(`[管理命令回执] 群聊${message.chat.id}失败:${result?.description || result?.error || '未知'}`);
+	}
+	await replyToAdmin(message, ctx, {
+		...options,
+		detailText,
+		isInGroup: message.chat.type !== 'private',
+		suppressFlash: true,
+	});
+}
+
+// 已完成权限校验后的旧结果路由，供未迁移的隐藏命令继续使用；
+// 四条公开管理命令统一走 replyToModerationAdmin。
 async function sendAuthorizedCommandResult(message, ctx, { flashText, detailText, replyMarkup = null }) {
 	if (shouldSilenceAuthorizedGroupCommand(message)) {
 		await replyToAdmin(message, ctx, {
@@ -2104,7 +2105,7 @@ async function sendAuthorizedCommandResult(message, ctx, { flashText, detailText
 	await sendTelegramMessage(message.chat.id, detailText, replyMarkup);
 }
 
-// /ban、/spam、/unban、/job 的参数/环境校验回执：
+// /job、/jobrun、/ad 的参数/环境校验回执：
 // 非第一主人群聊不发机器人回执，只把完整提示给主人；第一主人仍保持原来的群闪屏，私聊仍直接回复发令者。
 async function sendModerationCommandFeedback(message, ctx, { flashText, detailText = flashText }) {
 	if (shouldSilenceAuthorizedGroupCommand(message)) {
@@ -2172,7 +2173,7 @@ async function addManyToBlacklist(ids, env, options = {}) {
 
 // 批量 /unban 资格检查：
 // - 普通权限只读检查，D1 命中即拒绝；
-// - 第一主人、副主人、超级管理员可显式传 allowD1Removal，先移除 D1 再允许 Telegram 解封。
+// - 通过命令鉴权的管理员可显式传 allowD1Removal，先移除 D1 再允许 Telegram 解封。
 // 查询或移除失败时严格拒绝对应目标，任何分支都不调用 Telegram 封禁接口。
 async function checkManyUnbanEligibility(ids, env, options = {}) {
 	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [] };
@@ -2485,7 +2486,8 @@ function estimateBulkAuthorizationRequests(message) {
 	if (isAnonymousAdminMessage(message)) return 0;
 	const actorId = getMessageActorId(message);
 	if (isPrivilegedManager(actorId)) return 0;
-	return message?.chat?.type !== 'private' && isConfiguredGroup(message?.chat?.id) ? 1 : 0;
+	if (message?.chat?.type === 'private') return GROUP_IDS.length;
+	return isConfiguredGroup(message?.chat?.id) ? 1 : 0;
 }
 
 function createBulkJobPayload(action, ids, invalid, note, message, options = {}) {
@@ -2510,13 +2512,15 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		note: normalizeActionNote(note),
 		groupIds,
 		createdBy: getMessageActorId(message),
-		unbanAllowD1Removal: isUnban && isPrivilegedManager(getMessageActorId(message)),
+		unbanAllowD1Removal: isUnban && (options.allowD1Removal === true || isPrivilegedManager(getMessageActorId(message))),
 		operator,
 		operatorRole: classifyMessageOperatorRole(message, message.chat?.type === 'private' ? '管理员' : '群管理员'),
 		sourceChatId: String(message.chat?.id ?? ''),
 		sourceChatTitle: message.chat?.title || message.chat?.username || (message.chat?.type === 'private' ? '私聊' : '当前群组'),
 		sourceChatType: message.chat?.type || 'unknown',
 		notifyTargets: getBulkJobNotifyTargets(message),
+		// 仅公开管理命令显式开启来源群回执，隐藏连带任务沿用原通知范围。
+		notifySourceChat: options.notifySourceChat === true,
 		userBatchSize: BULK_TASK_USER_BATCH_SIZE,
 		concurrency: BULK_TASK_CONCURRENCY,
 		// 同款连带专用：{ "userId": { "chatId": [mid, ...] } }
@@ -2786,6 +2790,10 @@ async function renderBulkJobOwnerView(env, job, requestedPage) {
 }
 
 async function notifyBulkJobTargets(job, detailText) {
+	if (job.notifySourceChat === true && job.sourceChatId && ['group', 'supergroup'].includes(job.sourceChatType)) {
+		const result = await sendTelegramMessageChunks(job.sourceChatId, detailText);
+		if (!result?.ok) console.error(`[批量任务通知] 群聊${job.sourceChatId}失败:${result?.description || result?.error || '未知'}`);
+	}
 	const targets = Array.isArray(job.notifyTargets) ? job.notifyTargets : [];
 	if (!targets.length) return;
 	await mapWithConcurrency(targets, BATCH_USER_PROFILE_CONCURRENCY, async (targetId) => {
@@ -3123,23 +3131,31 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 			`❌ 批量任务需要绑定 D1 存储空间\n目标用户:${valid.length}\n总操作数:${budget.operations}\n预计子请求:${budget.estimate.total}/${BULK_TASK_SYNC_SUBREQUEST_BUDGET}`,
 			note
 		);
-		await replyToAdmin(message, ctx, {
+		await replyToModerationAdmin(message, ctx, {
 			flashText: '❌ 批量任务需要绑定 D1',
+			groupText: '❌ 批量任务需要绑定 D1',
 			detailText,
 			isInGroup,
 			notifySecondaryOwners: true
 		});
 		return true;
 	}
-	const job = await createBulkJob(env, action, valid, invalid, note, message);
+	const job = await createBulkJob(env, action, valid, invalid, note, message, {
+		allowD1Removal: action === 'unban' && options.allowD1Removal === true,
+		// 群内静默/简洁（主人要求）：/ban·/spam·/unban 的批量任务【不再向源群推异步完成通知】，
+		// 与它们的同步群内策略一致（/ban·/spam 群内全程静默；/unban 群内只保留同步阶段的
+		// 「任务已创建」简洁提示）。完整结果照旧私聊第一主人与副主人（job.notifyTargets 不受影响）。
+		notifySourceChat: false,
+	});
 	const autoQueueAvailable = Boolean(getBulkQueue(env));
 	if (!autoQueueAvailable) {
 		job.autoContinue = false;
 		await saveBulkJob(env, job);
 	}
 	const detailText = formatBulkJobDetail(job, '📦 <b>批量任务已创建</b>');
-	await replyToAdmin(message, ctx, {
+	await replyToModerationAdmin(message, ctx, {
 		flashText: `📦 批量任务已创建 <code>${job.id}</code>\n目标 ${job.totals.users} 个`,
+		groupText: `📦 批量任务已创建 <code>${job.id}</code>\n目标 ${job.totals.users} 个`,
 		detailText,
 		isInGroup,
 		notifySecondaryOwners: true
@@ -4011,7 +4027,6 @@ function renderBlacklistOperator(byId, usernames) {
 	let roleTag = '👤 群管理员';
 	if (isPrimaryOwner(raw)) roleTag = '👑 主人';
 	else if (isSecondaryOwner(raw)) roleTag = '👤 副主人';
-	else if (SUPER_ADMINS.includes(raw)) roleTag = '🛡️ 超级管理员';
 
 	// 有用户名就用纯文本 @xxx：Telegram 自动识别为用户链接，不受对方隐私设置影响。
 	// TGID 仍然照常给出，方便直接复制去 /check、/unban。
@@ -4085,6 +4100,12 @@ function isCheckCommand(text) {
 	return /^\/check(?:@[^\s]+)?(?:\s|$)/i.test(trimmedText);
 }
 
+// 四条管理命令必须先进入鉴权与执行入口，再撤回命令；不能被重发清理提前吞掉。
+function isPublicModerationCommand(text) {
+	if (!text) return false;
+	return /^\/(?:unban|ban|spam|check)(?:@[^\s]+)?(?:\s|$)/i.test(String(text).trim());
+}
+
 function isJobCommand(text) {
 	if (!text) {
 		return false;
@@ -4130,13 +4151,6 @@ function isTelegramSlashCommand(text) {
 		return false;
 	}
 	return /^\/[^\s/]+(?:\s|$)/.test(text.trim());
-}
-
-// 判断给定 user_id 是否在超级管理员白名单内（按钮交互专用鉴权）
-function isSuperAdmin(userId) {
-	if (userId === undefined || userId === null) return false;
-	const idStr = String(userId);
-	return SUPER_ADMINS.some((id) => id === idStr);
 }
 
 // 清掉会让 Telegram 直接返回 400 的非法字符。
@@ -4425,8 +4439,7 @@ function renderPermissionSection(title, ids, profiles, groupLabels) {
 async function renderPermissionAdminsList() {
 	const primaryOwner = OWNER_IDS.length ? [OWNER_IDS[0]] : [];
 	const secondaryOwners = OWNER_IDS.length > 1 ? OWNER_IDS.slice(1) : [];
-	const superAdmins = SUPER_ADMINS || [];
-	const allIds = [...primaryOwner, ...secondaryOwners, ...superAdmins];
+	const allIds = [...primaryOwner, ...secondaryOwners];
 	const profiles = await resolvePermissionUserProfiles(allIds);
 	// 只查【实际出现在名单里】的来源群，且函数内部去重 ——
 	// 不是遍历全部配置群，那会在群多时白花一堆 getChat。
@@ -4439,8 +4452,6 @@ async function renderPermissionAdminsList() {
 		...renderPermissionSection('👑 <b>主人</b>', primaryOwner, profiles, groupLabels),
 		'',
 		...renderPermissionSection('👤 <b>副主人</b>', secondaryOwners, profiles, groupLabels),
-		'',
-		...renderPermissionSection('🛡️ <b>超级管理员</b>', superAdmins, profiles, groupLabels),
 		'',
 		'说明:用户名/昵称来自 Telegram 当前可读取的群成员资料;未获取时仍以 TGID 为准。',
 		'来源群名可点击跳转（公开群走 t.me 永久链接；私密群需 bot 为管理员才有邀请链接，否则只显示群名）。'
@@ -5223,7 +5234,7 @@ function isTelegramServiceMessage(message) {
 //
 // 现在判据只有一条：第一主人 /spam 过就算。长度、内容特征一概不看。
 // 误封风险由两层兜住，都比长度门槛可靠：
-//   ① 仅 OWNER_IDS[0] 可触发（isPrimaryOwner 闸，副主人 / 超管 / 群管理员一律不连带）；
+//   ① 仅 OWNER_IDS[0] 可触发（isPrimaryOwner 闸，副主人 / 群管理员一律不连带）；
 //   ② 处置结果私聊第一主人，附一条可直接复制的 /unban 全部TGID 一键回滚。
 const MODERATION_TEXT_MIN_LENGTH = 1;
 
@@ -5910,7 +5921,6 @@ async function translateBlacklistOperator(byId) {
 	let roleTag = '👤 群管理员';
 	if (isPrimaryOwner(byId)) roleTag = '👑 主人';
 	else if (isSecondaryOwner(byId)) roleTag = '👤 副主人';
-	else if (SUPER_ADMINS.includes(byId)) roleTag = '🛡️ 超级管理员';
 
 	// 尝试查询操作人名字和类型
 	try {
@@ -6321,7 +6331,6 @@ async function resolveAdVoteTargetProtection(message, target) {
 	const targetId = String(target.targetUserId || '');
 	if (targetId === String(message?.from?.id || '')) return { protected: true, reason: '不能举报自己' };
 	if (isOwner(targetId)) return { protected: true, reason: '不能举报主人或副主人' };
-	if (isSuperAdmin(targetId)) return { protected: true, reason: '不能举报超级管理员' };
 	const botId = await getBotId();
 	if (botId && targetId === String(botId)) return { protected: true, reason: '不能举报当前机器人' };
 
@@ -7160,6 +7169,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		isConfiguredGroup(chatId) && message.message_id
 		&& !isTelegramServiceMessage(message)
 		&& !isAdExemptBot(message.from)
+		&& !isPublicModerationCommand(message.text)
 		&& (message.from?.is_bot === true || message.reply_to_message)
 		&& await matchHandledAdText(env, message)
 	) {
@@ -7250,14 +7260,18 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 仅真人可通过 /spam 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
 		if (isBotOperator(message.from)) return;
 
-		const isAdmin = await checkMessageOperatorCanBan(message, userId);
+		const isAdmin = await checkMessageOperatorCanModerate(message, userId);
 		if (!isAdmin) {
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /spam；私聊仅限主人、副主人或超级管理员。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/spam 仅限配置群的 Telegram 管理员、主人或副主人使用。');
 			}
 			return;
 		}
+
 		await deleteAuthorizedGroupCommandMessage(message, '/spam');
+		// 群聊静默（主人要求）：/spam 在群内不发任何 bot 回执，完整结果仅私聊第一主人与副主人。
+		// 撤回命令消息、指纹/样本学习、同款连带等原有行为一律不变。
+		message.__moderationGroupMode = 'silent';
 
 		// 提取 /spam 后面的参数。回复模式优先把参数当执行原因；无回复时才按 TGID 模式解析。
 		const argMatch = text.trim().match(/^\/spam(?:@[^\s]+)?\s*([\s\S]*)/i);
@@ -7270,12 +7284,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			if (valid.length === 0 && invalid.length === 0) {
 				const usageText = `❌ 使用方法：<code>/spam 用户ID</code> 或 <code>/spam 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
-				await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
+				await replyToModerationAdmin(message, ctx, { flashText: usageText });
 				return;
 			}
 			if (valid.length > BATCH_LIMIT) {
 				const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
-				await sendModerationCommandFeedback(message, ctx, { flashText: limitText });
+				await replyToModerationAdmin(message, ctx, { flashText: limitText });
 				return;
 			}
 			if (await startBulkModerationJobFromCommand(message, env, ctx, {
@@ -7312,7 +7326,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					lines.push(result.message);
 					flashText = `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
 				}
-				await replyToAdmin(message, ctx, {
+				await replyToModerationAdmin(message, ctx, {
 					flashText,
 					detailText: withActionContext(message, lines.join('\n'), note),
 					isInGroup,
@@ -7357,7 +7371,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				}
 				fullDetail += `\n\n<b>逐用户 Telegram 群封禁/预封明细</b>:\n\n${perUserBlocks.join('\n\n')}`;
 			}
-			await replyToAdmin(message, ctx, {
+			await replyToModerationAdmin(message, ctx, {
 				flashText,
 				detailText: withActionContext(message, fullDetail, note),
 				isInGroup,
@@ -7370,7 +7384,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const repliedUserId = repliedMsg?.from?.id;
 		if (!repliedUserId) {
 			const usageText = '❌ 使用方法：\n• 回复垃圾消息后发 <code>/spam</code>\n• 或直接 <code>/spam 用户ID</code>（支持批量：<code>/spam 123,456,789</code>）';
-			await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
+			await replyToModerationAdmin(message, ctx, { flashText: usageText });
 			return;
 		}
 
@@ -7483,7 +7497,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 【仅第一主人可触发】连带的杀伤力是单次封禁的 N 倍，而误封的根源不是
 			// 「代码判得不准」而是「谁有资格触发这个不可逆的批量操作」——
 			// 今天那次误封（管理员回复「广告」封了 14 个群）正是触发权开给群管理员的后果。
-			// 副主人 / 超级管理员 / 群管理员的 /spam 照常执行加黑 + 封禁 + 学指纹，只是不连带。
+			// 副主人 / 群管理员的 /spam 照常执行加黑 + 封禁 + 学指纹，只是不连带。
 			// 非第一主人【完全静默】：不提示、不在群里留任何痕迹，不暴露这个能力的存在。
 			try {
 				const linkedKey = isPrimaryOwner(operatorId) ? buildModerationTextKey(repliedMsg) : null;
@@ -7499,7 +7513,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 							// 【刻意不写进 lines】lines 走 detailText，而 detailText 会同时投给副主人
 							// （notifySecondaryOwners: true）。连带只属于第一主人，结果也只发给他 ——
 							// 由下面的 notifyLinkedSpamResult 单独私聊。
-							// 群内闪屏（flashText）本来就只有「已加黑 + TGID」、不含 lines，天然不暴露。
+							// 连带查杀详情继续通过独立私聊通知投递，不公开到来源群。
 							await notifyLinkedSpamResult(env, {
 								operatorId, message, sourceUserId: linkedUserId,
 								textNorm: linkedKey.norm, done,
@@ -7544,7 +7558,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				console.error('[同款连带] 执行失败:', error);
 			}
 
-			await replyToAdmin(message, ctx, {
+			await replyToModerationAdmin(message, ctx, {
 				flashText: `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} ${linkedUserId}`,
 				detailText: withActionContext(message, lines.join('\n'), replySpamNote),
 				isInGroup,
@@ -7563,7 +7577,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			} else {
 				failLines.push(result.message);
 			}
-			await replyToAdmin(message, ctx, {
+			await replyToModerationAdmin(message, ctx, {
 				flashText: `⚠️ ${linkedUserId}: ${escapeHtml(plainMsg)}`,
 				detailText: withActionContext(message, failLines.join('\n'), replySpamNote),
 				isInGroup,
@@ -7579,7 +7593,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const isAdmin = isPrivilegedManager(userId);
 		if (!isAdmin) {
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人使用。');
 			}
 			return;
 		}
@@ -7652,105 +7666,31 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
-	// 处理 /check 命令查询封禁状态。两种用法:
-	//   ① 群内回复某条消息发 /check —— 查被回复用户(原有)
-	//   ② /check <TGID> —— 私聊或群内带参数直接查指定 TGID
+	// /check 保留参数查询、群内回复查询及双库复制按钮。
 	if (isCheckCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
-		const isConfiguredSourceGroup = isConfiguredGroup(chatId);
-		const dispatchSourceAllowed = !isInGroup || isConfiguredSourceGroup;
-
-		// 解析参数:/check 后面跟的纯数字 TGID
+		const dispatchSourceAllowed = !isInGroup || isConfiguredGroup(chatId);
+		if (!(await checkMessageOperatorCanModerate(message, userId))) {
+			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/check 仅限配置群的 Telegram 管理员、主人或副主人使用。');
+			return;
+		}
+		// /check 群聊【刻意不撤回命令消息】（主人要求）：命令与查询结果都留在群里，
+		// 便于群内其他管理员看到「谁查了谁」；完整结果仍私聊第一主人。
+		// 其余命令的撤回行为一律不动。
 		const checkArg = text.trim().replace(/^\/check(?:@[^\s]+)?\s*/i, '').trim();
 		const hasTgidArg = /^\d+$/.test(checkArg);
-
-		// /check 属于高级管理命令，普通 Telegram 群管理员不开放。
-		const isAdmin = isPrivilegedManager(userId);
-		const quietGroupCommand = isInGroup && isConfiguredSourceGroup && !isPrimaryOwner(userId);
-
-		// ===== 副主人与超级管理员的 /check 命令消息保留在群里（2026-09-23 主人指定）=====
-		// 【只摘掉「撤回」这一个动作】quietGroupCommand 的其余语义对这两类角色一律不变：
-		// 不发「正在查询…」、不发 5 秒闪屏、完整结果仍然只进第一主人私聊。
-		//
-		// 【下面两处必须写成嵌套 if，不能合并成 `if (quietGroupCommand && !keep…)`】
-		// 带 TGID 参数那一路的 else 分支会往群里发「正在查询…」—— 合并之后这些角色就掉进
-		// 了 else，群里反而冒出一条机器人回执，与「群内零回执」的要求正好相反。
-		//
-		// 【刻意写成显式枚举，不写成 `keep = quietGroupCommand`】两者当前等价 ——
-		// 能走到这里的只有 isPrivilegedManager（主人 + 副主人 + 超管），第一主人又已被
-		// quietGroupCommand 的 !isPrimaryOwner 排除。但写死等价式会让【将来任何新放开的
-		// 角色自动继承「不撤回」】，那是主人没点过头的行为。枚举则让新角色默认照旧撤回。
-		// 匿名管理员走不到这里：其 userId 是 GroupAnonymousBot，isPrivilegedManager 判 false，
-		// 上面 !isAdmin 就已 return（test_kick.mjs:5131 锁着这条）。
-		const keepGroupCommandMessage = quietGroupCommand
-			&& (isSecondaryOwner(userId) || isSuperAdmin(userId));
-
-		if (hasTgidArg) {
-			// 带 TGID 参数:私聊 / 群内均可
-			if (!isAdmin) {
-				if (message.chat.type === 'private') {
-					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
-				}
-				return;
-			}
-			if (quietGroupCommand) {
-				if (!keepGroupCommandMessage) {
-					await deleteAuthorizedGroupCommandMessage(message, '/check');
-				}
-			} else {
-				await sendTelegramMessage(chatId, `正在查询 TGID: <code>${escapeHtml(checkArg)}</code> 的封禁状态...`);
-			}
-			const response = await buildBanlistCheckResponse(checkArg, {
-				includeReviewAction: true,
-				dispatchSourceAllowed,
-				env,
+		const repliedUser = !hasTgidArg && isInGroup ? message.reply_to_message?.from : null;
+		if (!hasTgidArg && !repliedUser?.id) {
+			await replyToModerationAdmin(message, ctx, {
+				detailText: isInGroup
+					? '❌ 请回复要查询封禁状态的用户消息后再发送 <code>/check</code>，或用 <code>/check TGID</code> 直接查。'
+					: 'ℹ️ 私聊查询请用:<code>/check TGID</code>\n例:<code>/check 993005028</code>\n群内可回复某条消息发 <code>/check</code> 查该用户。',
 			});
-			if (quietGroupCommand) {
-				await replyToAdmin(message, ctx, {
-					flashText: `🔍 查询完成 <code>${escapeHtml(checkArg)}</code>，完整结果已发送给主人`,
-					detailText: response.text,
-					isInGroup: true,
-					replyMarkup: response.replyMarkup,
-				});
-			} else {
-				await sendTelegramMessage(chatId, response.text, response.replyMarkup);
-			}
 			return;
 		}
-
-		// 无参数:沿用原"群内回复消息"用法
+		const tgidToCheck = hasTgidArg ? checkArg : String(repliedUser.id);
 		if (!isInGroup) {
-			if (!isAdmin) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
-				return;
-			}
-			await sendTelegramMessage(chatId, 'ℹ️ 私聊查询请用:<code>/check TGID</code>\n例:<code>/check 993005028</code>\n群内可回复某条消息发 <code>/check</code> 查该用户。');
-			return;
-		}
-		if (!isAdmin) {
-			return;
-		}
-		if (quietGroupCommand) {
-			// 与上面带 TGID 参数那一路同构：只摘掉撤回，其余静默语义不变。
-			// 这里当前没有 else 分支，合并写法暂时也安全 —— 但仍刻意写成嵌套 if，
-			// 免得后人给这处补 else 时踩上面注释里写的那个坑。
-			if (!keepGroupCommandMessage) {
-				await deleteAuthorizedGroupCommandMessage(message, '/check');
-			}
-		}
-		const repliedUser = message.reply_to_message?.from;
-		if (!repliedUser?.id) {
-			const usageText = '❌ 请回复要查询封禁状态的用户消息后再发送 <code>/check</code>，或用 <code>/check TGID</code> 直接查。';
-			await sendAuthorizedCommandResult(message, ctx, {
-				flashText: '❌ /check 用法错误，完整提示已发送给主人',
-				detailText: usageText,
-			});
-			return;
-		}
-
-		const tgidToCheck = repliedUser.id.toString();
-		if (!quietGroupCommand) {
-			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
+			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${escapeHtml(tgidToCheck)}</code> 的封禁状态...`);
 		}
 		const response = await buildBanlistCheckResponse(tgidToCheck, {
 			targetUser: repliedUser,
@@ -7758,19 +7698,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			dispatchSourceAllowed,
 			env,
 		});
-		if (quietGroupCommand) {
-			await replyToAdmin(message, ctx, {
-				flashText: `🔍 查询完成 <code>${escapeHtml(tgidToCheck)}</code>，完整结果已发送给主人`,
-				detailText: response.text,
-				isInGroup: true,
-				replyMarkup: response.replyMarkup,
-			});
-		} else {
-			await sendTelegramMessage(chatId, response.text, response.replyMarkup);
-		}
+		await replyToModerationAdmin(message, ctx, { detailText: response.text, replyMarkup: response.replyMarkup });
 		return;
 	}
-
 	// 处理 /start 命令（包含 deep link 参数）
 	const startCommand = parseTelegramCommand(text);
 	if (startCommand.head === '/start') {
@@ -7782,7 +7712,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			if (!isAdmin) {
 				if (!isInGroup) {
-					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人使用。');
 				}
 				return;
 			}
@@ -7851,7 +7781,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		const isAdmin = isPrivilegedManager(userId);
 		if (!isAdmin) {
-			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
+			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人使用。');
 			return;
 		}
 
@@ -7896,12 +7826,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 命令一律【裸文本】不包 <code>：Telegram 只会把纯文本里的 /xxx 识别成 bot_command
 		// 实体、渲染成蓝色链接并支持「点一下直接发送」；一旦包进 <code>，点击就只是复制。
 		const helpLines = [
-			'🔐 <b>第一主人专属指令</b>（其他人无反应，也不出现在命令菜单里）',
+			'🔐 <b>第一主人专属帮助</b>（仅第一主人私聊可展开）',
 			'',
-			'<b>━━ 人工封禁 ━━</b>',
+			'<b>━━ 人工封禁与查询 ━━</b>',
+			'以下四条命令可由配置群 Telegram 管理员、主人或副主人使用；群聊校验当前群，私聊校验任一配置群。',
 			'/ban TGID [原因]　加入全局黑名单 + 全群封禁',
 			'/spam　回复广告使用：删消息 + 全群封禁 + 撤回其历史发言',
 			'/unban TGID　移出黑名单 + 全群解封（裸发 /unban 是自己走自助解封，不是解封别人）',
+			'/check TGID　查询 GKY 与本地黑名单；群内也可回复用户消息发 /check',
+			'群内授权命令立即撤回，完整结果保留在群里并通知第一主人；私聊命令与结果均保留。',
 			'',
 			'<b>━━ 广告举报投票 ━━</b>',
 			'/ad [原因]　回复广告发起群内投票，通过后加黑并全群封禁',
@@ -7914,7 +7847,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/listgroups　列出全部生效群组',
 			'',
 			'<b>━━ 查询与退群（仅私聊）━━</b>',
-			'/admins　查看主人 / 副主人 / 超级管理员名单',
+			'/admins　查看主人 / 副主人名单',
 			'/groups　查看当前生效群组信息',
 			'/leavegroup -100xxx　让 bot 退出该群',
 			'',
@@ -8198,16 +8131,20 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 仅真人可通过 /ban 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
 		if (isBotOperator(message.from)) return;
 
-		// 普通管理员必须是当前群管理员；高级管理员保持原有权限。
-		const isAdmin = await checkMessageOperatorCanBan(message, userId);
+		// 群聊检查当前群管理员，私聊检查任一配置群；主人和副主人保留原权限。
+		const isAdmin = await checkMessageOperatorCanModerate(message, userId);
 		if (!isAdmin) {
 			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /ban；私聊仅限主人、副主人或超级管理员。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/ban 仅限配置群的 Telegram 管理员、主人或副主人使用。');
 			}
 			return;
 		}
+
 		await deleteAuthorizedGroupCommandMessage(message, '/ban');
+		// 群聊静默（主人要求）：/ban 在群内不发任何 bot 回执，完整结果仅私聊第一主人与副主人。
+		// 撤回命令消息、副主人通知等原有行为一律不变。
+		message.__moderationGroupMode = 'silent';
 
 		// 提取参数（支持单个 / 批量；开头 TGID 列表之后的文本作为执行原因）
 		// 用正则提取,与 /spam 完全对称:兼容 /ban、/ban@机器人名、多空格;彻底不依赖命令长度,
@@ -8218,12 +8155,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		if (valid.length === 0 && invalid.length === 0) {
 			const usageText = `❌ 使用方法：<code>/ban 用户ID</code> 或 <code>/ban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
-			await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
+			await replyToModerationAdmin(message, ctx, { flashText: usageText });
 			return;
 		}
 		if (valid.length > BATCH_LIMIT) {
 			const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
-			await sendModerationCommandFeedback(message, ctx, { flashText: limitText });
+			await replyToModerationAdmin(message, ctx, { flashText: limitText });
 			return;
 		}
 		if (await startBulkModerationJobFromCommand(message, env, ctx, {
@@ -8280,7 +8217,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				lines.push(result.message);
 				flashText = `⚠️ <code>${valid[0]}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
 			}
-			await replyToAdmin(message, ctx, {
+			await replyToModerationAdmin(message, ctx, {
 				flashText,
 				detailText: withActionContext(message, lines.join('\n'), note),
 				isInGroup,
@@ -8327,7 +8264,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			fullDetail += `\n\n<b>逐用户 Telegram 群封禁/预封明细</b>:\n\n${perUserBlocks.join('\n\n')}`;
 		}
-		await replyToAdmin(message, ctx, {
+		await replyToModerationAdmin(message, ctx, {
 			flashText,
 			detailText: withActionContext(message, fullDetail, note),
 			isInGroup,
@@ -8345,30 +8282,36 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (rest.trim()) {
 			const isInGroup = message.chat.type !== 'private';
 
-			// /unban 只能由主人、副主人或超级管理员执行。
-			const isAdmin = isPrivilegedManager(userId);
+			// 权限统一，原有 D1 检查、移除及 Telegram 解封流程保持原样。
+			const isAdmin = await checkMessageOperatorCanModerate(message, userId);
 			if (!isAdmin) {
 				if (!isInGroup) {
-					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/unban 仅限主人、副主人或超级管理员使用。');
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/unban 仅限配置群的 Telegram 管理员、主人或副主人使用。');
 				}
 				return;
 			}
+
 			await deleteAuthorizedGroupCommandMessage(message, '/unban');
+			// 群聊简洁（主人要求）：/unban 在群内只发「目标+解封总数」的简洁汇总，
+			// 不含逐群明细 / 群 ID / 群名；完整结果仍私聊第一主人。
+			// 撤回命令消息、D1 黑名单硬闸门等原有行为一律不变。
+			message.__moderationGroupMode = 'brief';
 
 			const { valid, invalid } = parseBatchTgids(rest);
 
 			if (valid.length === 0 && invalid.length === 0) {
 				const usageText = `❌ 使用方法：<code>/unban 用户ID</code> 或 <code>/unban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
-				await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
+				await replyToModerationAdmin(message, ctx, { flashText: usageText });
 				return;
 			}
 			if (valid.length > BATCH_LIMIT) {
 				const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
-				await sendModerationCommandFeedback(message, ctx, { flashText: limitText });
+				await replyToModerationAdmin(message, ctx, { flashText: limitText });
 				return;
 			}
 			if (await startBulkModerationJobFromCommand(message, env, ctx, {
 				action: 'unban',
+				allowD1Removal: isAdmin,
 				valid,
 				invalid,
 				note: '',
@@ -8392,8 +8335,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 				if (eligibility.blacklisted.includes(targetId)) {
 					lines.push('⛔ <b>目标仍在 D1 黑名单，已拒绝解封</b>', 'ℹ️ D1 记录保持不变，未调用 Telegram 解封接口。');
-					await replyToAdmin(message, ctx, {
+					await replyToModerationAdmin(message, ctx, {
 						flashText: `⛔ <code>${targetId}</code> 在 D1 黑名单，已拒绝解封`,
+						groupText: `⛔ <code>${targetId}</code> 在 D1 黑名单，已拒绝解封`,
 						detailText: lines.join('\n'),
 						isInGroup
 					});
@@ -8404,8 +8348,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					const failure = eligibility.failed.find((item) => item.id === targetId);
 					const failureText = failure?.msg || '❌ 无法确认 D1 黑名单状态，已拒绝解封';
 					lines.push(escapeHtml(failureText), 'ℹ️ 为避免绕过全局黑名单，本次未调用 Telegram 解封接口。');
-					await replyToAdmin(message, ctx, {
+					await replyToModerationAdmin(message, ctx, {
 						flashText: `❌ <code>${targetId}</code> 无法确认 D1 状态，已拒绝解封`,
+						groupText: `❌ <code>${targetId}</code> 无法确认 D1 状态，已拒绝解封`,
 						detailText: lines.join('\n'),
 						isInGroup
 					});
@@ -8425,8 +8370,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					'<b>Telegram 群解封结果</b>:',
 					await renderUnbanResultsDetail(unbanResults, null, { userId: targetId, retryCommand: '/unban' })
 				);
-				await replyToAdmin(message, ctx, {
+				await replyToModerationAdmin(message, ctx, {
 					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封\n${renderUnbanResults(unbanResults)}`,
+					groupText: `🔓 已解封 <code>${targetId}</code>\n${renderUnbanResults(unbanResults)}`,
 					detailText: lines.join('\n'),
 					isInGroup
 				});
@@ -8471,8 +8417,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				}
 				detailText += `\n\n${unbanHeaderLines.join('\n')}\n\n${perUserBlocks.join('\n\n')}`;
 			}
-			await replyToAdmin(message, ctx, {
+			await replyToModerationAdmin(message, ctx, {
 				flashText,
+				groupText: `🔓 批量解封完成\n✅ 解封 ${results.eligible.length}　⛔ D1拒绝 ${results.blacklisted.length}　❌ 失败 ${failedCount}`,
 				detailText,
 				isInGroup
 			});
@@ -8487,7 +8434,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 拆开后 /start 只做自我介绍并引导用户去 /unban，群里发也无害。
 	if (startCommand.head === '/start' && !startCommand.rest) {
 		// 群聊权限与拆分前完全一致：只有第一主人能触发，其他任何人（普通成员、群管理员、
-		// 超级管理员、副主人、匿名管理员）一律【纯静默】—— 不回、不撤回、不通知主人、
+		// 副主人、匿名管理员）一律【纯静默】—— 不回、不撤回、不通知主人、
 		// 零 Telegram 请求。私聊不进此判定，任何人都能看到介绍语。
 		if (message.chat.type !== 'private' && !isPrimaryOwner(getMessageActorId(message))) {
 			return;
@@ -8517,7 +8464,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 处理无参 /unban - 自助解封检查清单
 	if (unbanCommand.head === '/unban' && !unbanCommand.rest) {
 		// 群聊里的自助解封入口只对第一主人开放：任何其他人（普通成员、群管理员、
-		// 超级管理员、副主人、匿名管理员）在配置群发无参 /unban 一律【纯静默】——
+		// 副主人、匿名管理员）在配置群发无参 /unban 一律【纯静默】——
 		// 不回欢迎语、不撤回命令、不私聊主人、不产生任何 Telegram 请求。
 		// 原因：这段清单是给「被封禁用户私聊 bot」用的自助流程，任何人都能在群里
 		// 把它刷出来会污染群消息流，且清单里含解封确认整句，等于公开教学如何触发解封。
@@ -8527,9 +8474,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		const quietManagerCommand = await isNonPrimaryConfiguredGroupManager(message, userId);
-		if (quietManagerCommand) {
-			await deleteAuthorizedGroupCommandMessage(message, '/unban');
-		}
 		// D1 全局黑名单是自助解封的硬闸门：命中任何 reason 都拒绝，且不自动移除黑名单。
 		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env, {
 			silentGroupReply: quietManagerCommand && OWNER_IDS.length > 0,
@@ -8546,7 +8490,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			.replaceAll('{keyword}', SELF_UNBAN_KEYWORD);
 
 		if (quietManagerCommand) {
-			await replyToAdmin(message, ctx, {
+			await replyToModerationAdmin(message, ctx, {
 				flashText: 'ℹ️ 完整结果已发送给主人',
 				detailText: welcomeMessage,
 				isInGroup: true,
@@ -9092,11 +9036,6 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 }
 
 // 检查用户是否是任一配置群组的管理员
-// 检查用户是否是任一配置群组的管理员 / 超级管理员
-// 权限层级（高 → 低）:超级管理员 > 群管理员 > 普通用户
-// 超级管理员（SUPER_ADMINS 名单）拥有普通管理命令权限。
-// 这里直接把 super 当成 admin,所以 SUPER_ADMINS 用户即使不是任何群的成员也能使用 /ban /unban /spam 等命令
-//
 // 用 getChatAdministrators 拉群管理员列表本地匹配，比 getChatMember 更稳:
 // - 不要求 bot 是该群管理员（仅要求 bot 在群里）
 // - 不受 50+ 人群组限制
@@ -9105,15 +9044,9 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 async function checkIfUserIsAdmin(userId) {
 	const userIdStr = String(userId);
 
-	// 主人/副主人直接放行（最高权限，先于超管/群管理员检查）
+	// 主人/副主人直接放行（最高权限，先于群管理员检查）
 	if (isOwner(userIdStr)) {
 		console.log(`[管理员鉴权] 用户 ${userId} 是主人/副主人 ✅`);
-		return true;
-	}
-
-	// 超级管理员直接放行（最高权限,优先于群管理员检查）
-	if (isSuperAdmin(userIdStr)) {
-		console.log(`[管理员鉴权] 用户 ${userId} 是超级管理员 ✅`);
 		return true;
 	}
 
@@ -9799,7 +9732,7 @@ const AD_REPLY_LEARN_NEGATORS = [];
 const AD_FINGERPRINT_TYPES = ['keyword', 'domain', 'username', 'bio'];
 
 // ===== 权限人 username 永不学习白名单（2026-09-10 主人下令）=====
-// 主人 / 副主人 / 超级管理员的 @handle 绝不允许进指纹库。
+// 主人 / 副主人的 @handle 绝不允许进指纹库。
 //
 // 起因：广告号发言时艾特主人 → 主人的 @handle 被学成指纹 → 此后任何人艾特主人都被封。
 // 方案 A 已从结构上删掉 username 学习路径，这道白名单是【第二层保险】，防的是另一类漏法：
@@ -12853,7 +12786,7 @@ async function rescanAdMember(env, row, options = {}) {
 	const chatId = String(row?.chat_id || '');
 	const nowSeconds = Math.floor(Date.now() / 1000);
 
-	// 主人/副主人/超管永不判定，与消息路径一致。
+	// 主人/副主人永不判定，与消息路径一致。
 	if (isPrivilegedManager(userId)) {
 		await markAdBioChecked(env, userId, nowSeconds);
 		return { scanned: false, banned: false, reason: 'privileged' };
@@ -13604,7 +13537,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 async function screenAdJoinMember(env, member, options = {}) {
 	const userId = member?.id;
 	if (!userId || member?.is_bot) return 'skipped';			// bot 交给 handleNewChatMemberBots
-	if (isPrivilegedManager(userId)) return 'skipped';			// 主人 / 副主人 / 超级管理员豁免
+	if (isPrivilegedManager(userId)) return 'skipped';			// 主人 / 副主人豁免
 	const chatId = String(options.chatId ?? '');
 	if (!chatId) return 'skipped';
 	if (!env?.DB) return 'skipped';
