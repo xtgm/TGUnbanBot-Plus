@@ -582,6 +582,7 @@ async function handleInitialization(request) {
 				{ command: "ban", description: "添加用户到全局黑名单 (当前群管理员)" },
 				{ command: "spam", description: "举报并加入全局黑名单 (当前群管理员)" },
 				{ command: "check", description: "查询封禁状态 (高级管理员)" },
+				{ command: "stats", description: "本群发言/进退群统计 (群管理员)" },
 				{ command: "blacklist", description: "查看当前黑名单 (高级管理员)" }
 			]
 		};
