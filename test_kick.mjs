@@ -4694,12 +4694,13 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	let dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('主人 /help → 展开隐藏指令', !!dm && dm.body.text.includes('第一主人专属'));
 	const expectedHelpCommands = [
-		'/ban', '/spam',
+		'/ban', '/spam', '/stats',
 		'/ad', '/add_ad_admin', '/del_ad_admin',
 		'/admins', '/groups', '/leavegroup',
 	];
 	const missingHelpCommands = expectedHelpCommands.filter((command) => !dm?.body?.text?.includes(command));
-	assert('主人 /help → 全部 8 个指令齐全', missingHelpCommands.length === 0, `缺少 ${missingHelpCommands.join(',')}`);
+	assert('主人 /help → 全部 9 个指令齐全', missingHelpCommands.length === 0, `缺少 ${missingHelpCommands.join(',')}`);
+	assert('主人 /help → /stats 带使用方法（周/月/本群）', !!dm && dm.body.text.includes('/stats week') && dm.body.text.includes('只统计本群'));
 	// 旧版自动广告治理命令：这批必须从 /help 索引里彻底消失，不能只是不可用还在宣传。
 	// V2 广告检测方案重新提供了 /addword、/delword、/clearsamples 三个命令并挂进 /help，
 	// 故这三个从本清单移出；其余仍未恢复的必须保持不出现。
