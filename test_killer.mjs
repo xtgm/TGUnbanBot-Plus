@@ -60,8 +60,8 @@ const mutedCalls = () => callsOf('restrictChatMember').filter((c) => c.body?.per
 const unmuteCalls = () => callsOf('restrictChatMember').filter((c) => c.body?.permissions?.can_send_messages === true);
 
 const OWNER = '10001', DEPUTY = '10002';
-// -100111 = 杀手模式群；-100222 = 普通群（永远封禁踢出）
-const env = { TOKEN: 'T', BOT_TOKEN: '1:x', GROUP_ID: '-100111,-100222', OWNER_IDS: OWNER + ',' + DEPUTY, KILLER_MODE_GROUPS: '-100111', DB: makeD1() };
+// -100111 = 杀手模式群（只在 KILLER_MODE_GROUPS、不在 GROUP_ID，靠并入生效）；-100222 = 普通群（GROUP_ID）
+const env = { TOKEN: 'T', BOT_TOKEN: '1:x', GROUP_ID: '-100222', OWNER_IDS: OWNER + ',' + DEPUTY, KILLER_MODE_GROUPS: '-100111', DB: makeD1() };
 W.applyRuntimeConfig(W.loadRequiredConfig(env));
 await W.refreshMuteModeGroups(env);
 
@@ -69,6 +69,7 @@ await W.refreshMuteModeGroups(env);
 
 console.log('\n=== 1. 环境变量与默认状态 ===');
 check('KILLER_MODE_GROUPS 只认 -100111', W.isKillerModeGroup('-100111') && !W.isKillerModeGroup('-100222'));
+check('杀手群并入有效 GROUP_IDS（不在 GROUP_ID 环境变量也算配置群）', W.isConfiguredGroup('-100111'));
 check('默认 OFF = 禁言模式（-100111）', W.isGroupMuteMode('-100111'));
 check('普通群不进禁言模式（-100222）', !W.isGroupMuteMode('-100222'));
 

@@ -236,15 +236,21 @@ let GROUP_USERNAME = null;
 function applyRuntimeConfig(config) {
 	TOKEN = config.TOKEN;
 	BOT_TOKEN = config.BOT_TOKEN;
-	GROUP_IDS = config.GROUP_IDS;
-	// 每请求把动态群基线重置为空：GROUP_IDS 此刻只含环境变量群，
+	KILLER_MODE_GROUPS = config.KILLER_MODE_GROUPS || [];
+	// 杀手模式群并入有效 GROUP_IDS：它们即使不在 GROUP_ID 环境变量里，也享受完整全群治理
+	// （/stats、/ban、/spam、/check、/ad、广告检测、发言/进退群统计），但执行走禁言不踢
+	// —— 因为杀手模式 OFF 时 isGroupMuteMode 命中，banUserFromAllGroups / 拦截 / 批量 / purge
+	// 都会把这些群改成 restrictChatMember 禁言。等价于「加进 GROUP_ID + 杀手 OFF」，只是可用
+	// KILLER_MODE_GROUPS 单独管理。
+	const effectiveGroupIds = [...new Set([...(config.GROUP_IDS || []), ...KILLER_MODE_GROUPS])];
+	GROUP_IDS = effectiveGroupIds;
+	// 每请求把动态群基线重置为空：GROUP_IDS 此刻只含环境变量群（含杀手模式群），
 	// 随后 mergeDynamicGroupsFromD1 再按 D1 内容追加，避免 isolate 复用时残留上次的群。
-	ENV_GROUP_IDS = [...config.GROUP_IDS];
+	ENV_GROUP_IDS = [...effectiveGroupIds];
 	DYNAMIC_GROUP_IDS = [];
 	GROUP_ID = config.GROUP_ID;
 	OWNER_IDS = config.OWNER_IDS;
 	SUPER_ADMIN_IDS = config.SUPER_ADMIN_IDS || [];
-	KILLER_MODE_GROUPS = config.KILLER_MODE_GROUPS || [];
 	// 每请求先清空禁言模式集合；enabled 时由 refreshMuteModeGroups(env) 按 D1 状态重建。
 	MUTE_MODE_GROUP_SET = new Set();
 	STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
@@ -3023,8 +3029,16 @@ async function processBulkJobOperationSlice(job, env) {
 
 	await mapWithConcurrency(tasks, getBulkJobSafeConcurrency(job), async (task) => {
 		if (isUnban) {
-			const result = await unbanUser(task.userId, task.groupId);
-			if (result?.ok) {
+			// 禁言模式群：解的是禁言（restrictUser 恢复发言），不是原生解封。
+			let ok = false, errText = '群解封失败';
+			if (isGroupMuteMode(task.groupId)) {
+				try { const rr = await restrictUser(task.userId, task.groupId); ok = rr?.ok === true; if (!ok) errText = rr?.description || '解除禁言失败'; }
+				catch (e) { ok = false; errText = e?.message || '解除禁言失败'; }
+			} else {
+				const result = await unbanUser(task.userId, task.groupId);
+				ok = result?.ok === true; if (!ok) errText = result?.description || result?.error || '群解封失败';
+			}
+			if (ok) {
 				incrementBulkJobStat(job, 'unbanOk');
 			} else {
 				incrementBulkJobStat(job, 'unbanFailed');
@@ -3032,13 +3046,16 @@ async function processBulkJobOperationSlice(job, env) {
 					userId: task.userId,
 					groupId: task.groupId,
 					phase: 'unban',
-					error: result?.description || result?.error || '群解封失败'
+					error: errText
 				});
 			}
 			return;
 		}
 
-		const result = await banUserFromGroup(task.groupId, task.userId);
+		// 禁言模式群：只禁言不踢出（restrictChatMember）；其余群照常封禁踢出。
+		const result = isGroupMuteMode(task.groupId)
+			? await muteUserInGroup(task.groupId, task.userId)
+			: await banUserFromGroup(task.groupId, task.userId);
 		if (result.ok) {
 			incrementBulkJobStat(job, 'kickOk');
 		} else {
@@ -3993,11 +4010,13 @@ async function handlePurge(env, url) {
 		if (status === 'kicked' || status === 'left' || status === null) {
 			return { type: 'left' };
 		}
-		const r = await banUserFromGroup(groupId, entry.id);
+		// 禁言模式群：/purge 也只禁言不踢出（与杀手模式一致）；其余群照常踢出。
+		const purgeMute = isGroupMuteMode(groupId);
+		const r = purgeMute ? await muteUserInGroup(groupId, entry.id) : await banUserFromGroup(groupId, entry.id);
 		if (r.ok) {
 			return {
 				type: 'kicked',
-				detail: { 用户ID: entry.id, 群ID: groupId, 游标: cursor, 旧状态: status, 结果: '已踢' }
+				detail: { 用户ID: entry.id, 群ID: groupId, 游标: cursor, 旧状态: status, 结果: purgeMute ? '已禁言' : '已踢' }
 			};
 		}
 		return {
