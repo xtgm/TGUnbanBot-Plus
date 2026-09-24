@@ -8292,8 +8292,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 
 			await deleteAuthorizedGroupCommandMessage(message, '/unban');
-			// 群聊简洁（主人要求）：/unban 在群内只发「目标+解封总数」的简洁汇总，
-			// 不含逐群明细 / 群 ID / 群名；完整结果仍私聊第一主人。
+			// 群聊简洁（主人要求）：/unban 在群内只发「目标 + 解封总数」的简洁汇总，
+			// 目标用 formatBatchUserTarget 渲染成【可点击昵称 + @用户名 + TGID】（点昵称直接看资料卡），
+			// 但不含逐群明细 / 群 ID / 群名；完整结果仍私聊第一主人。
 			// 撤回命令消息、D1 黑名单硬闸门等原有行为一律不变。
 			message.__moderationGroupMode = 'brief';
 
@@ -8337,7 +8338,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					lines.push('⛔ <b>目标仍在 D1 黑名单，已拒绝解封</b>', 'ℹ️ D1 记录保持不变，未调用 Telegram 解封接口。');
 					await replyToModerationAdmin(message, ctx, {
 						flashText: `⛔ <code>${targetId}</code> 在 D1 黑名单，已拒绝解封`,
-						groupText: `⛔ <code>${targetId}</code> 在 D1 黑名单，已拒绝解封`,
+						groupText: `⛔ ${targetMention} 在 D1 黑名单，已拒绝解封`,
 						detailText: lines.join('\n'),
 						isInGroup
 					});
@@ -8350,7 +8351,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					lines.push(escapeHtml(failureText), 'ℹ️ 为避免绕过全局黑名单，本次未调用 Telegram 解封接口。');
 					await replyToModerationAdmin(message, ctx, {
 						flashText: `❌ <code>${targetId}</code> 无法确认 D1 状态，已拒绝解封`,
-						groupText: `❌ <code>${targetId}</code> 无法确认 D1 状态，已拒绝解封`,
+						groupText: `❌ ${targetMention} 无法确认 D1 状态，已拒绝解封`,
 						detailText: lines.join('\n'),
 						isInGroup
 					});
@@ -8372,7 +8373,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				);
 				await replyToModerationAdmin(message, ctx, {
 					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封\n${renderUnbanResults(unbanResults)}`,
-					groupText: `🔓 已解封 <code>${targetId}</code>\n${renderUnbanResults(unbanResults)}`,
+					groupText: `🔓 已解封 ${targetMention}\n${renderUnbanResults(unbanResults)}`,
 					detailText: lines.join('\n'),
 					isInGroup
 				});
@@ -8419,7 +8420,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			await replyToModerationAdmin(message, ctx, {
 				flashText,
-				groupText: `🔓 批量解封完成\n✅ 解封 ${results.eligible.length}　⛔ D1拒绝 ${results.blacklisted.length}　❌ 失败 ${failedCount}`,
+				groupText: `🔓 批量解封完成\n✅ 解封 ${results.eligible.length}　⛔ D1拒绝 ${results.blacklisted.length}　❌ 失败 ${failedCount}`
+					+ (idsToUnban.length ? '\n' + idsToUnban.map((id) => `· ${formatBatchUserTarget(id, userProfiles)}`).join('\n') : ''),
 				detailText,
 				isInGroup
 			});

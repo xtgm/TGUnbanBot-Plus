@@ -6132,7 +6132,7 @@ for (const mode of ['private', 'supergroup']) {
 			assert(label + ' 群内简洁回执、不推逐条明细也不推异步完成', mode === 'private'
 				? groupTexts === ''
 				: count === 1 ? groupTexts.includes(ids[0])
-					: count < 20 ? groupTexts.includes('批量解封完成') && !groupTexts.includes(ids[0])
+					: count < 20 ? groupTexts.includes('批量解封完成') && !groupTexts.includes('Telegram 群解封结果')
 						: groupTexts.includes('批量任务已创建') && !groupTexts.includes('批量任务完成'));
 			const ownerTexts = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').map((c) => c.body.text).join('\n');
 			assert(label + ' 第一主人收到最终结果或明确失败', count < 20
