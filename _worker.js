@@ -144,6 +144,17 @@ const DEFAULT_OWNER_IDS = [];
 //    空数组 = 未配置该角色。
 const DEFAULT_SUPER_ADMIN_IDS = [];
 
+// 10.6) 杀手模式可用群（环境变量 KILLER_MODE_GROUPS，逗号分隔超级群 ID，中英文逗号均可）。
+//    只有列进来的群才启用「杀手模式」特别功能，其余群永远按现状（封禁踢出）。
+//    每群 ON/OFF 由第一主人用 /killer 在群内切换，状态存 D1（killer_mode 表）：
+//      · 杀手模式 ON  = 触发即全群封禁 + 踢出（现状）。
+//      · 杀手模式 OFF = 仅永久禁言、不踢出（人留在群里）；仍写入全局黑名单。
+//    默认 OFF（= 禁言），与 GKY 一致（默认永久静音）。改默认改 KILLER_MODE_DEFAULT_ON。
+//    空数组 = 该功能完全不启用（零开销）。
+const DEFAULT_KILLER_MODE_GROUPS = [];
+// 杀手模式默认状态：false = 默认 OFF（禁言，同 GKY）；true = 默认 ON（封禁踢出）。
+const KILLER_MODE_DEFAULT_ON = false;
+
 // 11) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
 //    留空 → 用 GROUP_IDS[0]（主群），与原行为一致。
 //    填了但该群不在 GROUP_ID 配置里 → 忽略并回落主群 + 打日志，避免把用户导向 bot 管不到的群。
@@ -200,6 +211,10 @@ let OWNER_IDS = [];
 // 超级管理员 TGID 列表：等同 Telegram 群管理员的全部权限（免实际管理员身份），
 // 可用 /ban /spam /unban /check；不含主人/副主人高级权限，也不参与 /stats。空数组 = 未配置。
 let SUPER_ADMIN_IDS = [];
+// 杀手模式可用群 ID 列表（环境变量 KILLER_MODE_GROUPS）。每群 ON/OFF 存 D1，第一主人用 /killer 切换。
+let KILLER_MODE_GROUPS = [];
+// 每请求解析出的「当前处于禁言模式（杀手 OFF）」的群集合。KILLER_MODE_GROUPS 为空时恒为空集、零开销。
+let MUTE_MODE_GROUP_SET = new Set();
 // 静态用户资料表：bot 不在其所在群时作为 /admins 权限名单的兜底显示
 // 格式：TGID 字符串 → { id, first_name, last_name, username }
 // 环境变量 STATIC_USER_PROFILES（JSON 字符串）优先，留空则为空表
@@ -229,6 +244,9 @@ function applyRuntimeConfig(config) {
 	GROUP_ID = config.GROUP_ID;
 	OWNER_IDS = config.OWNER_IDS;
 	SUPER_ADMIN_IDS = config.SUPER_ADMIN_IDS || [];
+	KILLER_MODE_GROUPS = config.KILLER_MODE_GROUPS || [];
+	// 每请求先清空禁言模式集合；enabled 时由 refreshMuteModeGroups(env) 按 D1 状态重建。
+	MUTE_MODE_GROUP_SET = new Set();
 	STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
 	PROFILE_LOOKUP_GROUPS = config.PROFILE_LOOKUP_GROUPS || [];
 	AD_PROTECTED_USERNAMES = config.AD_PROTECTED_USERNAMES || [];
@@ -262,6 +280,8 @@ export default {
 		// 必须在任何路由分发之前合并 /addgroup 动态群：isConfiguredGroup 及其 26 个调用点
 		// 都依赖 GROUP_IDS，晚于分发会导致动态群被当成"非配置群"直接忽略。
 		await mergeDynamicGroupsFromD1(env);
+		// 重建禁言模式群集合（KILLER_MODE_GROUPS 为空时零开销）；必须在任何封禁/拦截分发之前。
+		await refreshMuteModeGroups(env);
 
 		if (url.pathname === "/banlist" && url.searchParams.has('tgid') && url.searchParams.get('tgid') != '') {
 			const tgid = url.searchParams.get('tgid');
@@ -336,6 +356,7 @@ export default {
 		// 重新校验任务里存的 groupIds，此处不合并会把动态群静默丢弃 ——
 		// 任务回执显示成功，但那些群实际没有执行封禁。
 		await mergeDynamicGroupsFromD1(env);
+		await refreshMuteModeGroups(env);
 
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
@@ -371,6 +392,7 @@ export default {
 		}
 		try {
 			await mergeDynamicGroupsFromD1(env);
+			await refreshMuteModeGroups(env);
 			const summary = await runAdBioRescan(env);
 			// 顺手清一次过期数据。原先只搭在 detectAdOnJoin 上，
 			// 没人入群的日子就不会剪枝；挂到 cron 上有个稳定节拍。
@@ -437,6 +459,19 @@ function loadRequiredConfig(env) {
 		superAdminIds = sanitizeAdmins(
 			Array.isArray(DEFAULT_SUPER_ADMIN_IDS) ? DEFAULT_SUPER_ADMIN_IDS : [DEFAULT_SUPER_ADMIN_IDS].filter(Boolean)
 		);
+	}
+
+	// KILLER_MODE_GROUPS 可选：逗号分隔超级群 ID（中英文逗号均可）。列进来的群启用杀手模式功能。
+	// 群 ID 形如 -100...，不能用 sanitizeAdmins（那只收纯数字），按 GROUP_ID 同款切分去空去重。
+	const sanitizeGroups = (raw) => [...new Set(
+		String(raw || '').split(/[,，]/).map((id) => id.trim()).filter((id) => id !== '')
+	)];
+	let killerModeGroups = [];
+	const rawKillerEnv = env.KILLER_MODE_GROUPS;
+	if (rawKillerEnv !== undefined && rawKillerEnv !== null && String(rawKillerEnv).trim() !== '') {
+		killerModeGroups = sanitizeGroups(rawKillerEnv);
+	} else {
+		killerModeGroups = sanitizeGroups((Array.isArray(DEFAULT_KILLER_MODE_GROUPS) ? DEFAULT_KILLER_MODE_GROUPS : []).join(','));
 	}
 
 	// 顶部 6 项可配置文案/参数：环境变量优先，否则用内置默认值
@@ -514,6 +549,7 @@ function loadRequiredConfig(env) {
 		GROUP_ID: uniqueGroupIds[0],
 		OWNER_IDS: ownerIds,
 		SUPER_ADMIN_IDS: superAdminIds,
+		KILLER_MODE_GROUPS: killerModeGroups,
 		AD_PROTECTED_USERNAMES: parseAdProtectedUsernames(env.AD_PROTECTED_USERNAMES),
 		MSG_CACHE_SIZE: msgCacheSize,
 		FLASH_MESSAGE_TTL_MS: flashTtlMs,
@@ -753,6 +789,7 @@ const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
 const D1_AD_VOTE_INIT_PROMISES = new WeakMap();
+const D1_KILLER_MODE_INIT_PROMISES = new WeakMap();
 const D1_DYNAMIC_GROUPS_CACHE = new WeakMap();
 
 function cloneD1RuntimeValue(value) {
@@ -1405,15 +1442,22 @@ async function removeFromBlacklist(userId, env) {
 // 对目标用户执行所有配置群的 Telegram 封禁/预封，逐群结果数组返回。
 // 用户在群内时 banChatMember 会把人移出并封禁；用户不在群内但 Telegram 可识别时，会加入群封禁列表（预封）。
 // bot 不在群 / 没权限 / Telegram 无法识别用户时，单群失败不影响其它群；串行避免 Telegram API 限流。
-// 返回 [{ groupId, userId, ok, error, memberProbe }]
+// 杀手模式 OFF 的群（isGroupMuteMode）【略过封禁踢出，改为仅永久禁言】——人留在群里。
+// 返回 [{ groupId, userId, ok, error, memberProbe, muted }]
 async function banUserFromAllGroups(userId, options = {}) {
 	const results = [];
 	for (const groupId of GROUP_IDS) {
+		if (isGroupMuteMode(groupId)) {
+			// 禁言模式：不踢、不预封，只对【已在群里】的人永久禁言（restrictChatMember）。
+			const r = await muteUserInGroup(groupId, userId);
+			results.push({ groupId, userId: String(userId), ok: r.ok, error: r.error, muted: true, memberProbe: null });
+			continue;
+		}
 		const memberProbe = options.probeMembership
 			? await probeTargetMemberBeforeBan(groupId, userId)
 			: null;
 		const r = await banUserFromGroup(groupId, userId, { revokeMessages: options.revokeMessages !== false });
-		results.push({ groupId, userId: String(userId), ok: r.ok, error: r.error, retried: r.retried === true, memberProbe });
+		results.push({ groupId, userId: String(userId), ok: r.ok, error: r.error, retried: r.retried === true, memberProbe, muted: false });
 	}
 	return results;
 }
@@ -1421,9 +1465,19 @@ async function banUserFromAllGroups(userId, options = {}) {
 // 把用户从所有配置群解除 Telegram 原生/手动封禁，逐群结果数组返回。
 // 调用方必须先确认目标不在 D1 黑名单；管理层命中 D1 时应先成功移除记录。
 // 本函数本身不修改 D1，也绝不调用封禁接口。
+// 杀手模式 OFF 的群里用户是被【禁言】的（没被封），所以那些群解除的是禁言（restrictUser 恢复发言）。
 async function unbanUserFromAllGroups(userId) {
 	const results = [];
 	for (const groupId of GROUP_IDS) {
+		if (isGroupMuteMode(groupId)) {
+			try {
+				const r = await restrictUser(userId, groupId);
+				results.push({ groupId, userId: String(userId), ok: r?.ok === true, error: r?.ok === true ? null : (r?.description || '解除禁言失败'), unmuted: true });
+			} catch (error) {
+				results.push({ groupId, userId: String(userId), ok: false, error: error.message || String(error), unmuted: true });
+			}
+			continue;
+		}
 		try {
 			const r = await unbanUser(userId, groupId);
 			results.push({
@@ -1605,6 +1659,7 @@ function getBanResultStats(banResults) {
 }
 
 function formatBanSuccessResult(r) {
+	if (r?.muted) return '已永久禁言（杀手模式关闭，未踢出）';
 	const state = r?.memberProbe?.state;
 	if (state === 'in_group') return '已封禁并移出群聊';
 	if (state === 'not_in_group') return '已加入群封禁列表（预封，禁止后续进群）';
@@ -1640,12 +1695,21 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 	if (total === 0) {
 		return 'ℹ️ 未配置 GROUP_ID，未执行 Telegram 群封禁/预封。';
 	}
-	if (okCount === total) {
+	const mutedCount = banResults.filter((r) => r.muted).length;
+	if (mutedCount === total) {
+		// 全部命中杀手模式群：只禁言、未踢出。
+		if (okCount === total) lines.push(`🔇 <b>杀手模式：已永久禁言 ${okCount}/${total} 个群（未踢出）</b>`);
+		else if (okCount === 0) lines.push(`⚠️ <b>D1 黑名单已生效；杀手模式禁言成功 0/${total}</b>`);
+		else lines.push(`🔇 <b>杀手模式：已禁言 ${okCount}/${total}</b>（${failCount} 个失败）`);
+	} else if (okCount === total) {
 		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${total}</b>`);
 	} else if (okCount === 0) {
 		lines.push(`⚠️ <b>D1 黑名单已生效；Telegram 群封禁/预封成功 0/${total}</b>`);
 	} else {
 		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${total}</b>（${failCount} 个失败）`);
+	}
+	if (mutedCount > 0 && mutedCount < total) {
+		lines.push(`🔇 其中 ${mutedCount} 个群为杀手模式关闭状态，命中用户仅永久禁言、未踢出。`);
 	}
 	if (banResults.some((r) => r.ok && r.memberProbe?.state === 'not_in_group')) {
 		lines.push('ℹ️ 目标不在群内时，成功表示已加入该群封禁列表（预封），不是从群里踢出了在线成员。');
@@ -1695,6 +1759,8 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 function renderBanResults(banResults) {
 	const { okCount, total, lookupFailCount, permissionFailCount } = getBanResultStats(banResults);
 	if (total === 0) return 'ℹ️ 未配置 GROUP_ID，未执行 Telegram 群封禁';
+	const mutedCount = banResults.filter((r) => r.muted).length;
+	if (mutedCount === total) return `🔇 杀手模式：已永久禁言 ${okCount}/${total} 个群（未踢出）`;
 	if (okCount === total) return `✅ Telegram封禁/预封成功 ${okCount}/${total} 个配置群`;
 	if (okCount === 0 && lookupFailCount === total) return '⚠️ D1已生效，Telegram暂无法识别TGID';
 	if (okCount === 0 && permissionFailCount === total) return `⚠️ Telegram封禁失败 0/${total}（检查bot封禁权限）`;
@@ -4903,6 +4969,11 @@ async function handleChatMemberUpdate(chatMember, env) {
 	if (enteredGroup) {
 		const blacklistCheck = await checkBlacklist(targetIdStr, env);
 		if (blacklistCheck.isBlacklisted) {
+			if (isGroupMuteMode(chat.id)) {
+				// 禁言模式群：黑名单用户复入【不踢回】（主人要求：只禁言不踢出）。
+				console.log('[chat_member] 禁言模式群，黑名单用户复入不踢回:', JSON.stringify({ 群ID: chat.id, 用户ID: targetIdStr }));
+				return;
+			}
 			const banResult = await banUserFromGroup(chat.id, targetIdStr);
 			console.log('[chat_member] 黑名单用户复入群，立即踢回:', JSON.stringify({
 				群ID: chat.id,
@@ -4963,10 +5034,16 @@ async function handleChatMemberUpdate(chatMember, env) {
 		// 普通管理员直接使用 Telegram 原生解封时，D1 仍在，因此继续由独立保护链封回。
 		const blacklistCheck = await checkBlacklist(targetIdStr, env);
 		if (blacklistCheck.isBlacklisted) {
-			// 仍在 D1 黑名单 → 撤销本次群内手动解封，立即封回，绝不删除黑名单记录
-			const banResult = await banUserFromGroup(chat.id, targetIdStr);
-			console.log('[chat_member] 拦截群内手动解封(D1黑名单保护):', JSON.stringify({ ...logCommon, 封回结果: banResult.ok ? '成功' : `失败:${banResult.error}` }));
-			await notifyOwnerBlacklistIntercept(targetUser, chat, '群内手动解封拦截', blacklistCheck, banResult);
+			if (isGroupMuteMode(chat.id)) {
+				// 禁言模式群：不封回（主人要求：只禁言不踢出）。仅审计通知。
+				console.log('[chat_member] 禁言模式群，黑名单用户被手动解封，不封回:', JSON.stringify(logCommon));
+				await notifyOwnerChatMemberAction(chatMember, '解封用户（禁言模式群，未封回）', oldStatus, newStatus);
+			} else {
+				// 仍在 D1 黑名单 → 撤销本次群内手动解封，立即封回，绝不删除黑名单记录
+				const banResult = await banUserFromGroup(chat.id, targetIdStr);
+				console.log('[chat_member] 拦截群内手动解封(D1黑名单保护):', JSON.stringify({ ...logCommon, 封回结果: banResult.ok ? '成功' : `失败:${banResult.error}` }));
+				await notifyOwnerBlacklistIntercept(targetUser, chat, '群内手动解封拦截', blacklistCheck, banResult);
+			}
 		} else {
 			// 不在 D1 黑名单：无黑名单变化，仅发审计通知告知主人群内发生了解封动作
 			await notifyOwnerChatMemberAction(chatMember, '解封用户（非黑名单）', oldStatus, newStatus);
@@ -5242,6 +5319,90 @@ async function setAdVoteAllowlist(env, userId, enabled, byUser) {
 		return { ok: true, enabled: false, existed: d1MutationChanges(result) > 0 };
 	} catch (error) {
 		console.error('[/ad] 更新发起白名单失败:', error);
+		return { ok: false, error: error.message || String(error) };
+	}
+}
+
+// ===== 杀手模式（KILLER_MODE_GROUPS + /killer 每群切换，状态存 D1）=====
+// ON = 封禁踢出（现状）；OFF = 仅永久禁言、不踢出（人留群）。无记录走 KILLER_MODE_DEFAULT_ON。
+async function ensureKillerModeTable(env) {
+	if (!env.DB) return false;
+	const cached = D1_KILLER_MODE_INIT_PROMISES.get(env.DB);
+	if (cached) return cached;
+	const initPromise = (async () => {
+		try {
+			if (!(await ensureD1Table(env))) throw new Error('D1 核心结构不可用');
+			await runD1SchemaStatement(
+				env,
+				'killer_mode',
+				'CREATE TABLE IF NOT EXISTS killer_mode (chat_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, by_user TEXT, at TEXT NOT NULL);',
+			);
+			return true;
+		} catch (error) {
+			console.error('D1 杀手模式表初始化失败: ' + formatD1SchemaError(error));
+			return false;
+		}
+	})();
+	D1_KILLER_MODE_INIT_PROMISES.set(env.DB, initPromise);
+	const initialized = await initPromise;
+	if (!initialized) D1_KILLER_MODE_INIT_PROMISES.delete(env.DB);
+	return initialized;
+}
+
+function isKillerModeGroup(chatId) {
+	return KILLER_MODE_GROUPS.length > 0 && KILLER_MODE_GROUPS.includes(String(chatId || ''));
+}
+
+// 读取全部群的杀手开关记录 → Map(chat_id → 1/0)。无记录的群由调用方走 KILLER_MODE_DEFAULT_ON。
+async function readKillerStateMap(env) {
+	const map = new Map();
+	if (!env.DB || !KILLER_MODE_GROUPS.length) return map;
+	if (!(await ensureKillerModeTable(env))) return map;
+	try {
+		const { results } = await env.DB.prepare('SELECT chat_id, enabled FROM killer_mode').all();
+		for (const r of (results || [])) map.set(String(r.chat_id), Number(r.enabled) ? 1 : 0);
+	} catch (error) {
+		console.error('[杀手模式] 读取状态失败:', error);
+	}
+	return map;
+}
+// __KILLER_MORE__
+
+// 每请求重建禁言模式群集合：KILLER_MODE_GROUPS 里、当前杀手 OFF 的群 = 禁言模式。
+async function refreshMuteModeGroups(env) {
+	MUTE_MODE_GROUP_SET = new Set();
+	if (!KILLER_MODE_GROUPS.length) return;
+	const stateMap = await readKillerStateMap(env);
+	for (const g of KILLER_MODE_GROUPS) {
+		const id = String(g);
+		const on = stateMap.has(id) ? stateMap.get(id) === 1 : KILLER_MODE_DEFAULT_ON;
+		if (!on) MUTE_MODE_GROUP_SET.add(id);
+	}
+}
+
+// 该群此刻是否禁言模式（杀手 OFF）。读模块级集合、不需 env —— 供逐群封禁/拦截判定。
+function isGroupMuteMode(chatId) {
+	return MUTE_MODE_GROUP_SET.has(String(chatId || ''));
+}
+
+// 单群杀手当前是否 ON（封禁踢出）。供 /killer 显示与切换。
+async function isKillerOn(env, chatId) {
+	const stateMap = await readKillerStateMap(env);
+	const id = String(chatId || '');
+	return stateMap.has(id) ? stateMap.get(id) === 1 : KILLER_MODE_DEFAULT_ON;
+}
+
+// 设置单群杀手开关。on=true → 封禁踢出；on=false → 禁言。
+async function setKillerMode(env, chatId, on, byUser) {
+	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
+	if (!(await ensureKillerModeTable(env))) return { ok: false, error: 'D1 杀手模式表初始化失败' };
+	try {
+		await env.DB.prepare('INSERT OR REPLACE INTO killer_mode (chat_id, enabled, by_user, at) VALUES (?, ?, ?, ?)')
+			.bind(String(chatId), on ? 1 : 0, String(byUser || ''), new Date().toISOString())
+			.run();
+		return { ok: true, on: !!on };
+	} catch (error) {
+		console.error('[杀手模式] 写入状态失败:', error);
 		return { ok: false, error: error.message || String(error) };
 	}
 }
@@ -7156,9 +7317,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 黑名单兜底：已黑用户在配置群里发言 → 删消息 + 立即踢出
 	// 必须先于消息缓存执行，避免已黑用户刷消息继续产生 D1 写入。
 	// 排除 bot 自身 / 私聊 / 群管理员（避免误伤误加黑的管理员）
+	// 杀手模式 OFF 的群【略过拦截】：人只是被禁言、没被踢出，无需再删踢（主人明确要求）。
 	// 命令命中后 return，不进入后续命令分发
 	if (
 		isConfiguredGroup(chatId) &&
+		!isGroupMuteMode(chatId) &&
 		message.from &&
 		!message.from.is_bot
 	) {
@@ -7754,6 +7917,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (await handleStatsCommand(message, env, ctx)) return;
 	}
 
+	// /killer 杀手模式切换（仅第一主人；仅 KILLER_MODE_GROUPS 群内有效）。其他人一律静默。
+	if (isKillerCommand(text)) {
+		if (await handleKillerCommand(message, env)) return;
+	}
+
 	if (isCheckCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
 		const dispatchSourceAllowed = !isInGroup || isConfiguredGroup(chatId);
@@ -7929,6 +8097,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/stats today　查本群今日；/stats week 本周；/stats month 本月',
 			'　　真人所有非服务消息各计一次发言（bot 与服务消息不计）；只统计本群、不跨群。',
 			'　　群内本群 Telegram 管理员 / 群主可查、主人 / 副主人随时可查；私聊用 /stats -100群ID [today|week|month] 查指定群。',
+			'',
+			'<b>━━ 杀手模式（仅第一主人 · 需 KILLER_MODE_GROUPS）━━</b>',
+			'/killer　在杀手模式群内切换本群模式：开=触发即全群封禁踢出；关=仅永久禁言不踢出（仍加黑）',
+			'　　/killer on 开启 · /killer off 关闭 · /killer status 看状态；私聊 /killer 列出各群状态',
 			'',
 			'<b>━━ 广告举报投票 ━━</b>',
 			'/ad [原因]　回复广告发起群内投票，通过后加黑并全群封禁',
@@ -8798,6 +8970,18 @@ async function muteChatMember(chatId, userId) {
 	console.log(`Muted user ${userId} in chat ${chatId}, response: ${JSON.stringify(result)}`);
 
 	return result;
+}
+
+// 禁言模式用：把 muteChatMember 的「成功返回 / 失败抛异常」包装成 { ok, error } 逐群结果，
+// 与 banUserFromGroup 的返回形状对齐，供 banUserFromAllGroups 统一收集。
+// 注意 restrictChatMember 只能禁言【已在群里】的人；目标不在群时 Telegram 报错 → ok:false（预期，无法预禁言）。
+async function muteUserInGroup(chatId, userId) {
+	try {
+		await muteChatMember(chatId, userId);
+		return { ok: true };
+	} catch (error) {
+		return { ok: false, error: error?.message || String(error) };
+	}
 }
 
 // 把用户踢出群（Telegram banChatMember API）
@@ -15487,6 +15671,58 @@ const STAT_GO_PREFIX = 'statgo:';
 
 function isStatsCommand(text) {
 	return typeof text === 'string' && /^\/stats(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
+}
+
+function isKillerCommand(text) {
+	return typeof text === 'string' && /^\/killer(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
+}
+
+// /killer 杀手模式切换。仅第一主人；仅对 KILLER_MODE_GROUPS 里的群生效。返回 true 表示已处理。
+// 群内：/killer 翻转当前群 ON/OFF；/killer on|off 显式设置；/killer status 只看不改。
+// 私聊：列出所有杀手模式群的当前状态（不改）。非第一主人一律静默（不暴露命令存在）。
+async function handleKillerCommand(message, env) {
+	const userId = getMessageActorId(message);
+	if (!isPrimaryOwner(userId)) return true; // 非第一主人：静默吞掉（群内不暴露、私聊不回）
+	const chatId = String(message.chat?.id || '');
+	const isInGroup = message.chat?.type !== 'private';
+	const arg = String(message.text || '').replace(/^\/killer(?:@[^\s]+)?\s*/i, '').trim().toLowerCase();
+
+	if (!isInGroup) {
+		if (!KILLER_MODE_GROUPS.length) {
+			await sendTelegramMessage(chatId, 'ℹ️ 未配置 <code>KILLER_MODE_GROUPS</code>，杀手模式功能未启用。');
+			return true;
+		}
+		const stateMap = await readKillerStateMap(env);
+		const lines = ['☠️ <b>杀手模式 · 各群状态</b>（在目标群内发 <code>/killer</code> 切换）'];
+		for (const g of KILLER_MODE_GROUPS) {
+			const on = stateMap.has(String(g)) ? stateMap.get(String(g)) === 1 : KILLER_MODE_DEFAULT_ON;
+			lines.push('• <code>' + escapeHtml(String(g)) + '</code>：' + (on ? '☠️ 开启（封禁踢出）' : '🔇 关闭（仅禁言）'));
+		}
+		await sendTelegramMessage(chatId, lines.join('\n'));
+		return true;
+	}
+
+	if (!isKillerModeGroup(chatId)) {
+		await sendTelegramMessage(chatId, '⚠️ 本群未启用杀手模式功能：请把本群 ID <code>' + escapeHtml(chatId) + '</code> 加进 <code>KILLER_MODE_GROUPS</code> 环境变量后重新初始化。');
+		return true;
+	}
+
+	const currentlyOn = await isKillerOn(env, chatId);
+	if (/^(status|状态)$/.test(arg)) {
+		await sendTelegramMessage(chatId, currentlyOn ? '☠️ 当前：杀手模式【开启】（封禁踢出）' : '🔇 当前：杀手模式【关闭】（仅禁言不踢出）');
+		return true;
+	}
+	let target;
+	if (/^(on|开|开启|启用|封禁)$/.test(arg)) target = true;
+	else if (/^(off|关|关闭|禁言|静音)$/.test(arg)) target = false;
+	else target = !currentlyOn; // 裸 /killer = 翻转
+
+	const r = await setKillerMode(env, chatId, target, userId);
+	if (!r.ok) { await sendTelegramMessage(chatId, '❌ 切换失败：' + escapeHtml(r.error || '未知错误')); return true; }
+	await sendTelegramMessage(chatId, target
+		? '☠️ <b>杀手模式已开启</b>\n本群此后触发处置的用户将【全群封禁 + 踢出】。'
+		: '🔇 <b>杀手模式已关闭</b>\n本群此后触发处置的用户【仅永久禁言、不踢出】，仍写入全局黑名单。');
+	return true;
 }
 
 // 解析粒度参数：week/周 → 本周，month/月 → 本月，其余（含空）→ 今日。
