@@ -114,6 +114,9 @@ check('关闭后 -100111 恢复禁言模式', W.isGroupMuteMode('-100111'));
 reset();
 await W.handleKillerCommand({ chat: { id: '-100222', type: 'supergroup' }, from: { id: Number(OWNER) }, text: '/killer' }, env);
 check('非杀手群 /killer 提示未启用', sent.some((x) => x.text.includes('未启用杀手模式')));
+reset();
+await W.handleKillerCommand({ chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER) }, text: '/killer' }, env);
+check('私聊 /killer 列表额外显示群名（<b>群名</b> + ID）', sent.some((x) => x.text.includes('<b>群</b>') && x.text.includes('-100111')));
 
 console.log('\n=== 6. /unban 在禁言群解除禁言、普通群解封 ===');
 reset();

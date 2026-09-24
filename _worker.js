@@ -15696,7 +15696,11 @@ async function handleKillerCommand(message, env) {
 		const lines = ['☠️ <b>杀手模式 · 各群状态</b>（在目标群内发 <code>/killer</code> 切换）'];
 		for (const g of KILLER_MODE_GROUPS) {
 			const on = stateMap.has(String(g)) ? stateMap.get(String(g)) === 1 : KILLER_MODE_DEFAULT_ON;
-			lines.push('• <code>' + escapeHtml(String(g)) + '</code>：' + (on ? '☠️ 开启（封禁踢出）' : '🔇 关闭（仅禁言）'));
+			// 额外显示群名（getChat 实时取；取不到就只显示 ID）。
+			let title = '';
+			try { const gi = await getChatInfoFromId(String(g)); title = String(gi?.title || ''); } catch (_) {}
+			const label = title ? '<b>' + escapeHtml(title) + '</b> <code>' + escapeHtml(String(g)) + '</code>' : '<code>' + escapeHtml(String(g)) + '</code>';
+			lines.push('• ' + label + '：' + (on ? '☠️ 开启（封禁踢出）' : '🔇 关闭（仅禁言）'));
 		}
 		await sendTelegramMessage(chatId, lines.join('\n'));
 		return true;
