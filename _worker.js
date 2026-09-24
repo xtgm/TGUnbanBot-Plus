@@ -7324,7 +7324,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
 					}
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
-					flashText = `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'} ${targetMention}\n` + renderBanResults(banResults);
+					flashText = `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
 				} else {
 					lines.push(`🎯 目标用户:${targetMention}`);
 					lines.push('');
@@ -7565,7 +7565,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 
 			await replyToModerationAdmin(message, ctx, {
-				flashText: `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'} ${formatUserReference(repliedUserId, repliedMsg.from)} <code>${escapeHtml(String(repliedUserId))}</code>`,
+				flashText: `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'}\n🎯 ${formatUserReference(repliedUserId, repliedMsg.from)} <code>${escapeHtml(String(repliedUserId))}</code>`,
 				detailText: withActionContext(message, lines.join('\n'), replySpamNote),
 				isInGroup,
 				notifySecondaryOwners: true
@@ -8216,7 +8216,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 						lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
 					}
 				}
-				flashText = `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'} ${targetMention}\n` + renderBanResults(banResults);
+				flashText = `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
 				lines.push(`🎯 目标用户:${targetMention}`);
@@ -8381,7 +8381,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				);
 				await replyToModerationAdmin(message, ctx, {
 					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封\n${renderUnbanResults(unbanResults)}`,
-					groupText: `🔓 已解封 ${targetMention}\n${renderUnbanResults(unbanResults)}`,
+					groupText: `🔓 已解封\n🎯 ${targetMention}\n${renderUnbanResults(unbanResults)}`,
 					detailText: lines.join('\n'),
 					isInGroup
 				});
