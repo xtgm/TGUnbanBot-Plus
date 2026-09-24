@@ -295,7 +295,7 @@ console.log('\n=== 11.5 连带仅第一主人可触发（核心安全闸）===')
 	// 沙箱里 OWNER_IDS = '10001'（第一个即第一主人）
 	check('第一主人 isPrimaryOwner 为真', W.isPrimaryOwner('10001') === true);
 	check('副主人不是第一主人', W.isPrimaryOwner('10002') === false);
-	check('超级管理员不是第一主人', W.isPrimaryOwner('20001') === false);
+	check('群管理员不是第一主人', W.isPrimaryOwner('20001') === false);
 	check('群管理员不是第一主人', W.isPrimaryOwner('30001') === false);
 	// isPrimaryOwner 只认 OWNER_IDS[0]，这是连带的唯一准入判据
 	W.applyRuntimeConfig(W.loadRequiredConfig({

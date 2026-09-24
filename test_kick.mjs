@@ -1117,16 +1117,17 @@ console.log('\n[4a] D1 高频路径低请求验证');
 	const steadyMessageSql = db._sql
 		.slice(sqlCountBeforeSteadyMessage)
 		.map((sql) => sql.replace(/\s+/g, ' ').trim());
-	// 稳定态 3 条：动态群组读取（15 秒运行时缓存，同请求只读一次）+ 黑名单主键查询 + 消息缓存写入。
-	// 第 4 条来自广告检测层首次触发 ensureAdDetectionTables 时的表存在性探测
-	// （SELECT name FROM sqlite_master WHERE type='table' AND name=? LIMIT 1）。
-	// 该探测按 DB 实例只发生一次：成功则结果进 WeakMap 缓存，失败则进入 60 秒冷却，
-	// 两种情况都不会让后续消息重复探测，因此这里放宽到 4 条而不是逐条累加。
-	assert('稳定态普通群消息不超过 4 条必要 D1 SQL', steadyMessageSql.length <= 4, JSON.stringify(steadyMessageSql));
-	assert('稳定态 D1 SQL = 动态群组读取 + 黑名单主键查询 + 消息缓存写入', (
-		steadyMessageSql.some((sql) => sql.startsWith('INSERT INTO moderation_messages')) &&
-		steadyMessageSql.includes('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ? LIMIT 1') &&
-		steadyMessageSql.some((sql) => sql.includes('FROM dynamic_groups'))
+	// 核心热路径 3 条（每条普通消息必发）：动态群组读取（15 秒缓存，同请求一次）+ 黑名单主键查询 + 消息缓存写入。
+	// 排除在核心之外单独衡量的两类：
+	//   ① 一次性建表探测（sqlite_master，广告检测与群统计首次触发，按 DB 实例缓存/冷却，不逐条重复）；
+	//   ② 发言统计写（stat_speech / stat_member，2026-09 新增，生产走 ctx.waitUntil 后台、按天 upsert，不占同步热路径）。
+	const coreSteadySql = steadyMessageSql.filter((sql) =>
+		!sql.includes('sqlite_master') && !/stat_speech|stat_member/.test(sql));
+	assert('稳定态普通群消息核心 D1 SQL 不超过 3 条', coreSteadySql.length <= 3, JSON.stringify(steadyMessageSql));
+	assert('稳定态核心 D1 SQL = 动态群组读取 + 黑名单主键查询 + 消息缓存写入', (
+		coreSteadySql.some((sql) => sql.startsWith('INSERT INTO moderation_messages')) &&
+		coreSteadySql.includes('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ? LIMIT 1') &&
+		coreSteadySql.some((sql) => sql.includes('FROM dynamic_groups'))
 	), JSON.stringify(steadyMessageSql));
 }
 
@@ -1545,7 +1546,7 @@ console.log('\n[10] 群内 /ban 单条');
 	const commandDelCalls = callsOf('deleteMessage').filter((c) => c.body.message_id === 700);
 	assert('群内 /ban 指令消息 msgId=700 撤回一次', commandDelCalls.length === 1);
 
-	assert('无群内闪屏撤回任务', ctxCalls.length === 0);
+	assert('无群内闪屏撤回任务（仅发言统计后台写，无延时撤回）', ctxCalls.length <= 1);
 }
 
 // ---------- [10b] 群内 /ban 单条 + 部分群失败:友好错误翻译 ----------
@@ -4180,6 +4181,73 @@ console.log('\n[19b] 普通管理员其它管理命令拒绝');
 	assert('普通管理员私聊其它管理命令不改变 D1', env.DB._rows.has('700'));
 }
 
+// ---------- [19c] 超级管理员（SUPER_ADMIN_IDS）= TG 群管理员权限，免实际管理员身份 ----------
+console.log('\n[19c] 超级管理员：免管理员身份用四条命令，且不碰 /stats 与主人命令');
+{
+	// 关键：7777 是超级管理员，但【不在】任何群的 getChatAdministrators 列表里（即非真实 TG 管理员）。
+	const superAdminGroupEnv = () => ({ TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMIN_IDS: '7777', DB: makeFakeDB([{ id: '703', reason: 'manual', by: '999', at: '2026-07-21T00:00:00Z' }]) });
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	const superRoutes = {
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 1 }, status: 'creator' }] }), // 7777 不在
+		banChatMember: () => ({ ok: true, result: true }),
+		unbanChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		getChat: () => ({ ok: true, result: { id: -1001, type: 'supergroup', title: '配置群' } }),
+		getChatMember: () => ({ ok: true, result: { status: 'member' } }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	};
+
+	// A. 群内 /ban：超管免管理员身份直通
+	resetCalls();
+	let env = superAdminGroupEnv();
+	sandbox.fetch = makeFetchMock(superRoutes);
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '超管' }, text: '/ban 701' } }) }), env, fakeCtx);
+	assert('超管群内 /ban 免管理员身份写入 D1', env.DB._rows.has('701'));
+	assert('超管群内 /ban 执行全群封禁', callsOf('banChatMember').length > 0);
+	assert('超管 /ban 不查询群管理员列表（免鉴权直通）', callsOf('getChatAdministrators').length === 0);
+
+	// B. 群内 /spam /unban /check 一并放行
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '超管' }, text: '/spam 702 广告' } }) }), env, fakeCtx);
+	assert('超管群内 /spam 免管理员身份写入 D1', env.DB._rows.has('702'));
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 3, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '超管' }, text: '/unban 703' } }) }), env, fakeCtx);
+	assert('超管群内 /unban 免管理员身份移出 D1', !env.DB._rows.has('703') && callsOf('unbanChatMember').length > 0);
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 4, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '超管' }, text: '/check 704' } }) }), env, fakeCtx);
+	assert('超管群内 /check 免管理员身份返回查询结果', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001'));
+
+	// C. 私聊 /ban 放行（等同任一配置群管理员）
+	resetCalls();
+	env = superAdminGroupEnv();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 5, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/ban 705' } }) }), env, fakeCtx);
+	assert('超管私聊 /ban 免管理员身份写入 D1', env.DB._rows.has('705'));
+	assert('超管私聊 /ban 不查询任何群管理员列表', callsOf('getChatAdministrators').length === 0);
+
+	// D. 非配置群不放行（作用域 = TG 管理员，非配置群里 TG 管理员也无权）
+	resetCalls();
+	env = superAdminGroupEnv();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 6, chat: { id: -9999, type: 'supergroup' }, from: { id: 7777, is_bot: false }, text: '/ban 706' } }) }), env, fakeCtx);
+	assert('超管在非配置群 /ban 不生效', !env.DB._rows.has('706') && callsOf('banChatMember').length === 0);
+
+	// E. 超管【不参与 /stats】：群内走真实管理员校验、非管理员被静默；私聊限主人/副主人
+	resetCalls();
+	env = superAdminGroupEnv();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 7, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false }, text: '/stats' } }) }), env, fakeCtx);
+	assert('超管群内 /stats 仍按真实管理员校验（查了管理员列表）', callsOf('getChatAdministrators').length > 0);
+	assert('超管群内 /stats 非管理员被静默：命令消息不撤回', !callsOf('deleteMessage').some((c) => c.body.message_id === 7));
+	assert('超管群内 /stats 不产生统计回执', !callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001'));
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 8, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/stats -1001' } }) }), env, fakeCtx);
+	assert('超管私聊 /stats 权限不足', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '7777' && c.body.text.includes('权限不足')));
+
+	// F. 超管【无】主人专属命令：/help 权限不足、不泄漏隐藏指令
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 9, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/help' } }) }), env, fakeCtx);
+	const superHelpDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
+	assert('超管私聊 /help 权限不足', !!superHelpDm && superHelpDm.body.text.includes('权限不足'));
+	assert('超管私聊 /help 不泄漏隐藏指令', !!superHelpDm && !superHelpDm.body.text.includes('/learnlast'));
+}
+
 // ===== 主人审计通知系统专项测试([20]-[24]) =====
 
 // ---------- [20] OWNER_IDS 未配置 → 不发任何私聊 ----------
@@ -4661,7 +4729,7 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	const removedSpamCommand = '/' + ['s', 'a'].join('');
 	assert('主人 /help → 公开管理四条齐全', !!dm && dm.body.text.includes('/ban TGID') && dm.body.text.includes('/spam') && dm.body.text.includes('/unban TGID') && dm.body.text.includes('/check TGID'));
 	assert('主人 /help → 当前权限与回执说明准确', dm.body.text.includes('配置群 Telegram 管理员、主人或副主人') && dm.body.text.includes('完整结果保留在群里并通知第一主人'));
-	assert('主人 /help → 权限名单只有主人与副主人', dm.body.text.includes('/admins　查看主人 / 副主人名单') && !dm.body.text.includes('超级管理员'));
+	assert('主人 /help → 含 /admins 名单与超级管理员说明', dm.body.text.includes('/admins　查看主人 / 副主人名单') && dm.body.text.includes('超级管理员（SUPER_ADMIN_IDS）'));
 	assert('主人 /help → 不再显示旧短命令', !!dm && !dm.body.text.includes(removedBanCommand) && !dm.body.text.includes(removedSpamCommand));
 	assert('主人 /help → 含 /ad 投票与白名单管理', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('/add_ad_admin') && dm.body.text.includes('/del_ad_admin'));
 	assert('主人 /help → 含动态群组三条', !!dm && dm.body.text.includes('/addgroup') && dm.body.text.includes('/delgroup') && dm.body.text.includes('/listgroups'));

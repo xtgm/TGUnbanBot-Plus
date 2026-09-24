@@ -135,6 +135,15 @@ const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
 //    填了主人/副主人ID但账号从未私聊过 bot → 通知会投递失败,Worker 日志可见
 const DEFAULT_OWNER_IDS = [];
 
+// 10.5) 超级管理员 TGID 列表（环境变量 SUPER_ADMIN_IDS，逗号分隔，中英文逗号均可）。
+//    定位：等同「Telegram 群管理员的全部权限」，但免实际管理员身份 ——
+//    在配置群内或私聊都能使用 /ban /spam /unban /check 四条管理命令，
+//    即便本人不是该群的 Telegram 管理员。
+//    刻意【不含】主人/副主人的高级权限（隐藏命令、二次审核、跨群通知等），
+//    也【不参与 /stats】（/stats 仍只认主人/副主人或本群真实 TG 管理员/群主）。
+//    空数组 = 未配置该角色。
+const DEFAULT_SUPER_ADMIN_IDS = [];
+
 // 11) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
 //    留空 → 用 GROUP_IDS[0]（主群），与原行为一致。
 //    填了但该群不在 GROUP_ID 配置里 → 忽略并回落主群 + 打日志，避免把用户导向 bot 管不到的群。
@@ -188,6 +197,9 @@ let ENV_GROUP_IDS = [];
 let DYNAMIC_GROUP_IDS = [];
 // 主人 TGID 列表:第一个是主人,后续是副主人。空数组 = 未配置,禁用通知
 let OWNER_IDS = [];
+// 超级管理员 TGID 列表：等同 Telegram 群管理员的全部权限（免实际管理员身份），
+// 可用 /ban /spam /unban /check；不含主人/副主人高级权限，也不参与 /stats。空数组 = 未配置。
+let SUPER_ADMIN_IDS = [];
 // 静态用户资料表：bot 不在其所在群时作为 /admins 权限名单的兜底显示
 // 格式：TGID 字符串 → { id, first_name, last_name, username }
 // 环境变量 STATIC_USER_PROFILES（JSON 字符串）优先，留空则为空表
@@ -216,6 +228,7 @@ function applyRuntimeConfig(config) {
 	DYNAMIC_GROUP_IDS = [];
 	GROUP_ID = config.GROUP_ID;
 	OWNER_IDS = config.OWNER_IDS;
+	SUPER_ADMIN_IDS = config.SUPER_ADMIN_IDS || [];
 	STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
 	PROFILE_LOOKUP_GROUPS = config.PROFILE_LOOKUP_GROUPS || [];
 	AD_PROTECTED_USERNAMES = config.AD_PROTECTED_USERNAMES || [];
@@ -362,6 +375,8 @@ export default {
 			// 顺手清一次过期数据。原先只搭在 detectAdOnJoin 上，
 			// 没人入群的日子就不会剪枝；挂到 cron 上有个稳定节拍。
 			await pruneAdDetectionData(env);
+			// 群统计明细超期剪枝（保留 STAT_RETENTION_DAYS 天），同样搭 cron 的稳定节拍。
+			await pruneStatData(env);
 			console.log('[广告检测·扫描] Cron ' + (controller?.cron || '') + ' 结果: ' + JSON.stringify(summary));
 		} catch (error) {
 			console.error('[广告检测·扫描] Cron 执行失败:', error);
@@ -409,6 +424,18 @@ function loadRequiredConfig(env) {
 	} else {
 		ownerIds = sanitizeAdmins(
 			Array.isArray(DEFAULT_OWNER_IDS) ? DEFAULT_OWNER_IDS : [DEFAULT_OWNER_IDS].filter(Boolean)
+		);
+	}
+
+	// SUPER_ADMIN_IDS 可选：逗号分隔（中英文逗号均可）。等同 Telegram 群管理员权限（免管理员身份），
+	// 不区分主副、全部平级；空 = 未配置该角色。复用 sanitizeAdmins 做去重/去空/纯数字校验。
+	let superAdminIds = [];
+	const rawSuperAdminEnv = env.SUPER_ADMIN_IDS;
+	if (rawSuperAdminEnv !== undefined && rawSuperAdminEnv !== null && String(rawSuperAdminEnv).trim() !== '') {
+		superAdminIds = sanitizeAdmins(String(rawSuperAdminEnv).split(/[,，]/));
+	} else {
+		superAdminIds = sanitizeAdmins(
+			Array.isArray(DEFAULT_SUPER_ADMIN_IDS) ? DEFAULT_SUPER_ADMIN_IDS : [DEFAULT_SUPER_ADMIN_IDS].filter(Boolean)
 		);
 	}
 
@@ -486,6 +513,7 @@ function loadRequiredConfig(env) {
 		GROUP_IDS: uniqueGroupIds,
 		GROUP_ID: uniqueGroupIds[0],
 		OWNER_IDS: ownerIds,
+		SUPER_ADMIN_IDS: superAdminIds,
 		AD_PROTECTED_USERNAMES: parseAdProtectedUsernames(env.AD_PROTECTED_USERNAMES),
 		MSG_CACHE_SIZE: msgCacheSize,
 		FLASH_MESSAGE_TTL_MS: flashTtlMs,
@@ -1838,6 +1866,12 @@ function isSecondaryOwner(id) {
 	return OWNER_IDS.length > 1 && OWNER_IDS.slice(1).includes(idStr);
 }
 
+// 超级管理员：等同 Telegram 群管理员的全部权限（免实际管理员身份），
+// 仅用于 /ban /spam /unban /check 的鉴权放行；不含主人/副主人高级权限、不参与 /stats。
+function isSuperAdmin(id) {
+	return SUPER_ADMIN_IDS.length > 0 && SUPER_ADMIN_IDS.includes(String(id || ''));
+}
+
 // 主人、副主人保留原有管理命令和跨群操作权限。
 function isPrivilegedManager(userId) {
 	const idStr = String(userId || '');
@@ -1881,6 +1915,11 @@ async function checkMessageOperatorCanModerate(message, userId) {
 	if (isBotOperator(message?.from)) return false;
 	if (isPrivilegedManager(userId)) return true;
 	if (isAnonymousAdminMessage(message)) return true;
+	// 超级管理员 = Telegram 群管理员的全部权限，免实际管理员身份；作用域与真实 TG 管理员一致：
+	// 私聊等同任一配置群管理员放行，群内仅限配置群（非配置群里 TG 管理员也无权，故此处同样拒绝）。
+	if (isSuperAdmin(userId)) {
+		return message?.chat?.type === 'private' ? true : isConfiguredGroup(message?.chat?.id);
+	}
 	if (message?.chat?.type === 'private') return checkIfUserIsAdmin(userId);
 	return checkIfUserIsAdminInGroup(userId, message?.chat?.id);
 }
@@ -1897,6 +1936,8 @@ async function isNonPrimaryConfiguredGroupManager(message, userId) {
 	if (!shouldSilenceAuthorizedGroupCommand(message)) return false;
 	if (isPrivilegedManager(userId) || isAnonymousAdminMessage(message)) return true;
 	if (isBotOperator(message?.from)) return false;
+	// 超级管理员在配置群内等同群管理员：命令消息同样静默、按管理员对待。
+	if (isSuperAdmin(userId)) return true;
 	return checkIfUserIsAdminInGroup(userId, message?.chat?.id);
 }
 
@@ -4837,6 +4878,17 @@ async function handleChatMemberUpdate(chatMember, env) {
 	// 跳过：被操作用户是机器人（不要把别的机器人加入黑名单 / 误踢）
 	if (targetUser.is_bot) return;
 
+	// 群统计·进退群计数（真人；配置群已在上方校验）。计在各业务 return 之前，避免漏。
+	//   群外→群内 = 入群；群内→left = 主动退群；群内→kicked = 被踢/被封。
+	{
+		const _inGroup = (st) => st === 'member' || st === 'restricted' || st === 'administrator' || st === 'creator';
+		const _os = oldMember.status;
+		const _ns = newMember.status;
+		if (!_inGroup(_os) && _inGroup(_ns)) await recordMemberEvent(env, chat.id, 'join');
+		else if (_inGroup(_os) && _ns === 'left') await recordMemberEvent(env, chat.id, 'leave');
+		else if (_inGroup(_os) && _ns === 'kicked') await recordMemberEvent(env, chat.id, 'kicked');
+	}
+
 	// 复入群拦截：用户从非成员状态变为 member/restricted（被拉进群、点链接加群、unban 后自加回）
 	// 先于"操作人 === 用户本人"检查，因为自加群时 from === target，会被后面跳过逻辑拦掉
 	const oldStatusEarly = oldMember.status;
@@ -6874,6 +6926,10 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 	const data = String(callbackQuery?.data || '');
 	// 三分支分流。必须排在 adv: 校验【之前】：投票分支开头那道 isConfiguredGroup
 	// 会把私聊来的回调全部挡掉，而 /words 本来就只在私聊里用。
+	if (data.startsWith(STAT_PAGINATION_PREFIX)) {
+		await handleStatsPaginationCallback(callbackQuery, env);
+		return;
+	}
 	if (data.startsWith(AD_WORDS_PAGINATION_PREFIX)) {
 		await handleAdWordsPaginationCallback(callbackQuery, env);
 		return;
@@ -7113,6 +7169,20 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				return;
 			}
 		}
+	}
+
+	// 群统计·发言计数（主人要求：真人所有非服务消息计一次发言，含命令、含管理员/主人；
+	// bot、服务消息、频道自动转发、新成员进群消息一律不计）。位置在黑名单兜底之后
+	// （被拦截的已 return，不计入），命令分发之前。后台写不阻塞热路径；统计表未就绪时内部静默跳过。
+	if (
+		isConfiguredGroup(chatId) &&
+		message.from &&
+		!message.from.is_bot &&
+		!isTelegramServiceMessage(message) &&
+		!(Array.isArray(message.new_chat_members) && message.new_chat_members.length)
+	) {
+		if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(recordSpeechStat(env, chatId, message.from, Date.now()));
+		else await recordSpeechStat(env, chatId, message.from, Date.now());
 	}
 
 	// 广告检测 v2 三个钩子。位置固定在黑名单兜底之后、所有命令分发之前：
@@ -7673,6 +7743,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 
 	// /check 保留参数查询、群内回复查询及双库复制按钮。
+	// /stats 群统计（公开命令，展示在外、进 /help）：群内本群 Telegram 管理员/群主可查、
+	// 主人/副主人随时可查（普通成员静默）；私聊仅主人/副主人查指定配置群。只汇总当前群。
+	if (isStatsCommand(text)) {
+		if (await handleStatsCommand(message, env, ctx)) return;
+	}
+
 	if (isCheckCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
 		const dispatchSourceAllowed = !isInGroup || isConfiguredGroup(chatId);
@@ -7841,6 +7917,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/unban TGID　移出黑名单 + 全群解封（裸发 /unban 是自己走自助解封，不是解封别人）',
 			'/check TGID　查询 GKY 与本地黑名单；群内也可回复用户消息发 /check',
 			'群内授权命令立即撤回，完整结果保留在群里并通知第一主人；私聊命令与结果均保留。',
+			'超级管理员（SUPER_ADMIN_IDS）：等同 Telegram 群管理员权限，免实际管理员身份即可在配置群内或私聊使用上面四条命令；不含主人/副主人的高级/隐藏命令，也不参与 /stats（本人不豁免广告检测与黑名单拦截）。',
 			'',
 			'<b>━━ 广告举报投票 ━━</b>',
 			'/ad [原因]　回复广告发起群内投票，通过后加黑并全群封禁',
@@ -15194,4 +15271,322 @@ async function handleAdReplyLearning(message, env, ctx) {
 		}
 	}
 	return true;
+}
+
+// ============================================================================
+// 群统计：发言数 / 入群数 / 退群数（2026-09-24 新增）
+// 设计口径（主人定）：仅统计【当前群】、按天存、北京时区(UTC+8，可环境变量覆盖)、
+// 真人所有非服务消息计一次发言（含命令、含管理员/主人；bot 与服务消息不计）。
+// 【独立建表】不动核心 D1_SCHEMA_VERSION，仿 ensureAdDetectionTables 用独立 promise 去重 +
+// 失败冷却降级：统计表建失败只让 /stats 返回空，绝不影响 /ban /spam /unban /ad 等既有功能。
+// ============================================================================
+const D1_STAT_INIT_PROMISES = new WeakMap();
+const D1_STAT_RETRY_AT = new WeakMap();
+const STAT_SCHEMA_RETRY_COOLDOWN_MS = 60000;
+const STAT_RANKING_PAGE_LIMIT = 30;      // 发言排行每页条数（Top N + 翻页）
+const STAT_RETENTION_DAYS = 180;         // 明细保留天数，超期由 cron 剪枝
+const STAT_RANKING_QUERY_CAP = 2000;     // 排行分页的总人数上限，防超大群把翻页拉到天文数字
+
+// 统计时区偏移（小时）。默认 +8（北京）。环境变量 STATS_TZ_OFFSET 覆盖，范围 -12~14，非法回落 +8。
+// 「今日/本周/本月」的切天都以此为准 —— 与项目 cron 的 UTC 日期戳刻意分开，那个是平台调度，
+// 这个是给中文用户看的「今天」。
+function getStatTzOffsetHours(env) {
+	const raw = env?.STATS_TZ_OFFSET;
+	if (raw === undefined || raw === null || String(raw).trim() === '') return 8;
+	const n = parseInt(String(raw).trim(), 10);
+	return Number.isFinite(n) && n >= -12 && n <= 14 ? n : 8;
+}
+
+// 毫秒时间戳 → 统计时区的 YYYY-MM-DD。做法：偏移后走 UTC 取年月日，避免依赖运行环境本地时区。
+function statDayString(env, nowMs = Date.now()) {
+	const offsetMs = getStatTzOffsetHours(env) * 3600 * 1000;
+	return new Date(nowMs + offsetMs).toISOString().slice(0, 10);
+}
+
+// 计算粒度的起止日（含端点，统计时区 YYYY-MM-DD）。周一为一周起点（中国习惯）。
+function statRangeDays(env, range, nowMs = Date.now()) {
+	const offsetMs = getStatTzOffsetHours(env) * 3600 * 1000;
+	const local = new Date(nowMs + offsetMs);
+	const y = local.getUTCFullYear();
+	const m = local.getUTCMonth();
+	const d = local.getUTCDate();
+	const today = new Date(Date.UTC(y, m, d));
+	const fmt = (dt) => dt.toISOString().slice(0, 10);
+	if (range === 'month') {
+		return { start: fmt(new Date(Date.UTC(y, m, 1))), end: fmt(today), label: '本月', range: 'month' };
+	}
+	if (range === 'week') {
+		const dow = today.getUTCDay();            // 0=周日,1=周一,…
+		const back = dow === 0 ? 6 : dow - 1;     // 回退到本周一
+		const start = new Date(today);
+		start.setUTCDate(today.getUTCDate() - back);
+		return { start: fmt(start), end: fmt(today), label: '本周', range: 'week' };
+	}
+	return { start: fmt(today), end: fmt(today), label: '今日', range: 'day' };
+}
+
+// 建统计两张表：stat_speech（群+人+日 发言数）、stat_member（群+日 进/退/被移出）。
+async function ensureStatTables(env) {
+	if (!env.DB) return false;
+	const cached = D1_STAT_INIT_PROMISES.get(env.DB);
+	if (cached) return cached;
+	const retryAt = D1_STAT_RETRY_AT.get(env.DB);
+	if (retryAt && Date.now() < retryAt) return false;
+	const initPromise = (async () => {
+		try {
+			if (!(await ensureD1Table(env))) throw new Error('D1 核心结构不可用');
+			await runD1SchemaStatement(env, 'stat_speech',
+				'CREATE TABLE IF NOT EXISTS stat_speech (chat_id TEXT NOT NULL, user_id TEXT NOT NULL, day TEXT NOT NULL, '
+				+ 'msg_count INTEGER NOT NULL DEFAULT 0, display_name TEXT, username TEXT, updated_at INTEGER NOT NULL, '
+				+ 'PRIMARY KEY (chat_id, user_id, day))');
+			await runD1SchemaStatement(env, 'idx_stat_speech_chat_day',
+				'CREATE INDEX IF NOT EXISTS idx_stat_speech_chat_day ON stat_speech (chat_id, day)', { optional: true });
+			await runD1SchemaStatement(env, 'stat_member',
+				'CREATE TABLE IF NOT EXISTS stat_member (chat_id TEXT NOT NULL, day TEXT NOT NULL, '
+				+ 'join_count INTEGER NOT NULL DEFAULT 0, leave_count INTEGER NOT NULL DEFAULT 0, kicked_count INTEGER NOT NULL DEFAULT 0, '
+				+ 'updated_at INTEGER NOT NULL, PRIMARY KEY (chat_id, day))');
+			if (!(await d1TablesExist(env, ['stat_speech', 'stat_member']))) throw new Error('群统计表迁移不完整');
+			return true;
+		} catch (error) {
+			console.error('[群统计] 建表失败: ' + formatD1SchemaError(error));
+			return false;
+		}
+	})();
+	D1_STAT_INIT_PROMISES.set(env.DB, initPromise);
+	const ok = await initPromise;
+	if (!ok) {
+		D1_STAT_INIT_PROMISES.delete(env.DB);
+		D1_STAT_RETRY_AT.set(env.DB, Date.now() + STAT_SCHEMA_RETRY_COOLDOWN_MS);
+	} else {
+		D1_STAT_RETRY_AT.delete(env.DB);
+	}
+	return ok;
+}
+
+async function statReady(env) {
+	if (!env?.DB) return false;
+	try { return await ensureStatTables(env); } catch (error) { console.error('[群统计] 就绪检查失败:', error); return false; }
+}
+
+// 记一次发言（+1）。真人非服务消息由 handleMessage 钩子调用；用 ctx.waitUntil 后台写，不阻塞热路径。
+// 昵称/用户名每次覆盖为最新，供排行展示（Bot API 列不出全部成员，只能这样冗余存）。
+async function recordSpeechStat(env, chatId, from, nowMs = Date.now()) {
+	if (!(await statReady(env))) return;
+	try {
+		const uid = String(from?.id || '');
+		if (!uid) return;
+		const day = statDayString(env, nowMs);
+		const displayName = [from?.first_name, from?.last_name].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+		const username = String(from?.username || '').replace(/^@+/, '').slice(0, 64);
+		await env.DB.prepare(
+			'INSERT INTO stat_speech (chat_id, user_id, day, msg_count, display_name, username, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?) '
+			+ 'ON CONFLICT(chat_id, user_id, day) DO UPDATE SET msg_count = msg_count + 1, '
+			+ 'display_name = excluded.display_name, username = excluded.username, updated_at = excluded.updated_at'
+		).bind(String(chatId), uid, day, displayName, username, Math.floor(nowMs / 1000)).run();
+	} catch (error) { console.error('[群统计] 记录发言失败:', error); }
+}
+
+// 记一次成员事件。kind ∈ join(入群) / leave(主动退群) / kicked(被踢或被封)。
+async function recordMemberEvent(env, chatId, kind, nowMs = Date.now()) {
+	if (!['join', 'leave', 'kicked'].includes(kind)) return;
+	if (!(await statReady(env))) return;
+	try {
+		const day = statDayString(env, nowMs);
+		const col = kind === 'join' ? 'join_count' : (kind === 'leave' ? 'leave_count' : 'kicked_count');
+		// kind 已白名单校验，列名/初值拼接安全；其余值走参数绑定。
+		await env.DB.prepare(
+			'INSERT INTO stat_member (chat_id, day, join_count, leave_count, kicked_count, updated_at) VALUES (?, ?, '
+			+ (kind === 'join' ? 1 : 0) + ', ' + (kind === 'leave' ? 1 : 0) + ', ' + (kind === 'kicked' ? 1 : 0) + ', ?) '
+			+ 'ON CONFLICT(chat_id, day) DO UPDATE SET ' + col + ' = ' + col + ' + 1, updated_at = excluded.updated_at'
+		).bind(String(chatId), day, Math.floor(nowMs / 1000)).run();
+	} catch (error) { console.error('[群统计] 记录成员事件失败:', error); }
+}
+
+// 汇总：某群某粒度的总发言、活跃人数、入群、退群、被移出。
+async function queryStatSummary(env, chatId, range, nowMs = Date.now()) {
+	const empty = { totalMsg: 0, activeUsers: 0, join: 0, leave: 0, kicked: 0 };
+	if (!(await statReady(env))) return empty;
+	const { start, end } = statRangeDays(env, range, nowMs);
+	try {
+		const s = await env.DB.prepare(
+			'SELECT COALESCE(SUM(msg_count),0) AS total, COUNT(DISTINCT user_id) AS users '
+			+ 'FROM stat_speech WHERE chat_id = ? AND day >= ? AND day <= ?'
+		).bind(String(chatId), start, end).first();
+		const m = await env.DB.prepare(
+			'SELECT COALESCE(SUM(join_count),0) AS j, COALESCE(SUM(leave_count),0) AS l, COALESCE(SUM(kicked_count),0) AS k '
+			+ 'FROM stat_member WHERE chat_id = ? AND day >= ? AND day <= ?'
+		).bind(String(chatId), start, end).first();
+		return {
+			totalMsg: Number(s?.total) || 0,
+			activeUsers: Number(s?.users) || 0,
+			join: Number(m?.j) || 0,
+			leave: Number(m?.l) || 0,
+			kicked: Number(m?.k) || 0
+		};
+	} catch (error) { console.error('[群统计] 汇总查询失败:', error); return empty; }
+}
+
+// 发言排行分页。按发言数倒序，昵称取该人任一天的记录（同人昵称基本不变，MAX 足够）。
+async function queryStatRanking(env, chatId, range, page = 1, nowMs = Date.now()) {
+	if (!(await statReady(env))) return { ok: false, rows: [], total: 0, totalPages: 1 };
+	const { start, end } = statRangeDays(env, range, nowMs);
+	const limit = STAT_RANKING_PAGE_LIMIT;
+	const safePage = Math.max(1, Number(page) || 1);
+	try {
+		const totalRow = await env.DB.prepare(
+			'SELECT COUNT(*) AS c FROM (SELECT user_id FROM stat_speech WHERE chat_id = ? AND day >= ? AND day <= ? GROUP BY user_id)'
+		).bind(String(chatId), start, end).first();
+		const total = Math.min(STAT_RANKING_QUERY_CAP, Number(totalRow?.c) || 0);
+		const totalPages = Math.max(1, Math.ceil(total / limit));
+		const { results } = await env.DB.prepare(
+			'SELECT user_id, SUM(msg_count) AS cnt, MAX(display_name) AS display_name, MAX(username) AS username '
+			+ 'FROM stat_speech WHERE chat_id = ? AND day >= ? AND day <= ? '
+			+ 'GROUP BY user_id ORDER BY cnt DESC, user_id ASC LIMIT ? OFFSET ?'
+		).bind(String(chatId), start, end, limit, (safePage - 1) * limit).all();
+		const rows = (results || []).map((r, i) => ({
+			rank: (safePage - 1) * limit + i + 1,
+			userId: String(r.user_id || ''),
+			count: Number(r.cnt) || 0,
+			displayName: String(r.display_name || ''),
+			username: String(r.username || '')
+		}));
+		return { ok: true, rows, total, totalPages };
+	} catch (error) { console.error('[群统计] 排行查询失败:', error); return { ok: false, rows: [], total: 0, totalPages: 1 }; }
+}
+
+// 剪枝：删除超过保留期的统计明细。cron 搭车执行。
+async function pruneStatData(env, nowMs = Date.now()) {
+	if (!env?.DB) return;
+	try {
+		if (!(await statReady(env))) return;
+		const cutoff = statDayString(env, nowMs - STAT_RETENTION_DAYS * 86400000);
+		await env.DB.batch([
+			env.DB.prepare('DELETE FROM stat_speech WHERE day < ?').bind(cutoff),
+			env.DB.prepare('DELETE FROM stat_member WHERE day < ?').bind(cutoff)
+		]);
+	} catch (error) { console.error('[群统计] 剪枝失败:', error); }
+}
+
+// ===== /stats 命令层 =====
+// 公开命令（展示在外、进 /help，不隐藏）：群内=本群管理员/群主可查，主人/副主人随时可查；
+// 只汇总当前群，粒度 今日 / 本周 / 本月。排行 Top N + inline 翻页，复用广告翻页基建。
+const STAT_PAGINATION_PREFIX = 'statpg:';
+
+function isStatsCommand(text) {
+	return typeof text === 'string' && /^\/stats(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
+}
+
+// 解析粒度参数：week/周 → 本周，month/月 → 本月，其余（含空）→ 今日。
+function parseStatsRange(arg) {
+	const v = String(arg || '').toLowerCase();
+	if (/week|周/.test(v)) return 'week';
+	if (/month|月/.test(v)) return 'month';
+	return 'day';
+}
+
+// 渲染一页统计（汇总 + 发言排行 + 翻页键盘）。命令首发与按钮翻页共用，排版一致。
+async function renderStatPage(env, chatId, range, page, chatTitle) {
+	const info = statRangeDays(env, range);
+	const summary = await queryStatSummary(env, chatId, range);
+	const ranking = await queryStatRanking(env, chatId, range, page);
+	const scope = chatTitle ? escapeHtml(String(chatTitle)) : ('群 <code>' + escapeHtml(String(chatId)) + '</code>');
+	const dateLabel = info.start === info.end ? info.start : (info.start + ' ~ ' + info.end);
+	const lines = [
+		'📊 <b>' + scope + '</b> · ' + info.label + '（' + dateLabel + ' 北京时间）',
+		'💬 总发言 <b>' + summary.totalMsg + '</b> 条　👥 活跃人数 <b>' + summary.activeUsers + '</b>',
+		'➕ 入群 <b>' + summary.join + '</b>　➖ 退群 <b>' + summary.leave + '</b>　🚫 被移出 <b>' + summary.kicked + '</b>',
+		''
+	];
+	if (!ranking.rows.length) {
+		lines.push('（本时段暂无发言记录）');
+	} else {
+		lines.push('🏆 <b>发言排行</b>（第 ' + page + '/' + ranking.totalPages + ' 页）');
+		for (const row of ranking.rows) {
+			const label = row.displayName || (row.username ? '@' + row.username : row.userId);
+			const link = '<a href="tg://user?id=' + escapeHtml(row.userId) + '">' + escapeHtml(label) + '</a>';
+			const uname = (row.displayName && row.username) ? ' <code>@' + escapeHtml(row.username) + '</code>' : '';
+			lines.push(row.rank + '. ' + link + uname + ' — ' + row.count + ' 条');
+		}
+	}
+	const keyboard = ranking.totalPages > 1
+		? buildAdPaginationKeyboard(STAT_PAGINATION_PREFIX, page, ranking.totalPages, encodeAdCallbackToken(range + '|' + chatId))
+		: null;
+	const fallbackLine = ranking.totalPages > 1
+		? '翻页：<code>/stats ' + (range === 'day' ? '' : range + ' ') + '第 ' + Math.min(ranking.totalPages, page + 1) + ' 页需用按钮</code>'
+		: '';
+	return { text: lines.join('\n'), keyboard, fallbackLine, totalPages: ranking.totalPages };
+}
+
+// /stats 命令处理。返回 true 表示已处理。
+async function handleStatsCommand(message, env, ctx) {
+	const chat = message.chat;
+	const isInGroup = chat.type !== 'private';
+	const actorId = getMessageActorId(message);
+	const rawId = message.from?.id;
+	const rawArg = String(message.text || '').replace(/^\/stats(?:@[^\s]+)?\s*/i, '').trim();
+
+	if (isInGroup) {
+		// 群内只查本群，且必须是配置群（非配置群无统计数据）。
+		if (!isConfiguredGroup(chat.id)) return true;
+		// 权限：主人/副主人随时可查；否则必须是本群 Telegram 管理员/群主；普通成员静默（不回、不撤回）。
+		const allowed = isPrivilegedManager(actorId) || (rawId && await checkIfUserIsAdminInGroup(rawId, chat.id));
+		if (!allowed) return true;
+		await deleteAuthorizedGroupCommandMessage(message, '/stats');
+		const range = parseStatsRange(rawArg);
+		const rendered = await renderStatPage(env, String(chat.id), range, 1, chat.title || '');
+		await sendAdPagedMessage(chat.id, rendered.text, rendered.keyboard, rendered.fallbackLine);
+		return true;
+	}
+
+	// 私聊：仅主人/副主人，需指定配置群 ID（私聊没有「当前群」）。
+	if (!isPrivilegedManager(actorId)) {
+		await sendTelegramMessage(chat.id, '❌ <b>权限不足</b>\n\n群内 /stats 限本群管理员/群主，私聊 /stats 限主人/副主人。');
+		return true;
+	}
+	const parts = rawArg.split(/\s+/).filter(Boolean);
+	const targetGroup = parts.find((p) => /^-\d+$/.test(p)) || '';
+	const range = parseStatsRange(parts.filter((p) => !/^-\d+$/.test(p)).join(' '));
+	if (!targetGroup) {
+		await sendTelegramMessage(chat.id, [
+			'用法：',
+			'• 群内直接发 <code>/stats</code>（今日）/ <code>/stats week</code> / <code>/stats month</code> 查当前群',
+			'• 私聊查指定群：<code>/stats -100群ID [week|month]</code>'
+		].join('\n'));
+		return true;
+	}
+	if (!isConfiguredGroup(targetGroup)) {
+		await sendTelegramMessage(chat.id, '⚠️ <code>' + escapeHtml(targetGroup) + '</code> 不在配置群范围，没有统计数据。');
+		return true;
+	}
+	let title = '';
+	try { const gi = await getChatInfoFromId(targetGroup); title = String(gi?.title || ''); } catch (_) {}
+	const rendered = await renderStatPage(env, String(targetGroup), range, 1, title);
+	await sendAdPagedMessage(chat.id, rendered.text, rendered.keyboard, rendered.fallbackLine);
+	return true;
+}
+
+// /stats 翻页回调。data 形如 statpg:<页码>:<base64url "range|chatId">，或 statpg:noop。
+async function handleStatsPaginationCallback(callbackQuery, env) {
+	const data = String(callbackQuery?.data || '');
+	const clickerId = String(callbackQuery?.from?.id || '');
+	const body = data.slice(STAT_PAGINATION_PREFIX.length);
+	if (body === 'noop') { await answerAdVoteCallback(callbackQuery?.id); return; }
+	const match = body.match(/^(\d+):(.*)$/);
+	if (!match) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
+	const page = Math.max(1, parseInt(match[1], 10) || 1);
+	const token = decodeAdCallbackToken(match[2]);
+	const sep = token.indexOf('|');
+	const range = sep >= 0 ? token.slice(0, sep) : 'day';
+	const statChatId = sep >= 0 ? token.slice(sep + 1) : '';
+	if (!statChatId) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
+	// 权限复查（与 /stats 命令一致）：主人/副主人，或该统计群的管理员/群主。
+	const allowed = isPrivilegedManager(clickerId) || await checkIfUserIsAdminInGroup(clickerId, statChatId);
+	if (!allowed) { await answerAdVoteCallback(callbackQuery?.id, '仅限该群管理员或主人操作', true); return; }
+	const msgChatId = String(callbackQuery?.message?.chat?.id || '');
+	const messageId = Number(callbackQuery?.message?.message_id) || 0;
+	let title = '';
+	try { const gi = await getChatInfoFromId(statChatId); title = String(gi?.title || ''); } catch (_) {}
+	const rendered = await renderStatPage(env, statChatId, range, page, title);
+	await editAdPagedMessage(msgChatId, messageId, rendered.text, rendered.keyboard);
+	await answerAdVoteCallback(callbackQuery?.id);
 }
