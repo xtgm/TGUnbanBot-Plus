@@ -2078,7 +2078,11 @@ async function replyToModerationAdmin(message, ctx, { flashText, detailText = fl
 	const hasOwnerTarget = getOwnerNotifyTargets(options.notifySecondaryOwners).length > 0;
 	const silenceGroup = groupMode === 'silent' && hasOwnerTarget;
 	if (message.chat.type !== 'private' && !silenceGroup) {
-		const textForGroup = (groupMode === 'brief' && groupText != null) ? groupText : detailText;
+		// brief 群内简洁：优先显式 groupText（含可点击目标），无则回退 flashText（各命令的简洁汇总），
+		// 都没有才回退 detailText —— 保证 brief 命令的任何回执点都不会误发完整逐群明细。
+		const textForGroup = groupMode === 'brief'
+			? (groupText != null ? groupText : (flashText != null ? flashText : detailText))
+			: detailText;
 		const result = await sendTelegramMessageChunks(message.chat.id, textForGroup, options.replyMarkup);
 		if (!result?.ok) console.error(`[管理命令回执] 群聊${message.chat.id}失败:${result?.description || result?.error || '未知'}`);
 	}
@@ -7269,9 +7273,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		await deleteAuthorizedGroupCommandMessage(message, '/spam');
-		// 群聊静默（主人要求）：/spam 在群内不发任何 bot 回执，完整结果仅私聊第一主人与副主人。
+		// 群聊简洁（主人要求）：/spam 在群内只发「目标 + 封禁结果」的简洁汇总，与 /unban 同款
+		//（目标渲染成可点击昵称 + 可复制 TGID）；完整逐群明细仍私聊第一主人与副主人。
 		// 撤回命令消息、指纹/样本学习、同款连带等原有行为一律不变。
-		message.__moderationGroupMode = 'silent';
+		message.__moderationGroupMode = 'brief';
 
 		// 提取 /spam 后面的参数。回复模式优先把参数当执行原因；无回复时才按 TGID 模式解析。
 		const argMatch = text.trim().match(/^\/spam(?:@[^\s]+)?\s*([\s\S]*)/i);
@@ -7319,7 +7324,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
 					}
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
-					flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
+					flashText = `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'} ${targetMention}\n` + renderBanResults(banResults);
 				} else {
 					lines.push(`🎯 目标用户:${targetMention}`);
 					lines.push('');
@@ -7352,7 +7357,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				else banSummary.banPartial += 1;
 			}
 			const failedCount = invalid.length + results.failed.length;
-			const flashText = `✅ 批量加黑(/spam)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+			const flashText = `✅ 批量加黑(/spam)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`
+				+ (idsToKick.length ? '\n' + idsToKick.map((id) => `· ${formatBatchUserTarget(id, userProfiles)}`).join('\n') : '');
 			const baseDetail = renderBatchAddResult(results, invalid, banSummary, userProfiles);
 			let fullDetail = baseDetail;
 			if (perUserBanResults.length > 0) {
@@ -7559,7 +7565,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 
 			await replyToModerationAdmin(message, ctx, {
-				flashText: `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} ${linkedUserId}`,
+				flashText: `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'} ${formatUserReference(repliedUserId, repliedMsg.from)} <code>${escapeHtml(String(repliedUserId))}</code>`,
 				detailText: withActionContext(message, lines.join('\n'), replySpamNote),
 				isInGroup,
 				notifySecondaryOwners: true
@@ -8142,9 +8148,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		await deleteAuthorizedGroupCommandMessage(message, '/ban');
-		// 群聊静默（主人要求）：/ban 在群内不发任何 bot 回执，完整结果仅私聊第一主人与副主人。
-		// 撤回命令消息、副主人通知等原有行为一律不变。
-		message.__moderationGroupMode = 'silent';
+		// 群聊简洁（主人要求）：/ban 在群内只发「目标 + 封禁结果」的简洁汇总，与 /unban 同款
+		//（目标用 formatTargetFromBanResults / formatBatchUserTarget 渲染成可点击昵称 + 可复制 TGID）；
+		// 完整逐群明细仍私聊第一主人与副主人。撤回命令消息、副主人通知等原有行为一律不变。
+		message.__moderationGroupMode = 'brief';
 
 		// 提取参数（支持单个 / 批量；开头 TGID 列表之后的文本作为执行原因）
 		// 用正则提取,与 /spam 完全对称:兼容 /ban、/ban@机器人名、多空格;彻底不依赖命令长度,
@@ -8209,7 +8216,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 						lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
 					}
 				}
-				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
+				flashText = `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'} ${targetMention}\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
 				lines.push(`🎯 目标用户:${targetMention}`);
@@ -8244,7 +8251,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			else banSummary.banPartial += 1;
 		}
 		const failedCount = invalid.length + results.failed.length;
-		const flashText = `✅ 批量加黑：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+		const flashText = `✅ 批量加黑：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`
+			+ (idsToKick.length ? '\n' + idsToKick.map((id) => `· ${formatBatchUserTarget(id, userProfiles)}`).join('\n') : '');
 		// 详细 detailText：批量汇总 + 每个用户的逐群明细
 		const baseDetail = renderBatchAddResult(results, invalid, banSummary, userProfiles);
 		let fullDetail = baseDetail;

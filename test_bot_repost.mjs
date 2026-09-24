@@ -469,10 +469,10 @@ console.log('\n=== 12. 引用已处置广告的四条管理命令先鉴权撤回
 			check(command + ' 先完成管理员鉴权再撤回', commandDeleteIndex > adminIndex);
 			check(command + ' 群内简洁结果，同时私聊第一主人', groupSent && ownerSent);
 		} else {
-			// /ban·/spam 群聊撤回命令 + 群内静默（无 bot 结果）+ 私聊第一主人完整。
+			// /ban·/spam 群聊撤回命令 + 群内简洁回执（含目标可点击 + 可复制 TGID）+ 私聊第一主人完整。
 			check(command + ' 鉴权后撤回命令一次', deletedCommand === 1);
 			check(command + ' 先完成管理员鉴权再撤回', commandDeleteIndex > adminIndex);
-			check(command + ' 群内静默、只私聊第一主人', !groupSent && ownerSent);
+			check(command + ' 群内简洁回执，同时私聊第一主人', groupSent && ownerSent);
 		}
 		if (command.startsWith('/unban')) {
 			check(command + ' 仍先移除 D1 再全群解封',

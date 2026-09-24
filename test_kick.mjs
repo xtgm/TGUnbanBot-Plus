@@ -749,7 +749,7 @@ console.log('\n[1] /spam 触发:加黑 + 全群踢 + 当前群近期消息清扫
 	const sendCalls = callsOf('sendMessage');
 	const groupSends = sendCalls.filter((c) => String(c.body.chat_id) === '-1001');
 	const dmSends = sendCalls.filter((c) => String(c.body.chat_id) === '999');
-	assert('群内静默、不发 bot 结果（/ban·/spam 主人要求）', !callsOf('sendMessage').some((c) => Number(c.body.chat_id) < 0));
+	assert('群内有简洁回执（/ban·/spam brief）', callsOf('sendMessage').some((c) => Number(c.body.chat_id) < 0));
 	assert('完整结果发送第一主人', dmSends.some((c) => c.body.text.includes('8888')));
 	assert('私聊详情 sendMessage 1 次', dmSends.length === 1);
 	assert('私聊详情含当前群近期消息清扫', dmSends[0].body.text.includes('当前群近期消息清扫'));
@@ -1527,11 +1527,11 @@ console.log('\n[10] 群内 /ban 单条');
 
 	const sendCalls = callsOf('sendMessage');
 	// 群内永久保留完整详情，同时私聊第一主人。
-	assert('sendMessage 只发主人一份详情（群内静默）', sendCalls.length === 1, `实际 ${sendCalls.length}`);
+	assert('sendMessage 群内简洁+主人完整两份', sendCalls.length === 2, `实际 ${sendCalls.length}`);
 
 	const groupSend = sendCalls.find((c) => String(c.body.chat_id) === '-1001');
 	const dmSend = sendCalls.find((c) => String(c.body.chat_id) === '999');
-	assert('群内静默、不发 bot 结果（/ban·/spam 主人要求）', !callsOf('sendMessage').some((c) => Number(c.body.chat_id) < 0));
+	assert('群内有简洁回执（/ban·/spam brief）', callsOf('sendMessage').some((c) => Number(c.body.chat_id) < 0));
 	assert('第一主人收到完整结果', dmSend?.body.text.includes('Telegram 群封禁/预封成功'));
 	assert('私聊发到管理员 999', !!dmSend);
 	assert('私聊含汇总头', dmSend.body.text.includes('Telegram 群封禁/预封成功 2/2'));
@@ -1657,7 +1657,7 @@ console.log('\n[10b3] 群内 /ban 首次加黑成功但 Telegram 无法识别 TG
 	assert('/ban USER_ID_INVALID 每个群只请求一次', callsOf('banChatMember').length === 2);
 	const groupFlash = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '-1001');
 	const dmSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('/ban 无法识别 TGID:群内静默（不发 bot 结果）', !groupFlash);
+	assert('/ban 无法识别 TGID:群内简洁回执含目标', groupFlash?.body.text.includes('7070447913'));
 	assert('/ban 无法识别 TGID:完整错误发给第一主人', !!dmSend);
 	assert('/ban 无法识别 TGID:私聊详情说明 D1 黑名单已生效', !!dmSend && dmSend.body.text.includes('D1 黑名单已生效'));
 	assert('/ban 无法识别 TGID:私聊详情说明 Telegram 当前无法识别', dmSend.body.text.includes('Telegram 当前无法识别该 TGID'));
@@ -1796,7 +1796,7 @@ console.log('\n[11] 群内 /ban 批量');
 	assert('banChatMember 调用 6 次', callsOf('banChatMember').length === 6);
 
 	const sendCalls = callsOf('sendMessage');
-	assert('sendMessage 只发主人一份详情（群内静默）', sendCalls.length === 1);
+	assert('sendMessage 群内简洁+主人完整两份', sendCalls.length === 2);
 	const dmSend = sendCalls.find((c) => String(c.body.chat_id) === '999');
 	assert('私聊详情含批量结果', dmSend.body.text.includes('批量添加完成'));
 	assert('私聊详情含每个用户', dmSend.body.text.includes('100') && dmSend.body.text.includes('200') && dmSend.body.text.includes('300'));
@@ -3267,7 +3267,7 @@ console.log('\n[12a3] 匿名管理员 /ban@bot');
 	assert('匿名 /ban@bot 执行全群踢出', callsOf('banChatMember').length === 2);
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	assert('匿名 /ban@bot 群内静默、不发 bot 结果', groupSends.length === 0);
+	assert('匿名 /ban@bot 群内有简洁回执', groupSends.length > 0);
 	assert('匿名 /ban@bot 主人收到匿名管理员审计', !!ownerDm && ownerDm.body.text.includes('匿名管理员'));
 }
 
@@ -3301,7 +3301,7 @@ console.log('\n[12a4] 匿名管理员 /spam@bot TGID');
 	assert('匿名 /spam@bot 执行全群踢出', callsOf('banChatMember').length === 2);
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	assert('匿名 /spam@bot 群内静默、不发 bot 结果', groupSends.length === 0);
+	assert('匿名 /spam@bot 群内有简洁回执', groupSends.length > 0);
 	assert('匿名 /spam@bot 主人收到匿名管理员审计', !!ownerDm && ownerDm.body.text.includes('匿名管理员'));
 }
 
@@ -3339,7 +3339,7 @@ console.log('\n[12a5] 匿名管理员回复 /spam');
 	assert('匿名回复 /spam 删除被回复消息', callsOf('deleteMessage').some((c) => c.body.message_id === 5000));
 	assert('匿名回复 /spam 执行全群踢出', callsOf('banChatMember').length === 2);
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	assert('匿名回复 /spam 群内静默、不发 bot 结果', groupSends.length === 0);
+	assert('匿名回复 /spam 群内有简洁回执', groupSends.length > 0);
 }
 
 // ---------- [12a5b] /spam 回复 sender_chat 不当 TGID 加黑 ----------
@@ -3987,7 +3987,7 @@ console.log('\n[15] 私聊主人投递失败仅日志');
 	assert('尝试私聊主人', dmAttempts === 1);
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
 	// 主人投递失败不影响来源群的永久结果。
-	assert('私聊投递失败时群内仍静默（有主人则不兜底）', groupSends.length === 0);
+	assert('私聊投递失败时群内仍有简洁回执（brief 不依赖主人投递）', groupSends.length > 0);
 	assert('私聊投递失败时 D1 处置仍完成', env.DB._rows.has('123'));
 }
 
@@ -4029,7 +4029,7 @@ console.log('\n[16] 普通管理员当前群鉴权 + 全局封禁');
 	assert('B 群鉴权只查询当前 B 群', adminCalls.length === 1 && String(adminCalls[0].body.chat_id) === '-1002');
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1002');
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('普通管理员群内 /ban 群内静默', groupSends.length === 0);
+	assert('普通管理员群内 /ban 群内有简洁回执', groupSends.length > 0);
 	assert('普通管理员群内 /ban 完整结果同时发给主人', !!ownerDm && ownerDm.body.text.includes('Telegram 群封禁/预封成功'));
 	assert('普通管理员群内 /ban 撤回命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 2));
 }
@@ -4202,7 +4202,7 @@ console.log('\n[20] OWNER_IDS 未配置:无群闪屏、无私聊');
 	const dmSends = callsOf('sendMessage').filter((c) => Number(c.body.chat_id) > 0);
 	assert('OWNER_IDS 未配置时无任何私聊', dmSends.length === 0);
 	const groupSends = callsOf('sendMessage').filter((c) => Number(c.body.chat_id) < 0);
-	assert('OWNER_IDS 未配置时群内仍有完整结果', groupSends.some((c) => c.body.text.includes('Telegram 群封禁/预封成功')));
+	assert('OWNER_IDS 未配置时群内仍有简洁回执', groupSends.some((c) => c.body.text.includes('Telegram封禁/预封成功')));
 }
 
 // ---------- [21] OWNER_IDS 已配置 + 主人=触发者 → 含"你自己" ----------
@@ -4249,7 +4249,7 @@ console.log('\n[22] 群管理员触发:主人收审计,触发者零私信');
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	const triggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
 	const groupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	assert('群管理员 /ban 群内静默', groupSends.length === 0);
+	assert('群管理员 /ban 群内有简洁回执', groupSends.length > 0);
 	assert('主人 999 收到审计通知', !!ownerDm);
 	assert('触发者 7777 完全不收私信', !triggerDm);
 	assert('审计含"群管理员操作通知"标题', ownerDm.body.text.includes('群管理员操作通知'));
@@ -4282,7 +4282,7 @@ console.log('\n[22b] OWNER_IDS 通知范围:主人全量,副主人仅 /ban /spam
 	let deputyDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '1000');
 	assert('/ban → 主人收到群封禁通知', !!ownerDm && ownerDm.body.text.includes('Telegram 群封禁/预封成功'));
 	assert('/ban → 副主人收到群封禁通知', !!deputyDm && deputyDm.body.text.includes('Telegram 群封禁/预封成功'));
-	assert('/ban → 群内静默', !callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001'));
+	assert('/ban → 群内有简洁回执', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001'));
 
 	resetCalls();
 	env = {
@@ -6028,7 +6028,7 @@ console.log('\n[98] 四条管理命令权限与回执矩阵');
 			assert(label + ' 群内命令撤回符合各命令策略', commandDeletes.length === (expectCommandDelete ? 1 : 0));
 			// 群内 bot 回执按命令分流（主人要求）：/check 完整、/unban 简洁（都发含目标的群内消息）；
 			// /ban·/spam 群内静默（无任何 bot 回执）；非允许 / 私聊一律无群内回执。
-			const expectGroupText = allowedInGroup && command !== 'ban' && command !== 'spam';
+			const expectGroupText = allowedInGroup;
 			assert(label + ' 群内回执符合各命令策略', expectGroupText
 				? groupMessages.length > 0 && groupMessages.every((c) => String(c.body.chat_id) === String(scenario.group) && c.body.text.includes(target))
 					&& !callsOf('deleteMessage').some((c) => c.body.message_id === 99100)
@@ -6172,7 +6172,7 @@ for (const action of ['ban', 'spam']) {
 	assert('/' + action + ' Queue 业务完成', job.status === 'done' && ids.every((id) => env.DB._rows.has(id)) && callsOf('banChatMember').length === 40);
 	// /ban·/spam 群内静默（主人要求）：源群既不发同步「已创建」也不推异步「完成」；完整回执只私聊第一主人。
 	const groupTexts = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001').map((c) => c.body.text).join('\n');
-	assert('/' + action + ' Queue 群内静默、不送达来源群', groupTexts === '');
+	assert('/' + action + ' Queue 群内只发简洁「已创建」、不推异步完成', groupTexts.includes('批量任务已创建') && !groupTexts.includes('批量任务完成'));
 	const ownerTexts = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').map((c) => c.body.text).join('\n');
 	assert('/' + action + ' Queue 创建与最终结果均私聊第一主人', ownerTexts.includes('批量任务已创建') && ownerTexts.includes('批量任务完成'));
 	assert('/' + action + ' Queue 只撤回命令，不撤回创建或完成回执',
