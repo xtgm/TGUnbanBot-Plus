@@ -6927,6 +6927,10 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 	const data = String(callbackQuery?.data || '');
 	// 三分支分流。必须排在 adv: 校验【之前】：投票分支开头那道 isConfiguredGroup
 	// 会把私聊来的回调全部挡掉，而 /words 本来就只在私聊里用。
+	if (data.startsWith(STAT_GO_PREFIX)) {
+		await handleStatsGoCallback(callbackQuery, env);
+		return;
+	}
 	if (data.startsWith(STAT_PAGINATION_PREFIX)) {
 		await handleStatsPaginationCallback(callbackQuery, env);
 		return;
@@ -7921,7 +7925,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'超级管理员（SUPER_ADMIN_IDS）：等同 Telegram 群管理员权限，免实际管理员身份即可在配置群内或私聊使用上面四条命令；不含主人/副主人的高级/隐藏命令，也不参与 /stats（本人不豁免广告检测与黑名单拦截）。',
 			'',
 			'<b>━━ 群统计 ━━</b>',
-			'/stats　群内发这条只出「用法」；查数据用下面带参数的：',
+			'/stats　群内发这条只出「用法」，并带 今日 / 本周 / 本月 按钮，点一下直接查；也可手打下面带参数的：',
 			'/stats today　查本群今日；/stats week 本周；/stats month 本月',
 			'　　真人所有非服务消息各计一次发言（bot 与服务消息不计）；只统计本群、不跨群。',
 			'　　群内本群 Telegram 管理员 / 群主可查、主人 / 副主人随时可查；私聊用 /stats -100群ID [today|week|month] 查指定群。',
@@ -15478,6 +15482,8 @@ async function pruneStatData(env, nowMs = Date.now()) {
 // 公开命令（展示在外、进 /help，不隐藏）：群内=本群管理员/群主可查，主人/副主人随时可查；
 // 只汇总当前群，粒度 今日 / 本周 / 本月。排行 Top N + inline 翻页，复用广告翻页基建。
 const STAT_PAGINATION_PREFIX = 'statpg:';
+// 用法面板按钮：点一下【新发一条】对应范围的数据消息（不改面板），token=base64url(range|chatId)。
+const STAT_GO_PREFIX = 'statgo:';
 
 function isStatsCommand(text) {
 	return typeof text === 'string' && /^\/stats(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
@@ -15518,6 +15524,17 @@ function buildPrivateStatsUsage() {
 		'• <code>/stats -100群ID week</code> — 本周',
 		'• <code>/stats -100群ID month</code> — 本月'
 	].join('\n');
+}
+
+// 群内用法面板按钮：今日 / 本周 / 本月。点一下由 handleStatsGoCallback 新发一条对应数据。
+// callback_data 超 64 字节（群 ID 异常长）时整块放弃按钮，只留文字用法，绝不挂死按钮。
+function buildStatsPanelKeyboard(chatId) {
+	const mk = (label, r) => {
+		const d = STAT_GO_PREFIX + encodeAdCallbackToken(r + '|' + String(chatId));
+		return adCallbackDataFits(d) ? { text: label, callback_data: d } : null;
+	};
+	const row = [mk('📅 今日', 'day'), mk('📆 本周', 'week'), mk('🗓 本月', 'month')];
+	return row.every(Boolean) ? { inline_keyboard: [row] } : null;
 }
 
 // 渲染一页统计（汇总 + 发言排行 + 翻页键盘）。命令首发与按钮翻页共用，排版一致。
@@ -15571,7 +15588,7 @@ async function handleStatsCommand(message, env, ctx) {
 		// 裸 /stats（或无法识别的参数）= 只显示用法，不甩数据；今日数据走 /stats today。
 		const range = parseStatsRange(rawArg);
 		if (range === null) {
-			await sendTelegramMessage(chat.id, buildGroupStatsUsage());
+			await sendTelegramMessage(chat.id, buildGroupStatsUsage(), buildStatsPanelKeyboard(chat.id));
 			return true;
 		}
 		const rendered = await renderStatPage(env, String(chat.id), range, 1, chat.title || '');
@@ -15626,5 +15643,27 @@ async function handleStatsPaginationCallback(callbackQuery, env) {
 	try { const gi = await getChatInfoFromId(statChatId); title = String(gi?.title || ''); } catch (_) {}
 	const rendered = await renderStatPage(env, statChatId, range, page, title);
 	await editAdPagedMessage(msgChatId, messageId, rendered.text, rendered.keyboard);
+	await answerAdVoteCallback(callbackQuery?.id);
+}
+
+// 用法面板按钮回调：点「今日/本周/本月」→ 复查权限后【新发一条】对应数据消息（面板保留、可连点）。
+// 与翻页回调的区别：翻页是原地编辑那条数据；这里是发新消息，不动面板。
+async function handleStatsGoCallback(callbackQuery, env) {
+	const data = String(callbackQuery?.data || '');
+	const clickerId = String(callbackQuery?.from?.id || '');
+	const token = decodeAdCallbackToken(data.slice(STAT_GO_PREFIX.length));
+	const sep = token.indexOf('|');
+	const range = sep >= 0 ? token.slice(0, sep) : 'day';
+	const statChatId = sep >= 0 ? token.slice(sep + 1) : '';
+	if (!statChatId) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
+	// 权限复查（与 /stats 命令一致）：主人/副主人，或该群管理员/群主。
+	const allowed = isPrivilegedManager(clickerId) || await checkIfUserIsAdminInGroup(clickerId, statChatId);
+	if (!allowed) { await answerAdVoteCallback(callbackQuery?.id, '仅限该群管理员或主人操作', true); return; }
+	let title = '';
+	try { const gi = await getChatInfoFromId(statChatId); title = String(gi?.title || ''); } catch (_) {}
+	const rendered = await renderStatPage(env, statChatId, range, 1, title);
+	// 发到面板所在聊天（即本群）；面板消息不动，数据作为额外一条出现在下方。
+	const targetChat = String(callbackQuery?.message?.chat?.id || statChatId);
+	await sendAdPagedMessage(targetChat, rendered.text, rendered.keyboard, rendered.fallbackLine);
 	await answerAdVoteCallback(callbackQuery?.id);
 }

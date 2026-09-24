@@ -158,6 +158,9 @@ check('普通成员群内 /stats 静默（不回群、不私聊）', sent.length
 sent.length = 0;
 await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: 777, is_bot: false }, text: '/stats', message_id: 102 }, env, { waitUntil() {} });
 check('群管理员群内裸 /stats 只出用法（不甩数据、不含私聊指定群那条）', sent.some((x) => x.chatId === '-100111' && x.text.includes('用法') && x.text.includes('/stats today')) && !sent.some((x) => x.text.includes('总发言') || x.text.includes('-100群ID')));
+const panelMsg = sent.find((x) => x.chatId === '-100111' && x.text.includes('用法'));
+const panelBtns = (panelMsg?.markup?.inline_keyboard || [])[0] || [];
+check('群内用法带三个内联按钮(今日/本周/本月，回调 statgo:)', panelBtns.length === 3 && panelBtns.every((b) => String(b.callback_data || '').startsWith('statgo:')));
 sent.length = 0;
 await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: 777, is_bot: false }, text: '/stats today', message_id: 108 }, env, { waitUntil() {} });
 check('群管理员 /stats today 发今日结果到本群', sent.some((x) => x.chatId === '-100111' && x.text.includes('总发言')));
@@ -167,6 +170,18 @@ check('主人不受管理员身份限制、随时可查', sent.some((x) => x.cha
 sent.length = 0;
 await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: Number(DEPUTY), is_bot: false }, text: '/stats month', message_id: 104 }, env, { waitUntil() {} });
 check('副主人随时可查', sent.some((x) => x.chatId === '-100111' && x.text.includes('本月')));
+
+console.log('\n=== 8b. 用法面板按钮：点一下新发数据（不改面板） ===');
+const goToday = 'statgo:' + W.encodeAdCallbackToken('day|-100111');
+sent.length = 0; currentAdmins = ['777'];
+await W.handleStatsGoCallback({ id: 'cb1', data: goToday, from: { id: 777 }, message: { chat: { id: '-100111' }, message_id: 102 } }, env);
+check('管理员点面板[今日] → 新发今日数据到本群', sent.some((x) => x.chatId === '-100111' && x.text.includes('总发言')));
+sent.length = 0; currentAdmins = [];
+await W.handleStatsGoCallback({ id: 'cb2', data: 'statgo:' + W.encodeAdCallbackToken('week|-100111'), from: { id: Number(OWNER) }, message: { chat: { id: '-100111' }, message_id: 102 } }, env);
+check('主人点面板[本周] → 新发本周数据', sent.some((x) => x.chatId === '-100111' && x.text.includes('本周')));
+sent.length = 0; currentAdmins = [];
+await W.handleStatsGoCallback({ id: 'cb3', data: goToday, from: { id: 555 }, message: { chat: { id: '-100111' }, message_id: 102 } }, env);
+check('非管理员点面板 → 不出数据（权限拦截）', !sent.some((x) => x.text.includes('总发言')));
 
 console.log('\n=== 9. /stats 输出内容 ===');
 sent.length = 0; currentAdmins = [];
