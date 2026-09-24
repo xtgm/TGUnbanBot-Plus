@@ -7921,9 +7921,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'超级管理员（SUPER_ADMIN_IDS）：等同 Telegram 群管理员权限，免实际管理员身份即可在配置群内或私聊使用上面四条命令；不含主人/副主人的高级/隐藏命令，也不参与 /stats（本人不豁免广告检测与黑名单拦截）。',
 			'',
 			'<b>━━ 群统计 ━━</b>',
-			'/stats [week|month]　本群发言 / 进退群统计，默认今日；/stats week 看本周、/stats month 看本月',
+			'/stats　群内发这条只出「用法」；查数据用下面带参数的：',
+			'/stats today　查本群今日；/stats week 本周；/stats month 本月',
 			'　　真人所有非服务消息各计一次发言（bot 与服务消息不计）；只统计本群、不跨群。',
-			'　　群内本群 Telegram 管理员 / 群主可查、主人 / 副主人随时可查；私聊用 /stats -100群ID 查指定群。',
+			'　　群内本群 Telegram 管理员 / 群主可查、主人 / 副主人随时可查；私聊用 /stats -100群ID [today|week|month] 查指定群。',
 			'',
 			'<b>━━ 广告举报投票 ━━</b>',
 			'/ad [原因]　回复广告发起群内投票，通过后加黑并全群封禁',
@@ -15483,11 +15484,40 @@ function isStatsCommand(text) {
 }
 
 // 解析粒度参数：week/周 → 本周，month/月 → 本月，其余（含空）→ 今日。
+// 解析 /stats 的时间范围参数。
+// 返回 'day'/'week'/'month'；空参数或无法识别的参数返回 null，
+// 由调用方决定「显示用法」还是「默认今日」。裸 /stats（null）在群内=显示用法。
 function parseStatsRange(arg) {
-	const v = String(arg || '').toLowerCase();
+	const v = String(arg || '').trim().toLowerCase();
+	if (!v) return null;
 	if (/week|周/.test(v)) return 'week';
 	if (/month|月/.test(v)) return 'month';
-	return 'day';
+	if (/today|day|今日|日/.test(v)) return 'day';
+	return null;
+}
+
+// 群内 /stats 用法（不含私聊指定群那条——主人要求群里不展示）。
+function buildGroupStatsUsage() {
+	return [
+		'📊 <b>群发言统计</b> · 用法',
+		'统计本群真人发言数与进 / 退群人数，仅本群，按日 / 周 / 月汇总。',
+		'',
+		'• <code>/stats today</code> — 查本群今日',
+		'• <code>/stats week</code> — 查本群本周',
+		'• <code>/stats month</code> — 查本群本月'
+	].join('\n');
+}
+
+// 私聊 /stats 用法（仅主人 / 副主人，必须带配置群 ID）。
+function buildPrivateStatsUsage() {
+	return [
+		'📊 <b>群发言统计</b> · 用法（私聊查指定群，仅主人 / 副主人）',
+		'按日 / 周 / 月汇总，只统计该群。',
+		'',
+		'• <code>/stats -100群ID</code> — 查指定群今日',
+		'• <code>/stats -100群ID week</code> — 本周',
+		'• <code>/stats -100群ID month</code> — 本月'
+	].join('\n');
 }
 
 // 渲染一页统计（汇总 + 发言排行 + 翻页键盘）。命令首发与按钮翻页共用，排版一致。
@@ -15538,7 +15568,12 @@ async function handleStatsCommand(message, env, ctx) {
 		const allowed = isPrivilegedManager(actorId) || (rawId && await checkIfUserIsAdminInGroup(rawId, chat.id));
 		if (!allowed) return true;
 		await deleteAuthorizedGroupCommandMessage(message, '/stats');
+		// 裸 /stats（或无法识别的参数）= 只显示用法，不甩数据；今日数据走 /stats today。
 		const range = parseStatsRange(rawArg);
+		if (range === null) {
+			await sendTelegramMessage(chat.id, buildGroupStatsUsage());
+			return true;
+		}
 		const rendered = await renderStatPage(env, String(chat.id), range, 1, chat.title || '');
 		await sendAdPagedMessage(chat.id, rendered.text, rendered.keyboard, rendered.fallbackLine);
 		return true;
@@ -15551,13 +15586,10 @@ async function handleStatsCommand(message, env, ctx) {
 	}
 	const parts = rawArg.split(/\s+/).filter(Boolean);
 	const targetGroup = parts.find((p) => /^-\d+$/.test(p)) || '';
-	const range = parseStatsRange(parts.filter((p) => !/^-\d+$/.test(p)).join(' '));
+	// 私聊带群 ID 时默认查今日（range 为 null 回落 day）；不带群 ID = 显示用法。
+	const range = parseStatsRange(parts.filter((p) => !/^-\d+$/.test(p)).join(' ')) || 'day';
 	if (!targetGroup) {
-		await sendTelegramMessage(chat.id, [
-			'用法：',
-			'• 群内直接发 <code>/stats</code>（今日）/ <code>/stats week</code> / <code>/stats month</code> 查当前群',
-			'• 私聊查指定群：<code>/stats -100群ID [week|month]</code>'
-		].join('\n'));
+		await sendTelegramMessage(chat.id, buildPrivateStatsUsage());
 		return true;
 	}
 	if (!isConfiguredGroup(targetGroup)) {

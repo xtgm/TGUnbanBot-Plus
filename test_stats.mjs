@@ -157,7 +157,10 @@ await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '
 check('普通成员群内 /stats 静默（不回群、不私聊）', sent.length === 0);
 sent.length = 0;
 await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: 777, is_bot: false }, text: '/stats', message_id: 102 }, env, { waitUntil() {} });
-check('群管理员群内 /stats 发结果到本群', sent.some((x) => x.chatId === '-100111' && x.text.includes('总发言')));
+check('群管理员群内裸 /stats 只出用法（不甩数据、不含私聊指定群那条）', sent.some((x) => x.chatId === '-100111' && x.text.includes('用法') && x.text.includes('/stats today')) && !sent.some((x) => x.text.includes('总发言') || x.text.includes('-100群ID')));
+sent.length = 0;
+await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: 777, is_bot: false }, text: '/stats today', message_id: 108 }, env, { waitUntil() {} });
+check('群管理员 /stats today 发今日结果到本群', sent.some((x) => x.chatId === '-100111' && x.text.includes('总发言')));
 sent.length = 0; currentAdmins = [];
 await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: Number(OWNER), is_bot: false }, text: '/stats week', message_id: 103 }, env, { waitUntil() {} });
 check('主人不受管理员身份限制、随时可查', sent.some((x) => x.chatId === '-100111' && x.text.includes('本周')));
@@ -167,7 +170,7 @@ check('副主人随时可查', sent.some((x) => x.chatId === '-100111' && x.text
 
 console.log('\n=== 9. /stats 输出内容 ===');
 sent.length = 0; currentAdmins = [];
-await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: Number(OWNER), is_bot: false }, text: '/stats', message_id: 105 }, env, { waitUntil() {} });
+await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: Number(OWNER), is_bot: false }, text: '/stats today', message_id: 105 }, env, { waitUntil() {} });
 const out = sent.find((x) => x.chatId === '-100111');
 check('输出含总发言', !!out && out.text.includes('总发言'));
 check('输出含活跃人数', !!out && out.text.includes('活跃人数'));
@@ -182,6 +185,9 @@ check('私聊非主人 → 权限不足', sent.some((x) => x.chatId === '555' &&
 sent.length = 0;
 await W.handleStatsCommand({ chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false }, text: '/stats -100111 week', message_id: 107 }, env, { waitUntil() {} });
 check('私聊主人查指定群 → 出结果', sent.some((x) => x.chatId === String(OWNER) && x.text.includes('本周')));
+sent.length = 0;
+await W.handleStatsCommand({ chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false }, text: '/stats', message_id: 109 }, env, { waitUntil() {} });
+check('私聊主人裸 /stats → 出私聊用法（含指定群写法）', sent.some((x) => x.chatId === String(OWNER) && x.text.includes('用法') && x.text.includes('/stats -100群ID')));
 
 console.log('\n=== 11. 发言钩子端到端（webhook） ===');
 const todayNow = W.statDayString(env, Date.now());
