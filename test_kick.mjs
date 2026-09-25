@@ -2166,7 +2166,7 @@ console.log('\n[11b2] D1 批量任务失败原因中文化');
 
 	const dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('批量任务失败原因显示中文', !!dm && dm.body.text.includes('bot 权限不足'));
-	assert('批量任务失败原因保留原始错误', dm.body.text.includes('not enough rights to restrict/unrestrict chat member'));
+	assert('批量任务失败原因只给中文、不附英文原文', !dm.body.text.includes('not enough rights') && !dm.body.text.includes('Bad Request'));
 	assert('批量任务失败建议含封禁用户权限', dm.body.text.includes('封禁用户'));
 }
 
@@ -4739,8 +4739,8 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	const removedBanCommand = '/' + ['b', 'e'].join('');
 	const removedSpamCommand = '/' + ['s', 'a'].join('');
 	assert('主人 /help → 公开管理四条齐全', !!dm && dm.body.text.includes('/ban TGID') && dm.body.text.includes('/spam') && dm.body.text.includes('/unban TGID') && dm.body.text.includes('/check TGID'));
-	assert('主人 /help → 当前权限与回执说明准确', dm.body.text.includes('━━ 人工封禁与查询（群管理员 / 主人 / 副主人）━━') && dm.body.text.includes('完整结果保留在群里并通知第一主人'));
-	assert('主人 /help → 含 /admins 名单与超级管理员说明', dm.body.text.includes('/admins　查看主人 / 副主人名单') && dm.body.text.includes('超级管理员（SUPER_ADMIN_IDS）'));
+	assert('主人 /help → 当前权限与回执说明准确', dm.body.text.includes('━━ 人工封禁与查询（群管理员 / 主人 / 副主人）━━') && dm.body.text.includes('结果留在群里并通知第一主人'));
+	assert('主人 /help → 含 /admins 名单与超级管理员说明', dm.body.text.includes('/admins　') && dm.body.text.includes('超管名单　环境变量 SUPER_ADMIN_IDS'));
 	assert('主人 /help → 不再显示旧短命令', !!dm && !dm.body.text.includes(removedBanCommand) && !dm.body.text.includes(removedSpamCommand));
 	assert('主人 /help → 含 /ad 投票与白名单管理', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('/add_ad_admin') && dm.body.text.includes('/del_ad_admin'));
 	assert('主人 /help → 含动态群组三条', !!dm && dm.body.text.includes('/addgroup') && dm.body.text.includes('/delgroup') && dm.body.text.includes('/listgroups'));
@@ -5014,13 +5014,26 @@ console.log('\n[67b] /admins 主人专属权限名单');
 		body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/admins' } })
 	}), env, fakeCtxAd);
 	let dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	// 名单变长后走分段发送，断言统一看发给主人的全部分段
+	const adminsText = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').map((c) => c.body.text).join('\n');
+	const superSection = adminsText.slice(adminsText.indexOf('⭐ <b>超级管理员</b>'), adminsText.indexOf('🛡 <b>Telegram 群管理员</b>'));
+	const tgAdminSection = adminsText.slice(adminsText.indexOf('🛡 <b>Telegram 群管理员</b>'));
 	assert('/admins 主人可查看权限名单', !!dm && dm.body.text.includes('权限名单'));
 	assert('/admins 显示主人用户名', dm.body.text.includes('@owner_user') && dm.body.text.includes('TGID:<code>999</code>'));
 	assert('/admins 显示副主人用户名', dm.body.text.includes('@deputy_user') && dm.body.text.includes('TGID:<code>888</code>'));
-	assert('/admins 不显示旧白名单用户', !dm.body.text.includes('@super_user') && !dm.body.text.includes('TGID:<code>7777</code>'));
-	assert('/admins 不把旧 SUPER_ADMINS 用户加入权限名单', !dm.body.text.includes('@fallback_user') && !dm.body.text.includes('TGID:<code>6666</code>'));
+	// 旧变量 SUPER_ADMINS 早已废弃：7777 / 6666 都不能进「超级管理员」一节（该节只读 SUPER_ADMIN_IDS）
+	assert('/admins 旧变量 SUPER_ADMINS 不进超级管理员一节', superSection.includes('⭐ <b>超级管理员</b>（SUPER_ADMIN_IDS）')
+		&& superSection.includes('\n无') && !superSection.includes('7777') && !superSection.includes('6666'));
+	assert('/admins 不把旧 SUPER_ADMINS 用户加入权限名单', !adminsText.includes('@fallback_user') && !adminsText.includes('6666'));
 	assert('/admins 不单独查询旧白名单用户资料', !callsOf('getChatMember').some((c) => ['7777', '6666'].includes(String(c.body.user_id))));
-	assert('/admins 不再显示超级管理员栏目', !dm.body.text.includes('超级管理员'));
+	// 「Telegram 群管理员」一节：7777 是 -1001 的真实群管理员，出现在这里是正确的
+	assert('/admins 列出各群 Telegram 管理员（群主排最前、人数正确）',
+		tgAdminSection.includes('🛡 <b>Telegram 群管理员</b>') && tgAdminSection.includes('▸ <code>-1001</code> · 3 人')
+		&& /群主　　<a href="tg:\/\/user\?id=999">主人<\/a> @owner_user/.test(tgAdminSection)
+		&& tgAdminSection.indexOf('@owner_user') < tgAdminSection.indexOf('@super_user'));
+	assert('/admins 群管理员一节含普通群管理员', tgAdminSection.includes('管理员　<a href="tg://user?id=7777">群管理员 甲</a> @super_user'));
+	assert('/admins 没有管理员的群显示 0 人', tgAdminSection.includes('▸ <code>-1002</code> · 0 人'));
+	assert('/admins 管理员列表每群只查一次（复用，不重复请求）', callsOf('getChatAdministrators').length === 2);
 
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', {
@@ -5036,6 +5049,55 @@ console.log('\n[67b] /admins 主人专属权限名单');
 		body: JSON.stringify({ message: { message_id: 3, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: '/admins' } })
 	}), env, fakeCtxAd);
 	assert('/admins 群内静默不公开名单', callsOf('sendMessage').length === 0);
+}
+
+// ---------- [67b2] /admins 超级管理员一节 + 请求预算（免费版 50 子请求也不超限）----------
+console.log('\n[67b2] /admins 超级管理员与请求预算');
+{
+	// 超管 5555 不在任何群当管理员 → 靠逐群补查拿到资料
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: (b) => (String(b.chat_id) === '-1001'
+			? { ok: true, result: [{ user: { id: 999, first_name: '主人', username: 'owner_user' }, status: 'creator' }, { user: { id: 4242, first_name: '机器人', is_bot: true }, status: 'administrator' }] }
+			: { ok: true, result: [] }),
+		getChatMember: (b) => (String(b.user_id) === '5555' && String(b.chat_id) === '-1002'
+			? { ok: true, result: { user: { id: 5555, first_name: '超管', username: 'sa_user' }, status: 'member' } }
+			: { ok: false, description: 'Bad Request: user not found' }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: '群' + String(b.chat_id).slice(-4), type: 'supergroup' } }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	let env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMIN_IDS: '5555', DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 11, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/admins' } })
+	}), env, fakeCtxAd);
+	let text = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').map((c) => c.body.text).join('\n');
+	const superPart = text.slice(text.indexOf('⭐ <b>超级管理员</b>'), text.indexOf('🛡 <b>Telegram 群管理员</b>'));
+	assert('/admins 超级管理员一节显示 SUPER_ADMIN_IDS 里的人及其资料', superPart.includes('TGID:<code>5555</code>') && superPart.includes('@sa_user'));
+	assert('/admins 群管理员一节不列 bot 账号', !text.includes('4242') && text.includes('▸ 群1001（<code>-1001</code>） · 1 人'));
+	assert('/admins 群管理员一节标题带群名', text.includes('▸ 群1001（<code>-1001</code>）'));
+	assert('/admins 预算充足时不出现上限提示', !text.includes('请求上限'));
+
+	// 预算：30 个群 + 3 个不在任何群当管理员的超管。不设上限时要 30（管理员列表）+ 30（群名）+ 3×30（补查）= 150 次。
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999, first_name: '主人' }, status: 'creator' }] }),
+		getChatMember: () => ({ ok: false, description: 'Bad Request: user not found' }),
+		getChat: (b) => ({ ok: true, result: { id: Number(b.chat_id), title: 'G', type: 'supergroup' } }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+	const manyGroups = Array.from({ length: 30 }, (_, i) => '-100' + String(700000 + i));
+	env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: manyGroups.join(','), OWNER_IDS: '999', SUPER_ADMIN_IDS: '6001,6002,6003', DB: makeFakeDB([]) };
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 12, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/admins' } })
+	}), env, fakeCtxAd);
+	const lookupCalls = callsOf('getChatAdministrators').length + callsOf('getChat').length + callsOf('getChatMember').length;
+	text = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').map((c) => c.body.text).join('\n');
+	assert('/admins 名单查询请求数不超过预算 40（免费版 50 子请求上限内）', lookupCalls <= 40, '实际 ' + lookupCalls + ' 次');
+	assert('/admins 优先保证各群管理员列表（30 个群全部查到）', callsOf('getChatAdministrators').length === 30);
+	assert('/admins 达到上限时名单仍完整输出三类人员与超管 TGID', text.includes('👑 <b>主人</b>') && text.includes('TGID:<code>6001</code>') && text.includes('TGID:<code>6003</code>'));
+	assert('/admins 达到上限时附说明', text.includes('本次查询已达请求上限'));
 }
 
 // ---------- [67c] /groups 仅主人查看配置群组 ----------
@@ -5158,9 +5220,9 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 		&& String(check.result?.body.text || '').includes('-1009999999'));
 	assert('外部群记录 → 提示写明影响所有接入 GKYbot 的群',
 		String(check.result?.body.text || '').includes('GKY 全局白名单')
-		&& String(check.result?.body.text || '').includes('对所有接入 GKYbot 的群生效'));
+		&& String(check.result?.body.text || '').includes('所有接入 GKYbot 的群都生效'));
 	assert('外部群记录 → 提示写明不改动本地 D1',
-		String(check.result?.body.text || '').includes('不会改动你的 D1 黑名单'));
+		String(check.result?.body.text || '').includes('不改动本地黑名单'));
 	assert('外部群记录 → 不再引导去 GKY 官方网页',
 		!String(check.result?.body.text || '').includes('GKY 官方网页'));
 
@@ -5168,7 +5230,7 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 	assert('GKY TGID 不一致 → 只禁用 GKY 复制', String(check.result?.body.text || '').includes('TGID 无法与查询目标核对') && JSON.stringify(check.copies) === JSON.stringify(['/unban ' + TARGET_ID]));
 
 	check = await runCheck({ gky: new Error('GKY unavailable'), env: makeCheckEnv([localEntry]) });
-	assert('GKY 查询失败 → 仍返回本地状态和 /unban 复制', String(check.result?.body.text || '').includes('GKY 查询失败') && String(check.result?.body.text || '').includes('本地黑名单:在黑名单中') && JSON.stringify(check.copies) === JSON.stringify(['/unban ' + TARGET_ID]));
+	assert('GKY 查询失败 → 仍返回本地状态和 /unban 复制', String(check.result?.body.text || '').includes('GKY 查询失败') && String(check.result?.body.text || '').includes('状态　　🚫 在黑名单中') && JSON.stringify(check.copies) === JSON.stringify(['/unban ' + TARGET_ID]));
 
 	check = await runCheck({ gky: GKY_CONFIGURED, env: makeCheckEnv([localEntry]), chat: { id: -1001, type: 'supergroup', title: '配置群' } });
 	assert('GROUP_ID 配置群 /check → 双封禁显示两个复制按钮', check.copies.length === 2);
@@ -5223,7 +5285,7 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 	assert('群管理员私聊 /check 不触发任何群闪屏', callsOf('sendMessage').every((c) => Number(c.body.chat_id) > 0));
 
 	check = await runCheck({ gky: GKY_CONFIGURED, env: makeCheckEnv([localEntry]), chat: { id: -2001, type: 'supergroup', title: '未配置群' } });
-	assert('非 GROUP_ID 来源群 → 仍返回双库详情', String(check.result?.body.text || '').includes('封禁查询结果') && String(check.result?.body.text || '').includes('本地黑名单:在黑名单中'));
+	assert('非 GROUP_ID 来源群 → 仍返回双库详情', String(check.result?.body.text || '').includes('封禁查询结果') && String(check.result?.body.text || '').includes('状态　　🚫 在黑名单中'));
 	assert('非 GROUP_ID 来源群 → 仅查询且无复制按钮', String(check.result?.body.text || '').includes('不提供任何复制按钮') && check.buttons.length === 0);
 
 	check = await runCheck({ gky: GKY_EXTERNAL, env: makeCheckEnv([localEntry]), chat: { id: -2001, type: 'supergroup', title: '未配置群' }, text: '/check', replyTo: { message_id: 3, from: { id: Number(TARGET_ID), is_bot: false, first_name: '目标用户' } } });

@@ -1120,7 +1120,7 @@ section('[8] 命令层端到端（权限、快照闭环、指纹与样本维护�
 	const freshNotice = calls
 		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(OWNER_ID))
 		.map((c) => String(c.body?.text || '')).join('\n');
-	assert('封禁通知报告已加 AI 样本', freshNotice.includes('已加 1 条 AI 样本'), freshNotice);
+	assert('封禁通知报告已加 AI 样本', freshNotice.includes('自动学习：') && freshNotice.includes('AI 样本 +1 条'), freshNotice);
 
 	// /confirm 不再被广告命令入口接管。断言的是「不产生 /confirm 的那套回执、不动快照」，
 	// 而不是「有报错」—— 未知命令交回既有命令层处理，那不是本段的职责。

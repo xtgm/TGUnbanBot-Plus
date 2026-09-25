@@ -1556,7 +1556,7 @@ async function probeTargetMemberBeforeBan(groupId, userId) {
 		const { 中文 } = translateTelegramError(error, { userId, retryCommand: '/ban 或 /spam' });
 		return { ok: false, state: 'unknown', label: `成员状态查询失败：${中文}`, error };
 	} catch (error) {
-		return { ok: false, state: 'unknown', label: `成员状态查询异常：${error.message || String(error)}`, error: error.message || String(error) };
+		return { ok: false, state: 'unknown', label: `成员状态查询异常：${toChineseErrorText(error?.message || String(error))}`, error: error.message || String(error) };
 	}
 }
 
@@ -1635,11 +1635,83 @@ function translateTelegramError(description, options = {}) {
 	if (lower.includes('forbidden') && lower.includes('blocked')) {
 		return { 中文: '用户拉黑了 bot', 建议: '此情况不影响 Telegram 群封禁/预封执行' };
 	}
-	if (lower.includes('flood') || lower.includes('too many requests')) {
+	if (lower.includes('flood') || lower.includes('too many requests') || lower.includes('retry after')) {
 		return { 中文: 'Telegram 限流', 建议: '稍后重试，或减小批量大小' };
 	}
-	// 兜底：原文返回
-	return { 中文: desc, 建议: '查看 Worker 日志和 Telegram 文档' };
+	if (lower.includes('bot was kicked')) {
+		return { 中文: 'bot 已被踢出该群', 建议: '重新把 bot 拉进该群并设为管理员' };
+	}
+	if (lower.includes('upgraded to a supergroup') || lower.includes('migrate_to_chat_id')) {
+		return { 中文: '该群已升级为超级群，群 ID 已变更', 建议: '用新的 -100 开头群 ID 更新 GROUP_ID 或动态群组' };
+	}
+	if (lower.includes('bot is not a member of the channel') || lower.includes('need administrator rights in the channel')) {
+		return { 中文: 'bot 不是该频道管理员', 建议: '把 bot 设为频道管理员' };
+	}
+	if (lower.includes("bot can't initiate conversation") || lower.includes("bot can't send messages to bots")) {
+		return { 中文: '对方从未私聊过 bot，无法主动发消息', 建议: '请对方先私聊 bot 发送 /start' };
+	}
+	if (lower.includes('user is deactivated')) {
+		return { 中文: '该账号已注销', 建议: '无需处理' };
+	}
+	if (lower.includes('have no rights to send') || lower.includes('not enough rights to send')) {
+		return { 中文: 'bot 在该群没有发言权限', 建议: '在群设置里给 bot 开启发消息权限' };
+	}
+	if (lower.includes('available only for supergroups')) {
+		return { 中文: '该操作只支持超级群', 建议: '把群升级为超级群后再试' };
+	}
+	if (lower.includes('message is not modified')) {
+		return { 中文: '内容没有变化，无需修改', 建议: '无需处理' };
+	}
+	if (lower.includes('message to edit not found') || lower.includes('message not found')) {
+		return { 中文: '消息已不存在', 建议: '消息可能已被删除，无需处理' };
+	}
+	if (lower.includes('query is too old') || lower.includes('query id is invalid')) {
+		return { 中文: '按钮点击已过期', 建议: '重新发送命令后再点' };
+	}
+	if (lower.includes('too many subrequests')) {
+		return { 中文: '单次请求的外部调用次数超限', 建议: '减小单次处理量，或稍后重试' };
+	}
+	if (lower.includes('internal server error') || lower.includes('bad gateway') || lower.includes('service unavailable')
+		|| lower.includes('gateway timeout') || /\bstatus:?\s*5\d\d\b/.test(lower) || /\bhttp\s*5\d\d\b/.test(lower)) {
+		return { 中文: 'Telegram 服务器暂时故障', 建议: '稍后重试' };
+	}
+	if (lower.includes('timeout') || lower.includes('timed out') || lower.includes('fetch failed') || lower.includes('network')
+		|| lower.includes('econnreset') || lower.includes('socket') || lower.includes('connection')) {
+		return { 中文: '网络请求超时或中断', 建议: '稍后重试' };
+	}
+	if (lower.includes('d1_') || lower.includes('sqlite') || lower.includes('no such table') || lower.includes('database')) {
+		return { 中文: 'D1 数据库操作失败', 建议: '稍后重试；持续失败请检查 D1 绑定与 Worker 日志' };
+	}
+	if (lower.includes('unexpected token') || lower.includes('json')) {
+		return { 中文: '返回数据格式异常', 建议: '稍后重试' };
+	}
+	if (lower.includes('cannot read properties') || lower.includes('is not a function') || lower.includes('is not defined')
+		|| lower.includes('typeerror') || lower.includes('referenceerror') || lower.includes('rangeerror')) {
+		return { 中文: '程序内部异常', 建议: '查看 Worker 日志定位原因' };
+	}
+	if (/\bstatus:?\s*4\d\d\b/.test(lower) || lower.includes('bad request')) {
+		return { 中文: 'Telegram 拒绝了本次请求', 建议: '查看 Worker 日志中的原文' };
+	}
+	// 兜底：本身已是中文说明的（如「GKY 查询异常」「批量 D1 操作连续失败」）原样返回；
+	// 仍是英文报错的，聊天里只给中文，英文原文写进 Worker 日志供排查（主人 2026-09-25 定的口径）。
+	if (!looksLikeEnglishErrorText(desc)) {
+		return { 中文: desc, 建议: '查看 Worker 日志获取详情' };
+	}
+	console.error('[错误翻译] 未收录的报错原文：' + desc);
+	return { 中文: '未能识别的错误（原文已写入 Worker 日志）', 建议: '到 Cloudflare Worker 日志查看原文' };
+}
+
+// 是否仍是英文报错：没有中文字符，或含连续两个以上英文单词（「not enough rights」这类）。
+// 单个英文词（bot、D1、GKY、HTTP）夹在中文里不算 —— 那是项目自己的中文说明。
+function looksLikeEnglishErrorText(text) {
+	const s = String(text || '');
+	if (!/[一-龥]/.test(s)) return /[a-z]/i.test(s);
+	return /[a-z]{2,}[\s:_\-]+[a-z]{2,}[\s:_\-]+[a-z]{2,}/i.test(s);
+}
+
+// 报错 → 只含中文原因的一句话。聊天回执统一走这里；英文原文由翻译兜底写入日志。
+function toChineseErrorText(raw, options = {}) {
+	return translateTelegramError(raw, options).中文;
 }
 
 function isTelegramPermissionError(description) {
@@ -2283,7 +2355,7 @@ async function addManyToBlacklist(ids, env, options = {}) {
 			}
 		} catch (error) {
 			console.error('批量添加黑名单时出错:', error);
-			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 添加黑名单失败: ${error.message || error}` })));
+			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 添加黑名单失败: ${toChineseErrorText(error?.message || error)}` })));
 		}
 	}
 	return results;
@@ -2305,7 +2377,7 @@ async function checkManyUnbanEligibility(ids, env, options = {}) {
 	try {
 		await ensureD1Table(env);
 	} catch (error) {
-		results.failed.push(...uniqueIds.map((id) => ({ id, msg: `❌ 无法确认 D1 黑名单状态: ${error.message || error}` })));
+		results.failed.push(...uniqueIds.map((id) => ({ id, msg: `❌ 无法确认 D1 黑名单状态: ${toChineseErrorText(error?.message || error)}` })));
 		return results;
 	}
 
@@ -2323,7 +2395,7 @@ async function checkManyUnbanEligibility(ids, env, options = {}) {
 			}
 		} catch (error) {
 			console.error('批量检查 /unban D1 资格时出错:', error);
-			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 无法确认 D1 黑名单状态: ${error.message || error}` })));
+			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 无法确认 D1 黑名单状态: ${toChineseErrorText(error?.message || error)}` })));
 		}
 	}
 	if (options.allowD1Removal !== true || results.blacklisted.length === 0) {
@@ -2370,7 +2442,7 @@ async function removeManyFromBlacklist(ids, env) {
 			}
 		} catch (error) {
 			console.error('批量移除黑名单时出错:', error);
-			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 移除黑名单失败: ${error.message || error}` })));
+			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 移除黑名单失败: ${toChineseErrorText(error?.message || error)}` })));
 		}
 	}
 	return results;
@@ -2728,9 +2800,8 @@ function formatBulkJobFailureLine(failure) {
 		userId: failure.userId,
 		retryCommand: isUnban ? '/unban' : '/ban 或 /spam'
 	});
-	const reasonText = 中文 === rawError
-		? escapeHtml(rawError)
-		: `${escapeHtml(中文)}（${escapeHtml(rawError)}）`;
+	// 只给中文原因：英文原文已由 translateTelegramError 兜底写入 Worker 日志，聊天里不再附带。
+	const reasonText = escapeHtml(中文);
 	return `❌ <code>${escapeHtml(failure.userId || '')}</code>${groupText}: ${reasonText}\n   建议:${escapeHtml(建议)}`;
 }
 
@@ -4406,7 +4477,31 @@ async function formatTargetByTgid(tgid) {
 	return `<code>${escapeHtml(idStr)}</code>`;
 }
 
-async function resolvePermissionUserProfiles(ids) {
+// /admins 单次命令的 Telegram 外部请求预算。Cloudflare 免费版每次请求最多 50 个子请求，
+// 名单查询只用 40 个，余量留给回执发送等开销；付费版也按同一预算走 —— /admins 是低频查询，
+// 不值得为它多花资源。超出预算的查询直接跳过，对应位置回落成纯 TGID / 群 ID，名单主体照常输出。
+const ADMINS_LOOKUP_BUDGET = 40;
+
+function createLookupBudget(limit) {
+	return {
+		left: limit,
+		skipped: 0,
+		take() {
+			if (this.left <= 0) { this.skipped += 1; return false; }
+			this.left -= 1;
+			return true;
+		}
+	};
+}
+
+// options（均可选，不传时行为与改动前完全一致）：
+//   budget        —— createLookupBudget 预算；每次 Telegram 请求前扣 1，扣完即跳过后续查询
+//   adminLists    —— Map，顺手记下每个群的管理员列表，供 /admins 的「群管理员」一节复用，不再重复请求
+//   betweenPasses —— 管理员列表查完、逐人补查之前执行（/admins 用它先查群名，补查最费请求，排最后）
+async function resolvePermissionUserProfiles(ids, options = {}) {
+	const budget = options.budget || null;
+	const take = () => !budget || budget.take();
+	const adminLists = options.adminLists instanceof Map ? options.adminLists : null;
 	const wanted = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))];
 	const wantedSet = new Set(wanted);
 	const profiles = new Map();
@@ -4425,6 +4520,10 @@ async function resolvePermissionUserProfiles(ids) {
 	const lookupGroups = [...GROUP_IDS, ...PROFILE_LOOKUP_GROUPS];
 
 	for (const groupId of lookupGroups) {
+		if (!take()) {
+			if (adminLists) adminLists.set(String(groupId), { ok: false, skipped: true, members: [] });
+			continue;
+		}
 		try {
 			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
 				method: 'POST',
@@ -4433,8 +4532,10 @@ async function resolvePermissionUserProfiles(ids) {
 			});
 			const result = await response.json();
 			if (!response.ok || !result.ok || !Array.isArray(result.result)) {
+				if (adminLists) adminLists.set(String(groupId), { ok: false, error: result?.description || ('HTTP ' + response.status), members: [] });
 				continue;
 			}
+			if (adminLists) adminLists.set(String(groupId), { ok: true, members: result.result });
 			for (const member of result.result) {
 				const user = member?.user;
 				const id = user?.id ? String(user.id) : '';
@@ -4449,8 +4550,11 @@ async function resolvePermissionUserProfiles(ids) {
 			}
 		} catch (error) {
 			console.error(`[权限名单] 查询群管理员失败 group=${groupId}:`, error);
+			if (adminLists) adminLists.set(String(groupId), { ok: false, error: error?.message || String(error), members: [] });
 		}
 	}
+
+	if (typeof options.betweenPasses === 'function') await options.betweenPasses();
 
 	// 逐个补查：上面 getChatAdministrators 只能查到【管理员】，而只读资料群里的目标人
 	// 通常只是普通成员，必须靠 getChatMember 才查得到 —— 这一轨才是只读资料群的主用途。
@@ -4461,9 +4565,12 @@ async function resolvePermissionUserProfiles(ids) {
 	// 后果是「静态表只作兜底、查到实时资料就覆盖」这个承诺根本不成立：
 	// 对方改了昵称永远显示旧值，配了只读资料群也白配。
 	// 改为只跳过【已由 API 查到】的，静态兜底不算已解析。
-	for (const id of wanted) {
+	//
+	// 【预算】这一轨最费请求（每人最多把全部群查一遍），预算用完立即整体停下，不再挨个群试。
+	lookup: for (const id of wanted) {
 		if (profiles.get(id)?.source === 'getChatAdministrators') continue;
 		for (const groupId of lookupGroups) {
+			if (!take()) break lookup;
 			try {
 				const result = await checkUserStatus(id, groupId);
 				const user = result?.result?.user;
@@ -4489,10 +4596,11 @@ async function resolvePermissionUserProfiles(ids) {
 // 【为什么要去重缓存】同一批权限人往往集中在少数几个群（截图里 6 个人分布在 5 个群），
 // 逐行调 getChat 会把同一个群查好几遍。/admins 是低频命令，但没理由白花请求。
 // 拿不到资料时回落成纯 ID —— 与改动前的显示完全一致，不会因为查询失败反而更难读。
-async function resolvePermissionGroupLabels(groupIds) {
+async function resolvePermissionGroupLabels(groupIds, options = {}) {
 	const labels = new Map();
 	const unique = [...new Set((groupIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
 	for (const groupId of unique) {
+		if (options.budget && !options.budget.take()) continue;
 		try {
 			const info = await fetchConfiguredGroupInfo(groupId);
 			if (!info?.ok) continue;
@@ -4567,16 +4675,74 @@ function renderPermissionSection(title, ids, profiles, groupLabels) {
 	return lines;
 }
 
+// 「Telegram 群管理员」一节：逐个治理群列出真人管理员（群主排最前，bot 账号不列）。
+// 数据直接复用 resolvePermissionUserProfiles 顺手记下的管理员列表，不额外发请求。
+function renderTelegramAdminSection(groupIds, adminLists, groupLabels) {
+	const lines = ['🛡 <b>Telegram 群管理员</b>'];
+	if (!groupIds.length) {
+		lines.push('无');
+		return lines;
+	}
+	groupIds.forEach((groupId, idx) => {
+		if (idx > 0) lines.push('');
+		const head = '▸ ' + renderPermissionGroupText(groupId, groupLabels.get(groupId));
+		const entry = adminLists.get(groupId);
+		if (!entry || entry.skipped) {
+			lines.push(head + ' · 未查询（本次请求数已达上限）');
+			return;
+		}
+		if (!entry.ok) {
+			lines.push(head + ' · 获取失败：' + escapeHtml(toChineseErrorText(entry.error || '未知错误')));
+			return;
+		}
+		const humans = (entry.members || []).filter((m) => m?.user?.id && !m.user.is_bot);
+		humans.sort((a, b) => (b.status === 'creator') - (a.status === 'creator'));
+		lines.push(head + ' · ' + humans.length + ' 人');
+		for (const member of humans) {
+			const user = member.user;
+			const id = String(user.id);
+			const name = [user.first_name, user.last_name].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim() || id;
+			const role = member.status === 'creator' ? '群主　　' : '管理员　';
+			const nameLink = '<a href="tg://user?id=' + escapeHtml(id) + '">' + escapeHtml(name) + '</a>';
+			const username = user.username ? ' @' + escapeHtml(user.username) : '';
+			const anonymous = member.is_anonymous ? '（匿名）' : '';
+			lines.push('　' + role + nameLink + username + anonymous + '（<code>' + escapeHtml(id) + '</code>）');
+		}
+	});
+	return lines;
+}
+
 async function renderPermissionAdminsList() {
 	const primaryOwner = OWNER_IDS.length ? [OWNER_IDS[0]] : [];
 	const secondaryOwners = OWNER_IDS.length > 1 ? OWNER_IDS.slice(1) : [];
-	const allIds = [...primaryOwner, ...secondaryOwners];
-	const profiles = await resolvePermissionUserProfiles(allIds);
-	// 只查【实际出现在名单里】的来源群，且函数内部去重 ——
-	// 不是遍历全部配置群，那会在群多时白花一堆 getChat。
-	const groupLabels = await resolvePermissionGroupLabels(
-		[...profiles.values()].map((p) => p?.groupId).filter(Boolean)
-	);
+	// 只读 SUPER_ADMIN_IDS；旧变量 SUPER_ADMINS 早已废弃，不进名单也不单独查资料。
+	const superAdmins = [...new Set((SUPER_ADMIN_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
+	const allIds = [...primaryOwner, ...secondaryOwners, ...superAdmins];
+	const governedGroups = [...new Set((GROUP_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
+
+	// 请求顺序即优先级（预算见 ADMINS_LOOKUP_BUDGET）：
+	//   ① 各群管理员列表 —— 同时解析出名单里当管理员的人，并给「群管理员」一节用
+	//   ② 治理群群名    —— 「群管理员」一节的分组标题
+	//   ③ 逐人补查      —— 不在任何群当管理员的人（超管常见），最费请求，排在后面
+	//   ④ 补查到的来源群名（只读资料群等尚未取到名字的群）
+	const budget = createLookupBudget(ADMINS_LOOKUP_BUDGET);
+	const adminLists = new Map();
+	let groupLabels = new Map();
+	const profiles = await resolvePermissionUserProfiles(allIds, {
+		budget,
+		adminLists,
+		betweenPasses: async () => {
+			groupLabels = await resolvePermissionGroupLabels(governedGroups, { budget });
+		}
+	});
+	const extraSourceGroups = [...profiles.values()]
+		.map((p) => String(p?.groupId || ''))
+		.filter((groupId) => groupId && !governedGroups.includes(groupId));
+	if (extraSourceGroups.length) {
+		const extraLabels = await resolvePermissionGroupLabels(extraSourceGroups, { budget });
+		for (const [groupId, label] of extraLabels) groupLabels.set(groupId, label);
+	}
+
 	const lines = [
 		'🔐 <b>权限名单</b>',
 		'',
@@ -4584,9 +4750,16 @@ async function renderPermissionAdminsList() {
 		'',
 		...renderPermissionSection('👤 <b>副主人</b>', secondaryOwners, profiles, groupLabels),
 		'',
+		...renderPermissionSection('⭐ <b>超级管理员</b>（SUPER_ADMIN_IDS）', superAdmins, profiles, groupLabels),
+		'',
+		...renderTelegramAdminSection(governedGroups, adminLists, groupLabels),
+		'',
 		'说明:用户名/昵称来自 Telegram 当前可读取的群成员资料;未获取时仍以 TGID 为准。',
 		'来源群名可点击跳转（公开群走 t.me 永久链接；私密群需 bot 为管理员才有邀请链接，否则只显示群名）。'
 	];
+	if (budget.skipped > 0) {
+		lines.push('为控制资源消耗，本次查询已达请求上限，部分资料只显示 TGID / 群 ID。');
+	}
 	return lines.join('\n');
 }
 
@@ -4659,72 +4832,66 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	}
 
 	// GKY 与本地 D1 是两套独立状态；任一查询结果都不能吞掉另一套复制操作。
+	// 【排版】分三节「GKY 封禁记录 / 本地黑名单 / 提示」，每行「标签　内容」，与 /help 同一套风格；
+	// 提示类文字统一收进末尾「提示」一节，不再夹在数据中间。
 	let localCheck = { isBlacklisted: false, entry: null };
-	let localBlacklistInfo = '';
+	const localLines = [];
 	if (options.env) {
 		localCheck = await checkBlacklist(queryTgid, options.env);
+		localLines.push('<b>━━ 本地黑名单 ━━</b>');
 		if (localCheck.isBlacklisted) {
 			const entry = localCheck.entry;
 			const reason = translateBlacklistReason(entry?.reason);
 			const operator = await translateBlacklistOperator(entry?.by);
 			const addedAt = entry?.at || '未知';
 			const noteText = String(entry?.note || '').trim();
-			localBlacklistInfo = `\n🚫 <b>本地黑名单:在黑名单中</b>\n` +
-				`├ 加黑方式:${reason}\n`;
-			if (noteText) {
-				localBlacklistInfo += `├ 执行原因:${escapeHtml(noteText)}\n`;
-			}
-			localBlacklistInfo += `├ 操作人:${operator}\n` +
-				`└ 时间:${escapeHtml(addedAt)}\n`;
+			localLines.push('状态　　🚫 在黑名单中');
+			localLines.push('加黑方式　' + reason);
+			if (noteText) localLines.push('执行原因　' + escapeHtml(noteText));
+			localLines.push('操作人　　' + operator);
+			localLines.push('加黑时间　' + escapeHtml(addedAt));
 		} else {
-			localBlacklistInfo = `\n✅ <b>本地黑名单:不在黑名单中</b>\n`;
+			localLines.push('状态　　✅ 不在黑名单');
 		}
 	}
 
-	let responseMessage = '';
+	const userMention = options.targetUser ? formatUserMention(options.targetUser) : '';
+	const userLine = '用户　　' + (userMention
+		? userMention + '（<code>' + escapeHtml(queryTgid) + '</code>）'
+		: '<a href="tg://user?id=' + escapeHtml(queryTgid) + '">' + escapeHtml(queryTgid) + '</a>');
+	const gkyLines = ['<b>━━ GKY 封禁记录 ━━</b>', userLine];
+	const notes = [];
 	let canCopyGkyCommand = false;
-	// 记录是否属于本部署的 GROUP_ID 配置群：决定 GKY 代码的语义是「移出本群黑名单」
+	// 记录是否属于本部署的配置群：决定 GKY 代码的语义是「移出本群黑名单」
 	// 还是「加 GKY 全局白名单」，两者影响面差别很大，必须在提示里说清。
 	let gkyRecordInConfiguredGroup = false;
 
 	if (!banlistData.success) {
-		responseMessage = `❌ <b>GKY 查询失败</b>\n\n${escapeHtml(banlistData.error || '未知错误')}${localBlacklistInfo}`;
+		gkyLines.push('状态　　❌ GKY 查询失败（' + escapeHtml(toChineseErrorText(banlistData.error || '未知错误')) + '）');
 	} else if (!banlistData.banned) {
-		responseMessage = `✅ <b>查询结果</b>\n\nTGID <code>${escapeHtml(queryTgid)}</code> 没有 GKY 封禁记录。`;
-		if (options.targetUser) {
-			responseMessage = `✅ <b>查询结果</b>\n\n用户 ${formatUserMention(options.targetUser) || `<code>${escapeHtml(queryTgid)}</code>`} 没有 GKY 封禁记录。\nTGID: <code>${escapeHtml(queryTgid)}</code>`;
-		}
-		responseMessage += localBlacklistInfo;
+		gkyLines.push('状态　　✅ 无封禁记录');
 	} else {
-		responseMessage = `🔍 <b>封禁查询结果</b>\n\n`;
-		if (options.targetUser) {
-			responseMessage += `👤 <b>用户:</b> ${formatUserMention(options.targetUser) || `<code>${escapeHtml(queryTgid)}</code>`}\n`;
-		}
-		responseMessage += `📋 <b>TGID:</b> <a href="tg://user?id=${escapeHtml(queryTgid)}">${escapeHtml(queryTgid)}</a>\n`;
-
 		if (banlistData.chatId) {
 			const chatInfo = await getChatInfoFromId(banlistData.chatId);
-			responseMessage += `💬 <b>ChatID:</b> <code>${escapeHtml(banlistData.chatId)}</code>`;
+			const idText = '<code>' + escapeHtml(banlistData.chatId) + '</code>';
+			let groupText = idText;
 			if (chatInfo && chatInfo.title) {
-				if (chatInfo.link) {
-					responseMessage += `(<a href="${escapeHtml(chatInfo.link)}">${escapeHtml(chatInfo.title)}</a>)`;
-				} else {
-					responseMessage += `(${escapeHtml(chatInfo.title)})`;
-				}
+				const titleText = chatInfo.link
+					? '<a href="' + escapeHtml(chatInfo.link) + '">' + escapeHtml(chatInfo.title) + '</a>'
+					: escapeHtml(chatInfo.title);
+				groupText = titleText + '（' + idText + '）';
 			}
-			responseMessage += `\n`;
+			gkyLines.push('来源群　' + groupText);
 		}
-
-		if (banlistData.msgId) responseMessage += `📨 <b>MsgID:</b> <code>${escapeHtml(banlistData.msgId)}</code>\n`;
-		if (banlistData.recordedDate) responseMessage += `📅 <b>封禁日期:</b> ${escapeHtml(banlistData.recordedDate)}\n`;
-		if (banlistData.reason) responseMessage += `⚠️ <b>封禁原因:</b> ${escapeHtml(banlistData.reason)}\n`;
-		if (banlistData.info) responseMessage += `\n📝 <b>封禁内容:</b>\n<tg-spoiler>${escapeHtml(banlistData.info)}</tg-spoiler>\n`;
-		responseMessage += localBlacklistInfo;
+		if (banlistData.msgId) gkyLines.push('消息 ID　<code>' + escapeHtml(banlistData.msgId) + '</code>');
+		if (banlistData.recordedDate) gkyLines.push('封禁时间　' + escapeHtml(formatGkyRecordedDate(banlistData.recordedDate)));
+		if (banlistData.reason) gkyLines.push('封禁原因　' + escapeHtml(banlistData.reason));
+		if (banlistData.info) gkyLines.push('封禁内容　<tg-spoiler>' + escapeHtml(banlistData.info) + '</tg-spoiler>');
 
 		const recordTgid = String(banlistData.tgid || '');
 		if (recordTgid !== queryTgid) {
 			// 这道门必须留：GKY 返回的记录与查询目标不是同一个人，此时给按钮会给错人加白名单。
-			responseMessage += '\n\n⚠️ 当前 GKY 返回记录的 TGID 无法与查询目标核对，因此不提供 GKY 复制按钮。请稍后重新使用 <code>/check</code>。';
+			notes.push('⚠️ GKY 返回记录的 TGID 无法与查询目标核对，不提供 GKY 复制按钮，请稍后重新 <code>/check</code>');
 		} else {
 			// 与源项目对齐：只要 GKY 判定被封就提供复制按钮，chatId 只决定"移出黑名单"还是
 			// "添加白名单"两种语义，而不是决定给不给按钮。
@@ -4736,21 +4903,28 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		}
 	}
 
+	const composeText = () => {
+		const parts = ['🔍 <b>封禁查询结果</b>', '', ...gkyLines];
+		if (localLines.length) parts.push('', ...localLines);
+		if (notes.length) parts.push('', '<b>━━ 提示 ━━</b>', ...notes);
+		return parts.join('\n');
+	};
+
 	if (!options.includeReviewAction) {
-		return { text: responseMessage };
+		return { text: composeText() };
 	}
 
-	// 非 GROUP_ID 群仍可查询两套状态，但不开放任何复制操作。
+	// 非配置群仍可查询两套状态，但不开放任何复制操作。
 	if (options.dispatchSourceAllowed === false) {
-		responseMessage += '\n\n⚠️ 当前查询来自非 <b>GROUP_ID</b> 群，因此仅提供查询结果，不提供任何复制按钮。请在私聊或 GROUP_ID 配置群重新使用 <code>/check</code>。';
-		return { text: responseMessage };
+		notes.push('⚠️ 当前查询来自非配置群，仅提供查询结果，不提供任何复制按钮；请在私聊或配置群重新 <code>/check</code>');
+		return { text: composeText() };
 	}
 
 	const inlineKeyboard = [];
 	if (canCopyGkyCommand) {
 		if (gkyRecordInConfiguredGroup) {
 			// 记录就在自己的配置群：语义是把该号从该群的 GKY 黑名单里移出。
-			responseMessage += '\n\nℹ️ GKY 与本地 D1 黑名单相互独立。下方按钮只复制 GKY 移出黑名单代码，必须由真人管理员在封禁记录对应的配置群发送。';
+			notes.push('ℹ️ 下方代码会把此号移出该群的 GKY 黑名单，需要真人管理员在对应配置群发送');
 			inlineKeyboard.push([{
 				text: '📋 点击复制 GKY 移出黑名单代码',
 				copy_text: { text: `GKYbotSave\n${queryTgid}` }
@@ -4759,10 +4933,9 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 			// 记录来自别的群：GKYbotSave 此时的效果是给该号加 GKY【全局】白名单，
 			// 该号在所有接入 GKYbot 的群都会被放行 —— 影响面远大于"解封我这个群"，
 			// 按钮文字四个字说不清，必须在提示里写明，否则容易被当成本地白名单。
-			responseMessage += '\n\n⚠️ 此 GKY 封禁记录<b>不属于</b>你的 <b>GROUP_ID</b> 配置群（来源群 <code>'
-				+ escapeHtml(String(banlistData.chatId || '未知'))
-				+ '</code>）。下方代码的效果是给该号加 <b>GKY 全局白名单</b> —— 对所有接入 GKYbot 的群生效，不只是你的群，请确认后再发送。'
-				+ '\nℹ️ GKY 与本地 D1 黑名单相互独立，此代码不会改动你的 D1 黑名单；需由真人管理员发送才生效。';
+			// 来源群 ID 已在「来源群」一行给出，这里不再重复。
+			notes.push('⚠️ 该记录不属于你的配置群，下方代码会给此号加 GKY 全局白名单（所有接入 GKYbot 的群都生效）');
+			notes.push('ℹ️ 只影响 GKY，不改动本地黑名单；需要真人管理员发送才生效');
 			inlineKeyboard.push([{
 				text: '📋 点击复制 GKY 添加全局白名单代码',
 				copy_text: { text: `GKYbotSave\n${queryTgid}` }
@@ -4771,13 +4944,14 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	}
 
 	if (localCheck.isBlacklisted) {
-		responseMessage += '\n\nℹ️ 下方按钮只复制本地解封命令，不会直接修改 D1；仍需由有权限的管理员发送执行。';
+		notes.push('ℹ️ 下方本地解封命令只是复制，不会直接修改黑名单；需要有权限的管理员发送');
 		inlineKeyboard.push([{
 			text: '📋 点击复制 本地解封命令',
 			copy_text: { text: `/unban ${queryTgid}` }
 		}]);
 	}
 
+	const responseMessage = composeText();
 	if (!inlineKeyboard.length) {
 		return { text: responseMessage };
 	}
@@ -4786,6 +4960,16 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		text: responseMessage,
 		replyMarkup: { inline_keyboard: inlineKeyboard }
 	};
+}
+
+// GKY 返回的时间形如「2026-07-27T08:23:43 [UTC+08:00]」，整理成「2026-07-27 08:23:43（UTC+8）」。
+// 认不出的格式原样返回 —— GKY 是第三方站点，格式变了宁可显示原样也不能显示错。
+function formatGkyRecordedDate(raw) {
+	const s = String(raw || '').trim();
+	const m = s.match(/^(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2}(?::\d{2})?)\s*\[?UTC\s*([+-])(\d{1,2})(?::?(\d{2}))?\]?$/i);
+	if (!m) return s;
+	const minutes = m[5] && m[5] !== '00' ? ':' + m[5] : '';
+	return m[1] + ' ' + m[2] + '（UTC' + m[3] + Number(m[4]) + minutes + '）';
 }
 
 const BOT_MODERATION_LOG_LABELS = {
@@ -7253,7 +7437,7 @@ function classifyAdDeleteOutcome(result) {
 			effective: true,
 			status: 'already_deleted',
 			summary: '已被其他机器人或管理员删除，等效成功',
-			detail: 'Telegram 原始返回:' + rawError,
+			detail: '',
 		};
 	}
 	const translated = translateTelegramError(rawError);
@@ -7261,7 +7445,7 @@ function classifyAdDeleteOutcome(result) {
 		effective: false,
 		status: 'failed',
 		summary: '删除失败:' + translated.中文,
-		detail: '建议:' + translated.建议 + '；Telegram 原始返回:' + rawError,
+		detail: '建议:' + translated.建议,
 	};
 }
 
@@ -7400,7 +7584,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await handleAdRecentCommand(message, env, ctx);
 		} catch (error) {
 			console.error('[学习候选] /recent 执行异常:', error);
-			await sendTelegramMessage(getMessageActorId(message), '❌ 命令执行异常：' + escapeHtml(String(error?.message || error)));
+			await sendTelegramMessage(getMessageActorId(message), '❌ 命令执行异常：' + escapeHtml(toChineseErrorText(String(error?.message || error))));
 		}
 		return;
 	}
@@ -8137,7 +8321,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/listgroups　列出全部生效群组',
 			'',
 			'<b>━━ 查询与退群（仅私聊）━━</b>',
-			'/admins　查看主人 / 副主人名单',
+			'/admins　查看主人、副主人、超级管理员与各群 Telegram 管理员名单',
 			'/groups　查看当前生效群组信息',
 			'/leavegroup -100xxx　让 bot 退出该群',
 			'',
@@ -8161,9 +8345,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/whitelist [list|add|del] [域名]　维护域名白名单，命中即豁免',
 			'',
 			'<b>━━ 说明 ━━</b>',
-			'· 超级管理员（SUPER_ADMIN_IDS）：免群管理员身份即可用上面四条封禁命令；不参与 /stats，本人不豁免广告检测与黑名单拦截。',
-			'· 群内授权命令立即撤回，完整结果保留在群里并通知第一主人；私聊命令与结果均保留。',
-			'· 广告自动判定 = 加黑 + 全群封禁 + 自动学入指纹与 AI 样本，并推快照给你复核；判对不用管，判错用 /ignore 回滚。',
+			'超管名单　环境变量 SUPER_ADMIN_IDS 里的人',
+			'超管可用　/ban /spam /unban /check，无需群管理员身份',
+			'超管限制　不能用 /stats，本人仍受广告检测与黑名单拦截',
+			'群内命令　发出即撤回，结果留在群里并通知第一主人',
+			'私聊命令　命令和结果都保留',
+			'自动判定　加黑 + 全群封禁 + 自动学习，快照推给你复核',
+			'判错回滚　用 /ignore 序号撤销，判对不用管',
 		];
 		await sendTelegramMessageChunks(chatId, helpLines.join('\n'));
 		return;
@@ -8184,7 +8372,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 		const listText = await renderPermissionAdminsList();
-		await sendTelegramMessage(chatId, listText);
+		// 名单含各群管理员后可能超过单条 4096 字上限，走分段发送；短名单仍是一条。
+		await sendTelegramMessageChunks(chatId, listText);
 		return;
 	}
 
@@ -13657,7 +13846,17 @@ function renderAdDetectionNotice(evaluation, context) {
 		lines.push('判定依据：');
 		for (const reason of evaluation.reasons.slice(0, 10)) lines.push('· ' + escapeHtml(String(reason)));
 	}
-	if (context?.banSummary) lines.push('封禁结果：' + escapeHtml(String(context.banSummary)));
+	// 封禁结果拆三行：成功数 / 失败群（每群一行、只给中文原因）/ 自动学习结果，不再挤成一整行长句。
+	if (context?.banResultLine) {
+		lines.push('封禁结果：' + escapeHtml(String(context.banResultLine)));
+		const failed = Array.isArray(context.failedGroupLines) ? context.failedGroupLines : [];
+		failed.forEach((text, idx) => {
+			lines.push((idx === 0 ? '失败群：' : '　　　　') + escapeHtml(String(text)));
+		});
+		if (context.learnLine) lines.push('自动学习：' + escapeHtml(String(context.learnLine)));
+	} else if (context?.banSummary) {
+		lines.push('封禁结果：' + escapeHtml(String(context.banSummary)));
+	}
 	if (context?.seq) {
 		lines.push('');
 		// 判定正确不给出口：指纹与 AI 样本已在 enforceAdDetection 里自动学入，
@@ -13709,12 +13908,14 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	} catch (_) { /* 记录失败不影响本次处置 */ }
 	const okCount = banResults.filter((r) => r.ok).length;
 	const failedBans = banResults.filter((r) => !r.ok);
-	let banSummary = okCount + '/' + banResults.length + ' 个群成功';
-	if (failedBans.length) {
-		banSummary += '；失败群：' + failedBans.slice(0, 3)
-			.map((r) => r.groupId + '(' + (r.error || '未知') + ')')
-			.join('、');
-	}
+	const banResultLine = okCount + '/' + banResults.length + ' 个群成功';
+	// 失败原因只给中文（英文原文由翻译兜底写入 Worker 日志）；最多列 3 个群，其余汇总成一句。
+	const failedGroupLines = failedBans.slice(0, 3)
+		.map((r) => r.groupId + '（' + toChineseErrorText(r.error || '未知') + '）');
+	if (failedBans.length > 3) failedGroupLines.push('等共 ' + failedBans.length + ' 个群失败');
+	// banSummary 仍是单行字符串：/learnlast 回执与日志沿用它，只是失败原因换成了中文。
+	let banSummary = banResultLine;
+	if (failedGroupLines.length) banSummary += '；失败群：' + failedGroupLines.join('、');
 
 	// 触发消息再单独删一次：revoke_messages 只对该群自己生效，服务消息也偶发残留。
 	if (chatId && input?.messageId) {
@@ -13802,13 +14003,16 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			reasons: evaluation.reasons,
 			snapshot: evaluation.snapshot
 		});
-		const learnNote = (learned ? '；已学入 ' + learned + ' 条指纹' : '')
-			+ (sampleAdded ? '；已加 1 条 AI 样本' : '');
+		const learnParts = [];
+		if (learned) learnParts.push('指纹 +' + learned + ' 条');
+		if (sampleAdded) learnParts.push('AI 样本 +1 条');
 		const notice = renderAdDetectionNotice(evaluation, {
 			userId,
 			chatTitle: input?.chatTitle || '',
 			seq,
-			banSummary: banSummary + learnNote
+			banResultLine,
+			failedGroupLines,
+			learnLine: learnParts.join('，')
 		});
 		try {
 			await sendTelegramMessageChunks(ownerId, notice);
@@ -14344,7 +14548,7 @@ async function handleAdDetectionCommands(message, env, ctx) {
 		}
 	} catch (error) {
 		console.error('[广告检测] 命令 /' + command + ' 执行异常:', error);
-		await sendTelegramMessage(chatId, '❌ 命令执行异常：' + escapeHtml(String(error?.message || error)));
+		await sendTelegramMessage(chatId, '❌ 命令执行异常：' + escapeHtml(toChineseErrorText(String(error?.message || error))));
 	}
 	return true;
 }
@@ -14498,7 +14702,7 @@ async function handleAdLearnLastCommand(env, chatId, ownerId, arg) {
 		} catch (error) {
 			// 处置失败绝不回滚已完成的学习 —— 指纹与样本已经入库，那部分是有效成果。
 			console.error('[learnlast] 加黑/封禁失败:', error);
-			lines.push('⚠️ 学习已完成，但加黑/封禁出错：' + escapeHtml(String(error?.message || error)));
+			lines.push('⚠️ 学习已完成，但加黑/封禁出错：' + escapeHtml(toChineseErrorText(String(error?.message || error))));
 			lines.push('可手动执行：<code>/ban ' + escapeHtml(targetIds.join(',')) + '</code>');
 		}
 	} else {
@@ -14557,7 +14761,7 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 		unbanSummary = okCount + '/' + results.length + ' 个群成功';
 		const failed = results.filter((r) => !r.ok);
 		if (failed.length) {
-			unbanSummary += '；失败群：' + failed.slice(0, 3).map((r) => r.groupId + '(' + (r.error || '未知') + ')').join('、');
+			unbanSummary += '；失败群：' + failed.slice(0, 3).map((r) => r.groupId + '（' + toChineseErrorText(r.error || '未知', { action: 'unban' }) + '）').join('、');
 		}
 	}
 
@@ -15743,7 +15947,7 @@ async function handleKillerCommand(message, env) {
 	else target = !currentlyOn; // 裸 /killer = 翻转
 
 	const r = await setKillerMode(env, chatId, target, userId);
-	if (!r.ok) { await sendTelegramMessage(chatId, '❌ 切换失败：' + escapeHtml(r.error || '未知错误')); return true; }
+	if (!r.ok) { await sendTelegramMessage(chatId, '❌ 切换失败：' + escapeHtml(toChineseErrorText(r.error || '未知错误'))); return true; }
 	await sendTelegramMessage(chatId, target
 		? '☠️ <b>杀手模式已开启</b>\n本群此后触发处置的用户将【全群封禁 + 踢出】。'
 		: '🔇 <b>杀手模式已关闭</b>\n本群此后触发处置的用户【仅永久禁言、不踢出】，仍写入全局黑名单。');
