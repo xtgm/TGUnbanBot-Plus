@@ -4700,7 +4700,17 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	];
 	const missingHelpCommands = expectedHelpCommands.filter((command) => !dm?.body?.text?.includes(command));
 	assert('主人 /help → 全部 9 个指令齐全', missingHelpCommands.length === 0, `缺少 ${missingHelpCommands.join(',')}`);
-	assert('主人 /help → /stats 带使用方法（周/月/本群）', !!dm && dm.body.text.includes('/stats week') && dm.body.text.includes('只统计本群'));
+	// /help 的 /stats 区一行一条：今日 / 本周 / 本月 与「私聊查指定群」各自独立成行，
+	// 不再写成 /stats today|week|month 这种合并形态（主人要求「一行一行区分」）。
+	assert('主人 /help → /stats 日 / 周 / 月各自独立成行',
+		!!dm && dm.body.text.includes('/stats today　') && dm.body.text.includes('/stats week　') && dm.body.text.includes('/stats month　'));
+	assert('主人 /help → /stats 指定群写法也逐行列出',
+		!!dm && dm.body.text.includes('/stats -100群ID today　') && dm.body.text.includes('/stats -100群ID month　'));
+	assert('主人 /help → 杀手模式 on / off / status 各自独立成行',
+		!!dm && dm.body.text.includes('/killer on　') && dm.body.text.includes('/killer off　') && dm.body.text.includes('/killer status　'));
+	// 曾漏列的三条：代码里实现了却查不到，主人无从知道它们存在。
+	assert('主人 /help → 含 /blacklist 与批量任务两条',
+		!!dm && dm.body.text.includes('/blacklist　') && dm.body.text.includes('/job 任务ID') && dm.body.text.includes('/jobrun 任务ID'));
 	// 旧版自动广告治理命令：这批必须从 /help 索引里彻底消失，不能只是不可用还在宣传。
 	// V2 广告检测方案重新提供了 /addword、/delword、/clearsamples 三个命令并挂进 /help，
 	// 故这三个从本清单移出；其余仍未恢复的必须保持不出现。
@@ -4729,7 +4739,7 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	const removedBanCommand = '/' + ['b', 'e'].join('');
 	const removedSpamCommand = '/' + ['s', 'a'].join('');
 	assert('主人 /help → 公开管理四条齐全', !!dm && dm.body.text.includes('/ban TGID') && dm.body.text.includes('/spam') && dm.body.text.includes('/unban TGID') && dm.body.text.includes('/check TGID'));
-	assert('主人 /help → 当前权限与回执说明准确', dm.body.text.includes('配置群 Telegram 管理员、主人或副主人') && dm.body.text.includes('完整结果保留在群里并通知第一主人'));
+	assert('主人 /help → 当前权限与回执说明准确', dm.body.text.includes('━━ 人工封禁与查询（群管理员 / 主人 / 副主人）━━') && dm.body.text.includes('完整结果保留在群里并通知第一主人'));
 	assert('主人 /help → 含 /admins 名单与超级管理员说明', dm.body.text.includes('/admins　查看主人 / 副主人名单') && dm.body.text.includes('超级管理员（SUPER_ADMIN_IDS）'));
 	assert('主人 /help → 不再显示旧短命令', !!dm && !dm.body.text.includes(removedBanCommand) && !dm.body.text.includes(removedSpamCommand));
 	assert('主人 /help → 含 /ad 投票与白名单管理', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('/add_ad_admin') && dm.body.text.includes('/del_ad_admin'));
