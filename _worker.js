@@ -4496,12 +4496,9 @@ function createLookupBudget(limit) {
 
 // options（均可选，不传时行为与改动前完全一致）：
 //   budget        —— createLookupBudget 预算；每次 Telegram 请求前扣 1，扣完即跳过后续查询
-//   adminLists    —— Map，顺手记下每个群的管理员列表，供 /admins 的「群管理员」一节复用，不再重复请求
-//   betweenPasses —— 管理员列表查完、逐人补查之前执行（/admins 用它先查群名，补查最费请求，排最后）
 async function resolvePermissionUserProfiles(ids, options = {}) {
 	const budget = options.budget || null;
 	const take = () => !budget || budget.take();
-	const adminLists = options.adminLists instanceof Map ? options.adminLists : null;
 	const wanted = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))];
 	const wantedSet = new Set(wanted);
 	const profiles = new Map();
@@ -4520,10 +4517,7 @@ async function resolvePermissionUserProfiles(ids, options = {}) {
 	const lookupGroups = [...GROUP_IDS, ...PROFILE_LOOKUP_GROUPS];
 
 	for (const groupId of lookupGroups) {
-		if (!take()) {
-			if (adminLists) adminLists.set(String(groupId), { ok: false, skipped: true, members: [] });
-			continue;
-		}
+		if (!take()) continue;
 		try {
 			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
 				method: 'POST',
@@ -4532,10 +4526,8 @@ async function resolvePermissionUserProfiles(ids, options = {}) {
 			});
 			const result = await response.json();
 			if (!response.ok || !result.ok || !Array.isArray(result.result)) {
-				if (adminLists) adminLists.set(String(groupId), { ok: false, error: result?.description || ('HTTP ' + response.status), members: [] });
 				continue;
 			}
-			if (adminLists) adminLists.set(String(groupId), { ok: true, members: result.result });
 			for (const member of result.result) {
 				const user = member?.user;
 				const id = user?.id ? String(user.id) : '';
@@ -4550,11 +4542,8 @@ async function resolvePermissionUserProfiles(ids, options = {}) {
 			}
 		} catch (error) {
 			console.error(`[权限名单] 查询群管理员失败 group=${groupId}:`, error);
-			if (adminLists) adminLists.set(String(groupId), { ok: false, error: error?.message || String(error), members: [] });
 		}
 	}
-
-	if (typeof options.betweenPasses === 'function') await options.betweenPasses();
 
 	// 逐个补查：上面 getChatAdministrators 只能查到【管理员】，而只读资料群里的目标人
 	// 通常只是普通成员，必须靠 getChatMember 才查得到 —— 这一轨才是只读资料群的主用途。
@@ -4675,73 +4664,22 @@ function renderPermissionSection(title, ids, profiles, groupLabels) {
 	return lines;
 }
 
-// 「Telegram 群管理员」一节：逐个治理群列出真人管理员（群主排最前，bot 账号不列）。
-// 数据直接复用 resolvePermissionUserProfiles 顺手记下的管理员列表，不额外发请求。
-function renderTelegramAdminSection(groupIds, adminLists, groupLabels) {
-	const lines = ['🛡 <b>Telegram 群管理员</b>'];
-	if (!groupIds.length) {
-		lines.push('无');
-		return lines;
-	}
-	groupIds.forEach((groupId, idx) => {
-		if (idx > 0) lines.push('');
-		const head = '▸ ' + renderPermissionGroupText(groupId, groupLabels.get(groupId));
-		const entry = adminLists.get(groupId);
-		if (!entry || entry.skipped) {
-			lines.push(head + ' · 未查询（本次请求数已达上限）');
-			return;
-		}
-		if (!entry.ok) {
-			lines.push(head + ' · 获取失败：' + escapeHtml(toChineseErrorText(entry.error || '未知错误')));
-			return;
-		}
-		const humans = (entry.members || []).filter((m) => m?.user?.id && !m.user.is_bot);
-		humans.sort((a, b) => (b.status === 'creator') - (a.status === 'creator'));
-		lines.push(head + ' · ' + humans.length + ' 人');
-		for (const member of humans) {
-			const user = member.user;
-			const id = String(user.id);
-			const name = [user.first_name, user.last_name].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim() || id;
-			const role = member.status === 'creator' ? '群主　　' : '管理员　';
-			const nameLink = '<a href="tg://user?id=' + escapeHtml(id) + '">' + escapeHtml(name) + '</a>';
-			const username = user.username ? ' @' + escapeHtml(user.username) : '';
-			const anonymous = member.is_anonymous ? '（匿名）' : '';
-			lines.push('　' + role + nameLink + username + anonymous + '（<code>' + escapeHtml(id) + '</code>）');
-		}
-	});
-	return lines;
-}
-
 async function renderPermissionAdminsList() {
 	const primaryOwner = OWNER_IDS.length ? [OWNER_IDS[0]] : [];
 	const secondaryOwners = OWNER_IDS.length > 1 ? OWNER_IDS.slice(1) : [];
 	// 只读 SUPER_ADMIN_IDS；旧变量 SUPER_ADMINS 早已废弃，不进名单也不单独查资料。
 	const superAdmins = [...new Set((SUPER_ADMIN_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
 	const allIds = [...primaryOwner, ...secondaryOwners, ...superAdmins];
-	const governedGroups = [...new Set((GROUP_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
-
-	// 请求顺序即优先级（预算见 ADMINS_LOOKUP_BUDGET）：
-	//   ① 各群管理员列表 —— 同时解析出名单里当管理员的人，并给「群管理员」一节用
-	//   ② 治理群群名    —— 「群管理员」一节的分组标题
-	//   ③ 逐人补查      —— 不在任何群当管理员的人（超管常见），最费请求，排在后面
-	//   ④ 补查到的来源群名（只读资料群等尚未取到名字的群）
+	// 超管常常不在任何群当管理员，要靠逐群补查才拿得到资料 —— 这一轨最费请求，
+	// 所以整条命令共用一份预算（见 ADMINS_LOOKUP_BUDGET），免费版也不会超子请求上限。
 	const budget = createLookupBudget(ADMINS_LOOKUP_BUDGET);
-	const adminLists = new Map();
-	let groupLabels = new Map();
-	const profiles = await resolvePermissionUserProfiles(allIds, {
-		budget,
-		adminLists,
-		betweenPasses: async () => {
-			groupLabels = await resolvePermissionGroupLabels(governedGroups, { budget });
-		}
-	});
-	const extraSourceGroups = [...profiles.values()]
-		.map((p) => String(p?.groupId || ''))
-		.filter((groupId) => groupId && !governedGroups.includes(groupId));
-	if (extraSourceGroups.length) {
-		const extraLabels = await resolvePermissionGroupLabels(extraSourceGroups, { budget });
-		for (const [groupId, label] of extraLabels) groupLabels.set(groupId, label);
-	}
+	const profiles = await resolvePermissionUserProfiles(allIds, { budget });
+	// 只查【实际出现在名单里】的来源群，且函数内部去重 ——
+	// 不是遍历全部配置群，那会在群多时白花一堆 getChat。
+	const groupLabels = await resolvePermissionGroupLabels(
+		[...profiles.values()].map((p) => p?.groupId).filter(Boolean),
+		{ budget }
+	);
 
 	const lines = [
 		'🔐 <b>权限名单</b>',
@@ -4750,9 +4688,7 @@ async function renderPermissionAdminsList() {
 		'',
 		...renderPermissionSection('👤 <b>副主人</b>', secondaryOwners, profiles, groupLabels),
 		'',
-		...renderPermissionSection('⭐ <b>超级管理员</b>（SUPER_ADMIN_IDS）', superAdmins, profiles, groupLabels),
-		'',
-		...renderTelegramAdminSection(governedGroups, adminLists, groupLabels),
+		...renderPermissionSection('⭐ <b>超级管理员</b>', superAdmins, profiles, groupLabels),
 		'',
 		'说明:用户名/昵称来自 Telegram 当前可读取的群成员资料;未获取时仍以 TGID 为准。',
 		'来源群名可点击跳转（公开群走 t.me 永久链接；私密群需 bot 为管理员才有邀请链接，否则只显示群名）。'
@@ -8321,7 +8257,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/listgroups　列出全部生效群组',
 			'',
 			'<b>━━ 查询与退群（仅私聊）━━</b>',
-			'/admins　查看主人、副主人、超级管理员与各群 Telegram 管理员名单',
+			'/admins　查看主人、副主人与超级管理员名单',
 			'/groups　查看当前生效群组信息',
 			'/leavegroup -100xxx　让 bot 退出该群',
 			'',
@@ -8372,7 +8308,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 		const listText = await renderPermissionAdminsList();
-		// 名单含各群管理员后可能超过单条 4096 字上限，走分段发送；短名单仍是一条。
+		// 名单较长时可能超过单条 4096 字上限，走分段发送；短名单仍是一条。
 		await sendTelegramMessageChunks(chatId, listText);
 		return;
 	}

@@ -5014,26 +5014,19 @@ console.log('\n[67b] /admins 主人专属权限名单');
 		body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/admins' } })
 	}), env, fakeCtxAd);
 	let dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	// 名单变长后走分段发送，断言统一看发给主人的全部分段
+	// 名单较长时走分段发送，断言统一看发给主人的全部分段
 	const adminsText = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').map((c) => c.body.text).join('\n');
-	const superSection = adminsText.slice(adminsText.indexOf('⭐ <b>超级管理员</b>'), adminsText.indexOf('🛡 <b>Telegram 群管理员</b>'));
-	const tgAdminSection = adminsText.slice(adminsText.indexOf('🛡 <b>Telegram 群管理员</b>'));
+	const superSection = adminsText.slice(adminsText.indexOf('⭐ <b>超级管理员</b>'));
 	assert('/admins 主人可查看权限名单', !!dm && dm.body.text.includes('权限名单'));
 	assert('/admins 显示主人用户名', dm.body.text.includes('@owner_user') && dm.body.text.includes('TGID:<code>999</code>'));
 	assert('/admins 显示副主人用户名', dm.body.text.includes('@deputy_user') && dm.body.text.includes('TGID:<code>888</code>'));
-	// 旧变量 SUPER_ADMINS 早已废弃：7777 / 6666 都不能进「超级管理员」一节（该节只读 SUPER_ADMIN_IDS）
-	assert('/admins 旧变量 SUPER_ADMINS 不进超级管理员一节', superSection.includes('⭐ <b>超级管理员</b>（SUPER_ADMIN_IDS）')
-		&& superSection.includes('\n无') && !superSection.includes('7777') && !superSection.includes('6666'));
-	assert('/admins 不把旧 SUPER_ADMINS 用户加入权限名单', !adminsText.includes('@fallback_user') && !adminsText.includes('6666'));
+	assert('/admins 不显示旧白名单用户', !adminsText.includes('@super_user') && !adminsText.includes('TGID:<code>7777</code>'));
+	assert('/admins 不把旧 SUPER_ADMINS 用户加入权限名单', !adminsText.includes('@fallback_user') && !adminsText.includes('TGID:<code>6666</code>'));
 	assert('/admins 不单独查询旧白名单用户资料', !callsOf('getChatMember').some((c) => ['7777', '6666'].includes(String(c.body.user_id))));
-	// 「Telegram 群管理员」一节：7777 是 -1001 的真实群管理员，出现在这里是正确的
-	assert('/admins 列出各群 Telegram 管理员（群主排最前、人数正确）',
-		tgAdminSection.includes('🛡 <b>Telegram 群管理员</b>') && tgAdminSection.includes('▸ <code>-1001</code> · 3 人')
-		&& /群主　　<a href="tg:\/\/user\?id=999">主人<\/a> @owner_user/.test(tgAdminSection)
-		&& tgAdminSection.indexOf('@owner_user') < tgAdminSection.indexOf('@super_user'));
-	assert('/admins 群管理员一节含普通群管理员', tgAdminSection.includes('管理员　<a href="tg://user?id=7777">群管理员 甲</a> @super_user'));
-	assert('/admins 没有管理员的群显示 0 人', tgAdminSection.includes('▸ <code>-1002</code> · 0 人'));
-	assert('/admins 管理员列表每群只查一次（复用，不重复请求）', callsOf('getChatAdministrators').length === 2);
+	// 超级管理员一节只读 SUPER_ADMIN_IDS：本用例未配置，显示「无」；旧变量 SUPER_ADMINS 不进来
+	assert('/admins 显示超级管理员一节（未配置时为无）', superSection.startsWith('⭐ <b>超级管理员</b>\n无'));
+	// 主人要求只加超管、不列 Telegram 群管理员名单
+	assert('/admins 不列 Telegram 群管理员名单', !adminsText.includes('Telegram 群管理员') && !adminsText.includes('▸ '));
 
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', {
@@ -5072,10 +5065,9 @@ console.log('\n[67b2] /admins 超级管理员与请求预算');
 		body: JSON.stringify({ message: { message_id: 11, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/admins' } })
 	}), env, fakeCtxAd);
 	let text = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').map((c) => c.body.text).join('\n');
-	const superPart = text.slice(text.indexOf('⭐ <b>超级管理员</b>'), text.indexOf('🛡 <b>Telegram 群管理员</b>'));
+	const superPart = text.slice(text.indexOf('⭐ <b>超级管理员</b>'), text.indexOf('说明:'));
 	assert('/admins 超级管理员一节显示 SUPER_ADMIN_IDS 里的人及其资料', superPart.includes('TGID:<code>5555</code>') && superPart.includes('@sa_user'));
-	assert('/admins 群管理员一节不列 bot 账号', !text.includes('4242') && text.includes('▸ 群1001（<code>-1001</code>） · 1 人'));
-	assert('/admins 群管理员一节标题带群名', text.includes('▸ 群1001（<code>-1001</code>）'));
+	assert('/admins 超管来源群带群名', superPart.includes('来源群:群1002（<code>-1002</code>）'));
 	assert('/admins 预算充足时不出现上限提示', !text.includes('请求上限'));
 
 	// 预算：30 个群 + 3 个不在任何群当管理员的超管。不设上限时要 30（管理员列表）+ 30（群名）+ 3×30（补查）= 150 次。
