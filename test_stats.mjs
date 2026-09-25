@@ -1,7 +1,8 @@
 // 群统计（发言 / 入群 / 退群）· 离线验证
 // 覆盖：建表、北京时区切天、发言计数+活跃人数、进退群计数、日/周/月汇总、仅本群隔离、
 //       发言排行+翻页、180 天剪枝、/stats 权限（群管理员/群主/主人/副主人可查，普通成员静默）、
-//       /stats 输出内容、发言钩子端到端（真人计数、命令计数、bot 不计）。
+//       /stats 输出内容、发言钩子端到端（真人计数、命令计数、bot 不计）、
+//       切天边界（23:59/00:00、周日/周一、周跨月、月末、跨年、闰日、换时区、跨 0 点渲染同一天）。
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { DatabaseSync } from 'node:sqlite';
@@ -37,6 +38,12 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(src.replace(/export\s+default\s*/, 'globalThis.__h = '), sandbox, { filename: '_worker.js' });
 const W = sandbox;
+
+// 可控时钟：命令层（/stats、面板按钮）内部取的是 Date.now()，不传时间参数。
+// 测试数据写在固定基准日，查询却走真实今天，就会出现「只有基准日当天跑才绿」的日期漂移。
+// 这里把沙箱里的 Date.now 接到 W.__clock：设了就用它，置 null 恢复真实时间。
+vm.runInContext('(() => { const real = Date.now.bind(Date); Date.now = () => (typeof globalThis.__clock === "function" ? globalThis.__clock() : real()); })();', sandbox);
+W.__clock = null;
 
 function makeD1() {
 	const db = new DatabaseSync(':memory:');
@@ -152,6 +159,8 @@ check('剪枝删掉 190 天前发言', env.DB.query("SELECT * FROM stat_speech W
 check('剪枝保留近期发言(用户1还在)', env.DB.query("SELECT * FROM stat_speech WHERE user_id='1'").length === 1);
 
 console.log('\n=== 8. /stats 权限（群内） ===');
+// 第 8～10 节全走命令层，时钟冻结在基准时间 T，与上面写入数据用的是同一天。
+W.__clock = () => T;
 sent.length = 0; currentAdmins = ['777'];
 await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: 555, is_bot: false }, text: '/stats', message_id: 101 }, env, { waitUntil() {} });
 check('普通成员群内 /stats 静默（不回群、不私聊）', sent.length === 0);
@@ -205,6 +214,7 @@ await W.handleStatsCommand({ chat: { id: Number(OWNER), type: 'private' }, from:
 check('私聊主人裸 /stats → 出私聊用法（含指定群写法）', sent.some((x) => x.chatId === String(OWNER) && x.text.includes('用法') && x.text.includes('/stats -100群ID')));
 
 console.log('\n=== 11. 发言钩子端到端（webhook） ===');
+W.__clock = null;   // 本节验证的就是「按真实当下记账」，恢复真实时间
 const todayNow = W.statDayString(env, Date.now());
 const drive = async (msg) => { const p = []; await W.__h.fetch(new Request('https://x/', { method: 'POST', body: JSON.stringify({ message: msg }) }), env, { waitUntil: (x) => p.push(Promise.resolve(x)) }); await Promise.allSettled(p); };
 await drive({ message_id: 5001, chat: { id: '-100111', type: 'supergroup', title: 'g' }, from: { id: 8801, is_bot: false, first_name: '钩子用户' }, text: '普通聊天' });
@@ -213,6 +223,91 @@ await drive({ message_id: 5002, chat: { id: '-100111', type: 'supergroup', title
 check('命令消息也计入发言（真人所有消息）', Number(env.DB.query("SELECT msg_count FROM stat_speech WHERE user_id='8802' AND day='" + todayNow + "'")[0]?.msg_count) >= 1);
 await drive({ message_id: 5003, chat: { id: '-100111', type: 'supergroup', title: 'g' }, from: { id: 8803, is_bot: true, first_name: '机器人' }, text: 'bot发言' });
 check('bot 消息不计入发言', env.DB.query("SELECT * FROM stat_speech WHERE user_id='8803'").length === 0);
+
+console.log('\n=== 12. 切天边界精准（北京时间 = UTC+8）===');
+// 每个场景用独立群号，互不串数据。at(北京时间字符串) → 毫秒时间戳。
+const at = (bj) => Date.parse(bj + '+08:00');
+const speak = (gid, uid, ms, e = env) => W.recordSpeechStat(e, gid, { id: uid, first_name: 'U' + uid }, ms);
+const total = async (gid, range, ms, e = env) => (await W.queryStatSummary(e, gid, range, ms)).totalMsg;
+
+// 12a. 23:59:59 与次日 00:00:00 各归各天
+const GA = '-100901';
+await speak(GA, 'a1', at('2026-09-24T23:59:59'));
+await speak(GA, 'a2', at('2026-09-25T00:00:00'));
+check('23:59:59 的发言算当天（09-24 今日 = 1）', await total(GA, 'day', at('2026-09-24T23:59:59.500')) === 1);
+check('00:00:00 的发言算次日（09-25 今日 = 1，不串前一天）', await total(GA, 'day', at('2026-09-25T12:00:00')) === 1);
+check('statDayString：UTC 15:59:59 → 北京 09-24，UTC 16:00:00 → 北京 09-25',
+	W.statDayString(env, Date.parse('2026-09-24T15:59:59Z')) === '2026-09-24' && W.statDayString(env, Date.parse('2026-09-24T16:00:00Z')) === '2026-09-25');
+
+// 12b. 周日 23:59 与周一 00:00：周一起算新一周
+const GB = '-100902';
+await speak(GB, 'b1', at('2026-09-27T23:59:00'));   // 周日
+await speak(GB, 'b2', at('2026-09-28T00:00:00'));   // 周一
+check('周日当晚：本周含周日这条（= 1）', await total(GB, 'week', at('2026-09-27T23:59:30')) === 1);
+check('周一：新一周从 0 起算，只含周一这条（= 1）', await total(GB, 'week', at('2026-09-28T12:00:00')) === 1);
+const wkMon = W.statRangeDays(env, 'week', at('2026-09-28T00:00:00'));
+check('周一 00:00 的本周起点就是当天 09-28', wkMon.start === '2026-09-28' && wkMon.end === '2026-09-28', JSON.stringify(wkMon));
+const wkSun = W.statRangeDays(env, 'week', at('2026-09-27T23:59:59'));
+check('周日的本周起点回退到周一 09-21', wkSun.start === '2026-09-21' && wkSun.end === '2026-09-27', JSON.stringify(wkSun));
+
+// 12c. 周跨月：本周含上月那几天，本月不含
+const GC = '-100903';
+await speak(GC, 'c1', at('2026-09-29T12:00:00'));   // 周二，上月
+await speak(GC, 'c2', at('2026-10-01T12:00:00'));   // 周四，本月 1 号
+check('周跨月：本周含上月 09-29 那条（= 2）', await total(GC, 'week', at('2026-10-01T20:00:00')) === 2);
+check('周跨月：本月只含 10-01 那条（= 1）', await total(GC, 'month', at('2026-10-01T20:00:00')) === 1);
+
+// 12d. 月末 23:59:59 与下月 1 号 00:00:00
+const GD = '-100904';
+await speak(GD, 'd1', at('2026-09-30T23:59:59'));
+await speak(GD, 'd2', at('2026-10-01T00:00:00'));
+check('月末最后一秒：本月含 09-30 这条、不含 10-01（= 1）', await total(GD, 'month', at('2026-09-30T23:59:59.500')) === 1);
+check('下月 1 号：新月份从 0 起算，只含 10-01（= 1）', await total(GD, 'month', at('2026-10-01T00:00:01')) === 1);
+const moFirst = W.statRangeDays(env, 'month', at('2026-10-01T00:00:00'));
+check('10-01 00:00 的本月范围 = 10-01 ~ 10-01', moFirst.start === '2026-10-01' && moFirst.end === '2026-10-01', JSON.stringify(moFirst));
+
+// 12e. 跨年：12-31 23:59:59 与 01-01 00:00:00
+const GE = '-100905';
+await speak(GE, 'e1', at('2026-12-31T23:59:59'));
+await speak(GE, 'e2', at('2027-01-01T00:00:00'));
+const NY = at('2027-01-01T10:00:00');
+check('跨年：01-01 今日只含新年那条（= 1）', await total(GE, 'day', NY) === 1);
+check('跨年：01-01 本月只含新年那条（= 1）', await total(GE, 'month', NY) === 1);
+check('跨年：本周（周一 2026-12-28 起）含 12-31 那条（= 2）', await total(GE, 'week', NY) === 2);
+const wkNY = W.statRangeDays(env, 'week', NY);
+check('跨年：2027-01-01（周五）本周起点 = 2026-12-28', wkNY.start === '2026-12-28' && wkNY.end === '2027-01-01', JSON.stringify(wkNY));
+
+// 12f. 闰年 2 月 29 日
+const GF = '-100906';
+await speak(GF, 'f1', at('2028-02-29T12:00:00'));
+check('闰日 2028-02-29 归属正确', W.statDayString(env, at('2028-02-29T12:00:00')) === '2028-02-29');
+check('闰日：2 月本月统计含这条（= 1）', await total(GF, 'month', at('2028-02-29T20:00:00')) === 1);
+check('闰日：3 月 1 号本月从 0 起算', await total(GF, 'month', at('2028-03-01T10:00:00')) === 0);
+const moLeap = W.statRangeDays(env, 'month', at('2028-02-29T20:00:00'));
+check('闰年 2 月本月范围 = 02-01 ~ 02-29', moLeap.start === '2028-02-01' && moLeap.end === '2028-02-29', JSON.stringify(moLeap));
+
+// 12g. STATS_TZ_OFFSET=0：按 UTC 切天
+const envUtc = { ...env, STATS_TZ_OFFSET: '0' };
+const GG = '-100907';
+const utcLate = Date.parse('2026-09-24T16:30:00Z');   // UTC 09-24 16:30 = 北京 09-25 00:30
+await speak(GG, 'g1', utcLate, envUtc);
+check('UTC 时区：16:30Z 归属 09-24（北京时区下是 09-25）',
+	W.statDayString(envUtc, utcLate) === '2026-09-24' && W.statDayString(env, utcLate) === '2026-09-25');
+check('UTC 时区：当天 23:00Z 查今日 = 1', await total(GG, 'day', Date.parse('2026-09-24T23:00:00Z'), envUtc) === 1);
+
+// 12h. 跨 0 点那一刻渲染：标题日期与数据必须是同一天
+// 第一次取时间停在 09-24 23:59:59.999，之后每次取都已是 09-25 00:00:00。
+// 若 renderStatPage 内部标题、汇总、排行各取一次时间，就会出现「标题 09-24、数据按 09-25 算成 0」。
+const GH = '-100908';
+await speak(GH, 'h1', at('2026-09-24T23:59:59'));
+await speak(GH, 'h2', at('2026-09-24T23:59:59'));
+let clockCalls = 0;
+W.__clock = () => (clockCalls++ === 0 ? at('2026-09-24T23:59:59.999') : at('2026-09-25T00:00:00'));
+const rendered = await W.renderStatPage(env, GH, 'day', 1, '边界群');
+W.__clock = null;
+check('跨 0 点渲染：标题是 09-24', rendered.text.includes('2026-09-24'), rendered.text.split('\n')[0]);
+check('跨 0 点渲染：汇总与标题同一天（总发言 2，不是 0）', rendered.text.includes('总发言 <b>2</b>'));
+check('跨 0 点渲染：发言排行与标题同一天（有排行、不是暂无记录）', rendered.text.includes('发言排行') && !rendered.text.includes('暂无发言记录'));
 
 console.log('\n群统计验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 if (fail > 0) process.exitCode = 1;

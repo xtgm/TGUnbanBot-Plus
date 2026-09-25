@@ -15799,10 +15799,12 @@ function buildStatsPanelKeyboard(chatId) {
 }
 
 // 渲染一页统计（汇总 + 发言排行 + 翻页键盘）。命令首发与按钮翻页共用，排版一致。
-async function renderStatPage(env, chatId, range, page, chatTitle) {
-	const info = statRangeDays(env, range);
-	const summary = await queryStatSummary(env, chatId, range);
-	const ranking = await queryStatRanking(env, chatId, range, page);
+// 【时间锚点只取一次】标题日期、汇总、排行必须落在同一天。原来三处各自取 Date.now()，
+// 查询恰好跨过统计时区 0 点时，可能出现标题写 09-25、汇总或排行却按 09-24 算。
+async function renderStatPage(env, chatId, range, page, chatTitle, nowMs = Date.now()) {
+	const info = statRangeDays(env, range, nowMs);
+	const summary = await queryStatSummary(env, chatId, range, nowMs);
+	const ranking = await queryStatRanking(env, chatId, range, page, nowMs);
 	const scope = chatTitle ? escapeHtml(String(chatTitle)) : ('群 <code>' + escapeHtml(String(chatId)) + '</code>');
 	const dateLabel = info.start === info.end ? info.start : (info.start + ' ~ ' + info.end);
 	const lines = [
