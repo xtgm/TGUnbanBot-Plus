@@ -5786,7 +5786,10 @@ console.log('\n[95] 自助解封回执与主群联系按钮');
 	}).SELF_UNBAN_CONTACT_GROUP;
 	assert('联系主群:未设置 → 回落 GROUP_IDS[0]', pick({}) === '-1001');
 	assert('联系主群:设为配置群内的 ID → 生效', pick({ SELF_UNBAN_CONTACT_GROUP: '-1003' }) === '-1003');
-	assert('联系主群:设为配置外的 ID → 忽略并回落主群', pick({ SELF_UNBAN_CONTACT_GROUP: '-1009' }) === '-1001');
+	// 方案 A（2026-09-26）：联系群不再要求在 GROUP_ID 里，只要是合法群 ID（负整数）就直接采用
+	assert('联系主群:设为配置外的合法群 ID → 独立生效（不必在 GROUP_ID）', pick({ SELF_UNBAN_CONTACT_GROUP: '-1009' }) === '-1009');
+	assert('联系主群:格式非法（非负整数）→ 忽略并回落主群', pick({ SELF_UNBAN_CONTACT_GROUP: 'abc' }) === '-1001');
+	assert('联系主群:正数（非群 ID）→ 忽略并回落主群', pick({ SELF_UNBAN_CONTACT_GROUP: '123' }) === '-1001');
 
 	// 旧自定义文案兼容
 	const legacy = await build({ username: 'mygroup', title: '我的主群' }, {

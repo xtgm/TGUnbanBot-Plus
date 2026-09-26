@@ -322,7 +322,7 @@ node test_kick.mjs && node test_ad_detection.mjs && node test_ad_bio_gates.mjs \
 | `SELF_UNBAN_PROMPT` | 见源码 | **仅 `/unban`**（无参数）收到时返回的自助解封检查清单。支持 HTML 子集。占位符：`{userId}`、`{keyword}`（自动填入当前生效的 `SELF_UNBAN_KEYWORD`）、`{title}`（主群名称）。<br>⚠️ 默认文案刻意不使用 `{title}` —— 主群若是私密群，显示真实群名等于把私人群名暴露给任何触发者。 |
 | `SELF_UNBAN_APPROVED` | 见源码 | 解封成功回执（**能拿到主群链接时使用**）。占位符：`{groupcount}` 配置群组数量、`{groupname}` 联系主群名称、`{groupid}` 联系主群 ID、`{username}`（**兼容旧配置，等价于 `{groupname}`**）。本项目解封走全群、封禁也走全群，bot 无法知道用户原本在哪个群被封，因此文案不再说"返回某个群"，而是告知"全部群组限制已解除"，并把主群作为**联系管理员的入口**以内联按钮呈现（按钮文字 = 💬 + 群名）。 |
 | `SELF_UNBAN_APPROVED_NOLINK` | 见源码 | 解封成功回执（**拿不到主群链接时的降级文案**）。与上一条内容相同，但去掉"点击下方按钮"字样，且不附带按钮 —— 绝不出现"点击一个点不动的东西"。占位符同上。 |
-| `SELF_UNBAN_CONTACT_GROUP` | 空（= 主群） | 解封成功后"联系管理员"按钮指向哪个群（**主群 = 回家的入口**）。留空则用 `GROUP_ID` 的第一个群。填了但该群**不在 `GROUP_ID` 配置列表里** → 忽略并回落主群 + 打日志，避免把用户导向 bot 管不到的群。<br>链接来源优先级：① 公开群 `username` → `https://t.me/xxx`；② 私有群 **`getChat` 直接返回的 `invite_link`**（零额外 API 调用）；③ 都拿不到 → 用降级文案。**刻意不调用 `exportChatInviteLink`** —— 那会撤销并重建主邀请链接，导致群内所有人手上的旧链接失效。 |
+| `SELF_UNBAN_CONTACT_GROUP` | 空（= 主群） | 解封成功后"联系管理员"按钮指向哪个群（**主群 = 回家的入口**）。留空则用 `GROUP_ID` 的第一个群。**填了就直接用，不要求它在 `GROUP_ID` 里**（可指向一个独立主群）；只做群 ID 格式校验（负整数），格式非法才回落主群 + 打日志。<br>该群只用来生成这颗按钮的链接，**不参与封禁 / 检测 / 鉴权**，因此把它单独设为联系群不会开放任何治理权限。<br>bot 需在该群里才取得到群名/链接：公开群用 `username` → `https://t.me/xxx`（免权限）；私有群用 **`getChat` 返回的 `invite_link`**（需 bot 为带「邀请用户」权限的管理员）；都拿不到 → 按钮降级为无链接文案。**刻意不调用 `exportChatInviteLink`** —— 那会撤销并重建主邀请链接，导致群内旧链接失效。 |
 | `BLACKLIST_PAGE_LIMIT` | `30` | `/blacklist` 命令单次最多展示多少条（按时间倒序，最新在前）。值必须是正整数。 |
 | `BLACKLIST_REASON_LABELS` | 见源码 | `/blacklist` 列表中"原因"字段的中文映射，**JSON 字符串**形式。例：`{"spam":"群内举报","manual":"管理员添加","manual_ban":"自动同步"}`。非法 JSON 时自动回退默认。 |
 | `GKY_BANLIST_ENDPOINT` | `https://gkybot.gmeow.cc/banlist` | GKY 封禁记录查询后端。改动者请确保返回 HTML 与 `parseBanlistHTML` 兼容。 |
@@ -487,14 +487,15 @@ wrangler secret put GROUP_ID     # 输入：-1001234567890
 
 | 变量 | 填什么 | 示例值 | 不填的后果 |
 | --- | --- | --- | --- |
-| `SELF_UNBAN_CONTACT_GROUP` | 解封成功后「联系管理员」按钮指向哪个群。**必须是 `GROUP_ID` 里已有的群** | `-1001234567890` | 用 `GROUP_ID` 的**第一个群**（即主群），大多数人不需要填 |
+| `SELF_UNBAN_CONTACT_GROUP` | 解封成功后「联系管理员」按钮指向哪个群。**不必在 `GROUP_ID` 里**，可指向独立主群（合法群 ID 即可） | `-1001234567890` | 用 `GROUP_ID` 的**第一个群**（即主群），大多数人不需要填 |
 | `SELF_UNBAN_KEYWORD` | 用户必须逐字粘贴的确认句 | `我不是广告狗，我是误封的，希望可以解封。` | 用内置默认句 |
 | `SELF_UNBAN_APPROVED` | 解封成功文案（**能拿到群链接时用**） | 见 6.6 完整示例 | 用内置默认文案 |
 | `SELF_UNBAN_APPROVED_NOLINK` | 解封成功文案（**拿不到群链接时的降级版**） | 见 6.6 完整示例 | 用内置默认文案 |
 
 > **主群怎么设？** 主群 = `GROUP_ID` 的**第一个**群，这是固定规则，不需要单独配置。
-> `SELF_UNBAN_CONTACT_GROUP` 只在你希望「联系入口」指向**非第一个**群时才需要填。
+> `SELF_UNBAN_CONTACT_GROUP` 只在你希望「联系入口」指向**别的群**时才需要填。
 > 例：`GROUP_ID = -1001111,-1002222`，主群是 `-1001111`；若你想让解封用户去 `-1002222` 找你，就填 `SELF_UNBAN_CONTACT_GROUP = -1002222`。
+> 该群**不必**出现在 `GROUP_ID` 里——可以是一个专门的独立主群，bot 在里面即可（不需要给它任何治理权限）。私有群要让按钮可点，bot 需是带「邀请用户」权限的管理员；否则按钮降级为无链接的纯文本。
 
 #### 6.4 其它可选项
 

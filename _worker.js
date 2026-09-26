@@ -157,7 +157,11 @@ const KILLER_MODE_DEFAULT_ON = false;
 
 // 11) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
 //    留空 → 用 GROUP_IDS[0]（主群），与原行为一致。
-//    填了但该群不在 GROUP_ID 配置里 → 忽略并回落主群 + 打日志，避免把用户导向 bot 管不到的群。
+//    填了就直接用（2026-09-26 方案 A）：联系群只用来生成那颗按钮的链接，不参与封禁/检测/鉴权，
+//    因此【不要求它在 GROUP_ID 里】，可指向一个独立的主群。只做群 ID 格式校验（负整数），
+//    格式非法才回落主群并打日志。bot 需在该群里才取得到群名/邀请链接
+//    （公开群用 t.me/username 免权限；私密群需 bot 为带「邀请用户」权限的管理员），
+//    取不到时按钮自动降级为无链接文案，不会出现点不动的假链接。
 //    环境变量名：SELF_UNBAN_CONTACT_GROUP
 const DEFAULT_SELF_UNBAN_CONTACT_GROUP = '';
 
@@ -492,15 +496,17 @@ function loadRequiredConfig(env) {
 	const selfUnbanPrompt = pickStr(env.SELF_UNBAN_PROMPT, DEFAULT_SELF_UNBAN_PROMPT);
 	const selfUnbanApproved = pickStr(env.SELF_UNBAN_APPROVED, DEFAULT_SELF_UNBAN_APPROVED);
 	const selfUnbanApprovedNoLink = pickStr(env.SELF_UNBAN_APPROVED_NOLINK, DEFAULT_SELF_UNBAN_APPROVED_NOLINK);
-	// 联系主群：留空用 GROUP_IDS[0]；填了但不在配置群列表里则忽略并回落主群（防止导向 bot 管不到的群）
+	// 联系主群：留空用 GROUP_IDS[0]。填了就直接用（方案 A）——联系群只用来生成自助解封回执里
+	// 的「联系管理员」按钮链接，不参与封禁/检测/鉴权，因此不要求它在 GROUP_ID 里，可指向独立主群。
+	// 只做群 ID 格式校验（负整数）；格式非法才回落主群并打日志。取不到群名/链接时按钮降级为无链接文案。
 	let selfUnbanContactGroup = uniqueGroupIds[0];
 	const rawContactGroup = pickStr(env.SELF_UNBAN_CONTACT_GROUP, DEFAULT_SELF_UNBAN_CONTACT_GROUP).trim();
 	if (rawContactGroup) {
-		if (uniqueGroupIds.includes(rawContactGroup)) {
+		if (/^-\d+$/.test(rawContactGroup)) {
 			selfUnbanContactGroup = rawContactGroup;
 		} else {
 			console.error(
-				`SELF_UNBAN_CONTACT_GROUP=${rawContactGroup} 不在 GROUP_ID 配置列表中，已回落主群 ${uniqueGroupIds[0]}`
+				`SELF_UNBAN_CONTACT_GROUP=${rawContactGroup} 不是合法的群 ID（应为负整数，如 -100...），已回落主群 ${uniqueGroupIds[0]}`
 			);
 		}
 	}
@@ -2889,10 +2895,12 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 		);
 		// 同款连带才有这两项；普通 /ban /spam 批量没有 deleteTargets，不显示以免空行干扰。
 		if (job.deleteTargets) {
-			lines.push(
-				`同款消息已删:${job.stats?.linkedMsgDeleted || 0}`,
-				`同款消息删除失败:${job.stats?.linkedMsgDeleteFailed || 0}`
-			);
+			lines.push(`同款消息已删:${job.stats?.linkedMsgDeleted || 0}`);
+			// 「删除失败」仅在真有失败时显示：消息被封禁 revoke 提前撤回已计入「已删」，
+			// 不再把它误报成失败，避免出现「群里明明没了却报删除失败」的困惑。
+			if (Number(job.stats?.linkedMsgDeleteFailed) > 0) {
+				lines.push(`同款消息删除失败:${job.stats.linkedMsgDeleteFailed}`);
+			}
 		}
 	}
 	lines.push(
@@ -3086,6 +3094,16 @@ function getBulkJobOperationTask(job, operationIndex) {
 	return userId && groupId && isConfiguredGroup(groupId) ? { userId, groupId } : null;
 }
 
+// 判断一次 deleteMessage 的失败是否「等效已删」：目标消息已不存在 / 已不可删。
+// 常见于封禁的 revoke_messages 抢先删掉了同一条 —— 此时再删返回「message to delete not found」，
+// 消息确实没了，不该算删除失败。判据与 classifyAdDeleteOutcome 保持一致，避免两处口径分叉。
+function isEffectivelyDeletedError(error) {
+	const lower = String(error || '').toLowerCase();
+	return lower.includes('message to delete not found')
+		|| lower.includes('message identifier is not specified')
+		|| lower.includes("message can't be deleted");
+}
+
 async function processBulkJobOperationSlice(job, env) {
 	const active = job.activeBatch;
 	if (!active) return;
@@ -3149,7 +3167,10 @@ async function processBulkJobOperationSlice(job, env) {
 			for (const mid of midList) {
 				try {
 					const del = await deleteMessage(task.groupId, mid);
-					if (del?.ok) incrementBulkJobStat(job, 'linkedMsgDeleted');
+					// 「删成功」与「消息已不存在/已被封禁 revoke 撤回」都算等效删除：封禁在连带删除
+					// 之前就跑了 revoke_messages，还在群里的目标其消息已被删，此处再删必返回 not found，
+					// 那不是失败。只有权限不足等真失败才计入 linkedMsgDeleteFailed。
+					if (del?.ok || isEffectivelyDeletedError(del?.error)) incrementBulkJobStat(job, 'linkedMsgDeleted');
 					else incrementBulkJobStat(job, 'linkedMsgDeleteFailed');
 				} catch (_) {
 					// 删不掉不影响加黑与封禁（那些已经完成），也不阻塞后续目标。
@@ -5733,7 +5754,8 @@ async function enforceLinkedSpamTargets(env, targets, options = {}) {
 		let deleted = 0;
 		for (const item of target.messageIds) {
 			const r = await deleteMessage(item.chatId, item.mid);
-			if (r?.ok) deleted += 1;
+			// 与批量路径同口径：消息已被封禁 revoke 撤回（not found）也算等效删除，不漏计。
+			if (r?.ok || isEffectivelyDeletedError(r?.error)) deleted += 1;
 		}
 		const added = await addToBlacklist(target.userId, env, {
 			reason: 'spam',

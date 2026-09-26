@@ -8,6 +8,8 @@ const src = fs.readFileSync('_worker.js', 'utf8');
 const banned = [];
 const deleted = [];
 const sent = [];
+// 测试可往里塞 "chatId:mid"，令 deleteMessage 对这几条返回「消息不存在」
+const deleteNotFoundMids = new Set();
 
 const sandbox = {
 	console, URL, URLSearchParams, TextEncoder, TextDecoder, Response, Request, Headers,
@@ -23,6 +25,10 @@ const sandbox = {
 		if (m === 'getChat') payload = { ok: true, result: { id: b?.chat_id, first_name: 'X', bio: '' } };
 		else if (m === 'getChatMember') payload = { ok: true, result: { status: 'member', user: { id: b?.user_id } } };
 		else if (m === 'sendMessage') payload = { ok: true, result: { message_id: 9000 + sent.length } };
+		// 指定 mid 模拟「消息已不存在」（封禁 revoke_messages 抢先删掉后再删的真实返回）
+		else if (m === 'deleteMessage' && deleteNotFoundMids.has(b.chat_id + ':' + b.message_id)) {
+			payload = { ok: false, description: 'Bad Request: message to delete not found' };
+		}
 		return { ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) };
 	}
 };
@@ -244,6 +250,29 @@ console.log('\n=== 10.2 批量路径也删同款消息（线上漏删回归）==
 	check('未误删无关消息（只删 payload 里列出的 mid）', deleted.length === 4, deleted.join(' '));
 	check('删除结果计入统计', Number(job.stats?.linkedMsgDeleted || 0) === 4,
 		'已删 ' + job.stats?.linkedMsgDeleted + ' 失败 ' + (job.stats?.linkedMsgDeleteFailed || 0));
+
+	// 封禁 revoke_messages 抢先删掉的同款消息，连带删除会拿到「message to delete not found」——
+	// 消息确实没了，必须计入「已删」而非「删除失败」（问题三：修正误报）。
+	deleted.length = 0;
+	deleteNotFoundMids.clear();
+	deleteNotFoundMids.add(GROUPS[0] + ':7101');
+	deleteNotFoundMids.add(GROUPS[0] + ':7102');
+	const jobGone = await W.createBulkJob(jobEnv, 'spam', ['901'], [], '连带-已撤回', msg, {
+		deleteTargets: { '901': { [GROUPS[0]]: [7101, 7102] } }
+	});
+	jobGone.status = 'running';
+	jobGone.activeBatch = {
+		startCursor: 0, userCount: 1, ids: ['901'], actionableIds: ['901'],
+		groupIds: [GROUPS[0]], operationCursor: 0, totalOperations: 1
+	};
+	await W.processBulkJobOperationSlice(jobGone, jobEnv);
+	check('已被 revoke 撤回的同款消息计入「已删」', Number(jobGone.stats?.linkedMsgDeleted || 0) === 2,
+		'已删 ' + jobGone.stats?.linkedMsgDeleted);
+	check('已被 revoke 撤回不计入「删除失败」', Number(jobGone.stats?.linkedMsgDeleteFailed || 0) === 0,
+		'失败 ' + jobGone.stats?.linkedMsgDeleteFailed);
+	const goneStatus = W.formatBulkJobStatus(jobGone);
+	check('回执不再出现「同款消息删除失败」行（无真失败时）', !goneStatus.includes('同款消息删除失败'), goneStatus);
+	deleteNotFoundMids.clear();
 }
 
 console.log('\n=== 10.5 门槛 4 字：短广告必须能进（线上两次漏放的形态）===');
