@@ -1,6 +1,5 @@
 # wrangler.toml
-name = 'tc033'
-name = "tg-unban-bot-plus"
+name = "tc033"
 main = "_worker.js"
 compatibility_date = "2026-05-19"
 keep_vars = true
