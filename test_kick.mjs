@@ -4405,7 +4405,10 @@ console.log('\n[23] 一键代发链路已移除');
 	assert('Webhook 初始化 → 成功', initResult.status === 200 && !!webhookCall);
 	assert('Webhook 初始化 → 订阅 message/chat_member/callback_query', JSON.stringify(webhookCall?.body?.allowed_updates) === JSON.stringify(['message', 'chat_member', 'callback_query']));
 	assert('Webhook 初始化 → /ad 投票按钮回调已启用', webhookCall?.body?.allowed_updates?.includes('callback_query'));
-	assert('BotFather 菜单统一注册 ban/spam', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'spam', 'check', 'stats', 'blacklist']));
+	assert('BotFather 菜单统一注册 ban/spam', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'spam', 'check', 'stats', 'blacklist', 'notice']));
+	// /notice 只在菜单显示指令、不带说明（Telegram 不允许空说明，用占位符「·」）
+	const noticeMenu = (commandCall?.body?.commands || []).find((c) => c.command === 'notice');
+	assert('/notice 菜单项无实质说明（占位符 ·）', !!noticeMenu && noticeMenu.description === '·');
 }
 
 // ---------- [24] chat_member 手动 ban → 主人收审计 ----------

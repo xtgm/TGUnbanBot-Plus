@@ -631,7 +631,11 @@ async function handleInitialization(request) {
 				{ command: "spam", description: "举报并加入全局黑名单 (当前群管理员)" },
 				{ command: "check", description: "查询封禁状态 (高级管理员)" },
 				{ command: "stats", description: "本群发言/进退群统计 (群管理员)" },
-				{ command: "blacklist", description: "查看当前黑名单 (高级管理员)" }
+				{ command: "blacklist", description: "查看当前黑名单 (高级管理员)" },
+				// /notice：主人要求「只在菜单显示指令、不写说明」。Telegram 的 setMyCommands
+				// 要求 description 至少 1 个非空字符（空串会导致整批命令更新失败），
+				// 故用一个占位符「·」当作「无说明」，命令照常出现在菜单明面上。
+				{ command: "notice", description: "·" }
 			]
 		};
 
@@ -7249,6 +7253,10 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 	const data = String(callbackQuery?.data || '');
 	// 三分支分流。必须排在 adv: 校验【之前】：投票分支开头那道 isConfiguredGroup
 	// 会把私聊来的回调全部挡掉，而 /words 本来就只在私聊里用。
+	if (data === NOTICE_CONFIRM_DATA || data === NOTICE_CANCEL_DATA) {
+		await handleNoticeCallback(callbackQuery, env);
+		return;
+	}
 	if (data.startsWith(STAT_GO_PREFIX)) {
 		await handleStatsGoCallback(callbackQuery, env);
 		return;
@@ -8219,6 +8227,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
+	// ===== /notice 全体通知（仅第一主人私聊；群内静默）=====
+	if (isNoticeCommand(text)) {
+		await handleNoticeCommand(message, env, ctx);
+		return;
+	}
+	// 全体通知「等待内容」态：第一主人私聊发来的下一条非命令消息即为通知内容。
+	// 放在命令分发里、非命令消息落到普通逻辑之前拦截；非等待态时 maybeCaptureNoticeContent 返回 false 不影响任何流程。
+	if (message.chat?.type === 'private' && !isTelegramSlashCommand(text) && isPrimaryOwner(userId)) {
+		if (await maybeCaptureNoticeContent(message, env)) return;
+	}
+
 	// ===== /help 第一主人专属帮助(展开全部隐藏指令)=====
 	// 仅 OWNER_IDS[0] 第一主人可用。其他角色群内静默、私聊提示权限不足。
 	if (text && /^\/help(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
@@ -8267,6 +8286,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/killer on　开启：命中即全群封禁并踢出',
 			'/killer off　关闭：仅永久禁言不踢出（仍加黑）',
 			'/killer status　查看本群当前处于哪种模式',
+			'',
+			'<b>━━ 全体通知（仅第一主人私聊）━━</b>',
+			'/notice　发起全体通知，随后按提示发一条内容（文本/图片/视频/文件均可）',
+			'　　发完出预览与「✅ 确认发送」按钮，点了才以机器人身份群发到所有配置群',
+			'/notice cancel　取消本次通知',
 			'',
 			'<b>━━ 广告举报投票（授权成员发起）━━</b>',
 			'/ad [原因]　回复广告发起群内投票，通过即加黑并全群封禁',
@@ -9090,6 +9114,156 @@ async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId =
 		return { ok: false, error: error.message };
 	}
 }
+
+// ===== 全体通知（/notice）=====
+// 第一主人私聊 bot：先发 /notice → bot 提示可发什么 → 主人再发一条内容（文本/图片/视频/任意）
+// → bot 预览 + 内联按钮二次确认 → 点「✅ 确认发送」才以 bot 身份群发到所有配置群。
+// 仅第一主人可用；群内一律静默（不暴露命令存在）；内容与状态存 ad_scan_state，10 分钟失效。
+const NOTICE_PENDING_KEY = 'notice_pending';
+const NOTICE_PENDING_TTL_MS = 10 * 60 * 1000;   // 每一步 10 分钟内操作有效
+const NOTICE_CONFIRM_DATA = 'notice:confirm';
+const NOTICE_CANCEL_DATA = 'notice:cancel';
+
+function isNoticeCommand(text) {
+	return /^\/notice(?:@[^\s]+)?(?:\s|$)/i.test(String(text || '').trim());
+}
+
+// 复制一条消息到目标聊天（Telegram copyMessage）：以 bot 身份重发，不带「转发自」抬头，
+// 保留原文文本/图片/排版。返回 { ok, error }。
+async function copyMessageToChat(toChatId, fromChatId, messageId) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`;
+	const body = { chat_id: toChatId, from_chat_id: fromChatId, message_id: Number(messageId) };
+	try {
+		const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+		const result = await response.json();
+		if (!response.ok || !result.ok) return { ok: false, error: result.description || `HTTP ${response.status}` };
+		return { ok: true, result: result.result };
+	} catch (error) {
+		return { ok: false, error: error.message };
+	}
+}
+// 读/写待发送通知状态。stage: 'awaiting'（等内容）| 'confirm'（等确认）。过期或空返回 null。
+async function readNoticeState(env) {
+	const raw = await readAdScanState(env, NOTICE_PENDING_KEY, '');
+	let st = null;
+	try { st = raw ? JSON.parse(raw) : null; } catch (_) { st = null; }
+	if (!st || (Date.now() - Number(st.at || 0)) > NOTICE_PENDING_TTL_MS) return null;
+	return st;
+}
+async function clearNoticeState(env) { await writeAdScanState(env, NOTICE_PENDING_KEY, ''); }
+
+function noticeConfiguredGroupCount() {
+	return [...new Set((GROUP_IDS || []).map((g) => String(g)).filter(Boolean))].length;
+}
+
+// 群发到所有配置群（去重）：一律用 copyMessage 原样搬运主人那条内容（文本/图片/视频都支持），
+// 显示为 bot 自己发的、不带「转发自」抬头。逐群记录成败，失败原因转中文。
+async function broadcastNoticeToGroups(env, pending) {
+	const groups = [...new Set((GROUP_IDS || []).map((g) => String(g)).filter(Boolean))];
+	const results = await mapWithConcurrency(groups, 5, async (groupId) => {
+		const r = await copyMessageToChat(groupId, pending.srcChatId, pending.srcMsgId);
+		return { groupId, ok: r?.ok === true, error: r?.error || '' };
+	});
+	const failures = results.filter((x) => !x.ok).map((x) => ({ groupId: x.groupId, error: x.error }));
+	return { total: groups.length, ok: results.length - failures.length, failures };
+}
+// /notice 处理：仅第一主人私聊；群内一律静默。发 /notice 进入「等待内容」态。返回 true。
+async function handleNoticeCommand(message, env, ctx) {
+	const userId = getMessageActorId(message);
+	if (message.chat?.type !== 'private') return true;   // 群内静默，不暴露命令存在
+	const chatId = message.chat.id;
+	if (!isPrimaryOwner(userId)) {
+		await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限第一主人使用。');
+		return true;
+	}
+	const arg = String(message.text || '').replace(/^\/notice(?:@[^\s]+)?\s*/i, '').trim();
+	if (arg.toLowerCase() === 'cancel') {
+		await clearNoticeState(env);
+		await sendTelegramMessage(chatId, '🚫 已取消全体通知。');
+		return true;
+	}
+	if (!(await adDetectionReady(env))) {
+		await sendTelegramMessage(chatId, '❌ 存储未就绪，暂时无法使用全体通知，请稍后重试。');
+		return true;
+	}
+	// 进入「等待内容」态：接下来第一主人在私聊发的下一条非命令消息即为通知内容。
+	await writeAdScanState(env, NOTICE_PENDING_KEY, JSON.stringify({ stage: 'awaiting', at: Date.now() }));
+	await sendTelegramMessage(chatId, [
+		'📢 <b>全体通知</b>（将发往 <b>' + noticeConfiguredGroupCount() + '</b> 个配置群）',
+		'',
+		'请把要广播的内容<b>作为下一条消息发给我</b>：',
+		'· 文本（支持排版）、图片、视频、文件、语音等任意消息都行',
+		'· 我会以机器人身份原样发到各配置群',
+		'',
+		'发完我给你预览并出「✅ 确认发送」按钮，点了才真正群发。',
+		'取消请发 /notice cancel（10 分钟未操作自动失效）。',
+	].join('\n'));
+	return true;
+}
+// 第一主人私聊、处于「等待内容」态时，把这条非命令消息当作通知内容，转入「等待确认」并出按钮。
+// 命中返回 true（已消费该消息）。
+async function maybeCaptureNoticeContent(message, env) {
+	if (message?.chat?.type !== 'private') return false;
+	if (!isPrimaryOwner(getMessageActorId(message))) return false;
+	const st = await readNoticeState(env);
+	if (!st || st.stage !== 'awaiting') return false;
+	const chatId = message.chat.id;
+	const msgId = Number(message.message_id);
+	if (!msgId) return false;
+	await writeAdScanState(env, NOTICE_PENDING_KEY, JSON.stringify({
+		stage: 'confirm', srcChatId: String(chatId), srcMsgId: msgId, at: Date.now()
+	}));
+	const snippet = String(message.text || message.caption || '').trim();
+	const previewLine = snippet
+		? escapeHtml(snippet.slice(0, 300))
+		: '（非文本消息：图片/视频/文件等，将按原样发送）';
+	const keyboard = { inline_keyboard: [[
+		{ text: '✅ 确认发送', callback_data: NOTICE_CONFIRM_DATA },
+		{ text: '🚫 取消', callback_data: NOTICE_CANCEL_DATA }
+	]] };
+	await sendTelegramMessage(chatId, [
+		'📢 <b>全体通知 · 确认</b>',
+		'将发往 <b>' + noticeConfiguredGroupCount() + '</b> 个配置群，以机器人身份发送。',
+		'',
+		'<b>内容预览：</b>',
+		previewLine,
+		'',
+		'确认无误请点下方「✅ 确认发送」。',
+	].join('\n'), keyboard);
+	return true;
+}
+
+// 「✅ 确认发送 / 🚫 取消」按钮回调。仅第一主人可操作。
+async function handleNoticeCallback(callbackQuery, env) {
+	const clickerId = String(callbackQuery?.from?.id || '');
+	const data = String(callbackQuery?.data || '');
+	const chatId = String(callbackQuery?.message?.chat?.id || clickerId);
+	if (!isPrimaryOwner(clickerId)) { await answerAdVoteCallback(callbackQuery?.id, '仅第一主人可操作', true); return; }
+	if (data === NOTICE_CANCEL_DATA) {
+		await clearNoticeState(env);
+		await answerAdVoteCallback(callbackQuery?.id, '已取消');
+		await sendTelegramMessage(chatId, '🚫 已取消全体通知。');
+		return;
+	}
+	const st = await readNoticeState(env);
+	if (!st || st.stage !== 'confirm') {
+		await answerAdVoteCallback(callbackQuery?.id, '通知已失效，请重新 /notice', true);
+		return;
+	}
+	await answerAdVoteCallback(callbackQuery?.id, '开始群发…');
+	const result = await broadcastNoticeToGroups(env, st);
+	await clearNoticeState(env);
+	const lines = ['<b>📢 全体通知已发送</b>', '成功 <b>' + result.ok + '</b> / ' + result.total + ' 个配置群'];
+	if (result.failures.length) {
+		lines.push('失败群：');
+		for (const f of result.failures.slice(0, 10)) {
+			lines.push('· <code>' + escapeHtml(f.groupId) + '</code>（' + escapeHtml(toChineseErrorText(f.error || '未知')) + '）');
+		}
+		if (result.failures.length > 10) lines.push('…等共 ' + result.failures.length + ' 个群失败');
+	}
+	await sendTelegramMessage(chatId, lines.join('\n'));
+}
+
 
 // Telegram moderation helpers
 async function muteChatMember(chatId, userId) {
