@@ -432,7 +432,10 @@ console.log('\n=== 11b. 同款直封（2026-09-26 方案 A）：第一主人 /sp
 	let adminList = QUIET_ADMINS;
 	sandbox.fetch = async (url, init) => {
 		const m = String(url).split('/').pop();
-		if (m === 'getChatAdministrators') return { ok: true, status: 200, json: async () => adminList() };
+		if (m === 'getChatAdministrators') {
+			let b = null; try { b = init?.body ? JSON.parse(init.body) : null; } catch (_) {}
+			return { ok: true, status: 200, json: async () => adminList(b) };
+		}
 		return originalFetch(url, init);
 	};
 	// 模拟第一主人回复广告 /spam 写入名单（与 /spam 分支调用的是同一个写入函数）
@@ -502,15 +505,34 @@ console.log('\n=== 11b. 同款直封（2026-09-26 方案 A）：第一主人 /sp
 			banned.length === 0 && env.DB.query("SELECT id FROM blacklist WHERE id='71005'").length === 0);
 	}
 
-	// ⑥ 群管理员自己发同款 → 不封
+	// ⑥ 群管理员自己发同款 → 不封（用独立群号，避开前面场景污染的按群管理员缓存）
 	{
-		const env = { ...baseEnv, DB: makeD1() };
+		const G = '-100861', G2 = '-100862';
+		const env = { ...baseEnv, GROUP_ID: G + ',' + G2, DB: makeD1() };
 		await bootEnv(env);
 		await seedSpam(env);
 		adminList = () => ({ ok: true, result: [{ user: { id: 71006 }, status: 'administrator' }] });
 		resetCalls();
-		await post(env, 9106, { id: 71006, is_bot: false, first_name: '群管理员' });
-		check('群管理员发同款 → 不封', !banned.some((x) => x.endsWith(':71006')), banned.join(' '));
+		await drop(env, { message_id: 9106, chat: { id: G, type: 'supergroup', title: '测试群' },
+			from: { id: 71006, is_bot: false, first_name: '群管理员' }, text: SPAM_TEXT });
+		check('群管理员发同款 → 不封（任一配置群管理员即豁免）', !banned.some((x) => x.endsWith(':71006')), banned.join(' '));
+		adminList = QUIET_ADMINS;
+	}
+
+	// ⑥b 只在【别的】配置群当管理员，在当前发言群不是 → 仍全群豁免（本次需求核心）
+	{
+		const GA = '-100871', GB = '-100872';
+		const env = { ...baseEnv, GROUP_ID: GA + ',' + GB, DB: makeD1() };
+		await bootEnv(env);
+		await seedSpam(env);
+		// 71016 只在 GB 是管理员；他在 GA 发同款广告，也不能被封。
+		adminList = (b) => (String(b?.chat_id) === GB
+			? { ok: true, result: [{ user: { id: 71016 }, status: 'administrator' }] }
+			: { ok: true, result: [] });
+		resetCalls();
+		await drop(env, { message_id: 9116, chat: { id: GA, type: 'supergroup', title: 'A群' },
+			from: { id: 71016, is_bot: false, first_name: '别群管理员' }, text: SPAM_TEXT });
+		check('只在别的配置群当管理员，也全群豁免不封', !banned.some((x) => x.endsWith(':71016')), banned.join(' '));
 		adminList = QUIET_ADMINS;
 	}
 

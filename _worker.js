@@ -2033,6 +2033,14 @@ function isPrivilegedManager(userId) {
 	return isOwner(idStr);
 }
 
+// 广告【自动】检测的身份豁免：主人、副主人、超级管理员发任何内容都不判定。
+// 只用于自动检测四个入口（发言 / 入群 / 定时复扫 / /rescreen），不参与命令鉴权，
+// /ban /spam 对这些人的执行口径保持原样。
+function isAdDetectionExemptUser(userId) {
+	const idStr = String(userId || '');
+	return isPrivilegedManager(idStr) || isSuperAdmin(idStr);
+}
+
 // 只检查用户是否为“指定当前群”的 Telegram 管理员。
 // 普通管理员的 /ban、/spam 必须使用该鉴权，禁止遍历其它 GROUP_IDS 借权。
 async function checkIfUserIsAdminInGroup(userId, groupId) {
@@ -5133,6 +5141,11 @@ async function handleChatMemberUpdate(chatMember, env) {
 	if (enteredGroup) {
 		const blacklistCheck = await checkBlacklist(targetIdStr, env);
 		if (blacklistCheck.isBlacklisted) {
+			// 受保护角色（主/副/超管/任一配置群群主·管理员）复入不踢：避免误加黑把他们踢出。
+			if (await isProtectedFromAutoModeration(targetIdStr, String(chat.id))) {
+				console.log('[chat_member] 受保护角色复入，不踢回:', JSON.stringify({ 群ID: chat.id, 用户ID: targetIdStr }));
+				return;
+			}
 			if (isGroupMuteMode(chat.id)) {
 				// 禁言模式群：黑名单用户复入【不踢回】（主人要求：只禁言不踢出）。
 				console.log('[chat_member] 禁言模式群，黑名单用户复入不踢回:', JSON.stringify({ 群ID: chat.id, 用户ID: targetIdStr }));
@@ -6843,6 +6856,8 @@ async function resolveAdVoteTargetProtection(message, target) {
 	const targetId = String(target.targetUserId || '');
 	if (targetId === String(message?.from?.id || '')) return { protected: true, reason: '不能举报自己' };
 	if (isOwner(targetId)) return { protected: true, reason: '不能举报主人或副主人' };
+	if (isSuperAdmin(targetId)) return { protected: true, reason: '不能举报超级管理员' };
+	if (await isAdminInAnyConfiguredGroup(targetId)) return { protected: true, reason: '不能举报群主或管理员' };
 	const botId = await getBotId();
 	if (botId && targetId === String(botId)) return { protected: true, reason: '不能举报当前机器人' };
 
@@ -7625,9 +7640,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	) {
 		const blacklistCheck = await checkBlacklist(userId, env);
 		if (blacklistCheck.isBlacklisted) {
-			// 双保险：管理员豁免，避免误加黑导致管理员被踢
-			const isAdmin = await checkIfUserIsAdmin(userId);
-			if (!isAdmin) {
+			// 双保险：受保护角色豁免，避免误加黑导致他们被踢。
+			// checkIfUserIsAdmin 已含主人/副主人/任意配置群管理员；再补超管。
+			const isProtected = isSuperAdmin(userId) || await checkIfUserIsAdmin(userId);
+			if (!isProtected) {
 				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+踢人`);
 				await deleteMessage(chatId, message.message_id);
 				await banUserFromGroup(chatId, userId);
@@ -7788,7 +7804,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const spamEligible = !message.reply_to_message && !isOwner(senderIdStr) && !isSuperAdmin(senderIdStr);
 		if (spamEligible) {
 			const cached = await cacheModerationMessage(env, message);
-			if (cached?.spamHit && !(await checkIfUserIsAdminInGroup(senderIdStr, chatId))) {
+			// senderIdStr 已排除主人/副主人/超管；这里再补「任意配置群的群主/管理员」豁免。
+			if (cached?.spamHit && !(await isAdminInAnyConfiguredGroup(senderIdStr))) {
 				console.log('[同款直封] 群 ' + chatId + ' 用户 ' + senderIdStr + ' 直发第一主人 /spam 过的同款文案 → 删除 + 封禁');
 				await deleteMessage(chatId, message.message_id);
 				await enforceHandledRepeatBan(env, message, { norm: cached.norm });
@@ -8070,6 +8087,18 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				}
 				if (linkedKey) {
 					const found = await findLinkedSpamTargets(env, linkedKey, repliedUserId);
+					// 受保护角色（超管 / 任一配置群群主·管理员 / 主副主人）永不被连带封禁：入队前剔除。
+					if (found.targets.length) {
+						const kept = [];
+						for (const t of found.targets) {
+							if (await isProtectedFromAutoModeration(t.userId)) {
+								console.log('[同款连带] 目标 ' + t.userId + ' 是受保护角色，跳过不封');
+							} else {
+								kept.push(t);
+							}
+						}
+						found.targets = kept;
+					}
 					if (found.targets.length) {
 						const noteText = '同款广告连带(/spam ' + linkedUserId + ')';
 						if (shouldRunLinkedSpamSync(found.targets.length)) {
@@ -8483,7 +8512,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'<b>━━ 说明 ━━</b>',
 			'超管名单　环境变量 SUPER_ADMIN_IDS 里的人',
 			'超管可用　/ban /spam /unban /check，无需群管理员身份',
-			'超管限制　不能用 /stats，本人仍受广告检测与黑名单拦截',
+			'超管限制　不能用 /stats，本人仍受黑名单拦截',
+			'检测豁免　超管、任一配置群的群主或管理员，发任何内容都不被广告自动检测',
 			'群内命令　发出即撤回，结果留在群里并通知第一主人',
 			'私聊命令　命令和结果都保留',
 			'自动判定　加黑 + 全群封禁 + 自动学习，快照推给你复核',
@@ -13498,6 +13528,32 @@ async function isAdminForAdDetection(chatId, userId) {
 	}
 }
 
+// 在【任意一个】配置群是群主或管理员 → 所有群都豁免广告自动检测。
+// 只在检测已经判定要封的那一刻调用（低频），逐群复用 isAdminForAdDetection 的 5 分钟缓存，
+// 普通发言热路径不多花任何请求。当前群已由入口处的按群豁免查过，这里跳过避免重复。
+// 某群查询失败且无缓存时按「不是该群管理员」处理，与 isAdminForAdDetection 口径一致。
+async function isAdminInAnyConfiguredGroup(userId, skipChatId = '') {
+	const uid = String(userId || '');
+	if (!uid) return false;
+	const skip = String(skipChatId || '');
+	for (const groupId of GROUP_IDS) {
+		const gid = String(groupId || '');
+		if (!gid || gid === skip) continue;
+		if (await isAdminForAdDetection(gid, uid)) return true;
+	}
+	return false;
+}
+
+// 受保护角色：主人 / 副主人 / 超级管理员 / 任意一个配置群的群主或管理员。
+// 这些人【任何自动路径】都不封禁、不禁言（广告自动检测、同款直封、同款连带、黑名单发言拦截、
+// 复入群拦截、/ad 投票）。手动 /ban /spam 不走这里、口径不变（主人口径）。
+// 异步：先做同步的主/副/超管判断，再按需查「任意配置群管理员」（复用 5 分钟缓存），
+// 只在「已判定要封的那一刻」调用，普通发言热路径不触发。
+async function isProtectedFromAutoModeration(userId, skipChatId = '') {
+	if (isAdDetectionExemptUser(userId)) return true;
+	return await isAdminInAnyConfiguredGroup(userId, skipChatId);
+}
+
 // === 闸三 · 定时滚动复查（cron）===
 // 存在的理由只有一个：闸一闸二都发生在【发言的那一刻】，而广告号的标准玩法是
 // 先用干净资料混进来、发几句正常话过检，事后再把 bio 改成广告 —— 从此不再发言，
@@ -13564,8 +13620,8 @@ async function rescanAdMember(env, row, options = {}) {
 	const chatId = String(row?.chat_id || '');
 	const nowSeconds = Math.floor(Date.now() / 1000);
 
-	// 主人/副主人永不判定，与消息路径一致。
-	if (isPrivilegedManager(userId)) {
+	// 主人/副主人/超管永不判定，与消息路径一致。
+	if (isAdDetectionExemptUser(userId)) {
 		await markAdBioChecked(env, userId, nowSeconds);
 		return { scanned: false, banned: false, reason: 'privileged' };
 	}
@@ -13596,6 +13652,11 @@ async function rescanAdMember(env, row, options = {}) {
 		// 而这一轨扫的正是不发言的人 —— 给他们写观察记录只会让 ad_user_screening
 		// 被 300 条/天的扫描结果灌满，把真正需要盯的新入群用户挤掉。
 		return { scanned: true, banned: false };
+	}
+	// 任意配置群的群主/管理员全群豁免：定罪后才查，未定罪的人不花这笔请求。
+	if (await isAdminInAnyConfiguredGroup(userId, chatId)) {
+		console.log('[广告检测·扫描] user=' + userId + ' 是其他配置群的管理员，豁免不封');
+		return { scanned: true, banned: false, reason: 'admin' };
 	}
 
 	const result = await enforceAdDetection(env, {
@@ -14330,7 +14391,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 async function screenAdJoinMember(env, member, options = {}) {
 	const userId = member?.id;
 	if (!userId || member?.is_bot) return 'skipped';			// bot 交给 handleNewChatMemberBots
-	if (isPrivilegedManager(userId)) return 'skipped';			// 主人 / 副主人豁免
+	if (isAdDetectionExemptUser(userId)) return 'skipped';		// 主人 / 副主人 / 超管豁免
 	const chatId = String(options.chatId ?? '');
 	if (!chatId) return 'skipped';
 	if (!env?.DB) return 'skipped';
@@ -14377,6 +14438,11 @@ async function screenAdJoinMember(env, member, options = {}) {
 		);
 
 		if (evaluation.verdict === 'ban') {
+			// 任意配置群的群主/管理员全群豁免（当前群入口处已查过）。
+			if (await isAdminInAnyConfiguredGroup(userId, chatId)) {
+				console.log('[广告检测] 入群筛查 user=' + userId + ' 是其他配置群的管理员，豁免不封');
+				return 'skipped';
+			}
 			await enforceAdDetection(env, {
 				userId,
 				chatId,
@@ -14499,7 +14565,7 @@ async function detectAdOnMessage(message, env) {
 	if (Array.isArray(message.new_chat_members) && message.new_chat_members.length) return false;
 
 	const userId = from.id;
-	if (isPrivilegedManager(userId)) return false;
+	if (isAdDetectionExemptUser(userId)) return false;
 
 	const text = String(message.text ?? message.caption ?? '').trim();
 	if (isTelegramSlashCommand(text)) return false;
@@ -14679,6 +14745,11 @@ async function detectAdOnMessage(message, env) {
 	// 闸一够封禁线就地处置，不再花 getChat —— 已经确定要封的人，bio 是什么无关紧要。
 	// （唯一的例外是上面那段 AI 单独定罪的补查，它已经把 decision 换成复评结论了。）
 	if (decision.verdict === 'ban') {
+		// 任意配置群的群主/管理员全群豁免：定罪后才查（低频），当前群入口处已查过。
+		if (await isAdminInAnyConfiguredGroup(userId, chat.id)) {
+			console.log('[广告检测] user=' + userId + ' 是其他配置群的管理员，豁免不封');
+			return false;
+		}
 		await enforceAdDetection(env, {
 			userId,
 			chatId: chat.id,
@@ -14733,6 +14804,10 @@ async function detectAdOnMessage(message, env) {
 	));
 
 	if (evaluation.verdict === 'ban') {
+		if (await isAdminInAnyConfiguredGroup(userId, chat.id)) {
+			console.log('[广告检测] user=' + userId + ' 是其他配置群的管理员，豁免不封');
+			return false;
+		}
 		await enforceAdDetection(env, {
 			userId,
 			chatId: chat.id,
@@ -15695,7 +15770,7 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 		try { snapshot = JSON.parse(String(row.snapshot || '{}')); } catch { snapshot = {}; }
 		const targetChatId = String(row.chat_id || '') || String(GROUP_IDS[0] || '');
 		try {
-			if (isPrivilegedManager(userId)) { cleared.push(userId); await deleteAdScreening(env, userId); continue; }
+			if (isAdDetectionExemptUser(userId)) { cleared.push(userId); await deleteAdScreening(env, userId); continue; }
 			const already = await checkBlacklist(userId, env);
 			if (already.isBlacklisted) { cleared.push(userId); await deleteAdScreening(env, userId); continue; }
 
@@ -15708,7 +15783,11 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 				{ config, whitelist }
 			);
 
-			if (evaluation.verdict === 'ban') {
+			if (evaluation.verdict === 'ban' && await isAdminInAnyConfiguredGroup(userId)) {
+				// 任意配置群的群主/管理员全群豁免，不封、清掉观察记录。
+				await deleteAdScreening(env, userId);
+				cleared.push(userId);
+			} else if (evaluation.verdict === 'ban') {
 				await enforceAdDetection(env, {
 					userId,
 					chatId: targetChatId,

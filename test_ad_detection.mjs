@@ -1029,6 +1029,62 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 	assert('主人豁免：不触发封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
 	assert('主人豁免：不查管理员', countCalls('getChatAdministrators') === 0);
 
+	// 超级管理员发广告文本：与主人同口径直接豁免（2026-09-30 699658898 误封修复）。
+	const SUPER_ID = 60011;
+	const envSa = makeEnv({ SUPER_ADMIN_IDS: String(SUPER_ID) });
+	resetCalls();
+	setApi(adProfile);
+	await sendUpdate({ message: groupMessage({ id: SUPER_ID, first_name: '超管' }, AD_TEXT) }, envSa);
+	assert('超管豁免：不触发封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('超管豁免：不拉资料', countCalls('getChat') === 0);
+	assert('超管豁免：不进黑名单', envSa.DB.query('SELECT COUNT(*) AS c FROM blacklist')[0].c === 0);
+	assert('超管豁免：不删消息', countCalls('deleteMessage') === 0);
+	// 入群筛查同样豁免。
+	resetCalls();
+	setApi(adProfile);
+	await sendUpdate({ message: joinMessage([{ id: SUPER_ID, first_name: '💚高价收网赚号💚' }]) }, envSa);
+	assert('超管入群：不触发封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+
+	// 只在【另一个】配置群当管理员：在本群发广告也全群豁免（这次误封的真实形态）。
+	const OTHER_GROUP = '-1003333333333';
+	const XADMIN_ID = 60012;
+	const envX = makeEnv({ GROUP_ID: GROUP_ID + ',' + OTHER_GROUP });
+	resetCalls();
+	setApi({
+		...adProfile,
+		getChatAdministrators: (body) => ({
+			ok: true,
+			result: String(body?.chat_id) === OTHER_GROUP
+				? [{ user: { id: XADMIN_ID, is_bot: false }, status: 'administrator' }]
+				: []
+		})
+	});
+	await sendUpdate({ message: groupMessage({ id: XADMIN_ID, first_name: '群管' }, AD_TEXT) }, envX);
+	assert('他群管理员：不触发封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('他群管理员：不进黑名单', envX.DB.query('SELECT COUNT(*) AS c FROM blacklist')[0].c === 0);
+	assert('他群管理员：两个群的管理员名单都查过',
+		calls.filter((c) => c.method === 'getChatAdministrators').map((c) => String(c.body?.chat_id)).sort().join(',')
+			=== [GROUP_ID, OTHER_GROUP].sort().join(','));
+	// 他群群主（creator）同样豁免。
+	const CREATOR_ID = 60013;
+	resetCalls();
+	setApi({
+		...adProfile,
+		getChatAdministrators: (body) => ({
+			ok: true,
+			result: String(body?.chat_id) === OTHER_GROUP
+				? [{ user: { id: CREATOR_ID, is_bot: false }, status: 'creator' }]
+				: []
+		})
+	});
+	await sendUpdate({ message: groupMessage({ id: CREATOR_ID, first_name: '群主' }, AD_TEXT) }, envX);
+	assert('他群群主：不触发封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+	// 对照：两个群都不是管理员的普通号，照常封禁（豁免没有放宽到普通人）。
+	resetCalls();
+	setApi(adProfile);
+	await sendUpdate({ message: groupMessage({ id: 60014, first_name: '路人' }, AD_TEXT) }, envX);
+	assert('对照·普通号：照常封禁', countCalls('banChatMember') > 0, JSON.stringify(calls.map((c) => c.method)));
+
 	// 非配置群：广告检测完全不介入（同样预建表，否则无表可查）。
 	const env9 = makeEnv();
 	await W.adDetectionReady(env9);
