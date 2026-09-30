@@ -529,6 +529,16 @@ function makeFakeDB(seed = [], options = {}) {
 					return { meta: { changes: 0 } };
 				},
 				async all() {
+					// 同款直封：消息缓存写入带 RETURNING（顺带查 ad_spam_texts 名单）走 .all()。
+					// 与 run() 分支同一套存储；本模拟库不建 ad_spam_texts，名单恒为空 → spam_hit 为 null。
+					if (sql.startsWith('INSERT INTO moderation_messages') && sql.includes('RETURNING')) {
+						const [mid, chatId, fromId, createdAt] = bound;
+						const data = getJson('moderation_messages', { items: [] });
+						const id = moderationSeq++;
+						data.items.push({ id, mid, chatId: String(chatId), fromId: String(fromId), at: createdAt });
+						setJson('moderation_messages', data);
+						return { results: [{ id, spam_hit: null }], meta: { changes: 1, last_row_id: id } };
+					}
 					if (sql.startsWith('INSERT OR IGNORE INTO blacklist') && sql.includes('RETURNING id')) {
 						mutationCallIndex += 1;
 						mutationCalls.push({ index: mutationCallIndex, type: 'insert', sql, bound: [...bound] });

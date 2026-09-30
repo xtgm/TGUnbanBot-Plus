@@ -51,6 +51,8 @@ function makeD1(sqlLog) {
 		const bd = params.map(nIn);
 		const up = sql.trim().slice(0, 6).toUpperCase();
 		if (up === 'SELECT' || sql.trim().toUpperCase().startsWith('PRAGMA')) return { kind: 'rows', rows: st.all(...bd).map(nOut) };
+		// 带 RETURNING 的写入与真实 D1 一致：返回行（同款直封靠它在写缓存的同一条 SQL 里带回命中标记）
+		if (/\bRETURNING\b/i.test(sql)) return { kind: 'rows', rows: st.all(...bd).map(nOut) };
 		const i = st.run(...bd);
 		return { kind: 'write', meta: { changes: Number(i?.changes || 0), last_row_id: Number(i?.lastInsertRowid || 0), rows_written: Number(i?.changes || 0) } };
 	};
@@ -139,21 +141,21 @@ console.log('\n=== 3. 已处置文案的记录与比对 ===');
 	const env = { ...baseEnv, DB: makeD1() };
 	await bootEnv(env);
 
-	check('未记录任何文案时不命中', await W.matchHandledAdText(env, { text: AD_TEXT }) === false);
+	check('未记录任何文案时不命中', !(await W.matchHandledAdText(env, { text: AD_TEXT })));
 	await W.recordHandledAdText(env, AD_TEXT);
-	check('记录后原文命中', await W.matchHandledAdText(env, { text: AD_TEXT }) === true);
+	check('记录后原文命中', Boolean(await W.matchHandledAdText(env, { text: AD_TEXT })));
 	check('带多余空白的同文案也命中（走归一化）',
-		await W.matchHandledAdText(env, { text: '  来跑分一天一万包吃住有意者私聊我详谈立即上车  ' }) === true);
+		Boolean(await W.matchHandledAdText(env, { text: '  来跑分一天一万包吃住有意者私聊我详谈立即上车  ' })));
 	check('引用体里的正文也命中（重发形态正是引用主人命令 + 自贴广告）',
-		await W.matchHandledAdText(env, { text: '好的', reply_to_message: { text: AD_TEXT } }) === true);
+		Boolean(await W.matchHandledAdText(env, { text: '好的', reply_to_message: { text: AD_TEXT } })));
 	check('caption 字段同样参与比对',
-		await W.matchHandledAdText(env, { caption: AD_TEXT }) === true);
-	check('无关正文不命中', await W.matchHandledAdText(env, { text: '今天天气不错适合出门散步' }) === false);
-	check('空消息不命中', await W.matchHandledAdText(env, {}) === false);
+		Boolean(await W.matchHandledAdText(env, { caption: AD_TEXT })));
+	check('无关正文不命中', !(await W.matchHandledAdText(env, { text: '今天天气不错适合出门散步' })));
+	check('空消息不命中', !(await W.matchHandledAdText(env, {})));
 	// 这条通道是【无条件删消息】，短文案撞正常发言概率高，宁缺毋滥。
 	await W.recordHandledAdText(env, '在吗');
-	check('过短文案不入库（避免误删正常发言）', await W.matchHandledAdText(env, { text: '在吗' }) === false);
-	check('无 DB 时安全返回 false', await W.matchHandledAdText({}, { text: AD_TEXT }) === false);
+	check('过短文案不入库（避免误删正常发言）', !(await W.matchHandledAdText(env, { text: '在吗' })));
+	check('无 DB 时安全返回空', !(await W.matchHandledAdText({}, { text: AD_TEXT })));
 
 	const raw = env.DB.query("SELECT value FROM ad_scan_state WHERE key='ad_handled_texts'")[0]?.value;
 	const list = JSON.parse(raw || '[]');
@@ -168,21 +170,21 @@ console.log('\n=== 4. 环形上限与过期淘汰 ===');
 {
 	const env = { ...baseEnv, DB: makeD1() };
 	await bootEnv(env);
-	for (let i = 0; i < 70; i += 1) await W.recordHandledAdText(env, '广告文案编号第' + i + '号请联系我详谈');
+	for (let i = 0; i < 510; i += 1) await W.recordHandledAdText(env, '广告文案编号第' + i + '号请联系我详谈');
 	const list = JSON.parse(env.DB.query("SELECT value FROM ad_scan_state WHERE key='ad_handled_texts'")[0].value);
-	check('超过上限后截断到 60 条', list.length === 60, '实际 ' + list.length);
-	check('最新的留在最前（第 69 号）', String(list[0].t).includes('第69号'), String(list[0].t));
+	check('超过上限后截断到 500 条', list.length === 500, '实际 ' + list.length);
+	check('最新的留在最前（第 509 号）', String(list[0].t).includes('第509号'), String(list[0].t));
 	check('最旧的 10 条已被挤出（第 0～9 号都不在列表内）',
 		!list.some((x) => /第[0-9]号/.test(String(x.t))),
 		list.filter((x) => /第[0-9]号/.test(String(x.t))).length + ' 条残留');
 	check('挤出的旧文案不再命中',
-		await W.matchHandledAdText(env, { text: '广告文案编号第0号请联系我详谈' }) === false);
+		!(await W.matchHandledAdText(env, { text: '广告文案编号第0号请联系我详谈' })));
 
 	// 过期项：手动塞一条 25 小时前的记录，应读不到。
-	const stale = JSON.stringify([{ t: W.normalizeAdFingerprintValue('过期的旧广告文案内容在此'), at: Date.now() - 25 * 60 * 60 * 1000 }]);
+	const stale = JSON.stringify([{ t: W.normalizeAdFingerprintValue('过期的旧广告文案内容在此'), at: Date.now() - 8 * 24 * 60 * 60 * 1000 }]);
 	await W.writeAdScanState(env, 'ad_handled_texts', stale);
 	W.primeHandledAdTexts(env, JSON.parse(stale));
-	check('超过 24 小时的记录不再命中', await W.matchHandledAdText(env, { text: '过期的旧广告文案内容在此' }) === false);
+	check('超过一周的记录不再命中', !(await W.matchHandledAdText(env, { text: '过期的旧广告文案内容在此' })));
 }
 
 console.log('\n=== 5. 运行期缓存：热路径不重复读 D1 ===');
@@ -198,12 +200,12 @@ console.log('\n=== 5. 运行期缓存：热路径不重复读 D1 ===');
 	for (let i = 0; i < 5; i += 1) hits.push(await W.matchHandledAdText(env, { text: AD_TEXT }));
 	const reads = sqlLog.filter((s) => s.includes('FROM ad_scan_state'));
 	check('5 次比对最多读 1 次 D1（15 秒运行期缓存）', reads.length <= 1, '实际 ' + reads.length + ' 次');
-	check('5 次比对全部命中（缓存不能把结果吃掉）', hits.every((h) => h === true), JSON.stringify(hits));
+	check('5 次比对全部命中（缓存不能把结果吃掉）', hits.every((h) => Boolean(h)), JSON.stringify(hits));
 
 	// 写入端必须主动刷缓存：重发常在封禁后几秒内到达，等 TTL 自然过期就会漏删第一条。
 	const FRESH = '崭新的另一条广告文案需要立刻生效不能等缓存过期';
 	await W.recordHandledAdText(env, FRESH);
-	check('新记录立即可命中（写入端主动刷新缓存）', await W.matchHandledAdText(env, { text: FRESH }) === true);
+	check('新记录立即可命中（写入端主动刷新缓存）', Boolean(await W.matchHandledAdText(env, { text: FRESH })));
 }
 
 console.log('\n=== 6. 端到端 A：未知 bot 发广告 → 被检测并全群封禁 ===');
@@ -420,6 +422,173 @@ console.log('\n=== 11. 热路径 D1 预算：稳定态不因重发通道多读�
 		reads2.length <= 1, '实际 ' + reads2.length + ' 次');
 }
 
+
+console.log('\n=== 11b. 同款直封（2026-09-26 方案 A）：第一主人 /spam 过的文案，广告号直发 → 删除 + 封禁 ===');
+{
+	// 中性文案：广告检测本身判不出来，这样下面出现的封禁只可能来自同款直封，而不是检测。
+	const SPAM_TEXT = '今天下午三点在老地方见面记得带上资料';
+	const QUIET_ADMINS = () => ({ ok: true, result: [] });
+	const originalFetch = sandbox.fetch;
+	let adminList = QUIET_ADMINS;
+	sandbox.fetch = async (url, init) => {
+		const m = String(url).split('/').pop();
+		if (m === 'getChatAdministrators') return { ok: true, status: 200, json: async () => adminList() };
+		return originalFetch(url, init);
+	};
+	// 模拟第一主人回复广告 /spam 写入名单（与 /spam 分支调用的是同一个写入函数）
+	const seedSpam = async (env, text = SPAM_TEXT) => { await W.recordSpamText(env, { text }); };
+	const post = (env, mid, from, extra = {}) => drop(env, {
+		message_id: mid, chat: { id: GROUPS[0], type: 'supergroup', title: '测试群' }, from, text: SPAM_TEXT, ...extra,
+	});
+	const spamRows = (env) => env.DB.query('SELECT text_norm FROM ad_spam_texts').map((r) => r.text_norm);
+
+	// ① 广告号（真人、不带引用、自身正文命中）→ 删除 + 加黑 + 全群封禁 + 私聊主人
+	{
+		const env = { ...baseEnv, DB: makeD1() };
+		await bootEnv(env);
+		await seedSpam(env);
+		resetCalls();
+		await post(env, 9101, { id: 71001, is_bot: false, first_name: '潜伏号' });
+		check('广告号直发同款 → 消息被删', deleted.includes(GROUPS[0] + ':9101'), deleted.join(' '));
+		check('广告号直发同款 → 全群封禁', GROUPS.every((g) => banned.includes(g + ':71001')), banned.join(' '));
+		check('广告号直发同款 → 进黑名单', env.DB.query("SELECT id FROM blacklist WHERE id='71001'").length === 1);
+		check('广告号直发同款 → 私聊主人「同款广告直封」并附回滚',
+			sent.some((t) => t.includes('同款广告直封') && t.includes('/unban 71001')), sent.join(' | ').slice(0, 200));
+	}
+
+	// ② 名单里没有这段文案 → 不直封（证明封禁确实来自名单，而不是检测）
+	{
+		const env = { ...baseEnv, DB: makeD1() };
+		await bootEnv(env);
+		resetCalls();
+		await post(env, 9102, { id: 71002, is_bot: false, first_name: '某人' });
+		check('名单为空时同一文案不被封', !banned.some((x) => x.endsWith(':71002')), banned.join(' '));
+	}
+
+	// ③ 自动检测处置过的文案（只进 ad_handled_texts，不进直封名单）→ 真人直发不直封
+	{
+		const env = { ...baseEnv, DB: makeD1() };
+		await bootEnv(env);
+		await W.recordHandledAdText(env, SPAM_TEXT);
+		resetCalls();
+		await post(env, 9103, { id: 71003, is_bot: false, first_name: '某人' });
+		check('自动检测来源的文案 → 真人直发不直封', !banned.some((x) => x.endsWith(':71003')), banned.join(' '));
+	}
+
+	// ④ 机器人账号贴同款 → 只删不封（走重发只删通道）
+	{
+		const env = { ...baseEnv, DB: makeD1() };
+		await bootEnv(env);
+		await seedSpam(env);
+		await W.recordHandledAdText(env, SPAM_TEXT);
+		resetCalls();
+		await post(env, 9104, { id: 71004, is_bot: true, username: 'someadminbot' },
+			{ reply_to_message: { message_id: 9000, from: { id: 10001, is_bot: false }, text: '/spam' } });
+		check('机器人贴同款 → 只删', deleted.includes(GROUPS[0] + ':9104'), deleted.join(' '));
+		check('机器人贴同款 → 不封', banned.length === 0, banned.join(' '));
+	}
+
+	// ⑤ 群友回复广告（同款只在引用体里）→ 只删不封
+	{
+		const env = { ...baseEnv, DB: makeD1() };
+		await bootEnv(env);
+		await seedSpam(env);
+		await W.recordHandledAdText(env, SPAM_TEXT);
+		resetCalls();
+		await post(env, 9105, { id: 71005, is_bot: false, first_name: '好心群友' },
+			{ text: '大家别信这是骗子', reply_to_message: { message_id: 9001, from: { id: 71001, is_bot: false }, text: SPAM_TEXT } });
+		check('群友回复广告 → 只删', deleted.includes(GROUPS[0] + ':9105'), deleted.join(' '));
+		check('群友回复广告 → 不封、不进黑名单',
+			banned.length === 0 && env.DB.query("SELECT id FROM blacklist WHERE id='71005'").length === 0);
+	}
+
+	// ⑥ 群管理员自己发同款 → 不封
+	{
+		const env = { ...baseEnv, DB: makeD1() };
+		await bootEnv(env);
+		await seedSpam(env);
+		adminList = () => ({ ok: true, result: [{ user: { id: 71006 }, status: 'administrator' }] });
+		resetCalls();
+		await post(env, 9106, { id: 71006, is_bot: false, first_name: '群管理员' });
+		check('群管理员发同款 → 不封', !banned.some((x) => x.endsWith(':71006')), banned.join(' '));
+		adminList = QUIET_ADMINS;
+	}
+
+	// ⑦ 主人自己发同款 → 不封
+	{
+		const env = { ...baseEnv, DB: makeD1() };
+		await bootEnv(env);
+		await seedSpam(env);
+		resetCalls();
+		await post(env, 9107, { id: 10001, is_bot: false, first_name: '主人' });
+		check('主人发同款 → 不封', !banned.some((x) => x.endsWith(':10001')), banned.join(' '));
+	}
+
+	// ⑧ 第一主人回复广告 /spam → 写进直封名单；副主人 /spam → 不写
+	{
+		const env = { ...baseEnv, OWNER_IDS: '10001,10002', DB: makeD1() };
+		await bootEnv(env);
+		resetCalls();
+		await drop(env, {
+			message_id: 9110, chat: { id: GROUPS[0], type: 'supergroup', title: '测试群' },
+			from: { id: 10001, is_bot: false, first_name: '主人' }, text: '/spam',
+			reply_to_message: { message_id: 9109, from: { id: 71010, is_bot: false }, text: SPAM_TEXT },
+		});
+		check('第一主人回复 /spam → 文案写进直封名单',
+			spamRows(env).includes(W.normalizeAdFingerprintValue(SPAM_TEXT)), JSON.stringify(spamRows(env)));
+
+		const envD = { ...baseEnv, OWNER_IDS: '10001,10002', DB: makeD1() };
+		await bootEnv(envD);
+		await W.ensureAdSpamTextsTable(envD);
+		resetCalls();
+		await drop(envD, {
+			message_id: 9112, chat: { id: GROUPS[0], type: 'supergroup', title: '测试群' },
+			from: { id: 10002, is_bot: false, first_name: '副主人' }, text: '/spam',
+			reply_to_message: { message_id: 9111, from: { id: 71011, is_bot: false }, text: SPAM_TEXT },
+		});
+		check('副主人回复 /spam → 不写进直封名单', spamRows(envD).length === 0, JSON.stringify(spamRows(envD)));
+	}
+
+	// ⑨ 超过一周的名单条目不再直封
+	{
+		const env = { ...baseEnv, DB: makeD1() };
+		await bootEnv(env);
+		await W.ensureAdSpamTextsTable(env);
+		const key = W.buildModerationTextKey({ text: SPAM_TEXT });
+		await env.DB.prepare('INSERT INTO ad_spam_texts (text_hash, text_norm, at) VALUES (?, ?, ?)')
+			.bind(key.hash, key.norm, Date.now() - 8 * 24 * 60 * 60 * 1000).run();
+		resetCalls();
+		await post(env, 9120, { id: 71020, is_bot: false, first_name: '某号' });
+		check('超过一周的名单条目不再直封', !banned.some((x) => x.endsWith(':71020')), banned.join(' '));
+	}
+
+	// ⑩ 过短文案不进直封名单（防「你好」「在吗」误伤）
+	{
+		const env = { ...baseEnv, DB: makeD1() };
+		await bootEnv(env);
+		await W.ensureAdSpamTextsTable(env);
+		await W.recordSpamText(env, { text: '在吗' });
+		check('不到 6 个字的文案不进直封名单', spamRows(env).length === 0, JSON.stringify(spamRows(env)));
+	}
+
+	// ⑪ 热路径：真人普通发言，名单查询与消息缓存写入是同一条 SQL，不单独查 ad_spam_texts
+	{
+		const sqlLog = [];
+		const env = { ...baseEnv, DB: makeD1(sqlLog) };
+		await bootEnv(env);
+		await seedSpam(env);
+		await drop(env, { message_id: 9130, chat: { id: GROUPS[0], type: 'supergroup', title: '测试群' },
+			from: { id: 44010, is_bot: false, first_name: '甲' }, text: '大家早上好今天天气不错啊' });
+		sqlLog.length = 0;
+		await drop(env, { message_id: 9131, chat: { id: GROUPS[0], type: 'supergroup', title: '测试群' },
+			from: { id: 44011, is_bot: false, first_name: '乙' }, text: '是啊适合出门走走晒太阳' });
+		const standalone = sqlLog.filter((s) => s.includes('ad_spam_texts') && !s.startsWith('INSERT INTO moderation_messages'));
+		const merged = sqlLog.filter((s) => s.startsWith('INSERT INTO moderation_messages') && s.includes('ad_spam_texts'));
+		check('普通发言不单独查询直封名单', standalone.length === 0, standalone.join(' | '));
+		check('名单查询合并在消息缓存写入的同一条 SQL 里', merged.length === 1, '实际 ' + merged.length + ' 条');
+	}
+	sandbox.fetch = originalFetch;
+}
 
 console.log('\n=== 12. 引用已处置广告的四条管理命令先鉴权撤回再执行 ===');
 {

@@ -5638,14 +5638,71 @@ function buildModerationTextKey(message) {
 	return { hash: hash.toString(16).padStart(8, '0'), norm };
 }
 
+// ===== 同款直封名单（2026-09-26 方案 A）=====
+// 只存「第一主人回复广告 /spam 过的文案」：广告号之后直发同款 → 删除 + 加黑 + 全群封禁。
+// 【为什么单独一张表】热路径 D1 预算守卫规定普通群消息核心 SQL ≤ 3 条。这张表不单独查询，
+// 而是嵌进 cacheModerationMessage 那条 INSERT 的 RETURNING 子查询里 —— 写消息缓存和查名单
+// 合成一条 SQL，普通发言不多付任何一次 D1 往返。
+// 【懒建表】首次写入或首次读取时自动 CREATE TABLE IF NOT EXISTS，不动 D1_SCHEMA_VERSION
+// （动版本号会让既有两个测试变红，也会触发整套核心迁移，本功能用不着）。
+// 保留一周：写入时顺手清掉超过一周的旧行，表永远很小。
+const AD_SPAM_TEXTS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const D1_AD_SPAM_TEXTS_INIT = new WeakMap();
+
+async function ensureAdSpamTextsTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_AD_SPAM_TEXTS_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			await runD1SchemaStatement(env, 'ad_spam_texts',
+				'CREATE TABLE IF NOT EXISTS ad_spam_texts (text_hash TEXT PRIMARY KEY, text_norm TEXT NOT NULL, at INTEGER NOT NULL)');
+			return true;
+		} catch (error) {
+			console.error('[同款直封] 建表失败:', error?.message || error);
+			return false;
+		}
+	})();
+	D1_AD_SPAM_TEXTS_INIT.set(env.DB, init);
+	const ok = await init;
+	if (!ok) D1_AD_SPAM_TEXTS_INIT.delete(env.DB);   // 失败不缓存，下次再试
+	return ok;
+}
+
+// 第一主人回复广告 /spam 时调用：把被举报消息的正文写进同款直封名单。
+// 与 moderation_messages 用同一个 buildModerationTextKey 取哈希与归一化正文，保证两边比对口径一致。
+async function recordSpamText(env, repliedMsg) {
+	const key = buildModerationTextKey(repliedMsg);
+	// 与已处置名单同一道短文案门槛：不到 6 个字不记，防止「你好」「在吗」误伤。
+	if (!key || String(key.norm).length < 6) return;
+	if (!(await ensureAdSpamTextsTable(env))) return;
+	const now = Date.now();
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_spam_texts (text_hash, text_norm, at) VALUES (?, ?, ?) '
+			+ 'ON CONFLICT(text_hash) DO UPDATE SET text_norm = excluded.text_norm, at = excluded.at'
+		).bind(key.hash, key.norm, now).run();
+		// 顺手清过期行：只在写入（即第一主人 /spam）时做，不占普通发言的热路径。
+		await env.DB.prepare('DELETE FROM ad_spam_texts WHERE at < ?').bind(now - AD_SPAM_TEXTS_TTL_MS).run();
+	} catch (error) {
+		console.error('[同款直封] 写入名单失败:', error?.message || error);
+	}
+}
+
+// 返回 { spamHit, norm }：spamHit = 这条消息的正文命中了同款直封名单（第一主人一周内 /spam 过）。
+// 名单查询嵌在 INSERT 的 RETURNING 子查询里，与消息缓存写入是【同一条 SQL】，不多付 D1 往返。
 async function cacheModerationMessage(env, message) {
+	const none = { spamHit: false, norm: '' };
 	// 双保险：即使调用点漏判，这里也拒绝服务消息进入清扫缓存。
-	if (isTelegramServiceMessage(message)) return;
-	if (!env.DB || !message?.message_id || !message?.from?.id) return;
+	if (isTelegramServiceMessage(message)) return none;
+	if (!env.DB || !message?.message_id || !message?.from?.id) return none;
 	try {
 		await ensureD1Table(env);
 		const textKey = buildModerationTextKey(message);
 		const nowIso = new Date().toISOString();
+		// 只有够长的正文才可能命中名单（写入端同一道 6 字门槛）；建表一次后按 DB 实例缓存，不逐条重复。
+		const canMatchSpam = Boolean(textKey && String(textKey.norm).length >= 6)
+			&& await ensureAdSpamTextsTable(env);
 		// 带新列写入；若库里还没有 text_hash / text_norm（迁移未跑或跑失败），
 		// 降级成旧的四列 INSERT。
 		// 【为什么要这道容错】moderation_messages 承载的是 /spam 历史消息清扫这项【既有基础能力】，
@@ -5653,17 +5710,30 @@ async function cacheModerationMessage(env, message) {
 		// 线上就出现过：版本号没提 → 迁移短路不执行 → 两列不存在 → 每条群消息 INSERT 全失败。
 		// 版本号提升治的是「迁移没跑」，这道降级治的是「迁移跑了但失败」（D1 抖动等），两者互补。
 		let insertResult;
+		let spamHit = false;
 		try {
-			insertResult = await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm) VALUES (?, ?, ?, ?, ?, ?)')
-				.bind(
-					message.message_id,
-					String(message.chat.id),
-					String(message.from.id),
-					nowIso,
-					textKey?.hash ?? null,
-					textKey?.norm ?? null
-				)
-				.run();
+			const baseSql = 'INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm) VALUES (?, ?, ?, ?, ?, ?)';
+			const baseArgs = [
+				message.message_id,
+				String(message.chat.id),
+				String(message.from.id),
+				nowIso,
+				textKey?.hash ?? null,
+				textKey?.norm ?? null
+			];
+			if (canMatchSpam) {
+				// 同一条 SQL：写缓存 + 查名单。RETURNING 带回自增 id（供裁剪判断）与命中标记。
+				// text_norm 二次比对兜住 FNV-1a 32 位哈希碰撞 —— 命中就封号，代价不对称，不能只信哈希。
+				const rows = await env.DB.prepare(baseSql
+					+ ' RETURNING id, (SELECT 1 FROM ad_spam_texts WHERE text_hash = ? AND text_norm = ? AND at >= ?) AS spam_hit')
+					.bind(...baseArgs, textKey.hash, textKey.norm, Date.now() - AD_SPAM_TEXTS_TTL_MS)
+					.all();
+				const row = rows?.results?.[0] || null;
+				spamHit = Number(row?.spam_hit) === 1;
+				insertResult = { meta: { last_row_id: Number(row?.id) || rows?.meta?.last_row_id } };
+			} else {
+				insertResult = await env.DB.prepare(baseSql).bind(...baseArgs).run();
+			}
 		} catch (error) {
 			const reason = String(error?.message || error).toLowerCase();
 			// 只对「列不存在」降级；其它错误（约束冲突、D1 不可用）照原样抛给外层日志，
@@ -5683,8 +5753,10 @@ async function cacheModerationMessage(env, message) {
 		if (shouldPruneD1Cache(insertResult)) {
 			await pruneAutoincrementCacheTable(env, 'moderation_messages', limit);
 		}
+		return { spamHit, norm: textKey?.norm || '' };
 	} catch (error) {
 		console.error('[清扫缓存] 写 D1 失败:', error);
+		return none;
 	}
 }
 
@@ -5945,8 +6017,10 @@ async function loadLearnSnapshot(env, ownerId) {
 // 存储复用 ad_scan_state 键值表，不新建表：单键存一份「最近已处置文案指纹」环形列表，
 // JSON 数组，只留最近 N 条，够覆盖 24 小时内的重发即可。
 const AD_HANDLED_TEXTS_KEY = 'ad_handled_texts';
-const AD_HANDLED_TEXTS_MAX = 60;
-const AD_HANDLED_TEXTS_TTL_MS = 24 * 60 * 60 * 1000;
+// 【2026-09-26】扩为一周 / 500 条：同款直封名单保留一周，重发只删通道同步保留一周，
+// 避免「直封名单还在、只删名单已过期」两边口径不一致。24 小时 / 60 条会漏掉隔几天才冒头的重发。
+const AD_HANDLED_TEXTS_MAX = 500;
+const AD_HANDLED_TEXTS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // 运行期缓存（按 DB 实例，惯例同 AD_FINGERPRINT_CACHE）。这张表只在封禁成功时才写，
 // 平时是纯读热路径，缓存 15 秒不会漏掉真实重发（重发间隔是人工处置的分钟级）。
 const AD_HANDLED_TEXTS_CACHE = new WeakMap();
@@ -5974,7 +6048,8 @@ function primeHandledAdTexts(env, list) {
 	});
 }
 
-// 记录一条「已被处置的广告文案」。由 enforceAdDetection 在封禁成功后调用。
+// 记录一条「已被处置的广告文案」（重发只删通道用）。
+// 调用方：enforceAdDetection 自动检测封禁后；第一主人回复广告 /spam 后（同时另写同款直封名单）。
 async function recordHandledAdText(env, rawText) {
 	const norm = normalizeAdFingerprintValue(rawText);
 	// 过短的不记：那种文案撞正常发言概率高，而这条通道是【无条件删消息】，宁缺毋滥。
@@ -6017,6 +6092,60 @@ async function matchHandledAdText(env, message) {
 	} catch (error) {
 		console.error('[重发删除] 比对已处置文案失败:', error);
 		return false;
+	}
+}
+
+// 同款直封：广告号直发第一主人 /spam 过的同款文案 → 加黑 + 全群封禁（杀手模式群只禁言），
+// 私聊第一主人并附一键回滚。消息删除已由调用方完成。
+async function enforceHandledRepeatBan(env, message, hit) {
+	const userId = String(message?.from?.id || '');
+	if (!userId) return;
+	let blacklistCode = 'ERROR';
+	try {
+		const added = await addToBlacklist(userId, env, {
+			reason: 'spam',
+			by: 'system',
+			note: '同款广告直封（第一主人 /spam 过的文案）'
+		});
+		blacklistCode = String(added?.code || (added?.success ? 'ADDED' : 'ERROR'));
+	} catch (error) {
+		console.error('[同款直封] 加入黑名单失败:', error);
+	}
+	let banResults = [];
+	try {
+		banResults = await banUserFromAllGroups(userId, { probeMembership: false, revokeMessages: true });
+	} catch (error) {
+		console.error('[同款直封] 全群封禁失败:', error);
+	}
+	const ownerId = getOwnerNotifyTargets()[0] || '';
+	if (!ownerId) return;
+	const okCount = banResults.filter((r) => r?.ok).length;
+	const failed = banResults.filter((r) => !r?.ok);
+	const lines = [
+		'<b>🎯 同款广告直封</b>',
+		'',
+		'<b>账号：</b>' + formatUserReference(userId, message.from),
+		'<b>来源群：</b>' + escapeHtml(message.chat?.title || '未知')
+			+ '（<code>' + escapeHtml(String(message.chat?.id ?? '')) + '</code>）',
+		'<b>同款文案：</b>' + escapeHtml(String(hit?.norm || '').slice(0, 120)),
+		'<b>依据：</b>该文案一周内被第一主人 /spam 处置过',
+		'',
+		'<b>黑名单：</b>' + (blacklistCode === 'ADDED' ? '已加入' : blacklistCode === 'EXISTS' ? '此前已在' : blacklistCode),
+		'<b>封禁结果：</b>' + okCount + '/' + banResults.length + ' 个群成功',
+	];
+	failed.slice(0, 3).forEach((r, idx) => {
+		lines.push((idx === 0 ? '<b>失败群：</b>' : '　　　　') + '<code>' + escapeHtml(String(r.groupId)) + '</code>（'
+			+ escapeHtml(toChineseErrorText(r.error || '未知')) + '）');
+	});
+	if (failed.length > 3) lines.push('　　　　等共 ' + failed.length + ' 个群失败');
+	lines.push('<b>消息：</b>已删除');
+	lines.push('');
+	lines.push('<b>判错一键回滚</b>（解黑 + 全群解封）：');
+	lines.push('<code>/unban ' + escapeHtml(userId) + '</code>');
+	try {
+		await sendTelegramMessageChunks(ownerId, lines.join('\n'));
+	} catch (error) {
+		console.error('[同款直封] 推送通知失败:', error);
 	}
 }
 
@@ -7576,6 +7705,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	//   2) 真人不带引用、直接重打一遍广告正文，那本来就该走 detectAdOnMessage 正常封禁，
 	//      走这条只删不封的通道反倒是放过。
 	// 副作用是热路径省掉一次 D1 读：真人普通发言不满足前置条件，压根不查表。
+	//
+	// 【2026-09-26】同款直封（广告号直发第一主人 /spam 过的文案 → 删 + 封）不走这里，
+	// 走下方「消息缓存写入」那一步：名单查询嵌进写缓存的同一条 SQL，普通发言不多付 D1。
+	// 本通道维持原状：只处理「bot 发的」或「带引用体」的消息，命中一律只删不封。
 	if (
 		isConfiguredGroup(chatId) && message.message_id
 		&& !isTelegramServiceMessage(message)
@@ -7648,7 +7781,20 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		!isTelegramServiceMessage(message) &&
 		!(text && text.startsWith('/'))
 	) {
-		if (ctx && typeof ctx.waitUntil === 'function') {
+		// 【同款直封】写缓存与查名单是同一条 SQL。只有「有资格被直封」的消息才需要等结果：
+		//   不带引用（群友回复广告只删不封，那条由重发通道处理）+ 发送者不是主人/副主人/超管。
+		// 其余消息照旧放后台写，不阻塞热路径。群管理员放到命中之后再查（罕见路径才花这一次请求）。
+		const senderIdStr = String(message.from.id);
+		const spamEligible = !message.reply_to_message && !isOwner(senderIdStr) && !isSuperAdmin(senderIdStr);
+		if (spamEligible) {
+			const cached = await cacheModerationMessage(env, message);
+			if (cached?.spamHit && !(await checkIfUserIsAdminInGroup(senderIdStr, chatId))) {
+				console.log('[同款直封] 群 ' + chatId + ' 用户 ' + senderIdStr + ' 直发第一主人 /spam 过的同款文案 → 删除 + 封禁');
+				await deleteMessage(chatId, message.message_id);
+				await enforceHandledRepeatBan(env, message, { norm: cached.norm });
+				return;
+			}
+		} else if (ctx && typeof ctx.waitUntil === 'function') {
 			ctx.waitUntil(cacheModerationMessage(env, message));
 		} else {
 			await cacheModerationMessage(env, message);
@@ -7914,6 +8060,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 非第一主人【完全静默】：不提示、不在群里留任何痕迹，不暴露这个能力的存在。
 			try {
 				const linkedKey = isPrimaryOwner(operatorId) ? buildModerationTextKey(repliedMsg) : null;
+				// 【同款直封】第一主人回复广告 /spam → 文案写进两份名单（均保留一周）：
+				//   ad_spam_texts    —— 同款直封：广告号之后直发同款 → 发言时即删除 + 封禁，不需二次 /spam
+				//   ad_handled_texts —— 重发只删：机器人贴原文 / 群友带引用回复 → 只删不封
+				// 只收第一主人：副主人 / 超管 / 群管理员的 /spam 不写名单（与连带同一道门）。
+				if (isPrimaryOwner(operatorId)) {
+					await recordSpamText(env, repliedMsg);
+					await recordHandledAdText(env, repliedMsg?.text ?? repliedMsg?.caption ?? '');
+				}
 				if (linkedKey) {
 					const found = await findLinkedSpamTargets(env, linkedKey, repliedUserId);
 					if (found.targets.length) {
