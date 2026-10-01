@@ -2072,6 +2072,33 @@ async function checkIfUserIsAdminInGroup(userId, groupId) {
 	}
 }
 
+// /rm 专用鉴权：只认【该群群主 creator】，普通管理员不算。
+// 主人明确要求「仅第一主人以及 telegram 群主」—— 删除消息不可逆，比 /stats 那种
+// 「管理员即可」更严；且与 checkIfUserIsAdminInGroup 分开，避免后者被别的调用点牵连放宽。
+async function checkIfUserIsGroupOwner(userId, groupId) {
+	const userIdStr = String(userId || '');
+	const groupIdStr = String(groupId || '');
+	if (!userIdStr || !isConfiguredGroup(groupIdStr)) return false;
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: groupIdStr }),
+		});
+		const result = await response.json();
+		if (!response.ok || !result.ok || !Array.isArray(result.result)) {
+			console.log(`[/rm] 群 ${groupIdStr} 管理员列表查询失败: ${result.description || `HTTP ${response.status}`}`);
+			return false;
+		}
+		// 只认 creator：Telegram 把群主标记为 status === 'creator'。
+		const hit = result.result.find((m) => m?.user && String(m.user.id) === userIdStr && m.status === 'creator');
+		return Boolean(hit);
+	} catch (error) {
+		console.error(`[/rm] 群 ${groupIdStr} 查询异常:`, error);
+		return false;
+	}
+}
+
 // /unban、/ban、/spam、/check 共用权限：主人/副主人保留原权限；
 // 群内检查当前配置群，私聊检查任一配置群；匿名管理员仅在当前配置群放行。
 async function checkMessageOperatorCanModerate(message, userId) {
@@ -8299,13 +8326,19 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (!isInGroup) {
 			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${escapeHtml(tgidToCheck)}</code> 的封禁状态...`);
 		}
+		const profileGroupId = isConfiguredGroup(String(chatId)) ? String(chatId) : (GROUP_IDS[0] || '');
 		const response = await buildBanlistCheckResponse(tgidToCheck, {
 			targetUser: repliedUser,
 			includeReviewAction: true,
 			dispatchSourceAllowed,
 			env,
 		});
-		await replyToModerationAdmin(message, ctx, { detailText: response.text, replyMarkup: response.replyMarkup });
+		// 资料卡 + 时间线（第1批）：/check 与 /profile 共用同一份渲染，避免两处口径分叉。
+		const profileLines = await buildProfileBlock(env, profileGroupId, tgidToCheck);
+		await replyToModerationAdmin(message, ctx, {
+			detailText: [...profileLines, '', response.text].join('\n'),
+			replyMarkup: response.replyMarkup,
+		});
 		return;
 	}
 	// 处理 /start 命令（包含 deep link 参数）
@@ -8341,15 +8374,19 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
 			}
 			const response = await buildBanlistCheckResponse(tgidToCheck, { includeReviewAction: true, env });
+			// 资料卡 + 时间线（第1批）：与 /check 正常查询、/profile 共用同一份渲染。
+			const profileLines = await buildProfileBlock(env,
+				isConfiguredGroup(String(chatId)) ? String(chatId) : (GROUP_IDS[0] || ''), tgidToCheck);
+			const checkText = [...profileLines, '', response.text].join('\n');
 			if (quietGroupCommand) {
 				await replyToAdmin(message, ctx, {
 					flashText: `🔍 查询完成 <code>${escapeHtml(tgidToCheck)}</code>，完整结果已发送给主人`,
-					detailText: response.text,
+					detailText: checkText,
 					isInGroup: true,
 					replyMarkup: response.replyMarkup,
 				});
 			} else {
-				await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+				await sendTelegramMessage(chatId, checkText, response.replyMarkup);
 			}
 			return;
 		}
@@ -8410,6 +8447,19 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
+	// ===== /rm 回复删除（仅第一主人 / 该群群主）=====
+	// 放在命令分发区最前，早于 /notice；非配置群的命令已在上方 isNonConfiguredGroup 处被拦。
+	if (isRmCommand(text)) {
+		await handleRmCommand(message, env, ctx);
+		return;
+	}
+
+	// ===== /profile 资料卡（权限同 /check）=====
+	if (isProfileCommand(text)) {
+		await handleProfileCommand(message, env, ctx);
+		return;
+	}
+
 	// ===== /notice 全体通知（仅第一主人私聊；群内静默）=====
 	if (isNoticeCommand(text)) {
 		await handleNoticeCommand(message, env, ctx);
@@ -8451,6 +8501,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/spam　回复广告：删消息 + 全群封禁 + 撤回其历史发言',
 			'/unban TGID　移出黑名单 + 全群解封（不带 ID 则是自助解封）',
 			'/check TGID　查封禁状态：GKY + 本地黑名单（群内可回复消息使用）',
+			'/profile TGID　资料卡：昵称 / 简介 / 时间线 / 黑名单 / GKY（群内可回复消息使用）',
+			'/rm　回复要删的消息后发送 → 删除该消息（仅第一主人 / 该群群主）',
 			'/blacklist　查看全局黑名单最近记录（主人 / 副主人）',
 			'/job 任务ID [页码]　查大批量封禁任务的进度',
 			'/jobrun 任务ID　手动续跑未完成的批量任务',
@@ -9297,6 +9349,176 @@ async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId =
 		console.error(`[sendTelegramMessage] 异常 chat=${chatId}:`, error);
 		return { ok: false, error: error.message };
 	}
+}
+
+// ===== /rm 回复删除（第1批 · 2026-10-01）=====
+// 回复要删的消息发 /rm 或 /rm@TestBot 都认（裸命令与带 @bot 名等价，主人确认过两种都支持）。
+// 权限：仅【第一主人 或 该群群主 creator】—— 删除不可逆，比 /stats 那种「管理员即可」更严。
+// 私聊不适用；必须先回复目标消息；非配置群直接不响应（不替别的群当刀）。
+function isRmCommand(text) {
+	return /^\/rm(?:@[^\s]+)?(?:\s|$)/i.test(String(text || '').trim());
+}
+
+async function handleRmCommand(message, env, ctx) {
+	const chat = message?.chat;
+	const chatId = chat?.id;
+	const userId = getMessageActorId(message);
+
+	// 私聊没有「群里的目标消息」，明确告知而不是静默 —— /rm 已在命令菜单明面上，
+	// 静默会让人以为命令坏了。
+	if (chat?.type === 'private') {
+		await sendTelegramMessage(chatId, '❌ <b>请在群里使用 /rm</b>\n\n回复要删除的那条消息，再发送 <code>/rm</code>。');
+		return;
+	}
+	if (!isConfiguredGroup(String(chatId))) return;   // 非配置群：不响应、不动
+
+	// 先撤回命令本身：权限不足 / 参数缺失时，群里不会同时留下命令和提示两条消息。
+	await deleteAuthorizedGroupCommandMessage(message, '/rm');
+
+	const target = message.reply_to_message;
+	if (!target?.message_id) {
+		await sendFlashMessage(chatId, '❌ 请<b>回复</b>要删除的那条消息，再发 /rm', ctx);
+		return;
+	}
+
+	// 权限：第一主人直接放行；否则必须是该群群主（status === 'creator'，普通管理员不算）
+	let allowed = isPrimaryOwner(userId);
+	if (!allowed) allowed = await checkIfUserIsGroupOwner(userId, String(chatId));
+	if (!allowed) {
+		await sendFlashMessage(chatId, '❌ /rm 仅限第一主人或该群群主使用', ctx);
+		return;
+	}
+
+	const del = await deleteMessage(chatId, target.message_id);
+	if (del?.ok) {
+		await sendFlashMessage(chatId, '✅ 已删除目标消息', ctx);
+	} else {
+		// 常见原因：bot 缺「删除消息」权限 / 消息超 48 小时 / 消息已被人删掉
+		await sendFlashMessage(chatId, '❌ 删除失败：' + escapeHtml(toChineseErrorText(del?.error || '未知错误')), ctx);
+	}
+}
+
+// ===== /profile 资料卡（第1批 · 2026-10-01）=====
+function isProfileCommand(text) {
+	return /^\/profile(?:@[^\s]+)?(?:\s|$)/i.test(String(text || '').trim());
+}
+
+// 时间格式化：unix 秒 / 毫秒 / ISO 字符串 → 北京时间「YYYY-MM-DD HH:mm」。
+// 固定 +8 小时：Workers 运行时区是 UTC，直接格式化会整体差 8 小时。
+function formatBeijingTime(value) {
+	if (value === null || value === undefined || value === '') return '未记录';
+	let ms;
+	if (typeof value === 'number') {
+		ms = value < 1e12 ? value * 1000 : value;   // 兼容秒 / 毫秒两种精度
+	} else {
+		const parsed = Date.parse(String(value));
+		if (!Number.isFinite(parsed)) return String(value);   // 认不出就原样返回，不猜
+		ms = parsed;
+	}
+	const d = new Date(ms + 8 * 3600 * 1000);
+	const z = (n) => String(n).padStart(2, '0');
+	return d.getUTCFullYear() + '-' + z(d.getUTCMonth() + 1) + '-' + z(d.getUTCDate())
+		+ ' ' + z(d.getUTCHours()) + ':' + z(d.getUTCMinutes());
+}
+
+// 读入群 / 退群 / 申请记录（表 stat_member_events 由第2批创建）。
+// 表还没建时静默返回空 → /profile 显示「未记录」，绝不抛错打断整条命令。
+// 刻意不按 chat_id 过滤：私聊查资料时也要看得到这个人最近一次入群在哪个群。
+async function readMemberEvents(env, userId) {
+	if (!env?.DB) return [];
+	try {
+		const { results } = await env.DB.prepare(
+			'SELECT kind, at, chat_id FROM stat_member_events WHERE user_id = ? ORDER BY at DESC LIMIT 50'
+		).bind(String(userId)).all();
+		return Array.isArray(results) ? results : [];
+	} catch (error) {
+		return [];   // 表尚未创建（第2批才建）→ 当作无数据，不打断命令
+	}
+}
+
+// 资料卡 + 时间线：/profile 的主体输出。
+async function buildProfileBlock(env, groupId, tgid) {
+	const lines = ['👤 <b>资料卡</b>　TGID <code>' + escapeHtml(String(tgid)) + '</code>', ''];
+
+	// ── 基本资料（fetchAdUserProfile 自带 5 分钟缓存，不额外烧请求）──
+	const profile = await fetchAdUserProfile(tgid, {});
+	const nick = [profile.firstName, profile.lastName].filter(Boolean).join(' ');
+	lines.push('<b>━━ 基本资料 ━━</b>');
+	lines.push('昵称　　' + escapeHtml(nick || '未获取'));
+	lines.push('用户名　' + (profile.username ? '@' + escapeHtml(profile.username) : '未获取'));
+	lines.push('简介　　' + escapeHtml(profile.bio || (profile.bioFetched ? '（空）' : '未获取')));
+	if (groupId) {
+		const st = await fetchAdMemberStatus(groupId, tgid);
+		const map = { creator: '群主', administrator: '管理员', member: '成员', restricted: '受限成员', left: '已离群', kicked: '已踢出' };
+		lines.push('群内身份　' + (st?.status ? escapeHtml(map[st.status] || st.status) : '不在该群')
+			+ '（<code>' + escapeHtml(String(groupId)) + '</code>）');
+	}
+
+	// ── 时间线 ──
+	const evts = await readMemberEvents(env, tgid);
+	const latest = (kind) => {
+		const e = evts.find((x) => x?.kind === kind && Number(x.at) > 0);
+		return e ? formatBeijingTime(e.at) : '未记录';
+	};
+	const joinCount = evts.filter((x) => x?.kind === 'join').length;
+	const joinEv = evts.find((x) => x?.kind === 'join');
+	lines.push('');
+	lines.push('<b>━━ 时间线 ━━</b>');
+	lines.push('申请时间　' + latest('join_request') + '（群未开启入群审批则永不出现）');
+	lines.push('入群时间　' + (joinEv ? formatBeijingTime(joinEv.at) : '未记录'));
+	lines.push('退群时间　' + (latest('leave') !== '未记录' ? latest('leave') : latest('kicked')));
+	// 任命管理员：依赖第3批的 MTProto 回填。管理员的 MTProto date 本就是「任命时间」，
+	// 不是入群时间 —— 这里刻意不复用它，避免把任命时间伪装成入群时间误导主人。
+	lines.push('任命管理员　未记录（第3批回填后可见）');
+	const m = await readAdGroupMember(env, tgid);
+	lines.push('最早发言　' + (Number(m?.first_seen) > 0 ? formatBeijingTime(m.first_seen) : '未记录'));
+	lines.push('最后发言　' + (Number(m?.last_seen) > 0 ? formatBeijingTime(m.last_seen) : '未记录'));
+	lines.push('总入群　　' + (joinCount > 0 ? joinCount + ' 次' : '未记录'));
+	// 黑名单与 GKY 不在这里查：/check 与 /profile 都要，由调用方的
+	// buildBanlistCheckResponse 统一查一次（GKY 是外部 HTTP，重复查浪费且更慢）。
+	return lines;
+}
+
+async function handleProfileCommand(message, env, ctx) {
+	const chat = message?.chat;
+	const chatId = chat?.id;
+	const userId = getMessageActorId(message);
+
+	// 权限与 /check 完全一致：群内管理员 / 主人 / 副主人 / 超管（私聊限主人与超管）。
+	const allowed = await checkMessageOperatorCanModerate(message, userId);
+	if (!allowed) {
+		if (chat?.type === 'private') {
+			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/profile 与 /check 同权限。');
+		}
+		return;
+	}
+
+	const rawArg = String(message.text || '').replace(/^\/profile(?:@[^\s]+)?\s*/i, '').trim();
+	// TGID 来源：显式参数 > 被回复消息的发送者
+	let tgid = /^\d+$/.test(rawArg) ? rawArg : '';
+	if (!tgid && message.reply_to_message?.from?.id) tgid = String(message.reply_to_message.from.id);
+	if (!tgid) {
+		await sendTelegramMessage(chatId, [
+			'👤 <b>资料卡</b> · 用法',
+			'',
+			'• <code>/profile TGID</code> — 查指定账号',
+			'• 回复某条消息发 <code>/profile</code> — 查发信人',
+			'',
+			'（与 /check 同权限，显示资料、时间线、本地黑名单与 GKY 记录）',
+		].join('\n'));
+		return;
+	}
+	// 群内保留命令本身（与 /check 一致，不撤回），结果发在当前聊天。
+	const groupId = isConfiguredGroup(String(chatId)) ? String(chatId) : (GROUP_IDS[0] || '');
+	const profileLines = await buildProfileBlock(env, groupId, tgid);
+	// 黑名单 + GKY + 复制按钮走 /check 同一个函数：查一次，口径与 /check 完全一致。
+	const response = await buildBanlistCheckResponse(tgid, { includeReviewAction: true, env });
+	await sendTelegramMessageChunks(
+		chatId,
+		[...profileLines, '', response.text].join('\n'),
+		response.replyMarkup || null
+	);
+	return;
 }
 
 // ===== 全体通知（/notice）=====

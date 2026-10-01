@@ -1,0 +1,209 @@
+// /rm 回复删除 + /profile 资料卡 · 离线端到端验证
+// 覆盖：/rm 权限（第一主人 / 群主 / 其他人）、参数（不回复、私聊）、裸命令与 @bot、
+//       删除成功与失败回执、命令撤回；/profile 权限、用法、输出（资料卡 + 时间线 +
+//       时间线表未建时优雅降级）、回复消息查发信人、群内不撤回命令。
+import fs from 'node:fs';
+import vm from 'node:vm';
+import { DatabaseSync } from 'node:sqlite';
+
+const src = fs.readFileSync('_worker.js', 'utf8');
+const calls = [];
+const sent = [];
+const deleted = [];
+let adminLists = {};   // 群ID → 成员数组（可按群返回不同权限）
+
+const sandbox = {
+	console: { log(){}, warn(){}, error(){} },
+	URL, URLSearchParams, TextEncoder, TextDecoder, Response, Request, Headers,
+	atob, btoa, setTimeout, clearTimeout,
+	fetch: async (url, init) => {
+		const m = String(url).split('/').pop();
+		let b = null;
+		try { b = init?.body ? JSON.parse(init.body) : null; } catch (_) {}
+		calls.push({ method: m, body: b });
+		let payload = { ok: true, result: true };
+		if (m === 'deleteMessage') {
+			// failDeletes 由后半段测试切换，模拟 bot 无权限 / 消息超 48 小时等失败
+			if (failDeletes) {
+				payload = { ok: false, description: "Bad Request: message can't be deleted" };
+			} else {
+				deleted.push(String(b?.chat_id) + ':' + String(b?.message_id));
+				payload = { ok: true, result: true };
+			}
+		} else if (m === 'sendMessage') {
+			sent.push({ chatId: String(b?.chat_id ?? ''), text: String(b?.text || ''), markup: b?.reply_markup || null });
+			payload = { ok: true, result: { message_id: 9000 + sent.length } };
+		} else if (m === 'getChatAdministrators') {
+			const list = adminLists[String(b?.chat_id)] || [];
+			payload = { ok: true, result: list };
+		} else if (m === 'getChat') {
+			payload = { ok: true, result: { id: Number(b?.chat_id) || 1, first_name: '测试用户', username: 'tester', bio: '这是简介', type: 'supergroup' } };
+		} else if (m === 'getChatMember') {
+			payload = { ok: true, result: { status: 'member', user: { id: Number(b?.user_id) } } };
+		} else if (m === 'copyMessage') {
+			payload = { ok: true, result: 1 };
+		}
+		return { ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) };
+	}
+};
+sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src.replace(/export\s+default\s*/, 'globalThis.__h = '), sandbox, { filename: '_worker.js' });
+const W = sandbox;
+
+function makeD1() {
+	const db = new DatabaseSync(':memory:');
+	const nIn = (v) => (v === undefined ? null : typeof v === 'boolean' ? (v ? 1 : 0) : typeof v === 'bigint' ? Number(v) : v);
+	const nOut = (r) => { if (!r) return null; const o = {}; for (const k of Object.keys(r)) o[k] = typeof r[k] === 'bigint' ? Number(r[k]) : r[k]; return o; };
+	const exec = (sql, params) => {
+		const st = db.prepare(sql); const bd = params.map(nIn);
+		const up = sql.trim().slice(0, 6).toUpperCase();
+		if (up === 'SELECT' || sql.trim().toUpperCase().startsWith('PRAGMA')) return { kind: 'rows', rows: st.all(...bd).map(nOut) };
+		if (/\bRETURNING\b/i.test(sql)) return { kind: 'rows', rows: st.all(...bd).map(nOut) };
+		const i = st.run(...bd); return { kind: 'write', meta: { changes: Number(i?.changes || 0), last_row_id: Number(i?.lastInsertRowid || 0) } };
+	};
+	const mk = (sql) => { const s = { sql, params: [] }; const a = {
+		bind(...x) { s.params = x; return a; },
+		async first() { const r = exec(s.sql, s.params); return r.kind === 'rows' ? (r.rows[0] ?? null) : null; },
+		async run() { const r = exec(s.sql, s.params); return r.kind === 'rows' ? { success: true, results: r.rows, meta: { changes: 0 } } : { success: true, results: [], meta: r.meta }; },
+		async all() { const r = exec(s.sql, s.params); return r.kind === 'rows' ? { success: true, results: r.rows, meta: { changes: 0 } } : { success: true, results: [], meta: r.meta }; }
+	}; return a; };
+	return {
+		prepare: mk,
+		async exec(sql) { for (const p of String(sql).split(';')) { const s = p.trim(); if (s) db.exec(s); } return { count: 1 }; },
+		async batch(l) { const o = []; for (const s of l) o.push(await s.run()); return o; },
+		query(sql) { return db.prepare(sql).all().map(nOut); }
+	};
+}
+
+let pass = 0, fail = 0;
+const check = (label, cond, extra) => { if (cond) { pass++; console.log('  ✅ ' + label); } else { fail++; console.log('  ❌ ' + label + (extra ? '  ' + extra : '')); } };
+const reset = () => { calls.length = 0; sent.length = 0; deleted.length = 0; };
+const callsOf = (m) => calls.filter((c) => c.method === m);
+
+const OWNER = '10001', DEPUTY = '10002', SUPER = '10003', STRANGER = '77777';
+const GROUP = '-100111';
+const env = { TOKEN: 'T', BOT_TOKEN: '1:x', GROUP_ID: GROUP + ',-100222', OWNER_IDS: OWNER + ',' + DEPUTY, SUPER_ADMIN_IDS: SUPER, DB: makeD1() };
+W.applyRuntimeConfig(W.loadRequiredConfig(env));
+await W.__h.fetch(new Request('https://x/T/export'), env, { waitUntil() {} });
+
+const drive = (update) => W.__h.fetch(new Request('https://x/', { method: 'POST', body: JSON.stringify(update) }), env, { waitUntil() {} });
+const rm = (from, text, extra = {}) => drive({ message: { chat: { id: Number(GROUP), type: 'supergroup' }, from: { id: Number(from), is_bot: false }, text, message_id: 100, ...extra } });
+
+// ── 让 mock 能按需失败（测试删除失败回执）──
+let failDeletes = false;
+
+console.log('\n=== 1. /rm 权限 ===');
+{
+	// 群里：OWNER 是群主，4444 是群主，8888 是普通管理员
+	const setAdmins = (list) => { adminLists[GROUP] = list; };
+	setAdmins([
+		{ user: { id: Number(OWNER) }, status: 'creator' },
+		{ user: { id: 4444 }, status: 'creator' },
+		{ user: { id: 8888 }, status: 'administrator' },
+	]);
+
+	reset();
+	await rm(OWNER, '/rm', { reply_to_message: { message_id: 555, from: { id: 99999, is_bot: false } } });
+	check('第一主人 /rm → 删除目标', deleted.includes(GROUP + ':555'), deleted.join(' '));
+	check('/rm 命令本身被撤回', deleted.includes(GROUP + ':100'), deleted.join(' '));
+
+	reset();
+	await rm(4444, '/rm', { reply_to_message: { message_id: 556, from: { id: 99998, is_bot: false } } });
+	check('群主（非第一主人）/rm → 删除目标', deleted.includes(GROUP + ':556'), deleted.join(' '));
+
+	reset();
+	await rm(8888, '/rm', { reply_to_message: { message_id: 557, from: { id: 99997, is_bot: false } } });
+	check('普通管理员 /rm → 不删（不是群主）', !deleted.some((x) => x.endsWith(':557')), deleted.join(' '));
+	check('普通管理员 /rm → 提示无权限', sent.some((s) => s.text.includes('仅限第一主人或该群群主')), JSON.stringify(sent));
+
+	reset();
+	await rm(STRANGER, '/rm', { reply_to_message: { message_id: 558, from: { id: 99996, is_bot: false } } });
+	check('陌生人 /rm → 不删', !deleted.some((x) => x.endsWith(':558')), deleted.join(' '));
+	check('陌生人 /rm → 提示无权限', sent.some((s) => s.text.includes('仅限第一主人或该群群主')));
+
+	// 副主人 / 超管不是群主 → 同样不许（主人只要求第一主人与群主）
+	reset();
+	await rm(DEPUTY, '/rm', { reply_to_message: { message_id: 559, from: { id: 99995, is_bot: false } } });
+	check('副主人（非群主）/rm → 不删', !deleted.some((x) => x.endsWith(':559')), deleted.join(' '));
+}
+
+console.log('\n=== 2. /rm 参数与场景 ===');
+{
+	const setAdmins = (list) => { adminLists[GROUP] = list; };
+	setAdmins([{ user: { id: Number(OWNER) }, status: 'creator' }]);
+
+	reset();
+	await rm(OWNER, '/rm');
+	check('未回复 → 提示先回复', sent.some((s) => s.text.includes('回复')), JSON.stringify(sent.map((s) => s.text)));
+	// 未回复时只撤回命令本身，不得删除群里任何其他消息
+	check('未回复 → 未删其他消息（仅撤回命令）',
+		deleted.filter((x) => !x.endsWith(':100')).length === 0, '多余删除 ' + deleted.filter((x) => !x.endsWith(':100')).join(' '));
+
+	reset();
+	await drive({ message: { chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false }, text: '/rm', message_id: 101 } });
+	check('私聊 /rm → 提示请在群里使用', sent.some((s) => s.text.includes('在群里使用')), JSON.stringify(sent.map((s) => s.text)));
+
+	reset();
+	await rm(OWNER, '/rm@TestBot', { reply_to_message: { message_id: 601, from: { id: 99994, is_bot: false } } });
+	check('/rm@TestBot（带 bot 名）同样生效', deleted.includes(GROUP + ':601'), deleted.join(' '));
+
+	// 删除失败 → 中文回执
+	reset();
+	failDeletes = true;
+	await rm(OWNER, '/rm', { reply_to_message: { message_id: 701, from: { id: 99993, is_bot: false } } });
+	const failMsg = sent.find((s) => s.text.includes('删除失败'))?.text || '';
+	check('删除失败 → 中文提示（不含英文原文）', Boolean(failMsg) && !/[A-Za-z]{4,}/.test(failMsg.replace(/\/rm|TestBot/g, '')), failMsg);
+	failDeletes = false;
+
+	// 非配置群：不响应
+	reset();
+	await drive({ message: { chat: { id: -100999, type: 'supergroup' }, from: { id: Number(OWNER), is_bot: false }, text: '/rm', message_id: 102, reply_to_message: { message_id: 801 } } });
+	check('非配置群 /rm → 完全不响应', deleted.length === 0 && sent.length === 0, '删 ' + deleted.join(' '));
+}
+
+console.log('\n=== 3. /profile 用法与权限 ===');
+{
+	reset();
+	await drive({ message: { chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false }, text: '/profile', message_id: 201 } });
+	check('裸 /profile → 出用法', sent.some((s) => s.text.includes('用法') && s.text.includes('/profile')), JSON.stringify(sent.map((s) => s.text.slice(0, 60))));
+
+	reset();
+	await drive({ message: { chat: { id: Number(STRANGER), type: 'private' }, from: { id: Number(STRANGER), is_bot: false }, text: '/profile 12345', message_id: 202 } });
+	check('非授权者私聊 /profile → 不出资料卡', !sent.some((s) => s.text.includes('资料卡')), JSON.stringify(sent.map((s) => s.text.slice(0, 50))));
+}
+
+console.log('\n=== 4. /profile 输出 ===');
+{
+	reset();
+	await drive({ message: { chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false }, text: '/profile 699658898', message_id: 203 } });
+	const out = sent.find((s) => s.chatId === String(OWNER))?.text || '';
+	check('输出含资料卡标题与 TGID', out.includes('资料卡') && out.includes('699658898'), out.slice(0, 120));
+	check('含基本资料三项（昵称 / 用户名 / 简介）', out.includes('昵称') && out.includes('用户名') && out.includes('简介'));
+	check('含时间线整节', out.includes('时间线'));
+	const keys = ['申请时间', '入群时间', '退群时间', '任命管理员', '最早发言', '最后发言', '总入群'];
+	const missing = keys.filter((k) => !out.includes(k));
+	check('时间线 7 项齐全', missing.length === 0, '缺 ' + missing.join(','));
+	check('stat_member_events 未建表 → 全部显示未记录，不报错', out.includes('未记录'), out.slice(out.indexOf('时间线'), out.indexOf('时间线') + 200));
+	check('本地黑名单与 GKY 两节在（复用 /check 渲染）', out.includes('本地黑名单') && out.includes('GKY'), '');
+
+	// 建表 + 真数据 → 时间线必须显示真实时间
+	const ts = Math.floor(Date.parse('2026-10-03T08:00:00+08:00') / 1000);
+	env.DB.exec('CREATE TABLE IF NOT EXISTS stat_member_events (chat_id TEXT, user_id TEXT, kind TEXT, at INTEGER)');
+	env.DB.prepare('INSERT INTO stat_member_events (chat_id, user_id, kind, at) VALUES (?, ?, ?, ?)')
+		.bind(GROUP, '699658898', 'join', ts).run();
+	reset();
+	await drive({ message: { chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false }, text: '/profile 699658898', message_id: 204 } });
+	const out2 = sent.find((s) => s.chatId === String(OWNER))?.text || '';
+	check('建表后入群时间显示为北京时间（2026-10-03 08:00）', out2.includes('2026-10-03 08:00'), out2.slice(out2.indexOf('入群时间'), out2.indexOf('入群时间') + 60));
+	check('总入群显示 1 次', out2.includes('1 次'), out2.slice(out2.indexOf('总入群'), out2.indexOf('总入群') + 30));
+
+	// 群内 /profile → 不撤回命令（与 /check 一致）
+	reset();
+	await drive({ message: { chat: { id: Number(GROUP), type: 'supergroup' }, from: { id: Number(OWNER), is_bot: false }, text: '/profile 699658898', message_id: 205 } });
+	check('群内 /profile → 不撤回命令本身', !deleted.includes(GROUP + ':205'), '删除列表 ' + deleted.join(' '));
+	check('群内 /profile → 结果发在群里', sent.some((s) => s.chatId === GROUP && s.text.includes('资料卡')));
+}
+
+console.log('\n/rm + profile 验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
+if (fail > 0) process.exitCode = 1;
