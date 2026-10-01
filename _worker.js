@@ -8326,7 +8326,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (!isInGroup) {
 			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${escapeHtml(tgidToCheck)}</code> 的封禁状态...`);
 		}
-		const profileGroupId = isConfiguredGroup(String(chatId)) ? String(chatId) : (GROUP_IDS[0] || '');
+		// 群内才有「当前群」上下文；私聊不指定群（取 GROUP_IDS[0] 去查是拿无关群当结论）。
+		const isGroupChat = message.chat?.type !== 'private';
+		const profileGroupId = isGroupChat && isConfiguredGroup(String(chatId)) ? String(chatId) : '';
 		const response = await buildBanlistCheckResponse(tgidToCheck, {
 			targetUser: repliedUser,
 			includeReviewAction: true,
@@ -8334,7 +8336,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			env,
 		});
 		// 资料卡 + 时间线（第1批）：/check 与 /profile 共用同一份渲染，避免两处口径分叉。
-		const profileLines = await buildProfileBlock(env, profileGroupId, tgidToCheck);
+		const profileLines = await buildProfileBlock(env, profileGroupId, tgidToCheck, isGroupChat);
 		await replyToModerationAdmin(message, ctx, {
 			detailText: [...profileLines, '', response.text].join('\n'),
 			replyMarkup: response.replyMarkup,
@@ -8375,8 +8377,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			const response = await buildBanlistCheckResponse(tgidToCheck, { includeReviewAction: true, env });
 			// 资料卡 + 时间线（第1批）：与 /check 正常查询、/profile 共用同一份渲染。
+			const isGroupChat = message.chat?.type !== 'private';
 			const profileLines = await buildProfileBlock(env,
-				isConfiguredGroup(String(chatId)) ? String(chatId) : (GROUP_IDS[0] || ''), tgidToCheck);
+				isGroupChat && isConfiguredGroup(String(chatId)) ? String(chatId) : '', tgidToCheck, isGroupChat);
 			const checkText = [...profileLines, '', response.text].join('\n');
 			if (quietGroupCommand) {
 				await replyToAdmin(message, ctx, {
@@ -9390,11 +9393,40 @@ async function handleRmCommand(message, env, ctx) {
 	}
 
 	const del = await deleteMessage(chatId, target.message_id);
+
+	// 完整结果分两条通道（用项目现成的 replyToAdmin）：
+	//   · 群内 = 5 秒闪屏回执。注意它有个规则：【只有第一主人执行时才发闪屏】，
+	//     群主执行时群里保持安静（shouldSilenceAuthorizedGroupCommand）。
+	//   · 私聊 = 完整审计通知发给【第一主人】，主人口径要求「完整结果返回给第一主人」，
+	//     于是群主在群里操作时，主人依然能在私聊看到谁删了什么。
+	const groupLabel = chat?.title
+		? escapeHtml(String(chat.title)) + '（<code>' + escapeHtml(String(chatId)) + '</code>）'
+		: '<code>' + escapeHtml(String(chatId)) + '</code>';
+	const rawContent = String(target.text || target.caption || '').trim();
+	const detailBase = [
+		'🗑 <b>群内消息删除</b>',
+		'',
+		'群　　' + groupLabel,
+		'操作人　' + formatUserReference(userId, message.from),
+		'目标 ID　<code>' + escapeHtml(String(target.message_id)) + '</code>',
+		'目标发送者　' + formatUserReference(target.from?.id, target.from),
+		'目标内容　' + (rawContent ? escapeHtml(rawContent.slice(0, 200)) : '（非文本消息，无文字内容）'),
+	];
+
 	if (del?.ok) {
-		await sendFlashMessage(chatId, '✅ 已删除目标消息', ctx);
+		await replyToAdmin(message, ctx, {
+			flashText: '✅ 已删除目标消息',
+			detailText: [...detailBase, '', '结果　　✅ 已删除'].join('\n'),
+			isInGroup: true,
+		});
 	} else {
 		// 常见原因：bot 缺「删除消息」权限 / 消息超 48 小时 / 消息已被人删掉
-		await sendFlashMessage(chatId, '❌ 删除失败：' + escapeHtml(toChineseErrorText(del?.error || '未知错误')), ctx);
+		const reason = toChineseErrorText(del?.error || '未知错误');
+		await replyToAdmin(message, ctx, {
+			flashText: '❌ 删除失败：' + escapeHtml(reason),
+			detailText: [...detailBase, '', '结果　　❌ 删除失败 —— ' + escapeHtml(reason)].join('\n'),
+			isInGroup: true,
+		});
 	}
 }
 
@@ -9423,13 +9455,17 @@ function formatBeijingTime(value) {
 
 // 读入群 / 退群 / 申请记录（表 stat_member_events 由第2批创建）。
 // 表还没建时静默返回空 → /profile 显示「未记录」，绝不抛错打断整条命令。
-// 刻意不按 chat_id 过滤：私聊查资料时也要看得到这个人最近一次入群在哪个群。
-async function readMemberEvents(env, userId) {
+// filterChatId：群内发命令时传当前配置群 → 时间线围绕本群执行（主人口径）；
+//               私聊没有群上下文 → 传 undefined，原样返回跨群记录，不猜是哪个群。
+async function readMemberEvents(env, userId, filterChatId) {
 	if (!env?.DB) return [];
 	try {
-		const { results } = await env.DB.prepare(
-			'SELECT kind, at, chat_id FROM stat_member_events WHERE user_id = ? ORDER BY at DESC LIMIT 50'
-		).bind(String(userId)).all();
+		const sql = filterChatId
+			? 'SELECT kind, at, chat_id FROM stat_member_events WHERE user_id = ? AND chat_id = ? ORDER BY at DESC LIMIT 50'
+			: 'SELECT kind, at, chat_id FROM stat_member_events WHERE user_id = ? ORDER BY at DESC LIMIT 50';
+		const stmt = env.DB.prepare(sql);
+		const bound = filterChatId ? stmt.bind(String(userId), String(filterChatId)) : stmt.bind(String(userId));
+		const { results } = await bound.all();
 		return Array.isArray(results) ? results : [];
 	} catch (error) {
 		return [];   // 表尚未创建（第2批才建）→ 当作无数据，不打断命令
@@ -9437,7 +9473,7 @@ async function readMemberEvents(env, userId) {
 }
 
 // 资料卡 + 时间线：/profile 的主体输出。
-async function buildProfileBlock(env, groupId, tgid) {
+async function buildProfileBlock(env, groupId, tgid, isGroupChat = false) {
 	const lines = ['👤 <b>资料卡</b>　TGID <code>' + escapeHtml(String(tgid)) + '</code>', ''];
 
 	// ── 基本资料（fetchAdUserProfile 自带 5 分钟缓存，不额外烧请求）──
@@ -9447,15 +9483,33 @@ async function buildProfileBlock(env, groupId, tgid) {
 	lines.push('昵称　　' + escapeHtml(nick || '未获取'));
 	lines.push('用户名　' + (profile.username ? '@' + escapeHtml(profile.username) : '未获取'));
 	lines.push('简介　　' + escapeHtml(profile.bio || (profile.bioFetched ? '（空）' : '未获取')));
-	if (groupId) {
-		const st = await fetchAdMemberStatus(groupId, tgid);
-		const map = { creator: '群主', administrator: '管理员', member: '成员', restricted: '受限成员', left: '已离群', kicked: '已踢出' };
-		lines.push('群内身份　' + (st?.status ? escapeHtml(map[st.status] || st.status) : '不在该群')
-			+ '（<code>' + escapeHtml(String(groupId)) + '</code>）');
+
+	// ── 群内身份 ──
+	// 只在【群内发命令】时显示：私聊没有群上下文，取 GROUP_IDS[0] 去查是拿一个
+	// 与本人无关的群当结论，属于误导 —— 主人口径就是「私聊原样返回」。
+	// 查之前先确认 bot 是该群管理员：Bot API 明写「只有 bot 是管理员才保证能查到他人状态」，
+	// 权限不足时返回的任何状态都不可信，这正是「真的不在」与「查不到」的分界。
+	const statusMap = { creator: '群主', administrator: '管理员', member: '成员', restricted: '受限成员', left: '已离群', kicked: '已踢出' };
+	if (isGroupChat && groupId) {
+		const groupTag = '（<code>' + escapeHtml(String(groupId)) + '</code>）';
+		const botId = await getBotId();
+		const botIsAdmin = botId ? await isAdminForAdDetection(groupId, String(botId)) : false;
+		if (!botIsAdmin) {
+			lines.push('群内身份　❌ 未能查询（bot 需在该群且为管理员）' + groupTag);
+		} else {
+			const st = await fetchAdMemberStatus(groupId, tgid);
+			if (st) {
+				// 拿到状态就是确定结论：left/kicked 即「真的不在」，不是查不到
+				lines.push('群内身份　' + escapeHtml(statusMap[st] || st) + groupTag);
+			} else {
+				lines.push('群内身份　❌ 未能查询（API 未返回状态）' + groupTag);
+			}
+		}
 	}
 
 	// ── 时间线 ──
-	const evts = await readMemberEvents(env, tgid);
+	// 群内发命令 → 围绕当前配置群；私聊 → 无群上下文，原样返回跨群记录。
+	const evts = await readMemberEvents(env, tgid, isGroupChat ? groupId : undefined);
 	const latest = (kind) => {
 		const e = evts.find((x) => x?.kind === kind && Number(x.at) > 0);
 		return e ? formatBeijingTime(e.at) : '未记录';
@@ -9464,6 +9518,7 @@ async function buildProfileBlock(env, groupId, tgid) {
 	const joinEv = evts.find((x) => x?.kind === 'join');
 	lines.push('');
 	lines.push('<b>━━ 时间线 ━━</b>');
+	if (!isGroupChat) lines.push('<i>（私聊查询无群上下文，以下为跨群原样记录）</i>');
 	lines.push('申请时间　' + latest('join_request') + '（群未开启入群审批则永不出现）');
 	lines.push('入群时间　' + (joinEv ? formatBeijingTime(joinEv.at) : '未记录'));
 	lines.push('退群时间　' + (latest('leave') !== '未记录' ? latest('leave') : latest('kicked')));
@@ -9509,8 +9564,10 @@ async function handleProfileCommand(message, env, ctx) {
 		return;
 	}
 	// 群内保留命令本身（与 /check 一致，不撤回），结果发在当前聊天。
-	const groupId = isConfiguredGroup(String(chatId)) ? String(chatId) : (GROUP_IDS[0] || '');
-	const profileLines = await buildProfileBlock(env, groupId, tgid);
+	// 群内才有当前群上下文；私聊不指定群（原样返回，不拿 GROUP_IDS[0] 当结论）。
+	const isGroupChat = chat?.type !== 'private';
+	const groupId = isGroupChat && isConfiguredGroup(String(chatId)) ? String(chatId) : '';
+	const profileLines = await buildProfileBlock(env, groupId, tgid, isGroupChat);
 	// 黑名单 + GKY + 复制按钮走 /check 同一个函数：查一次，口径与 /check 完全一致。
 	const response = await buildBanlistCheckResponse(tgid, { includeReviewAction: true, env });
 	await sendTelegramMessageChunks(

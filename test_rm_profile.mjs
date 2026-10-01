@@ -10,7 +10,8 @@ const src = fs.readFileSync('_worker.js', 'utf8');
 const calls = [];
 const sent = [];
 const deleted = [];
-let adminLists = {};   // 群ID → 成员数组（可按群返回不同权限）
+let adminLists = {};      // 群ID → 成员数组（可按群返回不同权限）
+let memberStatus = 'member';   // getChatMember 返回的状态，测试里切换以验证 6 种身份映射
 
 const sandbox = {
 	console: { log(){}, warn(){}, error(){} },
@@ -39,9 +40,12 @@ const sandbox = {
 		} else if (m === 'getChat') {
 			payload = { ok: true, result: { id: Number(b?.chat_id) || 1, first_name: '测试用户', username: 'tester', bio: '这是简介', type: 'supergroup' } };
 		} else if (m === 'getChatMember') {
-			payload = { ok: true, result: { status: 'member', user: { id: Number(b?.user_id) } } };
+			payload = { ok: true, result: { status: memberStatus, user: { id: Number(b?.user_id) } } };
 		} else if (m === 'copyMessage') {
 			payload = { ok: true, result: 1 };
+		} else if (m === 'getMe') {
+			// buildProfileBlock 里 getBotId() 要它，才能判定 bot 是否是该群管理员
+			payload = { ok: true, result: { id: 42, username: 'testbot', is_bot: true } };
 		}
 		return { ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) };
 	}
@@ -104,9 +108,16 @@ console.log('\n=== 1. /rm 权限 ===');
 	]);
 
 	reset();
-	await rm(OWNER, '/rm', { reply_to_message: { message_id: 555, from: { id: 99999, is_bot: false } } });
+	await rm(OWNER, '/rm', { reply_to_message: { message_id: 555, from: { id: 99999, is_bot: false, first_name: '被删用户' } } });
 	check('第一主人 /rm → 删除目标', deleted.includes(GROUP + ':555'), deleted.join(' '));
 	check('/rm 命令本身被撤回', deleted.includes(GROUP + ':100'), deleted.join(' '));
+	// 主人要求「完整的结果最好返回给第一主人」：群内闪屏 + 私聊完整审计，两者必须都发。
+	check('/rm 成功 → 完整审计私聊第一主人（含群、目标 ID、结果）', (() => {
+		const a = sent.find((s) => s.chatId === String(OWNER) && s.text.includes('主人操作通知'));
+		return Boolean(a) && a.text.includes('群内消息删除') && a.text.includes('555') && a.text.includes('已删除');
+	})(), JSON.stringify(sent.map((s) => s.chatId + ' | ' + s.text.slice(0, 46).replace(/\n/g, ' '))));
+	check('/rm 群内仍有闪屏回执', sent.some((s) => s.chatId === GROUP && s.text.includes('已删除目标消息')),
+		JSON.stringify(sent.map((s) => s.chatId + ':' + s.text.slice(0, 30))));
 
 	reset();
 	await rm(4444, '/rm', { reply_to_message: { message_id: 556, from: { id: 99998, is_bot: false } } });
@@ -186,23 +197,72 @@ console.log('\n=== 4. /profile 输出 ===');
 	check('时间线 7 项齐全', missing.length === 0, '缺 ' + missing.join(','));
 	check('stat_member_events 未建表 → 全部显示未记录，不报错', out.includes('未记录'), out.slice(out.indexOf('时间线'), out.indexOf('时间线') + 200));
 	check('本地黑名单与 GKY 两节在（复用 /check 渲染）', out.includes('本地黑名单') && out.includes('GKY'), '');
+	// 私聊没有群上下文 → 不显示群内身份。原先取 GROUP_IDS[0] 去查，是拿一个与本人无关的
+	// 群当结论，属于误导（主人口径：私聊原样返回）。
+	check('私聊 /profile → 不显示「群内身份」（无群上下文，不猜群）', !out.includes('群内身份'),
+		out.slice(out.indexOf('基本资料'), out.indexOf('时间线')));
 
-	// 建表 + 真数据 → 时间线必须显示真实时间
+	// 建表 + 真数据：本群 1 次入群、另一个配置群 1 次入群（同一个 TGID）
 	const ts = Math.floor(Date.parse('2026-10-03T08:00:00+08:00') / 1000);
 	env.DB.exec('CREATE TABLE IF NOT EXISTS stat_member_events (chat_id TEXT, user_id TEXT, kind TEXT, at INTEGER)');
-	env.DB.prepare('INSERT INTO stat_member_events (chat_id, user_id, kind, at) VALUES (?, ?, ?, ?)')
-		.bind(GROUP, '699658898', 'join', ts).run();
+	const ins = (cid, at) => env.DB.prepare('INSERT INTO stat_member_events (chat_id, user_id, kind, at) VALUES (?, ?, ?, ?)')
+		.bind(cid, '699658898', 'join', at).run();
+	await ins(GROUP, ts);
+	await ins('-100999', ts + 600);   // 另一个配置群也入过一次群
+
+	// 私聊 → 无群上下文，跨群原样返回
 	reset();
 	await drive({ message: { chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false }, text: '/profile 699658898', message_id: 204 } });
 	const out2 = sent.find((s) => s.chatId === String(OWNER))?.text || '';
-	check('建表后入群时间显示为北京时间（2026-10-03 08:00）', out2.includes('2026-10-03 08:00'), out2.slice(out2.indexOf('入群时间'), out2.indexOf('入群时间') + 60));
-	check('总入群显示 1 次', out2.includes('1 次'), out2.slice(out2.indexOf('总入群'), out2.indexOf('总入群') + 30));
+	// 私聊跨群：显示【最近一次】入群（别群 08:10 晚于本群 08:00）—— 既验证北京时间格式化，
+	// 又验证「跨群取最新」这个语义（比断言 08:00 更强，它同时锁定了排序与格式）。
+	check('入群时间为北京时间、且跨群取最近一条（2026-10-03 08:10）',
+		out2.includes('入群时间　2026-10-03 08:10'),
+		out2.slice(out2.indexOf('入群时间'), out2.indexOf('入群时间') + 40));
+	check('私聊无群上下文 → 跨群原样，总入群 2 次', out2.includes('2 次'), out2.slice(out2.indexOf('总入群'), out2.indexOf('总入群') + 24));
 
-	// 群内 /profile → 不撤回命令（与 /check 一致）
+	// 群内 → 时间线围绕本群，只算本群那 1 次
 	reset();
+	adminLists[GROUP] = [
+		{ user: { id: 42, is_bot: true, username: 'testbot' }, status: 'administrator' },
+		{ user: { id: Number(OWNER) }, status: 'creator' },
+	];
 	await drive({ message: { chat: { id: Number(GROUP), type: 'supergroup' }, from: { id: Number(OWNER), is_bot: false }, text: '/profile 699658898', message_id: 205 } });
+	const outG = sent.find((s) => s.chatId === GROUP && s.text.includes('资料卡'))?.text || '';
 	check('群内 /profile → 不撤回命令本身', !deleted.includes(GROUP + ':205'), '删除列表 ' + deleted.join(' '));
-	check('群内 /profile → 结果发在群里', sent.some((s) => s.chatId === GROUP && s.text.includes('资料卡')));
+	check('群内 /profile → 结果发在群里', Boolean(outG) && outG.includes('资料卡'));
+	check('群内 → 时间线围绕本群（本群 1 次，别群那次不算）',
+		outG.includes('1 次') && !outG.includes('2 次'),
+		outG.slice(outG.indexOf('总入群'), outG.indexOf('总入群') + 24));
+	// bot 是该群管理员 → 拿到确定状态（bot mock id=42 被放进管理员列表）
+	check('群内 → 显示群内身份且拿到确定状态', outG.includes('群内身份　成员'),
+		outG.slice(outG.indexOf('群内身份'), outG.indexOf('群内身份') + 60));
+
+	// 6 种身份逐一验证映射精准（bot 必须在管理员列表里，否则不会去查状态）
+	adminLists[GROUP] = [
+		{ user: { id: 42, is_bot: true, username: 'testbot' }, status: 'administrator' },
+		{ user: { id: Number(OWNER) }, status: 'creator' },
+	];
+	const statusExpect = { creator: '群主', administrator: '管理员', member: '成员', restricted: '受限成员', left: '已离群', kicked: '已踢出' };
+	for (const [code, cn] of Object.entries(statusExpect)) {
+		memberStatus = code;
+		reset();
+		await drive({ message: { chat: { id: Number(GROUP), type: 'supergroup' }, from: { id: Number(OWNER), is_bot: false }, text: '/profile 699658898', message_id: 207 } });
+		const txt = sent.find((s) => s.chatId === GROUP && s.text.includes('资料卡'))?.text || '';
+		check('status=' + code + ' → 精准显示「' + cn + '」', txt.includes('群内身份　' + cn),
+			txt.slice(txt.indexOf('群内身份'), txt.indexOf('群内身份') + 56));
+	}
+	memberStatus = 'member';
+
+	// 反例：bot 在【另一个配置群】不是管理员 → 必须「查不到」，绝不能「不在」。
+	// 用独立群号：AD_ADMIN_CACHE 按群缓存 5 分钟，改同一个群的列表不会立刻生效。
+	adminLists['-100222'] = [{ user: { id: Number(OWNER) }, status: 'creator' }];
+	reset();
+	await drive({ message: { chat: { id: -100222, type: 'supergroup' }, from: { id: Number(OWNER), is_bot: false }, text: '/profile 699658898', message_id: 206 } });
+	const outG2 = sent.find((s) => s.chatId === '-100222' && s.text.includes('资料卡'))?.text || '';
+	check('bot 非管理员 → 标注「未能查询」而非「不在」（查不到 ≠ 真的不在）',
+		outG2.includes('未能查询') && !outG2.includes('不在该群'),
+		outG2.slice(outG2.indexOf('群内身份'), outG2.indexOf('群内身份') + 70));
 }
 
 console.log('\n/rm + profile 验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
