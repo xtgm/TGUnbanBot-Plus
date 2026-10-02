@@ -338,8 +338,11 @@ export default {
 					await handleChatMemberUpdate(update.chat_member, env);
 				} else if (update.callback_query) {
 					await handleAdCallbackQuery(update.callback_query, env, ctx);
+				} else if (update.bot_chat_join_request) {
+					// 入群审批请求 → 记「申请时间」。群未开审批时此分支永不触发。
+					await handleBotChatJoinRequest(update.bot_chat_join_request, env);
 				} else {
-					console.log('[Telegram更新] 跳过：当前代码仅处理 message/chat_member/callback_query。');
+					console.log('[Telegram更新] 跳过：当前代码仅处理 message/chat_member/bot_chat_join_request/callback_query。');
 				}
 
 				return new Response('OK');
@@ -599,7 +602,10 @@ async function handleInitialization(request) {
 		const setWebhookUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`;
 		const setWebhookBody = {
 			url: webhookUrl.toString(),
-			allowed_updates: ['message', 'chat_member', 'callback_query']
+			// bot_chat_join_request：入群审批请求。第2批新增 —— 有了它才能记录「申请时间」。
+			// 群没开启入群审批时，这个类型永远不会推送（分支静默，无副作用）。
+			// ⚠️ 加了新类型必须重新访问初始化地址，setWebhook 才会重新下发 allowed_updates。
+			allowed_updates: ['message', 'chat_member', 'callback_query', 'bot_chat_join_request']
 		};
 
 		const response = await fetch(setWebhookUrl, {
@@ -5125,9 +5131,22 @@ async function handleChatMemberUpdate(chatMember, env) {
 		const _inGroup = (st) => st === 'member' || st === 'restricted' || st === 'administrator' || st === 'creator';
 		const _os = oldMember.status;
 		const _ns = newMember.status;
-		if (!_inGroup(_os) && _inGroup(_ns)) await recordMemberEvent(env, chat.id, 'join');
-		else if (_inGroup(_os) && _ns === 'left') await recordMemberEvent(env, chat.id, 'leave');
-		else if (_inGroup(_os) && _ns === 'kicked') await recordMemberEvent(env, chat.id, 'kicked');
+		let _kind = null;
+		if (!_inGroup(_os) && _inGroup(_ns)) _kind = 'join';
+		else if (_inGroup(_os) && _ns === 'left') _kind = 'leave';
+		else if (_inGroup(_os) && _ns === 'kicked') _kind = 'kicked';
+
+		if (_kind) {
+			await recordMemberEvent(env, chat.id, _kind);
+			// 第2批：同时写明细（谁、何时、被谁操作、走哪条邀请链接）供 /profile 时间线读。
+			// 时间用 ChatMemberUpdated.date（官方字段），拿不到才退回当前时刻。
+			await recordMemberEventDetail(env, chat.id, targetIdStr, _kind,
+				Number(chatMember?.date) > 0 ? chatMember.date * 1000 : Date.now(), {
+					actorId: fromIdStr,
+					inviteLink: chatMember?.invite_link?.invite_link || null,
+					viaRequest: chatMember?.via_join_request === true,
+				});
+		}
 	}
 
 	// 复入群拦截：用户从非成员状态变为 member/restricted（被拉进群、点链接加群、unban 后自加回）
@@ -16439,6 +16458,85 @@ async function recordMemberEvent(env, chatId, kind, nowMs = Date.now()) {
 			+ 'ON CONFLICT(chat_id, day) DO UPDATE SET ' + col + ' = ' + col + ' + 1, updated_at = excluded.updated_at'
 		).bind(String(chatId), day, Math.floor(nowMs / 1000)).run();
 	} catch (error) { console.error('[群统计] 记录成员事件失败:', error); }
+}
+
+// ===== 入群 / 退群 / 申请 事件明细（第2批 · 2026-10-02）=====
+// 与 stat_member 的分工：那张表只存「哪天有几人进出」（计数），这张存
+// 「谁、什么时候、被谁操作、走了哪条邀请链接」—— /profile 的时间线读它（readMemberEvents）。
+// 表由代码懒建，不动 D1_SCHEMA_VERSION（与 killer_mode、ad_spam_texts 同一套做法）。
+const D1_STAT_MEMBER_EVENTS_INIT = new WeakMap();
+
+async function ensureStatMemberEventsTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_STAT_MEMBER_EVENTS_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			await runD1SchemaStatement(env, 'stat_member_events',
+				'CREATE TABLE IF NOT EXISTS stat_member_events ('
+				+ 'chat_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL, '
+				+ 'actor_id TEXT, invite_link TEXT, via_request INTEGER NOT NULL DEFAULT 0, '
+				+ 'PRIMARY KEY (chat_id, user_id, kind, at))');
+			await runD1SchemaStatement(env, 'idx_stat_member_events_user',
+				'CREATE INDEX IF NOT EXISTS idx_stat_member_events_user ON stat_member_events (user_id, at)', { optional: true });
+			return true;
+		} catch (error) {
+			console.error('[入群记录] 建表失败:', formatD1SchemaError(error));
+			return false;
+		}
+	})();
+	D1_STAT_MEMBER_EVENTS_INIT.set(env.DB, init);
+	const ok = await init;
+	if (!ok) D1_STAT_MEMBER_EVENTS_INIT.delete(env.DB);   // 失败不缓存，下次重试
+	return ok;
+}
+
+// 记一条明细。失败只打日志不抛 —— 时间线缺一条不影响封禁、统计等任何其它功能。
+// atMs 优先用事件自带的 date（ChatMemberUpdated.date / ChatJoinRequest.date，官方字段），
+// 拿不到才退回 Date.now()：两条通道给的都是「事件发生时刻」，差值在秒级以内，兜底是安全的。
+// at 存 unix 秒，与 formatBeijingTime 兼容（它同时接受秒 / 毫秒 / ISO）。
+async function recordMemberEventDetail(env, chatId, userId, kind, atMs = Date.now(), meta = {}) {
+	if (!env?.DB || !userId || !kind) return;
+	if (!['join', 'leave', 'kicked', 'join_request'].includes(kind)) return;
+	if (!(await ensureStatMemberEventsTable(env))) return;
+	try {
+		await env.DB.prepare(
+			'INSERT INTO stat_member_events (chat_id, user_id, kind, at, actor_id, invite_link, via_request) '
+			+ 'VALUES (?, ?, ?, ?, ?, ?, ?) '
+			+ 'ON CONFLICT(chat_id, user_id, kind, at) DO NOTHING'
+		).bind(
+			String(chatId),
+			String(userId),
+			kind,
+			Math.floor(Number(atMs) / 1000),
+			meta.actorId ? String(meta.actorId) : null,
+			meta.inviteLink ? String(meta.inviteLink) : null,
+			meta.viaRequest ? 1 : 0
+		).run();
+	} catch (error) {
+		console.error('[入群记录] 写入失败:', error);
+	}
+}
+
+// bot_chat_join_request 处理：申请人「发起申请」的那一刻（还不是群成员）。
+// 只记时间，不批准/拒绝 —— 审批是管理员在 Telegram 客户端点的，bot 不代劳。
+// 群未开启入群审批时，这个 update 永远不会推送，本函数不会被执行。
+async function handleBotChatJoinRequest(req, env) {
+	try {
+		const chat = req?.chat;
+		const user = req?.user;
+		const chatId = String(chat?.id || '');
+		const userId = String(user?.id || '');
+		if (!chatId || !userId) return;
+		// 非配置群不记：时间线只服务我们治理的群。
+		if (!isConfiguredGroup(chatId)) return;
+		await recordMemberEventDetail(env, chatId, userId, 'join_request', req.date ? req.date * 1000 : Date.now(), {
+			inviteLink: req.invite_link?.invite_link || null,
+			viaRequest: true,
+		});
+	} catch (error) {
+		console.error('[入群记录] 申请事件处理失败:', error);
+	}
 }
 
 // 汇总：某群某粒度的总发言、活跃人数、入群、退群、被移出。

@@ -4413,7 +4413,8 @@ console.log('\n[23] 一键代发链路已移除');
 	const commandCall = callsOf('setMyCommands')[0];
 	const registeredCommands = commandCall?.body?.commands?.map((item) => item.command) || [];
 	assert('Webhook 初始化 → 成功', initResult.status === 200 && !!webhookCall);
-	assert('Webhook 初始化 → 订阅 message/chat_member/callback_query', JSON.stringify(webhookCall?.body?.allowed_updates) === JSON.stringify(['message', 'chat_member', 'callback_query']));
+	// 第2批新增 bot_chat_join_request（入群审批请求）—— 申请时间的唯一来源；群未开审批时永不推送
+	assert('Webhook 初始化 → 订阅 message/chat_member/bot_chat_join_request/callback_query', JSON.stringify(webhookCall?.body?.allowed_updates) === JSON.stringify(['message', 'chat_member', 'callback_query', 'bot_chat_join_request']));
 	assert('Webhook 初始化 → /ad 投票按钮回调已启用', webhookCall?.body?.allowed_updates?.includes('callback_query'));
 	assert('BotFather 菜单统一注册（含 /rm /profile）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice']));
 	// rm / profile 允许写说明，且必须标注权限「仅第一主人」；notice 只有占位符「·」（Telegram 不允许空说明）

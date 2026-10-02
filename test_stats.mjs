@@ -309,5 +309,68 @@ check('跨 0 点渲染：标题是 09-24', rendered.text.includes('2026-09-24'),
 check('跨 0 点渲染：汇总与标题同一天（总发言 2，不是 0）', rendered.text.includes('总发言 <b>2</b>'));
 check('跨 0 点渲染：发言排行与标题同一天（有排行、不是暂无记录）', rendered.text.includes('发言排行') && !rendered.text.includes('暂无发言记录'));
 
+console.log('\n=== 13. 入群/退群/申请 事件明细（第2批）===');
+{
+	// ① 单元：写入明细 + 字段落库 + 北京时间格式化（首次写入时表才被懒建 —— 不动 D1_SCHEMA_VERSION）
+	const ts = Math.floor(Date.parse('2026-10-02T10:30:00+08:00') / 1000);
+	await W.recordMemberEventDetail(env, '-100111', '77701', 'join', ts * 1000, {
+		actorId: '10001', inviteLink: 'https://t.me/+abc', viaRequest: true
+	});
+	check('stat_member_events 表在首次写入时自动创建（懒建，不占 schema 版本）',
+		env.DB.query("SELECT name FROM sqlite_master WHERE type='table' AND name='stat_member_events'").length === 1);
+	const rows = env.DB.query("SELECT * FROM stat_member_events WHERE user_id='77701'");
+	check('入群明细写入 1 条', rows.length === 1, JSON.stringify(rows));
+	check('at 存 unix 秒（与 formatBeijingTime 兼容）', rows[0]?.at === ts, '实际 ' + rows[0]?.at);
+	check('actor_id / invite_link / via_request 落库',
+		rows[0]?.actor_id === '10001' && rows[0]?.invite_link === 'https://t.me/+abc' && rows[0]?.via_request === 1,
+		JSON.stringify(rows[0]));
+	check('时间线格式化为北京时间 2026-10-02 10:30', W.formatBeijingTime(rows[0]?.at) === '2026-10-02 10:30',
+		W.formatBeijingTime(rows[0]?.at));
+
+	// ③ 同 (群,人,kind,秒) 重复插入去重
+	await W.recordMemberEventDetail(env, '-100111', '77701', 'join', ts * 1000, { actorId: '10001' });
+	check('重复事件只留 1 条',
+		env.DB.query("SELECT COUNT(*) AS c FROM stat_member_events WHERE user_id='77701'")[0]?.c === 1);
+
+	// ④ 非法 kind 拒绝（白名单 join / leave / kicked / join_request）
+	await W.recordMemberEventDetail(env, '-100111', '77702', 'bogus', ts * 1000, {});
+	check('非法 kind 不入库',
+		env.DB.query("SELECT COUNT(*) AS c FROM stat_member_events WHERE user_id='77702'")[0]?.c === 0);
+
+	// ⑤ 其余两种 kind
+	await W.recordMemberEventDetail(env, '-100111', '77703', 'leave', ts * 1000, {});
+	await W.recordMemberEventDetail(env, '-100111', '77704', 'join_request', ts * 1000, { viaRequest: true });
+	check('leave 与 join_request 均入库',
+		env.DB.query("SELECT COUNT(*) AS c FROM stat_member_events WHERE user_id IN ('77703','77704')")[0]?.c === 2);
+
+	// ⑥ 端到端：申请事件 update → 落库（群未开审批时该 update 永不出现，零副作用）
+	await W.__h.fetch(new Request('https://x/', { method: 'POST', body: JSON.stringify({
+		bot_chat_join_request: {
+			chat: { id: '-100111', type: 'supergroup', title: '搜索群' },
+			user: { id: 77705, is_bot: false, first_name: '申请人' },
+			date: ts, bio: '', invite_link: { invite_link: 'https://t.me/+xyz' }
+		}
+	}) }), env, { waitUntil() {} });
+	const req = env.DB.query("SELECT * FROM stat_member_events WHERE user_id='77705'");
+	check('端到端：申请事件落库且带 invite_link', req.length === 1 && req[0]?.kind === 'join_request'
+		&& req[0]?.invite_link === 'https://t.me/+xyz', JSON.stringify(req));
+
+	// ⑦ 端到端：chat_member 入群 → join 明细（时间取官方 ChatMemberUpdated.date）
+	await W.__h.fetch(new Request('https://x/', { method: 'POST', body: JSON.stringify({
+		chat_member: {
+			chat: { id: '-100111', type: 'supergroup', title: '搜索群' },
+			from: { id: 10001, is_bot: false, first_name: '管理员' },
+			date: ts,
+			old_chat_member: { status: 'left', user: { id: 77706, is_bot: false, first_name: '新成员' } },
+			new_chat_member: { status: 'member', user: { id: 77706, is_bot: false, first_name: '新成员' } }
+		}
+	}) }), env, { waitUntil() {} });
+	const evt = env.DB.query("SELECT * FROM stat_member_events WHERE user_id='77706'");
+	check('端到端：入群事件写入 join 明细', evt.length === 1 && evt[0]?.kind === 'join', JSON.stringify(evt));
+	check('端到端：时间取事件官方 date 而非当前时刻',
+		evt.length === 1 && evt[0]?.at === ts, '实际 ' + (evt[0]?.at ?? '无'));
+	check('端到端：统计计数同步 +1（明细未拖累 stat_member）',
+		Number(env.DB.query("SELECT SUM(join_count) AS c FROM stat_member WHERE chat_id='-100111'")[0]?.c || 0) >= 1);
+}
 console.log('\n群统计验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 if (fail > 0) process.exitCode = 1;
