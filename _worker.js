@@ -9713,10 +9713,13 @@ async function buildProfileBlock(env, groupId, tgid, isGroupChat = false) {
 	lines.push('申请时间　' + latest('join_request') + '（群未开启入群审批则永不出现）');
 	lines.push('入群时间　' + (joinEv ? formatBeijingTime(joinEv.at) : '未记录'));
 	lines.push('退群时间　' + (latest('leave') !== '未记录' ? latest('leave') : latest('kicked')));
-	// 任命管理员：第3批 MTProto 回填的 kind='promote'。
-	// MTProto 里 ChannelParticipantAdmin.date 是【被任命】的时刻，不是入群时间 ——
-	// 所以回填脚本把它单独存成 promote，刻意不复用 join，避免把任命时间冒充成入群时间误导主人。
-	lines.push('任命管理员　' + latest('promote'));
+	// 任命管理员：MTProto 协议【不提供任命时间】，这一项永远是未记录。
+	// 官方文档原文：channelParticipantAdmin 的 date = "When did the user join"（入群时间，
+	// 2026-10-02 查 core.telegram.org/constructor/channelParticipantAdmin 确认），promoted_by
+	// 只有「谁提的」没有「何时提的」，群主 ChannelParticipantCreator 连 date 都没有。
+	// 所以不能拿入群时间冒充任命时间 —— 早期版本按「date=任命时间」把回填数据存成 kind='promote'
+	// 是错的，已于同日把 D1 里 171 条 UPDATE 成 join。
+	lines.push('任命管理员　未记录（MTProto 协议不提供任命时间）');
 	const m = await readAdGroupMember(env, tgid);
 	lines.push('最早发言　' + (Number(m?.first_seen) > 0 ? formatBeijingTime(m.first_seen) : '未记录'));
 	lines.push('最后发言　' + (Number(m?.last_seen) > 0 ? formatBeijingTime(m.last_seen) : '未记录'));
@@ -16777,9 +16780,10 @@ async function ensureStatMemberEventsTable(env) {
 // at 存 unix 秒，与 formatBeijingTime 兼容（它同时接受秒 / 毫秒 / ISO）。
 async function recordMemberEventDetail(env, chatId, userId, kind, atMs = Date.now(), meta = {}) {
 	if (!env?.DB || !userId || !kind) return;
-	// 'promote' 由第3批 MTProto 回填写入（管理员的任命时刻），事件流本身不产生它；
-	// 放进白名单是让后续补录也能走这同一个写入函数，不至于被静默拒掉。
-	if (!['join', 'leave', 'kicked', 'join_request', 'promote'].includes(kind)) return;
+	// 只收事件流真正产生的四种 kind。曾短暂加过 'promote'（第3批回填），但官方文档确认
+	// channelParticipantAdmin.date 就是入群时间（"When did the user join"），不存在
+	// 单独的任命时间 —— 那个 kind 已从 D1 清除、这里也一并去掉，不留一个永不写入的白名单项。
+	if (!['join', 'leave', 'kicked', 'join_request'].includes(kind)) return;
 	if (!(await ensureStatMemberEventsTable(env))) return;
 	try {
 		await env.DB.prepare(
