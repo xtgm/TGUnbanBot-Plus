@@ -10673,6 +10673,27 @@ const AD_ENRICH_CHECKPOINT_KEY = 'ad_enrich_checkpoint';
 // AI 相似度落在 [软加分下限, 阈值) 区间时只加分，不直接定罪
 const AD_AI_SOFT_BONUS_FLOOR = 0.65;
 const AD_AI_SOFT_BONUS_SCORE = 2;
+
+// ===== AI 多样本聚合（top-K）· 形态 E =====
+//
+// 【关掉时（0，也是默认）】旧行为：取全部样本相似度的 **max**，**一条越线即定罪**。
+// 【打开时（K>0）】取最高的 K 条，其中**至少 MIN_HITS 条**达硬阈值才算 isMatch。
+//
+// · 治什么：#1615 那类「库里只有一条样本、且恰好边缘越线」——
+//   豁免词已扣 6 分（得分 -4），AI 0.789 vs 阈值 0.78 **只超 0.009**，却封了 13 个群。
+//   max 的本质是「取最不利的那一条」，top-K 把定罪从**单证**改成**多证**。
+// · 治不了什么：@svipultra 那类「**同质样本扎堆**」——库里 5 条全是同一昵称，
+//   K 条都超线照样中。top-K 的分母是**样本条数**，而问题是**证据同质**：
+//   条数多 ≠ 独立证据多。那一类靠 aiNameStripVeto（昵称剥离否证）兜，**两者必须同时保留**。
+// · fallback：**可比样本总数 < K 时退回 max** —— 新广告刚学进 1 条样本时保住召回。
+//   两个 fallback 条件（超线数 < K / 样本数 < K）**都救不了同质扎堆**，故只按样本数回退。
+// · 零额外 AI 推理：cosineSimilarity 在原循环里已全部算过，只改排序策略；回退 = 改回 0。
+// · 两个调用点（主判定 14475 + 昵称剥离复验 14513）走同一函数，天然同步 ——
+//   若只在一处生效会形成「主判定用 top-K、复验用 max」的逻辑分叉。
+// · 达标门槛 = **top-K 里过半**（K=3→2、K=5→3），随 K 自动走、不单独配 ——
+//   K 调了门槛还停在旧值会悄悄失衡。实际取值走 config.aiTopK（环境变量 AD_AI_TOP_K）。
+const AD_AI_TOP_K = 0;            // 0 = 关闭（现行为）；建议 K=3
+
 // 指纹命中加分
 const AD_FINGERPRINT_HIT_SCORE = 3;
 // 关键词计分：【只有交易动词与业务关键词同现才给分，单类命中一律 0 分】。
@@ -11282,6 +11303,9 @@ function loadAdDetectionConfig(env) {
 		observationScore: pickInt(env.AD_OBSERVATION_SCORE, DEFAULT_AD_OBSERVATION_SCORE, 1, 100),
 		observationHours: pickInt(env.AD_OBSERVATION_HOURS, DEFAULT_AD_OBSERVATION_HOURS, 1, 720),
 		aiSimilarityThreshold: pickFloat(env.AD_AI_SIMILARITY_THRESHOLD, DEFAULT_AD_AI_SIMILARITY_THRESHOLD, 0.1, 1),
+		// 形态 E：AI 多样本聚合的 K。0 = 关闭（现行为 max 单证定罪，也是默认值）；建议 3。
+		// 走 env 而非常量：线上可直接开关 A/B，不必改代码重新部署（见 AD_AI_TOP_K 上方说明）。
+		aiTopK: pickInt(env.AD_AI_TOP_K, AD_AI_TOP_K, 0, 50),
 		fingerprintMinConfidence: pickFloat(env.AD_FINGERPRINT_MIN_CONFIDENCE, DEFAULT_AD_FINGERPRINT_MIN_CONFIDENCE, 0, 1),
 		aiEnabled: Boolean(env?.AI && typeof env.AI.run === 'function'),
 		// 方案 E：短语自我泛化。AD_ENRICH_EVERY=0 表示完全关闭自动提炼。
@@ -13129,11 +13153,14 @@ async function loadAdSampleEmbeddings(env) {
 			//   2) 其余（spam / confirm / addsample 等学习来的）取 id 最大的 N 条，也就是最新的。
 			// COALESCE 是因为建表时 source 允许 NULL，老数据可能没写 source，
 			// 直接用 source NOT IN (...) 会因 NULL 比较返回 NULL 而把这些行整条漏掉。
+			// is_seed：标记这条是【人工审过的中心特征】还是【/spam 学来的样本】。
+			// 形态 E 的 fallback 要按「学来的样本数」判断冷启动 —— 种子永远在库（约 34 条），
+			// 用总数判会让 fallback 永不触发（实现时实测：total 恒为 9~13，条件是死的）。
 			const { results } = await env.DB.prepare(
-				"SELECT sample_text, embedding FROM ad_sample_embeddings "
+				"SELECT sample_text, embedding, 1 AS is_seed FROM ad_sample_embeddings "
 				+ "WHERE embedding IS NOT NULL AND COALESCE(source, '') IN ('seed', 'seed-core') "
 				+ "UNION ALL "
-				+ "SELECT sample_text, embedding FROM ("
+				+ "SELECT sample_text, embedding, 0 AS is_seed FROM ("
 				+ "SELECT sample_text, embedding, id FROM ad_sample_embeddings "
 				+ "WHERE embedding IS NOT NULL AND COALESCE(source, '') NOT IN ('seed', 'seed-core') "
 				+ "ORDER BY id DESC LIMIT ?"
@@ -13143,7 +13170,13 @@ async function loadAdSampleEmbeddings(env) {
 			for (const row of results || []) {
 				try {
 					const vector = JSON.parse(String(row.embedding));
-					if (Array.isArray(vector) && vector.length) rows.push({ text: String(row.sample_text || ''), vector });
+					if (Array.isArray(vector) && vector.length) {
+						rows.push({
+							text: String(row.sample_text || ''),
+							vector,
+							isSeed: Number(row.is_seed) === 1
+						});
+					}
 				} catch { /* 脏样本跳过 */ }
 			}
 			return rows;
@@ -13172,12 +13205,14 @@ async function checkAdAiSimilarity(env, text, options = {}) {
 	let best = 0;
 	let bestSample = null;
 	let skippedDim = 0;
+	const sims = [];   // 形态 E：收集全部可比样本的相似度，供 top-K 排序（不额外调 AI）
 	for (const sample of samples) {
 		// 维度守卫：cosineSimilarity 用 Math.min(a.length, b.length) 截断，维度不一致时会
 		// 静默算出一个无意义的相似度，可能随机越过阈值造成误封。换模型后库里必然残留旧维度向量
 		// （本项目就从 768 维换到 1024 维），所以这里必须显式跳过而不是让它算。
 		if (sample.vector.length !== vector.length) { skippedDim += 1; continue; }
 		const similarity = cosineSimilarity(vector, sample.vector);
+		sims.push(similarity);
 		if (similarity > best) { best = similarity; bestSample = sample.text; }
 	}
 	if (skippedDim > 0) {
@@ -13186,12 +13221,51 @@ async function checkAdAiSimilarity(env, text, options = {}) {
 			+ '（当前模型 ' + AD_EMBEDDING_MODEL + ' 输出 ' + vector.length + ' 维）'
 			+ '，请用 /clearsamples 清空后重新 /warmup 生成。');
 	}
+
+	// ===== 形态 E：多样本聚合（top-K）=====
+	// 关闭（K=0，默认）时 isMatch 仍是最朴素的「max 一条越线即定罪」。
+	// 打开时要求 top-K 里至少 **过半** 条达硬阈值 —— 把定罪从单证改成多证。
+	// 门槛随 K 自动走（K=3→2、K=5→3），不单独配 MIN_HITS：K 调了门槛还停在旧值会悄悄失衡。
+	// 可比样本 < K 时**退回 max**：新广告刚学进 1 条样本，不该因为「凑不满 K 条」而漏。
+	// 只收紧 isMatch，不动 isSoft —— 软加分只是凑分（+2），单条够宽松不会导致误封。
+	const topK = Number(config?.aiTopK ?? AD_AI_TOP_K);
+	let isMatch = best >= config.aiSimilarityThreshold;
+	const topKInfo = { enabled: false, k: 0, minHits: 0, hits: 0, total: sims.length, learned: 0, rejected: false, fallback: false };
+	if (topK > 0) {
+		topKInfo.enabled = true;
+		topKInfo.k = topK;
+		// 过半（K=3→2、K=5→3），至少 1
+		const minHits = Math.max(1, Math.ceil(topK / 2));
+		topKInfo.minHits = minHits;
+		// 【按学来的样本数判断冷启动，不能按总数】种子永远在库（约 34 条），
+		// 按总数判 fallback 永不触发（实测 total 恒为 9~13 ≥ K），新广告学进 1 条就会被判
+		// hits=1<2 而漏掉。种子仍【参与 top-K 排序】—— 它是人工审过的有效证据，
+		// 只是不参与「样本够不够」这个冷启动判断。
+		// 用 `=== false` 而不是 `!isSeed`：万一读到改代码之前的旧缓存（没有该字段），
+		// undefined 会被算成「学来的」→ learned 虚高 → 漏掉 fallback 收紧了判据。
+		// 宁可 learned=0 走 fallback 退回宽松的 max，也不能朝误封的方向偏。
+		topKInfo.learned = samples.filter((s) => s.isSeed === false).length;
+		if (topKInfo.learned < topK) {
+			topKInfo.fallback = true;   // 学来的样本不足 K → 保持 max 判定（冷启动保召回）
+		} else {
+			const sorted = [...sims].sort((a, b) => b - a).slice(0, topK);
+			topKInfo.hits = sorted.filter((s) => s >= config.aiSimilarityThreshold).length;
+			if (topKInfo.hits >= minHits) {
+				isMatch = true;    // 必然成立：max 是 sorted[0]，hits≥min 已隐含 max 达线
+			} else {
+				isMatch = false;
+				topKInfo.rejected = true;   // 越线但证据不够 —— 留痕供 /pending 复核
+			}
+		}
+	}
+
 	return {
 		available: true,
 		similarity: best,
 		sample: bestSample,
-		isMatch: best >= config.aiSimilarityThreshold,
-		isSoft: best >= AD_AI_SOFT_BONUS_FLOOR && best < config.aiSimilarityThreshold
+		isMatch,
+		isSoft: best >= AD_AI_SOFT_BONUS_FLOOR && best < config.aiSimilarityThreshold,
+		topK: topKInfo
 	};
 }
 
@@ -14522,7 +14596,11 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		const exemptVeto = aiExemptVeto || aiNameStripVeto;
 		if (ai.isMatch && !exemptVeto) {
 			layer = 'ai';
-			reasons.push('AI 语义相似度 ' + ai.similarity.toFixed(3) + ' ≥ 阈值 ' + config.aiSimilarityThreshold);
+			reasons.push('AI 语义相似度 ' + ai.similarity.toFixed(3) + ' ≥ 阈值 ' + config.aiSimilarityThreshold
+				// 形态 E 打开时写明多证依据，/pending 复核能直接看出这次是靠几条样本定的罪
+				+ (ai.topK?.enabled
+					? '，top-' + ai.topK.k + ' 中 ' + ai.topK.hits + '/' + ai.topK.k + ' 超线'
+					: ''));
 		} else if (aiExemptVeto) {
 			score += AD_AI_SOFT_BONUS_SCORE;
 			reasons.push('AI 语义相似度 ' + ai.similarity.toFixed(3) + ' ≥ 阈值 ' + config.aiSimilarityThreshold
@@ -14537,6 +14615,14 @@ async function evaluateAdSuspect(env, input, options = {}) {
 			reasons.push('AI 语义相似度 ' + ai.similarity.toFixed(3) + ' ≥ 阈值 ' + config.aiSimilarityThreshold
 				+ '，但' + aiNameStripNote + '，相似度由昵称贡献 → 降级为 +'
 				+ AD_AI_SOFT_BONUS_SCORE + ' 软加分，不直接定罪');
+		} else if (ai.topK?.rejected) {
+			// 形态 E：max 越线但 top-K 里达标条数不足 → 不定罪，且【必须留痕】。
+			// 否则这次 AI 判定完全不可观测：/pending 复核时看不出「AI 判过、够线、但证据不够」，
+			// 会误以为 AI 层根本没跑。放在 ai.isSoft 之前 —— 此时 best ≥ 阈值，
+			// isSoft 恒为 false，两者不会抢分支。
+			reasons.push('AI 语义相似度 ' + ai.similarity.toFixed(3) + ' ≥ 阈值 ' + config.aiSimilarityThreshold
+				+ '，但 top-' + ai.topK.k + ' 中仅 ' + ai.topK.hits + '/' + ai.topK.k
+				+ ' 超线 → 单证不足，不直接定罪');
 		} else if (ai.isSoft) {
 			score += AD_AI_SOFT_BONUS_SCORE;
 			reasons.push('+' + AD_AI_SOFT_BONUS_SCORE + ' AI 语义弱相似 ' + ai.similarity.toFixed(3));
