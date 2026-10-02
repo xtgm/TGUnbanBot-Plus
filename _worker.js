@@ -354,11 +354,11 @@ export default {
 					await handleChatMemberUpdate(update.chat_member, env);
 				} else if (update.callback_query) {
 					await handleAdCallbackQuery(update.callback_query, env, ctx);
-				} else if (update.bot_chat_join_request) {
+				} else if (update.chat_join_request) {
 					// 入群审批请求 → 记「申请时间」。群未开审批时此分支永不触发。
-					await handleBotChatJoinRequest(update.bot_chat_join_request, env);
+					await handleChatJoinRequest(update.chat_join_request, env);
 				} else {
-					console.log('[Telegram更新] 跳过：当前代码仅处理 message/chat_member/bot_chat_join_request/callback_query。');
+					console.log('[Telegram更新] 跳过：当前代码仅处理 message/chat_member/chat_join_request/callback_query。');
 				}
 
 				return new Response('OK');
@@ -628,10 +628,13 @@ async function handleInitialization(request) {
 		const setWebhookUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`;
 		const setWebhookBody = {
 			url: webhookUrl.toString(),
-			// bot_chat_join_request：入群审批请求。第2批新增 —— 有了它才能记录「申请时间」。
+			// chat_join_request：入群审批请求。第2批新增 —— 有了它才能记录「申请时间」。
 			// 群没开启入群审批时，这个类型永远不会推送（分支静默，无副作用）。
 			// ⚠️ 加了新类型必须重新访问初始化地址，setWebhook 才会重新下发 allowed_updates。
-			allowed_updates: ['message', 'chat_member', 'callback_query', 'bot_chat_join_request']
+			// ⚠️ 只能用官方 Update 对象里的 27 个类型之一；这里曾误写成 bot_chat_join_request
+			//    （该名在整份官方文档中出现 0 次），导致 Telegram 根本不推送、申请时间永远收不到。
+			// ⚠️ 该 update 还要求 bot 在群里有 can_invite_users 权限（官方文档明写）。
+			allowed_updates: ['message', 'chat_member', 'callback_query', 'chat_join_request']
 		};
 
 		const response = await fetch(setWebhookUrl, {
@@ -17424,10 +17427,11 @@ async function handleSearchCommand(message, env) {
 	return true;
 }
 
-// bot_chat_join_request 处理：申请人「发起申请」的那一刻（还不是群成员）。
+// chat_join_request 处理：申请人「发起申请」的那一刻（还不是群成员）。
 // 只记时间，不批准/拒绝 —— 审批是管理员在 Telegram 客户端点的，bot 不代劳。
 // 群未开启入群审批时，这个 update 永远不会推送，本函数不会被执行。
-async function handleBotChatJoinRequest(req, env) {
+// （函数名原为 handleBotChatJoinRequest，2026-10-02 随 update 名纠正一并改名。）
+async function handleChatJoinRequest(req, env) {
 	try {
 		const chat = req?.chat;
 		const user = req?.user;

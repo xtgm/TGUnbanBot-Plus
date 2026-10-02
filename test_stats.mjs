@@ -360,7 +360,8 @@ console.log('\n=== 13. 入群/退群/申请 事件明细（第2批）===');
 
 	// ⑥ 端到端：申请事件 update → 落库（群未开审批时该 update 永不出现，零副作用）
 	await W.__h.fetch(new Request('https://x/', { method: 'POST', body: JSON.stringify({
-		bot_chat_join_request: {
+		// 字段名必须是官方的 chat_join_request（bot_chat_join_request 不存在于 Update 对象）
+		chat_join_request: {
 			chat: { id: '-100111', type: 'supergroup', title: '搜索群' },
 			user: { id: 77705, is_bot: false, first_name: '申请人' },
 			date: ts, bio: '', invite_link: { invite_link: 'https://t.me/+xyz' }
