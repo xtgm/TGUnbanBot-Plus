@@ -493,4 +493,11 @@ Bot API **只能查 bot 所在群的成员** —— 把 bot 拉进对方所在�
 英文原文在 **Cloudflare 后台 → Workers → 本 Worker → 日志**。
 ## License
 
-见 [LICENSE](./LICENSE)。
+本项目沿用原项目 MIT License。
+
+原作者：[CMLiussss](https://github.com/cmliu) — Copyright (c) 2026
+原项目：[CF-Workers-TGUnbanBot](https://github.com/cmliu/CF-Workers-TGUnbanBot)
+
+再次特别鸣谢原作者 [CMLiussss](https://github.com/cmliu) 设计的源代码支持 🙏
+
+详见 [LICENSE](./LICENSE) 文件。
