@@ -7438,6 +7438,11 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 		await handleStatsGoCallback(callbackQuery, env);
 		return;
 	}
+	if (data.startsWith(STAT_TREND_PREFIX)) {
+		await handleStatsTrendCallback(callbackQuery, env);
+		return;
+	}
+
 	if (data.startsWith(STAT_PAGINATION_PREFIX)) {
 		await handleStatsPaginationCallback(callbackQuery, env);
 		return;
@@ -16711,6 +16716,80 @@ async function fetchChatMemberCount(chatId) {
 	}
 }
 
+// ===== 趋势（第2批 · 第4步）：逐日列表 + 汇总 + 环比 =====
+// 【不出图】项目里没有任何画图能力，方案已定「逐日列表 + 汇总对比」—— 用数字表，不引图表库。
+// 没数据的天补 0：列表因此不断档，环比的分母也不会因为中间缺天而虚高。
+// 天数上限 365、下限 1，防手滑传个天文数字把 D1 扫穿。
+async function queryStatTrend(env, chatId, days, nowMs = Date.now()) {
+	const empty = { days: [], start: '', end: '' };
+	if (!env?.DB) return empty;
+	const n = Math.max(1, Math.min(365, Number(days) || 7));
+	// 与 resolveStatRange 的 shift 同算法：以「统计时区的今天」为基准往回 n-1 天，
+	// 用 setUTCDate 让它自己跨月/跨年进位，不手工算月长。
+	const offsetMs = getStatTzOffsetHours(env) * 3600 * 1000;
+	const local = new Date(nowMs + offsetMs);
+	const today = new Date(Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()));
+	const start = new Date(today);
+	start.setUTCDate(today.getUTCDate() - (n - 1));
+	const fmt = (d) => d.toISOString().slice(0, 10);
+	const startDay = fmt(start);
+	const endDay = fmt(today);
+
+	const days2 = [];
+	for (let i = 0; i < n; i += 1) {
+		const d = new Date(start);
+		d.setUTCDate(start.getUTCDate() + i);
+		days2.push({ day: fmt(d), msg: 0, active: 0, join: 0, leave: 0, disposal: 0, newcomer: 0 });
+	}
+	const byDay = new Map(days2.map((r) => [r.day, r]));
+	// 先补满今天这条，否则一天数据都没有时趋势页会是空的（今天是 0 也该显示出来）。
+
+	if (!(await statReady(env))) return { days: days2, start: startDay, end: endDay };
+	try {
+		const speech = await env.DB.prepare(
+			'SELECT day, COALESCE(SUM(msg_count),0) AS msg, COUNT(DISTINCT user_id) AS users '
+			+ 'FROM stat_speech WHERE chat_id = ? AND day >= ? AND day <= ? GROUP BY day'
+		).bind(String(chatId), startDay, endDay).all();
+		for (const r of speech.results || []) {
+			const row = byDay.get(String(r.day));
+			if (row) { row.msg = Number(r.msg) || 0; row.active = Number(r.users) || 0; }
+		}
+		const member = await env.DB.prepare(
+			'SELECT day, COALESCE(SUM(join_count),0) AS j, COALESCE(SUM(leave_count),0) AS l '
+			+ 'FROM stat_member WHERE chat_id = ? AND day >= ? AND day <= ? GROUP BY day'
+		).bind(String(chatId), startDay, endDay).all();
+		for (const r of member.results || []) {
+			const row = byDay.get(String(r.day));
+			if (row) { row.join = Number(r.j) || 0; row.leave = Number(r.l) || 0; }
+		}
+	} catch (error) { console.error('[群统计] 趋势查询失败:', error); }
+
+	// 处置 / 新人治理是懒建表，可能一次都没处置过 —— 拿不到就当全 0，不阻断趋势。
+	try {
+		if (await ensureStatActionsTable(env)) {
+			const acts = await env.DB.prepare(
+				'SELECT day, kind, COALESCE(SUM(cnt),0) AS c FROM stat_actions '
+				+ 'WHERE chat_id = ? AND day >= ? AND day <= ? GROUP BY day, kind'
+			).bind(String(chatId), startDay, endDay).all();
+			for (const r of acts.results || []) {
+				const row = byDay.get(String(r.day));
+				if (!row) continue;
+				if (r.kind === 'disposal') row.disposal = Number(r.c) || 0;
+				else if (r.kind === 'newcomer') row.newcomer = Number(r.c) || 0;
+			}
+		}
+	} catch (error) { console.error('[群统计] 趋势处置查询失败:', error); }
+
+	return { days: days2, start: startDay, end: endDay };
+}
+
+// 同长度的上一个区间（环比用）。复用 queryStatTrend：把 nowMs 往回推 n 天即可，
+// 算法与区间切法天然一致，不会出现「本期含今天、上期不含今天」这种错位。
+async function queryStatTrendPrev(env, chatId, days, nowMs = Date.now()) {
+	const n = Math.max(1, Math.min(365, Number(days) || 7));
+	return await queryStatTrend(env, chatId, n, nowMs - n * 86400000);
+}
+
 // bot_chat_join_request 处理：申请人「发起申请」的那一刻（还不是群成员）。
 // 只记时间，不批准/拒绝 —— 审批是管理员在 Telegram 客户端点的，bot 不代劳。
 // 群未开启入群审批时，这个 update 永远不会推送，本函数不会被执行。
@@ -16813,6 +16892,8 @@ async function pruneStatData(env, nowMs = Date.now()) {
 const STAT_PAGINATION_PREFIX = 'statpg:';
 // 用法面板按钮：点一下【新发一条】对应范围的数据消息（不改面板），token=base64url(range|chatId)。
 const STAT_GO_PREFIX = 'statgo:';
+// 趋势页按钮：原地编辑成逐日列表，token=base64url(range|chatId)，range 供「返回统计」用。
+const STAT_TREND_PREFIX = 'stattrend:';
 
 function isStatsCommand(text) {
 	return typeof text === 'string' && /^\/stats(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
@@ -16963,6 +17044,13 @@ function buildStatsDataKeyboard(chatId, range, page, totalPages) {
 	// 任一格塞不下（群 ID 异常长）就丢整行，避免半残键盘。
 	if (row1.every(Boolean)) rows.push(row1);
 	if (row2.every(Boolean)) rows.push(row2);
+	// 趋势按钮：与时间切换不同前缀（stattrend:），点下去是原地编辑成逐日列表。
+	const trendMk = (label, d) => {
+		const data = STAT_TREND_PREFIX + d + ':' + encodeAdCallbackToken(range + '|' + String(chatId));
+		return adCallbackDataFits(data) ? { text: label, callback_data: data } : null;
+	};
+	const row3 = [trendMk('📈 7天趋势', 7), trendMk('📈 30天趋势', 30)];
+	if (row3.every(Boolean)) rows.push(row3);
 	const pager = buildAdPaginationKeyboard(STAT_PAGINATION_PREFIX, page, totalPages,
 		encodeAdCallbackToken(range + '|' + String(chatId)));
 	if (pager && pager.inline_keyboard && pager.inline_keyboard[0]) rows.push(pager.inline_keyboard[0]);
@@ -17015,6 +17103,84 @@ async function renderStatPage(env, chatId, range, page, chatTitle, nowMs = Date.
 		? '翻页：<code>/stats ' + (range === 'day' ? '' : range + ' ') + '第 ' + Math.min(ranking.totalPages, page + 1) + ' 页需用按钮</code>'
 		: '';
 	return { text: lines.join('\n'), keyboard, fallbackLine, totalPages: ranking.totalPages };
+}
+
+// 趋势页键盘：切换天数 + 返回统计页。返回键带上原 range，回到的就是点进来之前的那个区间。
+// callback 形如 stattrend:<天数>:<base64url "range|chatId">，或 statpg:1:<...> 用于返回。
+function buildStatsTrendKeyboard(chatId, days, range) {
+	const mk = (label, d) => {
+		const text = (Number(days) === d ? '·' : '') + label;
+		const data = STAT_TREND_PREFIX + d + ':' + encodeAdCallbackToken(range + '|' + String(chatId));
+		return adCallbackDataFits(data) ? { text, callback_data: data } : null;
+	};
+	const back = (() => {
+		const data = STAT_PAGINATION_PREFIX + '1:' + encodeAdCallbackToken(range + '|' + String(chatId));
+		return adCallbackDataFits(data) ? { text: '↩️ 返回统计', callback_data: data } : null;
+	})();
+	const row1 = [mk('📈 7天趋势', 7), mk('📈 30天趋势', 30)];
+	const rows = [];
+	if (row1.every(Boolean)) rows.push(row1);
+	if (back) rows.push([back]);
+	return rows.length ? { inline_keyboard: rows } : null;
+}
+
+// 趋势页：逐日列表 + 汇总 + 环比（方案 a+b，不出图）。
+async function renderStatTrend(env, chatId, days, range, chatTitle, nowMs = Date.now()) {
+	const [cur, prev] = await Promise.all([
+		queryStatTrend(env, chatId, days, nowMs),
+		queryStatTrendPrev(env, chatId, days, nowMs)
+	]);
+	const scope = chatTitle ? escapeHtml(String(chatTitle)) : ('群 <code>' + escapeHtml(String(chatId)) + '</code>');
+	const sum = (rows, key) => rows.reduce((a, r) => a + (Number(r[key]) || 0), 0);
+	const peak = (rows, key) => rows.reduce((a, r) => Math.max(a, Number(r[key]) || 0), 0);
+
+	const curMsg = sum(cur.days, 'msg');
+	const curJoin = sum(cur.days, 'join');
+	const curLeave = sum(cur.days, 'leave');
+	const curDisp = sum(cur.days, 'disposal');
+	const curNew = sum(cur.days, 'newcomer');
+	const peakActive = peak(cur.days, 'active');
+	const avgMsg = cur.days.length ? Math.round(curMsg / cur.days.length) : 0;
+
+	// 环比：百分比。上期为 0 时不编百分比 —— 「新增 / 上期无数据」比「∞%」诚实。
+	const pct = (now, before) => {
+		if (!before) return now ? '新增' : '持平';
+		const v = ((now - before) / before) * 100;
+		return (v > 0 ? '+' : '') + v.toFixed(0) + '%';
+	};
+	const prevMsg = sum(prev.days, 'msg');
+	const prevJoin = sum(prev.days, 'join');
+	const prevLeave = sum(prev.days, 'leave');
+	const prevDisp = sum(prev.days, 'disposal');
+
+	const lines = [
+		'📈 <b>群统计</b> · ' + scope,
+		'📅 近 <b>' + cur.days.length + '</b> 天　' + cur.start + ' ~ ' + cur.end + '（北京时间）',
+		''
+	];
+	for (const r of cur.days) {
+		// 每行只显示日期的 MM-DD（同一年内足够辨识），处置非 0 才占一格。
+		const md = r.day.slice(5);
+		let line = '<code>' + md + '</code>　💬 ' + r.msg + '　👥 ' + r.active
+			+ '　➕' + r.join + ' ➖' + r.leave;
+		if (r.disposal) line += '　🛡' + r.disposal;
+		lines.push(line);
+	}
+	lines.push(
+		'',
+		'━━━ <b>汇总</b> ━━━',
+		'💬 总发言 <b>' + curMsg + '</b>　日均 <b>' + avgMsg + '</b>　单日活跃峰值 <b>' + peakActive + '</b>',
+		'➕ 新增 <b>' + curJoin + '</b>　➖ 离开 <b>' + curLeave + '</b>　📈 净增 <b>'
+			+ ((curJoin - curLeave) > 0 ? '+' : '') + (curJoin - curLeave) + '</b>',
+		'🛡 处置 <b>' + curDisp + '</b>　👶 新人治理 <b>' + curNew + '</b>',
+		'',
+		'━━━ <b>环比</b>（上一个 ' + prev.days.length + ' 天 ' + prev.start + ' ~ ' + prev.end + '）━━━',
+		'💬 发言 ' + prevMsg + ' → ' + curMsg + '　<b>' + pct(curMsg, prevMsg) + '</b>',
+		'➕ 新增 ' + prevJoin + ' → ' + curJoin + '　<b>' + pct(curJoin, prevJoin) + '</b>'
+			+ '　➖ 离开 ' + prevLeave + ' → ' + curLeave + '　<b>' + pct(curLeave, prevLeave) + '</b>',
+		'🛡 处置 ' + prevDisp + ' → ' + curDisp + '　<b>' + pct(curDisp, prevDisp) + '</b>'
+	);
+	return { text: lines.join('\n'), keyboard: buildStatsTrendKeyboard(chatId, days, range) };
 }
 
 // /stats 命令处理。返回 true 表示已处理。
@@ -17112,5 +17278,31 @@ async function handleStatsGoCallback(callbackQuery, env) {
 	// 发到面板所在聊天（即本群）；面板消息不动，数据作为额外一条出现在下方。
 	const targetChat = String(callbackQuery?.message?.chat?.id || statChatId);
 	await sendAdPagedMessage(targetChat, rendered.text, rendered.keyboard, rendered.fallbackLine);
+	await answerAdVoteCallback(callbackQuery?.id);
+}
+
+// 趋势按钮回调：原地把那条统计消息编辑成逐日列表。权限复查与 /stats、翻页回调完全一致。
+// data 形如 stattrend:<天数>:<base64url "range|chatId">（range 供「返回统计」键还原区间）。
+async function handleStatsTrendCallback(callbackQuery, env) {
+	const data = String(callbackQuery?.data || '');
+	const clickerId = String(callbackQuery?.from?.id || '');
+	const body = data.slice(STAT_TREND_PREFIX.length);
+	const match = body.match(/^(\d+):(.*)$/);
+	if (!match) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
+	const days = Math.max(1, Math.min(365, parseInt(match[1], 10) || 7));
+	const token = decodeAdCallbackToken(match[2]);
+	const sep = token.indexOf('|');
+	const range = sep >= 0 ? token.slice(0, sep) : 'day';
+	const statChatId = sep >= 0 ? token.slice(sep + 1) : '';
+	if (!statChatId) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
+	// 权限复查（与 /stats 命令一致）：主人/副主人，或该统计群的管理员/群主。
+	const allowed = isPrivilegedManager(clickerId) || await checkIfUserIsAdminInGroup(clickerId, statChatId);
+	if (!allowed) { await answerAdVoteCallback(callbackQuery?.id, '仅限该群管理员或主人操作', true); return; }
+	const msgChatId = String(callbackQuery?.message?.chat?.id || '');
+	const messageId = Number(callbackQuery?.message?.message_id) || 0;
+	let title = '';
+	try { const gi = await getChatInfoFromId(statChatId); title = String(gi?.title || ''); } catch (_) {}
+	const rendered = await renderStatTrend(env, statChatId, days, range, title);
+	await editAdPagedMessage(msgChatId, messageId, rendered.text, rendered.keyboard);
 	await answerAdVoteCallback(callbackQuery?.id);
 }

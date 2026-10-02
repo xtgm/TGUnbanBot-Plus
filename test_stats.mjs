@@ -529,10 +529,16 @@ console.log('\n=== 15. 风控处置 / 新人治理 / 完整统计面板 ===');
 	check('切换时间走 statpg:1:（原地编辑，选中态才跟着变）',
 		!!kb && kb.inline_keyboard[0][1].callback_data.startsWith('statpg:1:'),
 		kb && kb.inline_keyboard[0][1].callback_data.slice(0, 12));
-	check('单页 → 只有两行时间按钮、无翻页行', !!kb && kb.inline_keyboard.length === 2, kb && String(kb.inline_keyboard.length));
+	check('单页 → 三行键盘（时间×2 + 趋势）、无翻页行', !!kb && kb.inline_keyboard.length === 3, kb && String(kb.inline_keyboard.length));
 	check('第二行 = 本月 / 近7天 / 近30天',
 		!!kb && kb.inline_keyboard[1].map((x) => x.text.replace('·', '')).join('/') === '本月/近7天/近30天',
 		kb && kb.inline_keyboard[1] && kb.inline_keyboard[1].map((x) => x.text).join(','));
+	check('第三行 = 7天趋势 / 30天趋势',
+		!!kb && kb.inline_keyboard[2].map((x) => x.text.replace('·', '').replace('📈', '').trim()).join('/') === '7天趋势/30天趋势',
+		kb && kb.inline_keyboard[2] && kb.inline_keyboard[2].map((x) => x.text).join(','));
+	check('趋势按钮走 stattrend: 前缀（与时间切换区分）',
+		!!kb && kb.inline_keyboard[2][0].callback_data.startsWith('stattrend:7:'),
+		kb && kb.inline_keyboard[2][0].callback_data.slice(0, 13));
 
 	const rpY = await W.renderStatPage(env, '-100111', 'yesterday', 1, '统计测试群', T);
 	check('切到昨天 → 选中态移到「·昨天」', !!rpY.keyboard && rpY.keyboard.inline_keyboard[0][1].text === '·昨天',
@@ -553,6 +559,66 @@ console.log('\n=== 15. 风控处置 / 新人治理 / 完整统计面板 ===');
 	check('剪枝不影响保留期内的计数', a.disposal === 4, JSON.stringify(a));
 	check('剪枝后表仍在（不是整表删掉）',
 		env.DB.query("SELECT name FROM sqlite_master WHERE type='table' AND name='stat_actions'").length === 1);
+}
+
+console.log('\n=== 16. 趋势（逐日列表 + 汇总 + 环比，不出图）===');
+{
+	// 补跨天数据：09-20 一条发言一次入群、09-22 一次处置，09-24 沿用第 2 节的 4 条发言。
+	await W.recordSpeechStat(env, '-100111', { id: '9', first_name: '趋势甲' }, Date.parse('2026-09-20T04:00:00Z'));
+	await W.recordMemberEvent(env, '-100111', 'join', Date.parse('2026-09-20T04:00:00Z'));
+	await W.recordStatAction(env, '-100111', 'disposal', Date.parse('2026-09-22T04:00:00Z'));
+
+	const t = await W.queryStatTrend(env, '-100111', 7, T);
+	check('7 天趋势返回 7 行', t.days.length === 7, String(t.days.length));
+	check('起止 = 09-18 ~ 09-24（含今天）', t.start === '2026-09-18' && t.end === '2026-09-24', t.start + '..' + t.end);
+	const td = Object.fromEntries(t.days.map((r) => [r.day, r]));
+	check('09-24 发言 4 条（沿用第 2 节数据）', td['2026-09-24'].msg === 4, JSON.stringify(td['2026-09-24']));
+	check('09-24 活跃 3 人', td['2026-09-24'].active === 3, JSON.stringify(td['2026-09-24']));
+	check('09-20 发言 1 条', td['2026-09-20'].msg === 1, JSON.stringify(td['2026-09-20']));
+	check('无数据的天补 0 而不是缺行（列表不断档）',
+		td['2026-09-18'].msg === 0 && td['2026-09-19'].msg === 0 && td['2026-09-21'].msg === 0,
+		JSON.stringify([td['2026-09-18'], td['2026-09-19'], td['2026-09-21']]));
+	check('09-20 入群 1', td['2026-09-20'].join === 1, JSON.stringify(td['2026-09-20']));
+	check('09-22 处置 1、09-24 处置 4',
+		td['2026-09-22'].disposal === 1 && td['2026-09-24'].disposal === 4,
+		td['2026-09-22'].disposal + '/' + td['2026-09-24'].disposal);
+
+	const p = await W.queryStatTrendPrev(env, '-100111', 7, T);
+	check('上期区间 = 09-11 ~ 09-17（紧邻本期之前，不重不漏）',
+		p.start === '2026-09-11' && p.end === '2026-09-17', p.start + '..' + p.end);
+
+	// —— 渲染 ——
+	const tr = await W.renderStatTrend(env, '-100111', 7, 'day', '统计测试群', T);
+	const head = tr.text.split('\n')[1];
+	check('标题含天数与起止区间', tr.text.includes('近 <b>7</b> 天') && head.includes('2026-09-18 ~ 2026-09-24'), head);
+	check('逐日列表覆盖首尾两天（MM-DD）',
+		tr.text.includes('<code>09-18</code>') && tr.text.includes('<code>09-24</code>'), '');
+	check('汇总节含总发言 / 日均 / 活跃峰值',
+		tr.text.includes('汇总') && tr.text.includes('日均') && tr.text.includes('活跃峰值'), '');
+	check('环比节含上一个 7 天与起止', tr.text.includes('环比') && tr.text.includes('上一个 7 天'), '');
+	// 上期一条都没有 → 写「新增」，绝不编一个百分比
+	check('上期为 0 → 显示「新增」不编百分比', tr.text.includes('发言 0 → 5　<b>新增</b>'),
+		tr.text.split('\n').filter((x) => x.includes('发言 ')).join(' | '));
+
+	// —— 键盘 ——
+	const tk = tr.keyboard;
+	check('趋势键盘两行（天数 + 返回）', !!tk && tk.inline_keyboard.length === 2, tk && String(tk.inline_keyboard.length));
+	check('当前 7 天 → 标选中「·7天趋势」', !!tk && tk.inline_keyboard[0][0].text === '·📈 7天趋势',
+		tk && tk.inline_keyboard[0][0].text);
+	check('天数按钮走 stattrend: 前缀', !!tk && tk.inline_keyboard[0][1].callback_data.startsWith('stattrend:30:'),
+		tk && tk.inline_keyboard[0][1].callback_data.slice(0, 13));
+	check('返回键走 statpg:1: 回到原区间', !!tk && tk.inline_keyboard[1][0].callback_data.startsWith('statpg:1:'),
+		tk && tk.inline_keyboard[1][0].callback_data.slice(0, 10));
+
+	// —— 上下限 ——
+	const big = await W.queryStatTrend(env, '-100111', 9999, T);
+	check('天数上限 365（防手滑把 D1 扫穿）', big.days.length === 365, String(big.days.length));
+	const tiny = await W.queryStatTrend(env, '-100111', -5, T);
+	check('天数下限 1', tiny.days.length === 1, String(tiny.days.length));
+
+	// —— 非配置群 / 无数据群不炸 ——
+	const none = await W.renderStatTrend(env, '-100999', 7, 'day', '', T);
+	check('没数据的群 → 全 0 正常渲染、不抛', none.text.includes('总发言 <b>0</b>'), none.text.split('\n').slice(-5).join(' | '));
 }
 
 console.log('\n群统计验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
