@@ -5180,6 +5180,8 @@ async function handleChatMemberUpdate(chatMember, env) {
 				新状态: newStatusEarly,
 				踢人结果: banResult.ok ? '成功' : `失败:${banResult.error}`
 			}));
+			// 风控·处置：黑名单用户复入被当场踢回，算本群挡下一次（失败不计）。
+			await recordDisposalsFromBanResults(env, [{ groupId: chat.id, ok: banResult?.ok === true }]);
 			await notifyOwnerBlacklistIntercept(targetUser, chat, '复入群拦截', blacklistCheck, banResult);
 			return; // 已处理，不再走后面"管理员操作同步"分支
 		}
@@ -5240,6 +5242,8 @@ async function handleChatMemberUpdate(chatMember, env) {
 				// 仍在 D1 黑名单 → 撤销本次群内手动解封，立即封回，绝不删除黑名单记录
 				const banResult = await banUserFromGroup(chat.id, targetIdStr);
 				console.log('[chat_member] 拦截群内手动解封(D1黑名单保护):', JSON.stringify({ ...logCommon, 封回结果: banResult.ok ? '成功' : `失败:${banResult.error}` }));
+				// 风控·处置：封回成功即本群挡下一次（管理员试图绕过 D1 黑名单解封）。
+				await recordDisposalsFromBanResults(env, [{ groupId: chat.id, ok: banResult?.ok === true }]);
 				await notifyOwnerBlacklistIntercept(targetUser, chat, '群内手动解封拦截', blacklistCheck, banResult);
 			}
 		} else {
@@ -5873,6 +5877,8 @@ async function enforceLinkedSpamTargets(env, targets, options = {}) {
 			note: options.note || '同款广告连带查杀'
 		});
 		const banResults = await banUserFromAllGroups(target.userId, { probeMembership: false });
+		// 风控·处置：同款连带查杀按实际封成功的群逐群 +1。
+		await recordDisposalsFromBanResults(env, banResults);
 		const okCount = banResults.filter((r) => r?.ok).length;
 		done.push({
 			userId: target.userId,
@@ -6151,6 +6157,10 @@ async function enforceHandledRepeatBan(env, message, hit) {
 	} catch (error) {
 		console.error('[同款直封] 全群封禁失败:', error);
 	}
+	// 风控·处置：同款直封按实际封成功的群逐群 +1。
+	// 必须放在下面 `if (!ownerId) return` 之前 —— 没配通知目标时那行会提前返回，
+	// 记在后面就会漏掉「封了人但没发通知」的处置。
+	await recordDisposalsFromBanResults(env, banResults);
 	const ownerId = getOwnerNotifyTargets()[0] || '';
 	if (!ownerId) return;
 	const okCount = banResults.filter((r) => r?.ok).length;
@@ -7208,6 +7218,8 @@ async function enforceApprovedAdVote(env, state) {
 		note: ('群内 /ad 举报投票通过' + (state.reason ? '：' + state.reason : '')).slice(0, 500),
 	});
 	const banResults = await banUserFromAllGroups(state.targetUserId, { probeMembership: true, revokeMessages: true });
+	// 风控·处置：群内 /ad 举报投票通过后的定罪封禁，按实际封成功的群逐群 +1。
+	await recordDisposalsFromBanResults(env, banResults);
 	const historyFallback = state.reportedMessageId
 		? null
 		: await cleanupAdVoteSourceChatMessages(env, state.chatId, state.targetUserId);
@@ -7908,6 +7920,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				let flashText;
 				if (result.success || alreadyExists) {
 					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
+					// 风控·处置：/spam 单条按实际封成功的群逐群 +1。
+					await recordDisposalsFromBanResults(env, banResults);
 					targetMention = formatTargetFromBanResults(valid[0], banResults);
 					lines.push(`🎯 目标用户:${targetMention}`);
 					lines.push('');
@@ -7946,6 +7960,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				if (okCount === banResults.length) banSummary.banOkAll += 1;
 				else if (okCount === 0) banSummary.banFailedAll += 1;
 				else banSummary.banPartial += 1;
+				// 风控·处置：批量 /spam 逐用户、逐群记一次（每个目标 × 每个封成功的群）。
+				await recordDisposalsFromBanResults(env, banResults);
 			}
 			const failedCount = invalid.length + results.failed.length;
 			const flashText = `✅ 批量加黑(/spam)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`
@@ -7994,6 +8010,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 加黑成功或已存在 → Telegram 群封禁/预封(revoke_messages 默认 true:封禁同时删该用户在各群全部消息)
 			//   + 缓存清扫兜底(补删 revoke 偶尔漏的、当前群近期消息)
 			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true });
+			// 风控·处置：引用回复 /spam（对发出广告那条消息的发送者处置）按封成功群逐群 +1。
+			await recordDisposalsFromBanResults(env, banResults);
 			const cleanupResult = await cleanupCurrentChatUserMessages(env, chatId, repliedUserId, [repliedMsg.message_id]);
 
 			const lines = [
@@ -8876,6 +8894,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			let flashText;
 			if (result.success || alreadyExists) {
 				const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
+				// 风控·处置：/ban 单条按实际封成功的群逐群 +1。
+				await recordDisposalsFromBanResults(env, banResults);
 				// 与 /spam 对齐：Telegram 的 revoke_messages 只对【仍在群里】的成员生效，
 				// 目标若已退群/已被别人踢过就变成预封，历史发言一条都撤不掉。
 				// 这里补一层兜底：从 moderation_messages 捞出该 TGID 在【当前群】缓存的消息 ID
@@ -8934,6 +8954,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			if (okCount === banResults.length) banSummary.banOkAll += 1;
 			else if (okCount === 0) banSummary.banFailedAll += 1;
 			else banSummary.banPartial += 1;
+			// 风控·处置：批量 /ban 逐用户、逐群记一次（每个目标 × 每个封成功的群）。
+			await recordDisposalsFromBanResults(env, banResults);
 		}
 		const failedCount = invalid.length + results.failed.length;
 		const flashText = `✅ 批量加黑：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`
@@ -14528,6 +14550,9 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	} catch (_) { /* 记录失败不影响本次处置 */ }
 	const okCount = banResults.filter((r) => r.ok).length;
 	const failedBans = banResults.filter((r) => !r.ok);
+	// 风控·处置：按实际封成功的群逐群 +1（面板「本群挡下 N 次」的唯一数据来源）。
+	// 放在这里而不是黑名单写入之后 —— 加黑可能因已存在而没写成，但封禁成功了就是挡下了。
+	await recordDisposalsFromBanResults(env, banResults);
 	const banResultLine = okCount + '/' + banResults.length + ' 个群成功';
 	// 失败原因只给中文（英文原文由翻译兜底写入 Worker 日志）；最多列 3 个群，其余汇总成一句。
 	const failedGroupLines = failedBans.slice(0, 3)
@@ -14722,6 +14747,11 @@ async function screenAdJoinMember(env, member, options = {}) {
 				chatTitle: options.chatTitle || '',
 				messageId: options.messageId ?? null
 			}, evaluation, { config, whitelist });
+			// 风控·新人治理（方案 b 精确计数）：只统计【入群筛查当场处置】的新人，
+			// 口径严格等于「新人被处理数」—— 不含老成员被违规踢出（那是 kicked_count 的事）。
+			// 上面管理员豁免的分支已经 return，走不到这里，不会把豁免记成治理。
+			// disposal 这一格已由 enforceAdDetection 按封禁结果记过，这里只补 newcomer，不重复计。
+			await recordStatAction(env, chatId, 'newcomer');
 			return 'banned';
 		}
 		if (evaluation.verdict === 'observe') {
@@ -15312,6 +15342,8 @@ async function handleAdLearnLastCommand(env, chatId, ownerId, arg) {
 						reason: 'spam', by: ownerId, note: '/learnlast 学习并处置'
 					});
 					const banResults = await banUserFromAllGroups(uid, { probeMembership: false });
+					// 风控·处置：/learnlast 学习并处置按封成功群逐群 +1。
+					await recordDisposalsFromBanResults(env, banResults);
 					const okCount = banResults.filter((r) => r?.ok).length;
 					done.push({ uid, code: String(added?.code || (added?.success ? 'ADDED' : 'ERROR')), ban: okCount + '/' + banResults.length });
 				}
@@ -16571,6 +16603,114 @@ async function recordMemberEventDetail(env, chatId, userId, kind, atMs = Date.no
 	}
 }
 
+// ===== 风控处置 / 新人治理 计数（第2批 · 2026-10-02）=====
+// 与 stat_member 的分工：那张表记「进出群几个人」（人数），这一格记「bot 做了几次风控动作」（次数）。
+//   · disposal = 本群封禁/加黑成功的次数
+//   · newcomer = 入群筛查当场处置的次数（方案 b 精确计数，口径严格等于「新人被处理数」）
+//
+// 【为什么不能从 blacklist 聚合】blacklist 表结构是 (id, reason, by_user, at, note)，
+// 没有 chat_id 列，8 个加黑调用点的 note 也全是中文描述不带群 —— 它是【全 bot 共享】的。
+// 面板要的是「本群挡下 N 次」，所以必须在【能确定群的处置点】当场记，事后聚合拿不到群归属。
+// blacklist.at 是 UTC ISO（new Date().toISOString()），跨 UTC/北京日界的记录直接按天切会错一天，
+// 当场记则由 statDayString 统一切天（默认 +8），8 小时时区换算在写入端一次完成。
+//
+// 一张表两个 kind：入群封禁两个口径都要 +1（既是处置、也是新人治理），天然保持一致。
+// 表由代码懒建，不动 D1_SCHEMA_VERSION（与 stat_member_events 同一套做法）。
+const D1_STAT_ACTIONS_INIT = new WeakMap();
+
+async function ensureStatActionsTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_STAT_ACTIONS_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			await runD1SchemaStatement(env, 'stat_actions',
+				'CREATE TABLE IF NOT EXISTS stat_actions ('
+				+ 'chat_id TEXT NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL, '
+				+ 'cnt INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, '
+				+ 'PRIMARY KEY (chat_id, day, kind))');
+			await runD1SchemaStatement(env, 'idx_stat_actions_day',
+				'CREATE INDEX IF NOT EXISTS idx_stat_actions_day ON stat_actions (chat_id, day)', { optional: true });
+			return true;
+		} catch (error) {
+			console.error('[群统计] 处置计数表建表失败:', formatD1SchemaError(error));
+			return false;
+		}
+	})();
+	D1_STAT_ACTIONS_INIT.set(env.DB, init);
+	const ok = await init;
+	if (!ok) D1_STAT_ACTIONS_INIT.delete(env.DB);   // 失败不缓存，下次重试
+	return ok;
+}
+
+// 记一次风控动作。失败只打日志不抛 —— 少计一次绝不能影响封禁本身。
+// kind 白名单校验后再拼进 SQL（与 recordMemberEvent 同一处理法），其余值一律参数绑定。
+async function recordStatAction(env, chatId, kind, nowMs = Date.now()) {
+	if (!env?.DB || !chatId) return;
+	if (kind !== 'disposal' && kind !== 'newcomer') return;
+	if (!(await ensureStatActionsTable(env))) return;
+	try {
+		const day = statDayString(env, nowMs);
+		await env.DB.prepare(
+			'INSERT INTO stat_actions (chat_id, day, kind, cnt, updated_at) VALUES (?, ?, ?, 1, ?) '
+			+ 'ON CONFLICT(chat_id, day, kind) DO UPDATE SET cnt = cnt + 1, updated_at = excluded.updated_at'
+		).bind(String(chatId), day, kind, Math.floor(nowMs / 1000)).run();
+	} catch (error) { console.error('[群统计] 记录风控处置失败:', error); }
+}
+
+// 查一段区间（含端点，统计时区 YYYY-MM-DD）内的两格计数。表还没建过 = 从未处置过 = 全 0。
+async function queryStatActions(env, chatId, start, end) {
+	const empty = { disposal: 0, newcomer: 0 };
+	if (!env?.DB) return empty;
+	if (!(await ensureStatActionsTable(env))) return empty;
+	try {
+		const { results } = await env.DB.prepare(
+			'SELECT kind, COALESCE(SUM(cnt),0) AS c FROM stat_actions '
+			+ 'WHERE chat_id = ? AND day >= ? AND day <= ? GROUP BY kind'
+		).bind(String(chatId), start, end).all();
+		const out = { ...empty };
+		for (const row of results || []) {
+			if (row.kind === 'disposal') out.disposal = Number(row.c) || 0;
+			else if (row.kind === 'newcomer') out.newcomer = Number(row.c) || 0;
+		}
+		return out;
+	} catch (error) { console.error('[群统计] 处置计数查询失败:', error); return empty; }
+}
+
+// 按 banUserFromAllGroups / banUserFromGroup 的结果逐群记一次处置。
+// 【口径】只有封成功（或禁言模式下禁言成功）的群才 +1 —— 面板上的「本群挡下 N 次」
+// 指的是「本群实际拦下了几次」，一个群成功封掉这个号才算挡下一次，失败的不算。
+// 一次处置常常横扫全部配置群，每个群各自 +1，各群的数字与它自己拦下的次数严格相等。
+async function recordDisposalsFromBanResults(env, banResults) {
+	if (!env?.DB || !Array.isArray(banResults)) return;
+	for (const r of banResults) {
+		if (!r || !r.ok || !r.groupId) continue;
+		await recordStatAction(env, r.groupId, 'disposal');
+	}
+}
+
+// 取群【此刻】的成员总数（getChatMemberCount）。面板报头的「当前成员」用它，是实时值，
+// 不是区间内的任何统计 —— 与「活跃人数」（区间内发言过的人）是两回事，不能互相替代。
+// 失败返回 null：让面板显示「未知」，绝不编一个数字出来。
+async function fetchChatMemberCount(chatId) {
+	if (!chatId) return null;
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMemberCount`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: String(chatId) })
+		});
+		const result = await response.json();
+		// 必须判 typeof number：`Number(null)` 是 0，直接 Number() 会让「接口没返回」
+		// 静默变成「当前成员 0」—— 那是编出来的数字，比显示「未知」糟得多。
+		const raw = result?.result;
+		return result?.ok && typeof raw === 'number' && Number.isFinite(raw) ? raw : null;
+	} catch (error) {
+		console.error('[群统计] 取成员总数失败:', error);
+		return null;
+	}
+}
+
 // bot_chat_join_request 处理：申请人「发起申请」的那一刻（还不是群成员）。
 // 只记时间，不批准/拒绝 —— 审批是管理员在 Telegram 客户端点的，bot 不代劳。
 // 群未开启入群审批时，这个 update 永远不会推送，本函数不会被执行。
@@ -16647,14 +16787,24 @@ async function queryStatRanking(env, chatId, range, page = 1, nowMs = Date.now()
 // 剪枝：删除超过保留期的统计明细。cron 搭车执行。
 async function pruneStatData(env, nowMs = Date.now()) {
 	if (!env?.DB) return;
+	const cutoff = statDayString(env, nowMs - STAT_RETENTION_DAYS * 86400000);
 	try {
 		if (!(await statReady(env))) return;
-		const cutoff = statDayString(env, nowMs - STAT_RETENTION_DAYS * 86400000);
 		await env.DB.batch([
 			env.DB.prepare('DELETE FROM stat_speech WHERE day < ?').bind(cutoff),
 			env.DB.prepare('DELETE FROM stat_member WHERE day < ?').bind(cutoff)
 		]);
 	} catch (error) { console.error('[群统计] 剪枝失败:', error); }
+
+	// 处置 / 新人治理计数单独剪枝，且【单独一条语句】：
+	// 它是懒建表，可能还没被建过（一次处置都没发生过），混进上面那个 batch
+	// 会让「no such table」把发言与成员的剪枝一起回滚。
+	// 留 180 天与 stat_speech / stat_member 同口径；剪掉的是计数行，不是事件明细
+	//（入群/退群/申请的 stat_member_events 按主人要求永久不剪）。
+	try {
+		if (!(await ensureStatActionsTable(env))) return;
+		await env.DB.prepare('DELETE FROM stat_actions WHERE day < ?').bind(cutoff).run();
+	} catch (error) { console.error('[群统计] 处置计数剪枝失败:', error); }
 }
 
 // ===== /stats 命令层 =====
@@ -16795,16 +16945,57 @@ function buildStatsPanelKeyboard(chatId) {
 // 渲染一页统计（汇总 + 发言排行 + 翻页键盘）。命令首发与按钮翻页共用，排版一致。
 // 【时间锚点只取一次】标题日期、汇总、排行必须落在同一天。原来三处各自取 Date.now()，
 // 查询恰好跨过统计时区 0 点时，可能出现标题写 09-25、汇总或排行却按 09-24 算。
+// 数据页键盘：时间切换行 + 多页时的翻页行。
+// 【为什么时间切换走 statpg 而不是 statgo】statgo 是「面板保留、另发一条数据」，
+// 原消息上的选中态 · 永远不会跟着变；statpg 是【原地编辑那条数据消息】，
+// 切完立刻把新的 ·标到刚点的那个按钮上 —— 正是截图里「可点切换 + 当前态标记」的形态。
+// 回调端零新增：handleStatsPaginationCallback 本来就按 token 里的 range 重查，只换了个 range。
+function buildStatsDataKeyboard(chatId, range, page, totalPages) {
+	const mk = (label, r) => {
+		// 只有 range 与按钮值完全相等才标选中态；自定义日期区间没有对应按钮，就没有 ·
+		const text = (range === r ? '·' : '') + label;
+		const data = STAT_PAGINATION_PREFIX + '1:' + encodeAdCallbackToken(r + '|' + String(chatId));
+		return adCallbackDataFits(data) ? { text, callback_data: data } : null;
+	};
+	const rows = [];
+	const row1 = [mk('今日', 'day'), mk('昨天', 'yesterday'), mk('前天', 'd2'), mk('本周', 'week')];
+	const row2 = [mk('本月', 'month'), mk('近7天', '7d'), mk('近30天', '30d')];
+	// 任一格塞不下（群 ID 异常长）就丢整行，避免半残键盘。
+	if (row1.every(Boolean)) rows.push(row1);
+	if (row2.every(Boolean)) rows.push(row2);
+	const pager = buildAdPaginationKeyboard(STAT_PAGINATION_PREFIX, page, totalPages,
+		encodeAdCallbackToken(range + '|' + String(chatId)));
+	if (pager && pager.inline_keyboard && pager.inline_keyboard[0]) rows.push(pager.inline_keyboard[0]);
+	return rows.length ? { inline_keyboard: rows } : null;
+}
+
 async function renderStatPage(env, chatId, range, page, chatTitle, nowMs = Date.now()) {
 	const info = statRangeDays(env, range, nowMs);
-	const summary = await queryStatSummary(env, chatId, range, nowMs);
-	const ranking = await queryStatRanking(env, chatId, range, page, nowMs);
+	// 四项互不依赖，并发取：成员总数是实时 API，其余三项各一条 SQL。
+	const [summary, ranking, actions, memberCount] = await Promise.all([
+		queryStatSummary(env, chatId, range, nowMs),
+		queryStatRanking(env, chatId, range, page, nowMs),
+		queryStatActions(env, chatId, info.start, info.end),
+		fetchChatMemberCount(chatId)
+	]);
 	const scope = chatTitle ? escapeHtml(String(chatTitle)) : ('群 <code>' + escapeHtml(String(chatId)) + '</code>');
 	const dateLabel = info.start === info.end ? info.start : (info.start + ' ~ ' + info.end);
+	const net = summary.join - summary.leave;
+	const netText = (net > 0 ? '+' : '') + net;
 	const lines = [
-		'📊 <b>' + scope + '</b> · ' + info.label + '（' + dateLabel + ' 北京时间）',
-		'💬 总发言 <b>' + summary.totalMsg + '</b> 条　👥 活跃人数 <b>' + summary.activeUsers + '</b>',
-		'➕ 入群 <b>' + summary.join + '</b>　➖ 退群 <b>' + summary.leave + '</b>　🚫 被移出 <b>' + summary.kicked + '</b>',
+		'📊 <b>群统计</b> · ' + scope,
+		'📅 统计日期: <b>' + info.label + ' ' + dateLabel + '</b>　当前成员: <b>' + (memberCount == null ? '未知' : memberCount) + '</b>（北京时间）',
+		'',
+		'💡 本时段本群挡下 <b>' + actions.disposal + '</b> 次风险，其中新人处置 <b>' + actions.newcomer + '</b> 人。',
+		'',
+		'━━━ <b>活跃</b> ━━━',
+		'💬 消息 <b>' + summary.totalMsg + '</b>　👥 活跃人数 <b>' + summary.activeUsers + '</b>',
+		'━━━ <b>增长</b> ━━━',
+		'➕ 新增 <b>' + summary.join + '</b>　➖ 离开 <b>' + summary.leave + '</b>　📈 净增 <b>' + netText + '</b>',
+		'━━━ <b>风控</b> ━━━',
+		// 被移出这一格保留：它是 Telegram 侧的口径（含人工手动踢），与 disposal（bot 处置）
+		// 互补，去掉等于丢掉现有功能。方案表格的 8 指标里没有它，这里是按「不倒退」补上的第 9 项。
+		'🛡 处置 <b>' + actions.disposal + '</b>　👶 新人治理 <b>' + actions.newcomer + '</b>　🚫 被移出 <b>' + summary.kicked + '</b>',
 		''
 	];
 	if (!ranking.rows.length) {
@@ -16818,9 +17009,8 @@ async function renderStatPage(env, chatId, range, page, chatTitle, nowMs = Date.
 			lines.push(row.rank + '. ' + link + uname + ' — ' + row.count + ' 条');
 		}
 	}
-	const keyboard = ranking.totalPages > 1
-		? buildAdPaginationKeyboard(STAT_PAGINATION_PREFIX, page, ranking.totalPages, encodeAdCallbackToken(range + '|' + chatId))
-		: null;
+	const keyboard = buildStatsDataKeyboard(chatId, range, page, ranking.totalPages);
+	// 多块消息挂不上按钮（sendAdPagedMessage 的既有限制），退回文本提示。
 	const fallbackLine = ranking.totalPages > 1
 		? '翻页：<code>/stats ' + (range === 'day' ? '' : range + ' ') + '第 ' + Math.min(ranking.totalPages, page + 1) + ' 页需用按钮</code>'
 		: '';

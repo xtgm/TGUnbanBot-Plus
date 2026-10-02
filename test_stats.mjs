@@ -10,6 +10,7 @@ import { DatabaseSync } from 'node:sqlite';
 const src = fs.readFileSync('_worker.js', 'utf8');
 const sent = [];
 let currentAdmins = [];   // 当前群 Telegram 管理员 id 列表（供 getChatAdministrators mock）
+let memberCountMock = 4855;   // getChatMemberCount 返回值；置 null 模拟接口失败
 
 const sandbox = {
 	console, URL, URLSearchParams, TextEncoder, TextDecoder, Response, Request, Headers,
@@ -28,6 +29,9 @@ const sandbox = {
 			payload = { ok: true, result: { id: b?.chat_id, title: '统计测试群', type: 'supergroup' } };
 		} else if (m === 'getChatMember') {
 			payload = { ok: true, result: { status: 'member', user: { id: b?.user_id } } };
+		} else if (m === 'getChatMemberCount') {
+			// 面板报头的「当前成员」。默认 4855（与方案截图同值），可由 memberCountMock 覆盖以测失败态。
+			payload = { ok: true, result: memberCountMock };
 		} else if (m === 'getMe') {
 			payload = { ok: true, result: { id: 42, username: 'testbot', is_bot: true } };
 		}
@@ -172,7 +176,7 @@ const panelBtns = (panelMsg?.markup?.inline_keyboard || [])[0] || [];
 check('群内用法带三个内联按钮(今日/本周/本月，回调 statgo:)', panelBtns.length === 3 && panelBtns.every((b) => String(b.callback_data || '').startsWith('statgo:')));
 sent.length = 0;
 await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: 777, is_bot: false }, text: '/stats today', message_id: 108 }, env, { waitUntil() {} });
-check('群管理员 /stats today 发今日结果到本群', sent.some((x) => x.chatId === '-100111' && x.text.includes('总发言')));
+check('群管理员 /stats today 发今日结果到本群', sent.some((x) => x.chatId === '-100111' && x.text.includes('消息 <b>')));
 sent.length = 0; currentAdmins = [];
 await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: Number(OWNER), is_bot: false }, text: '/stats week', message_id: 103 }, env, { waitUntil() {} });
 check('主人不受管理员身份限制、随时可查', sent.some((x) => x.chatId === '-100111' && x.text.includes('本周')));
@@ -184,7 +188,7 @@ console.log('\n=== 8b. 用法面板按钮：点一下新发数据（不改面板
 const goToday = 'statgo:' + W.encodeAdCallbackToken('day|-100111');
 sent.length = 0; currentAdmins = ['777'];
 await W.handleStatsGoCallback({ id: 'cb1', data: goToday, from: { id: 777 }, message: { chat: { id: '-100111' }, message_id: 102 } }, env);
-check('管理员点面板[今日] → 新发今日数据到本群', sent.some((x) => x.chatId === '-100111' && x.text.includes('总发言')));
+check('管理员点面板[今日] → 新发今日数据到本群', sent.some((x) => x.chatId === '-100111' && x.text.includes('消息 <b>')));
 sent.length = 0; currentAdmins = [];
 await W.handleStatsGoCallback({ id: 'cb2', data: 'statgo:' + W.encodeAdCallbackToken('week|-100111'), from: { id: Number(OWNER) }, message: { chat: { id: '-100111' }, message_id: 102 } }, env);
 check('主人点面板[本周] → 新发本周数据', sent.some((x) => x.chatId === '-100111' && x.text.includes('本周')));
@@ -196,9 +200,9 @@ console.log('\n=== 9. /stats 输出内容 ===');
 sent.length = 0; currentAdmins = [];
 await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: Number(OWNER), is_bot: false }, text: '/stats today', message_id: 105 }, env, { waitUntil() {} });
 const out = sent.find((x) => x.chatId === '-100111');
-check('输出含总发言', !!out && out.text.includes('总发言'));
+check('输出含总发言', !!out && out.text.includes('消息 <b>'));
 check('输出含活跃人数', !!out && out.text.includes('活跃人数'));
-check('输出含入群/退群/被移出', !!out && out.text.includes('入群') && out.text.includes('退群') && out.text.includes('被移出'));
+check('输出含入群/退群/被移出', !!out && out.text.includes('新增') && out.text.includes('离开') && out.text.includes('被移出'));
 check('输出含发言排行', !!out && out.text.includes('发言排行'));
 check('排行昵称可点击(tg://user)', !!out && out.text.includes('tg://user?id='));
 
@@ -306,7 +310,7 @@ W.__clock = () => (clockCalls++ === 0 ? at('2026-09-24T23:59:59.999') : at('2026
 const rendered = await W.renderStatPage(env, GH, 'day', 1, '边界群');
 W.__clock = null;
 check('跨 0 点渲染：标题是 09-24', rendered.text.includes('2026-09-24'), rendered.text.split('\n')[0]);
-check('跨 0 点渲染：汇总与标题同一天（总发言 2，不是 0）', rendered.text.includes('总发言 <b>2</b>'));
+check('跨 0 点渲染：汇总与标题同一天（总发言 2，不是 0）', rendered.text.includes('消息 <b>2</b>'));
 check('跨 0 点渲染：发言排行与标题同一天（有排行、不是暂无记录）', rendered.text.includes('发言排行') && !rendered.text.includes('暂无发言记录'));
 
 console.log('\n=== 13. 入群/退群/申请 事件明细（第2批）===');
@@ -455,6 +459,100 @@ console.log('\n=== 14. 自定义时间（第2批）：任何区间的汇总 == �
 	check('「上周」不被误判成「本周」', lw.label === '上周' && lw.label !== thisWeek.label, lw.label + ' vs ' + thisWeek.label);
 	const lm = W.statRangeDays(env, W.parseStatsRange('上月'), T);
 	check('「上月」不被误判成「本月」', lm.label === '上月' && lm.label !== W.statRangeDays(env, W.parseStatsRange('month'), T).label, lm.label);
+}
+
+console.log('\n=== 15. 风控处置 / 新人治理 / 完整统计面板 ===');
+{
+	// —— 计数写入与查询 ——
+	await W.recordStatAction(env, '-100111', 'disposal', T);
+	await W.recordStatAction(env, '-100111', 'disposal', T);
+	await W.recordStatAction(env, '-100111', 'newcomer', T);
+	let a = await W.queryStatActions(env, '-100111', '2026-09-24', '2026-09-24');
+	check('本群处置 2 次、新人治理 1 次', a.disposal === 2 && a.newcomer === 1, JSON.stringify(a));
+
+	a = await W.queryStatActions(env, '-100222', '2026-09-24', '2026-09-24');
+	check('另一配置群为 0（群隔离）', a.disposal === 0 && a.newcomer === 0, JSON.stringify(a));
+
+	// 8 小时时区换算：blacklist.at 是 UTC ISO 字符串，直接按天切会把
+	// UTC 20:00 算成 09-24，而北京已是次日 04:00。当场记由 statDayString 切天，必须落到 09-25。
+	await W.recordStatAction(env, '-100111', 'disposal', Date.parse('2026-09-24T20:00:00Z'));
+	a = await W.queryStatActions(env, '-100111', '2026-09-25', '2026-09-25');
+	check('跨 UTC 日界 → 记到北京次日 09-25', a.disposal === 1, JSON.stringify(a));
+
+	a = await W.queryStatActions(env, '-100111', '2026-09-24', '2026-09-25');
+	check('两日区间合计 3 次处置', a.disposal === 3, JSON.stringify(a));
+
+	await W.recordStatAction(env, '-100111', 'bogus', T);
+	a = await W.queryStatActions(env, '-100111', '2026-09-24', '2026-09-24');
+	check('非法 kind 不计（白名单拦截）', a.disposal === 2, JSON.stringify(a));
+
+	// —— 按封禁结果记：成功才计、失败与无群不计 ——
+	// recordDisposalsFromBanResults 不带时间参数（处置就发生在「现在」），
+	// 不接管时钟就会写进真实今天、与本节的固定基准日 09-24 对不上。
+	W.__clock = () => T;
+	await W.recordDisposalsFromBanResults(env, [
+		{ groupId: '-100111', ok: true },
+		{ groupId: '-100222', ok: false },
+		{ groupId: '-100111', ok: true },
+		{ ok: true }                    // 无 groupId 的脏数据不计、不崩
+	]);
+	W.__clock = null;
+	a = await W.queryStatActions(env, '-100111', '2026-09-24', '2026-09-24');
+	check('封成功 2 次逐群 +1，失败与无群不计', a.disposal === 4, JSON.stringify(a));
+	a = await W.queryStatActions(env, '-100222', '2026-09-24', '2026-09-24');
+	check('封禁失败的群不计数', a.disposal === 0, JSON.stringify(a));
+
+	// —— 面板输出（第2批·3A 重构后）——
+	const rp = await W.renderStatPage(env, '-100111', 'day', 1, '统计测试群', T);
+	const head = rp.text.split('\n')[1];
+	check('报头含统计日期与区间标签', rp.text.includes('统计日期') && head.includes('今日'), head);
+	check('报头含当前成员 4855', head.includes('当前成员: <b>4855</b>'), head);
+	check('结论行含「挡下」与本群处置数 4', rp.text.includes('挡下 <b>4</b>'), rp.text.split('\n')[3]);
+	check('三维度齐全（活跃 / 增长 / 风控）', ['活跃', '增长', '风控'].every((k) => rp.text.includes(k)));
+	check('增长含新增 / 离开 / 净增', ['新增', '离开', '净增'].every((k) => rp.text.includes(k)));
+	check('风控含处置 / 新人治理 / 被移出', ['处置 <b>', '新人治理', '被移出'].every((k) => rp.text.includes(k)));
+	check('活跃含消息与活跃人数', ['消息 <b>', '活跃人数'].every((k) => rp.text.includes(k)));
+
+	// 取不到成员数 → 显示「未知」，绝不编一个数字
+	memberCountMock = null;
+	const rpNull = await W.renderStatPage(env, '-100111', 'day', 1, '统计测试群', T);
+	check('成员数取不到 → 显示「未知」不编数字', rpNull.text.includes('当前成员: <b>未知</b>'), rpNull.text.split('\n')[1]);
+	memberCountMock = 4855;
+
+	// —— 键盘：时间切换原地编辑 + 选中态 ——
+	const kb = rp.keyboard;
+	check('数据页带键盘（时间切换行）', !!kb && kb.inline_keyboard.length >= 1, JSON.stringify(kb));
+	check('首行 = 今日 / 昨天 / 前天 / 本周',
+		!!kb && kb.inline_keyboard[0].map((x) => x.text.replace('·', '')).join('/') === '今日/昨天/前天/本周',
+		kb && kb.inline_keyboard[0].map((x) => x.text).join(','));
+	check('range=day → 标选中态「·今日」', !!kb && kb.inline_keyboard[0][0].text === '·今日', kb && kb.inline_keyboard[0][0].text);
+	check('切换时间走 statpg:1:（原地编辑，选中态才跟着变）',
+		!!kb && kb.inline_keyboard[0][1].callback_data.startsWith('statpg:1:'),
+		kb && kb.inline_keyboard[0][1].callback_data.slice(0, 12));
+	check('单页 → 只有两行时间按钮、无翻页行', !!kb && kb.inline_keyboard.length === 2, kb && String(kb.inline_keyboard.length));
+	check('第二行 = 本月 / 近7天 / 近30天',
+		!!kb && kb.inline_keyboard[1].map((x) => x.text.replace('·', '')).join('/') === '本月/近7天/近30天',
+		kb && kb.inline_keyboard[1] && kb.inline_keyboard[1].map((x) => x.text).join(','));
+
+	const rpY = await W.renderStatPage(env, '-100111', 'yesterday', 1, '统计测试群', T);
+	check('切到昨天 → 选中态移到「·昨天」', !!rpY.keyboard && rpY.keyboard.inline_keyboard[0][1].text === '·昨天',
+		rpY.keyboard && rpY.keyboard.inline_keyboard[0].map((x) => x.text).join(','));
+
+	// 自定义日期区间没有对应按钮 → 一个 · 都不该有（不能把「今日」标成选中）
+	const rpC = await W.renderStatPage(env, '-100111', '2026-09-20..2026-09-24', 1, '统计测试群', T);
+	check('自定义区间 → 无按钮被标选中', !!rpC.keyboard && rpC.keyboard.inline_keyboard[0].every((x) => !x.text.includes('·')),
+		rpC.keyboard && rpC.keyboard.inline_keyboard[0].map((x) => x.text).join(','));
+
+	// —— 剪枝：处置计数与 stat_speech / stat_member 同口径留 180 天 ——
+	// cutoff = 2026-09-24 - 180 天 = 2026-03-28，写一条 1 月的应当被删、9 月的留着。
+	await W.recordStatAction(env, '-100111', 'disposal', Date.parse('2026-01-01T04:00:00Z'));
+	await W.pruneStatData(env, T);
+	a = await W.queryStatActions(env, '-100111', '2026-01-01', '2026-01-01');
+	check('剪枝删掉超期（>180 天）的处置计数', a.disposal === 0, JSON.stringify(a));
+	a = await W.queryStatActions(env, '-100111', '2026-09-24', '2026-09-24');
+	check('剪枝不影响保留期内的计数', a.disposal === 4, JSON.stringify(a));
+	check('剪枝后表仍在（不是整表删掉）',
+		env.DB.query("SELECT name FROM sqlite_master WHERE type='table' AND name='stat_actions'").length === 1);
 }
 
 console.log('\n群统计验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
