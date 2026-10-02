@@ -7746,19 +7746,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 	}
 
-	// 群统计·发言计数（主人要求：真人所有非服务消息计一次发言，含命令、含管理员/主人；
-	// bot、服务消息、频道自动转发、新成员进群消息一律不计）。位置在黑名单兜底之后
-	// （被拦截的已 return，不计入），命令分发之前。后台写不阻塞热路径；统计表未就绪时内部静默跳过。
-	if (
-		isConfiguredGroup(chatId) &&
-		message.from &&
-		!message.from.is_bot &&
-		!isTelegramServiceMessage(message) &&
-		!(Array.isArray(message.new_chat_members) && message.new_chat_members.length)
-	) {
-		if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(recordSpeechStat(env, chatId, message.from, Date.now()));
-		else await recordSpeechStat(env, chatId, message.from, Date.now());
-	}
+	// ===== 群统计·发言计数的调用点（方案 A：挪到广告检测之后）=====
+	// 原来这段写在 detectAdOnMessage【之前】，于是被封的广告照旧计进「本群发言」，
+	// 群越被刷、统计越好看 —— 数字反过来奖励了广告。
+	// 现在条件判断收敛进 tryRecordSpeechStat，调用点后移到广告检测之后：
+	//   · 被封的（adVerdict === true）与重发已处置广告（上面已 return）一律不计；
+	//   · 命令消息走的是早于 detectAdOnMessage 的那几个 return，必须逐个补调，否则命令漏计。
 
 	// 广告检测 v2 三个钩子。位置固定在黑名单兜底之后、所有命令分发之前：
 	//   1) 命令层：11 条主人私聊命令，命中即 return，避免落进后面的通用命令分发。
@@ -7777,11 +7770,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			if (!recentIsInGroup) {
 				await sendTelegramMessage(message.chat.id, '❌ <b>权限不足</b>\n\n学习候选命令仅限第一主人使用。');
 			}
+			// 方案 A 补调：/recent 是命令消息，这条 return 早于主写入点，不补就漏计。
+			await tryRecordSpeechStat(message, env, chatId, ctx);
 			return;
 		}
 		if (recentIsInGroup) await deleteAuthorizedGroupCommandMessage(message, '/recent');
 		if (!env.DB) {
 			await sendTelegramMessage(getMessageActorId(message), '❌ 未绑定 D1 存储空间，学习候选不可用。');
+			await tryRecordSpeechStat(message, env, chatId, ctx);   // 方案 A 补调：命令不漏计
 			return;
 		}
 		try {
@@ -7790,14 +7786,19 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			console.error('[学习候选] /recent 执行异常:', error);
 			await sendTelegramMessage(getMessageActorId(message), '❌ 命令执行异常：' + escapeHtml(toChineseErrorText(String(error?.message || error))));
 		}
+		await tryRecordSpeechStat(message, env, chatId, ctx);   // 方案 A 补调：命令不漏计
 		return;
 	}
 
 	if (await handleAdDetectionCommands(message, env, ctx)) {
+		// 方案 A 补调：11 条广告管理命令（/pending /adstats /rescreen …）走这条 return，
+		// 全是真人发的命令消息，不补就整类命令从统计里消失。
+		await tryRecordSpeechStat(message, env, chatId, ctx);
 		return;
 	}
 
 	if (await handleAdReplyLearning(message, env, ctx)) {
+		await tryRecordSpeechStat(message, env, chatId, ctx);   // 方案 A 补调：回复学习也是命令
 		return;
 	}
 
@@ -7838,6 +7839,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 	const adObserved = adVerdict === 'observe';
+	// 方案 A 主写入点：走到这里已经确认【这条不是被封的广告】。被封的在上面 return 了，
+	// 重发已处置广告更早，两者都不计 —— 统计从此不给广告抬轿。
+	await tryRecordSpeechStat(message, env, chatId, ctx);
 
 	// /add_ad_admin、/del_ad_admin：第一主人管理 /ad 发起白名单。
 	if (text && /^\/(add_ad_admin|del_ad_admin)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
@@ -16686,6 +16690,19 @@ async function ensureStatTables(env) {
 async function statReady(env) {
 	if (!env?.DB) return false;
 	try { return await ensureStatTables(env); } catch (error) { console.error('[群统计] 就绪检查失败:', error); return false; }
+}
+
+// 计一次发言的完整判断（主人口径：真人所有非服务消息计一次，含命令、含管理员/主人；
+// bot、服务消息、频道自动转发、新成员进群消息一律不计）。条件收敛在这里，
+// 让「广告检测之前」的几个早退分支和「之后」的主路径共用同一套判据，绝不各写一份走样。
+// 后台写不阻塞热路径；统计表未就绪时 recordSpeechStat 内部静默跳过。
+async function tryRecordSpeechStat(message, env, chatId, ctx) {
+	if (!isConfiguredGroup(chatId)) return;
+	if (!message?.from || message.from.is_bot) return;
+	if (isTelegramServiceMessage(message)) return;
+	if (Array.isArray(message.new_chat_members) && message.new_chat_members.length) return;
+	if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(recordSpeechStat(env, chatId, message.from, Date.now()));
+	else await recordSpeechStat(env, chatId, message.from, Date.now());
 }
 
 // 记一次发言（+1）。真人非服务消息由 handleMessage 钩子调用；用 ctx.waitUntil 后台写，不阻塞热路径。

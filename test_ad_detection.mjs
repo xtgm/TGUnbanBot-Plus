@@ -3625,6 +3625,59 @@ section('[19] 方案 E · 短语自我泛化（共现提炼成指纹 + 三重闸
 }
 
 console.log('');
+// ===== [20] 方案 A · 发言统计剔除广告（写入挪到 detectAdOnMessage 之后）=====
+section('[20] 方案 A · 广告不计入发言统计、命令与观察照常计入');
+{
+	const cleanProfile = {
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: '路人', bio: '' } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } })
+	};
+	const speechCount = (env) => Number(env.DB.query('SELECT COUNT(*) AS c FROM stat_speech')[0]?.c) || 0;
+	// stat_speech 是懒建表：不先建好，「广告不计」的 0 条会与「表根本不存在」混淆成假通过。
+	const setup = async (env) => { await W.statReady(env); await flushWaits(); };
+
+	// ① 被封的广告 → 不计（方案 A 的核心：统计不给广告抬轿）
+	const envB = makeEnv();
+	await setup(envB);
+	resetCalls();
+	setApi(cleanProfile);
+	await sendUpdate({ message: groupMessage({ id: 60070, first_name: '路人' }, '长期收购网赚账号 USDT 秒结') }, envB);
+	await flushWaits();
+	assert('方案 A：被封的广告不计入发言统计', speechCount(envB) === 0, 'stat_speech=' + speechCount(envB));
+	assert('  ↑ 前置条件：这条确实被封了（否则 0 条没有意义）',
+		countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+
+	// ② 正常消息 → 照常计入（对照，证明不是「统计整个坏了」）
+	const envN = makeEnv();
+	await setup(envN);
+	resetCalls();
+	setApi(cleanProfile);
+	await sendUpdate({ message: groupMessage({ id: 60071, first_name: '路人' }, '今天天气不错，一起吃饭吗') }, envN);
+	await flushWaits();
+	assert('方案 A：正常消息照常计入（对照）', speechCount(envN) === 1, 'stat_speech=' + speechCount(envN));
+
+	// ③ 早于 detectAdOnMessage 的命令 return → 必须补计。
+	// /recent 对非第一主人是【静默 return】（连回执都没有），正好验证补调点而不会被回执干扰。
+	const envC = makeEnv();
+	await setup(envC);
+	resetCalls();
+	setApi(cleanProfile);
+	await sendUpdate({ message: groupMessage({ id: 60072, first_name: '路人' }, '/recent') }, envC);
+	await flushWaits();
+	assert('方案 A：/recent 这类早退命令仍计入（不因挪位置而漏计）',
+		speechCount(envC) === 1, 'stat_speech=' + speechCount(envC));
+
+	// ④ 转入观察 → 计入（没被封就还是真人发言，只剔广告不误伤）
+	const envO = makeEnv({ AD_CARD_KILL: 'observe' });
+	await setup(envO);
+	resetCalls();
+	setApi(cleanProfile);
+	await sendUpdate({ message: groupMessage({ id: 60073, first_name: '路人' }, '出货 批发 走量 USDT 有需要的来') }, envO);
+	await flushWaits();
+	assert('方案 A：转入观察的那条仍计入（observe 不等于封禁）',
+		speechCount(envO) === 1, 'stat_speech=' + speechCount(envO));
+}
+
 console.log('='.repeat(60));
 console.log(`广告检测测试汇总：通过 ${pass} 条，失败 ${fail} 条`);
 if (failures.length) {
