@@ -121,22 +121,28 @@ console.log('\n=== 1. /rm 权限 ===');
 
 	reset();
 	await rm(4444, '/rm', { reply_to_message: { message_id: 556, from: { id: 99998, is_bot: false } } });
-	check('群主（非第一主人）/rm → 删除目标', deleted.includes(GROUP + ':556'), deleted.join(' '));
+	// 主人 2026-10-02 把 /rm 收紧为【仅第一主人】—— 群主 / 普通管理员 / 副主人 / 超管一律不放行。
+	// （早先版本允许「第一主人 或 该群群主」，那段鉴权已从代码里删除。）
+	check('群主（非第一主人）/rm → 也删不了（已收紧为仅第一主人）', !deleted.some((x) => x.endsWith(':556')), deleted.join(' '));
+	check('群主 /rm → 提示仅限第一主人', sent.some((s) => s.text.includes('仅限第一主人')), JSON.stringify(sent));
 
 	reset();
 	await rm(8888, '/rm', { reply_to_message: { message_id: 557, from: { id: 99997, is_bot: false } } });
-	check('普通管理员 /rm → 不删（不是群主）', !deleted.some((x) => x.endsWith(':557')), deleted.join(' '));
-	check('普通管理员 /rm → 提示无权限', sent.some((s) => s.text.includes('仅限第一主人或该群群主')), JSON.stringify(sent));
+	check('普通管理员 /rm → 不删', !deleted.some((x) => x.endsWith(':557')), deleted.join(' '));
+	check('普通管理员 /rm → 提示仅限第一主人', sent.some((s) => s.text.includes('仅限第一主人')), JSON.stringify(sent));
 
 	reset();
 	await rm(STRANGER, '/rm', { reply_to_message: { message_id: 558, from: { id: 99996, is_bot: false } } });
 	check('陌生人 /rm → 不删', !deleted.some((x) => x.endsWith(':558')), deleted.join(' '));
-	check('陌生人 /rm → 提示无权限', sent.some((s) => s.text.includes('仅限第一主人或该群群主')));
+	check('陌生人 /rm → 提示仅限第一主人', sent.some((s) => s.text.includes('仅限第一主人')));
 
-	// 副主人 / 超管不是群主 → 同样不许（主人只要求第一主人与群主）
+	// 副主人 / 超管：同为非第一主人，一律不许
 	reset();
 	await rm(DEPUTY, '/rm', { reply_to_message: { message_id: 559, from: { id: 99995, is_bot: false } } });
-	check('副主人（非群主）/rm → 不删', !deleted.some((x) => x.endsWith(':559')), deleted.join(' '));
+	check('副主人 /rm → 不删（仅第一主人）', !deleted.some((x) => x.endsWith(':559')), deleted.join(' '));
+	reset();
+	await rm(SUPER, '/rm', { reply_to_message: { message_id: 560, from: { id: 99994, is_bot: false } } });
+	check('超级管理员 /rm → 不删（仅第一主人）', !deleted.some((x) => x.endsWith(':560')), deleted.join(' '));
 }
 
 console.log('\n=== 2. /rm 参数与场景 ===');
@@ -182,6 +188,20 @@ console.log('\n=== 3. /profile 用法与权限 ===');
 	reset();
 	await drive({ message: { chat: { id: Number(STRANGER), type: 'private' }, from: { id: Number(STRANGER), is_bot: false }, text: '/profile 12345', message_id: 202 } });
 	check('非授权者私聊 /profile → 不出资料卡', !sent.some((s) => s.text.includes('资料卡')), JSON.stringify(sent.map((s) => s.text.slice(0, 50))));
+
+	// /profile 已收紧为【仅第一主人】（原先同 /check，群内管理员也可查）——
+	// 副主人、超级管理员、群管理员一律不出资料卡。
+	for (const [who, id, tag] of [['副主人', DEPUTY, 310], ['超级管理员', SUPER, 311]]) {
+		reset();
+		await drive({ message: { chat: { id: Number(id), type: 'private' }, from: { id: Number(id), is_bot: false }, text: '/profile 12345', message_id: tag } });
+		check(who + ' 私聊 /profile → 不出资料卡（仅第一主人）',
+			!sent.some((s) => s.text.includes('资料卡')), JSON.stringify(sent.map((s) => s.text.slice(0, 40))));
+	}
+	// 群管理员在群里发：连闪屏回执都不出（函数开头就 return，不撤命令、不发消息）
+	reset();
+	await drive({ message: { chat: { id: Number(GROUP), type: 'supergroup' }, from: { id: 8888, is_bot: false }, text: '/profile 12345', message_id: 312 } });
+	check('群管理员群内 /profile → 不出资料卡、无任何回执',
+		sent.length === 0 && deleted.length === 0, JSON.stringify(sent.map((s) => s.text.slice(0, 40))));
 }
 
 console.log('\n=== 4. /profile 输出 ===');

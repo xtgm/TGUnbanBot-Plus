@@ -4415,7 +4415,12 @@ console.log('\n[23] 一键代发链路已移除');
 	assert('Webhook 初始化 → 成功', initResult.status === 200 && !!webhookCall);
 	assert('Webhook 初始化 → 订阅 message/chat_member/callback_query', JSON.stringify(webhookCall?.body?.allowed_updates) === JSON.stringify(['message', 'chat_member', 'callback_query']));
 	assert('Webhook 初始化 → /ad 投票按钮回调已启用', webhookCall?.body?.allowed_updates?.includes('callback_query'));
-	assert('BotFather 菜单统一注册 ban/spam', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'spam', 'check', 'stats', 'blacklist', 'notice']));
+	assert('BotFather 菜单统一注册（含 /rm /profile）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice']));
+	// rm / profile 允许写说明，且必须标注权限「仅第一主人」；notice 只有占位符「·」（Telegram 不允许空说明）
+	assert('rm / profile 菜单说明标注「仅第一主人」', ['rm', 'profile'].every((c) => {
+		const entry = (commandCall?.body?.commands || []).find((x) => x.command === c);
+		return Boolean(entry) && String(entry.description || '').includes('仅第一主人');
+	}));
 	// /notice 只在菜单显示指令、不带说明（Telegram 不允许空说明，用占位符「·」）
 	const noticeMenu = (commandCall?.body?.commands || []).find((c) => c.command === 'notice');
 	assert('/notice 菜单项无实质说明（占位符 ·）', !!noticeMenu && noticeMenu.description === '·');

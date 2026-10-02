@@ -629,7 +629,9 @@ async function handleInitialization(request) {
 				{ command: "unban", description: "开始自助解封" },
 				{ command: "ban", description: "添加用户到全局黑名单 (当前群管理员)" },
 				{ command: "spam", description: "举报并加入全局黑名单 (当前群管理员)" },
+				{ command: "rm", description: "删除我回复的那条消息 (仅第一主人)" },
 				{ command: "check", description: "查询封禁状态 (高级管理员)" },
+				{ command: "profile", description: "查看账号资料卡与时间线 (仅第一主人)" },
 				{ command: "stats", description: "本群发言/进退群统计 (群管理员)" },
 				{ command: "blacklist", description: "查看当前黑名单 (高级管理员)" },
 				// /notice：主人要求「只在菜单显示指令、不写说明」。Telegram 的 setMyCommands
@@ -2068,33 +2070,6 @@ async function checkIfUserIsAdminInGroup(userId, groupId) {
 		return false;
 	} catch (error) {
 		console.error(`[当前群鉴权] 群 ${groupIdStr} 查询异常:`, error);
-		return false;
-	}
-}
-
-// /rm 专用鉴权：只认【该群群主 creator】，普通管理员不算。
-// 主人明确要求「仅第一主人以及 telegram 群主」—— 删除消息不可逆，比 /stats 那种
-// 「管理员即可」更严；且与 checkIfUserIsAdminInGroup 分开，避免后者被别的调用点牵连放宽。
-async function checkIfUserIsGroupOwner(userId, groupId) {
-	const userIdStr = String(userId || '');
-	const groupIdStr = String(groupId || '');
-	if (!userIdStr || !isConfiguredGroup(groupIdStr)) return false;
-	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ chat_id: groupIdStr }),
-		});
-		const result = await response.json();
-		if (!response.ok || !result.ok || !Array.isArray(result.result)) {
-			console.log(`[/rm] 群 ${groupIdStr} 管理员列表查询失败: ${result.description || `HTTP ${response.status}`}`);
-			return false;
-		}
-		// 只认 creator：Telegram 把群主标记为 status === 'creator'。
-		const hit = result.result.find((m) => m?.user && String(m.user.id) === userIdStr && m.status === 'creator');
-		return Boolean(hit);
-	} catch (error) {
-		console.error(`[/rm] 群 ${groupIdStr} 查询异常:`, error);
 		return false;
 	}
 }
@@ -9384,11 +9359,11 @@ async function handleRmCommand(message, env, ctx) {
 		return;
 	}
 
-	// 权限：第一主人直接放行；否则必须是该群群主（status === 'creator'，普通管理员不算）
-	let allowed = isPrimaryOwner(userId);
-	if (!allowed) allowed = await checkIfUserIsGroupOwner(userId, String(chatId));
-	if (!allowed) {
-		await sendFlashMessage(chatId, '❌ /rm 仅限第一主人或该群群主使用', ctx);
+	// 权限：仅第一主人（主人 2026-10-02 定：这两条新指令只允许第一主人用）。
+	// 曾经允许「第一主人 或 该群群主」，现已收紧 —— 二次确认权限的逻辑全部删掉，
+	// 群主与普通管理员一律不放行。
+	if (!isPrimaryOwner(userId)) {
+		await sendFlashMessage(chatId, '❌ /rm 仅限第一主人使用', ctx);
 		return;
 	}
 
@@ -9539,11 +9514,11 @@ async function handleProfileCommand(message, env, ctx) {
 	const chatId = chat?.id;
 	const userId = getMessageActorId(message);
 
-	// 权限与 /check 完全一致：群内管理员 / 主人 / 副主人 / 超管（私聊限主人与超管）。
-	const allowed = await checkMessageOperatorCanModerate(message, userId);
-	if (!allowed) {
+	// 权限：仅第一主人（主人 2026-10-02 定）。原先同 /check（群内管理员也可查），现收紧。
+	// 注意这会让 /profile 与 /check 权限不一致：群管理员仍能用 /check 查同一个人。
+	if (!isPrimaryOwner(userId)) {
 		if (chat?.type === 'private') {
-			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/profile 与 /check 同权限。');
+			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/profile 仅限第一主人使用。');
 		}
 		return;
 	}
