@@ -8480,6 +8480,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
+	// ===== /health 运行检查（仅第一主人；两层自检 + 三权限）=====
+	// 不注册进 setMyCommands：它是隐藏命令，入口走群设置菜单页（第 6 步）与 README。
+	if (isHealthCommand(text)) {
+		await handleHealthCommand(message, env);
+		return;
+	}
+
 	// ===== /notice 全体通知（仅第一主人私聊；群内静默）=====
 	if (isNoticeCommand(text)) {
 		await handleNoticeCommand(message, env, ctx);
@@ -9454,6 +9461,88 @@ async function handleRmCommand(message, env, ctx) {
 // ===== /profile 资料卡（第1批 · 2026-10-01）=====
 function isProfileCommand(text) {
 	return /^\/profile(?:@[^\s]+)?(?:\s|$)/i.test(String(text || '').trim());
+}
+
+function isHealthCommand(text) {
+	return /^\/health(?:@[^\s]+)?(?:\s|$)/i.test(String(text || '').trim());
+}
+
+// ===== /health 运行检查报告渲染 =====
+// 每群一行：绿=全好，黄=能用但有缺口，红=有功能会坏。汇总只数「红」与「黄」两档。
+function renderHealthReport(report) {
+	const lines = ['🏥 <b>运行检查</b>', '', '━━━ <b>状态自检</b> ━━━'];
+	for (const item of report.layer1 || []) {
+		lines.push((item.ok === true ? '✅ ' : item.ok === null ? '⚠️ ' : '❌ ') + item.text);
+	}
+
+	const groups = report.layer2 || [];
+	lines.push('', '━━━ <b>逐群体检</b>（' + report.total + ' 个配置群）━━━');
+	if (!groups.length) {
+		lines.push('（未配置群，或 bot 身份未取到，跳过第二层）');
+	}
+	let bad = 0, warn = 0;
+	for (const g of groups) {
+		// 拿不到群名（getChat 失败，多半是 bot 不在群）就不编一个「未命名」出来 ——
+		// 那读起来像「群存在但没设名字」。空着，只留群 ID，靠 ID 对回配置。
+		const name = g.title ? escapeHtml(g.title) + '　' : '';
+		const id = '<code>' + escapeHtml(g.groupId) + '</code>';
+		// bot 够不着这个群（getChat 或拉管理员列表失败）—— 一律红。
+		// checkGroupHealth 里 present=false 必然伴随 error，所以合并成一个分支，不留只走一半的重复判断。
+		if (!g.present) {
+			bad += 1;
+			lines.push('❌ ' + name + id + '　'
+				+ (g.error ? escapeHtml(toChineseErrorText(g.error)) : 'bot 不在群内'));
+			continue;
+		}
+		if (!g.isAdmin) { warn += 1; lines.push('⚠️ ' + name + id + '　在群但<b>不是管理员</b>（检测与处置都不生效）'); continue; }
+		// 三权限：删 / 禁 / 邀。缺删或缺禁 = 有功能会坏（红）；只缺邀请 = 非致命（黄）。
+		const del = g.canDelete ? '✓' : '✗';
+		const rstr = g.canRestrict ? '✓' : '✗';
+		const inv = g.canInvite ? '✓' : '✗';
+		const flags = '删' + del + ' 禁' + rstr + ' 邀' + inv;
+		if (!g.canDelete || !g.canRestrict) {
+			bad += 1;
+			const missing = [!g.canDelete ? '删除消息' : '', !g.canRestrict ? '封禁成员' : ''].filter(Boolean).join('、');
+			lines.push('❌ ' + name + id + '　管理员　缺 <b>' + missing + '</b> 权限（' + flags + '）');
+		} else if (!g.canInvite) {
+			warn += 1;
+			lines.push('⚠️ ' + name + id + '　管理员　缺邀请链接权限（' + flags + '）');
+		} else {
+			lines.push('✅ ' + name + id + '　管理员（' + flags + '）');
+		}
+	}
+
+	lines.push('', '━━━ <b>汇总</b> ━━━');
+	if (!groups.length) lines.push('仅完成状态自检。');
+	else if (!bad && !warn) lines.push('✅ 全部 ' + groups.length + ' 个群正常（三权限齐全）');
+	else {
+		const parts = [];
+		if (bad) parts.push('❌ <b>' + bad + '</b> 个群有功能会坏');
+		if (warn) parts.push('⚠️ <b>' + warn + '</b> 个群有权限缺口');
+		lines.push(parts.join('　') + '（共 ' + groups.length + ' 个群）');
+	}
+	return lines.join('\n');
+}
+
+// /health 运行检查：仅第一主人（要跨全部配置群拉管理员列表，是主人的自助工具）。
+// 群内不撤回命令、不发闪屏，与 /profile 一致；非第一主人群内完全静默、私聊提示权限不足。
+async function handleHealthCommand(message, env) {
+	const userId = getMessageActorId(message);
+	const isInGroup = message.chat?.type !== 'private';
+	if (!isPrimaryOwner(userId)) {
+		if (isInGroup) return true;   // 群内不暴露这条隐藏命令的存在
+		await sendTelegramMessage(String(message.chat?.id || ''), '❌ <b>权限不足</b>\n\n/health 运行检查仅限第一主人使用。');
+		return true;
+	}
+	const chatId = String(message.chat?.id || '');
+	try {
+		const report = await runHealthCheck(env);
+		await sendTelegramMessageChunks(chatId, renderHealthReport(report));
+	} catch (error) {
+		console.error('[运行检查] 执行失败:', error);
+		await sendTelegramMessage(chatId, '❌ 运行检查失败：' + escapeHtml(toChineseErrorText(error.message || '未知错误')));
+	}
+	return true;
 }
 
 // 时间格式化：unix 秒 / 毫秒 / ISO 字符串 → 北京时间「YYYY-MM-DD HH:mm」。
@@ -16788,6 +16877,135 @@ async function queryStatTrend(env, chatId, days, nowMs = Date.now()) {
 async function queryStatTrendPrev(env, chatId, days, nowMs = Date.now()) {
 	const n = Math.max(1, Math.min(365, Number(days) || 7));
 	return await queryStatTrend(env, chatId, n, nowMs - n * 86400000);
+}
+
+// ===== 运行检查（第2批 · 第5步）：两层 + 三权限 =====
+// 【第一层 · 状态自检】查 bot 自己：token / 身份、D1、统计活性、Workers AI 绑定、配置规模。
+// 【第二层 · 逐群体检】查每个配置群：bot 在不在群、是不是管理员、三个关键权限。
+//
+// 三权限固定是这三个，因为它们各自决定一条功能能不能用（方案选定的「权限粒度 b」）：
+//   can_delete_messages  → /rm 与删广告消息（没这权限 /rm 会静默删不掉）
+//   can_restrict_members → 封禁 / 禁言（杀手模式全靠它）
+//   can_invite_users     → 私密群取邀请链接
+//
+// 统计活性是方案选定的「第二层 b」：只看「bot 在线」根本发现不了「统计其实已经断了」——
+// bot 活得好好的、token 也正常，但最近一条发言记录停在三天前，那才是要命的。
+const HEALTH_GROUP_CONCURRENCY = 4;
+
+// 单群体检：getChat 拿群名，getChatAdministrators 拿「bot 在不在 + 三权限」。
+// 不额外发 getChatMember —— 管理员列表里找得到 bot 就是管理员，找不到但列表拉得动
+// 说明 bot 在群里只是普通成员，两者够区分，省一次请求。
+async function checkGroupHealth(groupId, botId) {
+	const out = {
+		groupId: String(groupId), title: '', present: false, isAdmin: false,
+		canDelete: false, canRestrict: false, canInvite: false, error: ''
+	};
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: out.groupId })
+		});
+		const result = await response.json();
+		if (!result?.ok) { out.error = String(result?.description || 'getChat 失败'); return out; }
+		out.title = String(result.result?.title || result.result?.first_name || '');
+	} catch (error) { out.error = error.message || String(error); return out; }
+
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: out.groupId })
+		});
+		const result = await response.json();
+		// 拉不动管理员列表 ≈ bot 不在群里（或群已不可达），按「不在」报。
+		if (!result?.ok) { out.error = String(result?.description || 'getChatAdministrators 失败'); return out; }
+		out.present = true;
+		const me = (result.result || []).find((m) => String(m?.user?.id) === String(botId));
+		if (!me) return out;                 // 在群里，但不是管理员
+		out.isAdmin = true;
+		out.canDelete = me.can_delete_messages === true;
+		out.canRestrict = me.can_restrict_members === true;
+		out.canInvite = me.can_invite_users === true;
+	} catch (error) { out.error = error.message || String(error); }
+	return out;
+}
+
+// 第一层：bot 自己的状态。每项独立 try —— 一项挂了不能把整份报告拖成空白。
+async function runHealthLayerOne(env) {
+	const items = [];
+
+	// ① token / 身份：getMe 挂掉是最要命的（token 失效 = bot 整个下线）
+	try {
+		const id = await getBotId();
+		items.push(id
+			? { ok: true, text: 'Bot 身份　<code>@' + escapeHtml(String(BOT_USERNAME || '')) + '</code>（' + escapeHtml(String(id)) + '）' }
+			: { ok: false, text: 'Bot 身份　❌ getMe 未返回 —— token 可能失效或网络不通' });
+	} catch (error) {
+		items.push({ ok: false, text: 'Bot 身份　❌ ' + escapeHtml(toChineseErrorText(error.message || '未知错误')) });
+	}
+
+	// ② D1
+	const dbOk = await statReady(env);
+	items.push(dbOk
+		? { ok: true, text: 'D1 存储　✅ 已连接（统计表就绪）' }
+		: { ok: false, text: 'D1 存储　❌ 不可用 —— 统计、黑名单、封禁记录全部写不进去' });
+
+	// ③ 统计活性：最近一条发言记录是不是今天。这是「统计断了」唯一的信号。
+	if (dbOk) {
+		try {
+			const row = await env.DB.prepare('SELECT MAX(day) AS d FROM stat_speech').first();
+			const latest = row?.d ? String(row.d) : '';
+			const today = statDayString(env);
+			if (!latest) {
+				items.push({ ok: null, text: '统计活性　⚠️ 还没有任何发言记录（群太安静，或统计钩子没跑）' });
+			} else if (latest === today) {
+				items.push({ ok: true, text: '统计活性　✅ 最近写入 <b>' + escapeHtml(latest) + '</b>（今天）' });
+			} else {
+				const gap = Math.round((Date.parse(today + 'T00:00:00Z') - Date.parse(latest + 'T00:00:00Z')) / 86400000);
+				items.push({
+					ok: false,
+					text: '统计活性　❌ 最近写入 <b>' + escapeHtml(latest) + '</b>，已停 <b>' + gap + '</b> 天 —— 统计可能断了'
+				});
+			}
+		} catch (error) {
+			items.push({ ok: false, text: '统计活性　❌ 查询失败：' + escapeHtml(toChineseErrorText(error.message || '未知错误')) });
+		}
+	}
+
+	// ④ Workers AI：没绑不是故障，是降级 —— 标警告不标红。
+	const aiOk = Boolean(env?.AI && typeof env.AI.run === 'function');
+	items.push(aiOk
+		? { ok: true, text: 'Workers AI　✅ 已绑定（广告检测三层全开）' }
+		: { ok: null, text: 'Workers AI　⚠️ 未绑定 —— 广告检测降级为「评分 + 指纹」两层（不是故障）' });
+
+	// ⑤ 配置规模
+	const killerCount = KILLER_MODE_GROUPS.length;
+	items.push({
+		ok: true,
+		text: '配置规模　📋 配置群 <b>' + GROUP_IDS.length + '</b> 个　杀手模式 <b>' + killerCount + '</b> 个'
+	});
+	return items;
+}
+
+// 整份报告：第一层自检 + 第二层逐群（并发 4，避免一次打满 Telegram 限流）。
+async function runHealthCheck(env) {
+	const layer1 = await runHealthLayerOne(env);
+	let botId = '';
+	try { botId = String(await getBotId() || ''); } catch (_) {}
+
+	const targets = GROUP_IDS.filter(Boolean).map(String);
+	let layer2 = [];
+	if (botId && targets.length) {
+		layer2 = await mapWithConcurrency(targets, HEALTH_GROUP_CONCURRENCY, async (g) => {
+			try { return await checkGroupHealth(g, botId); }
+			catch (error) {
+				return { groupId: String(g), title: '', present: false, isAdmin: false,
+					canDelete: false, canRestrict: false, canInvite: false, error: error.message || String(error) };
+			}
+		});
+	}
+	return { layer1, layer2, total: targets.length };
 }
 
 // bot_chat_join_request 处理：申请人「发起申请」的那一刻（还不是群成员）。
