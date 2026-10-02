@@ -224,11 +224,25 @@ console.log('\n=== 4. /profile 输出 ===');
 
 	// 建表 + 真数据：本群 1 次入群、另一个配置群 1 次入群（同一个 TGID）
 	const ts = Math.floor(Date.parse('2026-10-03T08:00:00+08:00') / 1000);
-	env.DB.exec('CREATE TABLE IF NOT EXISTS stat_member_events (chat_id TEXT, user_id TEXT, kind TEXT, at INTEGER)');
+	// 列必须与 _worker.js 的建表语句完全一致：只建 4 列的话，7 列的 INSERT 会失败
+	//（被 recordMemberEventDetail 内部的 try/catch 吞掉，表现为「写入 0 行」却毫无报错）。
+	env.DB.exec('CREATE TABLE IF NOT EXISTS stat_member_events ('
+		+ 'chat_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL, '
+		+ 'actor_id TEXT, invite_link TEXT, via_request INTEGER NOT NULL DEFAULT 0, '
+		+ 'PRIMARY KEY (chat_id, user_id, kind, at))');
 	const ins = (cid, at) => env.DB.prepare('INSERT INTO stat_member_events (chat_id, user_id, kind, at) VALUES (?, ?, ?, ?)')
 		.bind(cid, '699658898', 'join', at).run();
 	await ins(GROUP, ts);
 	await ins('-100999', ts + 600);   // 另一个配置群也入过一次群
+
+	// 第3批 · MTProto 回填口径：任命时间存成 kind='promote'（管理员的 MTProto date 是
+	// 【任命时刻】不是入群时间），白名单必须放行它，否则回填的行会被静默拒掉。
+	// 注意 recordMemberEventDetail 的 atMs 参数要的是【毫秒】——它内部 /1000 才存进 at 列。
+	const promoteAtMs = Date.parse('2026-05-24T07:35:00+08:00');
+	await W.recordMemberEventDetail(env, GROUP, '699658898', 'promote', promoteAtMs);
+	check('promote 写入被白名单放行（第3批回填口径）',
+		Number(env.DB.query("SELECT COUNT(*) AS c FROM stat_member_events WHERE kind='promote'")[0]?.c) === 1,
+		String(env.DB.query("SELECT COUNT(*) AS c FROM stat_member_events WHERE kind='promote'")[0]?.c));
 
 	// 私聊 → 无群上下文，跨群原样返回
 	reset();
@@ -257,6 +271,15 @@ console.log('\n=== 4. /profile 输出 ===');
 	// bot 是该群管理员 → 拿到确定状态（bot mock id=42 被放进管理员列表）
 	check('群内 → 显示群内身份且拿到确定状态', outG.includes('群内身份　成员'),
 		outG.slice(outG.indexOf('群内身份'), outG.indexOf('群内身份') + 60));
+	// 第3批回填后的任命时间：读的是 promote 那条，不是入群时间
+	check('任命管理员 → 显示回填的真实时间（promote）',
+		outG.includes('任命管理员　2026-05-24 07:35'),
+		outG.slice(outG.indexOf('任命管理员'), outG.indexOf('任命管理员') + 40));
+	check('任命管理员不再显示「第3批回填后可见」占位',
+		!outG.includes('第3批回填后可见'), '');
+	check('入群时间与任命时间是两条不同记录（不互相冒充）',
+		outG.includes('入群时间　2026-10-03 08:00') && outG.includes('任命管理员　2026-05-24 07:35'),
+		outG.slice(outG.indexOf('入群时间'), outG.indexOf('任命管理员') + 30));
 
 	// 6 种身份逐一验证映射精准（bot 必须在管理员列表里，否则不会去查状态）
 	adminLists[GROUP] = [

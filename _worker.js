@@ -9713,9 +9713,10 @@ async function buildProfileBlock(env, groupId, tgid, isGroupChat = false) {
 	lines.push('申请时间　' + latest('join_request') + '（群未开启入群审批则永不出现）');
 	lines.push('入群时间　' + (joinEv ? formatBeijingTime(joinEv.at) : '未记录'));
 	lines.push('退群时间　' + (latest('leave') !== '未记录' ? latest('leave') : latest('kicked')));
-	// 任命管理员：依赖第3批的 MTProto 回填。管理员的 MTProto date 本就是「任命时间」，
-	// 不是入群时间 —— 这里刻意不复用它，避免把任命时间伪装成入群时间误导主人。
-	lines.push('任命管理员　未记录（第3批回填后可见）');
+	// 任命管理员：第3批 MTProto 回填的 kind='promote'。
+	// MTProto 里 ChannelParticipantAdmin.date 是【被任命】的时刻，不是入群时间 ——
+	// 所以回填脚本把它单独存成 promote，刻意不复用 join，避免把任命时间冒充成入群时间误导主人。
+	lines.push('任命管理员　' + latest('promote'));
 	const m = await readAdGroupMember(env, tgid);
 	lines.push('最早发言　' + (Number(m?.first_seen) > 0 ? formatBeijingTime(m.first_seen) : '未记录'));
 	lines.push('最后发言　' + (Number(m?.last_seen) > 0 ? formatBeijingTime(m.last_seen) : '未记录'));
@@ -16776,7 +16777,9 @@ async function ensureStatMemberEventsTable(env) {
 // at 存 unix 秒，与 formatBeijingTime 兼容（它同时接受秒 / 毫秒 / ISO）。
 async function recordMemberEventDetail(env, chatId, userId, kind, atMs = Date.now(), meta = {}) {
 	if (!env?.DB || !userId || !kind) return;
-	if (!['join', 'leave', 'kicked', 'join_request'].includes(kind)) return;
+	// 'promote' 由第3批 MTProto 回填写入（管理员的任命时刻），事件流本身不产生它；
+	// 放进白名单是让后续补录也能走这同一个写入函数，不至于被静默拒掉。
+	if (!['join', 'leave', 'kicked', 'join_request', 'promote'].includes(kind)) return;
 	if (!(await ensureStatMemberEventsTable(env))) return;
 	try {
 		await env.DB.prepare(
