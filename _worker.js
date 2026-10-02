@@ -16363,6 +16363,11 @@ function statDayString(env, nowMs = Date.now()) {
 
 // 计算粒度的起止日（含端点，统计时区 YYYY-MM-DD）。周一为一周起点（中国习惯）。
 function statRangeDays(env, range, nowMs = Date.now()) {
+	// 第2批·自定义时间：range 除了 day/week/month，还可能是任意日期串
+	// （'2026-09-01..2026-09-15'、'昨天'、'上周'、'近7天' 等），先走这条解析。
+	const custom = resolveStatRange(env, range, nowMs);
+	if (custom) return custom;
+
 	const offsetMs = getStatTzOffsetHours(env) * 3600 * 1000;
 	const local = new Date(nowMs + offsetMs);
 	const y = local.getUTCFullYear();
@@ -16381,6 +16386,54 @@ function statRangeDays(env, range, nowMs = Date.now()) {
 		return { start: fmt(start), end: fmt(today), label: '本周', range: 'week' };
 	}
 	return { start: fmt(today), end: fmt(today), label: '今日', range: 'day' };
+}
+
+// 解析自定义区间字符串 → {start, end, label}；不认识就返回 null，让上层走 day/week/month。
+// 【为什么不用对象传参】/stats 的翻页与按钮把 range 编码进 callback token（64 字节上限），
+// 对象没法编码；统一成字符串后按钮与命令能共用同一套 token。
+// 【时区】一律用 statRangeDays 同款算法（getStatTzOffsetHours，默认 +8），与 day/week/month 同口径，
+// 保证「每天/每周/每月条数对得上」这条要求不受影响。
+function resolveStatRange(env, range, nowMs) {
+	if (!range) return null;
+	const v = String(range).trim();
+
+	// 绝对日期：'YYYY-MM-DD'（单日）或 'YYYY-MM-DD..YYYY-MM-DD'（区间，端点含）
+	if (/^\d{4}-\d{2}-\d{2}(\.\.\d{4}-\d{2}-\d{2})?$/.test(v)) {
+		const parts = v.split('..');
+		const start = parts[0];
+		const end = parts[1] || start;
+		if (start > end) return { start: end, end: start, label: end + ' ~ ' + start, range: 'custom' };
+		return { start, end, label: start === end ? start : (start + ' ~ ' + end), range: 'custom' };
+	}
+
+	const offsetMs = getStatTzOffsetHours(env) * 3600 * 1000;
+	const local = new Date(nowMs + offsetMs);
+	const today = new Date(Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()));
+	const fmt = (dt) => dt.toISOString().slice(0, 10);
+	// 以「今天」为基准偏移 N 天；用 setUTCDate 让它自己跨月/跨年进位，不手工算月长。
+	const shift = (n) => { const t = new Date(today); t.setUTCDate(t.getUTCDate() + n); return t; };
+	const dayOf = (t, label) => ({ start: fmt(t), end: fmt(t), label, range: 'custom' });
+	const span = (a, b, label) => ({ start: fmt(a), end: fmt(b), label, range: 'custom' });
+
+	const L = v.toLowerCase();
+	if (L === 'yesterday' || v === '昨天') return dayOf(shift(-1), '昨天');
+	if (L === 'd2' || v === '前天') return dayOf(shift(-2), '前天');
+	// 近 N 天：含今天
+	if (L === '7d' || L === 'last7d' || /^近\s*7\s*天$/.test(v)) return span(shift(-6), today, '近 7 天');
+	if (L === '30d' || L === 'last30d' || /^近\s*30\s*天$/.test(v)) return span(shift(-29), today, '近 30 天');
+	// 上周：周一到周日（与 day/week 同口径，周一为一周起点）
+	if (L === 'lastweek' || v === '上周') {
+		const dow = today.getUTCDay();
+		const backToMon = dow === 0 ? 6 : dow - 1;      // 本周一相对今天的偏移
+		return span(shift(-backToMon - 7), shift(-backToMon - 1), '上周');
+	}
+	// 上月：1 号到月末（Date.UTC(y, m, 0) = 本月 0 号 = 上月最后一天，JS 月份进位自动处理跨年）
+	if (L === 'lastmonth' || v === '上月') {
+		const y = today.getUTCFullYear();
+		const mm = today.getUTCMonth();
+		return span(new Date(Date.UTC(y, mm - 1, 1)), new Date(Date.UTC(y, mm, 0)), '上月');
+	}
+	return null;
 }
 
 // 建统计两张表：stat_speech（群+人+日 发言数）、stat_member（群+日 进/退/被移出）。
@@ -16676,8 +16729,22 @@ async function handleKillerCommand(message, env) {
 // 返回 'day'/'week'/'month'；空参数或无法识别的参数返回 null，
 // 由调用方决定「显示用法」还是「默认今日」。裸 /stats（null）在群内=显示用法。
 function parseStatsRange(arg) {
-	const v = String(arg || '').trim().toLowerCase();
-	if (!v) return null;
+	const raw = String(arg || '').trim();
+	if (!raw) return null;
+	// 绝对日期：'YYYY-MM-DD' 单日 / 'YYYY-MM-DD..YYYY-MM-DD' 区间（原样交给 resolveStatRange）
+	if (/^\d{4}-\d{2}-\d{2}(\.\.\d{4}-\d{2}-\d{2})?$/.test(raw)) return raw;
+	// 两个日期空格分隔：'2026-09-01 2026-09-15'（主人手打的习惯写法）→ 归一成 '..' 形式
+	const dateList = raw.match(/\d{4}-\d{2}-\d{2}/g);
+	if (dateList && dateList.length >= 2) return dateList[0] + '..' + dateList[1];
+	const v = raw.toLowerCase();
+	// 相对词必须排在 week/month/day 之前 —— 「上周」含「周」、「上月」含「月」，
+	// 先判 /week|周/ 就会被误判成本周、自定义时间永远生效不了。
+	if (v === 'yesterday' || raw === '昨天') return 'yesterday';
+	if (v === 'd2' || raw === '前天') return 'd2';
+	if (v === 'lastweek' || raw === '上周') return 'lastweek';
+	if (v === 'lastmonth' || raw === '上月') return 'lastmonth';
+	if (v === '7d' || v === 'last7d' || /^近\s*7\s*天$/.test(raw)) return '7d';
+	if (v === '30d' || v === 'last30d' || /^近\s*30\s*天$/.test(raw)) return '30d';
 	if (/week|周/.test(v)) return 'week';
 	if (/month|月/.test(v)) return 'month';
 	if (/today|day|今日|日/.test(v)) return 'day';
@@ -16690,9 +16757,13 @@ function buildGroupStatsUsage() {
 		'📊 <b>群发言统计</b> · 用法',
 		'统计本群真人发言数与进 / 退群人数，仅本群，按日 / 周 / 月汇总。',
 		'',
-		'• <code>/stats today</code> — 查本群今日',
-		'• <code>/stats week</code> — 查本群本周',
-		'• <code>/stats month</code> — 查本群本月'
+		'• <code>/stats today</code> 今日　<code>/stats week</code> 本周　<code>/stats month</code> 本月',
+		'• <code>/stats 昨天</code> · <code>前天</code> · <code>上周</code> · <code>上月</code>',
+		'• <code>/stats 近7天</code> · <code>近30天</code>',
+		'• <code>/stats 2026-09-10</code>　指定某天',
+		'• <code>/stats 2026-09-01 2026-09-15</code>　指定区间',
+		'',
+		'下方按钮可切换常用区间。'
 	].join('\n');
 }
 
@@ -16702,9 +16773,11 @@ function buildPrivateStatsUsage() {
 		'📊 <b>群发言统计</b> · 用法（私聊查指定群，仅主人 / 副主人）',
 		'按日 / 周 / 月汇总，只统计该群。',
 		'',
-		'• <code>/stats -100群ID</code> — 查指定群今日',
-		'• <code>/stats -100群ID week</code> — 本周',
-		'• <code>/stats -100群ID month</code> — 本月'
+		'• <code>/stats -100群ID</code> 指定群今日　<code>week</code> 本周　<code>month</code> 本月',
+		'• <code>/stats -100群ID 昨天</code> · <code>前天</code> · <code>上周</code> · <code>上月</code>',
+		'• <code>/stats -100群ID 近7天</code> · <code>近30天</code>',
+		'• <code>/stats -100群ID 2026-09-10</code>　指定某天',
+		'• <code>/stats -100群ID 2026-09-01 2026-09-15</code>　指定区间'
 	].join('\n');
 }
 

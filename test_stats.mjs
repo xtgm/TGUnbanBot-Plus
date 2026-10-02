@@ -372,5 +372,90 @@ console.log('\n=== 13. 入群/退群/申请 事件明细（第2批）===');
 	check('端到端：统计计数同步 +1（明细未拖累 stat_member）',
 		Number(env.DB.query("SELECT SUM(join_count) AS c FROM stat_member WHERE chat_id='-100111'")[0]?.c || 0) >= 1);
 }
+console.log('\n=== 14. 自定义时间（第2批）：任何区间的汇总 == 逐日求和 ===');
+{
+	const T = Date.parse('2026-10-07T15:00:00+08:00');
+	const G = '-100960';
+	// 连续 10 天，每天 1 条：09-28 ~ 10-07（跨月，覆盖周与月的边界）
+	const days = ['2026-09-28', '2026-09-29', '2026-09-30', '2026-10-01', '2026-10-02',
+		'2026-10-03', '2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07'];
+	for (const day of days) {
+		await W.recordSpeechStat(env, G, { id: 'u1', first_name: '甲' }, Date.parse(day + 'T12:00:00+08:00'));
+	}
+	const tsOfDay = (d) => Date.parse(d + 'T12:00:00+08:00');
+	const nextDay = (d) => {
+		const t = new Date(d + 'T12:00:00+08:00');
+		t.setUTCDate(t.getUTCDate() + 1);
+		return t.toISOString().slice(0, 10);
+	};
+
+	// 核心：每一种区间，其汇总数必须等于「该区间内逐日的 sum」—— 四口径互等的定义。
+	// 覆盖 day/week/month/相对词/单日/绝对区间。
+	// 注意：空格写法 '2026-10-01 2026-10-05'【不在这里】—— statRangeDays 不认识它，
+	// 会防御性回退成「今天」，逐日求和恰好也=1，凑成假阳性通过。真实路径必须先经 parseStatsRange
+	// 归一成 '..' 形式，所以那条单独验（见下方「空格写法归一后查询」）。
+	const ranges = ['day', 'week', 'month', 'yesterday', 'd2', 'lastweek', 'lastmonth', '7d', '30d',
+		'2026-10-01', '2026-10-01..2026-10-05'];
+	for (const r of ranges) {
+		const info = W.statRangeDays(env, r, T);
+		const q = await W.queryStatSummary(env, G, r, T);
+		let manual = 0;
+		for (let d = info.start; d <= info.end; d = nextDay(d)) {
+			manual += (await W.queryStatSummary(env, G, 'day', tsOfDay(d))).totalMsg;
+		}
+		check('区间「' + r + '」汇总 == 逐日求和（' + info.start + '~' + info.end + '）',
+			q.totalMsg === manual, '汇总=' + q.totalMsg + ' 逐日=' + manual);
+	}
+
+	// 关键词 → label 与区间的正确性
+	const spec = [
+		['昨天', '昨天', 1], ['前天', '前天', 1], ['上周', '上周', 7],
+		['上月', '上月', 0], ['近7天', '近 7 天', 7], ['近30天', '近 30 天', 30],
+		['2026-09-10', '2026-09-10', 1],
+	];
+	for (const [input, expectLabel, expectDays] of spec) {
+		const info = W.statRangeDays(env, W.parseStatsRange(input), T);
+		check('关键词「' + input + '」→ 「' + expectLabel + '」', info.label === expectLabel,
+			JSON.stringify(info));
+		if (expectDays > 0) {
+			// 数区间内天数
+			let n = 0;
+			for (let d = info.start; d <= info.end; d = nextDay(d)) n++;
+			check('  ↑ 天数 = ' + expectDays, n === expectDays, '实际 ' + n + ' 天');
+		}
+	}
+
+	// 端点 inclusive：09-30 那天只该在以它为边界的区间里出现一次
+	const one = await W.queryStatSummary(env, G, '2026-09-30', T);
+	check('单日查询 = 1 条（端点含首含尾）', one.totalMsg === 1, '实际 ' + one.totalMsg);
+	const five = await W.queryStatSummary(env, G, '2026-10-01..2026-10-05', T);
+	check('五天区间 = 5 条（不重不漏）', five.totalMsg === 5, '实际 ' + five.totalMsg);
+	// 空格写法：必须经 parseStatsRange 归一后再查询 —— 直接喂给 statRangeDays 会被防御性
+	// 回退成「今天」，那不是用户实际走的路径（/stats A B 一定会先过 parseStatsRange）。
+	const cross = await W.queryStatSummary(env, G, '2026-09-28..2026-10-07', T);
+	check('十天区间（跨月）= 10 条', cross.totalMsg === 10, '实际 ' + cross.totalMsg);
+
+	// 空格写法：必须经 parseStatsRange 归一后再查询 —— 直接喂给 statRangeDays 会被防御性
+	// 回退成「今天」，那不是用户实际走的路径（/stats A B 一定会先过 parseStatsRange）。
+	const spacedParsed = W.parseStatsRange('2026-10-01 2026-10-05');
+	const spaced = await W.queryStatSummary(env, G, spacedParsed, T);
+	check('空格写法归一后查询 = 5 条（不走 parse 的路径不计入断言）',
+		spacedParsed === '2026-10-01..2026-10-05' && spaced.totalMsg === 5,
+		'解析=' + spacedParsed + ' 结果=' + spaced.totalMsg);
+
+	// 解析层
+	check('空格分隔两日期 → 归一成 .. 形式',
+		W.parseStatsRange('2026-10-01 2026-10-05') === '2026-10-01..2026-10-05',
+		W.parseStatsRange('2026-10-01 2026-10-05'));
+	check('单个日期原样透传', W.parseStatsRange('2026-10-01') === '2026-10-01', W.parseStatsRange('2026-10-01'));
+	check('乱输入 → null（回退到用法提示）', W.parseStatsRange('随便写点什么') === null, String(W.parseStatsRange('随便写点什么')));
+	// 「上周」「上月」不能被 /周/ /月/ 的正则抢先判成本周/本月
+	const lw = W.statRangeDays(env, W.parseStatsRange('上周'), T);
+	const thisWeek = W.statRangeDays(env, W.parseStatsRange('week'), T);
+	check('「上周」不被误判成「本周」', lw.label === '上周' && lw.label !== thisWeek.label, lw.label + ' vs ' + thisWeek.label);
+	const lm = W.statRangeDays(env, W.parseStatsRange('上月'), T);
+	check('「上月」不被误判成「本月」', lm.label === '上月' && lm.label !== W.statRangeDays(env, W.parseStatsRange('month'), T).label, lm.label);
+}
+
 console.log('\n群统计验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 if (fail > 0) process.exitCode = 1;
