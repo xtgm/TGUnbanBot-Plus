@@ -9,6 +9,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 const src = fs.readFileSync('_worker.js', 'utf8');
 const sent = [];
+const edits = [];        // editMessageText 请求（菜单页与翻页是原地编辑，不是新发）
+const answers = [];      // answerCallbackQuery 回执文案
 let currentAdmins = [];   // 当前群 Telegram 管理员 id 列表（供 getChatAdministrators mock）
 let memberCountMock = 4855;   // getChatMemberCount 返回值；置 null 模拟接口失败
 
@@ -34,6 +36,13 @@ const sandbox = {
 			payload = { ok: true, result: memberCountMock };
 		} else if (m === 'getMe') {
 			payload = { ok: true, result: { id: 42, username: 'testbot', is_bot: true } };
+		} else if (m === 'editMessageText') {
+			edits.push({ chatId: String(b?.chat_id ?? ''), messageId: Number(b?.message_id) || 0,
+				text: String(b?.text || ''), markup: b?.reply_markup || null });
+			payload = { ok: true, result: { message_id: Number(b?.message_id) || 0 } };
+		} else if (m === 'answerCallbackQuery') {
+			answers.push({ id: String(b?.callback_query_id ?? ''), text: String(b?.text || '') });
+			payload = { ok: true, result: true };
 		}
 		return { ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) };
 	}
@@ -221,6 +230,8 @@ console.log('\n=== 11. 发言钩子端到端（webhook） ===');
 W.__clock = null;   // 本节验证的就是「按真实当下记账」，恢复真实时间
 const todayNow = W.statDayString(env, Date.now());
 const drive = async (msg) => { const p = []; await W.__h.fetch(new Request('https://x/', { method: 'POST', body: JSON.stringify({ message: msg }) }), env, { waitUntil: (x) => p.push(Promise.resolve(x)) }); await Promise.allSettled(p); };
+// 按钮回调入口（菜单页、翻页、趋势都是原地编辑，走 callback_query 而不是 message）
+const driveCb = async (cq) => { const p = []; await W.__h.fetch(new Request('https://x/', { method: 'POST', body: JSON.stringify({ callback_query: cq }) }), env, { waitUntil: (x) => p.push(Promise.resolve(x)) }); await Promise.allSettled(p); };
 await drive({ message_id: 5001, chat: { id: '-100111', type: 'supergroup', title: 'g' }, from: { id: 8801, is_bot: false, first_name: '钩子用户' }, text: '普通聊天' });
 check('真人普通消息已计入发言', Number(env.DB.query("SELECT msg_count FROM stat_speech WHERE user_id='8801' AND day='" + todayNow + "'")[0]?.msg_count) >= 1);
 await drive({ message_id: 5002, chat: { id: '-100111', type: 'supergroup', title: 'g' }, from: { id: 8802, is_bot: false, first_name: '发命令' }, text: '/stats' });
@@ -619,6 +630,76 @@ console.log('\n=== 16. 趋势（逐日列表 + 汇总 + 环比，不出图）===
 	// —— 非配置群 / 无数据群不炸 ——
 	const none = await W.renderStatTrend(env, '-100999', 7, 'day', '', T);
 	check('没数据的群 → 全 0 正常渲染、不抛', none.text.includes('总发言 <b>0</b>'), none.text.split('\n').slice(-5).join(' | '));
+}
+
+console.log('\n=== 17. 群设置菜单：返回按钮按打开者身份 + menu 回调 ===');
+{
+	// 本节局部常量：其它节都是直接写 '-100111' 字面量，这里引用次数多，取个名字好读。
+	const GROUP = '-100111';
+	const hasBack = (kb) => Boolean(kb && kb.inline_keyboard
+		&& kb.inline_keyboard.some((row) => row.some((b) => String(b.text || '').includes('返回群设置'))));
+	const clear = () => { sent.length = 0; edits.length = 0; answers.length = 0; };
+	const menuData = (action, chatId) => 'menu:' + W.encodeAdCallbackToken(action + '|' + chatId);
+
+	// ① 键盘层：showMenuBack 两侧
+	check('showMenuBack=true → 键盘挂「返回群设置」',
+		hasBack(W.buildStatsDataKeyboard(GROUP, 'day', 1, 1, true)));
+	check('showMenuBack=false → 不挂（非第一主人无死按钮）',
+		!hasBack(W.buildStatsDataKeyboard(GROUP, 'day', 1, 1, false)));
+	check('默认（不传）→ 不挂', !hasBack(W.buildStatsDataKeyboard(GROUP, 'day', 1, 1)));
+	check('isPrimaryOwner 判定两侧正确（决定 showMenuBack 的那个三元）',
+		W.isPrimaryOwner(OWNER) === true && W.isPrimaryOwner('8888') === false);
+
+	// ② 端到端：第一主人 /stats → 挂返回
+	clear();
+	await drive({ chat: { id: Number(GROUP), type: 'supergroup', title: '统计测试群' },
+		from: { id: Number(OWNER), is_bot: false }, text: '/stats today', message_id: 701 });
+	const ownerPage = sent.find((s) => s.chatId === GROUP && s.text.includes('群统计'));
+	check('第一主人打开统计页 → 挂「返回群设置」', !!ownerPage && hasBack(ownerPage.markup),
+		JSON.stringify(ownerPage?.markup?.inline_keyboard?.map((r) => r.map((b) => b.text))));
+
+	// ③ /health 报告同样挂返回（该命令本身仅第一主人可用）
+	clear();
+	await drive({ chat: { id: Number(GROUP), type: 'supergroup', title: '统计测试群' },
+		from: { id: Number(OWNER), is_bot: false }, text: '/health', message_id: 702 });
+	const healthPage = sent.find((s) => s.chatId === GROUP && s.text.includes('运行检查'));
+	check('/health 报告 → 挂「返回群设置」', !!healthPage && hasBack(healthPage.markup),
+		JSON.stringify(healthPage?.markup?.inline_keyboard?.map((r) => r.map((b) => b.text))));
+
+	// ④ menu 回调：点「群统计」原地编辑出统计页
+	clear();
+	await driveCb({ id: 'cbm1', from: { id: Number(OWNER), is_bot: false },
+		message: { message_id: 710, chat: { id: Number(GROUP), type: 'supergroup' }, text: '菜单' },
+		data: menuData('stats', GROUP) });
+	let e = edits.find((x) => x.chatId === GROUP);
+	check('菜单点「群统计」→ 原地编辑出统计页', !!e && e.text.includes('群统计'), JSON.stringify(edits.map((x) => x.text.slice(0, 30))));
+	check('  ↑ 该页带返回键', !!e && hasBack(e.markup), JSON.stringify(e?.markup?.inline_keyboard?.map((r) => r.map((b) => b.text))));
+
+	// ⑤ menu 回调：点「运行检查」
+	clear();
+	await driveCb({ id: 'cbm2', from: { id: Number(OWNER), is_bot: false },
+		message: { message_id: 711, chat: { id: Number(GROUP), type: 'supergroup' }, text: '菜单' },
+		data: menuData('health', GROUP) });
+	e = edits.find((x) => x.chatId === GROUP);
+	check('菜单点「运行检查」→ 编辑出报告', !!e && e.text.includes('运行检查'), JSON.stringify(edits.map((x) => x.text.slice(0, 30))));
+	check('  ↑ 报告带返回键', !!e && hasBack(e.markup), '');
+
+	// ⑥ menu 回调：回菜单
+	clear();
+	await driveCb({ id: 'cbm3', from: { id: Number(OWNER), is_bot: false },
+		message: { message_id: 712, chat: { id: Number(GROUP), type: 'supergroup' }, text: '子页' },
+		data: menuData('root', GROUP) });
+	e = edits.find((x) => x.chatId === GROUP);
+	check('点「返回群设置」→ 回菜单（含三个入口）', !!e && e.text.includes('群设置')
+		&& ['群统计', '资料卡', '运行检查'].every((t) => JSON.stringify(e.markup || '').includes(t)), JSON.stringify(e?.text));
+
+	// ⑦ 权限：非第一主人点菜单 → 拒绝且不渲染
+	clear();
+	await driveCb({ id: 'cbm4', from: { id: 8888, is_bot: false },
+		message: { message_id: 713, chat: { id: Number(GROUP), type: 'supergroup' }, text: '菜单' },
+		data: menuData('stats', GROUP) });
+	check('非第一主人点菜单 → 不渲染', edits.length === 0, JSON.stringify(edits.map((x) => x.text.slice(0, 30))));
+	check('  ↑ 应答「仅限第一主人」', answers.some((a) => a.text.includes('仅限第一主人')), JSON.stringify(answers));
 }
 
 console.log('\n群统计验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');

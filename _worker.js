@@ -7438,6 +7438,11 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 		await handleStatsGoCallback(callbackQuery, env);
 		return;
 	}
+	if (data.startsWith(SETTINGS_MENU_PREFIX)) {
+		await handleMenuCallback(callbackQuery, env);
+		return;
+	}
+
 	if (data.startsWith(STAT_TREND_PREFIX)) {
 		await handleStatsTrendCallback(callbackQuery, env);
 		return;
@@ -8487,6 +8492,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
+	// ===== /menu 群设置菜单页（仅第一主人）=====
+	if (isMenuCommand(text)) {
+		await handleMenuCommand(message, env);
+		return;
+	}
+
 	// ===== /notice 全体通知（仅第一主人私聊；群内静默）=====
 	if (isNoticeCommand(text)) {
 		await handleNoticeCommand(message, env, ctx);
@@ -8530,6 +8541,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/check TGID　查封禁状态：GKY + 本地黑名单（群内可回复消息使用）',
 			'/profile TGID　资料卡：昵称 / 简介 / 时间线 / 黑名单 / GKY（群内可回复消息使用）',
 			'/rm　回复要删的消息后发送 → 删除该消息（仅第一主人 / 该群群主）',
+			'/health　运行检查：bot 状态自检 + 逐群查在不在群、是不是管理员、三个权限',
+			'/menu　群设置菜单：群统计 / 资料卡 / 运行检查 的入口页（仅第一主人，群里发）',
 			'/blacklist　查看全局黑名单最近记录（主人 / 副主人）',
 			'/job 任务ID [页码]　查大批量封禁任务的进度',
 			'/jobrun 任务ID　手动续跑未完成的批量任务',
@@ -9537,7 +9550,8 @@ async function handleHealthCommand(message, env) {
 	const chatId = String(message.chat?.id || '');
 	try {
 		const report = await runHealthCheck(env);
-		await sendTelegramMessageChunks(chatId, renderHealthReport(report));
+		// 挂「返回群设置」：/health 本来就是仅第一主人的命令，与从菜单点进来的形态一致。
+		await sendTelegramMessageChunks(chatId, renderHealthReport(report), buildSettingsBackKeyboard(chatId));
 	} catch (error) {
 		console.error('[运行检查] 执行失败:', error);
 		await sendTelegramMessage(chatId, '❌ 运行检查失败：' + escapeHtml(toChineseErrorText(error.message || '未知错误')));
@@ -17008,6 +17022,85 @@ async function runHealthCheck(env) {
 	return { layer1, layer2, total: targets.length };
 }
 
+// 「返回群设置」按钮。【只在第一主人打开时挂】—— 非第一主人进不了菜单页，
+// 给他们显示这颗按钮就是一颗点了没用的死按钮（方案 A 的核心要求：无死按钮）。
+// 调用方用 isPrimaryOwner(actorId) 决定传不传，本函数只负责造键盘。
+function buildSettingsBackKeyboard(chatId) {
+	const data = SETTINGS_MENU_PREFIX + encodeAdCallbackToken('root|' + String(chatId));
+	return adCallbackDataFits(data) ? { inline_keyboard: [[{ text: '↩️ 返回群设置', callback_data: data }]] } : null;
+}
+
+// ===== 群设置菜单页（第2批 · 第6步，方案 a）=====
+// 首页三个入口：群统计 / 资料卡 / 运行检查。仅第一主人可进 ——
+// 这也是「返回群设置」按钮只给第一主人显示的依据：非第一主人根本进不来，
+// 给他们显示那个按钮就是一颗点了没用的死按钮（方案 A 要求「无死按钮」）。
+function renderGroupSettingsMenu(chatId, title) {
+	const scope = title ? escapeHtml(String(title)) : ('群 <code>' + escapeHtml(String(chatId)) + '</code>');
+	const mk = (label, action) => {
+		const data = SETTINGS_MENU_PREFIX + encodeAdCallbackToken(action + '|' + String(chatId));
+		return adCallbackDataFits(data) ? { text: label, callback_data: data } : null;
+	};
+	const row1 = [mk('📊 群统计', 'stats'), mk('👤 资料卡', 'profile')];
+	const row2 = [mk('🏥 运行检查', 'health')];
+	const rows = [];
+	if (row1.every(Boolean)) rows.push(row1);
+	if (row2.every(Boolean)) rows.push(row2);
+	return {
+		text: [
+			'⚙️ <b>群设置</b> · ' + scope,
+			'',
+			'选择要打开的面板：'
+		].join('\n'),
+		keyboard: rows.length ? { inline_keyboard: rows } : null
+	};
+}
+
+// 菜单里「资料卡」那一格：它需要一个 TGID 参数，按钮给不了 ——
+// 原地改成用法提示 + 返回键，不去伪造一个空参数去调 buildProfileBlock。
+function renderProfileHint(chatId, title) {
+	const back = buildSettingsBackKeyboard(chatId);
+	return {
+		text: [
+			'👤 <b>资料卡</b> · ' + (title ? escapeHtml(String(title)) : '群 <code>' + escapeHtml(String(chatId)) + '</code>'),
+			'',
+			'发送 <code>/profile TGID</code> 查询指定的人（昵称 / 用户名 / 简介 / 时间线 / 黑名单 / GKY）。',
+			'也可以<b>回复某条消息</b>再发 <code>/profile</code>，直接查发信人。',
+			'',
+			'仅第一主人可用；群内不撤回命令。'
+		].join('\n'),
+		// buildSettingsBackKeyboard 返回的已是 { inline_keyboard: [[按钮]] } 整个对象，
+		// 再包一层 [[back]] 会得到没有 text 的空按钮。
+		keyboard: back
+	};
+}
+
+// /menu 指令：仅第一主人，且【仅群内】——菜单叫「群设置」，天然属于某个群的上下文；
+// 私聊没有当前群，点「群统计」会拿用户 ID 当群号查出一片空白。
+async function handleMenuCommand(message, env) {
+	const userId = getMessageActorId(message);
+	const isInGroup = message.chat?.type !== 'private';
+	if (!isPrimaryOwner(userId)) {
+		if (isInGroup) return true;   // 群内不暴露这条隐藏命令的存在
+		await sendTelegramMessage(String(message.chat?.id || ''), '❌ <b>权限不足</b>\n\n/menu 群设置菜单仅限第一主人使用。');
+		return true;
+	}
+	const chatId = String(message.chat?.id || '');
+	if (!isInGroup) {
+		await sendTelegramMessage(chatId, 'ℹ️ 群设置菜单是按群的，请到<b>配置群里</b>发送 <code>/menu</code>。');
+		return true;
+	}
+	// 不再判 isConfiguredGroup：非配置群的命令在分发之前就被 isNonConfiguredGroup 拦掉
+	// （与 /rm 同策略），走不到这里，加了就是一段永不执行的分支。
+	const title = String(message.chat?.title || '');
+	const menu = renderGroupSettingsMenu(chatId, title);
+	await sendTelegramMessage(chatId, menu.text, menu.keyboard);
+	return true;
+}
+
+function isMenuCommand(text) {
+	return /^\/menu(?:@[^\s]+)?(?:\s|$)/i.test(String(text || '').trim());
+}
+
 // bot_chat_join_request 处理：申请人「发起申请」的那一刻（还不是群成员）。
 // 只记时间，不批准/拒绝 —— 审批是管理员在 Telegram 客户端点的，bot 不代劳。
 // 群未开启入群审批时，这个 update 永远不会推送，本函数不会被执行。
@@ -17112,6 +17205,8 @@ const STAT_PAGINATION_PREFIX = 'statpg:';
 const STAT_GO_PREFIX = 'statgo:';
 // 趋势页按钮：原地编辑成逐日列表，token=base64url(range|chatId)，range 供「返回统计」用。
 const STAT_TREND_PREFIX = 'stattrend:';
+// 群设置菜单页：token=base64url("<动作>|<chatId>")，动作 ∈ stats / profile / health。
+const SETTINGS_MENU_PREFIX = 'menu:';
 
 function isStatsCommand(text) {
 	return typeof text === 'string' && /^\/stats(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
@@ -17249,7 +17344,7 @@ function buildStatsPanelKeyboard(chatId) {
 // 原消息上的选中态 · 永远不会跟着变；statpg 是【原地编辑那条数据消息】，
 // 切完立刻把新的 ·标到刚点的那个按钮上 —— 正是截图里「可点切换 + 当前态标记」的形态。
 // 回调端零新增：handleStatsPaginationCallback 本来就按 token 里的 range 重查，只换了个 range。
-function buildStatsDataKeyboard(chatId, range, page, totalPages) {
+function buildStatsDataKeyboard(chatId, range, page, totalPages, showMenuBack = false) {
 	const mk = (label, r) => {
 		// 只有 range 与按钮值完全相等才标选中态；自定义日期区间没有对应按钮，就没有 ·
 		const text = (range === r ? '·' : '') + label;
@@ -17272,10 +17367,15 @@ function buildStatsDataKeyboard(chatId, range, page, totalPages) {
 	const pager = buildAdPaginationKeyboard(STAT_PAGINATION_PREFIX, page, totalPages,
 		encodeAdCallbackToken(range + '|' + String(chatId)));
 	if (pager && pager.inline_keyboard && pager.inline_keyboard[0]) rows.push(pager.inline_keyboard[0]);
+	// 「返回群设置」排在最后（导航惯例），且只在第一主人打开时出现。
+	if (showMenuBack) {
+		const back = buildSettingsBackKeyboard(chatId);
+		if (back) rows.push(back.inline_keyboard[0]);
+	}
 	return rows.length ? { inline_keyboard: rows } : null;
 }
 
-async function renderStatPage(env, chatId, range, page, chatTitle, nowMs = Date.now()) {
+async function renderStatPage(env, chatId, range, page, chatTitle, nowMs = Date.now(), showMenuBack = false) {
 	const info = statRangeDays(env, range, nowMs);
 	// 四项互不依赖，并发取：成员总数是实时 API，其余三项各一条 SQL。
 	const [summary, ranking, actions, memberCount] = await Promise.all([
@@ -17315,7 +17415,7 @@ async function renderStatPage(env, chatId, range, page, chatTitle, nowMs = Date.
 			lines.push(row.rank + '. ' + link + uname + ' — ' + row.count + ' 条');
 		}
 	}
-	const keyboard = buildStatsDataKeyboard(chatId, range, page, ranking.totalPages);
+	const keyboard = buildStatsDataKeyboard(chatId, range, page, ranking.totalPages, showMenuBack);
 	// 多块消息挂不上按钮（sendAdPagedMessage 的既有限制），退回文本提示。
 	const fallbackLine = ranking.totalPages > 1
 		? '翻页：<code>/stats ' + (range === 'day' ? '' : range + ' ') + '第 ' + Math.min(ranking.totalPages, page + 1) + ' 页需用按钮</code>'
@@ -17422,7 +17522,8 @@ async function handleStatsCommand(message, env, ctx) {
 			await sendTelegramMessage(chat.id, buildGroupStatsUsage(), buildStatsPanelKeyboard(chat.id));
 			return true;
 		}
-		const rendered = await renderStatPage(env, String(chat.id), range, 1, chat.title || '');
+		// 第 6 个参数 nowMs 走默认值（命令层内部自己取时间），第 7 个是「要不要挂返回群设置」。
+		const rendered = await renderStatPage(env, String(chat.id), range, 1, chat.title || '', undefined, isPrimaryOwner(actorId));
 		await sendAdPagedMessage(chat.id, rendered.text, rendered.keyboard, rendered.fallbackLine);
 		return true;
 	}
@@ -17446,7 +17547,7 @@ async function handleStatsCommand(message, env, ctx) {
 	}
 	let title = '';
 	try { const gi = await getChatInfoFromId(targetGroup); title = String(gi?.title || ''); } catch (_) {}
-	const rendered = await renderStatPage(env, String(targetGroup), range, 1, title);
+	const rendered = await renderStatPage(env, String(targetGroup), range, 1, title, undefined, isPrimaryOwner(actorId));
 	await sendAdPagedMessage(chat.id, rendered.text, rendered.keyboard, rendered.fallbackLine);
 	return true;
 }
@@ -17472,7 +17573,7 @@ async function handleStatsPaginationCallback(callbackQuery, env) {
 	const messageId = Number(callbackQuery?.message?.message_id) || 0;
 	let title = '';
 	try { const gi = await getChatInfoFromId(statChatId); title = String(gi?.title || ''); } catch (_) {}
-	const rendered = await renderStatPage(env, statChatId, range, page, title);
+	const rendered = await renderStatPage(env, statChatId, range, page, title, undefined, isPrimaryOwner(clickerId));
 	await editAdPagedMessage(msgChatId, messageId, rendered.text, rendered.keyboard);
 	await answerAdVoteCallback(callbackQuery?.id);
 }
@@ -17492,7 +17593,7 @@ async function handleStatsGoCallback(callbackQuery, env) {
 	if (!allowed) { await answerAdVoteCallback(callbackQuery?.id, '仅限该群管理员或主人操作', true); return; }
 	let title = '';
 	try { const gi = await getChatInfoFromId(statChatId); title = String(gi?.title || ''); } catch (_) {}
-	const rendered = await renderStatPage(env, statChatId, range, 1, title);
+	const rendered = await renderStatPage(env, statChatId, range, 1, title, undefined, isPrimaryOwner(clickerId));
 	// 发到面板所在聊天（即本群）；面板消息不动，数据作为额外一条出现在下方。
 	const targetChat = String(callbackQuery?.message?.chat?.id || statChatId);
 	await sendAdPagedMessage(targetChat, rendered.text, rendered.keyboard, rendered.fallbackLine);
@@ -17522,5 +17623,49 @@ async function handleStatsTrendCallback(callbackQuery, env) {
 	try { const gi = await getChatInfoFromId(statChatId); title = String(gi?.title || ''); } catch (_) {}
 	const rendered = await renderStatTrend(env, statChatId, days, range, title);
 	await editAdPagedMessage(msgChatId, messageId, rendered.text, rendered.keyboard);
+	await answerAdVoteCallback(callbackQuery?.id);
+}
+
+// 群设置菜单页回调：原地在「菜单 ↔ 子页面」之间切换。
+// data 形如 menu:<base64url "动作|chatId">，动作 ∈ root(回菜单) / stats / profile / health。
+// 【仅第一主人】菜单页本身就是仅第一主人的入口，回调端必须复查 ——
+// 按钮消息可能被转发出去，不能只靠「发起时是第一主人」。
+async function handleMenuCallback(callbackQuery, env) {
+	const data = String(callbackQuery?.data || '');
+	const clickerId = String(callbackQuery?.from?.id || '');
+	if (!isPrimaryOwner(clickerId)) { await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人', true); return; }
+	const token = decodeAdCallbackToken(data.slice(SETTINGS_MENU_PREFIX.length));
+	const sep = token.indexOf('|');
+	const action = sep >= 0 ? token.slice(0, sep) : 'root';
+	const statChatId = sep >= 0 ? token.slice(sep + 1) : '';
+	if (!statChatId) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
+
+	const msgChatId = String(callbackQuery?.message?.chat?.id || '');
+	const messageId = Number(callbackQuery?.message?.message_id) || 0;
+	let title = '';
+	if (isConfiguredGroup(statChatId)) {
+		try { const gi = await getChatInfoFromId(statChatId); title = String(gi?.title || ''); } catch (_) {}
+	}
+
+	let text = '';
+	let keyboard = null;
+	if (action === 'root') {
+		const menu = renderGroupSettingsMenu(statChatId, title);
+		text = menu.text; keyboard = menu.keyboard;
+	} else if (action === 'stats') {
+		// 从菜单进入 → 必挂「返回群设置」（本回调已确认是第一主人）。
+		const r = await renderStatPage(env, statChatId, 'day', 1, title, undefined, true);
+		text = r.text; keyboard = r.keyboard;
+	} else if (action === 'health') {
+		const report = await runHealthCheck(env);
+		text = renderHealthReport(report);
+		keyboard = buildSettingsBackKeyboard(statChatId);
+	} else if (action === 'profile') {
+		const hint = renderProfileHint(statChatId, title);
+		text = hint.text; keyboard = hint.keyboard;
+	} else {
+		await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return;
+	}
+	await editAdPagedMessage(msgChatId, messageId, text, keyboard);
 	await answerAdVoteCallback(callbackQuery?.id);
 }

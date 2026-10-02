@@ -4764,6 +4764,10 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('主人 /help → 含 /ad 投票与白名单管理', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('/add_ad_admin') && dm.body.text.includes('/del_ad_admin'));
 	assert('主人 /help → 含动态群组三条', !!dm && dm.body.text.includes('/addgroup') && dm.body.text.includes('/delgroup') && dm.body.text.includes('/listgroups'));
 	assert('主人 /help → 含查询与退群三条', !!dm && dm.body.text.includes('/admins') && dm.body.text.includes('/groups') && dm.body.text.includes('/leavegroup'));
+	// 第2批新增的两条隐藏命令（运行检查、群设置菜单）必须进清单，否则主人找不到入口
+	assert('主人 /help → 含 /health 运行检查与 /menu 群设置菜单',
+		!!dm && dm.body.text.includes('/health　') && dm.body.text.includes('/menu　'),
+		!!dm ? dm.body.text.split('\n').filter((l) => l.startsWith('/health') || l.startsWith('/menu')).join(' | ') : '无 /help 回执');
 	// 命令必须是裸文本（不包 <code>），Telegram 只对纯文本里的 /xxx 给「点击发送」
 	const helpCommandLines = dm.body.text.split('\n').filter((l) => /^\/[a-z_]/.test(l));
 	assert('主人 /help → 命令为裸文本，可点击直接发送',
@@ -6377,6 +6381,115 @@ console.log('\n[102] 批量任务通知范围与失败隔离');
 		? { ok: false, description: 'Forbidden: bot cannot send messages' } : { ok: true, result: { message_id: 99801 } } });
 	await sandbox.notifyBulkJobTargets({ ...job, notifySourceChat: true }, '批量任务最终结果');
 	assert('批量结果群内投递失败仍通知第一主人', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '999' && c.body.text.includes('批量任务最终结果')));
+}
+
+// ---------- [103] /menu 群设置菜单页：权限、三入口与回调 ----------
+console.log('\n[103] /menu 群设置菜单页');
+{
+	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+	const GROUP = { id: -1001, type: 'supergroup', title: '菜单测试群' };
+	const baseRoutes = {
+		getChat: () => ({ ok: true, result: { id: 1, title: '菜单测试群', type: 'supergroup' } }),
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 999 }, status: 'creator' }] }),
+		sendMessage: () => ({ ok: true, result: { message_id: 71000 } }),
+		editMessageText: () => ({ ok: true, result: { message_id: 71001 } }),
+		answerCallbackQuery: () => ({ ok: true, result: true }),
+	};
+	const tokenFor = (action, chatId) => 'menu:' + sandbox.encodeAdCallbackToken(action + '|' + chatId);
+	const sendMenu = async (actor, chatSpec) => {
+		resetCalls();
+		sandbox.fetch = makeFetchMock({ ...baseRoutes });
+		const env = { ...baseEnv, DB: makeFakeDB() };
+		const message = { message_id: 70001, chat: chatSpec, from: { id: actor, is_bot: false }, text: '/menu' };
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message }) }), env, fakeCtx);
+		return { env, msgs: callsOf('sendMessage') };
+	};
+	const clickMenu = async (actor, data, chatSpec = GROUP) => {
+		resetCalls();
+		sandbox.fetch = makeFetchMock({ ...baseRoutes });
+		const env = { ...baseEnv, DB: makeFakeDB() };
+		const cq = { id: 'cbmenu', from: { id: actor, is_bot: false },
+			message: { message_id: 71001, chat: chatSpec, text: '菜单' }, data };
+		await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ callback_query: cq }) }), env, fakeCtx);
+		return { env, edits: callsOf('editMessageText'), answers: callsOf('answerCallbackQuery') };
+	};
+	const chatLabel = (msgs) => JSON.stringify(msgs.map((x) => String(x.body.chat_id) + ':' + String(x.body.text).slice(0, 24)));
+
+	// ① 权限矩阵：仅第一主人，且仅配置群内
+	{
+		const { msgs } = await sendMenu(999, GROUP);
+		const m = msgs.find((x) => String(x.body.chat_id) === '-1001');
+		assert('[103] 第一主人群内 → 出菜单页', !!m && m.body.text.includes('群设置'), chatLabel(msgs));
+	}
+	{
+		const { msgs } = await sendMenu(999, { id: 999, type: 'private' });
+		const m = msgs.find((x) => String(x.body.chat_id) === '999');
+		assert('[103] 第一主人私聊 → 提示去配置群里发（菜单按群）', !!m && m.body.text.includes('配置群里'), chatLabel(msgs));
+	}
+	{
+		const { msgs } = await sendMenu(998, GROUP);
+		assert('[103] 副主人群内 → 完全静默，不暴露命令存在', msgs.length === 0, chatLabel(msgs));
+	}
+	{
+		const { msgs } = await sendMenu(998, { id: 998, type: 'private' });
+		const m = msgs.find((x) => String(x.body.chat_id) === '998');
+		assert('[103] 副主人私聊 → 提示仅限第一主人', !!m && m.body.text.includes('仅限第一主人'), chatLabel(msgs));
+	}
+	{
+		const { msgs } = await sendMenu(6666, GROUP);
+		assert('[103] 群管理员群内 → 静默（菜单是主人的，不给管理员入口）', msgs.length === 0, chatLabel(msgs));
+	}
+	{
+		const { msgs } = await sendMenu(999, { id: -1999, type: 'supergroup', title: '非配置群' });
+		// 非配置群的命令在分发前就被 isNonConfiguredGroup 拦掉（与 /rm 同策略），
+		// 连「不是配置群」的提示都不会发 —— 断言零回执，别去断言一句永远到不了的文案。
+		assert('[103] 第一主人在非配置群 → 完全不响应（非配置群命令一律拦）', msgs.length === 0, chatLabel(msgs));
+	}
+
+	// ② 菜单内容：三个入口 + 统一 menu: 前缀 + token 不超 64 字节
+	const { msgs: menuMsgs } = await sendMenu(999, GROUP);
+	const menuMsg = menuMsgs.find((x) => String(x.body.chat_id) === '-1001');
+	const rows = menuMsg?.body.reply_markup?.inline_keyboard || [];
+	const buttons = rows.flat();
+	assert('[103] 菜单三入口齐全（群统计 / 资料卡 / 运行检查）',
+		['群统计', '资料卡', '运行检查'].every((t) => buttons.some((b) => String(b.text).includes(t))),
+		JSON.stringify(buttons.map((b) => b.text)));
+	assert('[103] 入口回调统一 menu: 前缀',
+		buttons.length > 0 && buttons.every((b) => String(b.callback_data || '').startsWith('menu:')),
+		JSON.stringify(buttons.map((b) => b.callback_data)));
+	assert('[103] 每个回调 token 都在 64 字节内（Telegram 硬限）',
+		buttons.length > 0 && buttons.every((b) => Buffer.byteLength(String(b.callback_data || ''), 'utf8') <= 64),
+		JSON.stringify(buttons.map((b) => Buffer.byteLength(String(b.callback_data || ''), 'utf8'))));
+
+	// ③ 回调：回菜单 / 资料卡提示（都不依赖 D1 统计表）
+	{
+		const { edits, answers } = await clickMenu(999, tokenFor('root', '-1001'));
+		const edit = edits[0];
+		assert('[103] 点「返回群设置」→ 原地编辑回菜单', edits.length === 1 && String(edit?.body.text || '').includes('群设置'),
+			JSON.stringify(edits.map((e) => String(e.body.text).slice(0, 30))));
+		assert('[103] 菜单页回调已应答', answers.length === 1, String(answers.length));
+	}
+	{
+		const { edits } = await clickMenu(999, tokenFor('profile', '-1001'));
+		const text = String(edits[0]?.body.text || '');
+		const kb = (edits[0]?.body.reply_markup?.inline_keyboard || []).flat();
+		assert('[103] 点「资料卡」→ 出用法（含 /profile TGID）', edits.length === 1 && text.includes('/profile TGID'), text.slice(0, 60));
+		assert('[103] 资料卡提示页带「返回群设置」', kb.some((b) => String(b.text).includes('返回群设置')), JSON.stringify(kb.map((b) => b.text)));
+	}
+	// ④ 回调端权限复查：按钮消息可能被转发，不能只靠发起时是第一主人
+	{
+		const { edits, answers } = await clickMenu(998, tokenFor('stats', '-1001'));
+		assert('[103] 非第一主人点菜单 → 拒绝且不渲染', edits.length === 0, String(edits.length));
+		assert('[103] 拒绝时明确提示仅限第一主人',
+			answers.some((a) => String(a.body.text || '').includes('仅限第一主人')),
+			JSON.stringify(answers.map((a) => a.body.text)));
+	}
+	{
+		const { edits, answers } = await clickMenu(999, 'menu:not-a-valid-token');
+		assert('[103] 坏 token → 提示按钮数据已失效，不渲染',
+			edits.length === 0 && answers.some((a) => String(a.body.text || '').includes('失效')),
+			JSON.stringify(answers.map((a) => a.body.text)));
+	}
 }
 
 // ---------- 总结 ----------
