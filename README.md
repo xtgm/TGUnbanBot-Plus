@@ -240,6 +240,7 @@
 | `AD_OBSERVATION_SCORE` | `5` | 广告**观察**阈值（1-100） |
 | `AD_OBSERVATION_HOURS` | `24` | 观察窗口保留小时数（1-720） |
 | `AD_AI_SIMILARITY_THRESHOLD` | `0.78` | AI 硬命中阈值（0.1-1） |
+| `AD_AI_TOP_K` | `0` | **AI 多样本聚合（形态 E）**：`0` = 关闭（现行为，一条样本越线即定罪）；设 `3` 则取最高 3 条、**过半超线**才定罪，把单证改成多证。零额外 AI 推理，改回 `0` 即回退。**治不了「同质样本扎堆」**，那一类仍靠昵称剥离否证 |
 | `AD_FINGERPRINT_MIN_CONFIDENCE` | `0.6` | 指纹参与判定的最低置信度（0-1） |
 | `AD_PROTECTED_USERNAMES` | 空 | 权限人 `@handle` 永不学习白名单 |
 | `AD_TRUSTED_BOTS` | `nmnmfunbot,tc520lh_bot` | 可信 bot 白名单，名单内完全免检 |
