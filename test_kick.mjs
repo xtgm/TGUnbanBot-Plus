@@ -4764,10 +4764,13 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('主人 /help → 含 /ad 投票与白名单管理', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('/add_ad_admin') && dm.body.text.includes('/del_ad_admin'));
 	assert('主人 /help → 含动态群组三条', !!dm && dm.body.text.includes('/addgroup') && dm.body.text.includes('/delgroup') && dm.body.text.includes('/listgroups'));
 	assert('主人 /help → 含查询与退群三条', !!dm && dm.body.text.includes('/admins') && dm.body.text.includes('/groups') && dm.body.text.includes('/leavegroup'));
-	// 第2批新增的两条隐藏命令（运行检查、群设置菜单）必须进清单，否则主人找不到入口
+	// 第2批新增的隐藏命令（运行检查、群设置菜单、关键词搜索）必须进清单，否则主人找不到入口
 	assert('主人 /help → 含 /health 运行检查与 /menu 群设置菜单',
 		!!dm && dm.body.text.includes('/health　') && dm.body.text.includes('/menu　'),
 		!!dm ? dm.body.text.split('\n').filter((l) => l.startsWith('/health') || l.startsWith('/menu')).join(' | ') : '无 /help 回执');
+	assert('主人 /help → 含 /search 关键词搜索（写明权限是第一主人 + 群主）',
+		!!dm && dm.body.text.includes('/search ') && dm.body.text.includes('第一主人 + 该群群主'),
+		!!dm ? dm.body.text.split('\n').filter((l) => l.startsWith('/search')).join(' | ') : '无 /help 回执');
 	// 命令必须是裸文本（不包 <code>），Telegram 只对纯文本里的 /xxx 给「点击发送」
 	const helpCommandLines = dm.body.text.split('\n').filter((l) => /^\/[a-z_]/.test(l));
 	assert('主人 /help → 命令为裸文本，可点击直接发送',

@@ -1010,6 +1010,31 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 	assert('slash 命令：不进黑名单', env6.DB.query('SELECT COUNT(*) AS c FROM blacklist')[0].c === 0);
 	assert('slash 命令：不写观察窗口', env6.DB.query('SELECT COUNT(*) AS c FROM ad_user_screening')[0].c === 0);
 
+	// ===== 第2批 · 广告不进搜索库（/search 的检索源是 moderation_messages）=====
+	// 判定链：detectAdOnMessage 返回 'observe' → handleMessage 里 adObserved 为真 →
+	// 跳过 cacheModerationMessage。AD_CARD_KILL 设成 observe 是为了让【结构查杀】产出
+	// observe 而不是 ban（默认 ban 会直接封掉，走不到观察分支）。
+	const envObs = makeEnv({ AD_CARD_KILL: 'observe' });
+	resetCalls();
+	setApi(plainProfile);
+	await sendUpdate({ message: groupMessage({ id: 60051, first_name: '路人' }, '出货 批发 走量 USDT 有需要的来') }, envObs);
+	assert('observe：确实进了观察窗口（前置条件成立）',
+		envObs.DB.query('SELECT COUNT(*) AS c FROM ad_user_screening')[0].c === 1,
+		JSON.stringify(envObs.DB.query('SELECT user_id, score FROM ad_user_screening')));
+	assert('observe：不封禁、不删消息', countCalls('banChatMember') === 0 && countCalls('deleteMessage') === 0,
+		JSON.stringify(calls.map((c) => c.method)));
+	assert('observe：正文不写 moderation_messages（不进 /search 检索源）',
+		envObs.DB.query('SELECT COUNT(*) AS c FROM moderation_messages')[0].c === 0,
+		JSON.stringify(envObs.DB.query('SELECT mid, text_norm FROM moderation_messages')));
+	// 对照组：同一条链路的正常消息必须写进去 —— 否则上面那条「0 条」可能只是表没建，是假通过。
+	const envOk = makeEnv();
+	resetCalls();
+	setApi(plainProfile);
+	await sendUpdate({ message: groupMessage({ id: 60052, first_name: '路人' }, '今天天气不错，一起吃饭吗') }, envOk);
+	assert('对照：正常消息照样写进 moderation_messages（证明上一条不是假通过）',
+		envOk.DB.query('SELECT COUNT(*) AS c FROM moderation_messages')[0].c === 1,
+		JSON.stringify(envOk.DB.query('SELECT mid, text_norm FROM moderation_messages')));
+
 	// 群管理员发同样的文本：鉴权通过即跳过，连资料都不拉。
 	const env7 = makeEnv();
 	resetCalls();

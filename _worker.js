@@ -155,6 +155,16 @@ const DEFAULT_KILLER_MODE_GROUPS = [];
 // 杀手模式默认状态：false = 默认 OFF（禁言，同 GKY）；true = 默认 ON（封禁踢出）。
 const KILLER_MODE_DEFAULT_ON = false;
 
+// 10.7) 关键词搜索的保留群（环境变量 STAT_SEARCH_GROUPS，逗号分隔超级群 ID，中英文逗号均可）。
+//    moderation_messages 全局只留 200 条（按 autoincrement 取最新），别的群照旧；
+//    只有列进来的群改按【创建时间】保留 STAT_SEARCH_RETENTION_DAYS 天，这样 /search 才查得到历史。
+//    与 KILLER_MODE_GROUPS 同款模式：列进来的群会自动并入有效 GROUP_IDS ——
+//    否则它们不算配置群、isConfiguredGroup 为 false，消息根本不写缓存，配了也搜不到东西。
+//    空数组 = 该功能不启用，裁剪逻辑与改动前完全一致（零影响）。
+const DEFAULT_STAT_SEARCH_GROUPS = [];
+// 搜索群正文保留天数（按 moderation_messages.created_at 裁剪）。
+const STAT_SEARCH_RETENTION_DAYS = 180;
+
 // 11) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
 //    留空 → 用 GROUP_IDS[0]（主群），与原行为一致。
 //    填了就直接用（2026-09-26 方案 A）：联系群只用来生成那颗按钮的链接，不参与封禁/检测/鉴权，
@@ -217,6 +227,9 @@ let OWNER_IDS = [];
 let SUPER_ADMIN_IDS = [];
 // 杀手模式可用群 ID 列表（环境变量 KILLER_MODE_GROUPS）。每群 ON/OFF 存 D1，第一主人用 /killer 切换。
 let KILLER_MODE_GROUPS = [];
+// 关键词搜索的保留群 ID 列表（环境变量 STAT_SEARCH_GROUPS）。这些群的正文按天保留 180 天，
+// 其余群维持全局 200 条。空数组 = 不启用，裁剪行为与改动前完全一致。
+let STAT_SEARCH_GROUPS = [];
 // 每请求解析出的「当前处于禁言模式（杀手 OFF）」的群集合。KILLER_MODE_GROUPS 为空时恒为空集、零开销。
 let MUTE_MODE_GROUP_SET = new Set();
 // 静态用户资料表：bot 不在其所在群时作为 /admins 权限名单的兜底显示
@@ -241,12 +254,15 @@ function applyRuntimeConfig(config) {
 	TOKEN = config.TOKEN;
 	BOT_TOKEN = config.BOT_TOKEN;
 	KILLER_MODE_GROUPS = config.KILLER_MODE_GROUPS || [];
+	STAT_SEARCH_GROUPS = config.STAT_SEARCH_GROUPS || [];
 	// 杀手模式群并入有效 GROUP_IDS：它们即使不在 GROUP_ID 环境变量里，也享受完整全群治理
 	// （/stats、/ban、/spam、/check、/ad、广告检测、发言/进退群统计），但执行走禁言不踢
 	// —— 因为杀手模式 OFF 时 isGroupMuteMode 命中，banUserFromAllGroups / 拦截 / 批量 / purge
 	// 都会把这些群改成 restrictChatMember 禁言。等价于「加进 GROUP_ID + 杀手 OFF」，只是可用
 	// KILLER_MODE_GROUPS 单独管理。
-	const effectiveGroupIds = [...new Set([...(config.GROUP_IDS || []), ...KILLER_MODE_GROUPS])];
+	// 搜索群同样并入：不并入就不算配置群，isConfiguredGroup 为 false，消息一条都不写缓存，
+	// STAT_SEARCH_GROUPS 配了也搜不到东西。语义上它也确实是「我们要治理并留下记录的群」。
+	const effectiveGroupIds = [...new Set([...(config.GROUP_IDS || []), ...KILLER_MODE_GROUPS, ...STAT_SEARCH_GROUPS])];
 	GROUP_IDS = effectiveGroupIds;
 	// 每请求把动态群基线重置为空：GROUP_IDS 此刻只含环境变量群（含杀手模式群），
 	// 随后 mergeDynamicGroupsFromD1 再按 D1 内容追加，避免 isolate 复用时残留上次的群。
@@ -487,6 +503,15 @@ function loadRequiredConfig(env) {
 		killerModeGroups = sanitizeGroups((Array.isArray(DEFAULT_KILLER_MODE_GROUPS) ? DEFAULT_KILLER_MODE_GROUPS : []).join(','));
 	}
 
+	// 搜索群：同款解析（环境变量优先，否则用顶部默认值）。
+	let statSearchGroups = [];
+	const rawSearchEnv = env.STAT_SEARCH_GROUPS;
+	if (rawSearchEnv !== undefined && rawSearchEnv !== null && String(rawSearchEnv).trim() !== '') {
+		statSearchGroups = sanitizeGroups(rawSearchEnv);
+	} else {
+		statSearchGroups = sanitizeGroups((Array.isArray(DEFAULT_STAT_SEARCH_GROUPS) ? DEFAULT_STAT_SEARCH_GROUPS : []).join(','));
+	}
+
 	// 顶部 6 项可配置文案/参数：环境变量优先，否则用内置默认值
 	const pickStr = (envVal, fallback) => {
 		if (envVal === undefined || envVal === null) return fallback;
@@ -565,6 +590,7 @@ function loadRequiredConfig(env) {
 		OWNER_IDS: ownerIds,
 		SUPER_ADMIN_IDS: superAdminIds,
 		KILLER_MODE_GROUPS: killerModeGroups,
+		STAT_SEARCH_GROUPS: statSearchGroups,
 		AD_PROTECTED_USERNAMES: parseAdProtectedUsernames(env.AD_PROTECTED_USERNAMES),
 		MSG_CACHE_SIZE: msgCacheSize,
 		FLASH_MESSAGE_TTL_MS: flashTtlMs,
@@ -1253,11 +1279,30 @@ function shouldPruneD1Cache(insertResult) {
 	return insertedId === null || insertedId % D1_CACHE_PRUNE_INTERVAL === 0;
 }
 
-async function pruneAutoincrementCacheTable(env, table, keepLimit) {
+async function pruneAutoincrementCacheTable(env, table, keepLimit, nowMs = Date.now()) {
 	if (table !== 'moderation_messages') {
 		throw new Error(`Unsupported D1 cache table: ${table}`);
 	}
 	const safeLimit = Math.max(1, Math.floor(Number(keepLimit) || 1));
+	// 【第2批 · 分群裁剪】搜索群按 created_at 保留 STAT_SEARCH_RETENTION_DAYS 天（/search 的历史来源），
+	// 其余群仍按 autoincrement 保留最新 keepLimit 条 —— 与改动前逐字一致。
+	// 搜索群没配时走下面的原版单条 SQL，行为一个字都不变（零影响）。
+	if (STAT_SEARCH_GROUPS.length) {
+		const notIn = STAT_SEARCH_GROUPS.map(() => '?').join(',');
+		// created_at 存的是 UTC ISO（new Date().toISOString()），字典序即时间序，直接比字符串。
+		const cutoffIso = new Date(nowMs - STAT_SEARCH_RETENTION_DAYS * 86400000).toISOString();
+		await env.DB.prepare(
+			`DELETE FROM ${table} WHERE chat_id IN (${notIn}) AND created_at < ?`
+		).bind(...STAT_SEARCH_GROUPS, cutoffIso).run();
+		// 「其他群维持全局 200 条」的名额必须【只在非搜索群里算】：
+		// 子查询不排除搜索群的话，搜索群的行会占掉这 200 个名额，别的群实际保留数少于 keepLimit。
+		await env.DB.prepare(
+			`DELETE FROM ${table} WHERE chat_id NOT IN (${notIn}) AND id <= COALESCE((
+				SELECT id FROM ${table} WHERE chat_id NOT IN (${notIn}) ORDER BY id DESC LIMIT 1 OFFSET ?
+			), 0)`
+		).bind(...STAT_SEARCH_GROUPS, ...STAT_SEARCH_GROUPS, safeLimit).run();
+		return;
+	}
 	await env.DB.prepare(`DELETE FROM ${table} WHERE id <= COALESCE((SELECT id FROM ${table} ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`)
 		.bind(safeLimit)
 		.run();
@@ -7438,6 +7483,11 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 		await handleStatsGoCallback(callbackQuery, env);
 		return;
 	}
+	if (data.startsWith(SEARCH_PREFIX)) {
+		await handleSearchPaginationCallback(callbackQuery, env);
+		return;
+	}
+
 	if (data.startsWith(SETTINGS_MENU_PREFIX)) {
 		await handleMenuCallback(callbackQuery, env);
 		return;
@@ -7781,9 +7831,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
-	if (await detectAdOnMessage(message, env)) {
+	// detectAdOnMessage 三种返回：true = 已封禁处置（直接收尾）；
+	// 'observe' = 转入观察（继续走后续，但正文不进搜索库）；false = 放行。
+	const adVerdict = await detectAdOnMessage(message, env);
+	if (adVerdict === true) {
 		return;
 	}
+	const adObserved = adVerdict === 'observe';
 
 	// /add_ad_admin、/del_ad_admin：第一主人管理 /ad 发起白名单。
 	if (text && /^\/(add_ad_admin|del_ad_admin)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
@@ -7838,7 +7892,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		message.from && !message.from.is_bot &&
 		message.message_id &&
 		!isTelegramServiceMessage(message) &&
-		!(text && text.startsWith('/'))
+		!(text && text.startsWith('/')) &&
+		// 转入观察的那条不写：它是 /search 的检索源，广告正文不入库（方案「广告不记录」）。
+		!adObserved
 	) {
 		// 【同款直封】写缓存与查名单是同一条 SQL。只有「有资格被直封」的消息才需要等结果：
 		//   不带引用（群友回复广告只删不封，那条由重发通道处理）+ 发送者不是主人/副主人/超管。
@@ -8498,6 +8554,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
+	// ===== /search 关键词搜索（第一主人 + 该群群主）=====
+	if (isSearchCommand(text)) {
+		await handleSearchCommand(message, env);
+		return;
+	}
+
 	// ===== /notice 全体通知（仅第一主人私聊；群内静默）=====
 	if (isNoticeCommand(text)) {
 		await handleNoticeCommand(message, env, ctx);
@@ -8543,6 +8605,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/rm　回复要删的消息后发送 → 删除该消息（仅第一主人 / 该群群主）',
 			'/health　运行检查：bot 状态自检 + 逐群查在不在群、是不是管理员、三个权限',
 			'/menu　群设置菜单：群统计 / 资料卡 / 运行检查 的入口页（仅第一主人，群里发）',
+			'/search 关键词|TGID|@用户名　查谁发过什么（第一主人 + 该群群主）',
 			'/blacklist　查看全局黑名单最近记录（主人 / 副主人）',
 			'/job 任务ID [页码]　查大批量封禁任务的进度',
 			'/jobrun 任务ID　手动续跑未完成的批量任务',
@@ -14922,7 +14985,8 @@ async function detectAdOnJoin(message, env, ctx) {
 // 插在黑名单兜底拦截之后：已黑用户根本走不到这里。
 // 成本控制是关键：先用纯 JS 的文本 / 转发评分做零成本预筛，得分为 0 立即退出，
 // 只有可疑消息才付出 getChat + AI 推理的代价，正常聊天不产生任何额外子请求。
-// 返回 true 表示已处置（调用方应立即 return），false 表示放行给后续逻辑。
+// 返回 true 表示已处置（调用方应立即 return）；'observe' 表示转入观察（调用方继续走后续逻辑，
+// 但不把这条正文写进 moderation_messages —— 那是 /search 的检索源）；false 表示放行。
 async function detectAdOnMessage(message, env) {
 	if (!env?.DB) return false;
 	const chat = message?.chat;
@@ -15239,6 +15303,11 @@ async function detectAdOnMessage(message, env) {
 		}, config);
 		console.log('[广告检测] 闸二转入观察 user=' + userId + ' score=' + evaluation.score + '/' + config.scoreThreshold
 			+ ' 留存行为分=' + (evaluation.retainScore ?? 0));
+		// 【第2批 · 广告不进搜索库】转入观察 = 已经可疑但还没定罪，这条正文不该留在
+		// moderation_messages 里供 /search 检索（已封的那条天然不写 —— detectAdOnMessage
+		// 返回 true 时调用方直接收尾，根本走不到写缓存；缺口只有 observe 这一条）。
+		// 在这里返回标记，而不是回头去删：此刻消息还没写进缓存，写入在更后面的 cacheModerationMessage。
+		return 'observe';
 	}
 	return false;
 }
@@ -17101,6 +17170,236 @@ function isMenuCommand(text) {
 	return /^\/menu(?:@[^\s]+)?(?:\s|$)/i.test(String(text || '').trim());
 }
 
+function isSearchCommand(text) {
+	return /^\/search(?:@[^\s]+)?(?:\s|$)/i.test(String(text || '').trim());
+}
+
+// /search 权限：第一主人 + 【该群 Telegram 群主】（creator），普通管理员一律不给。
+// 主人的口径是「能看历史发言的人越少越好」—— /stats 还只是数字，这里能看到谁说过什么。
+// 不复用 checkIfUserIsAdminInGroup：那个只回答「是不是管理员」，区分不出 creator。
+// 不接 AD_ADMIN_CACHE：它存的是 id 列表、没有 status，判不了群主；搜索低频，直接查一次。
+async function isGroupCreator(userId, chatId) {
+	const uid = String(userId || '');
+	const gid = String(chatId || '');
+	if (!uid || !gid || !isConfiguredGroup(gid)) return false;
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: gid }),
+		});
+		const result = await response.json();
+		if (!result?.ok || !Array.isArray(result.result)) return false;
+		const hit = result.result.find((m) => String(m?.user?.id) === uid);
+		return hit?.status === 'creator';
+	} catch (error) {
+		console.error('[搜索] 查询群主失败:', error);
+		return false;
+	}
+}
+
+// ===== 关键词搜索（第2批 · 第7步）=====
+// 检索源是 moderation_messages 的 text_norm（小写化的归一正文，写入时截断 200 字）。
+// 两个已知边界，方案里明说接受：① 正文只存到第 200 个字符，后面的内容搜不到；
+// ② 命令消息（/xxx 开头）从来不进这张表，搜不到任何命令。
+const SEARCH_PAGE_SIZE = 10;
+const SEARCH_PREFIX = 'searchpg:';
+
+// 分类查询词：@用户名 → username 检索；纯数字（≥5 位）→ 当 TGID 查发送者；其余当关键词。
+function classifySearchQuery(raw) {
+	const v = String(raw || '').trim();
+	if (!v) return null;
+	if (/^@?[A-Za-z0-9_]{4,}$/.test(v) && v.startsWith('@')) return { kind: 'username', value: v.slice(1) };
+	if (/^\d{5,}$/.test(v)) return { kind: 'user', value: v };
+	return { kind: 'keyword', value: v };
+}
+
+// @username → TGID。Bot API 没有「按用户名查用户 ID」的接口，
+// 但 stat_speech 存了每个发言者的 username（由发言钩子写入、覆盖面最广），反查一次即可。
+// 拿不到就是查不到 —— 返回空串让上层明说「没找到这个用户名」，绝不退回成「搜全部」。
+async function resolveUsernameToUserId(env, rawName) {
+	const name = String(rawName || '').replace(/^@+/, '').trim().toLowerCase();
+	if (!name || !env?.DB) return '';
+	if (!(await statReady(env))) return '';
+	try {
+		const row = await env.DB.prepare(
+			'SELECT user_id FROM stat_speech WHERE LOWER(username) = ? ORDER BY day DESC LIMIT 1'
+		).bind(name).first();
+		return row?.user_id ? String(row.user_id) : '';
+	} catch (error) {
+		console.error('[搜索] 用户名反查失败:', error);
+		return '';
+	}
+}
+
+// 执行检索。三个条件可组合（群范围 + 发送者 + 关键词），LIKE 一律转义并走 ESCAPE，
+// 免得查询词里的 % _ 把整库都匹出来。
+async function runSearchMessages(env, opts) {
+	const empty = { rows: [], total: 0, totalPages: 1 };
+	if (!env?.DB) return empty;
+	const pageSize = SEARCH_PAGE_SIZE;
+	const page = Math.max(1, Number(opts.page) || 1);
+	const where = [];
+	const params = [];
+	if (Array.isArray(opts.chatIds) && opts.chatIds.length) {
+		where.push('chat_id IN (' + opts.chatIds.map(() => '?').join(',') + ')');
+		params.push(...opts.chatIds.map(String));
+	}
+	if (opts.userId) { where.push('from_id = ?'); params.push(String(opts.userId)); }
+	if (opts.keyword) {
+		where.push("text_norm LIKE ? ESCAPE '\\'");
+		const escaped = String(opts.keyword).toLowerCase().replace(/[\\%_]/g, (c) => '\\' + c);
+		params.push('%' + escaped + '%');
+	}
+	if (!where.length) return empty;
+	const whereSql = 'WHERE ' + where.join(' AND ');
+	try {
+		const totalRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM moderation_messages ' + whereSql).bind(...params).first();
+		const total = Number(totalRow?.c) || 0;
+		const totalPages = Math.max(1, Math.ceil(total / pageSize));
+		const { results } = await env.DB.prepare(
+			'SELECT mid, chat_id, from_id, created_at, text_norm FROM moderation_messages ' + whereSql
+			+ ' ORDER BY id DESC LIMIT ? OFFSET ?'
+		).bind(...params, pageSize, (page - 1) * pageSize).all();
+		return { rows: results || [], total, totalPages };
+	} catch (error) {
+		console.error('[搜索] 查询失败:', error);
+		return empty;
+	}
+}
+
+// /search 权限统一入口：第一主人无条件放行；其余必须是【该群 Telegram 群主】（creator）。
+// 群内才判得到群主；私聊没有群上下文，只有第一主人能用。
+async function canUseSearch(userId, chatId) {
+	if (isPrimaryOwner(userId)) return true;
+	if (!chatId) return false;
+	return await isGroupCreator(userId, chatId);
+}
+
+// 渲染搜索结果。o: { scopeLabel, queryLabel, rows, total, page, totalPages, showChatId, historyNote }
+function renderSearchResult(o) {
+	const lines = ['🔍 <b>搜索</b> · ' + o.scopeLabel, '查询：' + o.queryLabel, ''];
+	if (!o.total) {
+		lines.push('（没有匹配的记录）');
+	} else {
+		lines.push('共 <b>' + o.total + '</b> 条'
+			+ (o.totalPages > 1 ? '　第 <b>' + o.page + '/' + o.totalPages + '</b> 页' : ''));
+		lines.push('');
+		for (const r of o.rows) {
+			const who = '<a href="tg://user?id=' + escapeHtml(String(r.from_id || '')) + '">'
+				+ escapeHtml(String(r.from_id || '')) + '</a>';
+			// 跨群搜索时标出群 ID（群内搜索标题里已有群名，不必重复）
+			const where = o.showChatId ? '　<code>' + escapeHtml(String(r.chat_id || '')) + '</code>' : '';
+			// text_norm 可能为 null（迁移没跑完时的降级写入），显示「无正文」而不是空白行。
+			const body = r.text_norm ? escapeHtml(String(r.text_norm).slice(0, 200)) : '<i>（无正文）</i>';
+			lines.push('• <code>' + escapeHtml(formatBeijingTime(r.created_at)) + '</code>　' + who + where);
+			lines.push('　' + body);
+		}
+	}
+	if (o.historyNote) lines.push('', o.historyNote);
+	return lines.join('\n');
+}
+
+// 保留策略提示：说清楚「为什么有些群只有最近 200 条」，别让人以为是 bug。
+function searchHistoryNote(scopeChatIds) {
+	const configured = scopeChatIds.filter((c) => STAT_SEARCH_GROUPS.includes(String(c)));
+	if (configured.length === scopeChatIds.length && configured.length > 0) {
+		return '📖 本群正文保留 <b>' + STAT_SEARCH_RETENTION_DAYS + '</b> 天（在 <code>STAT_SEARCH_GROUPS</code> 里）。';
+	}
+	if (configured.length === 0) {
+		return '📖 本群未列入 <code>STAT_SEARCH_GROUPS</code>，只保留全局最新 200 条 —— 更早的搜不到。';
+	}
+	return '📖 列入 <code>STAT_SEARCH_GROUPS</code> 的群保留 <b>' + STAT_SEARCH_RETENTION_DAYS
+		+ '</b> 天，其余群只有全局最新 200 条。';
+}
+
+// /search 权限与用法
+function buildSearchUsage() {
+	return [
+		'🔍 <b>搜索</b> · 用法',
+		'在消息缓存里查谁发过什么。<b>权限：第一主人 + 该群群主</b>。',
+		'',
+		'• <code>/search 关键词</code>　按正文搜（大小写不敏感）',
+		'• <code>/search 709xxxxx</code>　按 TGID 查这个人发过什么',
+		'• <code>/search @用户名</code>　按用户名查（内部反查成 TGID）',
+		'',
+		'群内发 = 只查本群；私聊发 = 跨全部配置群（仅第一主人）。',
+		'',
+		'⚠️ 两个已知边界：正文写入时截断 <b>200 字</b>，后面的搜不到；命令消息（<code>/</code> 开头）从不入库，搜不到任何命令。'
+	].join('\n');
+}
+
+// /search 命令处理。返回 true 表示已处理。
+async function handleSearchCommand(message, env) {
+	const userId = getMessageActorId(message);
+	const isInGroup = message.chat?.type !== 'private';
+	const chatId = String(message.chat?.id || '');
+	const raw = String(message.text || '').replace(/^\/search(?:@[^\s]+)?\s*/i, '').trim();
+
+	if (!isInGroup) {
+		// 私聊没有群上下文，群主无从判起 —— 只给第一主人（可跨全部配置群）。
+		if (!isPrimaryOwner(userId)) {
+			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/search 仅限第一主人或配置群群主使用；私聊查询仅限第一主人。');
+			return true;
+		}
+	} else if (!(await canUseSearch(userId, chatId))) {
+		// 群内非第一主人且非本群群主 → 静默，不暴露这条隐藏命令的存在。
+		return true;
+	}
+
+	if (!raw) {
+		await sendTelegramMessage(chatId, buildSearchUsage());
+		return true;
+	}
+
+	const q = classifySearchQuery(raw);
+	if (!q) { await sendTelegramMessage(chatId, buildSearchUsage()); return true; }
+
+	let userIdFilter = null;
+	let keywordFilter = null;
+	let queryLabel = '';
+	if (q.kind === 'user') {
+		userIdFilter = q.value;
+		queryLabel = '发送者 <code>' + escapeHtml(q.value) + '</code>';
+	} else if (q.kind === 'username') {
+		userIdFilter = await resolveUsernameToUserId(env, q.value);
+		if (!userIdFilter) {
+			// 查不到就明说查不到 —— 不能退回成「搜全部关键词」，那是完全不同的结果集。
+			await sendTelegramMessage(chatId, '⚠️ 没找到用户名 <code>@' + escapeHtml(q.value)
+				+ '</code> 的记录。\n\n该用户可能没在发言统计里出现过，或用户名拼写有误。');
+			return true;
+		}
+		queryLabel = '@' + escapeHtml(q.value) + '（<code>' + escapeHtml(userIdFilter) + '</code>）';
+	} else {
+		keywordFilter = q.value;
+		queryLabel = '关键词「' + escapeHtml(q.value) + '」';
+	}
+
+	// 群内只查本群；私聊（已确认是第一主人）跨全部配置群。
+	const scopeChatIds = isInGroup ? [String(chatId)] : GROUP_IDS.map(String);
+	const result = await runSearchMessages(env, {
+		chatIds: scopeChatIds, userId: userIdFilter, keyword: keywordFilter, page: 1
+	});
+	// token 只存查询的三个要素（类型|值|范围），翻页回调据此原样重跑。
+	const token = [q.kind, q.value, isInGroup ? String(chatId) : 'all'].join('|');
+	const scopeLabel = isInGroup
+		? (String(message.chat?.title || '') || '群 <code>' + escapeHtml(String(chatId)) + '</code>')
+		: '全部配置群';
+	const text = renderSearchResult({
+		scopeLabel,
+		queryLabel,
+		rows: result.rows,
+		total: result.total,
+		page: 1,
+		totalPages: result.totalPages,
+		showChatId: !isInGroup,
+		historyNote: searchHistoryNote(scopeChatIds)
+	});
+	const keyboard = buildAdPaginationKeyboard(SEARCH_PREFIX, 1, result.totalPages, encodeAdCallbackToken(token));
+	await sendAdPagedMessage(chatId, text, keyboard, '（记录较多，用下方按钮翻页）');
+	return true;
+}
+
 // bot_chat_join_request 处理：申请人「发起申请」的那一刻（还不是群成员）。
 // 只记时间，不批准/拒绝 —— 审批是管理员在 Telegram 客户端点的，bot 不代劳。
 // 群未开启入群审批时，这个 update 永远不会推送，本函数不会被执行。
@@ -17666,6 +17965,62 @@ async function handleMenuCallback(callbackQuery, env) {
 	} else {
 		await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return;
 	}
+	await editAdPagedMessage(msgChatId, messageId, text, keyboard);
+	await answerAdVoteCallback(callbackQuery?.id);
+}
+
+// /search 翻页回调：原地编辑成下一页。data 形如 searchpg:<页>:<base64url "类型|值|范围">。
+// 权限与命令端完全一致地重查一遍 —— 按钮消息可能被转发，不能只靠发起时验过。
+async function handleSearchPaginationCallback(callbackQuery, env) {
+	const data = String(callbackQuery?.data || '');
+	const clickerId = String(callbackQuery?.from?.id || '');
+	const body = data.slice(SEARCH_PREFIX.length);
+	if (body === 'noop') { await answerAdVoteCallback(callbackQuery?.id); return; }
+	const match = body.match(/^(\d+):(.*)$/);
+	if (!match) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
+	const page = Math.max(1, parseInt(match[1], 10) || 1);
+	const parts = decodeAdCallbackToken(match[2]).split('|');
+	const kind = parts[0] || 'keyword';
+	const value = parts[1] || '';
+	const scope = parts[2] || 'all';
+	if (!value) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
+
+	// 权限复查：'all' 表示私聊发起的跨群搜索（只有第一主人），否则按群判群主。
+	if (scope === 'all') {
+		if (!isPrimaryOwner(clickerId)) { await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人或该群群主', true); return; }
+	} else if (!(await canUseSearch(clickerId, scope))) {
+		await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人或该群群主', true);
+		return;
+	}
+
+	const scopeChatIds = scope === 'all' ? GROUP_IDS.map(String) : [String(scope)];
+	let userIdFilter = null;
+	let keywordFilter = null;
+	let queryLabel = '';
+	if (kind === 'user') { userIdFilter = value; queryLabel = '发送者 <code>' + escapeHtml(value) + '</code>'; }
+	else if (kind === 'username') {
+		userIdFilter = await resolveUsernameToUserId(env, value);
+		if (!userIdFilter) { await answerAdVoteCallback(callbackQuery?.id, '没有该用户名的记录', true); return; }
+		queryLabel = '@' + escapeHtml(value) + '（<code>' + escapeHtml(userIdFilter) + '</code>）';
+	} else { keywordFilter = value; queryLabel = '关键词「' + escapeHtml(value) + '」'; }
+
+	const result = await runSearchMessages(env, {
+		chatIds: scopeChatIds, userId: userIdFilter, keyword: keywordFilter, page
+	});
+	const msgChatId = String(callbackQuery?.message?.chat?.id || '');
+	const messageId = Number(callbackQuery?.message?.message_id) || 0;
+	let scopeLabel = scope === 'all' ? '全部配置群' : '';
+	if (scope !== 'all') {
+		try { const gi = await getChatInfoFromId(scope); scopeLabel = String(gi?.title || '') || ('群 <code>' + escapeHtml(scope) + '</code>'); }
+		catch (_) { scopeLabel = '群 <code>' + escapeHtml(scope) + '</code>'; }
+	}
+	const text = renderSearchResult({
+		scopeLabel, queryLabel, rows: result.rows, total: result.total, page,
+		totalPages: result.totalPages, showChatId: scope === 'all',
+		historyNote: searchHistoryNote(scopeChatIds)
+	});
+	const keyboard = buildAdPaginationKeyboard(SEARCH_PREFIX, page, result.totalPages,
+		encodeAdCallbackToken([kind, value, scope].join('|')));
 	await editAdPagedMessage(msgChatId, messageId, text, keyboard);
 	await answerAdVoteCallback(callbackQuery?.id);
 }
