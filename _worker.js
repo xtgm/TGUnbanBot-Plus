@@ -5370,7 +5370,9 @@ async function handleChatMemberUpdate(chatMember, env) {
 			source: 'chat_member'
 		});
 		// 已封禁的人后面那套「管理员操作同步」没有意义：他已经不在群里了。
-		if (joinVerdict === 'banned') return;
+		// 'dryrun' = 判定命中但演练没处置，人还在群里。仍要在这里 return：
+		// 下面那套是给 kicked / promoted 之类管理员动作用的，入群场景继续走会触发无关逻辑。
+		if (joinVerdict === 'banned' || joinVerdict === 'dryrun') return;
 	}
 
 	// 跳过：操作人是被操作用户本人（用户自愿 leave 不算管理员动作）
@@ -5778,7 +5780,196 @@ async function setKillerMode(env, chatId, on, byUser) {
 		return { ok: false, error: error.message || String(error) };
 	}
 }
+
+// ===== 演练模式（dryrun）=====
+//
+// 【做什么】群开关打开后广告判定照常跑，但处置链一个人都不动：不加黑、不封禁、
+// 不删消息、不学指纹 / AI 样本 / 头像 / 形状、不写 /ignore 快照 —— 只写一条流水，
+// 并推一条带 🧪 的私聊给第一主人。用途是「动手之前先看会封谁」，调阈值用。
+//
+// 【代价，必须一直写明】演练开着 = 本群完全不设防，广告照发、不删不封。这是演练的
+// 本质不是缺陷，但回执与 /adstats 都要显眼提示，别让人开了忘记关。
+//
+// 【为什么开关不进 fetch 入口的刷新】killer_mode 走 refreshMuteModeGroups 在每个请求
+// 开头读一次；演练若照抄，每条普通消息都会多一条 D1 查询，直接把
+// 「稳定态核心 SQL ≤ 3 条」那条断言撞红。演练只在【定罪时】才走到读开关这一步，
+// 热路径永远到不了它，所以这里刻意不做运行期缓存、也不挂进 fetch 入口。
+const D1_DRYRUN_INIT_PROMISES = new WeakMap();
 
+async function ensureDryRunTable(env) {
+	if (!env.DB) return false;
+	const cached = D1_DRYRUN_INIT_PROMISES.get(env.DB);
+	if (cached) return cached;
+	const initPromise = (async () => {
+		try {
+			if (!(await ensureD1Table(env))) throw new Error('D1 核心结构不可用');
+			await runD1SchemaStatement(
+				env,
+				'dryrun_groups',
+				'CREATE TABLE IF NOT EXISTS dryrun_groups (chat_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, by_user TEXT, at TEXT NOT NULL);',
+			);
+			return true;
+		} catch (error) {
+			console.error('D1 演练模式表初始化失败: ' + formatD1SchemaError(error));
+			return false;
+		}
+	})();
+	D1_DRYRUN_INIT_PROMISES.set(env.DB, initPromise);
+	const initialized = await initPromise;
+	if (!initialized) D1_DRYRUN_INIT_PROMISES.delete(env.DB);
+	return initialized;
+}
+
+// 该群此刻是否演练模式。
+// 【读失败一律返回 false = 照常处置】：开关读不出来时宁可真的执行处置，也不能因为
+// 一次 D1 抖动就把整个群静默变成不设防 —— 演练是主人主动开的，防护缺位不能由故障引发。
+async function isDryRunGroup(env, chatId) {
+	const id = String(chatId || '');
+	if (!id || !env?.DB) return false;
+	if (!(await ensureDryRunTable(env))) return false;
+	try {
+		const row = await env.DB.prepare('SELECT enabled FROM dryrun_groups WHERE chat_id = ?').bind(id).first();
+		return Number(row?.enabled) === 1;
+	} catch (error) {
+		console.error('[演练模式] 读取开关失败（按正常处置继续）:', error);
+		return false;
+	}
+}
+
+// 写开关。返回 {ok, error}，供命令回执区分「写成功」与「写失败」。
+async function setDryRun(env, chatId, on, byUser) {
+	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
+	if (!(await ensureDryRunTable(env))) return { ok: false, error: 'D1 演练模式表初始化失败' };
+	try {
+		await env.DB.prepare('INSERT OR REPLACE INTO dryrun_groups (chat_id, enabled, by_user, at) VALUES (?, ?, ?, ?)')
+			.bind(String(chatId), on ? 1 : 0, String(byUser || ''), new Date().toISOString())
+			.run();
+		return { ok: true, on: !!on };
+	} catch (error) {
+		console.error('[演练模式] 写入开关失败:', error);
+		return { ok: false, error: error.message || String(error) };
+	}
+}
+
+// 已开演练的群 → Map(chat_id → 1)。供 /dryrun 私聊列出各群状态。
+async function readDryRunStateMap(env) {
+	const map = new Map();
+	if (!env.DB) return map;
+	if (!(await ensureDryRunTable(env))) return map;
+	try {
+		const { results } = await env.DB.prepare('SELECT chat_id, enabled FROM dryrun_groups').all();
+		for (const r of (results || [])) if (Number(r.enabled) === 1) map.set(String(r.chat_id), 1);
+	} catch (error) {
+		console.error('[演练模式] 读取状态失败:', error);
+	}
+	return map;
+}
+
+// ===== 演练流水 =====
+//
+// 【为什么单独一张表】演练命中的价值全在「判据 reasons + 得分」，要能回头逐条复盘。
+// 现有几张表都存不了它：ad_user_screening 与 ad_pending_snapshots 一小时就过期、
+// moderation_messages 只留最近 200 条且不含判据、blacklist 只有封过的没有未处置的。
+//
+// 【为什么懒建而不进广告层完整性复验】演练是可选功能，这张表没建好时只该丢演练流水，
+// 不能连累广告检测整体判为「未就绪」而把真处置一起停摆。与 ad_spam_texts 同一套做法：
+// 按需建、建失败不缓存、下次再试。
+//
+// 保留 30 天：写入时顺手清掉超期旧行，表永远很小，不为一个可选功能再占一条 cron 节拍。
+const AD_DRYRUN_LOG_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const D1_AD_DRYRUN_LOG_INIT = new WeakMap();
+
+async function ensureAdDryRunLogTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_AD_DRYRUN_LOG_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			await runD1SchemaStatement(env, 'ad_dryrun_log',
+				'CREATE TABLE IF NOT EXISTS ad_dryrun_log (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, user_id TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 0, verdict TEXT NOT NULL DEFAULT \'\', layer TEXT NOT NULL DEFAULT \'\', reasons TEXT NOT NULL DEFAULT \'\', snapshot TEXT NOT NULL DEFAULT \'\', created_at INTEGER NOT NULL DEFAULT 0)');
+			await runD1SchemaStatement(env, 'idx_ad_dryrun_created', 'CREATE INDEX IF NOT EXISTS idx_ad_dryrun_created ON ad_dryrun_log (created_at)', { optional: true });
+			return true;
+		} catch (error) {
+			console.error('[演练模式] 建流水表失败:', error?.message || error);
+			return false;
+		}
+	})();
+	D1_AD_DRYRUN_LOG_INIT.set(env.DB, init);
+	const ok = await init;
+	if (!ok) D1_AD_DRYRUN_LOG_INIT.delete(env.DB);
+	return ok;
+}
+
+// 记一条演练命中。返回流水 id（拿不到返回 null）。
+// 【写失败绝不影响调用方】：演练本来就什么都不做，流水少一条只影响复盘，
+// 不能因为一次 D1 抖动让处置链的返回结构变样、进而让调用方的回执分支走错。
+async function recordAdDryRun(env, input) {
+	if (!env?.DB) return null;
+	if (!(await ensureAdDryRunLogTable(env))) return null;
+	try {
+		const evaluation = input?.evaluation || {};
+		const nowSeconds = Math.floor(Date.now() / 1000);
+		const res = await env.DB.prepare(
+			'INSERT INTO ad_dryrun_log (chat_id, user_id, score, threshold, verdict, layer, reasons, snapshot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+		).bind(
+			String(input?.chatId || ''),
+			String(input?.userId || ''),
+			Number(evaluation.score) || 0,
+			Number(evaluation.threshold) || 0,
+			String(evaluation.verdict || ''),
+			String(evaluation.layer || ''),
+			JSON.stringify(Array.isArray(evaluation.reasons) ? evaluation.reasons.slice(0, 20) : []),
+			JSON.stringify(evaluation.snapshot || {}),
+			nowSeconds
+		).run();
+		await env.DB.prepare('DELETE FROM ad_dryrun_log WHERE created_at < ?')
+			.bind(nowSeconds - Math.floor(AD_DRYRUN_LOG_TTL_MS / 1000)).run();
+		// 三写法兜底，与 pruneAutoincrementCacheTable 取自增主键的口径一致。
+		return Number(res?.meta?.last_row_id ?? res?.meta?.lastRowId ?? res?.meta?.last_rowid) || null;
+	} catch (error) {
+		console.error('[演练模式] 写入流水失败:', error);
+		return null;
+	}
+}
+
+// 读演练流水：最近 limit 条，可按群过滤。供 /adstats 一屏展示。
+async function readAdDryRunLog(env, options = {}) {
+	const rows = [];
+	if (!env?.DB) return rows;
+	if (!(await ensureAdDryRunLogTable(env))) return rows;
+	const limit = Math.max(1, Math.min(Number(options.limit) || 5, 20));
+	try {
+		const chatId = String(options.chatId || '');
+		const stmt = chatId
+			? env.DB.prepare('SELECT id, chat_id, user_id, score, threshold, layer, reasons, created_at FROM ad_dryrun_log WHERE chat_id = ? ORDER BY id DESC LIMIT ?').bind(chatId, limit)
+			: env.DB.prepare('SELECT id, chat_id, user_id, score, threshold, layer, reasons, created_at FROM ad_dryrun_log ORDER BY id DESC LIMIT ?').bind(limit);
+		const { results } = await stmt.all();
+		for (const r of (results || [])) rows.push(r);
+	} catch (error) {
+		console.error('[演练模式] 读取流水失败:', error);
+	}
+	return rows;
+}
+
+// 某群的演练命中条数（今日与累计两个口径，/adstats 一屏用）。
+async function countAdDryRun(env, chatId) {
+	const out = { total: 0, today: 0 };
+	if (!env?.DB) return out;
+	if (!(await ensureAdDryRunLogTable(env))) return out;
+	const id = String(chatId || '');
+	try {
+		if (id) {
+			const { results } = await env.DB.prepare(
+				'SELECT COUNT(*) AS total, SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS today FROM ad_dryrun_log WHERE chat_id = ?'
+			).bind(Math.floor(Date.now() / 1000) - 86400, id).all();
+			out.total = Number(results?.[0]?.total) || 0;
+			out.today = Number(results?.[0]?.today) || 0;
+		}
+	} catch (error) {
+		console.error('[演练模式] 统计流水失败:', error);
+	}
+	return out;
+}
 
 // 当前群清扫缓存：保存普通用户近期消息 ID，供 /spam 引用回复时清扫该用户当前群近期消息。
 // 只记消息 ID 与发送者，不存正文 —— 这是自动广告治理移除后唯一保留的消息缓存。
@@ -8510,6 +8701,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (await handleKillerCommand(message, env)) return;
 	}
 
+	// /dryrun 演练模式切换（仅第一主人；任意配置群内有效）。其他人一律静默。
+	// 必须排在广告检测分发【之前】：演练是判定之后的处置开关，命令本身不该被检测吃掉。
+	if (isDryRunCommand(text)) {
+		if (await handleDryRunCommand(message, env)) return;
+	}
+
 	if (isCheckCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
 		const dispatchSourceAllowed = !isInGroup || isConfiguredGroup(chatId);
@@ -8756,6 +8953,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/killer on　开启：命中即全群封禁并踢出',
 			'/killer off　关闭：仅永久禁言不踢出（仍加黑）',
 			'/killer status　查看本群当前处于哪种模式',
+			'',
+			'<b>━━ 演练模式（仅第一主人 · 任意配置群）━━</b>',
+			'/dryrun　翻转本群开关；私聊发送则列出已开演练的群与命中数',
+			'/dryrun on　开启：判定照跑，但不删不封不学习，命中只写流水并私聊通知你',
+			'/dryrun off　关闭：恢复自动处置（加黑 + 全群封禁 + 删消息 + 自动学习）',
+			'/dryrun status　查看本群当前状态',
+			'　　⚠️ 演练期间本群完全不设防、广告照发，调完阈值记得关',
 			'',
 			'<b>━━ 全体通知（仅第一主人私聊）━━</b>',
 			'/notice　发起全体通知，随后按提示发一条内容（文本/图片/视频/文件均可）',
@@ -15711,7 +15915,14 @@ const AD_LAYER_LABELS = {
 // 渲染推送给第一主人的判定通知。序号是 /ignore 的唯一入口。
 function renderAdDetectionNotice(evaluation, context) {
 	const lines = [];
-	lines.push('<b>🚫 广告号自动封禁</b>');
+	// 演练命中必须换标题：复用正常回执却挂着「广告号自动封禁」，
+	// 主人会以为真封了，转头去群里一看人还在、消息也在。
+	if (context?.dryrun) {
+		lines.push('<b>🧪 广告号演练命中（未处置）</b>');
+		lines.push('演练模式：判定照跑，但本群不删不封、不加黑、不学习');
+	} else {
+		lines.push('<b>🚫 广告号自动封禁</b>');
+	}
 	if (context?.seq) lines.push('快照序号：<b>#' + context.seq + '</b>');
 	lines.push('用户：<code>' + escapeHtml(String(context?.userId || '')) + '</code>');
 	if (evaluation.snapshot.name) lines.push('名称：' + escapeHtml(evaluation.snapshot.name));
@@ -15756,6 +15967,34 @@ function renderAdDetectionNotice(evaluation, context) {
 	return lines.join('\n');
 }
 
+
+// 演练命中的私聊通知。与正常封禁回执同一条链路（第一主人私聊），但标题与处置结果
+// 必须让人一眼看出【没有真的动手】—— 否则主人会以为广告已经清掉，转头去群里一看还在。
+async function pushAdDryRunNotice(env, context) {
+	const ownerId = getOwnerNotifyTargets()[0] || '';
+	if (!ownerId) return;
+	try {
+		const evaluation = context?.evaluation || {};
+		const notice = renderAdDetectionNotice(evaluation, {
+			userId: context?.userId,
+			chatTitle: context?.input?.chatTitle || '',
+			seq: null,
+			dryrun: true,
+			banResultLine: '演练命中，未处置（不加黑 / 不封禁 / 不删消息 / 不学习）'
+		});
+		const tail = [
+			'',
+			'本来会执行：加黑 + 全群封禁 + 删消息 + 学指纹与 AI 样本',
+			'流水号：' + (context?.dryRunId ? '#' + context.dryRunId : '（未写入，D1 写失败）'),
+			'查看本群命中：<code>/adstats</code>　关闭本群演练：<code>/dryrun</code>',
+			'⚠️ 演练期间本群完全不设防，广告照发 —— 看完记得关。'
+		];
+		await sendTelegramMessageChunks(ownerId, notice + '\n' + tail.join('\n'));
+	} catch (error) {
+		console.error('[广告检测·演练] 推送通知失败:', error);
+	}
+}
+
 // === 处置执行 ===
 // 判定为广告后的统一处置链：加黑 → 全群封禁 → 删触发消息 → 自动学指纹 → 存快照 → 推私聊 → 清观察记录。
 // 每一步独立容错：加黑失败仍继续封禁，封禁部分失败仍推送通知，
@@ -15764,6 +16003,41 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	const userId = String(input?.userId ?? '');
 	const chatId = input?.chatId != null ? String(input.chatId) : '';
 	if (!userId) return { banned: false, seq: null, reason: 'no_user' };
+
+	// ===== 演练模式：命中只记流水 + 推私聊，一个人都不动 =====
+	//
+	// 【必须插在这个位置】在 noteParts、加黑、全群封禁、删消息、四类学习、
+	// /ignore 快照之前 —— 演练的定义就是这些动作一个都不做，挪到后面就晚了。
+	//
+	// 【chatId 为空不演练】演练开关是按群开的，chatId 空说明这次处置没有可归属的群，
+	// 查不出属于哪个群就不该猜，按正常处置继续。
+	//
+	// 【读开关失败也不演练】见 isDryRunGroup：一次 D1 抖动不能把整个群静默变成不设防。
+	if (chatId && (await isDryRunGroup(env, chatId))) {
+		let dryRunId = null;
+		try {
+			dryRunId = await recordAdDryRun(env, { userId, chatId, evaluation, input });
+		} catch (error) {
+			console.error('[广告检测·演练] 记录流水失败:', error);
+		}
+		await pushAdDryRunNotice(env, { userId, chatId, evaluation, input, dryRunId });
+		console.log('[广告检测·演练] 命中未处置 user=' + userId + ' chat=' + chatId
+			+ ' score=' + evaluation?.score + '/' + evaluation?.threshold
+			+ ' layer=' + evaluation?.layer + ' 流水=' + dryRunId);
+		// 返回结构刻意对齐正常处置，只是 banned=false、seq=null：
+		// cron 那条调用点读的是 result?.banned !== false，会正确记成「未封」；
+		// banSummary 给非空值是让 /spam 那条群内闪屏读到时能显示演练字样而不是「未知」。
+		return {
+			banned: false,
+			dryrun: true,
+			seq: null,
+			dryRunId,
+			blacklistCode: null,
+			banSummary: '演练命中（未处置）',
+			learned: 0,
+			sampleAdded: false
+		};
+	}
 
 	const noteParts = [
 		'广告自动判定',
@@ -16015,7 +16289,7 @@ async function screenAdJoinMember(env, member, options = {}) {
 				console.log('[广告检测] 入群筛查 user=' + userId + ' 是其他配置群的管理员，豁免不封');
 				return 'skipped';
 			}
-			await enforceAdDetection(env, {
+			const result = await enforceAdDetection(env, {
 				userId,
 				chatId,
 				chatTitle: options.chatTitle || '',
@@ -16025,6 +16299,9 @@ async function screenAdJoinMember(env, member, options = {}) {
 			// 口径严格等于「新人被处理数」—— 不含老成员被违规踢出（那是 kicked_count 的事）。
 			// 上面管理员豁免的分支已经 return，走不到这里，不会把豁免记成治理。
 			// disposal 这一格已由 enforceAdDetection 按封禁结果记过，这里只补 newcomer，不重复计。
+			// 演练命中不记 newcomer：风控这一格的口径是【真被处置过的新人】，
+			// 演练一个都没动，记进去会让面板的治理数据虚高。
+			if (result?.dryrun) return 'dryrun';
 			await recordStatAction(env, chatId, 'newcomer');
 			return 'banned';
 		}
@@ -17288,6 +17565,28 @@ async function handleAdStatsCommand(env, chatId) {
 		? '✅ 每日上限 ' + config.avatarVisionDaily + ' 张（模型 ' + AD_AVATAR_VISION_MODEL + '）'
 		: '⏸️ 已关闭（AD_AVATAR_VISION_DAILY=0），只跑头像指纹，不调模型'));
 	lines.push('<b>域名白名单</b>　生效 <b>' + whitelist.size + '</b> 条（D1 自定义 ' + whitelistRows + ' 条，内置种子 ' + AD_DOMAIN_WHITELIST_SEED.length + ' 条）');
+	// 演练模式：本群开关 + 命中流水。放在最后一屏，与判定、库状态分开 ——
+	// 主人调阈值时要的正是「刚才有没有命中、命中是因为什么」。
+	if (isConfiguredGroup(chatId)) {
+		const dryOn = await isDryRunGroup(env, chatId);
+		lines.push('<b>演练模式</b>　' + (dryOn ? '🧪 本群【开启】—— 判定照跑，但不删不封、不加黑、不学习' : '✅ 本群关闭（正常自动处置）'));
+		const dryCounts = await countAdDryRun(env, chatId);
+		if (dryCounts.total > 0) {
+			lines.push('　↳ 命中：今日 <b>' + dryCounts.today + '</b> 条，累计 <b>' + dryCounts.total + '</b> 条（流水保留 30 天）');
+			const dryRows = await readAdDryRunLog(env, { chatId, limit: 5 });
+			for (const row of dryRows) {
+				let reasons = [];
+				try { reasons = JSON.parse(String(row.reasons || '[]')); } catch (_) {}
+				const when = new Date((Number(row.created_at) || 0) * 1000).toISOString().slice(5, 16).replace('T', ' ');
+				lines.push('· #' + row.id + ' ' + when + '　user=' + escapeHtml(String(row.user_id))
+					+ '　' + (Number(row.score) || 0) + '/' + (Number(row.threshold) || 0)
+					+ '　' + escapeHtml(AD_LAYER_LABELS[String(row.layer)] || String(row.layer)));
+				if (reasons.length) lines.push('　依据：' + escapeHtml(String(reasons[0]).slice(0, 60)));
+			}
+		} else if (dryOn) {
+			lines.push('　↳ 尚无命中记录');
+		}
+	}
 	await sendTelegramMessageChunks(chatId, lines.join('\n'));
 }
 
@@ -17378,6 +17677,8 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 	const config = loadAdDetectionConfig(env);
 	const whitelist = await loadAdDomainWhitelist(env);
 	const banned = [];
+	// 演练命中的单独归类：混进 banned 会拼成「已封禁 N 人」，而一个人都没动。
+	const dryRunHits = [];
 	const kept = [];
 	const cleared = [];
 	const failed = [];
@@ -17409,13 +17710,14 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 				await deleteAdScreening(env, userId);
 				cleared.push(userId);
 			} else if (evaluation.verdict === 'ban') {
-				await enforceAdDetection(env, {
+				const dryResult = await enforceAdDetection(env, {
 					userId,
 					chatId: targetChatId,
 					chatTitle: '',
 					messageId: null
 				}, evaluation, { config, whitelist });
-				banned.push(userId + '(' + evaluation.score + ')');
+				if (dryResult?.dryrun) dryRunHits.push(userId + '(' + evaluation.score + ')');
+			else banned.push(userId + '(' + evaluation.score + ')');
 			} else if (evaluation.verdict === 'observe') {
 				await upsertAdScreening(env, userId, {
 					chatId: targetChatId,
@@ -17442,6 +17744,7 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 		'本次处理 <b>' + rows.length + '</b> 人（上限 ' + limit + '）',
 		'',
 		'判定为广告并封禁：<b>' + banned.length + '</b>',
+		'演练命中（未处置）：<b>' + dryRunHits.length + '</b>',
 		'继续观察：<b>' + kept.length + '</b>',
 		'解除观察：<b>' + cleared.length + '</b>',
 		'复判失败：<b>' + failed.length + '</b>'
@@ -17450,6 +17753,11 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 		lines.push('');
 		lines.push('已封禁：');
 		for (const item of banned.slice(0, 10)) lines.push('· <code>' + escapeHtml(item) + '</code>');
+	}
+	if (dryRunHits.length) {
+		lines.push('');
+		lines.push('🧪 演练命中（不删不封，命中只记流水）：');
+		for (const item of dryRunHits.slice(0, 10)) lines.push('· <code>' + escapeHtml(item) + '</code>');
 	}
 	if (failed.length) {
 		lines.push('');
@@ -17634,10 +17942,16 @@ async function handleAdReplyLearning(message, env, ctx) {
 	}, evaluation, { config, whitelist, sampleText: semanticText, sampleSource: semanticSource });
 
 	await deleteMessage(chat.id, message.message_id);
-	await sendFlashMessage(chat.id, [
-		'✅ 已按广告处置 ' + targetId,
-		'指纹 +' + (Number(learn?.learned) || 0) + '　封禁 ' + (enforced.banSummary || '未知')
-	].join('\n'), ctx);
+	await sendFlashMessage(chat.id, enforced?.dryrun
+		? [
+			'🧪 演练命中（未处置）' + targetId,
+			'本来会：加黑 + 全群封禁 + 删消息 + 学指纹',
+			'本群不设防中，看完发 /dryrun 关闭'
+		]
+		: [
+			'✅ 已按广告处置 ' + targetId,
+			'指纹 +' + (Number(learn?.learned) || 0) + '　封禁 ' + (enforced.banSummary || '未知')
+		], ctx);
 
 	// 群内只留 5 秒闪屏（含 TGID 与指纹计数，不宜长期公开），完整详情私聊第一主人。
 	// enforceAdDetection 内部只在【自动判定】路径推送快照通知；回复学习是管理员主动触发，
@@ -17647,7 +17961,8 @@ async function handleAdReplyLearning(message, env, ctx) {
 	if (ownerId) {
 		const displayName = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
 		const noticeLines = [
-			'<b>🛡 回复学习已执行</b>',
+			// 演练命中不能挂「已执行」：主人会照着下面的撤销命令去解一个根本没封的人。
+			enforced?.dryrun ? '<b>🧪 回复学习 · 演练命中（未处置）</b>' : '<b>🛡 回复学习已执行</b>',
 			'',
 			'<b>操作人：</b>' + formatUserReference(operatorId, from),
 			'<b>群组：</b>' + escapeHtml(chat.title || '未知') + '（<code>' + escapeHtml(String(chat.id)) + '</code>）',
@@ -17665,12 +17980,19 @@ async function handleAdReplyLearning(message, env, ctx) {
 			'<b>命中依据：</b>' + escapeHtml(evaluation.reasons.slice(0, 6).join('；') || '（无）'),
 			'',
 			'<b>处置结果</b>',
-			'黑名单：' + (enforced.blacklistCode === 'ADDED' ? '已加入' : enforced.blacklistCode === 'EXISTS' ? '此前已在黑名单' : String(enforced.blacklistCode || '未知')),
-			'全群封禁：' + (enforced.banSummary || '未知'),
-			'学入指纹：' + (Number(learn?.learned) || 0) + ' 条（manual 来源，豁免误报退役）',
-			''
+			...(enforced?.dryrun
+				? ['🧪 演练模式：不加黑、不封禁、不删消息、未学入指纹',
+					'本来会：加黑 + 全群封禁 + 删消息 + 学指纹与 AI 样本']
+				: ['黑名单：' + (enforced.blacklistCode === 'ADDED' ? '已加入' : enforced.blacklistCode === 'EXISTS' ? '此前已在黑名单' : String(enforced.blacklistCode || '未知')),
+					'全群封禁：' + (enforced.banSummary || '未知'),
+					'学入指纹：' + (Number(learn?.learned) || 0) + ' 条（manual 来源，豁免误报退役）',
+					'']),
 		];
-		if (enforced.seq) {
+		if (enforced?.dryrun) {
+			// 没有 seq 也没有真封：/unban 会去解一个根本没封的人，必须把这条路堵掉。
+			noticeLines.push('无需撤销（没有真的处置）。本群不设防中，看完发 <code>/dryrun</code> 关闭；'
+				+ '命中流水看 <code>/adstats</code>。');
+		} else if (enforced.seq) {
 			noticeLines.push('复核：/pending 查看第 <b>' + enforced.seq + '</b> 号快照，'
 				+ '判错发 <code>/ignore ' + enforced.seq + '</code> 可解黑 + 全群解封 + 给指纹记误报。');
 		} else {
@@ -18727,6 +19049,81 @@ async function handleKillerCommand(message, env) {
 		? '☠️ <b>杀手模式已开启</b>\n本群此后触发处置的用户将【全群封禁 + 踢出】。'
 		: '🔇 <b>杀手模式已关闭</b>\n本群此后触发处置的用户【仅永久禁言、不踢出】，仍写入全局黑名单。');
 	return true;
+}
+function isDryRunCommand(text) {
+	return typeof text === 'string' && /^\/dryrun(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
+}
+
+// /dryrun 演练模式切换。仅第一主人（与 /killer 同一道门：敏感开关不放开给群管理员）。
+// 返回 true = 本条已处理，调用方短路；非第一主人同样返回 true 但只静默吞掉，
+// 不回任何话 —— 群里不暴露这条命令的存在。
+// 群内：/dryrun 翻转本群；/dryrun on|off 显式设置；/dryrun status 只看不改。
+// 私聊：列出已开演练的群与命中数（只读）。
+// /dryrun 演练模式切换。仅第一主人（与 /killer 同一道门：敏感开关不放开给群管理员）。
+// 返回 true = 本条已处理，调用方短路；非第一主人同样返回 true 但只静默吞掉，
+// 不回任何话 —— 群里不暴露这条命令的存在。
+// 群内：/dryrun 翻转本群；/dryrun on|off 显式设置；/dryrun status 只看不改。
+// 私聊：列出已开演练的群与命中数（只读）。
+async function handleDryRunCommand(message, env) {
+	const userId = getMessageActorId(message);
+	if (!isPrimaryOwner(userId)) return true;
+	const chatId = String(message.chat?.id || '');
+	const isInGroup = message.chat?.type !== 'private';
+	const arg = String(message.text || '').replace(/^\/dryrun(?:@\[^\s]+)?\s*/i, '').trim().toLowerCase();
+	
+if (!isInGroup) {
+	const stateMap = await readDryRunStateMap(env);
+	if (!stateMap.size) {
+		await sendTelegramMessage(chatId, '🧪 当前没有任何群处于演练模式。到目标群内发 <code>/dryrun</code> 开启。');
+		return true;
+	}
+	const lines = ['🧪 <b>演练模式 · 已开启的群</b>（在目标群内发 <code>/dryrun</code> 切换）'];
+	for (const id of stateMap.keys()) {
+		let title = '';
+		try { const gi = await getChatInfoFromId(id); title = String(gi?.title || ''); } catch (_) {}
+		const label = title
+				? '<b>' + escapeHtml(title) + '</b> <code>' + escapeHtml(id) + '</code>'
+				: '<code>' + escapeHtml(id) + '</code>';
+		const counts = await countAdDryRun(env, id);
+		lines.push('• ' + label + '：今日命中 ' + counts.today + ' 条（累计 ' + counts.total + '）');
+	}
+	lines.push('');
+	lines.push('⚠️ 演练期间这些群不删不封，调完阈值记得回来关。');
+	await sendTelegramMessage(chatId, lines.join('\n'));
+	return true;
+}
+	
+if (!isConfiguredGroup(chatId)) {
+	await sendTelegramMessage(chatId, '⚠️ 本群不在配置群列表：请先在群里发 <code>/addgroup</code>，'
+			+ '或把本群 ID 加进 <code>GROUP_IDS</code> 环境变量。本群本来就不做广告处置，开演练没有意义。');
+	return true;
+}
+	
+const currentlyOn = await isDryRunGroup(env, chatId);
+if (/^(status|状态)$/.test(arg)) {
+	await sendTelegramMessage(chatId, currentlyOn
+			? '🧪 当前：演练模式【开启】—— 判定照跑，但不删不封、不学习，只写流水并私聊通知你。'
+			: '✅ 当前：演练模式【关闭】—— 正常自动处置。');
+	return true;
+}
+let target;
+	if (/^(on|开|开启|启用)$/.test(arg)) target = true;
+	else if (/^(off|关|关闭)$/.test(arg)) target = false;
+	else target = !currentlyOn;   // 裸 /dryrun = 翻转
+	
+const r = await setDryRun(env, chatId, target, userId);
+if (!r.ok) {
+	await sendTelegramMessage(chatId, '❌ 切换失败：' + escapeHtml(toChineseErrorText(r.error || '未知错误')));
+	return true;
+}
+await sendTelegramMessage(chatId, target
+		? '🧪 <b>演练模式已开启</b>\n'
+			+ '判定照常跑，但本群【不删消息、不封禁、不加黑、不学指纹与样本】，'
+			+ '命中只写流水，并私聊通知你。\n'
+			+ '⚠️ 演练期间本群完全不设防，广告照发 —— 调完阈值记得再发一次 <code>/dryrun</code> 关闭。\n'
+			+ '查看命中：<code>/adstats</code>'
+		: '✅ <b>演练模式已关闭</b>\n本群恢复自动处置（加黑 + 全群封禁 + 删消息 + 自动学习）。');
+return true;
 }
 
 // 解析粒度参数：week/周 → 本周，month/月 → 本月，其余（含空）→ 今日。

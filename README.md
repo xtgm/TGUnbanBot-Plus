@@ -103,6 +103,7 @@
 | `/addgroup` `/delgroup` `/listgroups` | 仅第一主人私聊 | 指令增删治理群（存 D1 `dynamic_groups`，不改环境变量；三道硬校验） |
 | `/killer [on\|off\|status]` | 仅第一主人 · 群内 | 切换杀手模式：**ON = 全群封禁踢出**（含 `/ban` `/spam` 与自动处置）、**OFF = 仅永久禁言不踢出**（默认 OFF，需群在 `KILLER_MODE_GROUPS`）；非杀手群的 `/ban` `/spam` 恒为禁言，要踢人用 `/sban`；私聊 `/killer` 列出各群状态 |
 | `/leavegroup -100xxxx` | 仅第一主人私聊 | 让 bot 真的退出群（与 `/delgroup` 区别：后者只停止治理） |
+| `/dryrun [on\|off\|status]` | 仅第一主人 · 配置群内 | **演练模式**：判定照跑但不删不封不加黑不学习，命中写流水 + 私聊通知你；私聊 `/dryrun` 列出已开的群与命中数。⚠️ 演练期间该群完全不设防 |
 | `/add_ad_admin TGID` `/del_ad_admin TGID` | 仅第一主人私聊 | 授权 / 取消某成员发起 `/ad` 举报投票 |
 | `/pending [N]` `/ignore 序号` `/rescreen [N]` `/adstats` | 仅第一主人私聊 | 广告检测复核与状态查询，见 [广告检测](#广告检测) |
 | `/words [页码]` `/addword` `/delword` `/addsample` `/clearsamples` `/warmup` `/whitelist` | 仅第一主人私聊 | 指纹库、语义样本与域名白名单维护 |
@@ -116,6 +117,7 @@
 | 手动封禁不同步 | 真人点 Telegram 封禁按钮 | **不写入 D1 黑名单**，仅发审计通知 |
 | 手动解封封回 | 对象仍在 D1 黑名单 | 立即封回（群内手动解封无法绕过全局黑名单） |
 | 广告自动处置 | 总分 ≥ `AD_SCORE_THRESHOLD` | 加黑 + 全群封禁 + 删消息 + 学指纹与 AI 样本 + 回执带 `/ignore` 序号 |
+| 演练模式 | 群内 `/dryrun` 开启 | 上面这条**一条都不执行**，命中只写流水 + 私聊通知（调阈值先看会封谁）。⚠️ 该群期间完全不设防 |
 | 转入观察 | 总分 ≥ `AD_OBSERVATION_SCORE` 但未及封禁线 | 写观察窗口，窗口内再发即累加；**正文不进 `/search` 检索源** |
 | 批量任务自动续接 | 超出同步安全预算 | 转 D1 批量任务 + Queues 分片续接到完成 |
 | 定时滚动复查 | cron（每天 2 次、日限 300 人） | 分档复查简介：进群 6 小时内每 2 小时一查，越往后越疏、3 天封顶；bio 没改且判据库没更新则跳过 |
@@ -146,7 +148,7 @@
 | `/pending [N]` | 看待确认快照（得分、判据、资料） |
 | `/ignore 序号` | **误封一键纠错**：解封 + 给命中指纹加误报，累计 3 次退役该指纹 |
 | `/rescreen [N]` | 重新筛查观察窗口里的可疑用户 |
-| `/adstats` | 总览阈值、AI 状态、指纹与样本规模、头像指纹库、观察窗口人数 |
+| `/adstats` | 总览阈值、AI 状态、指纹与样本规模、头像指纹库、观察窗口人数；末屏是本群**演练状态**与命中流水 |
 
 ### 指纹库与样本库维护（仅第一主人私聊）
 
@@ -174,21 +176,21 @@
 | 部署后 | 发 `/adstats`，确认表与种子数据已建 |
 | 绑了 AI | 发几次 `/warmup` 补满向量 |
 | 发现漏放 | 引用回复 `/spam` 最快；被抢先删的用 `/recent` + `/learnlast` |
-| 校准阈值 | 用 `/pending` 复核（测试证明不了阈值设得对） |
+| 校准阈值 | 先开 `/dryrun` 看会封谁，再用 `/pending` 复核（测试证明不了阈值设得对） |
 ## 项目结构
 
 ```text
 .
 ├── _worker.js             # Worker 主程序（单文件，含广告检测层）
 ├── wrangler.toml          # Cloudflare Wrangler 配置（D1 / Queue / AI 绑定）
-├── test_*.mjs             # 21 个离线测试文件
+├── test_*.mjs             # 22 个离线测试文件
 ├── README.md
 └── LICENSE
 ```
 
 | 项 | 数值 | 说明 |
 | --- | --- | --- |
-| 测试文件 | **21 个** | 合计 **3464 项**，全绿才允许推送 |
+| 测试文件 | **22 个** | 合计 **3523 项**，全绿才允许推送 |
 | 测试方式 | `node test_xxx.mjs` | 每个文件独立可跑，退出码非 0 即失败 |
 | 运行要求 | **Node 22+** | `node:sqlite` 内置模块要求 |
 | 测试环境 | 全部离线 | Bot API 全 mock，D1 用 `node:sqlite` 的 `DatabaseSync(':memory:')` **真实 SQLite 后端**（`ON CONFLICT`、`UNIQUE`、`batch` 事务真跑），Workers AI 用固定向量函数模拟 |
@@ -290,6 +292,7 @@
 | 统计 | `stat_member_events` | 入群 / 退群 / 申请**明细**（`/profile` 时间线数据源，**永久不剪枝**） |
 | 投票 | `ad_votes` `ad_vote_allowlist` | `/ad` 投票状态（保留 7 天）与发起白名单。**按需建立** |
 | 杀手模式 | `killer_mode` | 每群 ON/OFF 开关（`/killer` 的存储）。**按需建立** |
+| 演练模式 | `dryrun_groups` | 每群 ON/OFF 开关（`/dryrun` 的存储）。**按需建立** |
 | 广告检测 | `ad_fingerprints` | 广告指纹库（keyword / domain / username / bio 四类，含命中数、误报数、置信度、来源） |
 | 广告检测 | `ad_user_screening` | 观察窗口记录（得分、判据、资料快照、过期时间） |
 | 广告检测 | `ad_sample_embeddings` | AI 语义样本与向量（向量懒加载，首次建表写入 10 条种子） |
@@ -302,6 +305,7 @@
 | 广告检测 | `ad_avatars` | **头像指纹库**：主键 `big_file_unique_id`（官方保证跨时间跨 bot 稳定），记判决 / 复用定罪次数 / 下载句柄。`verdict` = `pending` 待识别、`ad` 广告图、`clean` 已排除 |
 | 广告检测 | `ad_spam_texts` | 同款直封名单（正文哈希，`/spam` 学入后直发即删 + 封）。**按需建立** |
 | 广告检测 | `ad_profile_shapes` | **资料形状库**：bio 归一化哈希 + 复用定罪次数，给同模板批量号跨账号加分 |
+| 广告检测 | `ad_dryrun_log` | **演练命中流水**：得分、阈值、判据（`reasons`），保留 30 天。**按需建立**，不进完整性复验 |
 
 > **广告检测的表走独立初始化路径**，与核心 5 表完全隔离，`D1_SCHEMA_VERSION` 保持 `8` 不变 —— 老部署升级后现有黑名单数据**一条都不会动**。建表失败时整个广告层静默跳过并进入 60 秒冷却（避免 D1 抖动时每条消息都重试迁移耗尽子请求预算），既有功能不受任何影响。
 
