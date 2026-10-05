@@ -17882,11 +17882,13 @@ function buildGroupStatsUsage() {
 		'📊 <b>群发言统计</b> · 用法',
 		'统计本群真人发言数与进 / 退群人数，仅本群，按日 / 周 / 月汇总。',
 		'',
-		'• <code>/stats today</code> 今日　<code>/stats week</code> 本周　<code>/stats month</code> 本月',
+		'• <code>/stats today</code> 今日',
+		'• <code>/stats week</code>  本周',
+		'• <code>/stats month</code> 本月',
 		'• <code>/stats 昨天</code> · <code>前天</code> · <code>上周</code> · <code>上月</code>',
 		'• <code>/stats 近7天</code> · <code>近30天</code>',
-		'• <code>/stats 2026-09-10</code>　指定某天',
-		'• <code>/stats 2026-09-01 2026-09-15</code>　指定区间',
+		'• <code>/stats 2026-09-10</code> 指定某天',
+		'• <code>/stats 2026-09-01 2026-09-15</code> 指定区间',
 		'',
 		'下方按钮可切换常用区间。'
 	].join('\n');
