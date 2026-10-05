@@ -10831,6 +10831,14 @@ const DEFAULT_AD_FINGERPRINT_MIN_CONFIDENCE = 0.6;
 
 // 指纹直接封禁所需权重（低于此值只加分，不单独定罪）
 const AD_FINGERPRINT_BAN_WEIGHT = 0.8;
+// ===== 资料形状层 · 同模板批量号跨账号复用 =====
+// 形状命中【只加分、不定罪】：本项目的形状库没有「全库零误封测试」那道兜底，
+// 让它单独定罪等于新开一条零验证的封禁通道。加的分进既有阈值体系，
+// 与评分层、指纹层同场竞技 —— 形状只作佐证，够不够线仍由原有阈值说了算。
+const AD_PROFILE_SHAPE_SCORE = 3;
+// 该形状至少被定罪过几次才参与。1 次 = 只有一个号栽过，可能就是误判；
+// 2 次起才有「这是一套在复用的模板」的证据强度。
+const AD_PROFILE_SHAPE_MIN_HITS = 2;
 // ===== 短语自我泛化（方案 E · AI 自我学习闭环）=====
 // /spam 每新增一批样本后，从样本库里扫【新样本】做共现提炼：
 // 跨样本重复出现 >= AD_ENRICH_MIN_OCCURRENCE 次、4~8 字、过三重闸（豁免词 / 强动词·业务词 / 形态）
@@ -11581,11 +11589,12 @@ async function d1AdDetectionTablesExist(env) {
 		'ad_group_members',
 		'ad_scan_state',
 		'ad_learn_snapshots',
-		'ad_avatars'
+		'ad_avatars',
+		'ad_profile_shapes'
 	]);
 }
 
-// 建立广告检测的 8 张 D1 表。范式与 ensureAdVoteTables 一致：
+// 建立广告检测的 12 张 D1 表（完整性复验另列 11 张，ad_spam_texts 按需建、不参与复验）。范式与 ensureAdVoteTables 一致：
 // promise 去重 → 核心表先行 → 逐条建表/建索引 → 存在性复验 → 失败删缓存并冷却 60 秒。
 // 冷却是为了避免 D1 抖动时每条消息都重试一次迁移，把子请求预算耗光。
 async function ensureAdDetectionTables(env) {
@@ -11628,9 +11637,34 @@ async function ensureAdDetectionTables(env) {
 			// 因为判据主体是昵称与 bio（跨群相同）、restricted 又已归零不计分，
 			// 用哪个群几乎不影响结论，故不按 (user_id, chat_id) 建组合主键 ——
 			// 那会让同一人在 N 个群里占 N 行，把扫描配额直接乘以 N。
-			await runD1SchemaStatement(env, 'ad_group_members', 'CREATE TABLE IF NOT EXISTS ad_group_members (user_id TEXT PRIMARY KEY, chat_id TEXT, first_name TEXT, last_name TEXT, username TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, bio_checked_at INTEGER NOT NULL DEFAULT 0)');
+			await runD1SchemaStatement(env, 'ad_group_members', 'CREATE TABLE IF NOT EXISTS ad_group_members (user_id TEXT PRIMARY KEY, chat_id TEXT, first_name TEXT, last_name TEXT, username TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, bio_checked_at INTEGER NOT NULL DEFAULT 0, profile_hash TEXT NOT NULL DEFAULT \'\', last_verdict TEXT NOT NULL DEFAULT \'\')');
 			// 扫描按 bio_checked_at 升序取「最久没查过的人」，这个索引是 cron 的主查询路径。
 			await runD1SchemaStatement(env, 'idx_ad_members_bio_checked', 'CREATE INDEX IF NOT EXISTS idx_ad_members_bio_checked ON ad_group_members (bio_checked_at)', { optional: true });
+			// ===== 变化门所需的两列（bio 未变则跳过指纹与 AI 层）=====
+			// 【必须先加列】：存量名册没有这两列，CREATE TABLE IF NOT EXISTS 对已存在的表
+			// 完全无效，漏了这一步老部署会在运行期报 no such column，而报错被 catch 吞掉
+			// 之后表现是「变化门静默失效、每轮照旧全量送 AI」——看不出哪里断了。
+			// 【先判表再判列】：表不存在 = 首次建表，上面的 CREATE 已带齐两列，无列可迁；
+			// 此时若照旧跑两条 PRAGMA 探测，会把「稳定态核心 SQL ≤ 3 条」那条断言撞红 ——
+			// 断言的过滤器只豁免 sqlite_master 这类一次性建表探测，认不出 PRAGMA。
+			// d1TableExists 正走 sqlite_master，属被豁免的一次性探测，且老库缺列时仍会进列检查。
+			const membersTableExists = await d1TableExists(env, 'ad_group_members');
+			for (const [column, sql] of [
+				['profile_hash', 'ALTER TABLE ad_group_members ADD COLUMN profile_hash TEXT NOT NULL DEFAULT \'\';'],
+				['last_verdict', 'ALTER TABLE ad_group_members ADD COLUMN last_verdict TEXT NOT NULL DEFAULT \'\';']
+			]) {
+				try {
+					if (membersTableExists && !(await d1ColumnExists(env, 'ad_group_members', column))) {
+						await runD1SchemaStatement(env, 'ad_group_members.' + column, sql);
+					}
+				} catch (error) {
+					const message = formatD1SchemaError(error).toLowerCase();
+					if (!message.includes('duplicate') && !message.includes('exists')) {
+						throw error;
+					}
+				}
+			}
+
 			await runD1SchemaStatement(env, 'idx_ad_members_last_seen', 'CREATE INDEX IF NOT EXISTS idx_ad_members_last_seen ON ad_group_members (last_seen)', { optional: true });
 
 			// 定时扫描的跨次状态（当日已扫计数、当日日期戳）。
@@ -11657,6 +11691,14 @@ async function ensureAdDetectionTables(env) {
 			// file_id 又只在换图前有效，所以只在视觉识别那一刻用，不参与比对。
 			await runD1SchemaStatement(env, 'ad_avatars', 'CREATE TABLE IF NOT EXISTS ad_avatars (file_unique_id TEXT PRIMARY KEY, verdict TEXT NOT NULL DEFAULT \'pending\', hits INTEGER NOT NULL DEFAULT 0, file_id TEXT, source TEXT, last_user_id TEXT, vision_checked_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_avatars_verdict', 'CREATE INDEX IF NOT EXISTS idx_ad_avatars_verdict ON ad_avatars (verdict)', { optional: true });
+
+			// 资料形状库：bio 归一化后的形态指纹（见 adProfileShape）。
+			// 与 ad_fingerprints 分开的理由：那张表存的是【词】，靠子串匹配；
+			// 这张表存的是【整份资料的形态】，靠完整形状命中 ——
+			// 「同一批号共用一套 bio、只换链接」正是词指纹抓不到、形状指纹专抓的形态。
+			// 列名与 ad_fingerprints 对齐（hits / false_positive_count），
+			// 好让 /ignore 的纠错口径在两张表上完全一致。
+			await runD1SchemaStatement(env, 'ad_profile_shapes', 'CREATE TABLE IF NOT EXISTS ad_profile_shapes (shape TEXT PRIMARY KEY, hits INTEGER NOT NULL DEFAULT 0, false_positive_count INTEGER NOT NULL DEFAULT 0, last_hit INTEGER NOT NULL DEFAULT 0, sample TEXT NOT NULL DEFAULT \'\', created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0)');
 
 			if (!(await d1AdDetectionTablesExist(env))) throw new Error('D1 广告检测表迁移不完整');
 			await seedAdDetectionData(env);
@@ -12766,6 +12808,108 @@ function normalizeAdFingerprintValue(value) {
 		.trim()
 		.toLowerCase()
 		.slice(0, 200);
+}
+
+// ===== 资料形状哈希 · 同模板批量号跨账号复用 =====
+//
+// 批量广告号常常同模板：bio 是同一套文案，只换邀请链接、号码或昵称。第一个号被定罪后把
+// 这份 bio 的「形状」学进 ad_profile_shapes，之后同形状的号在【零 AI】下就能命中 ——
+// 模板再怎么换链接，也不会把同一套话术重新烧一遍判定。
+//
+// 【为什么只取 bio、不取昵称】昵称是低熵文本（同名者众，而且改昵称本来就是广告号的日常
+// 操作），拿它做形状会显著扩大零 AI 的误伤面；号商与引流模板都写在 bio 里。bio 为空、
+// 或归一化后没有区分度（只剩占位符、实质内容不足 4 字）时返回空串，不参与复用 ——
+// 宁可不命中，也不能让两个正常人的短 bio 撞成同一个形状。
+//
+// 【占位符】链接、@用户名、数字段都是每换一个号就要改的部分，归一成同一串才对得上：
+// 「专业收号 秒结 t.me/aaa」与「专业收号 秒结 t.me/bbb」必须是同一个形状。
+// 替换必须【先长后短】：`http://t.me/xxx` 先被 t.me 那条整段吃掉，剩下的半截才不会被
+// URL 那条再吃一次 —— 否则同一份资料会裂出两个形状，复用直接失效。
+function adProfileShape(profile) {
+	const raw = String(profile?.bio ?? '');
+	if (!raw) return '';
+	let s = raw
+		// 零宽与不可见格式符：攻击者用它们在词内拆行规避匹配，
+		// 残留会让同一份模板裂成多个形状。
+		.replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/g, '')
+		.toLowerCase();
+	s = s
+		.replace(/(?:https?:\/\/)?(?:www\.)?(?:t|telegram)\.(?:me|dog)\/\S+/g, '[链接]')
+		.replace(/https?:\/\/\S+/g, '[链接]')
+		.replace(/www\.\S+/g, '[链接]')
+		.replace(/@[a-z0-9_]{3,}/g, '[号]')
+		.replace(/\d+/g, '[数]')
+		// 只保留字母（含中日韩）、数字与占位符，其余标点一律当分隔符清掉。
+		.replace(/[^\p{L}\p{N}\[\]]+/gu, ' ')
+		.replace(/\s+/g, ' ')
+		.trim();
+	if (!s) return '';
+	// 实质内容（剥掉全部占位符）不足 4 字 = 没有区分度，两个人的短 bio 会撞成同一形状。
+	const core = s.replace(/\[(?:链接|号|数)\]/g, '').replace(/\s+/g, '');
+	if (core.length < 4) return '';
+	return adTextHash(s);
+}
+// 读一条资料形状。查不到返回 null（= 未入库，既不算命中也不算干净）。
+// 查询失败同样返回 null：形状层【只加分】，失败时少加一次分的代价是放行方向，
+// 绝不会因为一次 D1 抖动就把正常人推向定罪 —— 与头像库那种「失败不得当 clean」
+// 的方向性要求正好相反，这里 fail-open 才是对的。
+async function readAdProfileShape(env, shape) {
+	const key = String(shape || '');
+	if (!env?.DB || !key) return null;
+	try {
+		const row = await env.DB.prepare(
+			'SELECT shape, hits, false_positive_count, last_hit, sample FROM ad_profile_shapes WHERE shape = ?'
+		).bind(key).first();
+		return row || null;
+	} catch (error) {
+		console.error('[广告检测] 读取资料形状库失败:', error);
+		return null;
+	}
+}
+
+// 定罪即学习：此人被封时，把他 bio 的形状记进库并给复用次数 +1。
+// 与指纹库同一语义 —— 资料模板是广告团队的公开复用资产，一次定罪就该拦住后面
+// 所有同模板的号；而模板换多少个链接、换多少个号码都不改变形状本身。
+async function learnAdProfileShape(env, shape, sample) {
+	const key = String(shape || '');
+	if (!env?.DB || !key) return false;
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_profile_shapes (shape, hits, false_positive_count, last_hit, sample, created_at, updated_at) '
+			+ 'VALUES (?, 1, 0, ?, ?, ?, ?) '
+			+ 'ON CONFLICT(shape) DO UPDATE SET hits = ad_profile_shapes.hits + 1, '
+			+ 'last_hit = excluded.last_hit, updated_at = excluded.updated_at'
+		).bind(key, now, String(sample || '').slice(0, 300), now, now).run();
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 资料形状学习失败:', error);
+		return false;
+	}
+}
+
+// 误判纠错（/ignore 走这条路）：给命中的形状记一次误报，或直接删掉。
+// 档位与指纹库 markAdFingerprintFalsePositive 一致：
+//   默认档只累加误报（被动噪声清理）；purge 档（/ignore）当次即删 —— 主人已经明确
+//   说了「这是误判」，不再攒次数。两张表的纠错口径必须同进同退。
+async function markAdProfileShapeFalsePositive(env, shape, options = {}) {
+	const key = String(shape || '');
+	if (!env?.DB || !key) return { ok: false, reason: 'unavailable' };
+	const purge = options.purge === true;
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		if (purge) {
+			const res = await env.DB.prepare('DELETE FROM ad_profile_shapes WHERE shape = ?').bind(key).run();
+			return { ok: true, removed: Number(res?.meta?.changes || 0) };
+		}
+		await env.DB.prepare(
+			'UPDATE ad_profile_shapes SET false_positive_count = false_positive_count + 1, updated_at = ? WHERE shape = ?'
+		).bind(now, key).run();
+		return { ok: true, affected: 1 };
+	} catch (error) {
+		console.error('[广告检测] 资料形状纠错失败:', error);
+		return { ok: false, reason: 'error' };
+	}
 }
 
 // \u3010\u5355\u4E1A\u52A1\u8BCD\u6307\u7EB9\u5224\u5B9A\uFF082026-09-09 \u4E3B\u4EBA\u4E0B\u4EE4\uFF0CP1 \u5355\u8BCD\u4E0D\u5C01\uFF09\u3011
@@ -14429,6 +14573,49 @@ async function markAdBioChecked(env, userId, nowSeconds = Math.floor(Date.now() 
 		console.error('[广告检测] 标记 bio 检查时间失败:', error);
 	}
 }
+// 写回「上次判时这份资料的形状 + 结论」。只动这两列，不碰 bio_checked_at ——
+// 那个时间戳在判定【之前】就已经推过一次（429 防卡死），这里再推等于重复。
+async function markAdProfileVerdict(env, userId, profileHash, verdict) {
+	if (!env?.DB) return false;
+	const uid = String(userId || '');
+	if (!uid) return false;
+	try {
+		await env.DB.prepare(
+			'UPDATE ad_group_members SET profile_hash = ?, last_verdict = ? WHERE user_id = ?'
+		).bind(String(profileHash || ''), String(verdict || ''), uid).run();
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 写回资料结论失败:', error);
+		return false;
+	}
+}
+
+// 判据库的最新变动时刻：四张表里最新的一次写入。
+//
+// 【为什么不靠在写入点埋标记】指纹、样本、头像、形状四张表的写入点分散在十几处
+// （自动学习、/spam 学习、纠错、种子灌入、补向量…），漏埋一处 = 漏放一次，
+// 而漏放正是本项目最不能出的错。直接查 MAX 时间戳是【零钩子】的：
+// 新增一个学习点不用记得改这里，查漏是结构性的，不依赖人记得。
+//
+// 失败返回 0：读不到就当「库没变动过」，门会跳过判定 —— 方向上是「多省一次」，
+// 但跳过本身需要「bio 没变 + 上次判 pass」两条硬条件同时成立，不构成新的误封路径。
+async function readAdJudgeLibStamp(env) {
+	if (!env?.DB) return 0;
+	try {
+		const row = await env.DB.prepare(
+			'SELECT COALESCE(MAX(u.t), 0) AS t FROM ('
+			+ 'SELECT MAX(updated_at) AS t FROM ad_fingerprints '
+			+ 'UNION ALL SELECT MAX(created_at) FROM ad_sample_embeddings '
+			+ 'UNION ALL SELECT MAX(updated_at) FROM ad_avatars '
+			+ 'UNION ALL SELECT MAX(updated_at) FROM ad_profile_shapes'
+			+ ') u'
+		).first();
+		return Number(row?.t) || 0;
+	} catch (error) {
+		console.error('[广告检测] 读取判据库版本失败:', error);
+		return 0;
+	}
+}
 
 // 是否需要为这个人拉一次 bio。三种情况都要查：
 //   ① 名册里没有他（首次发言，或 D1 读失败 —— 见 readAdGroupMember 的 fail-open 说明）；
@@ -14436,12 +14623,20 @@ async function markAdBioChecked(env, userId, nowSeconds = Math.floor(Date.now() 
 //   ③ 距上次查超过 AD_BIO_RECHECK_DAYS 天。
 // 时间倒流（时钟回拨或数据被手改到未来）时 now - checked 为负，也判定为不查 —— 无所谓，
 // cron 那一轨仍会按 bio_checked_at ASC 把他排到队首。
+// 是否需要为这个人拉一次 bio。三种情况都要查：
+//   ① 名册里没有他（首次发言，或 D1 读失败 —— 见 readAdGroupMember 的 fail-open 说明）；
+//   ② bio_checked_at 为 0（从没查过）；
+//   ③ 距上次查已过【他这一档】的间隔 —— 档位按进群时长分，新人查得密、老人照旧 3 天，
+//      与 cron 轨共用 adRescanTierSeconds 的同一组数字，两条轨节奏必须一致。
+// 时间倒流（时钟回拨或数据被手改到未来）时 now - checked 为负，判定为不查 —— 无所谓，
+// cron 那一轨仍会按到期时刻把他排到队首。
 function shouldCheckAdBio(member, nowSeconds = Math.floor(Date.now() / 1000)) {
 	if (!member) return true;
 	const checked = Number(member.bio_checked_at) || 0;
 	if (checked <= 0) return true;
-	return (Number(nowSeconds) || 0) - checked >= AD_BIO_RECHECK_SECONDS;
+	return (Number(nowSeconds) || 0) - checked >= adRescanTierSeconds(member, nowSeconds);
 }
+
 
 // === 管理员列表缓存（仅供广告检测豁免使用）===
 // 【为什么不直接给 checkIfUserIsAdminInGroup 加缓存】：那个函数同时是 /ban、/spam 的
@@ -14566,15 +14761,64 @@ async function writeAdScanState(env, key, value, nowSeconds = Math.floor(Date.no
 // 他自动落到队尾，下一批自然取到别人。这个自平衡的性质意味着增删行、
 // 跨天中断、Worker 重启都不会让扫描错位或重复，比显式 offset 游标健壮得多。
 // 排除已在黑名单里的人：已经封掉了，再查 bio 纯属浪费配额。
+// ===== 复查档位：进群越久资料越稳定，查得越稀 =====
+//
+// 【为什么新人要密】广告号的标准玩法是「先用干净资料混进来，过几天再改 bio」——
+// 改的那一刻起他就不再发言，消息路径永远触发不到，只有这一闸抓得到。
+// 入群后的头 72 小时正是这个动作的高发窗口，也是整条闸三唯一还来得及拦的时机。
+// 72 小时之后回落到 3 天（AD_BIO_RECHECK_SECONDS 的既有口径），
+// 老成员的轮询成本一个字节都没涨。
+//
+// ⚠️ 三个档位数字【必须与 JS 版 adRescanTierSeconds 完全一致】：SQL 这份决定 cron
+// 扫谁、JS 那份决定发言路径什么时候重拉 bio，两边口径分叉会让同一个人在两条轨上
+// 得到不同的复查节奏，排查时完全看不出来。
+const AD_RESCAN_TIERS_SQL = 'CASE '
+	+ 'WHEN ? - m.first_seen <= 21600 THEN 7200 '        // 入群 ≤ 6h：每 2 小时
+	+ 'WHEN ? - m.first_seen <= 86400 THEN 21600 '       // ≤ 24h：每 6 小时
+	+ 'WHEN ? - m.first_seen <= 259200 THEN 86400 '      // ≤ 72h：每 24 小时
+	+ 'ELSE ' + AD_BIO_RECHECK_SECONDS + ' END';
+
+// JS 侧同口径档位。first_seen 为 0（bot 部署前已在群、老数据没这列）一律按最老一档，
+// 不把存量成员当刚进门的号高频重扫。
+function adRescanTierSeconds(member, nowSeconds) {
+	const firstSeen = Number(member?.first_seen) || 0;
+	if (!firstSeen) return AD_BIO_RECHECK_SECONDS;
+	const age = (Number(nowSeconds) || 0) - firstSeen;
+	if (age <= 21600) return 7200;
+	if (age <= 86400) return 21600;
+	if (age <= 259200) return 86400;
+	return AD_BIO_RECHECK_SECONDS;
+}
+
+// 取下一批待复查的人。
+//
+// 三个关键点：
+//   ① 到期判断【按档位】而不是统一 3 天 —— 新人 2 小时就到期，老人照旧 3 天。
+//   ② 排序按【到期时刻】而不是 bio_checked_at。新人档位短，他刚查完 bio_checked_at
+//      就是最新值；按 bio_checked_at 排他永远轮不到队首，阶梯等于白做。
+//   ③ 先用 bio_checked_at 走索引收窄（最小档位 7200 秒），再算各自到期时刻 ——
+//      直接对表达式排序会让 idx_ad_members_bio_checked 完全失效，变成全表扫。
+// 查完就把 bio_checked_at 推到现在，到期时刻随之后移，自平衡性质与原来一致：
+// 增删行、跨天中断、Worker 重启都不会让扫描错位或重复。
 async function loadAdRescanBatch(env, limit, nowSeconds = Math.floor(Date.now() / 1000)) {
 	if (!env?.DB) return [];
+	const now = Number(nowSeconds) || 0;
 	try {
 		const rows = await env.DB.prepare(
-			'SELECT m.user_id, m.chat_id, m.first_name, m.last_name, m.username, m.bio_checked_at '
+			'SELECT m.user_id, m.chat_id, m.first_name, m.last_name, m.username, m.bio_checked_at, '
+			+ 'm.first_seen, m.profile_hash, m.last_verdict '
 			+ 'FROM ad_group_members m LEFT JOIN blacklist b ON b.id = m.user_id '
-			+ 'WHERE b.id IS NULL AND m.bio_checked_at <= ? '
-			+ 'ORDER BY m.bio_checked_at ASC LIMIT ?'
-		).bind((Number(nowSeconds) || 0) - AD_BIO_RECHECK_SECONDS, Math.max(1, Number(limit) || 1)).all();
+			+ 'WHERE b.id IS NULL '
+			+ 'AND m.bio_checked_at <= ? '
+			+ 'AND (m.bio_checked_at + ' + AD_RESCAN_TIERS_SQL + ') <= ? '
+			+ 'ORDER BY (m.bio_checked_at + ' + AD_RESCAN_TIERS_SQL + ') ASC LIMIT ?'
+		).bind(
+			now - 7200,            // 索引收窄：最小档位之前的根本没到期
+			now, now, now,         // WHERE 里的档位 CASE（三个 WHEN 共用一个 now）
+			now,                   // WHERE 的到期比较
+			now, now, now,         // ORDER BY 里的档位 CASE
+			Math.max(1, Number(limit) || 1)
+		).all();
 		return Array.isArray(rows?.results) ? rows.results : [];
 	} catch (error) {
 		console.error('[广告检测] 读取待复查名单失败:', error);
@@ -14615,6 +14859,28 @@ async function rescanAdMember(env, row, options = {}) {
 	await markAdBioChecked(env, userId, nowSeconds);
 	if (!profile.bioFetched) return { scanned: true, banned: false, reason: 'fetch_failed' };
 
+	// ===== 变化门：资料一个字没改、上次结论又是干净的，就跳过整轮判定 =====
+	// 这一轨的输入【只有资料、没有正文】，所以「同一份 bio + 空正文」必然得出同一结论 ——
+	// 再跑一遍 evaluateAdSuspect 只是把上次的结论重算一次，而那一遍要花指纹库查询、
+	// 头像库查询，外加一次 bge-m3 嵌入。getChat 省不掉（不拉 bio 就不知道变没变），
+	// 省掉的是拉到 bio 之后的全部判定开销。
+	//
+	// 【三道条件缺一不可】
+	//   ① 形状非空且与上次一致 —— bio 真的没改过；
+	//   ② 上次结论是 pass（干净）—— 上次判出 observe / ban 的一律重判，漏的风险不担；
+	//   ③ 判据库自上次判以来没被写过（bio_checked_at 严格晚于四张表的最新写入）。
+	//      这一条是【零钩子】的：指纹、样本、头像、形状任何一处新增或纠错都会把门关上。
+	//      少了它，「他没改 bio，但库里刚学进一条正好命中新 bio 的指纹」就会被整轮跳过 ——
+	//      而判据库的写入点分散在十几处，靠埋标记迟早漏一处，漏一处就是漏放。
+	const shape = adProfileShape(profile);
+	const lastHash = String(row.profile_hash || '');
+	const lastVerdict = String(row.last_verdict || '');
+	if (shape && shape === lastHash && lastVerdict === 'pass'
+		&& (Number(row.bio_checked_at) || 0) > await readAdJudgeLibStamp(env)) {
+		return { scanned: false, banned: false, reason: 'unchanged' };
+	}
+
+
 	const baseEvaluation = await evaluateAdSuspect(
 		env,
 		{ profile, text: '', forwardChat: null },
@@ -14622,6 +14888,10 @@ async function rescanAdMember(env, row, options = {}) {
 	);
 	// 头像指纹叠加（无头像则原样返回，本轨零额外开销）
 	const evaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+	// 写回形状与结论：pass 让下一轮能走门，observe / ban 则让门始终关着。
+	// 不碰 bio_checked_at —— 那个时间戳在判定之前已经推过一次（429 防卡死）。
+	await markAdProfileVerdict(env, userId, shape, evaluation.verdict);
+
 	if (evaluation.verdict !== 'ban') {
 		// 【不写观察记录】。观察窗口的语义是「短期内再有动作就合并裁决」，
 		// 而这一轨扫的正是不发言的人 —— 给他们写观察记录只会让 ad_user_screening
@@ -15213,6 +15483,21 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	// 组合广告词（如「收购 USDT 秒结」）由结构通道「招揽∧行业」兜底封禁，不依赖这才这里放。
 	const fingerprintBan = fingerprint.hits.length > 0
 		&& fingerprint.nonSingleMaxWeight >= AD_FINGERPRINT_BAN_WEIGHT;
+	// ===== 资料形状层（零 AI，只加分不定罪）=====
+	// 前置条件卡在【资料本身已有可疑分】上：scoreAdProfile 得 0 分说明这份 bio 里
+	// 一个广告判据都没有，自然也谈不上「与已知广告模板同形」。把这条卡在前面，
+	// 干净资料的普通发言在这里【零 D1 读】—— 热路径「稳定态核心 SQL ≤ 3 条」的
+	// 预算断言落点就在这道前置上，别把它挪到没有条件的地方。
+	const shapeKey = adProfileShape(profile);
+	if (shapeKey && profileResult.score > 0) {
+		const shapeRow = await readAdProfileShape(env, shapeKey);
+		if (shapeRow && (Number(shapeRow.hits) || 0) >= AD_PROFILE_SHAPE_MIN_HITS) {
+			score += AD_PROFILE_SHAPE_SCORE;
+			reasons.push('+' + AD_PROFILE_SHAPE_SCORE + ' 资料形状与已知广告模板一致（复用定罪 '
+				+ (Number(shapeRow.hits) || 0) + ' 次）');
+		}
+	}
+
 
 	let ai = { available: false, similarity: 0, sample: null, isMatch: false, isSoft: false };
 	// AI 硬命中是否被豁免词否证。声明在这里而不是 if 块内：下面的 hardHit 汇总点
@@ -15407,6 +15692,12 @@ async function evaluateAdSuspect(env, input, options = {}) {
 			// 头像指纹主键：跟着快照进 D1，/ignore 回滚时才能找到该清哪一行。
 			// 不展示给主人（图片标识对人没意义），纯粹是回滚链路的外键。
 			avatarId: String(profile.avatarId || ''),
+			// 资料形状主键：跟着快照进 D1，/ignore 回滚时直接拿它反查要清哪一行。
+			// 【不能让回滚端拿 snapshot.bio 重算】—— bio 在快照里被截到 200 字，
+			// 长简介重算出来的形状与判定时那个对不上，会静默清不掉，
+			// 表现为「/ignore 说成功了，同模板下一个人照样被加 3 分」。
+			profileShape: shapeKey || '',
+
 			forwardTitle: String(input?.forwardChat?.title || '').slice(0, 120)
 		}
 	};
@@ -15520,6 +15811,14 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		if (immediateAvatar) await learnAdAvatarOnBan(env, immediateAvatar, userId);
 		else await queueAdAvatarLearning(env, userId);
 	} catch (_) { /* 头像学习失败不影响本次处置 */ }
+	// 定罪即学习资料形状：资料模板是批量号的【公开复用资产】，学一次之后同模板的号
+	// 在零 AI 下就能命中（只加分，仍要过原有阈值）。取 snapshot 里存好的形状，
+	// 不在这里重算 —— 重算要拿完整 bio，而处置端只拿到 evaluation。
+	try {
+		await learnAdProfileShape(env, evaluation?.snapshot?.profileShape || '',
+			String(evaluation?.snapshot?.bio || ''));
+	} catch (_) { /* 形状学习失败不影响本次处置 */ }
+
 	const okCount = banResults.filter((r) => r.ok).length;
 	const failedBans = banResults.filter((r) => !r.ok);
 	// 风控·处置：按实际封成功的群逐群 +1（面板「本群挡下 N 次」的唯一数据来源）。
@@ -16142,6 +16441,11 @@ function adPayloadFromSnapshot(snapshot) {
 		// 头像指纹主键。【白名单重建】这里漏一个字段，那条链路就整体静默失效 ——
 		// /ignore 的头像纠错必须从这里拿到 avatarId 才能定位到 ad_avatars 的行。
 		avatarId: String(snap.avatarId || ''),
+		// 资料形状主键。与 avatarId 同理：这是一份【白名单重建】，
+		// 漏一个字段整条纠错链路就静默失效 —— /ignore 会「说成功了」，
+		// 但同模板的下一个人照样被加 3 分，谁也看不出来哪里断了。
+		profileShape: String(snap.profileShape || ''),
+
 		domains: extractAdDomains([name, bio, text].filter(Boolean).join('\n'))
 	};
 }
@@ -16426,13 +16730,17 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	// purge: true —— 主人已明确说这是误判，命中的指纹当次即删，不再攒 3 次误报。
 	// 同批改动拆掉了自动学习的强动词闸门，指纹写入变宽，纠错端必须同步变快。
 	const fp = await markAdFingerprintFalsePositive(env, payload, { purge: true });
+		// 资料形状同步纠错：同一份 bio 判成误封时，它的形状也必须跟着撤 ——
+		// 否则下一个人只是碰巧用了同一套模板，就会被这条错形状再加一次分。
+		const shapeCleared = await markAdProfileShapeFalsePositive(env, payload?.profileShape, { purge: true });
+
 	// 删掉当初自动学进去的那条 AI 语义样本。在这批改动之前 /ignore 碰都没碰样本库 ——
 	// 于是指纹删了、号解封了，错样本却永久留在 AI 样本库里继续误伤相似的正常用户，
 	// 而 AI 层是硬命中即封、不看豁免词也不看总分的，一条错样本比一条错指纹更危险。
 	const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
 	await deleteAdScreening(env, targetId);
 	await deleteAdPendingSnapshot(env, ownerId, seq);
-	return { targetId, removed, unbanSummary, fp, sampleRemoved, avatarCleared };
+	return { targetId, removed, unbanSummary, fp, sampleRemoved, avatarCleared, shapeCleared };
 }
 
 // /ignore 单次最多处理多少个序号。
@@ -16514,6 +16822,8 @@ async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
 			lines.push('黑名单：' + (r.removed.success ? '已移除' : (r.removed.code === 'NOT_FOUND' ? '本就不在黑名单' : '移除失败')));
 			lines.push('解封：' + escapeHtml(r.unbanSummary));
 			lines.push('指纹修正：' + (r.fp.ok ? '已标记 <b>' + (r.fp.affected || 0) + '</b> 条误判，删除 <b>' + (r.fp.retired || 0) + '</b> 条' : '标记失败'));
+			lines.push('形状修正：' + (r.shapeCleared.ok ? (r.shapeCleared.removed > 0 ? '已删除 ' + r.shapeCleared.removed + ' 条模板形状' : '无对应形状') : '删除失败'));
+
 			lines.push('AI 样本：' + (r.sampleRemoved.ok ? (r.sampleRemoved.removed > 0 ? '已删除 <b>' + r.sampleRemoved.removed + '</b> 条' : '无对应样本') : '删除失败'));
 			if (r.fp.ok && r.fp.affected > 0 && Array.isArray(r.fp.rows)) {
 				lines.push('');
@@ -17248,6 +17558,10 @@ async function handleAdReplyLearning(message, env, ctx) {
 		// purge: true —— 管理员已经明确声明这是误判，指纹当次即删，不再攒 3 次误报。
 		// 主人原话：「除非说误判了，我就可以通过指定的指令执行全群解封并给指纹记误报 + 删除记录的指纹。」
 		const fp = await markAdFingerprintFalsePositive(env, payload, { purge: true });
+		// 资料形状同步纠错：同一份 bio 判成误封时，它的形状也必须跟着撤 ——
+		// 否则下一个人只是碰巧用了同一套模板，就会被这条错形状再加一次分。
+		const shapeCleared = await markAdProfileShapeFalsePositive(env, payload?.profileShape, { purge: true });
+
 		// 同步清掉当初自动学进去的那条 AI 语义样本。拼法必须走 buildAdSampleText，
 		// 与 enforceAdDetection 写入时完全一致，否则 text_hash 对不上、静默删不掉，
 		// 错样本会永久留在库里继续把相似的正常用户往高相似度上拉（AI 层是硬命中即封）。
@@ -17259,6 +17573,8 @@ async function handleAdReplyLearning(message, env, ctx) {
 			'黑名单：' + (removed.success ? '已移除' : (removed.code === 'NOT_FOUND' ? '本就不在黑名单' : '移除失败')),
 			'解封：' + unbanOk + '/' + unbanTotal + ' 个群成功',
 			'指纹修正：' + (fp.ok ? '标记 ' + (fp.affected || 0) + ' 条误判，删除 ' + (fp.retired || 0) + ' 条' : '标记失败'),
+			'形状修正：' + (shapeCleared.ok ? (shapeCleared.removed > 0 ? '已删除 ' + shapeCleared.removed + ' 条模板形状' : '无对应形状') : '删除失败'),
+
 			'AI 样本：' + (sampleRemoved.ok ? (sampleRemoved.removed > 0 ? '已删除 ' + sampleRemoved.removed + ' 条' : '无对应样本') : '删除失败')
 		].join('\n'));
 		return true;
