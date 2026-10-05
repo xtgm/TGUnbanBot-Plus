@@ -11075,7 +11075,12 @@ const AD_TRADE_VERBS = [
 	// 「假钞玩妹交流群🔥快递面交都可」—— 离线实测这句在四张词表 + 两组正则里【逐词零命中】，
 	// 名片通道通了也定不了罪。「面交」是线下成交动作，正常群聊几乎不用（要用也是「见面」「当面」），
 	// 且它单独出现【不构成任何证据】—— 必须配 AD_BUSINESS_KEYWORDS 里的行业词凑成形态 A 才定罪。
-	'面交', '当面交易'
+	'面交', '当面交易',
+	// 促销招揽（2026-10-05 主人截图名片漏检后补）：「最新18系列上新 水果专卖店」
+	// 「七折出17 pro max 看我简介」两条在全部词表里逐词零命中、得 0 分放行。
+	// 这两个是【招揽/促销动作】，单独出现不算证据（「我们店上新了」不会命中），
+	// 必须与 AD_BUSINESS_KEYWORDS 的行业词同现才凑成形态 A，门槛与其它动词完全一致。
+	'上新', '七折'
 ];
 
 // 弱交易动词：形态上像招揽，但在正常语境里同样高频，单独出现不构成任何广告证据。
@@ -11121,7 +11126,11 @@ const AD_BUSINESS_KEYWORDS = [
 	// 只把它们当行业指向词，仍需 AD_TRADE_VERBS 的招揽动词同现才凑成形态 A。
 	// 这两个词是纯违法标的，正常群聊不存在使用场景（讨论反假币会说「假币鉴别」，
 	// 那也仍需招揽动词才定罪），所以误封面接近于零。
-	'假钞', '假币'
+	'假钞', '假币',
+	// 行业指向（2026-10-05 名片②④漏检后补，与 AD_TRADE_VERBS 的「上新」「七折」配对）。
+	// 「专卖店」是零售形态词；「pro max」是具体商品型号 —— 两者都只作行业指向，
+	// 单独出现【不计分不封禁】，仍要招揽动词同现才构成形态 A（「我买了 pro max」不会命中）。
+	'专卖店', 'pro max'
 ];
 
 // 豁免词：命中且无交易动词时整体减分，保护正常用户。
@@ -11170,6 +11179,65 @@ const AD_EXEMPT_KEYWORDS = [
 	//   同样注意：hasAdSuspiciousLink 里那条独立的 t.me 判据已一并删除，加词只是双保险。
 	'私聊', '代理', '官方中文', 't.me'
 ];
+
+// ===== 广告语境下失效的豁免词 =====
+//
+// 主人 2026-09-08 加 't.me' / '代理' 进豁免的理由成立且继续有效：正常人分享 Telegram
+// 链接、技术群聊「反向代理」都是日常，一刀切取消豁免必然大面积误封。
+//
+// 但实测（2026-10-05 真实样本 Lisa Ka）暴露了另一面：她的简介是
+//   `https://t.me/cyy42Y4H2DgyZGNI 进群了解项目 一天8000!`
+// —— 这不是私有邀请链接（t.me/+、joinchat 那条剔除已存在，管不到它），
+// 于是命中 't.me' 豁免直接 -3，**广告简介的得分比不查简介还低**（2 → -1），
+// 豁免词从「保护正常人」变成了「广告号的挡箭牌」。
+//
+// 【为什么是条件化而不是删词】删词会重演误封；这里改成「语境判定」：
+// 只有当文案里同时出现明确的招揽特征时，这两条豁免才算数失效，
+// 纯技术讨论一个字都不受影响。而且失效只是【不再减分】——
+// 定罪仍要过原有的形态门槛（招揽×业务同现 / 总分撞线），不会变成单词封禁。
+const AD_EXEMPT_CANCEL_WORDS = new Set(['t.me', '代理']);// 广告语境：邀请链接形态 + 招揽动词 + 金额话术 + 灰产行业词，命中任一即认为
+// 「这里不是单纯的技术讨论」。刻意写得保守 —— 漏一个词只是继续豁免（漏放），
+// 误命中一个只会取消 -3 减分（仍需其它证据才定罪），两个方向的代价都不对称。
+// 广告语境：只认【强信号】，刻意【不含任何链接形态，也不含「进群」这类普通词】。
+//
+// 两次实测教训，各砍掉一档：
+//   ① 链接形态（t.me/+、joinchat）归上面的 privateInvite 逻辑 —— 那套「+7 但可被豁免
+//      抵消、宁可放过技术群主」的缓冲是有意设计，塞进来会直接冲破它。
+//   ② 「进群 / 入群 / 拉群 / 看主页 / 出货 / 批发」这类日常词也删了 ——
+//      实测技术群主的简介「CDN 技术交流，进群 t.me/+…」正含「进群」，
+//      被判广告语境 → 豁免失效 → 7 分定罪，6 条防误封断言当场变红。
+// 留下的只有广告几乎独占的写法：金额承诺、灰产词、强招揽构词。
+// Lisa 的简介「…进群了解项目 一天8000!」靠「一天8000」命中；
+// 「招代理 一天5000」靠「招代理」命中 —— 去掉普通词后样本照样全中。
+const AD_EXEMPT_CANCEL_RE = new RegExp(
+	'一天\\d|日入\\d|月入\\d|日赚\\d|赚\\d|赚一万|稳赚|躺赚|暴富|躺平赚'
+	+ '|招代理|做代理|收代理|代理价|一级代理'
+	+ '|带单|跟单|上分|回血|包赢|包赢包赔'
+	+ '|假钞|假币|洗钱|跑分|代收|代付|过机|卡料|上分平台'
+	, 'i');
+
+// 返回「广告语境下仍然生效」的豁免命中。
+//
+// 【为什么是整张表失效，而不是只挑 t.me / 代理】实测第二次（同一批真实样本）又冒出
+// 第三个漏网的：Lisa 的随机用户名 `cyy42Y4H2Dgy` 小写后含 `h2`，被 countAdKeywordHits
+// 当成 TLS 协议词吃掉 -3 —— 只挑几个词永远会有下一个子串撞进来。既然上面那条广告语境
+// 正则本身足够严（邀请链接 / 招揽动词 / 金额话术 / 灰产词，命中任一才算），那就让
+// 整张豁免表在这类文案上一起失效。
+//
+// 【为什么这样做不会变成误封】这里只撤销 -3 减分，**不加任何分**；定罪仍要过原有的
+// 形态门槛（招揽×业务同现 / 总分撞线 / 身份硬构词）。最坏情况是「豁免没兜住但仍需
+// 其它证据才封」，而不是「命中一个词就封」。
+//
+// 剔除情况写进 reasons —— 主人复核时必须能看出「为什么这次豁免没生效」。
+function dropAdContextExempt(exemptHits, source, reasons) {
+	if (!Array.isArray(exemptHits) || !exemptHits.length) return exemptHits;
+	const text = String(source || '');
+	if (!AD_EXEMPT_CANCEL_RE.test(text)) return exemptHits;
+	if (Array.isArray(reasons)) {
+		reasons.push('（广告语境，豁免词整体失效：' + exemptHits.slice(0, 3).join('/') + ' 不再减免，仅撤销减分不加分）');
+	}
+	return [];
+}
 
 // 回复学习触发词与否定词（第一主人普通回复即可标注广告）
 // 触发词一律要求成词。历史词表里的单字「封」、英文子串「ad」和「学习」都是裸子串匹配，
@@ -12119,8 +12187,11 @@ function judgeAdIdentityKill(payload) {
 	//   招揽构词（AD_SOLICIT_PATTERNS）= 收购 / 回收 / 求购 / 出售 / 招代理 —— 部分词
 	//     在正常语境成立（垃圾回收、回收站、出售二手显卡），【保留豁免词闸门】+ 技术负向排除。
 	//   宽词表（AD_IDENTITY_KILL_WIDE 打开时）—— 匹配最松，同样保留豁免词闸门。
-	const exemptHits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
-
+	let exemptHits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
+	// 广告语境下 t.me / 代理 不算护身符：否则在昵称里写「招代理 t.me/xxx」，
+	// 单类判据就会因为命中豁免词被放行 —— 这正是「招代理」曾被放走的路径。
+	// 只影响【是否算豁免】，不额外加分；定罪仍要过硬构词或软构词+无豁免这两道门。
+	exemptHits = dropAdContextExempt(exemptHits, source);
 	const bizStruct = AD_STRUCT_MATCH(AD_IDENTITY_BIZ_HARD_PATTERNS, source);
 	const solicitStruct = AD_STRUCT_MATCH(AD_SOLICIT_PATTERNS, source)
 		&& !AD_IDENTITY_TECH_RECYCLE_RE.test(source);
@@ -12247,6 +12318,11 @@ function judgeAdProfileCard(payload) {
 
 // 通道 body：bio + 本条正文。资料卡单独不够定罪、但正文补上了缺的那一半时在此收网。
 function judgeAdBodyWithBio(payload) {
+	// 正文为空时整体跳过 —— 那种情形归通道 1（资料卡查杀）管，本通道重复判定会让
+	// layer 标错。【2026-10-05 曾改成「正文空时拿简介单独判」，实测后撤回】：
+	// 那批纯简介广告（Lisa 的「进群了解项目 一天8000」）后来由【形态 E 金额招揽】
+	// 在 evaluateAdSuspect 层面接住了，分数照样够线，不依赖这一路；
+	// 硬改这里只会与「正文为空时跳过」那条既有断言冲突，属于白担风险。
 	if (!String(payload?.text || '').trim()) return { guilty: false, channel: 'body', form: '', reasons: [] };
 	const text = [payload?.bio, payload?.text].filter(Boolean).join('\n');
 	return judgeAdStructure(text, payload?.username, 'body');
@@ -12477,6 +12553,12 @@ function scoreAdProfile(profile, options = {}) {
 			reasons.push('（私有群邀请链接不吃 ' + dropped.join('/') + ' 豁免：该豁免只保护公开账号链接）');
 		}
 	}
+	// 广告语境判定：昵称 / 简介里同时有招揽特征时，t.me 与「代理」不再当护身符。
+	// 【排在私有邀请那条之后】两条剔除各管一档、提示语不同，先到先得会让后一条永不触发：
+	// 私有邀请链接（t.me/+、joinchat）命中时上面已经剔过并给出更精确的原因。
+	// 这条专治上面管不到的形态 —— 随机用户名式引流号（t.me/cyy42Y4H2DgyZGNI），
+	// 它既不是私有邀请链接，也不该吃到 -3 豁免（实测曾因此把广告简介打到比不查还低）。
+	exemptHits = dropAdContextExempt(exemptHits, combined, reasons);
 	if (exemptHits.length) {
 		const penalty = tradeHits.length ? AD_EXEMPT_PENALTY_WITH_TRADE : AD_EXEMPT_PENALTY;
 		add(penalty, '命中豁免词：' + exemptHits.slice(0, 3).join('/') + (tradeHits.length ? '（含交易动词，减免打折）' : ''));
@@ -15019,6 +15101,47 @@ async function consumeAdConfirmToken(env, token, action, userId) {
 // === 三层合并判定 ===
 // 判定顺序：结构化评分 → 指纹库 → AI 语义。任一层给出硬命中即判广告；
 // AI 软命中（0.65 ≤ 相似度 < 阈值）只加 2 分，交给总分裁决，避免语义层单独误杀。
+// ===== 形态 E · 金额招揽 =====
+//
+// 2026-10-05 线上实测这批漏放的共同形态：把【钱】和【招人/收钱的动作】写在一起，
+// 但既不命中「招揽动词 × 行业词」形态 A（那些词一个都不在词表），也不在任何既有形态里：
+//   「进群了解项目 一天8000」「微信帮我收款 赚一万」「带单老师带你赚5万」「收款码发我 一单800」
+// 逐个往词表里加词治不了 —— 变体无穷无尽，加一次漏一批（正是前几轮的教训）。
+// 所以判的是【结构】：金额 与 收益/招揽动作 同现，两类缺一不可。
+//
+// 【+5 而不是直接封】金额+收钱在正常对话里也常见（「收款码发我 转你200」），
+// 所以这一档最高只把人推到观察线：撞观察 = 进观察窗口 + 通知主人复核，不封不禁言。
+// 真广告要么再发一条撞到 7 分，要么被 /pending 复核时一眼看出来。宁可多观察，不可误封。
+const AD_MONEY_SOLICIT_SCORE = 5;
+// 金额：数字带货币单位 / 货币符号 / 大写人民币数额 / 【单位在前】的时薪业务量写法。
+// 「一天8000」「一单800」这类单位在前的写法是线上实测原文（Lisa 的简介、收款变体），
+// 只写「数字+单位」会整批漏掉 —— 这也是为什么金额正则要正反两个方向都覆盖。
+const AD_MONEY_AMOUNT_RE = new RegExp(
+	'(?:¥|￥)'
+	+ '|(?:\\d[\\d,\\.\\s]{0,6}\\s*(?:万|千|百|[kKwW]|元|块|rmb|usdt))'
+	+ '|(?:[一二三四五六七八九十两]\\s*[万亿])'
+	+ '|(?:[一两\\d]+\\s*(?:天|日|单|笔)\\s*\\d{2,6})'	// 一天8000 / 一单800 / 两单5000
+	+ '|(?:\\b\\d{3,6}\\b(?=\\s*(?:[个张单笔天]|/天)))'
+	, 'i');
+// 收益动作：承诺赚钱、回报、赌博类。
+const AD_MONEY_GAIN_RE = /赚|收益|利润|稳赚|日赚|日结|月结|躺赚|月入|回本|分红|上分|回血|包赢|带单|跟单|带你/;
+// 招人 / 收钱动作：拉人入群、代收款、带货销售。
+const AD_MONEY_SOLICIT_RE = /进群|入群|拉群|了解项目|了解详情|加[薇微vV信]|私我|点我|接单|一单|代收|代付|跑分|收款|收钱|出货|批发|低价|七折|折扣|专卖|上新|代购|带货|面交/;
+
+// 命中返回 {score, reason}，不命中返回 null（由调用方决定加不加）。
+function scoreAdMoneySolicit(text) {
+	const source = String(text || '');
+	if (!source.trim()) return null;
+	const amount = AD_MONEY_AMOUNT_RE.test(source);
+	if (!amount) return null;
+	const gain = AD_MONEY_GAIN_RE.test(source);
+	const solicit = AD_MONEY_SOLICIT_RE.test(source);
+	// 金额 + 任一动作即成立（两类同现的下限）。两个都没有就只是在报数，不算招揽。
+	if (!gain && !solicit) return null;
+	const labels = [gain ? '收益动作' : '', solicit ? '招人/收钱动作' : ''].filter(Boolean).join(' × ');
+	return { score: AD_MONEY_SOLICIT_SCORE, reason: '金额与' + labels + '同现（形态 E 金额招揽，达观察线不定罪）' };
+}
+
 async function evaluateAdSuspect(env, input, options = {}) {
 	const config = options.config || loadAdDetectionConfig(env);
 	const whitelist = options.whitelist instanceof Set ? options.whitelist : await loadAdDomainWhitelist(env);
@@ -15052,6 +15175,13 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		+ (forwardResult.isAd ? forwardResult.score : 0);
 	const reasons = [...profileResult.reasons, ...textResult.reasons, ...contextResult.reasons];
 	if (forwardResult.isAd) reasons.push(...forwardResult.reasons);
+	// 形态 E · 金额招揽：简介 + 本条正文合起来看（广告常常一半写简介一半写正文）。
+	// 只加分、不定罪 —— 分数自然决定去观察还是封禁，见 AD_MONEY_SOLICIT_SCORE 说明。
+	const moneySolicit = scoreAdMoneySolicit([String(profile.bio || ''), String(text || '')].filter(Boolean).join('\n'));
+	if (moneySolicit) {
+		score += moneySolicit.score;
+		reasons.push('+' + moneySolicit.score + ' ' + moneySolicit.reason);
+	}
 	let layer = 'score';
 
 	const payload = {
