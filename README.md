@@ -26,7 +26,7 @@
 | --- | --- |
 | [与原项目的差异](#与原项目的差异) | 本项目相对原项目改了什么、为什么这么改 |
 | [功能](#功能) | **每个命令怎么用**：普通用户 / 群管理员 / 第一主人各自能用哪些指令，以及配置群内的回执规则与自动化行为 |
-| [广告检测](#广告检测) | **三层判定怎么工作**、11 条管理命令怎么用、阈值怎么调、误判怎么纠 |
+| [广告检测](#广告检测) | **三层判定怎么工作**、12 条管理命令怎么用、阈值怎么调、误判怎么纠 |
 | [项目结构](#项目结构) | 各文件的职责与测试覆盖范围 |
 | [前置条件](#前置条件) | 部署前需要准备什么 |
 | [环境变量](#环境变量) | **每个配置项填什么、不填的后果**，以及源码顶部 `=可修改=` 区段怎么改 |
@@ -48,10 +48,10 @@
 | **黑名单结构升级** | `["123"]` → `[{id, reason, by, at}]`，记原因 / 操作人 / 时间；旧裸数组自动归一化，零迁移 |
 | **多群组支持** | `GROUP_ID` 逗号分隔多群，解封与封禁遍历全部配置群；第一条为主群 |
 | **全局黑名单处置闭环** | `/ban` `/spam` 加黑后**立即遍历全部群禁言**、`/sban` **立即遍历全部群踢出**（原项目只写库不踢人）；黑名单用户发言实时拦截删消息 + 踢人、复入群立即踢回 |
-| **批量任务** | 三条命令支持多 TGID（半角 / 全角逗号 / 空格 / 换行 / `[123,456]`）；`U<20` 且 `U×G≤24` 且子请求 `≤100` 同步，否则转 D1 批量 + Queues 分片续接；单次最多 50 个 |
+| **批量任务** | 四条命令（`/ban` `/sban` `/spam` `/unban`）支持多 TGID（半角 / 全角逗号 / 空格 / 换行 / `[123,456]`）；`U<20` 且 `U×G≤24` 且子请求 `≤100` 同步，否则转 D1 批量 + Queues 分片续接；单次最多 50 个 |
 | **通知系统** | `OWNER_IDS[0]` 是主人（收全部通知），其余为副主人（收加黑踢出通知）；留空不发私聊通知 |
 | **解封回执改造** | 不再给「返回某群」假链接（私有群点不动），改为**主群内联按钮** = 联系管理员入口；`SELF_UNBAN_CONTACT_GROUP` 可指定，拿不到链接自动降级不附按钮 |
-| **D1 黑名单来源收紧** | **唯一写入来源 = 真人执行的 `/ban` `/spam`**；原生封禁按钮、第三方机器人封禁一律不写；黑名单永不自助解封，只能 `/unban` 移除 |
+| **D1 黑名单来源收紧** | **写入来源 = 真人执行的 `/ban` `/spam` `/sban` 等管理命令**；原生封禁按钮、第三方机器人封禁一律不写；黑名单永不自助解封，只能 `/unban` 移除 |
 | **动态群组** | 第一主人私聊 `/addgroup` `/delgroup` `/listgroups` 增删群，存 D1 不改环境变量；三道硬校验，动态群永不顶替主群 |
 | **`chat_member` 事件订阅** | 群内手动封禁**不再写黑名单**（仅审计通知）；手动解封时**封不回黑名单用户**（无法绕过全局黑名单） |
 | **`/blacklist` 竖排排版** | 每条记录一段、字段各占一行，避免长字段撑爆折行；时间格式化、操作人译成可读角色并优先输出 `@username`（`tg://user` 链接会因对方隐私设置退化成死文本） |
@@ -75,7 +75,7 @@
 
 | 命令 | 使用位置 | 说明 |
 | --- | --- | --- |
-| `/ban 用户ID [原因]` | 私聊 / 群内 | 加入 D1 黑名单（`reason=manual`）+ 遍历全部群**永久禁言（不踢出）**。支持批量。群内撤回命令不发回执，详情私聊第一主人；**群内对单个 TGID 还会清扫当前群**（私聊与批量不做，大范围用 `/purge`） |
+| `/ban 用户ID [原因]` | 私聊 / 群内 | 加入 D1 黑名单（`reason=manual`）+ 遍历全部群**永久禁言（不踢出）**（杀手 ON 群为踢出）。支持批量。群内撤回命令不发回执，详情私聊第一主人；**群内对单个 TGID 还会清扫当前群**（私聊与批量不做，大范围用 `/purge`） |
 | `/sban 用户ID [原因]` | 群内（群主/第一主人/副主人）· 私聊（第一主人/副主人） | 加入 D1 黑名单 + 遍历全部群**踢出并撤回其历史发言**。`/ban` 改禁言后，要踢人就用这条；支持批量 |
 | `/spam [用户ID] [原因]` | 回复 / 私聊 / 直接输入 | 同上（`reason=spam`，**全群禁言**）+ **删除被回复的垃圾消息**；回复后文本作为原因 |
 | `/unban 用户ID` | 私聊 / 群内 | 先删 D1 记录成功才解封；每群执行「恢复发言 + 解除封禁」两步（同一个人可能部分群被 `/sban` 踢、部分群被 `/ban` 禁言）；群内只发「目标 + 解封总数」汇总（目标可点击、TGID 可复制） |
@@ -100,17 +100,17 @@
 | `/recent [N]` | 群内 / 私聊 | **捞回已被删的广告**：从 `moderation_messages` 按广告特征强度排序取最近 48 小时，冻结成快照私聊。群内可用但命令被撤回、列表只走私聊 |
 | `/learnlast 序号` | 仅第一主人私聊 | 按**冻结快照**序号学习（不能重查实时数据，列表会因新消息挤动而错位），学习同时加黑 + 全群封禁；判错用回执里的 `/unban` 一键回滚 |
 | `/addgroup` `/delgroup` `/listgroups` | 仅第一主人私聊 | 指令增删治理群（存 D1 `dynamic_groups`，不改环境变量；三道硬校验） |
-| `/killer [on\|off\|status]` | 仅第一主人 · 群内 | 切换杀手模式：**ON = 全群封禁踢出**、**OFF = 仅永久禁言不踢出**（默认 OFF，需群在 `KILLER_MODE_GROUPS`）；私聊 `/killer` 列出各群状态 |
+| `/killer [on\|off\|status]` | 仅第一主人 · 群内 | 切换杀手模式：**ON = 全群封禁踢出**（含 `/ban` `/spam` 与自动处置）、**OFF = 仅永久禁言不踢出**（默认 OFF，需群在 `KILLER_MODE_GROUPS`）；非杀手群的 `/ban` `/spam` 恒为禁言，要踢人用 `/sban`；私聊 `/killer` 列出各群状态 |
 | `/leavegroup -100xxxx` | 仅第一主人私聊 | 让 bot 真的退出群（与 `/delgroup` 区别：后者只停止治理） |
 | `/add_ad_admin TGID` `/del_ad_admin TGID` | 仅第一主人私聊 | 授权 / 取消某成员发起 `/ad` 举报投票 |
-| `/pending [N]` `/confirm 序号` `/ignore 序号` `/rescreen [N]` `/adstats` | 仅第一主人私聊 | 广告检测复核与状态查询，见 [广告检测](#广告检测) |
+| `/pending [N]` `/ignore 序号` `/rescreen [N]` `/adstats` | 仅第一主人私聊 | 广告检测复核与状态查询，见 [广告检测](#广告检测) |
 | `/words [页码]` `/addword` `/delword` `/addsample` `/clearsamples` `/warmup` `/whitelist` | 仅第一主人私聊 | 指纹库、语义样本与域名白名单维护 |
 
 ### 自动化
 
 | 行为 | 触发条件 | 说明 |
 | --- | --- | --- |
-| 黑名单实时拦截 | 黑名单用户在配置群发言 | 删消息 + 踢出 + 通知主人 |
+| 黑名单实时拦截 | 黑名单用户在配置群发言 | 删消息 + 踢出 + 通知主人（禁言模式群跳过拦截） |
 | 复入群踢回 | 黑名单用户被拉回 / 自加回 | 立即踢回（禁言模式群除外）；受保护角色（主 / 副 / 超管 / 任一群主管理员）不踢 |
 | 手动封禁不同步 | 真人点 Telegram 封禁按钮 | **不写入 D1 黑名单**，仅发审计通知 |
 | 手动解封封回 | 对象仍在 D1 黑名单 | 立即封回（群内手动解封无法绕过全局黑名单） |
@@ -130,14 +130,13 @@
 | ② 指纹层 | 关键词、域名、用户名、简介四类指纹匹配 | `AD_FINGERPRINT_MIN_CONFIDENCE` = 0.6 |
 | ③ AI 语义层 | `bge-m3` 向量相似度，抓改写过表述的广告 | `AD_AI_SIMILARITY_THRESHOLD` = 0.78 |
 
-三道闸：首发查简介、定时复查简介、入群即查。未绑 Workers AI 自动跳过第三层。
+三道闸：闸一 零成本评分定罪（含简介补查）、闸二 发言路径深度判定、闸三 定时滚动复查简介；入群即写名册，堵住「扫不到的号」的缺口。未绑 Workers AI 自动跳过第三层。
 
 ### 复核与纠错命令（仅第一主人私聊）
 
 | 命令 | 干什么 |
 | --- | --- |
 | `/pending [N]` | 看待确认快照（得分、判据、资料） |
-| `/confirm 序号` | 确认定罪，手动处置并学习 |
 | `/ignore 序号` | **误封一键纠错**：解封 + 给命中指纹加误报，累计 3 次退役该指纹 |
 | `/rescreen [N]` | 重新筛查观察窗口里的可疑用户 |
 | `/adstats` | 总览阈值、AI 状态、指纹与样本规模、观察窗口人数 |
@@ -175,15 +174,14 @@
 .
 ├── _worker.js             # Worker 主程序（单文件，含广告检测层）
 ├── wrangler.toml          # Cloudflare Wrangler 配置（D1 / Queue / AI 绑定）
-├── test_*.mjs             # 17 个离线测试文件
-├── 项目文档.md             # 时间线的 Telegram API 出处（纯官方视角）
+├── test_*.mjs             # 18 个离线测试文件
 ├── README.md
 └── LICENSE
 ```
 
 | 项 | 数值 | 说明 |
 | --- | --- | --- |
-| 测试文件 | **17 个** | 合计 **3293 项**，全绿才允许推送 |
+| 测试文件 | **18 个** | 合计 **3333 项**，全绿才允许推送 |
 | 测试方式 | `node test_xxx.mjs` | 每个文件独立可跑，退出码非 0 即失败 |
 | 运行要求 | **Node 22+** | `node:sqlite` 内置模块要求 |
 | 测试环境 | 全部离线 | Bot API 全 mock，D1 用 `node:sqlite` 的 `DatabaseSync(':memory:')` **真实 SQLite 后端**（`ON CONFLICT`、`UNIQUE`、`batch` 事务真跑），Workers AI 用固定向量函数模拟 |
@@ -245,6 +243,11 @@
 | `AD_FINGERPRINT_MIN_CONFIDENCE` | `0.6` | 指纹参与判定的最低置信度（0-1） |
 | `AD_PROTECTED_USERNAMES` | 空 | 权限人 `@handle` 永不学习白名单 |
 | `AD_TRUSTED_BOTS` | `nmnmfunbot,tc520lh_bot` | 可信 bot 白名单，名单内完全免检 |
+| `AD_ENRICH_EVERY` | `5` | 每新增多少条 AI 样本自动提炼一次指纹（0-200，**0 = 关闭自动提炼**） |
+| `AD_ENRICH_MIN_OCCURRENCE` | `2` | 提炼候选子串需跨样本出现的最少次数（2-20） |
+| `AD_ENRICH_MAX_RESULTS` | `20` | 单次提炼最多入库的指纹条数（1-100） |
+| `AD_CARD_KILL` | `ban` | 结构型广告卡片的处置通道：`ban` = 封禁、`observe` = 只写观察不封（上线初期看误伤面用）、`off` = 关闭该通道退回三层评分 |
+| `STATS_TZ_OFFSET` | `8` | `/stats` 切天的时区偏移小时数（-12~14，非法值回落 +8） |
 
 ### 关于源码顶部 `=可修改=` 区段
 
@@ -259,10 +262,10 @@
 | 绑定 | binding 名 | 必需性 | 用途 |
 | --- | --- | --- | --- |
 | D1 Database | `DB` | **必需** | **唯一存储后端**。黑名单、清扫缓存、批量任务、投票状态、广告指纹库全部存 D1。表结构由代码自动建立，首次写入自动建表。 |
-| Queue | `BULK_QUEUE` | 推荐 | `/ban` `/spam` `/unban` 超出同步安全预算后的自动续接队列。注意这是 Cloudflare Queue 绑定，不是 `wrangler secret put` 环境变量。 |
+| Queue | `BULK_QUEUE` | 推荐 | `/ban` `/sban` `/spam` `/unban` 超出同步安全预算后的自动续接队列。注意这是 Cloudflare Queue 绑定，不是 `wrangler secret put` 环境变量。 |
 | Workers AI | `AI` | 可选 | 广告检测第三层语义判定（`@cf/baai/bge-m3` 1024 维多语言嵌入模型）。不绑则自动降级为「评分 + 指纹」两层。 |
 
-> **未绑定 D1** 或 D1 黑名单读取失败时，自助解封会失败关闭并拒绝继续，避免绕过全局黑名单。`/ban` `/spam` `/unban` `/blacklist` 等命令会提示未绑定存储空间。
+> **未绑定 D1** 或 D1 黑名单读取失败时，自助解封会失败关闭并拒绝继续，避免绕过全局黑名单。`/ban` `/sban` `/spam` `/unban` `/blacklist` 等命令会提示未绑定存储空间。
 > **未绑定 `BULK_QUEUE`** 时，大批量任务仍会创建到 D1，但不会自动续接，需要管理员用 `/jobrun 任务ID` 手动补跑。
 > **未绑定 `AI`** 时广告检测仍工作（评分 + 指纹两层），`/adstats` 会明确标注「未绑定，降级为评分 + 指纹两层」，不会静默失效。
 
@@ -270,22 +273,27 @@
 
 | 分组 | 表名 | 用途 |
 | --- | --- | --- |
-| 核心 | `schema_meta` | 核心 schema 版本号（当前 `6`） |
+| 核心 | `schema_meta` | 核心 schema 版本号（当前 `8`） |
 | 核心 | `blacklist` | 全局黑名单（TGID、原因、操作人、时间、备注） |
 | 核心 | `moderation_messages` | 群内消息缓存，供 `/spam` `/ban` 清扫历史发言 |
-| 核心 | `batch_jobs` | `/ban` `/spam` `/unban` 大批量任务状态与游标 |
+| 核心 | `batch_jobs` | `/ban` `/sban` `/spam` `/unban` 大批量任务状态与游标 |
 | 核心 | `dynamic_groups` | `/addgroup` 指令添加的治理群组 |
 | 统计 | `stat_speech` `stat_member` `stat_actions` | 发言与进退群按天计数、风控处置计数（`/stats` 数据源） |
 | 统计 | `stat_member_events` | 入群 / 退群 / 申请**明细**（`/profile` 时间线数据源，**永久不剪枝**） |
 | 投票 | `ad_votes` `ad_vote_allowlist` | `/ad` 投票状态（保留 7 天）与发起白名单。**按需建立** |
+| 杀手模式 | `killer_mode` | 每群 ON/OFF 开关（`/killer` 的存储）。**按需建立** |
 | 广告检测 | `ad_fingerprints` | 广告指纹库（keyword / domain / username / bio 四类，含命中数、误报数、置信度、来源） |
 | 广告检测 | `ad_user_screening` | 观察窗口记录（得分、判据、资料快照、过期时间） |
 | 广告检测 | `ad_sample_embeddings` | AI 语义样本与向量（向量懒加载，首次建表写入 10 条种子） |
 | 广告检测 | `ad_domain_whitelist` | 域名白名单（首次建表写入 50 条种子） |
-| 广告检测 | `ad_pending_snapshots` | 待确认快照，供 `/pending` `/confirm` `/ignore` 复核，保留 1 小时 |
+| 广告检测 | `ad_pending_snapshots` | 待确认快照，供 `/pending` `/ignore` 复核，保留 1 小时 |
 | 广告检测 | `ad_confirm_tokens` | 二次确认令牌（`/clearsamples` 用） |
+| 广告检测 | `ad_group_members` | 发言者名册（入群即写、滚动复查简介的数据源） |
+| 广告检测 | `ad_scan_state` | 定时扫描进度游标（闸三按 `bio_checked_at` 升序推进） |
+| 广告检测 | `ad_learn_snapshots` | `/recent` 冻结的广告快照（供 `/learnlast` 按序号学习） |
+| 广告检测 | `ad_spam_texts` | 同款直封名单（正文哈希，`/spam` 学入后直发即删 + 封）。**按需建立** |
 
-> **广告检测的表走独立初始化路径**，与核心 5 表完全隔离，`D1_SCHEMA_VERSION` 保持 `6` 不变 —— 老部署升级后现有黑名单数据**一条都不会动**。建表失败时整个广告层静默跳过并进入 60 秒冷却（避免 D1 抖动时每条消息都重试迁移耗尽子请求预算），既有功能不受任何影响。
+> **广告检测的表走独立初始化路径**，与核心 5 表完全隔离，`D1_SCHEMA_VERSION` 保持 `8` 不变 —— 老部署升级后现有黑名单数据**一条都不会动**。建表失败时整个广告层静默跳过并进入 60 秒冷却（避免 D1 抖动时每条消息都重试迁移耗尽子请求预算），既有功能不受任何影响。
 
 ## 部署
 
@@ -342,11 +350,11 @@ wrangler secret put GROUP_ID     # -1001234567890（可逗号分隔多群）
 
 #### 6.4 其它可选项
 
-`SUPER_ADMIN_IDS` `KILLER_MODE_GROUPS` `STAT_SEARCH_GROUPS` `PROFILE_LOOKUP_GROUPS` `STATIC_USER_PROFILES` `BLACKLIST_PAGE_LIMIT` `GKY_BANLIST_ENDPOINT` `FLASH_MESSAGE_TTL_MS` `MSG_CACHE_SIZE`。
+`SUPER_ADMIN_IDS` `KILLER_MODE_GROUPS` `STAT_SEARCH_GROUPS` `PROFILE_LOOKUP_GROUPS` `STATIC_USER_PROFILES` `BLACKLIST_PAGE_LIMIT` `GKY_BANLIST_ENDPOINT` `FLASH_MESSAGE_TTL_MS` `MSG_CACHE_SIZE` `STATS_TZ_OFFSET`。
 
-#### 6.5 广告检测阈值（可选，**建议一个都不填**）
+#### 6.5 广告检测阈值与开关（可选，**建议一个都不填**）
 
-`AD_SCORE_THRESHOLD` `AD_OBSERVATION_SCORE` `AD_OBSERVATION_HOURS` `AD_AI_SIMILARITY_THRESHOLD` `AD_FINGERPRINT_MIN_CONFIDENCE` `AD_PROTECTED_USERNAMES` `AD_TRUSTED_BOTS` —— 用默认值，理由见 [阈值调优](#阈值调优)。
+`AD_SCORE_THRESHOLD` `AD_OBSERVATION_SCORE` `AD_OBSERVATION_HOURS` `AD_AI_SIMILARITY_THRESHOLD` `AD_AI_TOP_K` `AD_FINGERPRINT_MIN_CONFIDENCE` `AD_ENRICH_EVERY` `AD_ENRICH_MIN_OCCURRENCE` `AD_ENRICH_MAX_RESULTS` `AD_CARD_KILL` `AD_PROTECTED_USERNAMES` `AD_TRUSTED_BOTS` —— 用默认值，理由见 [阈值调优](#阈值调优)。
 
 #### 6.6 完整配置示例（可直接照抄改值）
 
@@ -426,7 +434,7 @@ Workers 已连 GitHub 时，`git push` 即自动部署。
 | 项 | 说明 |
 | --- | --- |
 | 路径 | `GET /{TOKEN}/purge` |
-| 用法 | 分批清扫 `/ban` `/spam` 存量黑名单里仍在群里的人 |
+| 用法 | 分批清扫 D1 存量黑名单里仍在群里的人 |
 | 路径 | `GET /{TOKEN}/purge/run` |
 | 用法 | 立即执行一次（默认分批，避免撞子请求上限） |
 ## 常见问题
@@ -446,22 +454,22 @@ bot 必须是**群管理员**，然后重新访问初始化地址重订 webhook�
 ### Q7：修改了 `_worker.js` 顶部的 `DEFAULT_*` 默认值，但没生效
 **环境变量优先级更高**，后台已填同名变量就盖住源码；改源码要 `wrangler deploy`。
 ### Q8：管理员命令（`/ban` `/spam` `/check` `/blacklist`）没反应
-鉴权是「**任一配置群**的管理员或群主」；`/blacklist` 只能私聊发。
+`/ban` `/spam` `/check` 的鉴权是「**任一配置群**的管理员或群主」；`/blacklist` 只能私聊发。`/sban` 更严：限第一主人、副主人、该群群主，私聊仅第一主人与副主人，其余人在群里**完全静默**。
 ### Q9：部署后环境变量被意外重置
 本项目 `wrangler.toml` 已设 `keep_vars = true`；fork 后改过记得改回来。
 ### Q10：自助解封通过后，用户为什么还是不能在群里发言
 三种情况：`kicked` 要重新加群、被其它系统限言、在 GKY 全局黑名单（会触发二次审核提醒）。
-### Q11：`/ban` `/spam` `/unban` 批量超过 50 个怎么办
+### Q11：`/ban` `/sban` `/spam` `/unban` 批量超过 50 个怎么办
 单次上限 50，超过拆批；预算不足的自动转批量任务。
 ### Q12：`/{TOKEN}/export` 接口怎么用，安不安全
 受 `TOKEN` 保护（不匹配返回 405）；浏览器看表、`?format=json` / `?format=csv` 下载。
-### Q13：`/ban` `/spam` 显示"全部群踢人失败"怎么办
-去群设置 → 管理员 → 本机器人，打开**封禁用户**与**删除消息**。
+### Q13：`/ban` `/sban` `/spam` 显示「Telegram 封禁失败 0/N（检查bot封禁权限）」
+去群设置 → 管理员 → 本机器人，打开**封禁用户**（禁言与踢出都靠它）；`/sban` 撤回历史发言另需**删除消息**。
 ### Q14：黑名单用户的旧消息怎么办，会被自动删吗
-`revoke_messages` 自动撤回**最近 48 小时**，这是平台上限，更早的只能手动删。
+踢出（`/sban`、自动处置、杀手 ON 群）时 `revoke_messages` 自动撤回**最近 48 小时**，这是平台上限，更早的只能手动删。`/ban` 禁言不撤回消息 —— 要清历史，引用回复 `/spam`，或在群里对单个 TGID 发 `/ban` 顺带清扫当前群。
 ### Q15：群里发了 /ban 或 /spam 但第一主人没收到详情
 先私聊 bot 发一次 `/start` 建立会话，并核对 `OWNER_IDS[0]` 是第一主人。
-### Q16：四条管理命令还会发 5 秒闪屏吗
+### Q16：管理命令在群里还会发 5 秒闪屏吗
 不会 —— 群内只发简洁汇总，完整明细私聊第一主人。
 ### Q17：群管理员在群里发命令，自己能收到详情吗
 群内发令者不收完整详情，**私聊执行时自己收到**。
@@ -483,7 +491,7 @@ Q21 是服务消息被清扫缓存误删，本条是**频道转发消息本身**
 引用回复 `/spam` 最快（自动学指纹）；手工加 `/addword`；被抢先删的用 `/recent` + `/learnlast`。
 ### Q26：`/adstats` 显示「未绑定，降级为评分 + 指纹两层」
 Workers AI 没绑上 —— `wrangler.toml` 加 `[ai]` 段，绑定名必须**正好是** `AI`。
-### Q27：广告检测的 6 张表建失败了会怎样
+### Q27：广告检测的 9 张表建失败了会怎样
 **既有功能完全不受影响**，广告层静默跳过并进 60 秒冷却；用 `/adstats` 诊断。
 ### Q28：`/admins` 里某个权限人显示「昵称:未获取 用户名:未获取」
 Bot API **只能查 bot 所在群的成员** —— 把 bot 拉进对方所在的群填 `PROFILE_LOOKUP_GROUPS`，或用 `STATIC_USER_PROFILES` 填静态资料。
