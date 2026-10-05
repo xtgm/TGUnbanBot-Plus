@@ -662,7 +662,8 @@ async function handleInitialization(request) {
 		const setCommandsBody = {
 			commands: [
 				{ command: "unban", description: "开始自助解封" },
-				{ command: "ban", description: "添加用户到全局黑名单 (当前群管理员)" },
+				{ command: "ban", description: "添加用户到全局黑名单并全群禁言 (当前群管理员)" },
+				{ command: "sban", description: "加黑并全群踢出 (第一主人/副主人/群主)" },
 				{ command: "spam", description: "举报并加入全局黑名单 (当前群管理员)" },
 				{ command: "rm", description: "删除我回复的那条消息 (仅第一主人)" },
 				{ command: "check", description: "查询封禁状态 (高级管理员)" },
@@ -1516,51 +1517,106 @@ async function removeFromBlacklist(userId, env) {
 // bot 不在群 / 没权限 / Telegram 无法识别用户时，单群失败不影响其它群；串行避免 Telegram API 限流。
 // 杀手模式 OFF 的群（isGroupMuteMode）【略过封禁踢出，改为仅永久禁言】——人留在群里。
 // 返回 [{ groupId, userId, ok, error, memberProbe, muted }]
-async function banUserFromAllGroups(userId, options = {}) {
-	const results = [];
-	for (const groupId of GROUP_IDS) {
-		if (isGroupMuteMode(groupId)) {
-			// 禁言模式：不踢、不预封，只对【已在群里】的人永久禁言（restrictChatMember）。
-			const r = await muteUserInGroup(groupId, userId);
-			results.push({ groupId, userId: String(userId), ok: r.ok, error: r.error, muted: true, memberProbe: null });
-			continue;
-		}
+// 人工命令（/ban /spam /sban）的踢/禁言口径：杀手模式 ON 的群保持【踢出】（现状不变），
+// 其余一律【禁言】。这样 /ban /spam 默认不再踢人，而 KILLER_MODE_GROUPS 里那个开关为 ON 的群
+// 仍按老行为踢出 —— 杀手模式自身的全部功能零改动。
+function resolveHumanCommandMode(groupId) {
+	return isKillerModeGroup(groupId) && !isGroupMuteMode(groupId) ? 'kick' : 'mute';
+}
+
+// 单群执行处置，按 mode 分派。mode 值域：
+//   'kick'  → 恒踢出（/sban，含预封与撤回历史发言）
+//   'human' → 人工命令口径（resolveHumanCommandMode：杀手 ON 踢、其余禁言）
+//   缺省    → 现状口径：杀手模式 OFF 的群禁言、其余踢出（自动路径与 /purge 一直这么走，不传即不变）
+// 返回 { groupId, userId, ok, error, muted, mutedBy, memberProbe, retried }
+async function applyGroupModeration(groupId, userId, mode, options = {}) {
+	const effective = mode === 'kick'
+		? 'kick'
+		: mode === 'human'
+			? resolveHumanCommandMode(groupId)
+			: (isGroupMuteMode(groupId) ? 'mute' : 'kick');
+	if (effective === 'mute') {
+		// 禁言：不踢、不预封，只对【已在群里】的人永久禁言（restrictChatMember）。
+		// 目标不在群时 Telegram 报错 → ok:false，这是预期（禁言接口没有预封能力，靠 D1 黑名单 + 复入群拦截兜底）。
+		// probe 照旧执行（仅当调用方要求）：它同时是回执里「可点击昵称 + 状态」的数据来源，
+		// 砍掉会让 /ban 回执从「昵称 + TGID」退化成只剩一串 TGID —— 那是信息量倒退，不是省请求。
 		const memberProbe = options.probeMembership
 			? await probeTargetMemberBeforeBan(groupId, userId)
 			: null;
-		const r = await banUserFromGroup(groupId, userId, { revokeMessages: options.revokeMessages !== false });
-		results.push({ groupId, userId: String(userId), ok: r.ok, error: r.error, retried: r.retried === true, memberProbe, muted: false });
+		const r = await muteUserInGroup(groupId, userId);
+		return {
+			groupId,
+			userId: String(userId),
+			ok: r.ok,
+			error: r.error,
+			retried: r.retried === true,
+			muted: true,
+			mutedBy: mode === 'human' ? 'human' : 'killer',
+			memberProbe
+		};
+	}
+	const memberProbe = options.probeMembership
+		? await probeTargetMemberBeforeBan(groupId, userId)
+		: null;
+	const r = await banUserFromGroup(groupId, userId, { revokeMessages: options.revokeMessages !== false });
+	return {
+		groupId,
+		userId: String(userId),
+		ok: r.ok,
+		error: r.error,
+		retried: r.retried === true,
+		memberProbe,
+		muted: false,
+		mutedBy: null
+	};
+}
+
+async function banUserFromAllGroups(userId, options = {}) {
+	const results = [];
+	for (const groupId of GROUP_IDS) {
+		results.push(await applyGroupModeration(groupId, userId, options.mode, options));
 	}
 	return results;
 }
 
-// 把用户从所有配置群解除 Telegram 原生/手动封禁，逐群结果数组返回。
+// 把用户从所有配置群解除处置，逐群结果数组返回。
 // 调用方必须先确认目标不在 D1 黑名单；管理层命中 D1 时应先成功移除记录。
 // 本函数本身不修改 D1，也绝不调用封禁接口。
-// 杀手模式 OFF 的群里用户是被【禁言】的（没被封），所以那些群解除的是禁言（restrictUser 恢复发言）。
+// 【双解】同一人可能在 A 群被 /sban 踢出、在 B 群被 /ban 禁言，D1 不记录各群处置方式，
+// 所以每个群固定两步：先 restrictChatMember 恢复发言，再 unbanChatMember 解除封禁。
+// 顺序固定「先恢复发言、后解除封禁」，两者终态等价（群成员 + 默认权限），
+// 对「本就不存在的状态」（没被禁言的人 / 没被封的人）报错即吞掉 —— 至少一步成功就算该群成功。
 async function unbanUserFromAllGroups(userId) {
 	const results = [];
 	for (const groupId of GROUP_IDS) {
-		if (isGroupMuteMode(groupId)) {
-			try {
-				const r = await restrictUser(userId, groupId);
-				results.push({ groupId, userId: String(userId), ok: r?.ok === true, error: r?.ok === true ? null : (r?.description || '解除禁言失败'), unmuted: true });
-			} catch (error) {
-				results.push({ groupId, userId: String(userId), ok: false, error: error.message || String(error), unmuted: true });
-			}
-			continue;
+		let restrictOk = false;
+		let restrictError = null;
+		let unbanOk = false;
+		let unbanError = null;
+		try {
+			const r = await restrictUser(userId, groupId);
+			restrictOk = r?.ok === true;
+			if (!restrictOk) restrictError = r?.description || '恢复发言失败';
+		} catch (error) {
+			restrictError = error.message || String(error);
 		}
 		try {
 			const r = await unbanUser(userId, groupId);
-			results.push({
-				groupId,
-				userId: String(userId),
-				ok: r?.ok === true,
-				error: r?.ok === true ? null : (r?.description || r?.error || '未知错误')
-			});
+			unbanOk = r?.ok === true;
+			if (!unbanOk) unbanError = r?.description || r?.error || '解除封禁失败';
 		} catch (error) {
-			results.push({ groupId, userId: String(userId), ok: false, error: error.message || String(error) });
+			unbanError = error.message || String(error);
 		}
+		const ok = restrictOk || unbanOk;
+		results.push({
+			groupId,
+			userId: String(userId),
+			ok,
+			error: ok ? null : (unbanError || restrictError || '未知错误'),
+			unmuted: restrictOk,
+			unbanned: unbanOk,
+			dual: true
+		});
 	}
 	return results;
 }
@@ -1803,7 +1859,8 @@ function getBanResultStats(banResults) {
 }
 
 function formatBanSuccessResult(r) {
-	if (r?.muted) return '已永久禁言（杀手模式关闭，未踢出）';
+	// mutedBy：'human' = 人工命令口径（/ban /spam 默认禁言）；'killer' = 杀手模式关闭状态。
+	if (r?.muted) return r?.mutedBy === 'human' ? '已永久禁言（未踢出）' : '已永久禁言（杀手模式关闭，未踢出）';
 	const state = r?.memberProbe?.state;
 	if (state === 'in_group') return '已封禁并移出群聊';
 	if (state === 'not_in_group') return '已加入群封禁列表（预封，禁止后续进群）';
@@ -1840,7 +1897,14 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 		return 'ℹ️ 未配置 GROUP_ID，未执行 Telegram 群封禁/预封。';
 	}
 	const mutedCount = banResults.filter((r) => r.muted).length;
-	if (mutedCount === total) {
+	const humanMutedCount = banResults.filter((r) => r.muted && r.mutedBy === 'human').length;
+	const killerMutedCount = mutedCount - humanMutedCount;
+	if (mutedCount === total && killerMutedCount === 0) {
+		// 人工命令口径（/ban /spam）：所有配置群只禁言、未踢出。
+		if (okCount === total) lines.push(`🔇 <b>已永久禁言 ${okCount}/${total} 个群（未踢出）</b>`);
+		else if (okCount === 0) lines.push(`⚠️ <b>D1 黑名单已生效；禁言成功 0/${total}</b>`);
+		else lines.push(`🔇 <b>已禁言 ${okCount}/${total}</b>（${failCount} 个失败）`);
+	} else if (mutedCount === total) {
 		// 全部命中杀手模式群：只禁言、未踢出。
 		if (okCount === total) lines.push(`🔇 <b>杀手模式：已永久禁言 ${okCount}/${total} 个群（未踢出）</b>`);
 		else if (okCount === 0) lines.push(`⚠️ <b>D1 黑名单已生效；杀手模式禁言成功 0/${total}</b>`);
@@ -1853,7 +1917,11 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${total}</b>（${failCount} 个失败）`);
 	}
 	if (mutedCount > 0 && mutedCount < total) {
-		lines.push(`🔇 其中 ${mutedCount} 个群为杀手模式关闭状态，命中用户仅永久禁言、未踢出。`);
+		// 混合口径：/ban /spam 在杀手模式 ON 的群仍踢出、其余禁言 —— 两种都要说清，不能只提杀手模式。
+		const mutedParts = [];
+		if (humanMutedCount > 0) mutedParts.push(`${humanMutedCount} 个群仅永久禁言、未踢出`);
+		if (killerMutedCount > 0) mutedParts.push(`${killerMutedCount} 个群命中杀手模式关闭状态，仅永久禁言`);
+		lines.push(`🔇 其中 ${mutedParts.join('；')}。`);
 	}
 	if (banResults.some((r) => r.ok && r.memberProbe?.state === 'not_in_group')) {
 		lines.push('ℹ️ 目标不在群内时，成功表示已加入该群封禁列表（预封），不是从群里踢出了在线成员。');
@@ -1904,7 +1972,16 @@ function renderBanResults(banResults) {
 	const { okCount, total, lookupFailCount, permissionFailCount } = getBanResultStats(banResults);
 	if (total === 0) return 'ℹ️ 未配置 GROUP_ID，未执行 Telegram 群封禁';
 	const mutedCount = banResults.filter((r) => r.muted).length;
-	if (mutedCount === total) return `🔇 杀手模式：已永久禁言 ${okCount}/${total} 个群（未踢出）`;
+	const humanMutedCount = banResults.filter((r) => r.muted && r.mutedBy === 'human').length;
+	if (mutedCount === total) {
+		return humanMutedCount === total
+			? `🔇 已永久禁言 ${okCount}/${total} 个群（未踢出）`
+			: `🔇 杀手模式：已永久禁言 ${okCount}/${total} 个群（未踢出）`;
+	}
+	if (mutedCount > 0 && humanMutedCount > 0) {
+		// /ban /spam 混合口径：杀手模式 ON 的群踢出、其余禁言。
+		return `✅ Telegram 处置成功 ${okCount}/${total} 个配置群（禁言 ${humanMutedCount}、踢出 ${total - mutedCount}）`;
+	}
 	if (okCount === total) return `✅ Telegram封禁/预封成功 ${okCount}/${total} 个配置群`;
 	if (okCount === 0 && lookupFailCount === total) return '⚠️ D1已生效，Telegram暂无法识别TGID';
 	if (okCount === 0 && permissionFailCount === total) return `⚠️ Telegram封禁失败 0/${total}（检查bot封禁权限）`;
@@ -1924,13 +2001,18 @@ async function renderUnbanResultsDetail(unbanResults, chatInfoCache = null, opti
 		return 'ℹ️ 未配置 GROUP_ID，未执行 Telegram 群解封。';
 	}
 	if (okCount === total) {
-		lines.push(`✅ <b>已解除全部 ${total} 个配置群的 Telegram 封禁</b>`);
+		lines.push(`✅ <b>已解除全部 ${total} 个配置群的封禁并恢复发言</b>`);
 	} else if (okCount === 0 && lookupFailCount === total) {
 		lines.push(`⚠️ <b>全部 ${total} 个配置群 Telegram 解封失败：Telegram 当前无法识别该 TGID</b>`);
 	} else if (okCount === 0) {
 		lines.push(`⚠️ <b>全部 ${total} 个配置群 Telegram 解封失败</b>`);
 	} else {
-		lines.push(`✅ <b>已解除 ${okCount}/${total} 个配置群的 Telegram 封禁</b>（${total - okCount} 个失败）`);
+		lines.push(`✅ <b>已解除 ${okCount}/${total} 个配置群的封禁并恢复发言</b>（${total - okCount} 个失败）`);
+	}
+	// 双解口径一句话说清：每个群都跑「恢复发言 + 解除封禁」两步，因为同一个人可能
+	// 在 A 群被 /sban 踢出、在 B 群被 /ban 禁言，D1 不记录各群处置方式。
+	if (unbanResults.some((r) => r.dual)) {
+		lines.push('ℹ️ 每群已执行「恢复发言 + 解除封禁」两步，未被处置过的一步会静默跳过。');
 	}
 
 	await mapWithConcurrency(
@@ -1973,10 +2055,10 @@ function renderUnbanResults(unbanResults) {
 	const total = unbanResults.length;
 	const lookupFailCount = unbanResults.filter((r) => !r.ok && isTelegramUserUnresolvableError(r.error)).length;
 	if (total === 0) return 'ℹ️ 未配置 GROUP_ID，未执行群解封';
-	if (okCount === total) return `✅ 已解除全部 ${total} 个群的 Telegram 封禁`;
+	if (okCount === total) return `✅ 已解除全部 ${total} 个群的封禁并恢复发言`;
 	if (okCount === 0 && lookupFailCount === total) return '⚠️ D1检查通过，Telegram暂无法识别TGID';
 	if (okCount === 0) return `⚠️ 全部 ${total} 个群解封失败（请检查 bot 是否为群管理员）`;
-	return `✅ 已解除 ${okCount}/${total} 个群的 Telegram 封禁（${total - okCount} 个失败）`;
+	return `✅ 已解除 ${okCount}/${total} 个群的封禁并恢复发言（${total - okCount} 个失败）`;
 }
 
 // 管理命令按角色鉴权并私聊投递详情；四条公开管理命令使用无闪屏回执。
@@ -2603,6 +2685,7 @@ function getBulkJobCommand(action) {
 	const normalized = normalizeBulkJobAction(action);
 	if (normalized === 'spam') return '/spam';
 	if (normalized === 'ban') return '/ban';
+	if (normalized === 'sban') return '/sban';
 	if (normalized === 'unban') return '/unban';
 	return '';
 }
@@ -2769,6 +2852,9 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		id: buildBulkJobId(normalizedAction),
 		action: normalizedAction,
 		reason: normalizedAction === 'spam' ? 'spam' : (isUnban ? null : 'manual'),
+		// 处置方式（执行时传给 applyGroupModeration）：'kick' = /sban 恒踢出；
+		// 'human' = /ban /spam 口径（杀手 ON 踢、其余禁言）；null = 现状（老任务与自动路径）。
+		mode: options.mode || null,
 		command: getBulkJobCommand(normalizedAction),
 		status: 'queued',
 		ids: ids.map((id) => String(id)),
@@ -3186,15 +3272,22 @@ async function processBulkJobOperationSlice(job, env) {
 
 	await mapWithConcurrency(tasks, getBulkJobSafeConcurrency(job), async (task) => {
 		if (isUnban) {
-			// 禁言模式群：解的是禁言（restrictUser 恢复发言），不是原生解封。
-			let ok = false, errText = '群解封失败';
-			if (isGroupMuteMode(task.groupId)) {
-				try { const rr = await restrictUser(task.userId, task.groupId); ok = rr?.ok === true; if (!ok) errText = rr?.description || '解除禁言失败'; }
-				catch (e) { ok = false; errText = e?.message || '解除禁言失败'; }
-			} else {
-				const result = await unbanUser(task.userId, task.groupId);
-				ok = result?.ok === true; if (!ok) errText = result?.description || result?.error || '群解封失败';
-			}
+			// 双解（与 unbanUserFromAllGroups 同口径）：每群固定两步「先恢复发言、后解除封禁」。
+			// 同一个人可能在部分群被 /sban 踢出、部分群被 /ban 禁言，D1 不记录各群处置方式，
+			// 只做一步会漏掉另一半；对「本就不存在的状态」报错即吞，至少一步成功就算该群成功。
+			let restrictOk = false, unbanOk = false, errText = '群解封失败';
+			try {
+				const rr = await restrictUser(task.userId, task.groupId);
+				restrictOk = rr?.ok === true;
+				if (!restrictOk) errText = rr?.description || '恢复发言失败';
+			} catch (e) { restrictOk = false; errText = e?.message || '恢复发言失败'; }
+			try {
+				const rr = await unbanUser(task.userId, task.groupId);
+				unbanOk = rr?.ok === true;
+				if (unbanOk) errText = '群解封失败';
+				else errText = rr?.description || rr?.error || errText;
+			} catch (e) { unbanOk = false; if (!restrictOk) errText = e?.message || '解除封禁失败'; }
+			const ok = restrictOk || unbanOk;
 			if (ok) {
 				incrementBulkJobStat(job, 'unbanOk');
 			} else {
@@ -3209,10 +3302,11 @@ async function processBulkJobOperationSlice(job, env) {
 			return;
 		}
 
-		// 禁言模式群：只禁言不踢出（restrictChatMember）；其余群照常封禁踢出。
-		const result = isGroupMuteMode(task.groupId)
-			? await muteUserInGroup(task.groupId, task.userId)
-			: await banUserFromGroup(task.groupId, task.userId);
+		// 按任务携带的 mode 分派单群处置：
+		//   'kick'  → /sban 恒踢出（含撤回历史发言）
+		//   'human' → /ban /spam 口径：杀手模式 ON 的群踢出、其余禁言
+		//   缺省    → 现状：杀手模式 OFF 的群禁言、其余踢出（老任务的 payload 没有该字段，行为不变）
+		const result = await applyGroupModeration(task.groupId, task.userId, job.mode);
 		if (result.ok) {
 			incrementBulkJobStat(job, 'kickOk');
 		} else {
@@ -3431,6 +3525,7 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 	}
 	const job = await createBulkJob(env, action, valid, invalid, note, message, {
 		allowD1Removal: action === 'unban' && options.allowD1Removal === true,
+		mode: options.mode || null,
 		// 群内静默/简洁（主人要求）：/ban·/spam·/unban 的批量任务【不再向源群推异步完成通知】，
 		// 与它们的同步群内策略一致（/ban·/spam 群内全程静默；/unban 群内只保留同步阶段的
 		// 「任务已创建」简洁提示）。完整结果照旧私聊第一主人与副主人（job.notifyTargets 不受影响）。
@@ -4414,6 +4509,28 @@ function isBanCommand(text) {
 
 	const trimmedText = text.trim();
 	return /^\/ban(?:@[^\s]+)?(?:\s|$)/i.test(trimmedText);
+}
+
+// /sban：加黑 + 全群【踢出】并撤回历史发言。与 /ban 共用同一条命令分支，只在权限与处置方式上分叉。
+// （`^\/sban` 与 `^\/ban` 互不匹配，两条命令不会互相误判。）
+function isSbanCommand(text) {
+	if (!text) {
+		return false;
+	}
+	return /^\/sban(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
+}
+
+// /sban 鉴权：第一主人 / 副主人 / 该群 Telegram 群主（creator）。
+// 超管与普通管理员不给 —— 踢人比禁言重，主人定的口子就是这三种身份。
+// 私聊没有群上下文、判不出谁是群主，所以私聊只放第一主人与副主人；群主要踢人得进群发命令。
+async function checkSbanPermission(message, userId) {
+	if (isBotOperator(message?.from)) return false;
+	if (isPrimaryOwner(userId) || isSecondaryOwner(userId)) return true;
+	if (message?.chat?.type === 'private') return false;
+	if (!isConfiguredGroup(message?.chat?.id)) return false;
+	// 不复用 checkIfUserIsAdminInGroup：那个把管理员和群主一并放行，/sban 只认 creator。
+	// 不接 AD_ADMIN_CACHE：它存的是 id 列表、没有 status，区分不出群主。
+	return await isGroupCreator(userId, String(message.chat.id));
 }
 
 // 判断给定 chat_id 是否属于配置的任一群组
@@ -7975,6 +8092,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			if (await startBulkModerationJobFromCommand(message, env, ctx, {
 				action: 'spam',
+				mode: 'human',
 				valid,
 				invalid,
 				note,
@@ -7992,17 +8110,18 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				const lines = [`🎬 操作:举报加黑(/spam)`];
 				let flashText;
 				if (result.success || alreadyExists) {
-					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
-					// 风控·处置：/spam 单条按实际封成功的群逐群 +1。
+					// mode:'human' = /spam 与 /ban 同口径：杀手模式 ON 的群踢出、其余群禁言不踢。
+					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true, mode: 'human' });
+					// 风控·处置：/spam 单条按实际处置成功的群逐群 +1。
 					await recordDisposalsFromBanResults(env, banResults);
 					targetMention = formatTargetFromBanResults(valid[0], banResults);
 					lines.push(`🎯 目标用户:${targetMention}`);
 					lines.push('');
 					if (alreadyExists) {
-						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
+						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行全群处置</b>');
 					}
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
-					flashText = `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
+					flashText = `${result.success ? '✅ 已加黑并全群禁言' : '⚠️ 已在黑名单，已继续全群禁言'}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
 				} else {
 					lines.push(`🎯 目标用户:${targetMention}`);
 					lines.push('');
@@ -8026,7 +8145,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const perUserBanResults = await mapWithConcurrency(
 				idsToKick,
 				BULK_TASK_CONCURRENCY,
-				async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id) })
+				async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id, { mode: 'human' }) })
 			);
 			for (const { banResults } of perUserBanResults) {
 				const okCount = banResults.filter((r) => r.ok).length;
@@ -8082,7 +8201,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (result.success || alreadyExists) {
 			// 加黑成功或已存在 → Telegram 群封禁/预封(revoke_messages 默认 true:封禁同时删该用户在各群全部消息)
 			//   + 缓存清扫兜底(补删 revoke 偶尔漏的、当前群近期消息)
-			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true });
+			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true, mode: 'human' });
 			// 风控·处置：引用回复 /spam（对发出广告那条消息的发送者处置）按封成功群逐群 +1。
 			await recordDisposalsFromBanResults(env, banResults);
 			const cleanupResult = await cleanupCurrentChatUserMessages(env, chatId, repliedUserId, [repliedMsg.message_id]);
@@ -8267,7 +8386,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 
 			await replyToModerationAdmin(message, ctx, {
-				flashText: `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'}\n🎯 ${formatUserReference(repliedUserId, repliedMsg.from)} <code>${escapeHtml(String(repliedUserId))}</code>`,
+				flashText: `${result.success ? '✅ 已加黑并全群禁言' : '⚠️ 已在黑名单，已继续全群禁言'}\n🎯 ${formatUserReference(repliedUserId, repliedMsg.from)} <code>${escapeHtml(String(repliedUserId))}</code>`,
 				detailText: withActionContext(message, lines.join('\n'), replySpamNote),
 				isInGroup,
 				notifySecondaryOwners: true
@@ -8604,9 +8723,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'🔐 <b>第一主人专属帮助</b>（仅第一主人私聊可展开）',
 			'',
 			'<b>━━ 人工封禁与查询（群管理员 / 主人 / 副主人）━━</b>',
-			'/ban TGID [原因]　加黑 + 全群封禁',
-			'/spam　回复广告：删消息 + 全群封禁 + 撤回其历史发言',
-			'/unban TGID　移出黑名单 + 全群解封（不带 ID 则是自助解封）',
+			'/ban TGID [原因]　加黑 + 全群禁言（不踢出）',
+			'/sban TGID [原因]　加黑 + 全群踢出并撤回其历史发言（第一主人 / 副主人 / 该群群主）',
+			'/spam　回复广告：删消息 + 全群禁言',
+			'/unban TGID　移出黑名单 + 全群解封并恢复发言（不带 ID 则是自助解封）',
 			'/check TGID　查封禁状态：GKY + 本地黑名单（群内可回复消息使用）',
 			'/profile TGID　资料卡：昵称 / 简介 / 时间线 / 黑名单 / GKY（群内可回复消息使用）',
 			'/rm　回复要删的消息后发送 → 删除该消息（仅第一主人 / 该群群主）',
@@ -8927,39 +9047,50 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 
 
-	// 处理 /ban 命令 - 添加用户到黑名单（支持批量、群内/私聊双场景；兼容 /ban@机器人名）
-	if (isBanCommand(text)) {
+	// 处理 /ban 与 /sban 命令 - 添加用户到黑名单（支持批量、群内/私聊双场景；兼容 @机器人名）
+	//   /ban  → 加黑 + 全群【禁言】（杀手模式 ON 的群仍踢出，见 resolveHumanCommandMode）
+	//   /sban → 加黑 + 全群【踢出】并撤回历史发言（主人定的「指定人全群踢出」专用指令）
+	// 两者共用这一条分支：解析、批量、渲染、回执逻辑完全一致，只在权限与处置方式上分叉。
+	if (isBanCommand(text) || isSbanCommand(text)) {
+		const isSban = isSbanCommand(text);
+		const commandName = isSban ? '/sban' : '/ban';
+		const moderationMode = isSban ? 'kick' : 'human';
 		const isInGroup = message.chat.type !== 'private';
 		if (isInGroup && !isConfiguredGroup(chatId)) return;
 
-		// 仅真人可通过 /ban 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
+		// 仅真人可写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
 		if (isBotOperator(message.from)) return;
 
-		// 群聊检查当前群管理员，私聊检查任一配置群；主人和副主人保留原权限。
-		const isAdmin = await checkMessageOperatorCanModerate(message, userId);
+		// /sban 的口子更窄：第一主人 / 副主人 / 该群 Telegram 群主；超管与普通管理员不给。
+		// 私聊判不出群主，所以私聊只放第一主人与副主人 —— 群主要踢人得进群发命令。
+		const isAdmin = isSban
+			? await checkSbanPermission(message, userId)
+			: await checkMessageOperatorCanModerate(message, userId);
 		if (!isAdmin) {
 			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/ban 仅限配置群的 Telegram 管理员、主人或副主人使用。');
+				await sendTelegramMessage(chatId, isSban
+					? '❌ <b>权限不足</b>\n\n/sban 限第一主人、副主人或该群群主使用（私聊仅第一主人与副主人）。'
+					: '❌ <b>权限不足</b>\n\n/ban 仅限配置群的 Telegram 管理员、主人或副主人使用。');
 			}
 			return;
 		}
 
-		await deleteAuthorizedGroupCommandMessage(message, '/ban');
-		// 群聊简洁（主人要求）：/ban 在群内只发「目标 + 封禁结果」的简洁汇总，与 /unban 同款
+		await deleteAuthorizedGroupCommandMessage(message, commandName);
+		// 群聊简洁（主人要求）：在群内只发「目标 + 处置结果」的简洁汇总，与 /unban 同款
 		//（目标用 formatTargetFromBanResults / formatBatchUserTarget 渲染成可点击昵称 + 可复制 TGID）；
 		// 完整逐群明细仍私聊第一主人与副主人。撤回命令消息、副主人通知等原有行为一律不变。
 		message.__moderationGroupMode = 'brief';
 
 		// 提取参数（支持单个 / 批量；开头 TGID 列表之后的文本作为执行原因）
-		// 用正则提取,与 /spam 完全对称:兼容 /ban、/ban@机器人名、多空格;彻底不依赖命令长度,
+		// 用正则提取,与 /spam 完全对称:兼容 /ban、/ban@机器人名、/sban、多空格;彻底不依赖命令长度,
 		// 根除早期 slice(5) 吃掉参数首字符那类"命令一改短就错位"的隐患。
-		const argMatch = text.trim().match(/^\/ban(?:@[^\s]+)?\s*([\s\S]*)/i);
+		const argMatch = text.trim().match(/^\/(?:ban|sban)(?:@[^\s]+)?\s*([\s\S]*)/i);
 		const rawArg = argMatch ? argMatch[1] : '';
 		const { valid, invalid, note } = parseTargetIdsAndNote(rawArg);
 
 		if (valid.length === 0 && invalid.length === 0) {
-			const usageText = `❌ 使用方法：<code>/ban 用户ID</code> 或 <code>/ban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
+			const usageText = `❌ 使用方法：<code>${commandName} 用户ID</code> 或 <code>${commandName} 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
 			await replyToModerationAdmin(message, ctx, { flashText: usageText });
 			return;
 		}
@@ -8969,7 +9100,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 		if (await startBulkModerationJobFromCommand(message, env, ctx, {
-			action: 'ban',
+			action: isSban ? 'sban' : 'ban',
+			mode: moderationMode,
 			valid,
 			invalid,
 			note,
@@ -8985,11 +9117,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const alreadyExists = result.code === 'EXISTS';
 			// 统一详情格式:无论成功失败都展示完整字段
 			let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
-			const lines = [`🎬 操作:加入黑名单`];
+			const lines = [`🎬 操作:${isSban ? '全群踢出并加黑(/sban)' : '加入黑名单(/ban)'}`];
 			let flashText;
 			if (result.success || alreadyExists) {
-				const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
-				// 风控·处置：/ban 单条按实际封成功的群逐群 +1。
+				const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true, mode: moderationMode });
+				// 风控·处置：单条按实际处置成功的群逐群 +1。
 				await recordDisposalsFromBanResults(env, banResults);
 				// 与 /spam 对齐：Telegram 的 revoke_messages 只对【仍在群里】的成员生效，
 				// 目标若已退群/已被别人踢过就变成预封，历史发言一条都撤不掉。
@@ -9003,9 +9135,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				lines.push(`🎯 目标用户:${targetMention}`);
 				lines.push('');
 				if (alreadyExists) {
-					lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
+					lines.push(`⚠️ <b>该用户已在黑名单中,本次已继续执行${isSban ? '全群踢出' : '全群处置'}</b>`);
 				}
-				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/ban' }));
+				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: commandName }));
 				if (cleanupResult) {
 					lines.push(renderCurrentChatCleanupResult(cleanupResult));
 					if (cleanupResult.failed > 0 && cleanupResult.errors.length > 0) {
@@ -9016,7 +9148,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 						lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
 					}
 				}
-				flashText = `${result.success ? '✅ 已加黑并全群封禁' : '⚠️ 已在黑名单，已继续全群封禁'}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
+				flashText = `${result.success ? (isSban ? '✅ 已加黑并全群踢出' : '✅ 已加黑并全群禁言') : (isSban ? '⚠️ 已在黑名单，已继续全群踢出' : '⚠️ 已在黑名单，已继续全群禁言')}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
 				lines.push(`🎯 目标用户:${targetMention}`);
@@ -9042,18 +9174,18 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const perUserBanResults = await mapWithConcurrency(
 			idsToKick,
 			BULK_TASK_CONCURRENCY,
-			async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id) })
+			async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id, { mode: moderationMode }) })
 		);
 		for (const { banResults } of perUserBanResults) {
 			const okCount = banResults.filter((r) => r.ok).length;
 			if (okCount === banResults.length) banSummary.banOkAll += 1;
 			else if (okCount === 0) banSummary.banFailedAll += 1;
 			else banSummary.banPartial += 1;
-			// 风控·处置：批量 /ban 逐用户、逐群记一次（每个目标 × 每个封成功的群）。
+			// 风控·处置：批量逐用户、逐群记一次（每个目标 × 每个处置成功的群）。
 			await recordDisposalsFromBanResults(env, banResults);
 		}
 		const failedCount = invalid.length + results.failed.length;
-		const flashText = `✅ 批量加黑：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`
+		const flashText = `✅ 批量加黑(${commandName})：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`
 			+ (idsToKick.length ? '\n' + idsToKick.map((id) => `· ${formatBatchUserTarget(id, userProfiles)}`).join('\n') : '');
 		// 详细 detailText：批量汇总 + 每个用户的逐群明细
 		const baseDetail = renderBatchAddResult(results, invalid, banSummary, userProfiles);
@@ -9064,7 +9196,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			for (const { userId: uid, banResults } of perUserBanResults) {
 				const resultDetail = await renderBanResultsDetail(banResults, chatInfoCache, {
 					userId: uid,
-					retryCommand: '/ban',
+					retryCommand: commandName,
 					compactSpacing: true
 				});
 				perUserBlocks.push(buildTelegramAtomicHtmlBlock([
@@ -9072,7 +9204,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					resultDetail
 				]));
 			}
-			fullDetail += `\n\n<b>逐用户 Telegram 群封禁/预封明细</b>:\n\n${perUserBlocks.join('\n\n')}`;
+			fullDetail += `\n\n<b>逐用户 Telegram ${isSban ? '群踢出' : '禁言/踢出'}明细</b>:\n\n${perUserBlocks.join('\n\n')}`;
 		}
 		await replyToModerationAdmin(message, ctx, {
 			flashText,
@@ -9975,16 +10107,52 @@ async function muteChatMember(chatId, userId) {
 	return result;
 }
 
-// 禁言模式用：把 muteChatMember 的「成功返回 / 失败抛异常」包装成 { ok, error } 逐群结果，
-// 与 banUserFromGroup 的返回形状对齐，供 banUserFromAllGroups 统一收集。
+// 从 muteChatMember 抛出的 `HTTP error! status: 429, body: {...}` 里还原结构化失败字段，
+// 供 shouldRetryTelegramMutationFailure / getTelegramMutationRetryDelayMs 判定是否重试。
+// 消息里既没有 status 也没有 body → 是 fetch 自身抛的网络异常，按网络错误处理（可重试）。
+function parseMuteFailure(error) {
+	const message = String(error?.message || error || '');
+	const statusMatch = message.match(/status:\s*(\d+)/);
+	const bodyMatch = message.match(/body:\s*(\{[\s\S]*\})/);
+	if (!statusMatch && !bodyMatch) return { networkError: true };
+	let parsed = null;
+	if (bodyMatch) {
+		try { parsed = JSON.parse(bodyMatch[1]); } catch (_) { parsed = null; }
+	}
+	return {
+		httpStatus: statusMatch ? Number(statusMatch[1]) : 0,
+		errorCode: Number(parsed?.error_code) || 0,
+		retryAfterSeconds: Number(parsed?.parameters?.retry_after) || 0
+	};
+}
+
+// 禁言用：把 muteChatMember 的「成功返回 / 失败抛异常」包装成 { ok, error } 逐群结果，
+// 与 banUserFromGroup 的返回形状对齐，供 applyGroupModeration 统一收集。
+// 【重试与 banUserFromGroup 同规格】429 / 5xx / 网络异常各重试一次，否则 /ban 改禁言后
+// 会丢掉踢出路径原有的限流重试保障 —— 同一条命令路径的可靠性不该因为换了处置方式而倒退。
 // 注意 restrictChatMember 只能禁言【已在群里】的人；目标不在群时 Telegram 报错 → ok:false（预期，无法预禁言）。
 async function muteUserInGroup(chatId, userId) {
-	try {
-		await muteChatMember(chatId, userId);
-		return { ok: true };
-	} catch (error) {
-		return { ok: false, error: error?.message || String(error) };
+	let lastError = null;
+	let attempts = 0;
+	for (let attempt = 1; attempt <= 2; attempt += 1) {
+		attempts = attempt;
+		try {
+			await muteChatMember(chatId, userId);
+			return { ok: true, attempts, retried: attempt > 1 };
+		} catch (error) {
+			lastError = error;
+			if (attempt >= 2) break;
+			const failure = parseMuteFailure(error);
+			if (!shouldRetryTelegramMutationFailure(failure)) break;
+			await new Promise((resolve) => setTimeout(resolve, getTelegramMutationRetryDelayMs(failure)));
+		}
 	}
+	return {
+		ok: false,
+		error: lastError?.message || String(lastError || '失败'),
+		attempts,
+		retried: attempts > 1
+	};
 }
 
 // 把用户踢出群（Telegram banChatMember API）

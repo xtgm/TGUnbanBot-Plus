@@ -2725,7 +2725,7 @@ section('[16] 指纹种子库（35 图特征下移到第二层）+ /spam 人工�
 	}, envSpam);
 	const spamRows = envSpam.DB.query("SELECT type, value, weight, source FROM ad_fingerprints WHERE source = 'spam'");
 	assert('/spam 学习：本职照做（目标入黑名单）', envSpam.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '92003'")[0].c === 1, JSON.stringify(envSpam.DB.query('SELECT id, reason FROM blacklist')));
-	assert('/spam 学习：本职照做（全群封禁）', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('/spam 学习：本职照做（全群禁言，不再踢出）', countCalls('restrictChatMember') >= 1 && countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
 	assert('/spam 学习：写入了指纹', spamRows.length > 0, JSON.stringify(spamRows));
 	assert('/spam 学习：来源标记为 spam（不是 manual，保留误报自动退役）',
 		spamRows.every((r) => r.source === 'spam'), JSON.stringify(spamRows.map((r) => r.source)));

@@ -13,9 +13,10 @@ import { DatabaseSync } from 'node:sqlite';
 
 const src = fs.readFileSync('_worker.js', 'utf8');
 let banned = [];
+let muted = [];
 let deleted = [];
 let sent = [];
-const resetCalls = () => { banned = []; deleted = []; sent = []; };
+const resetCalls = () => { banned = []; muted = []; deleted = []; sent = []; };
 
 const sandbox = {
 	console, URL, URLSearchParams, TextEncoder, TextDecoder, Response, Request, Headers,
@@ -25,6 +26,8 @@ const sandbox = {
 		let b = null;
 		try { b = init?.body ? JSON.parse(init.body) : null; } catch (_) { b = null; }
 		if (m === 'banChatMember') banned.push(b.chat_id + ':' + b.user_id);
+		// /ban /spam 现在走禁言（restrictChatMember），自动检测路径仍走踢出（banChatMember）。
+		if (m === 'restrictChatMember') muted.push(b.chat_id + ':' + b.user_id);
 		if (m === 'deleteMessage') deleted.push(b.chat_id + ':' + b.message_id);
 		if (m === 'sendMessage') sent.push(String(b.text || ''));
 		let payload = { ok: true, result: true };
@@ -673,8 +676,8 @@ console.log('\n=== 12. 引用已处置广告的四条管理命令先鉴权撤回
 			check(command + ' 双库查询保持只读', sent.some((text) => text.includes('封禁查询结果'))
 				&& env.DB.query("SELECT id FROM blacklist WHERE id='88001'").length === 1);
 		} else {
-			check(command + ' 继续加黑与全群封禁', env.DB.query("SELECT id FROM blacklist WHERE id='88001'").length === 1
-				&& banned.filter((x) => x.endsWith(':88001')).length === GROUPS.length);
+			check(command + ' 继续加黑并全群禁言', env.DB.query("SELECT id FROM blacklist WHERE id='88001'").length === 1
+				&& muted.filter((x) => x.endsWith(':88001')).length === GROUPS.length);
 			if (command === '/spam') check('/spam 仍删除被引用的广告消息', deleted.includes(GROUPS[0] + ':8399'));
 		}
 	}
