@@ -434,13 +434,22 @@ export default {
 			// 互不挤占（bio 扫描看 ad_scan_state 的 scan_*，这里看 avatar_*）。
 			// 内部已做全量前置判断（无 AI 绑定 / 未就绪 / 额度用尽都会直接返回）。
 			const avatarSummary = await runAdAvatarVision(env);
+			// 正文图片视觉识别同样独立一轨：共用 cron 节拍，状态键 img_* 与
+			// avatar_* 互不挤占。内部同样做全量前置判断（无 AI 绑定 / 未就绪 /
+			// 额度用尽 / 队列为空都会直接返回）。
+			//
+			// batchSize 单轮封顶：一张图要 getFile + 下载 + 推理，300 张一次跑完
+			// 是分钟级的串行 IO。队列靠 vision_checked_at 自平衡 —— 这轮没取到的
+			// 下轮 cron 自然排在前面，不需要一次吃干净，也不会重复计费。
+			const imageSummary = await runAdImageVision(env, { batchSize: AD_IMAGE_VISION_BATCH });
 			// 顺手清一次过期数据。原先只搭在 detectAdOnJoin 上，
 			// 没人入群的日子就不会剪枝；挂到 cron 上有个稳定节拍。
 			await pruneAdDetectionData(env);
 			// 群统计明细超期剪枝（保留 STAT_RETENTION_DAYS 天），同样搭 cron 的稳定节拍。
 			await pruneStatData(env);
 			console.log('[广告检测·扫描] Cron ' + (controller?.cron || '') + ' 结果: ' + JSON.stringify(summary)
-				+ ' 头像: ' + JSON.stringify(avatarSummary));
+				+ ' 头像: ' + JSON.stringify(avatarSummary)
+				+ ' 图片: ' + JSON.stringify(imageSummary));
 		} catch (error) {
 			console.error('[广告检测·扫描] Cron 执行失败:', error);
 		}
@@ -12126,7 +12135,10 @@ function loadAdDetectionConfig(env) {
 		// 头像视觉识别的每日张数上限（0 = 只跑 L1 指纹库，不调模型）。
 		// 免费层每天 10,000 Neurons 且超限【直接报错】，所以默认给个保守值，
 		// 并允许主人先设 0 关掉 L2、确认 L1 效果后再开 —— 两层可独立灰度。
-		avatarVisionDaily: pickInt(env.AD_AVATAR_VISION_DAILY, AD_AVATAR_VISION_DAILY, 0, 500)
+		avatarVisionDaily: pickInt(env.AD_AVATAR_VISION_DAILY, AD_AVATAR_VISION_DAILY, 0, 500),
+		// 正文图片视觉识别的每日张数上限（0 = 关闭 L2，只保留 L1 指纹查表）。
+		// 上限比头像宽一个量级（付费层超限是计费不是报错），理由见 AD_IMAGE_VISION_DAILY。
+		imageVisionDaily: pickInt(env.AD_IMAGE_VISION_DAILY, AD_IMAGE_VISION_DAILY, 0, 5000)
 	};
 }
 
@@ -12142,11 +12154,12 @@ async function d1AdDetectionTablesExist(env) {
 		'ad_scan_state',
 		'ad_learn_snapshots',
 		'ad_avatars',
-		'ad_profile_shapes'
+		'ad_profile_shapes',
+		'ad_images'
 	]);
 }
 
-// 建立广告检测的 12 张 D1 表（完整性复验另列 11 张，ad_spam_texts 按需建、不参与复验）。范式与 ensureAdVoteTables 一致：
+// 建立广告检测的 13 张 D1 表（完整性复验另列 12 张，ad_spam_texts 按需建、不参与复验）。范式与 ensureAdVoteTables 一致：
 // promise 去重 → 核心表先行 → 逐条建表/建索引 → 存在性复验 → 失败删缓存并冷却 60 秒。
 // 冷却是为了避免 D1 抖动时每条消息都重试一次迁移，把子请求预算耗光。
 async function ensureAdDetectionTables(env) {
@@ -12243,6 +12256,22 @@ async function ensureAdDetectionTables(env) {
 			// file_id 又只在换图前有效，所以只在视觉识别那一刻用，不参与比对。
 			await runD1SchemaStatement(env, 'ad_avatars', 'CREATE TABLE IF NOT EXISTS ad_avatars (file_unique_id TEXT PRIMARY KEY, verdict TEXT NOT NULL DEFAULT \'pending\', hits INTEGER NOT NULL DEFAULT 0, file_id TEXT, source TEXT, last_user_id TEXT, vision_checked_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_avatars_verdict', 'CREATE INDEX IF NOT EXISTS idx_ad_avatars_verdict ON ad_avatars (verdict)', { optional: true });
+
+			// 正文图片指纹库。主键同样是 file_unique_id —— 与头像那张表同源同义，
+			// 但【为什么它在这里更值钱】：头像一个人一张、换得还勤，而广告素材是
+			// 批量复投的（同一张引流图会被一群人、在多个群里反复发），
+			// 于是「第一次登记、之后每一次都零成本命中」这条路径的命中率远高于头像。
+			// 图16 那种「三条连发的同款引流图」就是典型的同一 file_unique_id。
+			//
+			// 与 ad_avatars 的唯一结构差异是 kind 列：头像只有 ChatPhoto 一种来源，
+			// 而正文图片分 photo / sticker / animation / video / document 五种载体，
+			// 混在一起会让 L2 无法按载体决定要不要推理（sticker 还有 set_name 可用）。
+			//
+			// verdict / hits 语义与 ad_avatars 逐字对齐（pending / ad / clean，
+			// hits = 用过这张图且被定罪的次数），这样 /ignore 的纠错口径在两张表上
+			// 完全一致，不会出现「头像能回滚、图片回滚不了」的半边失效。
+			await runD1SchemaStatement(env, 'ad_images', 'CREATE TABLE IF NOT EXISTS ad_images (file_unique_id TEXT PRIMARY KEY, verdict TEXT NOT NULL DEFAULT \'pending\', hits INTEGER NOT NULL DEFAULT 0, file_id TEXT, kind TEXT, source TEXT, last_user_id TEXT, vision_checked_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
+			await runD1SchemaStatement(env, 'idx_ad_images_verdict', 'CREATE INDEX IF NOT EXISTS idx_ad_images_verdict ON ad_images (verdict)', { optional: true });
 
 			// 资料形状库：bio 归一化后的形态指纹（见 adProfileShape）。
 			// 与 ad_fingerprints 分开的理由：那张表存的是【词】，靠子串匹配；
@@ -15494,6 +15523,182 @@ async function applyAvatarToEvaluation(env, evaluation, profile) {
 	return applyAvatarVerdict(evaluation, avatar);
 }
 
+// ===== 正文图片指纹（L1）=====
+//
+// 【补的是哪个洞】detectAdOnMessage 的早退闸门只认 text / caption / 转发 / 引用体 /
+// 名片显示名五样，而一条【裸图片消息】（caption 为空）这五样全空 —— 于是整条消息
+// 在闸门就 return 了，四条通道一条都跑不到，连名册都不进。线上看到的形态是：
+// 同款引流图连发三条，每条的话术全写在图片像素里，caption 一个字没有。
+// 这一层让那类消息至少能进到「查一次指纹表」这一步。
+//
+// 与头像 L1 同构：主键 file_unique_id、verdict 三态、hits 复用计数。
+// 差别在于触发条件 —— 头像要等 getChat 顺带返回，这里 message 里现成带着，
+// 零 Telegram 请求；代价是消息路径多一条 D1 读，靠下面 extractAdMedia 的
+// 「没有媒体就返回 null」把它挡在纯文本消息之外，稳态断言不受影响。
+
+// 从消息里取参与指纹比对的那一个媒体。
+// 一条 Telegram 消息只有一个媒体载体，按固定顺序取第一个命中的。
+// photo 是【升序的尺寸数组】，最后一项即最大尺寸 —— 同一张图各尺寸的
+// file_unique_id 是同一个，取哪项都对，取最大项只为语义清晰。
+function extractAdMedia(message) {
+	if (!message) return null;
+	const pick = (node, kind) => {
+		if (!node) return null;
+		const fileUniqueId = String(node.file_unique_id || '');
+		if (!fileUniqueId) return null;
+		return { kind, fileUniqueId, fileId: String(node.file_id || '') };
+	};
+	if (Array.isArray(message.photo) && message.photo.length) {
+		return pick(message.photo[message.photo.length - 1], 'photo') || null;
+	}
+	return pick(message.sticker, 'sticker')
+		|| pick(message.animation, 'animation')
+		|| pick(message.video, 'video')
+		|| pick(message.document, 'document');
+}
+
+// 读一条图片指纹。查不到返回 null（= 未入库，既不是 ad 也不是 clean）。
+async function readAdImage(env, fileUniqueId) {
+	const key = String(fileUniqueId || '');
+	if (!env?.DB || !key) return null;
+	try {
+		const row = await env.DB.prepare('SELECT file_unique_id, verdict, hits, kind, source, last_user_id, vision_checked_at, created_at, updated_at FROM ad_images WHERE file_unique_id = ?').bind(key).first();
+		return row || null;
+	} catch (error) {
+		// 查不到不等于干净：失败按「未入库」处理，下一条消息再试，
+		// 绝不把查询失败当成 clean 去放行 —— 与头像那张表同一口径。
+		console.error('[广告检测] 读取图片指纹失败:', error);
+		return null;
+	}
+}
+
+// 登记一张正文图片（verdict=pending），供 L2 视觉识别排队。
+// 只在「表里还没有这一行」时调用一次 —— 稳定态下同款图每条消息零写入。
+async function registerAdImage(env, media, userId) {
+	const fileUniqueId = String(media?.fileUniqueId || '');
+	if (!env?.DB || !fileUniqueId) return false;
+	return upsertAdImage(env, fileUniqueId, {
+		verdict: 'pending',
+		fileId: String(media?.fileId || ''),
+		kind: String(media?.kind || ''),
+		lastUserId: String(userId || '')
+	});
+}
+
+// 写入 / 更新一条图片指纹。patch 里的字段只覆盖传了的那几个。
+// 与 upsertAdAvatar 逐句对齐，只多了 kind 一列。
+async function upsertAdImage(env, fileUniqueId, patch = {}) {
+	const key = String(fileUniqueId || '');
+	if (!env?.DB || !key) return false;
+	const now = Math.floor(Date.now() / 1000);
+	const verdict = patch.verdict != null ? String(patch.verdict) : 'pending';
+	const fileId = patch.fileId != null ? String(patch.fileId) : '';
+	const kind = patch.kind != null ? String(patch.kind) : '';
+	const source = patch.source != null ? String(patch.source) : null;
+	const lastUserId = patch.lastUserId != null ? String(patch.lastUserId) : null;
+	const visionCheckedAt = Number(patch.visionCheckedAt) || 0;
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_images (file_unique_id, verdict, hits, file_id, kind, source, last_user_id, vision_checked_at, created_at, updated_at) '
+			+ 'VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?) '
+			+ 'ON CONFLICT(file_unique_id) DO UPDATE SET '
+			+ 'verdict = CASE WHEN ad_images.verdict = \'ad\' THEN ad_images.verdict ELSE excluded.verdict END, '
+			+ 'file_id = CASE WHEN excluded.file_id != \'\' THEN excluded.file_id ELSE ad_images.file_id END, '
+			+ 'kind = CASE WHEN excluded.kind != \'\' THEN excluded.kind ELSE ad_images.kind END, '
+			+ 'source = COALESCE(excluded.source, ad_images.source), '
+			+ 'last_user_id = COALESCE(excluded.last_user_id, ad_images.last_user_id), '
+			+ 'vision_checked_at = CASE WHEN excluded.vision_checked_at > 0 THEN excluded.vision_checked_at ELSE ad_images.vision_checked_at END, '
+			+ 'updated_at = excluded.updated_at'
+		).bind(key, verdict, fileId, kind, source, lastUserId, visionCheckedAt, now, now).run();
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 写入图片指纹失败:', error);
+		return false;
+	}
+}
+
+// 定罪即学习：此人被封时，把这张图记成广告素材，并给它的「复用次数」+1。
+// 正是这一层让 L1 的价值随时间复利 —— 第一张图要等 L2 判，之后同款全部零成本。
+async function learnAdImageOnBan(env, fileUniqueId, userId) {
+	const key = String(fileUniqueId || '');
+	if (!env?.DB || !key) return false;
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_images (file_unique_id, verdict, hits, file_id, kind, source, last_user_id, vision_checked_at, created_at, updated_at) '
+			+ 'VALUES (?, \'ad\', 1, \'\', \'\', \'learned\', ?, 0, ?, ?) '
+			+ 'ON CONFLICT(file_unique_id) DO UPDATE SET verdict = \'ad\', hits = ad_images.hits + 1, '
+			+ 'source = \'learned\', last_user_id = excluded.last_user_id, updated_at = excluded.updated_at'
+		).bind(key, String(userId || ''), now, now).run();
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 图片定罪学习失败:', error);
+		return false;
+	}
+}
+
+// 误封纠错（/ignore 走这条路）：把这张图转成 clean，
+// 防止「发过同款图的人全被连坐」—— 正常群里撞同一张梗图是常态。
+async function clearAdImageOnIgnore(env, fileUniqueId) {
+	const key = String(fileUniqueId || '');
+	if (!env?.DB || !key) return false;
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		await env.DB.prepare('INSERT INTO ad_images (file_unique_id, verdict, hits, file_id, kind, source, vision_checked_at, created_at, updated_at) VALUES (?, \'clean\', 0, \'\', \'\', \'manual\', 0, ?, ?) ON CONFLICT(file_unique_id) DO UPDATE SET verdict = \'clean\', hits = 0, source = \'manual\', updated_at = excluded.updated_at').bind(key, now, now).run();
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 图片纠错失败:', error);
+		return false;
+	}
+}
+
+// 把图片命中叠加到已有判定结果上（纯函数，不动原对象）。与 applyAvatarVerdict 同位。
+//
+// 分档（【比头像严一档】，这是与头像唯一的实质差异）：
+//   ad + 本次已有任何判据   → 封（图片与正文/简介互相印证）
+//   ad + 复用定罪 >= 5 次   → 单独即可封（同一张素材已被反复用于被封的人）
+//   ad + 本次干净           → 只进观察，不封
+//   clean / pending / 无图片 → 原样返回，一个字节都不改
+//
+// 【为什么头像是 2、图片是 5】头像被盗用需要主动换图，正常用户撞上同一张
+// 广告头像的概率低；而正文图片的载体是「群里发的图」，梗图、热门截图、
+// 别人转的图都可能被多人正常转发 —— 复用门槛必须更高，否则一张被 2 个人
+// 转过的普通图就会开始单独定罪。单证（本次干净）一律不定罪这条两层一致。
+const AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS = 5;
+function applyImageVerdict(evaluation, image) {
+	if (!evaluation || !image) return evaluation;
+	if (String(image.verdict || '') !== 'ad') return evaluation;
+	const hits = Number(image.hits) || 0;
+	const hasCorroboration = (evaluation.reasons || []).length > 0 || (Number(evaluation.score) || 0) >= 2;
+	const reason = '消息图片命中广告素材库（复用定罪 ' + hits + ' 次）';
+	const reasons = (evaluation.reasons || []).concat([reason]);
+	let verdict = evaluation.verdict;
+	if (hasCorroboration) verdict = 'ban';
+	else if (hits >= AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS) verdict = 'ban';
+	else verdict = evaluation.verdict === 'ban' ? 'ban' : 'observe';
+	// score 只作展示：图片不改评分口径，避免与历史分叠加时重复计分。
+	return Object.assign({}, evaluation, { verdict, reasons });
+}
+
+// 取这条消息对应的图片指纹，【一次消息只读一遍】，两道闸共用同一份结果。
+//
+// 【为什么不沿用头像那种「每处各自读」】头像只有闸二一个调用点，读一次就够；
+// 图片不同 —— 闸一没定罪才会走到闸二，两道闸都在同一条消息的执行流里，
+// 各读各的会把同一行读两遍（首见还要多写一次），纯属把热路径 SQL 推高一倍。
+// 读出来的行交给 applyImageVerdict 这个纯函数分别叠到两道闸的判定上，
+// 结果与各读各的完全一致，代价只是第一次 D1 读。
+//
+// 返回值语义与 readAdImage 一致：null = 未入库（既不是 ad 也不是 clean，不参与裁决）。
+async function loadAdImageForMessage(env, media, userId) {
+	if (!media?.fileUniqueId) return null;
+	const row = await readAdImage(env, media.fileUniqueId);
+	if (row) return row;
+	// 首次见到这张图：登记成 pending，L2 视觉识别才有东西可排队。
+	// 只发生一次 —— 行存在之后就走稳定态的「只读不写」。
+	await registerAdImage(env, media, userId);
+	return null;
+}
+
 async function markAdBioChecked(env, userId, nowSeconds = Math.floor(Date.now() / 1000)) {
 	if (!env?.DB) return;
 	const uid = String(userId || '');
@@ -15988,6 +16193,41 @@ const AD_AVATAR_VISION_PROMPT = '这是一张社交软件的用户头像图片�
 	+ '动漫头像、纯色与图案均不是广告。'
 	+ '只输出 JSON，不要任何其它文字，格式：{"ad":true 或 false,"text":"图中读到的文字，没有则空","reason":"一句话理由"}';
 
+// ===== 正文图片视觉识别（L2）的常量 =====
+//
+// 与头像那套共用模型（moondream 的 OCR 与结构化输出正好是这里的主需求），
+// 但【预算、队列、状态键、分档全部独立】—— 正文图片的量级与头像不是一回事：
+// 头像是「一个人一张、一辈子换不了几次」，正文图片是「一个群一天几百张」，
+// 共用同一个日预算会让正文把头像那 50 张挤成零。
+//
+// 【默认值为什么敢给到 300 而头像是 50】见 AD_AVATAR_VISION_DAILY 上方那条
+//「按张数熔断而不是按 Neurons」的理由：免费层超限【直接报错】，所以必须保守。
+// 主人是付费 Workers（Workers Paid），官方 pricing 页原文口径是
+// 「超出每日免费额度按 $0.011 / 1,000 Neurons 计费」，付费层是【计费不是报错】，
+// 可用性风险不复存在。默认值仍保留上限，是为了让账单不随群活跃度无界增长 ——
+// 这个上限管的是钱，不是可用性。要关掉整条 L2，设 AD_IMAGE_VISION_DAILY=0。
+//
+// 单张 Neurons 消耗官方仍未公布；按 moondream 的 $0.30/M input、$1.00/M output
+// 与 $11/M Neurons 反推，单张约 35~50 Neurons —— 这是【估算值】，不是官方数。
+// 300 张/天 ≈ 1.5 万 Neurons，仅占免费额度的 1.5 倍量级，超出部分按单价计费。
+const AD_IMAGE_VISION_DAILY = 300;
+// 单轮 cron 最多推理多少张。队列靠 vision_checked_at 自平衡，轮与轮之间不会重复。
+const AD_IMAGE_VISION_BATCH = 100;
+const AD_IMAGE_VISION_MODEL = AD_AVATAR_VISION_MODEL;
+// 状态键与头像的 avatar_day / avatar_count 各自独立，两轨互不挤占。
+const AD_IMAGE_VISION_DAY_KEY = 'img_day';
+const AD_IMAGE_VISION_COUNT_KEY = 'img_count';
+const AD_IMAGE_VISION_PROMPT = '这是社交软件聊天记录里的一条【图片消息】。判断它是否是广告引流图：'
+	+ '图里若有引流文字（点我一下、免费观看、看主页、看简介、加V、进群、'
+	+ '赚钱、代理、代购、招租、约、开车、上车）、二维码、联系方式、'
+	+ '色情或赌博内容、明显商品推销、以及「标题条 + 缩略图 + 底部条」这种'
+	+ '批量套版的引流图，即为广告。'
+	+ '以下一律【不是】广告：自拍、风景、宠物、家人、动漫与表情包、梗图、'
+	+ '群聊截图（截的是文字对话）、文档与代码截图、菜单与价目表照片、'
+	+ '游戏与软件界面、纯色与普通图案。'
+	+ '拿不准就判 false —— 这一层只加分与进观察，宁可漏判也不能误伤正常发言。'
+	+ '只输出 JSON，不要任何其它文字，格式：{"ad":true 或 false,"text":"图中读到的文字，没有则空","reason":"一句话理由"}';
+
 // 从模型回答里抠 JSON。解析不出来一律按「未判」处理 —— 宁可漏判也不能靠猜定罪。
 function parseAvatarVisionAnswer(raw) {
 	const text = String(raw || '').trim();
@@ -16109,6 +16349,118 @@ async function runAdAvatarVision(env, options = {}) {
 		await writeAdScanState(env, 'avatar_count', String(used), Math.floor(Date.now() / 1000));
 	}
 	console.log('[广告检测·头像] 本轮 队列=' + stats.queued + ' 完成=' + stats.done
+		+ ' 广告=' + stats.ad + ' 干净=' + stats.clean + ' 失败=' + stats.failed
+		+ ' 当日=' + used + '/' + dailyLimit + (lastNote ? ' 末条:' + lastNote : ''));
+	return stats;
+}
+
+// 能交给 moondream 推理的载体。只有静态位图。
+// animation / video 是 mp4、webm，document 未知（要下载才知道 MIME），
+// 塞给一个图片模型只会白烧一次请求再记一笔失败 —— 它们的出路是 L1：
+// 登记进指纹表，靠「同款复用」命中。所以在取队列时就按 kind 排除，
+// 让这几类永远不进推理队列，而不是进去后失败再标记。
+const AD_IMAGE_VISION_KINDS = ['photo', 'sticker'];
+
+// 取今日的正文图片推理额度。与头像的 avatar_day / avatar_count 各自独立，
+// 两轨互不挤占 —— 正文图片量大，共用一个计数器会把头像那 50 张挤成零。
+async function readImageVisionQuota(env, nowSeconds) {
+	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
+	const savedDay = await readAdScanState(env, AD_IMAGE_VISION_DAY_KEY, '');
+	const count = savedDay === today ? (Number(await readAdScanState(env, AD_IMAGE_VISION_COUNT_KEY, '0')) || 0) : 0;
+	if (savedDay !== today) await writeAdScanState(env, AD_IMAGE_VISION_DAY_KEY, today, nowSeconds);
+	return { today, used: count };
+}
+
+// ===== 正文图片视觉识别（L2）=====
+// 结构照抄 runAdAvatarVision：cron 队列消费、按张数熔断、逐张推 vision_checked_at。
+// 挂 cron 而不是消息路径的理由与头像完全相同 —— 一次推理要 getFile + 下载 +
+// 模型调用，挂在消息上会拖慢每一次回复，且撞子请求配额；付费层解决的是
+// 「超限报错」，解决不了「每条消息慢半秒」。
+async function runAdImageVision(env, options = {}) {
+	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '' };
+	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
+	if (!(await adDetectionReady(env))) { stats.skipped = 'not_ready'; return stats; }
+	// 未绑 Workers AI：与广告检测整体的降级口径一致 —— 跳过而不是报错。
+	if (!env.AI) { stats.skipped = 'no_ai'; return stats; }
+
+	const config = loadAdDetectionConfig(env);
+	// 环境变量 AD_IMAGE_VISION_DAILY=0 即关闭 L2（只保留 L1 指纹查表，零 Neurons）。
+	const dailyLimit = Number(options.dailyLimit) >= 0 ? Number(options.dailyLimit) : config.imageVisionDaily;
+	const nowSeconds = Math.floor(Date.now() / 1000);
+	const quota = await readImageVisionQuota(env, nowSeconds);
+	const remaining = dailyLimit - quota.used;
+	if (dailyLimit <= 0) { stats.skipped = 'disabled'; return stats; }
+	if (remaining <= 0) { stats.skipped = 'daily_limit_reached'; stats.queued = quota.used; return stats; }
+
+	let rows = [];
+	try {
+		const kinds = AD_IMAGE_VISION_KINDS.map((k) => '\'' + k + '\'').join(', ');
+		rows = await env.DB.prepare(
+			'SELECT file_unique_id, file_id, kind, last_user_id FROM ad_images '
+			+ 'WHERE verdict = \'pending\' AND vision_checked_at = 0 AND file_id != \'\' '
+			+ 'AND kind IN (' + kinds + ') '
+			+ 'ORDER BY updated_at ASC LIMIT ?'
+		).bind(Math.min(remaining, Number(options.batchSize) > 0 ? Number(options.batchSize) : dailyLimit)).all();
+		rows = (rows && rows.results) || rows || [];
+	} catch (error) {
+		console.error('[广告检测·图片] 取队列失败:', error);
+		stats.skipped = 'queue_error';
+		return stats;
+	}
+	stats.queued = rows.length;
+	if (!rows.length) return stats;
+
+	let used = quota.used;
+	let lastNote = '';
+	for (const row of rows) {
+		// 无论成败都推进 vision_checked_at：否则一次 429 或模型抽风会让这张图
+		// 每轮都被取出来反复烧额度 —— 付费层虽然不报错，但会照单计费。
+		let verdict = 'pending';
+		let note = '';
+		try {
+			const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ file_id: String(row.file_id) })
+			});
+			const fileResult = await fileResponse.json();
+			if (!fileResult?.ok) throw new Error(fileResult?.description || 'getFile 失败');
+			const filePath = String(fileResult?.result?.file_path || '');
+			if (!filePath) throw new Error('file_path 为空');
+			const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
+			if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
+			const buffer = await imageResponse.arrayBuffer();
+			// photo 是 jpeg，sticker 是 webp —— data URI 的 MIME 按 kind 定，
+			// 与 getFile 返回的扩展名无关（Telegram 的 file_path 扩展名不可靠）。
+			const mime = String(row.kind) === 'sticker' ? 'image/webp' : 'image/jpeg';
+			const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
+			const aiResult = await env.AI.run(AD_IMAGE_VISION_MODEL, { image, task: 'query', question: AD_IMAGE_VISION_PROMPT });
+			const parsed = parseAvatarVisionAnswer(aiResult?.answer ?? aiResult?.output ?? aiResult);
+			if (!parsed) throw new Error('模型回答无法解析: ' + String(JSON.stringify(aiResult)).slice(0, 200));
+			verdict = parsed.ad ? 'ad' : 'clean';
+			note = (parsed.text ? ' 文字:' + parsed.text : '') + (parsed.reason ? ' 理由:' + parsed.reason : '');
+			lastNote = note;
+		} catch (error) {
+			stats.failed += 1;
+			console.error('[广告检测·图片] 识别失败 id=' + row.file_unique_id + ':', error);
+		}
+		try {
+			await upsertAdImage(env, row.file_unique_id, {
+				verdict,
+				source: verdict === 'pending' ? null : 'vision',
+				kind: String(row.kind || ''),
+				visionCheckedAt: Math.floor(Date.now() / 1000)
+			});
+		} catch (error) {
+			console.error('[广告检测·图片] 写回结果失败:', error);
+		}
+		if (verdict === 'ad') stats.ad += 1;
+		else if (verdict === 'clean') stats.clean += 1;
+		if (verdict !== 'pending') stats.done += 1;
+		used += 1;
+		await writeAdScanState(env, AD_IMAGE_VISION_COUNT_KEY, String(used), Math.floor(Date.now() / 1000));
+	}
+	console.log('[广告检测·图片] 本轮 队列=' + stats.queued + ' 完成=' + stats.done
 		+ ' 广告=' + stats.ad + ' 干净=' + stats.clean + ' 失败=' + stats.failed
 		+ ' 当日=' + used + '/' + dailyLimit + (lastNote ? ' 末条:' + lastNote : ''));
 	return stats;
@@ -16399,7 +16751,13 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		// 能就地写头像库 —— enforceAdDetection 只拿到 evaluation，没有 profile。
 		// 它【不进 domains、不进 semanticText、不进指纹学习】：那是图片标识不是文本，
 		// 喂给任何文本判据都会变成噪声。
-		avatarId: profile.avatarId || ''
+		avatarId: profile.avatarId || '',
+		// 正文图片指纹主键（message 里那个媒体的 file_unique_id）。与 avatarId 同一职责：
+		// enforceAdDetection 只拿到 evaluation、没有 message，定罪即学习与 /ignore 回滚
+		// 都要靠它定位 ad_images 的行。同样【不进 domains / semanticText / 指纹学习】。
+		// 没有媒体的调用方（入群线、cron 复查、各种命令路径）不传 media，这里自然是空串，
+		// 那几条链路的行为与改动前逐字节一致。
+		imageId: String(input?.media?.fileUniqueId || '')
 	};
 
 	const fingerprint = await matchAdFingerprints(env, payload, { config });
@@ -16637,6 +16995,9 @@ async function evaluateAdSuspect(env, input, options = {}) {
 			// 头像指纹主键：跟着快照进 D1，/ignore 回滚时才能找到该清哪一行。
 			// 不展示给主人（图片标识对人没意义），纯粹是回滚链路的外键。
 			avatarId: String(profile.avatarId || ''),
+			// 正文图片指纹主键：与 avatarId 同一职责，/ignore 回滚时反查 ad_images 那一行。
+			// 没有媒体的消息是空串，回滚端读到空串自动跳过 —— 老快照同样如此。
+			imageId: String(payload.imageId || ''),
 			// 资料形状主键：跟着快照进 D1，/ignore 回滚时直接拿它反查要清哪一行。
 			// 【不能让回滚端拿 snapshot.bio 重算】—— bio 在快照里被截到 200 字，
 			// 长简介重算出来的形状与判定时那个对不上，会静默清不掉，
@@ -17016,6 +17377,14 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		if (immediateAvatar) await learnAdAvatarOnBan(env, immediateAvatar, userId);
 		else await queueAdAvatarLearning(env, userId);
 	} catch (_) { /* 头像学习失败不影响本次处置 */ }
+	// 定罪即学习正文图片：与头像同一逻辑（引流素材是批量复用的，学一次拦住同款）。
+	// 【为什么不需要头像那套补学队列】头像要等 getChat 才拿得到，而闸一压根不调它，
+	// 所以那条路径 avatarId 恒为空、只能排队异步补；媒体却是 update 自带的字段，
+	// 闸一就取得到 —— payload.imageId 在闸一定罪时已经非空，没有「恒为空」这个缺口。
+	try {
+		const learnedImageId = String(evaluation?.payload?.imageId || '');
+		if (learnedImageId) await learnAdImageOnBan(env, learnedImageId, userId);
+	} catch (_) { /* 图片学习失败不影响本次处置 */ }
 	// 定罪即学习资料形状：资料模板是批量号的【公开复用资产】，学一次之后同模板的号
 	// 在零 AI 下就能命中（只加分，仍要过原有阈值）。取 snapshot 里存好的形状，
 	// 不在这里重算 —— 重算要拿完整 bio，而处置端只拿到 evaluation。
@@ -17420,7 +17789,18 @@ async function detectAdOnMessage(message, env) {
 		? [message.contact.first_name, message.contact.last_name].filter(Boolean).join(' ').trim()
 		: '';
 	const contactName = looksLikePersonName(contactDisplayName) ? '' : contactDisplayName;
-	if (!text && !forwardChat && !quotedText && !contactName) return false;
+	// ===== 正文图片（裸图片消息此前在这里被整体丢弃）=====
+	//
+	// 下面这道闸门原先只认 text / 转发 / 引用体 / 名片显示名四样。一条
+	// 【caption 为空的图片消息】这四样全空 —— 于是整条消息在这里就 return，
+	// 后面的名册、评分、四条通道、头像判据一条都跑不到。而引流图的全部话术
+	// 都写在图片像素里，caption 恒为空（线上样本：同款引流图连发三条）。
+	//
+	// 提取是纯函数、零成本；真正花 D1 的是后面的 loadAdImageForMessage，
+	// 那一步同样被 media 为空挡在纯文本消息之外 —— 「稳定态核心 SQL ≤ 3 条」
+	// 那条断言测的正是纯文本消息，不会因此变红。
+	const media = extractAdMedia(message);
+	if (!text && !forwardChat && !quotedText && !contactName && !media) return false;
 	if (!(await adDetectionReady(env))) return false;
 
 	const config = loadAdDetectionConfig(env);
@@ -17505,6 +17885,9 @@ async function detectAdOnMessage(message, env) {
 	// 就必须把广告写在别人看得见的地方，而最显眼的地方恰好都是免费的。
 	// 这一闸【完整走三层】（结构分 + 指纹库 + AI 语义）：指纹和 AI 只花 D1 与 Workers AI，
 	// 不花 Telegram 请求，而它们正是自动学习与 /spam 学习成果的落地点，压后到 3 天一次会白费。
+	// 图片指纹【一条消息只读这一次】，闸一闸二共用同一份结果（理由见 loadAdImageForMessage）。
+	// media 为空（纯文本消息）时本行一个 D1 都不发，热路径预算与改动前完全一致。
+	const imageRow = media ? await loadAdImageForMessage(env, media, userId) : null;
 	const cheapProfile = {
 		firstName: from.first_name || '',
 		lastName: from.last_name || '',
@@ -17512,15 +17895,20 @@ async function detectAdOnMessage(message, env) {
 		bio: '',
 		status: ''
 	};
-	const cheap = applyHistory(await evaluateAdSuspect(
+	let cheap = applyHistory(await evaluateAdSuspect(
 		env,
 		// text || contactName：名片消息的 text 恒为空，所以不存在覆盖正文的情况。
 		// 用「短路取值」而非拼接，是为了让名片显示名走进 payload.text 后，
 		// 结构评分 / 指纹库 / AI 语义 / 四通道结构查杀【四层全都能看到它】。
-		{ profile: cheapProfile, text: text || contactName, quotedText, forwardChat },
+		{ profile: cheapProfile, text: text || contactName, quotedText, forwardChat, media },
 		// skipMissingBioPenalty：这一闸的 bio 是「没查」而不是「没有」，不能拿它减分。
 		{ config, whitelist, skipMissingBioPenalty: true }
 	));
+	// 正文图片指纹：与头像同位（叠在 applyHistory 之后 = 最终裁决位），
+	// 而且排在闸一 —— 媒体在 update 里现成带着，不需要等 getChat，
+	// 所以「图片是唯一证据」时闸一就能封，不必为一次图片判据多花一个 Telegram 请求。
+	// imageRow 为 null（无媒体 / 尚未入库）时 applyImageVerdict 原样返回，一个字节不改。
+	cheap = applyImageVerdict(cheap, imageRow);
 
 	const needBio = shouldCheckAdBio(member, nowSeconds);
 
@@ -17631,11 +18019,21 @@ async function detectAdOnMessage(message, env) {
 		// 与闸一同一口径传名片显示名。漏传这里会造成一种诡异形态：
 		// 名片消息在闸一（无 bio）没定罪 → 走到闸二拉了 bio 本该更容易定罪，
 		// 结果因为 text 又变回空串，反而比闸一更判不出来。
-		{ profile, text: text || contactName, quotedText, forwardChat },
+		{ profile, text: text || contactName, quotedText, forwardChat, media },
 		{ config, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
 	));
 	// 闸二已拉到 getChat，头像就在响应里 —— 读指纹零成本，叠加在历史分之后作最终裁决。
-	const evaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+	// 图片判据【必须在这里再叠一次】：闸二的 baseEvaluation 是重新算出来的，
+	// 闸一叠进去的那份并不跟过来。图片是唯一证据、且闸一没定罪时，
+	// 少了这一行就会在这一步漏回放行。
+	// 叠的是闸前已经读好的 imageRow —— 同一行不读第二遍，热路径 SQL 只付一次。
+	// 两者都只改 verdict / reasons 不碰 score，所以叠放顺序只影响 reasons 的排列，
+	// 不影响分值与阈值比较。
+	const evaluation = await applyAvatarToEvaluation(
+		env,
+		applyImageVerdict(baseEvaluation, imageRow),
+		profile
+	);
 
 	if (evaluation.verdict === 'ban') {
 		if (await isAdminInAnyConfiguredGroup(userId, chat.id)) {
@@ -17694,6 +18092,10 @@ function adPayloadFromSnapshot(snapshot) {
 		// 头像指纹主键。【白名单重建】这里漏一个字段，那条链路就整体静默失效 ——
 		// /ignore 的头像纠错必须从这里拿到 avatarId 才能定位到 ad_avatars 的行。
 		avatarId: String(snap.avatarId || ''),
+		// 正文图片主键。与 avatarId 完全同构 —— 漏了这一个字段，/ignore 的图片纠错
+		// 就会「说成功了」却一行都没清，同款图下一个人照样命中。老快照无此字段，
+		// 还原成空串，回滚端读到空串自动跳过。
+		imageId: String(snap.imageId || ''),
 		// 资料形状主键。与 avatarId 同理：这是一份【白名单重建】，
 		// 漏一个字段整条纠错链路就静默失效 —— /ignore 会「说成功了」，
 		// 但同模板的下一个人照样被加 3 分，谁也看不出来哪里断了。
@@ -17980,6 +18382,11 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	// 否则同用这张图（自拍、风景、家人照被盗用）的正常用户会被连坐。
 	// 老快照冻结于头像功能上线之前，还原出的 avatarId 是空串 → 本步自动跳过。
 	const avatarCleared = await clearAdAvatarOnIgnore(env, payload?.avatarId);
+	// 正文图片同步纠错：与头像同一理由 —— 这个号既然是误封，这张图就不能继续挂着
+	// 「广告素材」标签，否则正常群里转发过同款图（梗图、截图、别人转的图）的人
+	// 会被连坐，而且图片比头像更容易被多人正常转发，这个口子必须同时堵上。
+	// 老快照冻结于图片功能上线之前，还原出的 imageId 是空串 → 本步自动跳过。
+	const imageCleared = await clearAdImageOnIgnore(env, payload?.imageId);
 	// purge: true —— 主人已明确说这是误判，命中的指纹当次即删，不再攒 3 次误报。
 	// 同批改动拆掉了自动学习的强动词闸门，指纹写入变宽，纠错端必须同步变快。
 	const fp = await markAdFingerprintFalsePositive(env, payload, { purge: true });
@@ -17993,7 +18400,7 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
 	await deleteAdScreening(env, targetId);
 	await deleteAdPendingSnapshot(env, ownerId, seq);
-	return { targetId, removed, unbanSummary, fp, sampleRemoved, avatarCleared, shapeCleared };
+	return { targetId, removed, unbanSummary, fp, sampleRemoved, avatarCleared, imageCleared, shapeCleared };
 }
 
 // /ignore 单次最多处理多少个序号。
@@ -18475,6 +18882,7 @@ async function handleAdStatsCommand(env, chatId) {
 	let pendingCount = 0;
 	let whitelistRows = 0;
 	let avatarRows = [];
+	let imageRows = [];
 	try {
 		const rows = await env.DB.batch([
 			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints'),
@@ -18484,7 +18892,9 @@ async function handleAdStatsCommand(env, chatId) {
 			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE expires_at > ?').bind(now),
 			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_domain_whitelist'),
 			// 头像指纹库按判决分档：ad = 已定为广告图、pending = 等 L2 判、clean = 已判干净。
-			env.DB.prepare('SELECT verdict, COUNT(*) AS c FROM ad_avatars GROUP BY verdict')
+			env.DB.prepare('SELECT verdict, COUNT(*) AS c FROM ad_avatars GROUP BY verdict'),
+			// 正文图片指纹库同口径分档。
+			env.DB.prepare('SELECT verdict, COUNT(*) AS c FROM ad_images GROUP BY verdict')
 		]);
 		fpTotal = Number(rows[0]?.results?.[0]?.c) || 0;
 		fpByType = rows[1]?.results || [];
@@ -18493,6 +18903,7 @@ async function handleAdStatsCommand(env, chatId) {
 		pendingCount = Number(rows[4]?.results?.[0]?.c) || 0;
 		whitelistRows = Number(rows[5]?.results?.[0]?.c) || 0;
 		avatarRows = rows[6]?.results || [];
+		imageRows = rows[7]?.results || [];
 	} catch (error) {
 		console.error('[广告检测] 统计查询失败:', error);
 	}
@@ -18540,6 +18951,16 @@ async function handleAdStatsCommand(env, chatId) {
 	lines.push('　↳ 视觉识别：' + (config.avatarVisionDaily > 0
 		? '✅ 每日上限 ' + config.avatarVisionDaily + ' 张（模型 ' + AD_AVATAR_VISION_MODEL + '）'
 		: '⏸️ 已关闭（AD_AVATAR_VISION_DAILY=0），只跑头像指纹，不调模型'));
+	// 正文图片指纹库。与头像同口径，但「待识别」里混着三类【永远不进推理队列】的载体
+	// （动图 / 视频 / 文件）—— moondream 只吃静态位图，它们只能靠 L1 同款复用命中，
+	// 所以这个数字不会随 L2 跑完归零，不是卡住了。
+	const imageAd = Number(imageRows.find((r) => String(r.verdict) === 'ad')?.c) || 0;
+	const imagePending = Number(imageRows.find((r) => String(r.verdict) === 'pending')?.c) || 0;
+	const imageClean = Number(imageRows.find((r) => String(r.verdict) === 'clean')?.c) || 0;
+	lines.push('<b>正文图片指纹</b>　广告图 <b>' + imageAd + '</b>　待识别 <b>' + imagePending + '</b>　已排除 <b>' + imageClean + '</b>');
+	lines.push('　↳ 视觉识别：' + (config.imageVisionDaily > 0
+		? '✅ 每日上限 ' + config.imageVisionDaily + ' 张（模型 ' + AD_IMAGE_VISION_MODEL + '，只判 photo / sticker）'
+		: '⏸️ 已关闭（AD_IMAGE_VISION_DAILY=0），只跑图片指纹，不调模型'));
 	lines.push('<b>域名白名单</b>　生效 <b>' + whitelist.size + '</b> 条（D1 自定义 ' + whitelistRows + ' 条，内置种子 ' + AD_DOMAIN_WHITELIST_SEED.length + ' 条）');
 	// 入群检查流水。只记命中的话这一屏对绝大多数新成员是一片空白，
 	// 主人分不清「检查过、这个人正常」和「压根没看过他」—— 后者正是漏放的形态。
