@@ -103,7 +103,7 @@
 | `/addgroup` `/delgroup` `/listgroups` | 仅第一主人私聊 | 指令增删治理群（存 D1 `dynamic_groups`，不改环境变量；三道硬校验） |
 | `/killer [on\|off\|status]` | 仅第一主人 · 群内 | 切换杀手模式：**ON = 全群封禁踢出**（含 `/ban` `/spam` 与自动处置）、**OFF = 仅永久禁言不踢出**（默认 OFF，需群在 `KILLER_MODE_GROUPS`）；非杀手群的 `/ban` `/spam` 恒为禁言，要踢人用 `/sban`；私聊 `/killer` 列出各群状态 |
 | `/leavegroup -100xxxx` | 仅第一主人私聊 | 让 bot 真的退出群（与 `/delgroup` 区别：后者只停止治理） |
-| `/dryrun [on\|off\|status]` | 仅第一主人 · 配置群内 | **演练模式**：判定照跑但不删不封不加黑不学习，命中写流水 + 私聊通知你；私聊 `/dryrun` 列出已开的群与命中数。⚠️ 演练期间该群完全不设防 |
+| `/dryrun [on\|off\|status]` | 仅第一主人 · 配置群内 | **演练模式**：判定照跑但不删不封不加黑不学习，命中写流水 + 私聊通知你。**群内回执发完即撤回、完整信息走私聊**（群里不留痕）；私聊 `/dryrun` 列出已开的群与命中数。⚠️ 演练期间该群完全不设防 |
 | `/add_ad_admin TGID` `/del_ad_admin TGID` | 仅第一主人私聊 | 授权 / 取消某成员发起 `/ad` 举报投票 |
 | `/pending [N]` `/ignore 序号` `/rescreen [N]` `/adstats` | 仅第一主人私聊 | 广告检测复核与状态查询，见 [广告检测](#广告检测) |
 | `/words [页码]` `/addword` `/delword` `/addsample` `/clearsamples` `/warmup` `/whitelist` | 仅第一主人私聊 | 指纹库、语义样本与域名白名单维护 |
@@ -118,6 +118,7 @@
 | 手动解封封回 | 对象仍在 D1 黑名单 | 立即封回（群内手动解封无法绕过全局黑名单） |
 | 广告自动处置 | 总分 ≥ `AD_SCORE_THRESHOLD` | 加黑 + 全群封禁 + 删消息 + 学指纹与 AI 样本 + 回执带 `/ignore` 序号 |
 | 演练模式 | 群内 `/dryrun` 开启 | 上面这条**一条都不执行**，命中只写流水 + 私聊通知（调阈值先看会封谁）。⚠️ 该群期间完全不设防 |
+| 入群判定 | 有人进群（两条 update 路径都接） | **不等发言**：当场拉 bio + 查头像指纹，达线即封；每次检查都写 `ad_join_checks` 流水，正常号也记 |
 | 转入观察 | 总分 ≥ `AD_OBSERVATION_SCORE` 但未及封禁线 | 写观察窗口，窗口内再发即累加；**正文不进 `/search` 检索源** |
 | 批量任务自动续接 | 超出同步安全预算 | 转 D1 批量任务 + Queues 分片续接到完成 |
 | 定时滚动复查 | cron（每天 2 次、日限 300 人） | 分档复查简介：进群 6 小时内每 2 小时一查，越往后越疏、3 天封顶；bio 没改且判据库没更新则跳过 |
@@ -148,7 +149,7 @@
 | `/pending [N]` | 看待确认快照（得分、判据、资料） |
 | `/ignore 序号` | **误封一键纠错**：解封 + 给命中指纹加误报，累计 3 次退役该指纹 |
 | `/rescreen [N]` | 重新筛查观察窗口里的可疑用户 |
-| `/adstats` | 总览阈值、AI 状态、指纹与样本规模、头像指纹库、观察窗口人数；末屏是本群**演练状态**与命中流水 |
+| `/adstats` | 总览阈值、AI 状态、指纹与样本规模、头像指纹库、观察窗口人数；后两屏是本群**入群检查流水**（每次进群都记，含正常号）与**演练状态** |
 
 ### 指纹库与样本库维护（仅第一主人私聊）
 
@@ -183,14 +184,14 @@
 .
 ├── _worker.js             # Worker 主程序（单文件，含广告检测层）
 ├── wrangler.toml          # Cloudflare Wrangler 配置（D1 / Queue / AI 绑定）
-├── test_*.mjs             # 22 个离线测试文件
+├── test_*.mjs             # 23 个离线测试文件
 ├── README.md
 └── LICENSE
 ```
 
 | 项 | 数值 | 说明 |
 | --- | --- | --- |
-| 测试文件 | **22 个** | 合计 **3523 项**，全绿才允许推送 |
+| 测试文件 | **23 个** | 合计 **3578 项**，全绿才允许推送 |
 | 测试方式 | `node test_xxx.mjs` | 每个文件独立可跑，退出码非 0 即失败 |
 | 运行要求 | **Node 22+** | `node:sqlite` 内置模块要求 |
 | 测试环境 | 全部离线 | Bot API 全 mock，D1 用 `node:sqlite` 的 `DatabaseSync(':memory:')` **真实 SQLite 后端**（`ON CONFLICT`、`UNIQUE`、`batch` 事务真跑），Workers AI 用固定向量函数模拟 |
@@ -245,6 +246,7 @@
 | `FLASH_MESSAGE_TTL_MS` | `5000` | 群内闪屏存活毫秒数（0~60000） |
 | `MSG_CACHE_SIZE` | `50` | 清扫回看上限（1-500），`/spam` 按它回看当前群近期消息 |
 | `AD_SCORE_THRESHOLD` | `7` | 广告**封禁**阈值（1-100） |
+| `AD_JOIN_SCORE_THRESHOLD` | `0` | **入群专用**封禁线。`0` = 沿用消息线（默认，行为与加它之前一致）；设 `9` 则进群要更严的证据才封。实际取值与消息线取 `max`，配低了也松不过消息线。**结构 / 指纹 / AI 强证据不受它约束** |
 | `AD_OBSERVATION_SCORE` | `5` | 广告**观察**阈值（1-100） |
 | `AD_OBSERVATION_HOURS` | `24` | 观察窗口保留小时数（1-720） |
 | `AD_AI_SIMILARITY_THRESHOLD` | `0.78` | AI 硬命中阈值（0.1-1） |
@@ -306,6 +308,7 @@
 | 广告检测 | `ad_spam_texts` | 同款直封名单（正文哈希，`/spam` 学入后直发即删 + 封）。**按需建立** |
 | 广告检测 | `ad_profile_shapes` | **资料形状库**：bio 归一化哈希 + 复用定罪次数，给同模板批量号跨账号加分 |
 | 广告检测 | `ad_dryrun_log` | **演练命中流水**：得分、阈值、判据（`reasons`），保留 30 天。**按需建立**，不进完整性复验 |
+| 广告检测 | `ad_join_checks` | **入群检查流水**：每次进群都记，含判为正常的（能看到「检查过、这个人正常」），保留 30 天。**按需建立** |
 
 > **广告检测的表走独立初始化路径**，与核心 5 表完全隔离，`D1_SCHEMA_VERSION` 保持 `8` 不变 —— 老部署升级后现有黑名单数据**一条都不会动**。建表失败时整个广告层静默跳过并进入 60 秒冷却（避免 D1 抖动时每条消息都重试迁移耗尽子请求预算），既有功能不受任何影响。
 
@@ -368,7 +371,7 @@ wrangler secret put GROUP_ID     # -1001234567890（可逗号分隔多群）
 
 #### 6.5 广告检测阈值与开关（可选，**建议一个都不填**）
 
-`AD_SCORE_THRESHOLD` `AD_OBSERVATION_SCORE` `AD_OBSERVATION_HOURS` `AD_AI_SIMILARITY_THRESHOLD` `AD_AI_TOP_K` `AD_FINGERPRINT_MIN_CONFIDENCE` `AD_ENRICH_EVERY` `AD_ENRICH_MIN_OCCURRENCE` `AD_ENRICH_MAX_RESULTS` `AD_CARD_KILL` `AD_AVATAR_VISION_DAILY` `AD_PROTECTED_USERNAMES` `AD_TRUSTED_BOTS` —— 用默认值，理由见 [阈值调优](#阈值调优)。
+`AD_SCORE_THRESHOLD` `AD_OBSERVATION_SCORE` `AD_OBSERVATION_HOURS` `AD_AI_SIMILARITY_THRESHOLD` `AD_AI_TOP_K` `AD_FINGERPRINT_MIN_CONFIDENCE` `AD_ENRICH_EVERY` `AD_ENRICH_MIN_OCCURRENCE` `AD_ENRICH_MAX_RESULTS` `AD_CARD_KILL` `AD_AVATAR_VISION_DAILY` `AD_PROTECTED_USERNAMES` `AD_TRUSTED_BOTS` —— 用默认值，理由见 [阈值调优](#阈值调优)。 `AD_JOIN_SCORE_THRESHOLD`
 
 #### 6.6 完整配置示例（可直接照抄改值）
 

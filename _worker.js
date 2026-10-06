@@ -5969,6 +5969,111 @@ async function countAdDryRun(env, chatId) {
 		console.error('[演练模式] 统计流水失败:', error);
 	}
 	return out;
+}
+// ===== 入群检查流水 =====
+//
+// 【为什么每次入群都记，包括判为正常的】只记命中的话，用户页与看板对绝大多数
+// 新成员是一片空白 —— 管理员分不清「检查过、这个人正常」和「压根没看过他」，
+// 而后者正是漏放最典型的形态。menshen 的 coldjudge 每次都落一条 join_checked，
+// action 明确排除在「被处置过」的计数之外，本表同理：它是检查记录，不是处置记录。
+//
+// 按需建、不进广告层完整性复验：这张表只服务看板，建失败不该让真处置停摆。
+// 保留 30 天，写入时顺手剪，量级是「进群人数 × 30」。
+const AD_JOIN_CHECKS_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const D1_AD_JOIN_CHECKS_INIT = new WeakMap();
+
+async function ensureAdJoinChecksTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_AD_JOIN_CHECKS_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			// 刻意不给字符串列写 DEFAULT 空串：INSERT 每次都提供全值，而带引号的
+			// DEFAULT '' 在本文件的单引号字符串里要转义，多一处转义就多一次踩坑机会。
+			await runD1SchemaStatement(env, 'ad_join_checks',
+				'CREATE TABLE IF NOT EXISTS ad_join_checks (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, user_id TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 0, verdict TEXT NOT NULL, layer TEXT NOT NULL, reasons TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0)');
+			await runD1SchemaStatement(env, 'idx_ad_join_checks_created', 'CREATE INDEX IF NOT EXISTS idx_ad_join_checks_created ON ad_join_checks (created_at)', { optional: true });
+			return true;
+		} catch (error) {
+			console.error('[入群检查] 建流水表失败:', error?.message || error);
+			return false;
+		}
+	})();
+	D1_AD_JOIN_CHECKS_INIT.set(env.DB, init);
+	const ok = await init;
+	if (!ok) D1_AD_JOIN_CHECKS_INIT.delete(env.DB);
+	return ok;
+}
+
+// 记一条入群检查。【任何 verdict 都记】，返回流水 id（失败返回 null）。
+// 失败绝不影响调用方：流水只是看板数据，不能让入群筛查的返回值变形。
+async function recordAdJoinCheck(env, input) {
+	if (!env?.DB) return null;
+	if (!(await ensureAdJoinChecksTable(env))) return null;
+	try {
+		const evaluation = input?.evaluation || {};
+		const nowSeconds = Math.floor(Date.now() / 1000);
+		const res = await env.DB.prepare(
+			'INSERT INTO ad_join_checks (chat_id, user_id, score, threshold, verdict, layer, reasons, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		).bind(
+			String(input?.chatId || ''),
+			String(input?.userId || ''),
+			Number(evaluation.score) || 0,
+			Number(evaluation.threshold) || 0,
+			String(evaluation.verdict || ''),
+			String(evaluation.layer || ''),
+			JSON.stringify(Array.isArray(evaluation.reasons) ? evaluation.reasons.slice(0, 20) : []),
+			nowSeconds
+		).run();
+		await env.DB.prepare('DELETE FROM ad_join_checks WHERE created_at < ?')
+			.bind(nowSeconds - Math.floor(AD_JOIN_CHECKS_TTL_MS / 1000)).run();
+		return Number(res?.meta?.last_row_id ?? res?.meta?.lastRowId ?? res?.meta?.last_rowid) || null;
+	} catch (error) {
+		console.error('[入群检查] 写入流水失败:', error);
+		return null;
+	}
+}
+
+// 某群的入群检查统计：今日 / 累计 / 其中真正被处置的（verdict=ban）。
+async function countAdJoinChecks(env, chatId) {
+	const out = { total: 0, today: 0, hits: 0 };
+	if (!env?.DB) return out;
+	if (!(await ensureAdJoinChecksTable(env))) return out;
+	const id = String(chatId || '');
+	if (!id) return out;
+	try {
+		const { results } = await env.DB.prepare(
+			'SELECT COUNT(*) AS total, '
+			+ 'SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS today, '
+			+ 'SUM(CASE WHEN verdict = ? THEN 1 ELSE 0 END) AS hits '
+			+ 'FROM ad_join_checks WHERE chat_id = ?'
+		).bind(Math.floor(Date.now() / 1000) - 86400, 'ban', id).all();
+		out.total = Number(results?.[0]?.total) || 0;
+		out.today = Number(results?.[0]?.today) || 0;
+		out.hits = Number(results?.[0]?.hits) || 0;
+	} catch (error) {
+		console.error('[入群检查] 统计流水失败:', error);
+	}
+	return out;
+}
+
+// 最近几条入群检查，供 /adstats 展示「检查过、正常」。
+async function readAdJoinChecks(env, options = {}) {
+	const rows = [];
+	if (!env?.DB) return rows;
+	if (!(await ensureAdJoinChecksTable(env))) return rows;
+	const limit = Math.max(1, Math.min(Number(options.limit) || 5, 20));
+	const id = String(options.chatId || '');
+	try {
+		const stmt = id
+			? env.DB.prepare('SELECT id, chat_id, user_id, score, threshold, verdict, layer, reasons, created_at FROM ad_join_checks WHERE chat_id = ? ORDER BY id DESC LIMIT ?').bind(id, limit)
+			: env.DB.prepare('SELECT id, chat_id, user_id, score, threshold, verdict, layer, reasons, created_at FROM ad_join_checks ORDER BY id DESC LIMIT ?').bind(limit);
+		const { results } = await stmt.all();
+		for (const r of (results || [])) rows.push(r);
+	} catch (error) {
+		console.error('[入群检查] 读取流水失败:', error);
+	}
+	return rows;
 }
 
 // 当前群清扫缓存：保存普通用户近期消息 ID，供 /spam 引用回复时清扫该用户当前群近期消息。
@@ -8985,7 +9090,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/pending [N]　列出待复核的自动判定快照，默认 10 条',
 			'/ignore 序号　判错回滚：解黑 + 全群解封 + 删掉学到的指纹和样本（支持 3 5 7 与 3-8）',
 			'/rescreen [N]　重新筛查观察窗口里的可疑用户，默认 10 人',
-			'/adstats　检测状态总览：指纹库、样本向量、观察窗口与配置',
+			'/adstats　检测状态总览：指纹、样本向量、观察窗口、入群检查流水与本群演练状态',
 			'',
 			'<b>━━ 指纹与样本维护（仅私聊）━━</b>',
 			'/words [关键词] [页码]　翻看 / 搜索指纹库，按命中次数倒序，按钮翻页',
@@ -9006,6 +9111,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'超管限制　不能用 /stats，本人仍受黑名单拦截',
 			'检测豁免　超管、任一配置群的群主或管理员，发任何内容都不被广告自动检测',
 			'群内命令　发出即撤回，结果留在群里并通知第一主人',
+			'　　　　　/dryrun 是例外：命令与回执都撤回，完整信息走私聊（群里不留痕）',
+			'入群判定　进群那一刻就查 bio 与头像，不等发言；封禁线默认与消息线相同，',
+			'　　　　　要更严可设环境变量 AD_JOIN_SCORE_THRESHOLD（如 9），每次检查都留流水',
 			'私聊命令　命令和结果都保留',
 			'自动判定　加黑 + 全群封禁 + 自动学习，快照推给你复核',
 			'判错回滚　用 /ignore 序号撤销，判对不用管',
@@ -11030,6 +11138,18 @@ async function getChatInfoFromId(chatId) {
 const DEFAULT_AD_SCORE_THRESHOLD = 7;
 const DEFAULT_AD_OBSERVATION_SCORE = 5;
 const DEFAULT_AD_OBSERVATION_HOURS = 24;
+// 入群专用封禁线。【默认 0 = 与消息线完全一致，行为与加这个开关之前逐字相同】。
+//
+// 为什么默认不抬高：进群那一刻手里只有资料卡一份证据，理论上该比发言线更严
+//（menshen 就这么做的 —— 冷判定单开更高的采信线 antiad_cold_conf=85，注释原话
+//「这一步是在人刚进门时就限制他发言」）。但实测抬到 9 会先打掉一件事：
+//  bio「读书会成员进群 t.me/+abcdefghij」= 7 分，正好卡在消息线 7 上，
+//  原本进群即封（test_ad_detection 的端到端用例锁着），抬线后 7 < 9 就被放过 ——
+//  而「进群那一刻就拦住、不等他发言」正是这个功能存在的理由。
+// 两个目标在 7 分这个样本上不可兼得，主人定的口径是【先保住进群即封】。
+//
+// 想要更严的误伤保护时配 AD_JOIN_SCORE_THRESHOLD=9 即可，机制已经就位。
+const DEFAULT_AD_JOIN_SCORE_THRESHOLD = 0;
 const DEFAULT_AD_AI_SIMILARITY_THRESHOLD = 0.78;
 const DEFAULT_AD_FINGERPRINT_MIN_CONFIDENCE = 0.6;
 
@@ -11753,6 +11873,10 @@ function loadAdDetectionConfig(env) {
 	};
 	return {
 		scoreThreshold: pickInt(env.AD_SCORE_THRESHOLD, DEFAULT_AD_SCORE_THRESHOLD, 1, 100),
+		// 入群封禁线。默认 0 = 沿用 scoreThreshold（见 DEFAULT_AD_JOIN_SCORE_THRESHOLD）。
+		// screenAdJoinMember 里还会与 scoreThreshold 取 max，保证「进群」永远不比
+		//「发言」更容易被封 —— 配得比消息线还低也不会松。
+		joinScoreThreshold: pickInt(env.AD_JOIN_SCORE_THRESHOLD, DEFAULT_AD_JOIN_SCORE_THRESHOLD, 0, 100),
 		observationScore: pickInt(env.AD_OBSERVATION_SCORE, DEFAULT_AD_OBSERVATION_SCORE, 1, 100),
 		observationHours: pickInt(env.AD_OBSERVATION_HOURS, DEFAULT_AD_OBSERVATION_HOURS, 1, 720),
 		aiSimilarityThreshold: pickFloat(env.AD_AI_SIMILARITY_THRESHOLD, DEFAULT_AD_AI_SIMILARITY_THRESHOLD, 0.1, 1),
@@ -16273,15 +16397,43 @@ async function screenAdJoinMember(env, member, options = {}) {
 		const config = options.config || loadAdDetectionConfig(env);
 		const whitelist = options.whitelist || await loadAdDomainWhitelist(env);
 
+		// ===== 入群专用封禁线 =====
+		// 见 DEFAULT_AD_JOIN_SCORE_THRESHOLD 的说明：进群那一刻只有资料卡一份证据，
+		// 发消息那条路有正文 / 上下文 / 转发 / 历史累积多份 —— 证据少却用同一条线裁决，
+		// 等于对刚进门的人从严。所以入群单开一条更高的线，没到线就按现状转观察、不拦。
+		//
+		// 取 max 是防线：配置项写得比消息线还低时，不能让「进群」反而比「发言」更容易被封。
+		//
+		// 只覆盖 scoreThreshold —— 指纹硬命中、AI 硬命中、四通道结构查杀、头像定罪
+		// 在 evaluateAdSuspect 里都与 scoreThreshold 无关（`score >= threshold || hardHit`），
+		// 强证据照旧直接拦。这与 menshen「规则门与形状命中排在采信线之前、零 AI 直接处置」
+		// 是同一个取向：门槛收紧的只是「凭一份资料卡凑够分数就封」这一条路。
+		const joinScore = Math.max(Number(config.joinScoreThreshold) || 0, Number(config.scoreThreshold) || 0)
+			|| Number(config.scoreThreshold);
+		const joinConfig = joinScore === config.scoreThreshold
+			? config
+			: Object.assign({}, config, { scoreThreshold: joinScore });
+
 		const baseEvaluation = await evaluateAdSuspect(
 			env,
 			{ profile, text: '', forwardChat: null },
 			// getChat 失败时不能扣「无 Bio」那一分 —— 那是「查到了、确实是空」才成立的判据。
-			{ config, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
+			{ config: joinConfig, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
 		);
 		// 入群即判头像：这是「广告号还没发广告就被拦住」的主通道，
 		// 头像指纹命中时即便正文干净也能进判据（分档见 applyAvatarVerdict）。
+		// 头像与其它强证据一样不走入群线，仍按原样定罪。
 		const evaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+
+		// ===== 入群检查流水：任何 verdict 都记 =====
+		// 只记命中的话，看板上对绝大多数新成员是一片空白，管理员分不清
+		//「检查过、这个人正常」和「压根没看过他」—— 而后者正是漏放最典型的形态。
+		// 失败不影响入群筛查的返回值：流水只是看板数据。
+		try {
+			await recordAdJoinCheck(env, { userId, chatId, evaluation });
+		} catch (error) {
+			console.error('[入群检查] 记录流水失败:', error);
+		}
 
 		if (evaluation.verdict === 'ban') {
 			// 任意配置群的群主/管理员全群豁免（当前群入口处已查过）。
@@ -17565,6 +17717,33 @@ async function handleAdStatsCommand(env, chatId) {
 		? '✅ 每日上限 ' + config.avatarVisionDaily + ' 张（模型 ' + AD_AVATAR_VISION_MODEL + '）'
 		: '⏸️ 已关闭（AD_AVATAR_VISION_DAILY=0），只跑头像指纹，不调模型'));
 	lines.push('<b>域名白名单</b>　生效 <b>' + whitelist.size + '</b> 条（D1 自定义 ' + whitelistRows + ' 条，内置种子 ' + AD_DOMAIN_WHITELIST_SEED.length + ' 条）');
+	// 入群检查流水。只记命中的话这一屏对绝大多数新成员是一片空白，
+	// 主人分不清「检查过、这个人正常」和「压根没看过他」—— 后者正是漏放的形态。
+	if (isConfiguredGroup(chatId)) {
+		const joinCounts = await countAdJoinChecks(env, chatId);
+		const joinLine = Math.max(Number(config.joinScoreThreshold) || 0, Number(config.scoreThreshold) || 0);
+		lines.push('<b>入群检查</b>　今日 <b>' + joinCounts.today + '</b> 人，处置 <b>' + joinCounts.hits + '</b>，'
+			+ '累计 <b>' + joinCounts.total + '</b> 条（保留 30 天）');
+		lines.push('　↳ 封禁线 <b>' + joinLine + '</b>（消息线 ' + config.scoreThreshold + '）'
+			+ (joinLine > config.scoreThreshold
+				? '—— 进群只有资料卡一份证据，线比发言高，没到线只转观察不拦'
+				: '—— 与消息线相同（未设 AD_JOIN_SCORE_THRESHOLD 或设得更低）'));
+		if (joinCounts.total > 0) {
+			const joinRows = await readAdJoinChecks(env, { chatId, limit: 3 });
+			for (const row of joinRows) {
+				let joinReasons = [];
+				try { joinReasons = JSON.parse(String(row.reasons || '[]')); } catch (_) {}
+				const when = new Date((Number(row.created_at) || 0) * 1000).toISOString().slice(5, 16).replace('T', ' ');
+				const verdictLabel = String(row.verdict) === 'ban' ? '处置'
+					: (String(row.verdict) === 'observe' ? '转观察' : '正常');
+				lines.push('· #' + row.id + ' ' + when + '　user=' + escapeHtml(String(row.user_id))
+					+ '　' + (Number(row.score) || 0) + '/' + (Number(row.threshold) || 0) + '　' + verdictLabel);
+				if (joinReasons.length && String(row.verdict) !== 'pass') {
+					lines.push('　依据：' + escapeHtml(String(joinReasons[0]).slice(0, 60)));
+				}
+			}
+		}
+	}
 	// 演练模式：本群开关 + 命中流水。放在最后一屏，与判定、库状态分开 ——
 	// 主人调阈值时要的正是「刚才有没有命中、命中是因为什么」。
 	if (isConfiguredGroup(chatId)) {
@@ -19064,68 +19243,109 @@ function isDryRunCommand(text) {
 // 不回任何话 —— 群里不暴露这条命令的存在。
 // 群内：/dryrun 翻转本群；/dryrun on|off 显式设置；/dryrun status 只看不改。
 // 私聊：列出已开演练的群与命中数（只读）。
+// 群内回执发完立即撤回。它只为了让发送者看到「命令收到了」，下一毫秒就撤 ——
+// 主人的口径是群里不留痕（命令与回执都清掉），完整信息另行推私聊。
+async function sendAndRecall(chatId, text) {
+	const sent = await sendTelegramMessage(chatId, text);
+	const mid = sent?.result?.message_id;
+	if (mid) await deleteMessage(chatId, mid);
+	return sent;
+}
+
+// 群内回执已经撤了，不补这一份就等于什么都没发生 —— 完整信息必须到私聊。
+async function pushDryRunDetail(chatId, text) {
+	const ownerId = getOwnerNotifyTargets()[0] || "";
+	// 私聊里操作的那条分支本来就在第一主人窗口里，再推一份是重复。
+	if (!ownerId || String(ownerId) === String(chatId)) return;
+	try {
+		await sendTelegramMessage(ownerId, text);
+	} catch (error) {
+		console.error('[演练模式] 推送私聊详情失败:', error);
+	}
+}
+
 async function handleDryRunCommand(message, env) {
 	const userId = getMessageActorId(message);
 	if (!isPrimaryOwner(userId)) return true;
 	const chatId = String(message.chat?.id || '');
 	const isInGroup = message.chat?.type !== 'private';
 	const arg = String(message.text || '').replace(/^\/dryrun(?:@\[^\s]+)?\s*/i, '').trim().toLowerCase();
-	
-if (!isInGroup) {
-	const stateMap = await readDryRunStateMap(env);
-	if (!stateMap.size) {
-		await sendTelegramMessage(chatId, '🧪 当前没有任何群处于演练模式。到目标群内发 <code>/dryrun</code> 开启。');
-		return true;
-	}
-	const lines = ['🧪 <b>演练模式 · 已开启的群</b>（在目标群内发 <code>/dryrun</code> 切换）'];
-	for (const id of stateMap.keys()) {
-		let title = '';
-		try { const gi = await getChatInfoFromId(id); title = String(gi?.title || ''); } catch (_) {}
-		const label = title
+
+	if (!isInGroup) {
+		const stateMap = await readDryRunStateMap(env);
+		if (!stateMap.size) {
+			await sendTelegramMessage(chatId, '🧪 当前没有任何群处于演练模式。到目标群内发 <code>/dryrun</code> 开启。');
+			return true;
+		}
+		const lines = ['🧪 <b>演练模式 · 已开启的群</b>（在目标群内发 <code>/dryrun</code> 切换）'];
+		for (const id of stateMap.keys()) {
+			let title = '';
+			try { const gi = await getChatInfoFromId(id); title = String(gi?.title || ""); } catch (_) {}
+			const label = title
 				? '<b>' + escapeHtml(title) + '</b> <code>' + escapeHtml(id) + '</code>'
 				: '<code>' + escapeHtml(id) + '</code>';
-		const counts = await countAdDryRun(env, id);
-		lines.push('• ' + label + '：今日命中 ' + counts.today + ' 条（累计 ' + counts.total + '）');
+			const counts = await countAdDryRun(env, id);
+			lines.push('• ' + label + '：今日命中 ' + counts.today + ' 条（累计 ' + counts.total + '）');
+		}
+		lines.push('');
+		lines.push('⚠️ 演练期间这些群不删不封，调完阈值记得回来关。');
+		await sendTelegramMessage(chatId, lines.join('\n'));
+		return true;
 	}
-	lines.push('');
-	lines.push('⚠️ 演练期间这些群不删不封，调完阈值记得回来关。');
-	await sendTelegramMessage(chatId, lines.join('\n'));
-	return true;
-}
-	
-if (!isConfiguredGroup(chatId)) {
-	await sendTelegramMessage(chatId, '⚠️ 本群不在配置群列表：请先在群里发 <code>/addgroup</code>，'
+
+	// 群内：回执发完立即撤回，同时把同一份完整信息补推到第一主人私聊。
+	// 撤回命令本身用的是项目通用封装（防重复删标记在 message 上）。
+	const reply = async (text, detail) => {
+		await deleteAuthorizedGroupCommandMessage(message, 'dryrun');
+		await sendAndRecall(chatId, text);
+		await pushDryRunDetail(chatId, detail || text);
+	};
+
+	if (!isConfiguredGroup(chatId)) {
+		await reply('⚠️ 本群不在配置群列表：请先在群里发 <code>/addgroup</code>，'
 			+ '或把本群 ID 加进 <code>GROUP_IDS</code> 环境变量。本群本来就不做广告处置，开演练没有意义。');
-	return true;
-}
-	
-const currentlyOn = await isDryRunGroup(env, chatId);
-if (/^(status|状态)$/.test(arg)) {
-	await sendTelegramMessage(chatId, currentlyOn
-			? '🧪 当前：演练模式【开启】—— 判定照跑，但不删不封、不学习，只写流水并私聊通知你。'
-			: '✅ 当前：演练模式【关闭】—— 正常自动处置。');
-	return true;
-}
-let target;
+		return true;
+	}
+
+	const currentlyOn = await isDryRunGroup(env, chatId);
+	if (/^(status|状态)$/.test(arg)) {
+		await reply(
+			currentlyOn
+				? '🧪 当前：演练模式【开启】—— 判定照跑，但不删不封、不学习，只写流水并私聊通知你。'
+				: '✅ 当前：演练模式【关闭】—— 正常自动处置。');
+		return true;
+	}
+	let target;
 	if (/^(on|开|开启|启用)$/.test(arg)) target = true;
 	else if (/^(off|关|关闭)$/.test(arg)) target = false;
 	else target = !currentlyOn;   // 裸 /dryrun = 翻转
-	
-const r = await setDryRun(env, chatId, target, userId);
-if (!r.ok) {
-	await sendTelegramMessage(chatId, '❌ 切换失败：' + escapeHtml(toChineseErrorText(r.error || '未知错误')));
-	return true;
-}
-await sendTelegramMessage(chatId, target
+
+	const r = await setDryRun(env, chatId, target, userId);
+	if (!r.ok) {
+		await reply('❌ 切换失败：' + escapeHtml(toChineseErrorText(r.error || '未知错误')));
+		return true;
+	}
+	const groupLabel = escapeHtml(String(message.chat?.title || '') || chatId);
+	const counts = await countAdDryRun(env, chatId);
+	const short = target
 		? '🧪 <b>演练模式已开启</b>\n'
-			+ '判定照常跑，但本群【不删消息、不封禁、不加黑、不学指纹与样本】，'
-			+ '命中只写流水，并私聊通知你。\n'
+			+ '判定照常跑，但本群【不删消息、不封禁、不加黑、不学指纹与样本】，命中只写流水，并私聊通知你。\n'
 			+ '⚠️ 演练期间本群完全不设防，广告照发 —— 调完阈值记得再发一次 <code>/dryrun</code> 关闭。\n'
 			+ '查看命中：<code>/adstats</code>'
-		: '✅ <b>演练模式已关闭</b>\n本群恢复自动处置（加黑 + 全群封禁 + 删消息 + 自动学习）。');
-return true;
+	: '✅ <b>演练模式已关闭</b>\n本群恢复自动处置（加黑 + 全群封禁 + 删消息 + 自动学习）。';
+	const detail = target
+		? '<b>🧪 演练模式已开启</b>\n'
+			+ '群：<b>' + groupLabel + '</b> <code>' + escapeHtml(chatId) + '</code>\n'
+			+ '判定照常跑，但本群【不删消息、不封禁、不加黑、不学指纹与样本】，命中只写流水。\n'
+			+ '本群命中：今日 ' + counts.today + ' 条，累计 ' + counts.total + ' 条。\n'
+			+ '⚠️ 演练期间本群完全不设防，广告照发 —— 调完阈值记得再发一次 <code>/dryrun</code> 关闭。\n'
+			+ '查看：<code>/adstats</code>'
+		: '<b>✅ 演练模式已关闭</b>\n'
+			+ '群：<b>' + groupLabel + '</b> <code>' + escapeHtml(chatId) + '</code>\n'
+			+ '恢复自动处置（加黑 + 全群封禁 + 删消息 + 自动学习）。';
+	await reply(short, detail);
+	return true;
 }
-
 // 解析粒度参数：week/周 → 本周，month/月 → 本月，其余（含空）→ 今日。
 // 解析 /stats 的时间范围参数。
 // 返回 'day'/'week'/'month'；空参数或无法识别的参数返回 null，
