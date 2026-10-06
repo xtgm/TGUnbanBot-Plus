@@ -1442,7 +1442,7 @@ async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, option
 		}
 	}
 	if (!blacklistCheck.checkFailed) {
-		await notifyOwnerBlacklistAppeal(fromUser, blacklistCheck);
+		await notifyOwnerBlacklistAppeal(fromUser, blacklistCheck, 'appeal', chatId);
 	} else if ((options.flashOnly || options.silentGroupReply) && options.message) {
 		const auditText = renderAuditNotification(
 			formatMessageActorMention(options.message),
@@ -7055,6 +7055,45 @@ async function translateBlacklistOperator(byId) {
 	return `${roleTag} <code>${escapeHtml(byId)}</code>`;
 }
 
+// ===== 通知里的「发起来源」一行 =====
+//
+// notifyOwnerBlacklistIntercept 与 notifyOwnerChatMemberAction 早就带着 📍 群：这一行，
+// 而【由用户主动发起】的两个 —— 自助解封、黑名单申诉 —— 漏了：主人拿到通知分不清
+// 「他自己私聊跑来解的」还是「群里管理员替他解的」
+// （2026-10-06 提出，方案 B：两个函数一起补齐，复用既有范式）。
+//
+// 私聊必须单独处理：getChatInfoFromId 对私聊返回的是 first_name，照搬群的写法
+// 会渲染成「群：张三 1630699369」，读起来像个群 —— 比不写这一行还误导。
+async function formatOriginLabel(chatOrId) {
+	const chat = (chatOrId && typeof chatOrId === 'object') ? chatOrId : null;
+	const chatId = String(chat?.id ?? chatOrId ?? '');
+	if (!chatId) return '<code>未知</code>';
+	// 两种输入都认：对象（message.chat / chatMember.chat）与裸 id（blockSelfUnban
+	// 那条路径只拿到 chatId 字符串）。裸 id 的类型信息藏在正负号里 ——
+	// Telegram 的群与频道恒为负数，私聊（含与 bot 的对话）恒为正数。
+	const type = String(chat?.type || '');
+	const numeric = Number(chatId);
+	if (type === 'private' || (!type && Number.isFinite(numeric) && numeric > 0)) return '私聊';
+
+	let label = `<code>${escapeHtml(chatId)}</code>`;
+	const directTitle = String(chat?.title || '');
+	if (directTitle) return `<b>${escapeHtml(directTitle)}</b> ${label}`;
+	try {
+		const info = await getChatInfoFromId(chatId);
+		if (info?.title) label = `<b>${escapeHtml(info.title)}</b> ${label}`;
+	} catch (_) {
+		// 拉不到群名就只显示 id，与 intercept / chatMemberAction 同款兜底。
+	}
+	return label;
+}
+
+// 【刻意没有「发起人」这一行】这两个场景里发起人与被处理对象在代码结构上恒为同一人：
+// handleMessage 里 `const userId = message.from?.id`，而 notifyOwnerSelfUnban /
+// notifyOwnerBlacklistAppeal 收到的 fromUser 也是 message.from —— 三者永远相等，
+// 所以「👤 用户:」那一行本身就已经说明了是谁点的，再加一行只是噪音。
+// （曾写过一个 formatOriginActor，实测在全部调用点下恒返回空串，已删：不给将来
+//  留死代码。真出现「管理员代发」的路径时再补，那时要连 userId 的来源一起改。）
+
 // 黑名单自动拦截通知主人（复入群拦截 / 发言拦截时调用）
 async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklistInfo, banResult) {
 	if (!OWNER_IDS.length) return;
@@ -7096,7 +7135,7 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 //   'appeal'（默认）—— 发了 /unban 或粘贴确认整句，是【真的在尝试解封】并被闸门拒绝；
 //   'start'         —— 只是打开了 bot（Telegram 自动发 /start），可能只是误触，
 //                      /start 现在只回自我介绍、不拒绝，所以这条纯属知情通报。
-async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo, kind = 'appeal') {
+async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo, kind = 'appeal', origin = null) {
 	if (!OWNER_IDS.length) return;
 	const target = fromUser
 		? formatUserMention(fromUser)
@@ -7109,9 +7148,14 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo, kind = 'appea
 	const addedAt = entry?.at ? escapeHtml(entry.at) : '未知';
 	const isStart = kind === 'start';
 
+	const originLine = origin
+		? `📍 发起:${await formatOriginLabel(origin)}`
+		: null;
+
 	const lines = [
 		isStart ? '📬 <b>黑名单用户打开了机器人</b>' : '📢 <b>黑名单用户申诉</b>',
 		`👤 用户:${target} <code>${escapeHtml(targetId)}</code>`,
+		...(originLine ? [originLine] : []),
 		`📋 加黑方式:${reason}`,
 		`🔧 加黑操作人:${operator}`,
 		`🕐 加黑时间:${addedAt}`,
@@ -7126,7 +7170,9 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo, kind = 'appea
 }
 
 // 用户完成自助解封时通知主人（所有自助解封都通知）
-async function notifyOwnerSelfUnban(fromUser, perGroupResults) {
+// origin = 发起这次解封的会话（message.chat 或裸 chatId）。不传则不显示来源行 ——
+// 宁可少一行，也不显示一个编出来的「未知」。
+async function notifyOwnerSelfUnban(fromUser, perGroupResults, origin = null) {
 	if (!OWNER_IDS.length) return;
 	const target = fromUser
 		? formatUserMention(fromUser)
@@ -7137,9 +7183,14 @@ async function notifyOwnerSelfUnban(fromUser, perGroupResults) {
 		.map(r => r.replace(/<[^>]+>/g, ''))
 		.join('\n');
 
+	const originLine = origin
+		? `📍 发起:${await formatOriginLabel(origin)}`
+		: null;
+
 	const lines = [
 		`📬 <b>用户自助解封</b>`,
 		`👤 用户:${target} <code>${escapeHtml(targetId)}</code>`,
+		...(originLine ? [originLine] : []),
 		'',
 		`📋 各群解封结果:`,
 		escapeHtml(resultSummary),
@@ -9839,7 +9890,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const startCheck = await checkBlacklist(userId, env, { strict: true });
 			if (startCheck.isBlacklisted && !startCheck.checkFailed) {
 				// 用 waitUntil 异步投递：通知失败不该拖慢或阻断介绍语的回复
-				ctx.waitUntil(notifyOwnerBlacklistAppeal(message.from, startCheck, 'start'));
+				ctx.waitUntil(notifyOwnerBlacklistAppeal(message.from, startCheck, 'start', message.chat));
 			}
 		} catch (error) {
 			console.error('[/start] 黑名单知情通报失败:', error);
@@ -9953,7 +10004,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		await sendTelegramMessage(chatId, perGroupResults.join('\n'));
 
 		// 通知主人：有用户完成了自助解封
-		await notifyOwnerSelfUnban(message.from, perGroupResults);
+		await notifyOwnerSelfUnban(message.from, perGroupResults, message.chat);
 
 		// 检查用户是否在 GKY 封禁黑名单中（全局判定，提醒发到主群）
 		try {
