@@ -9242,6 +9242,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'　　　　　/dryrun 是例外：命令与回执都撤回，完整信息走私聊（群里不留痕）',
 			'入群判定　进群那一刻就查 bio 与头像，不等发言；封禁线默认与消息线相同，',
 			'　　　　　要更严可设环境变量 AD_JOIN_SCORE_THRESHOLD（如 9），每次检查都留流水',
+			'　　　　　资料里挂的 @xxx / t.me/xxx 会查清目标的简介与案底再打分（每人最多 5 个、',
+			'　　　　　按 handle 缓存 6 小时；资料里没链接则一个请求都不发）',
 			'私聊命令　命令和结果都保留',
 			'自动判定　加黑 + 全群封禁 + 自动学习，快照推给你复核',
 			'判错回滚　用 /ignore 序号撤销，判对不用管',
@@ -12957,6 +12959,275 @@ function judgeAdQuotedKill(payload) {
 	};
 }
 
+// ===== 资料里挂的频道 / 群 / bot —— 解析与判据（对齐 menshen 的 resolveLink）=====
+//
+// 【解决什么】广告号与正常用户都会在 bio 里写 t.me/xxx，只看字符串分不开：
+//「挂自己的技术频道」和「挂刷单群」写的都是 `t.me/xxx`，差别全在**被挂的那个账号**
+// 本身是什么、简介写了什么、有没有案底。menshen 逐个 getChat("@handle") 把目标查清楚
+// 再判（sender.go resolveLink），我方此前只把 bio 当纯文本正则，对链接指向哪儿一无所知。
+//
+// 【能力边界，先写清楚】getChat 只给 类型 + 标题 + 简介 description，**给不了频道里
+// 发过什么** —— bot 读不到别人的频道历史消息，menshen 也一样。能拿到的最硬证据是
+// 被挂频道【自己写的简介】，那正是攻击者写的引流落地页文案。bot 还要多一步：
+// 它的简介 getChat 拿不到，只有公开预览页的 og:description 给（见 fetchAdBotAbout）。
+//
+// 【为什么不引入生成式模型】menshen 靠提示词推理「这个频道是不是广告」；我方 AI 层是
+// bge-m3 向量相似度、全文件没有一处 chat/completions，提示词没有落点。而被挂账号的
+// 简介本质上就是一份 bio —— 直接用打 bio 的同一条广告语境正则去打它（见
+// scoreAdProfileLinks），判据同源、不新造一套。查不到的按 menshen 口径「不因查不到
+// 而加重怀疑」：不加不减。
+//
+// 【成本闸】只有 bio/昵称里真的出现了 @xxx 或 t.me/xxx 形态才发请求（见
+// extractAdProfileHandles 的形态判断），没链接的人一个请求都不加；有链接也最多 5 个，
+// 结果按小写 handle 缓存 6 小时 —— 群里十个人挂同一个频道只查一次。
+const D1_AD_LINK_CACHE_INIT = new WeakMap();
+const AD_LINK_MAX_HANDLES = 5;
+const AD_LINK_TTL_SECONDS = 6 * 60 * 60;
+// 与 menshen profileHandleRe 同形：@xxx 与 t.me/xxx 两种公开用户名写法。
+// t.me/+xxx 与 t.me/joinchat 是私密邀请，查不出目标 —— 那归已有的 privateInvite 判据管。
+const AD_PROFILE_HANDLE_RE = /(?:@|t\.me\/)([A-Za-z][A-Za-z0-9_]{3,31})/g;
+
+async function ensureAdLinkCacheTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_AD_LINK_CACHE_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			await runD1SchemaStatement(env, 'ad_link_cache',
+				'CREATE TABLE IF NOT EXISTS ad_link_cache (handle TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT \'\', title TEXT NOT NULL DEFAULT \'\', about TEXT NOT NULL DEFAULT \'\', ad_known INTEGER NOT NULL DEFAULT 0, fetched_at INTEGER NOT NULL DEFAULT 0)');
+			return true;
+		} catch (error) {
+			console.error('[广告检测·链接] 建表失败:', error);
+			return false;
+		}
+	})();
+	D1_AD_LINK_CACHE_INIT.set(env.DB, init);
+	const ok = await init;
+	if (!ok) D1_AD_LINK_CACHE_INIT.delete(env.DB);
+	return ok;
+}
+
+// 读缓存。过期返回 null 由调用方重新解析 —— 与 menshen 的 linkTTL 同为 6 小时，
+// 频道简介很少变，但改了之后 6 小时内还能看到旧值，这是可接受的代价。
+async function readAdLinkCache(env, handle) {
+	const key = String(handle || '').toLowerCase();
+	if (!env?.DB || !key) return null;
+	if (!(await ensureAdLinkCacheTable(env))) return null;
+	try {
+		const row = await env.DB.prepare(
+			'SELECT handle, kind, title, about, ad_known, fetched_at FROM ad_link_cache WHERE handle = ? AND fetched_at > ?'
+		).bind(key, Math.floor(Date.now() / 1000) - AD_LINK_TTL_SECONDS).first();
+		if (!row) return null;
+		return {
+			handle: String(row.handle || key),
+			kind: String(row.kind || 'unknown'),
+			title: String(row.title || ''),
+			about: String(row.about || ''),
+			adKnown: Number(row.ad_known) === 1
+		};
+	} catch (error) {
+		// 缓存读不到只意味着这次要真查一次，不能因此把整条解析链判死。
+		console.error('[广告检测·链接] 读缓存失败:', error);
+		return null;
+	}
+}
+
+async function writeAdLinkCache(env, info) {
+	const key = String(info?.handle || '').toLowerCase();
+	if (!env?.DB || !key) return;
+	if (!(await ensureAdLinkCacheTable(env))) return;
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_link_cache (handle, kind, title, about, ad_known, fetched_at) VALUES (?, ?, ?, ?, ?, ?)'
+			+ ' ON CONFLICT(handle) DO UPDATE SET kind = excluded.kind, title = excluded.title,'
+			+ ' about = excluded.about, ad_known = excluded.ad_known, fetched_at = excluded.fetched_at'
+		).bind(key, String(info.kind || 'unknown'), String(info.title || '').slice(0, 200),
+			String(info.about || '').slice(0, 600), info.adKnown ? 1 : 0,
+			Math.floor(Date.now() / 1000)).run();
+	} catch (error) {
+		console.error('[广告检测·链接] 写缓存失败:', error);
+	}
+}
+
+// 案底：这个账号在我方账本里有没有被判过广告。等价 menshen 的 accountAdKnown
+//（gban 名单 + antiad_log verdict='ad'），我方的两本账是：
+//   · blacklist —— 现在还在黑名单里
+//   · ad_pending_snapshots —— 判过且【没被 /ignore 回滚过】（回滚会把 expires_at 置 0，
+//     正好不算案底：纠错过的判定不该继续拿来定别人的罪）
+// 一条 SQL 拿两个计数，不在闸一路径上（闸一压根不解析链接）。
+async function isAdKnownAccount(env, uid) {
+	const id = String(uid || '');
+	if (!env?.DB || !/^-?\d+$/.test(id)) return false;
+	try {
+		const row = await env.DB.prepare(
+			'SELECT (SELECT COUNT(*) FROM blacklist WHERE id = ?)'
+			+ ' + (SELECT COUNT(*) FROM ad_pending_snapshots WHERE user_id = ? AND expires_at > 0) AS c'
+		).bind(id, id).first();
+		return Number(row?.c || 0) > 0;
+	} catch (error) {
+		// 查不到案底不加重怀疑（menshen 同口径）：拿不到证据不等于有罪。
+		return false;
+	}
+}
+
+// bot 的简介只有公开预览页给得到：getChat 对别的 bot 只返回名字与用户名。
+// 外网 HTTP、5 秒超时、失败返回空串 —— 空 about 在 scoreAdProfileLinks 里是
+//「不加不减」，不会因为抓不到就把这个 bot 往广告那边推。
+const AD_BOT_ABOUT_TIMEOUT_MS = 5000;
+async function fetchAdBotAbout(handle) {
+	const key = String(handle || '').toLowerCase();
+	if (!key) return '';
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), AD_BOT_ABOUT_TIMEOUT_MS);
+	try {
+		const response = await fetch('https://t.me/' + key, {
+			method: 'GET',
+			signal: controller.signal,
+			headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TGUnbanBot-adlink/1.0)' }
+		});
+		if (!response.ok) return '';
+		const html = await response.text();
+		// 与 menshen ogDescriptionRe 同口径：只取 og:description 一段，截断防超长。
+		const matched = /<meta property="og:description" content="([^"]*)"/.exec(String(html || ''));
+		if (!matched) return '';
+		let about = decodeBasicTelegramHtmlEntities(matched[1]).trim();
+		// 没设简介时预览页给的是默认文案，那不是简介，别当成「这个 bot 自己说只留联系方式」。
+		if (about.startsWith('You can contact @') && about.endsWith(' right away.')) return '';
+		return about.slice(0, 600);
+	} catch (_) {
+		return '';
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+// 从昵称与简介里取出公开用户名（@xxx 与 t.me/xxx），去重保序，上限 5 个。
+//
+// 【形态闸 = 成本闸】没有 handle 就返回空数组，resolveAdProfileLinks 据此一个请求
+// 都不发 —— 这就是「资料干净的人不花 getChat」的落点，等价 menshen coldjudge.go:257
+// 那句「链接解析放在预筛之后：每个链接一次 getChat，不该花在资料干净的人身上」。
+// 我方的预筛比它的 coldSuspicious 更硬：不用猜这份资料可不可疑，链接形态本身就是
+// 「有没有东西可查」的充要条件。
+function extractAdProfileHandles(profile) {
+	const text = [profile?.firstName, profile?.lastName, profile?.bio]
+		.map((part) => String(part || '').trim())
+		.filter(Boolean).join(' ');
+	if (!text) return [];
+	// 本人的 username 是账号标识不是「挂的链接」—— 查它等于查自己，白花一次请求。
+	const self = String(profile?.username || '').replace(/^@/, '').toLowerCase();
+	const out = [];
+	const seen = new Set();
+	for (const matched of text.matchAll(AD_PROFILE_HANDLE_RE)) {
+		const handle = String(matched[1] || '');
+		const key = handle.toLowerCase();
+		// joinchat 出现在 t.me/joinchat/xxx 里，那是私密邀请、查不出目标。
+		if (key === 'joinchat' || key === self || seen.has(key)) continue;
+		seen.add(key);
+		out.push(handle);
+		if (out.length >= AD_LINK_MAX_HANDLES) break;
+	}
+	return out;
+}
+
+// 查一个公开用户名指向什么：类型（channel / supergroup / group / bot / user）、
+// 标题、简介、案底。结果按小写 handle 缓存 6 小时。
+async function resolveAdLink(env, handle) {
+	const key = String(handle || '').toLowerCase();
+	if (!key || !BOT_TOKEN) return null;
+	const cached = await readAdLinkCache(env, key);
+	if (cached) return cached;
+
+	const info = { handle: key, kind: 'unknown', title: '', about: '', adKnown: false };
+	// cacheable=false 表示这次是暂时性故障，别缓存 —— 否则一次 429 会把这条链路
+	// 按死 6 小时，期间这个号挂的频道永远显示 unknown。
+	let cacheable = true;
+	try {
+		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getChat', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: '@' + key })
+		});
+		const result = await response.json();
+		const data = result?.result;
+		if (result?.ok && data) {
+			info.kind = String(data.type || 'unknown');
+			info.title = String(data.title || [data.first_name, data.last_name].filter(Boolean).join(' ') || '').slice(0, 200);
+			info.about = String(data.description || data.bio || '').slice(0, 600);
+			// private 是用户与 bot 共有的 type。TG 硬性规定 bot 用户名必须以 bot 结尾。
+			if (info.kind === 'private') info.kind = /bot$/.test(key) ? 'bot' : 'user';
+			// bot 的简介 getChat 拿不到，只有公开预览页的 og:description 给。
+			if (info.kind === 'bot' && !info.about) info.about = await fetchAdBotAbout(key);
+			info.adKnown = await isAdKnownAccount(env, data.id);
+		} else {
+			// 私有群、已删号、打错的用户名都是常态而非故障 —— 这类要缓存，否则每条消息
+			// 都重查一遍只是白撞速率限制（menshen 同样处理）。429 / 5xx 是暂时故障，不缓存。
+			const description = String(result?.description || '');
+			cacheable = response.status !== 429 && response.status < 500
+				&& !/429|too many requests|internal server|timeout/i.test(description);
+		}
+	} catch (error) {
+		cacheable = false;
+		console.error('[广告检测·链接] 解析失败 handle=' + key + ':', error?.message || error);
+	}
+	if (cacheable) await writeAdLinkCache(env, info);
+	return info;
+}
+
+// 批量解析一份资料里挂的链接。串行而不是并发：上限 5 个，串行最坏 5 次往返，
+// 并发换来的那点速度不值得冒一次性打爆限流的险（menshen 也是串行 for）。
+async function resolveAdProfileLinks(env, profile) {
+	const handles = extractAdProfileHandles(profile);
+	if (!handles.length) return [];
+	const out = [];
+	for (const handle of handles) {
+		try {
+			const info = await resolveAdLink(env, handle);
+			if (info) out.push(info);
+		} catch (error) {
+			console.error('[广告检测·链接] 单条解析异常 handle=' + handle + ':', error?.message || error);
+		}
+	}
+	return out;
+}
+
+// 被挂账号的判据。【只加分，不产生 hardHit】—— 定罪仍要过原有阈值
+// （scoreThreshold / 指纹 / AI / 结构通道），链接这一层永远只是抬高总分的证据之一。
+//
+// 这是与 menshen 的实质差别，也是必须的：它把资料交给生成式模型推理
+//（bioLinksClause），我方是规则化，规则化只能认「写明白了的」，认不出反向否证
+//（「标题吓人但简介是技术群」）。既然认不出反向，就不该让它有单独定罪的权力。
+//
+// ③ 那三条「不加」的分支正是本功能的核心：**正常用户与广告号都带 t.me，分界不在这
+// 串字符上，而在被挂账号写没写招揽、有没有案底。** 只挂链接、指向正常号、简介为空、
+// 查不到 —— 一律不加分，正常人挂自己的频道一个分都不涨。
+function scoreAdProfileLinks(links) {
+	if (!Array.isArray(links) || !links.length) return { score: 0, reasons: [] };
+	let score = 0;
+	const reasons = [];
+	const add = (delta, label) => { score += delta; reasons.push((delta >= 0 ? '+' : '') + delta + ' ' + label); };
+
+	for (const link of links) {
+		const handle = String(link?.handle || '');
+		if (!handle) continue;
+		const kind = String(link.kind || 'unknown');
+		const title = String(link.title || '');
+		const about = String(link.about || '');
+		// ① 案底：我方账本判过它广告、或它还在黑名单里。这条最强 ——
+		//    它不是模式匹配，是已经发生过、还能被 /ignore 纠错掉的定罪。
+		if (link.adKnown) add(3, '挂的 @' + handle + ' 有广告案底（黑名单 / 曾被判定）');
+		// ② 被挂账号【自己写的简介】含招揽：这是攻击者写的引流落地页文案，
+		//    用打 bio 的同一条广告语境正则（金额承诺 / 灰产词 / 强招揽）打它 ——
+		//    判据同源，不新造一套。只认频道/群/bot：挂一个正常个人号不构成广告位。
+		if (['channel', 'supergroup', 'group', 'bot'].includes(kind)
+			&& about && AD_EXEMPT_CANCEL_RE.test(about)) {
+			add(2, '挂的 @' + handle + '（' + kind + '「' + title.slice(0, 30) + '」）简介含招揽话术');
+		}
+		// ③ 其余一律不加：kind=unknown（查不到）、about 为空（没设置或抓不到）、
+		//    kind=user（挂个人号）、正常技术/兴趣社群的简介。
+	}
+	return { score, reasons };
+}
+
 function scoreAdProfile(profile, options = {}) {
 	const whitelistSet = options.whitelist instanceof Set ? options.whitelist : new Set(AD_DOMAIN_WHITELIST_SEED);
 	const firstName = String(profile?.firstName ?? profile?.first_name ?? '');
@@ -13068,6 +13339,17 @@ function scoreAdProfile(profile, options = {}) {
 	// 「收U秒结」从 +2 被压到 1 分、「【出租账号】」被压到 0 分）。
 	// 故未查 bio 时必须显式跳过，由调用方传 skipMissingBioPenalty。
 	if (displayName && !AD_HAS_EMOJI_RE.test(displayName) && !bio && !options.skipMissingBioPenalty) add(-1, '名称无 emoji 且无 Bio');
+
+	// ===== 资料里挂的频道 / 群 / bot（见 scoreAdProfileLinks）=====
+	// 只有调用方（入群线、闸二）真的解析过才会有这个字段；闸一的 cheapProfile
+	// 没有它 → scoreAdProfileLinks([]) 直接返回 0 分，零请求、零分、零 reasons。
+	// 放在所有既有加减分之后：链接证据是「附在资料上的外部佐证」，
+	// 排在后面才不会挤掉它上面那些更直接的判据在 reasons 里的位置。
+	const linkResult = scoreAdProfileLinks(profile?.adLinks);
+	if (linkResult.score) {
+		score += linkResult.score;
+		reasons.push(...linkResult.reasons);
+	}
 
 	// 下限 AD_SCORE_FLOOR（-3）而非 0：夹到 0 会让豁免词减分完全失效，详见该常量说明。
 	return { score: Math.max(AD_SCORE_FLOOR, score), rawScore: score, reasons, tradeHits, businessHits };
@@ -16704,6 +16986,13 @@ async function screenAdJoinMember(env, member, options = {}) {
 		profile.status = '';
 		await markAdBioChecked(env, userId, nowSeconds);
 
+		// ===== 解析资料里挂的频道 / 群 / bot（对齐 menshen resolveLink）=====
+		// 放在这里的理由：入群是「一次定终身」的事件，前面还有三天冷却锁兜着，
+		// 多花的 0~5 个 getChat 摊到每个人一生只有一次；而进群那一刻正是 menshen
+		// 冷判定（coldjudge）跑链接解析的同一条时机 —— 你要的「进群直接拦」靠它。
+		// 形态闸在 extractAdProfileHandles：bio 里没有 @xxx / t.me/xxx 就一个请求都不发。
+		profile.adLinks = await resolveAdProfileLinks(env, profile);
+
 		const config = options.config || loadAdDetectionConfig(env);
 		const whitelist = options.whitelist || await loadAdDomainWhitelist(env);
 
@@ -17109,6 +17398,14 @@ async function detectAdOnMessage(message, env) {
 	// 由 formatAdMemberStatus 渲染成「未查询」。
 	profile.status = '';
 	await markAdBioChecked(env, userId, nowSeconds);
+
+	// ===== 解析资料里挂的频道 / 群 / bot（对齐 menshen resolveLink）=====
+	// 【为什么闸二可以花这个钱】走到这里 = needBio 为真（首次发言或 bio 复查期已到），
+	// 本来就已经为这次判定花了一个 getChat；链接解析再花 0~5 个，且结果按 handle
+	// 缓存 6 小时 —— 群里十个人挂同一个频道只查第一次。形态闸同样兜底：
+	// bio 里没有链接形态，这一步连一个请求都不发。
+	// 闸一不走这里，「闸一定罪零 getChat」三条断言不受影响。
+	profile.adLinks = await resolveAdProfileLinks(env, profile);
 
 	// 据实传：getChat 成功就正常判定（空 bio 该减分就减），失败则跳过减分。
 	// 两轨用同一个判断依据（profile.bioFetched），阈值与判据完全一致，不另立标准。
