@@ -66,7 +66,10 @@ function makeD1() {
 			return stmtFor([]);
 		},
 		exec: async (sql) => { db.exec(sql); sqlLog.push(String(sql).replace(/\s+/g, ' ').trim()); return { results: [], success: true }; },
-		batch: async (stmts) => stmts.map((st) => st.run()),
+		// 必须 await —— 不 await 会返回 Promise 数组，batch[i].results 为 undefined，
+		// /adstats 前半段（指纹库/样本/白名单/头像计数）会静默读成 0：查库明明正常，
+		// 看着却像产品缺陷。实际是 mock 少了 await。
+		batch: async (stmts) => Promise.all(stmts.map((st) => st.run())),
 		query(sql, ...params) { return db.prepare(sql).all(...params).map(normOut); },
 		_sql: sqlLog,
 		_raw: db

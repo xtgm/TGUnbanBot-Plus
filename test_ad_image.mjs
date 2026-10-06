@@ -433,7 +433,7 @@ section('[8] evaluateAdSuspect 把 media 写进 payload');
 }
 
 // ================= [9] 看板 =================
-section('[9] /adstats 展示正文图片指纹');
+section('[9] /adstats 展示正文图片指纹 + 计数守卫');
 {
 	const env = makeEnv();
 	await W.adDetectionReady(env);
@@ -459,6 +459,31 @@ section('[9] /adstats 展示正文图片指纹');
 		.map((c) => c.body?.text || '').join('\n');
 	assert('关闭时显示 AD_IMAGE_VISION_DAILY=0', sentOff.includes('AD_IMAGE_VISION_DAILY=0'), sentOff.slice(0, 900));
 	assert('关闭时说明「只跑图片指纹，不调模型」', sentOff.includes('只跑图片指纹，不调模型'), sentOff.slice(0, 900));
+
+	// ===== /adstats 计数守卫 =====
+	// 这批守的是 mock 的 batch 实现本身：缺 await 时 rows[i].results 是 undefined，
+	// /adstats 前半段（指纹库 / 头像 / 正文图片）会静默读成 0 —— 查库明明有数据，
+	// 看着却像产品缺陷。9 个测试文件的 stmts.map() 就是这个形态，而它们的断言
+	// 全打在 batch 之后的入群屏 / 演练屏上，没有一条守这几行。
+	//
+	// 反向验证过（把本文件 batch 改回缺 await 再跑）：下面 5 项立刻变红、
+	// 报错正是 bug 形态「共 0 条」「广告图 0 待识别 0 已排除 0」，证明不是恒绿。
+	// ★ 「语义样本」「域名白名单」两行【不在 batch 里】—— 分别走 countAdSamples
+	// 与 loadAdDomainWhitelist，反向验证时不红。留着是守各自那条查询，别当成 batch 守卫。
+	const envBatch = makeEnv();
+	await W.adDetectionReady(envBatch);
+	await W.upsertAdAvatar(envBatch, 'AV_BOARD_1', { verdict: 'ad', fileId: 'F_AV1' });
+	await W.upsertAdAvatar(envBatch, 'AV_BOARD_2', { verdict: 'pending', fileId: 'F_AV2' });
+	resetCalls();
+	await send(privateMessage(OWNER_ID, '/adstats'), envBatch);
+	const boardLines = calls.filter((c) => c.method === 'sendMessage')
+		.map((c) => c.body?.text || '').join('\n').split('\n');
+	const lineOf = (needle) => boardLines.find((l) => l.includes(needle)) || '';
+	assert('指纹库计数读得到（非 0）', /共 <b>[1-9]\d*<\/b> 条/.test(lineOf('指纹库')), lineOf('指纹库'));
+	assert('语义样本计数读得到（非 0）', /共 <b>[1-9]\d*<\/b> 条/.test(lineOf('语义样本')), lineOf('语义样本'));
+	assert('域名白名单计数读得到（非 0）', /生效 <b>[1-9]\d*<\/b> 条/.test(lineOf('域名白名单')), lineOf('域名白名单'));
+	assert('头像指纹广告图计数读得到（非 0）', /广告图 <b>[1-9]\d*<\/b>/.test(lineOf('头像指纹')), lineOf('头像指纹'));
+	assert('头像三档分列，pending 那张也数得出来', /待识别 <b>1<\/b>/.test(lineOf('头像指纹')), lineOf('头像指纹'));
 }
 
 // ================= 汇总 =================
