@@ -189,6 +189,8 @@ const AD_VOTE_DURATION_SECONDS = 60 * 60;
 const AD_VOTE_COMMAND_MAX_AGE_SECONDS = 30;
 const AD_VOTE_RETENTION_SECONDS = 7 * 24 * 60 * 60;
 const AD_VOTE_BUTTON_PREFIX = 'adv:';
+// 演练通知上两个结论按钮的回调前缀。data 形如 dry:ok:12 / dry:no:12。
+const DRYRUN_BUTTON_PREFIX = 'dry:';
 const AD_WORDS_PAGINATION_PREFIX = 'adwords:';
 const AD_JOB_PAGINATION_PREFIX = 'adjob:';
 const AD_WORDS_PAGE_LIMIT = 20;
@@ -5780,7 +5782,7 @@ async function setKillerMode(env, chatId, on, byUser) {
 		return { ok: false, error: error.message || String(error) };
 	}
 }
-
+
 // ===== 演练模式（dryrun）=====
 //
 // 【做什么】群开关打开后广告判定照常跑，但处置链一个人都不动：不加黑、不封禁、
@@ -5886,8 +5888,29 @@ async function ensureAdDryRunLogTable(env) {
 	const init = (async () => {
 		try {
 			await runD1SchemaStatement(env, 'ad_dryrun_log',
-				'CREATE TABLE IF NOT EXISTS ad_dryrun_log (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, user_id TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 0, verdict TEXT NOT NULL DEFAULT \'\', layer TEXT NOT NULL DEFAULT \'\', reasons TEXT NOT NULL DEFAULT \'\', snapshot TEXT NOT NULL DEFAULT \'\', created_at INTEGER NOT NULL DEFAULT 0)');
+				'CREATE TABLE IF NOT EXISTS ad_dryrun_log (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, user_id TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 0, verdict TEXT NOT NULL DEFAULT \'\', layer TEXT NOT NULL DEFAULT \'\', reasons TEXT NOT NULL DEFAULT \'\', snapshot TEXT NOT NULL DEFAULT \'\', evaluation TEXT NOT NULL DEFAULT \'\', fp INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0)');
 			await runD1SchemaStatement(env, 'idx_ad_dryrun_created', 'CREATE INDEX IF NOT EXISTS idx_ad_dryrun_created ON ad_dryrun_log (created_at)', { optional: true });
+			// ===== 按钮三列（存量表迁移）=====
+			// CREATE TABLE IF NOT EXISTS 对已存在的表完全无效，缺了这一步老部署会在
+			// 第一次点按钮时报 no such column —— 而错误被上层 catch 吞掉后，表现是
+			//「按钮点了没反应」，看不出哪里断了。
+			// 先判表再判列：表不存在 = 首次建表，上面的 CREATE 已经带齐三列。
+			if (await d1TableExists(env, 'ad_dryrun_log')) {
+				for (const column of ['evaluation', 'fp', 'done']) {
+					try {
+						if (!(await d1ColumnExists(env, 'ad_dryrun_log', column))) {
+							await runD1SchemaStatement(env, 'ad_dryrun_log.' + column,
+								'ALTER TABLE ad_dryrun_log ADD COLUMN ' + column
+								+ (column === 'evaluation'
+									? ' TEXT NOT NULL DEFAULT \'\''
+									: ' INTEGER NOT NULL DEFAULT 0'));
+						}
+					} catch (error) {
+						const message = formatD1SchemaError(error).toLowerCase();
+						if (!message.includes('duplicate') && !message.includes('exists')) throw error;
+					}
+				}
+			}
 			return true;
 		} catch (error) {
 			console.error('[演练模式] 建流水表失败:', error?.message || error);
@@ -5900,6 +5923,16 @@ async function ensureAdDryRunLogTable(env) {
 	return ok;
 }
 
+// 判定对象整体 JSON 化。环引用 / 循环引用都会让 JSON.stringify 抛，
+// 而流水写失败不该连累处置链的返回结构 —— 退化成空对象也要写成功。
+function safeJsonStringify(value) {
+	try {
+		return JSON.stringify(value);
+	} catch (_) {
+		return '{}';
+	}
+}
+
 // 记一条演练命中。返回流水 id（拿不到返回 null）。
 // 【写失败绝不影响调用方】：演练本来就什么都不做，流水少一条只影响复盘，
 // 不能因为一次 D1 抖动让处置链的返回结构变样、进而让调用方的回执分支走错。
@@ -5910,7 +5943,8 @@ async function recordAdDryRun(env, input) {
 		const evaluation = input?.evaluation || {};
 		const nowSeconds = Math.floor(Date.now() / 1000);
 		const res = await env.DB.prepare(
-			'INSERT INTO ad_dryrun_log (chat_id, user_id, score, threshold, verdict, layer, reasons, snapshot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+			'INSERT INTO ad_dryrun_log (chat_id, user_id, score, threshold, verdict, layer, reasons, snapshot, evaluation, created_at)'
+			+ ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
 		).bind(
 			String(input?.chatId || ''),
 			String(input?.userId || ''),
@@ -5920,6 +5954,10 @@ async function recordAdDryRun(env, input) {
 			String(evaluation.layer || ''),
 			JSON.stringify(Array.isArray(evaluation.reasons) ? evaluation.reasons.slice(0, 20) : []),
 			JSON.stringify(evaluation.snapshot || {}),
+			// 整份判定存全量：按钮点「确认封」时要原样交回 enforceAdDetection，
+			// 只存判据与快照的话，payload / structure / behaviorScore 这些它要用的
+			// 字段都还原不出来 —— 学指纹、学样本、清观察那一串会拿错数据。
+			safeJsonStringify(evaluation),
 			nowSeconds
 		).run();
 		await env.DB.prepare('DELETE FROM ad_dryrun_log WHERE created_at < ?')
@@ -5941,8 +5979,8 @@ async function readAdDryRunLog(env, options = {}) {
 	try {
 		const chatId = String(options.chatId || '');
 		const stmt = chatId
-			? env.DB.prepare('SELECT id, chat_id, user_id, score, threshold, layer, reasons, created_at FROM ad_dryrun_log WHERE chat_id = ? ORDER BY id DESC LIMIT ?').bind(chatId, limit)
-			: env.DB.prepare('SELECT id, chat_id, user_id, score, threshold, layer, reasons, created_at FROM ad_dryrun_log ORDER BY id DESC LIMIT ?').bind(limit);
+			? env.DB.prepare('SELECT id, chat_id, user_id, score, threshold, layer, reasons, fp, done, created_at FROM ad_dryrun_log WHERE chat_id = ? ORDER BY id DESC LIMIT ?').bind(chatId, limit)
+			: env.DB.prepare('SELECT id, chat_id, user_id, score, threshold, layer, reasons, fp, done, created_at FROM ad_dryrun_log ORDER BY id DESC LIMIT ?').bind(limit);
 		const { results } = await stmt.all();
 		for (const r of (results || [])) rows.push(r);
 	} catch (error) {
@@ -5951,25 +5989,71 @@ async function readAdDryRunLog(env, options = {}) {
 	return rows;
 }
 
-// 某群的演练命中条数（今日与累计两个口径，/adstats 一屏用）。
+// 某群的演练命中统计，/adstats 一屏用。
+// fp/done 是主人点按钮留下的两个结论：误报（点「不该封」）与已处置（点「确认封」）。
+// lowestFp = 被判误报的最低得分 —— 它贴住封禁线就说明线设低了，这一条直接告诉主人往哪调。
 async function countAdDryRun(env, chatId) {
-	const out = { total: 0, today: 0 };
+	const out = { total: 0, today: 0, fp: 0, done: 0, lowestFp: null };
 	if (!env?.DB) return out;
 	if (!(await ensureAdDryRunLogTable(env))) return out;
 	const id = String(chatId || '');
 	try {
 		if (id) {
 			const { results } = await env.DB.prepare(
-				'SELECT COUNT(*) AS total, SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS today FROM ad_dryrun_log WHERE chat_id = ?'
+				'SELECT COUNT(*) AS total,'
+				+ ' SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS today,'
+				+ ' SUM(CASE WHEN fp = 1 THEN 1 ELSE 0 END) AS fp_count,'
+				+ ' SUM(CASE WHEN done = 1 THEN 1 ELSE 0 END) AS done_count,'
+				+ ' MIN(CASE WHEN fp = 1 THEN score END) AS lowest_fp'
+				+ ' FROM ad_dryrun_log WHERE chat_id = ?'
 			).bind(Math.floor(Date.now() / 1000) - 86400, id).all();
-			out.total = Number(results?.[0]?.total) || 0;
-			out.today = Number(results?.[0]?.today) || 0;
+			const row = results?.[0] || {};
+			out.total = Number(row.total) || 0;
+			out.today = Number(row.today) || 0;
+			out.fp = Number(row.fp_count) || 0;
+			out.done = Number(row.done_count) || 0;
+			out.lowestFp = row.lowest_fp === null || row.lowest_fp === undefined ? null : Number(row.lowest_fp);
 		}
 	} catch (error) {
 		console.error('[演练模式] 统计流水失败:', error);
 	}
 	return out;
-}
+}
+
+// 读单条演练流水（含整份判定）。按钮回调用：要把原始 evaluation 原样交回处置链。
+async function readAdDryRunRow(env, id) {
+	const rowId = Number(id) || 0;
+	if (!env?.DB || !rowId) return null;
+	if (!(await ensureAdDryRunLogTable(env))) return null;
+	try {
+		return await env.DB.prepare(
+			'SELECT id, chat_id, user_id, score, threshold, verdict, layer, reasons, evaluation, fp, done, created_at'
+			+ ' FROM ad_dryrun_log WHERE id = ?'
+		).bind(rowId).first();
+	} catch (error) {
+		console.error('[演练模式] 读取单条流水失败:', error);
+		return null;
+	}
+}
+
+// 给演练流水落一个主人结论。field 只接受 fp / done 两值，避免拼进 SQL 的列名失控。
+// 返回是否写成功（幂等：已经置过的会返回 false，防按钮重复点重复处置）。
+async function markAdDryRunVerdict(env, id, field) {
+	const rowId = Number(id) || 0;
+	const column = field === 'fp' ? 'fp' : (field === 'done' ? 'done' : '');
+	if (!env?.DB || !rowId || !column) return { ok: false, reason: 'bad_arg' };
+	if (!(await ensureAdDryRunLogTable(env))) return { ok: false, reason: 'no_table' };
+	try {
+		const res = await env.DB.prepare(
+			'UPDATE ad_dryrun_log SET ' + column + ' = 1 WHERE id = ? AND ' + column + ' = 0'
+		).bind(rowId).run();
+		const changed = Number(res?.meta?.changes || 0);
+		return { ok: changed > 0, changed };
+	} catch (error) {
+		console.error('[演练模式] 写入结论失败:', error);
+		return { ok: false, reason: 'error', error: error.message || String(error) };
+	}
+}
 // ===== 入群检查流水 =====
 //
 // 【为什么每次入群都记，包括判为正常的】只记命中的话，用户页与看板对绝大多数
@@ -7220,6 +7304,37 @@ function buildAdVoteInlineKeyboard(state) {
 	};
 }
 
+// 通用消息编辑：把私聊里那条通知原地改成结论态。
+// 不传 reply_markup 时 Telegram 会移除按钮 —— 这正是我们要的：
+// 结论落定后按钮留着只会被重复点。
+async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) {
+	if (!chatId || !messageId) return { ok: false, error: '参数缺失' };
+	try {
+		const body = {
+			chat_id: chatId,
+			message_id: Number(messageId),
+			text: sanitizeTelegramText(text),
+			parse_mode: 'HTML',
+			disable_web_page_preview: true
+		};
+		if (replyMarkup) body.reply_markup = replyMarkup;
+		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/editMessageText', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		// 「message is not modified」= 文本本来就没变，不算失败。
+		if (response.ok && result?.ok) return { ok: true, result };
+		const description = String(result?.description || '');
+		if (/not modified/i.test(description)) return { ok: true, result };
+		return { ok: false, error: description || ('HTTP ' + response.status) };
+	} catch (error) {
+		console.error('[消息编辑] editMessageText 异常:', error);
+		return { ok: false, error: error.message || String(error) };
+	}
+}
+
 async function answerAdVoteCallback(callbackQueryId, text = '', showAlert = false) {
 	if (!callbackQueryId) return { ok: false, error: 'callback_query_id 缺失' };
 	try {
@@ -7929,6 +8044,10 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 	}
 	if (data.startsWith(AD_JOB_PAGINATION_PREFIX)) {
 		await handleBulkJobPaginationCallback(callbackQuery, env);
+		return;
+	}
+	if (data.startsWith(DRYRUN_BUTTON_PREFIX)) {
+		await handleDryRunButtonCallback(callbackQuery, env);
 		return;
 	}
 	if (!data.startsWith(AD_VOTE_BUTTON_PREFIX)) return;
@@ -9061,7 +9180,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'',
 			'<b>━━ 演练模式（仅第一主人 · 任意配置群）━━</b>',
 			'/dryrun　翻转本群开关；私聊发送则列出已开演练的群与命中数',
-			'/dryrun on　开启：判定照跑，但不删不封不学习，命中只写流水并私聊通知你',
+			'/dryrun on　开启：判定照跑，但不删不封不学习，命中只写流水并私聊通知你，通知带两个按钮当场拍板（✅确认封 / ❌不该封标误报）',
 			'/dryrun off　关闭：恢复自动处置（加黑 + 全群封禁 + 删消息 + 自动学习）',
 			'/dryrun status　查看本群当前状态',
 			'　　⚠️ 演练期间本群完全不设防、广告照发，调完阈值记得关',
@@ -16110,15 +16229,116 @@ async function pushAdDryRunNotice(env, context) {
 			'',
 			'本来会执行：加黑 + 全群封禁 + 删消息 + 学指纹与 AI 样本',
 			'流水号：' + (context?.dryRunId ? '#' + context.dryRunId : '（未写入，D1 写失败）'),
+			'',
+			'<b>你判断这条该不该封？</b>',
+			'✅ 确认封 = 当场真处置　　❌ 不该封 = 标为误报（只统计，不动判据库）',
 			'查看本群命中：<code>/adstats</code>　关闭本群演练：<code>/dryrun</code>',
 			'⚠️ 演练期间本群完全不设防，广告照发 —— 看完记得关。'
 		];
-		await sendTelegramMessageChunks(ownerId, notice + '\n' + tail.join('\n'));
+		// 按钮只在流水写成功时挂：没有 id 就没有回调目标，挂了也是死按钮。
+		// callback_data 有 64 字节上限，`dry:ok:123` 这种短格式远够。
+		const keyboard = context?.dryRunId ? {
+			inline_keyboard: [[
+				{ text: '✅ 确认封（立即处置）', callback_data: DRYRUN_BUTTON_PREFIX + 'ok:' + context.dryRunId },
+				{ text: '❌ 不该封（标为误报）', callback_data: DRYRUN_BUTTON_PREFIX + 'no:' + context.dryRunId }
+			]]
+		} : null;
+		await sendTelegramMessageChunks(ownerId, notice + '\n' + tail.join('\n'), keyboard);
 	} catch (error) {
 		console.error('[广告检测·演练] 推送通知失败:', error);
 	}
 }
 
+// 演练通知上的两个结论按钮。只有第一主人能点 —— 一个会真的封人、一个往统计里
+// 写结论，与 /ignore 同一档权限。
+async function handleDryRunButtonCallback(callbackQuery, env) {
+	const data = String(callbackQuery?.data || '');
+	const match = data.slice(DRYRUN_BUTTON_PREFIX.length).match(/^(ok|no):(\d+)$/);
+	if (!match) {
+		await answerAdVoteCallback(callbackQuery?.id);
+		return;
+	}
+	const action = match[1];
+	const rowId = Number(match[2]);
+	const fromId = String(callbackQuery?.from?.id || '');
+	if (!isPrimaryOwner(fromId)) {
+		await answerAdVoteCallback(callbackQuery?.id, '这两个按钮只有第一主人能点', true);
+		return;
+	}
+
+	const row = await readAdDryRunRow(env, rowId);
+	if (!row) {
+		await answerAdVoteCallback(callbackQuery?.id, '这条流水不存在或已清理', true);
+		return;
+	}
+	if (Number(row.fp) === 1 || Number(row.done) === 1) {
+		await answerAdVoteCallback(callbackQuery?.id, '这条已经处理过了', true);
+		return;
+	}
+
+	const chatId = String(callbackQuery?.message?.chat?.id || '');
+	const messageId = Number(callbackQuery?.message?.message_id) || 0;
+	const originText = String(callbackQuery?.message?.text || '');
+
+	if (action === 'no') {
+		// 误报：只标记，判据库一个字不动（指纹/形状/AI 样本都不碰）。
+		const marked = await markAdDryRunVerdict(env, rowId, 'fp');
+		if (!marked.ok) {
+			await answerAdVoteCallback(callbackQuery?.id, '标记失败：' + (marked.reason || '未知'), true);
+			return;
+		}
+		await answerAdVoteCallback(callbackQuery?.id, '已标为误报（只统计，不动判据库）');
+		const fpLine = [
+			'─────',
+			'❌ 已标为误报　流水 #' + rowId + '　得分 ' + (Number(row.score) || 0) + '/' + (Number(row.threshold) || 0),
+			'只计入 /adstats 的演练统计，判据库一字未动。',
+			'看统计：/adstats'
+		];
+		await editTelegramMessage(chatId, messageId, originText + '\n' + fpLine.join('\n'));
+		return;
+	}
+
+	// 确认封：把流水里存的整份判定原样交回处置链，force 绕过演练短路。
+	let evaluation = null;
+	try { evaluation = JSON.parse(String(row.evaluation || '{}')); } catch (_) { evaluation = null; }
+	if (!evaluation || typeof evaluation !== 'object' || !Array.isArray(evaluation.reasons)) {
+		await answerAdVoteCallback(callbackQuery?.id, '流水里没有可用的判定数据，无法处置', true);
+		return;
+	}
+
+	const config = loadAdDetectionConfig(env);
+	const whitelist = await loadAdDomainWhitelist(env);
+	let result = null;
+	try {
+		result = await enforceAdDetection(env, {
+			userId: String(row.user_id),
+			chatId: String(row.chat_id),
+			chatTitle: String(callbackQuery?.message?.chat?.title || ''),
+			messageId: null
+		}, Object.assign({}, evaluation, { verdict: 'ban' }), { config, whitelist, force: true });
+	} catch (error) {
+		console.error('[演练模式] 确认封执行失败:', error);
+	}
+	if (!result || result.banned !== true) {
+		await answerAdVoteCallback(callbackQuery?.id, '处置未完成：' + (result?.reason || '见日志'), true);
+		return;
+	}
+	const marked = await markAdDryRunVerdict(env, rowId, 'done');
+	await answerAdVoteCallback(callbackQuery?.id, '已按广告处置 ' + String(row.user_id));
+	const okLine = [
+		'─────',
+		'✅ 已确认封禁　流水 #' + rowId + '　' + (result.banSummary || '已处置'),
+		'加黑 + 全群封禁 + 学指纹与 AI 样本已执行。',
+		'判错了仍可 /unban ' + String(row.user_id) + ' 一键回滚'
+	];
+	await editTelegramMessage(chatId, messageId, originText + '\n' + okLine.join('\n'));
+	console.log('[演练模式] 主人确认封 user=' + row.user_id + ' 流水=#' + rowId + ' marked=' + marked.ok);
+}
+
+// 回执里给结论落款用的时间行（私聊通知已经过了发送时刻，落款要重新取）。
+function nowStampLine() {
+	return new Date().toLocaleString('zh-CN', { hour12: false });
+}
 // === 处置执行 ===
 // 判定为广告后的统一处置链：加黑 → 全群封禁 → 删触发消息 → 自动学指纹 → 存快照 → 推私聊 → 清观察记录。
 // 每一步独立容错：加黑失败仍继续封禁，封禁部分失败仍推送通知，
@@ -16137,7 +16357,9 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// 查不出属于哪个群就不该猜，按正常处置继续。
 	//
 	// 【读开关失败也不演练】见 isDryRunGroup：一次 D1 抖动不能把整个群静默变成不设防。
-	if (chatId && (await isDryRunGroup(env, chatId))) {
+	// options.force：主人在演练通知上点「✅ 确认封」时用 —— 那一刻他已经在
+	// 看完完整判据后拍过板，不能再被演练开关挡回来（否则按钮点了没反应）。
+	if (!options.force && chatId && (await isDryRunGroup(env, chatId))) {
 		let dryRunId = null;
 		try {
 			dryRunId = await recordAdDryRun(env, { userId, chatId, evaluation, input });
@@ -17752,14 +17974,26 @@ async function handleAdStatsCommand(env, chatId) {
 		const dryCounts = await countAdDryRun(env, chatId);
 		if (dryCounts.total > 0) {
 			lines.push('　↳ 命中：今日 <b>' + dryCounts.today + '</b> 条，累计 <b>' + dryCounts.total + '</b> 条（流水保留 30 天）');
+			// 主人在演练通知上点按钮留下的结论汇总。待判数 = 还没拍板的，
+			// 最低误报分贴住封禁线时直接告诉他往哪调 —— 误封处理的数据出口在这里。
+			const dryPending = dryCounts.total - dryCounts.fp - dryCounts.done;
+			const verdictParts = ['　↳ 结论：✅确认封 <b>' + dryCounts.done + '</b>　❌误报 <b>' + dryCounts.fp + '</b>　待判 <b>' + dryPending + '</b>'];
+			if (dryCounts.lowestFp !== null) {
+				verdictParts.push('　误报最低分 <b>' + dryCounts.lowestFp + '/' + (Number(config.scoreThreshold) || 0) + '</b>');
+			}
+			lines.push(verdictParts.join(''));
+			if (dryCounts.lowestFp !== null && dryCounts.lowestFp >= Number(config.scoreThreshold)) {
+				lines.push('　⚠️ 被判误报的分数已顶到封禁线 —— 拉高 <code>AD_SCORE_THRESHOLD</code> 才不会再封错人');
+			}
 			const dryRows = await readAdDryRunLog(env, { chatId, limit: 5 });
 			for (const row of dryRows) {
 				let reasons = [];
+				const mark = Number(row.fp) === 1 ? '　<b>❌误报</b>' : (Number(row.done) === 1 ? '　<b>✅已封</b>' : '　⏳待判');
 				try { reasons = JSON.parse(String(row.reasons || '[]')); } catch (_) {}
 				const when = new Date((Number(row.created_at) || 0) * 1000).toISOString().slice(5, 16).replace('T', ' ');
 				lines.push('· #' + row.id + ' ' + when + '　user=' + escapeHtml(String(row.user_id))
 					+ '　' + (Number(row.score) || 0) + '/' + (Number(row.threshold) || 0)
-					+ '　' + escapeHtml(AD_LAYER_LABELS[String(row.layer)] || String(row.layer)));
+					+ '　' + escapeHtml(AD_LAYER_LABELS[String(row.layer)] || String(row.layer)) + mark);
 				if (reasons.length) lines.push('　依据：' + escapeHtml(String(reasons[0]).slice(0, 60)));
 			}
 		} else if (dryOn) {
@@ -19228,7 +19462,7 @@ async function handleKillerCommand(message, env) {
 		? '☠️ <b>杀手模式已开启</b>\n本群此后触发处置的用户将【全群封禁 + 踢出】。'
 		: '🔇 <b>杀手模式已关闭</b>\n本群此后触发处置的用户【仅永久禁言、不踢出】，仍写入全局黑名单。');
 	return true;
-}
+}
 function isDryRunCommand(text) {
 	return typeof text === 'string' && /^\/dryrun(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
 }

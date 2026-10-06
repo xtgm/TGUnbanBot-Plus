@@ -445,6 +445,149 @@ section('[6] 热路径（dryrun_groups 不在稳定态查询里）');
 	assert('定罪路径查得到开关', env.DB._sql.some((sql) => sql.includes('dryrun_groups')), JSON.stringify(env.DB._sql));
 }
 
+// ================= [7] 演练通知的结论按钮 =================
+section('[7] 演练通知的结论按钮（✅确认封 / ❌不该封）');
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	const config = await W.loadAdDetectionConfig(env);
+	const whitelist = await W.loadAdDomainWhitelist(env);
+	await W.setDryRun(env, GROUP_ID, true, OWNER_ID);
+	await W.ensureAdDryRunLogTable(env);
+
+	const mkBanEval = async (name) => {
+		const ev = await W.evaluateAdSuspect(
+			env, { profile: { bio: AD_BIO, firstName: name, username: '', bioFetched: true }, text: '', forwardChat: null },
+			{ config, whitelist, skipMissingBioPenalty: false });
+		return Object.assign({}, ev, { verdict: 'ban' });
+	};
+
+	// 造两条演练流水：A 用来点「❌不该封」，B 用来点「✅确认封」
+	resetCalls();
+	await W.enforceAdDetection(env, { userId: '666010', chatId: GROUP_ID, chatTitle: '测试群', messageId: 510 },
+		await mkBanEval('按钮A'), { config, whitelist });
+	await W.enforceAdDetection(env, { userId: '666011', chatId: GROUP_ID, chatTitle: '测试群', messageId: 511 },
+		await mkBanEval('按钮B'), { config, whitelist });
+	const rowOf = (id) => env.DB.query('SELECT * FROM ad_dryrun_log WHERE id = ?', id)[0];
+	// 两条流水按 user_id 认人：A 对应第一封通知（下面的 notices[0]），B 用来点确认封。
+	const rowA = env.DB.query('SELECT * FROM ad_dryrun_log WHERE user_id = ?', '666010')[0];
+	const rowB = env.DB.query('SELECT * FROM ad_dryrun_log WHERE user_id = ?', '666011')[0];
+	assert('两条流水都写进去了', Boolean(rowA) && Boolean(rowB) && rowA.id !== rowB.id,
+		JSON.stringify({ a: rowA && rowA.id, b: rowB && rowB.id }));
+
+	// ---- ① 通知上挂着两个按钮 ----
+	const notices = callsOf('sendMessage').filter((c) => String(c.body?.text || '').includes('演练命中（未处置）'));
+	assert('演练通知发出去了', notices.length > 0, JSON.stringify(notices.map((c) => String(c.body?.text || '').slice(0, 40))));
+	const keyboard = notices[0]?.body?.reply_markup?.inline_keyboard;
+	const keys = (keyboard || [])[0] || [];
+	assert('通知带 inline_keyboard', Array.isArray(keyboard), JSON.stringify(keyboard));
+	assert('两个按钮，文案各就各位',
+		keys.length === 2 && keys[0].text.includes('确认封') && keys[1].text.includes('不该封'), JSON.stringify(keys));
+	assert('callback_data 形如 dry:ok:<id> / dry:no:<id>',
+		String(keys[0]?.callback_data || '').startsWith('dry:ok:') && String(keys[1]?.callback_data || '').startsWith('dry:no:'),
+		JSON.stringify(keys));
+	assert('按钮 id 指向刚写下的两条流水',
+		String(keys[0]?.callback_data) === 'dry:ok:' + rowA.id && String(keys[1]?.callback_data) === 'dry:no:' + rowA.id,
+		JSON.stringify({ a: rowA.id, keys: keys.map((k) => k.callback_data) }));
+	assert('流水存了整份判定（按钮能原样还原处置）',
+		Boolean(rowA.evaluation) && Array.isArray(JSON.parse(rowA.evaluation).reasons) && JSON.parse(rowA.evaluation).reasons.length > 0,
+		String(rowA.evaluation).slice(0, 120));
+
+	const cbOf = (fromId, data) => ({
+		id: 'cbq_' + data, data,
+		from: { id: fromId, is_bot: false, first_name: 'X' },
+		message: { message_id: 777, chat: { id: GROUP_ID, type: 'supergroup', title: '测试群' }, text: '通知原文' }
+	});
+	const answerText = () => String(callsOf('answerCallbackQuery')[0]?.body?.text || '');
+
+	// ---- ② 非第一主人点了：拒绝，且一个字段都不动 ----
+	resetCalls();
+	await W.handleDryRunButtonCallback(cbOf('20002', 'dry:no:' + rowB.id), env);
+	assert('非第一主人被拒', /第一主人/.test(answerText()), answerText());
+	assert('被拒时 done/fp 都没被写', Number(rowOf(rowB.id).fp) === 0 && Number(rowOf(rowB.id).done) === 0,
+		JSON.stringify(rowOf(rowB.id)));
+	assert('被拒时没发起任何封禁', callsOf('banChatMember').length === 0 && callsOf('editMessageText').length === 0,
+		JSON.stringify({ ban: callsOf('banChatMember').length, edit: callsOf('editMessageText').length }));
+
+	// ---- ③ 非法 data：只回一个空 ack ----
+	resetCalls();
+	await W.handleDryRunButtonCallback(cbOf(String(OWNER_ID), 'dry:zz:1'), env);
+	assert('非法 data 只 ack 不带文案', answerText() === '' && callsOf('answerCallbackQuery').length === 1, answerText());
+	assert('非法 data 不动流水', Number(rowOf(rowA.id).fp) === 0 && Number(rowOf(rowA.id).done) === 0);
+
+	// ---- ④ 点「❌不该封」：只标记，判据库与处置链一个都不碰 ----
+	const before = {
+		fp: env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c,
+		shape: env.DB.query('SELECT COUNT(*) AS c FROM ad_profile_shapes')[0].c,
+		black: env.DB.query('SELECT COUNT(*) AS c FROM blacklist')[0].c,
+		snap: env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c
+	};
+	resetCalls();
+	await W.handleDryRunButtonCallback(cbOf(String(OWNER_ID), 'dry:no:' + rowA.id), env);
+	const afterRowA = rowOf(rowA.id);
+	assert('点「不该封」回执文案正确', /已标为误报/.test(answerText()), answerText());
+	assert('fp 置 1、done 仍 0', Number(afterRowA.fp) === 1 && Number(afterRowA.done) === 0, JSON.stringify(afterRowA));
+	assert('误报不发起封禁、不删消息',
+		callsOf('banChatMember').length === 0 && callsOf('deleteMessage').length === 0,
+		JSON.stringify({ ban: callsOf('banChatMember').length, del: callsOf('deleteMessage').length }));
+	assert('误报不动判据库（指纹/形状/黑名单/快照全零变化）',
+		env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c === before.fp
+		&& env.DB.query('SELECT COUNT(*) AS c FROM ad_profile_shapes')[0].c === before.shape
+		&& env.DB.query('SELECT COUNT(*) AS c FROM blacklist')[0].c === before.black
+		&& env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c === before.snap,
+		JSON.stringify({ before, after: {
+			fp: env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c,
+			shape: env.DB.query('SELECT COUNT(*) AS c FROM ad_profile_shapes')[0].c,
+			black: env.DB.query('SELECT COUNT(*) AS c FROM blacklist')[0].c,
+			snap: env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c
+		} }));
+	const editedA = callsOf('editMessageText')[0];
+	assert('通知被原地补上「已标为误报」',
+		editedA && String(editedA.body?.text || '').includes('已标为误报') && String(editedA.body?.text || '').includes('通知原文'),
+		JSON.stringify(editedA && editedA.body?.text).slice(-200));
+
+	// ---- ⑤ 同一条再点一次：幂等，不重复处置 ----
+	resetCalls();
+	await W.handleDryRunButtonCallback(cbOf(String(OWNER_ID), 'dry:no:' + rowA.id), env);
+	assert('重复点被挡下', /已经处理过/.test(answerText()), answerText());
+	assert('重复点没有第二次编辑', callsOf('editMessageText').length === 0, JSON.stringify(callsOf('editMessageText').length));
+
+	// ---- ⑥ 点「✅确认封」：force 绕过演练短路，真处置 ----
+	resetCalls();
+	const confirm = await W.handleDryRunButtonCallback(cbOf(String(OWNER_ID), 'dry:ok:' + rowB.id), env);
+	const afterRowB = rowOf(rowB.id);
+	assert('确认封回执文案正确', /已按广告处置/.test(answerText()), answerText());
+	assert('done 置 1', Number(afterRowB.done) === 1, JSON.stringify(afterRowB));
+	assert('真进了黑名单', Number(env.DB.query('SELECT COUNT(*) AS c FROM blacklist WHERE id = ?', '666011')[0].c) === 1,
+		JSON.stringify(env.DB.query('SELECT id FROM blacklist')));
+	assert('真发起了封禁（force 穿透演练开关）', callsOf('banChatMember').length >= 1,
+		JSON.stringify(callsOf('banChatMember')));
+	assert('确认封后会学习（指纹至少 +1）',
+		env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c > before.fp,
+		JSON.stringify({ before: before.fp, after: env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c }));
+	assert('通知被补上「已确认封禁」',
+		callsOf('editMessageText').some((c) => String(c.body?.text || '').includes('已确认封禁')),
+		JSON.stringify(callsOf('editMessageText').map((c) => String(c.body?.text || '').slice(-80))));
+
+	// ---- ⑦ /adstats 的结论汇总 ----
+	resetCalls();
+	await W.handleAdStatsCommand(env, GROUP_ID);
+	const stats = callsOf('sendMessage').map((c) => String(c.body?.text || '')).join('\n');
+	assert('/adstats 给出结论汇总行', /结论：✅确认封 <b>1<\/b>　❌误报 <b>1<\/b>/.test(stats), stats.slice(-600));
+	assert('/adstats 每条流水标出结论',
+		stats.includes('❌误报') && stats.includes('✅已封'), stats.slice(-600));
+
+	// ---- ⑧ 分发分支是活的（防按钮成为死代码）----
+	const srcLines = src.split('\r\n');
+	const dryIdx = srcLines.findIndex((l) => l.includes('data.startsWith(DRYRUN_BUTTON_PREFIX)'));
+	const voteIdx = srcLines.findIndex((l) => l.includes('data.startsWith(AD_VOTE_BUTTON_PREFIX)'));
+	assert('分发分支存在', dryIdx > 0, String(dryIdx));
+	assert('分发分支在 AD_VOTE 之前（不会被投票前缀抢先吃掉）', dryIdx > 0 && voteIdx > 0 && dryIdx < voteIdx,
+		JSON.stringify({ dryIdx, voteIdx }));
+	assert('分发分支里调的正是按钮处理器',
+		srcLines[dryIdx + 1].includes('handleDryRunButtonCallback'), srcLines[dryIdx + 1]);
+}
+
 console.log(`\n========== 演练模式：通过 ${pass} / 失败 ${fail} ==========`);
 if (fail > 0) {
 	console.log('失败项：');
