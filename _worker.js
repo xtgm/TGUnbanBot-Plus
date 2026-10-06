@@ -2437,7 +2437,7 @@ async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, no
 async function replyToModerationAdmin(message, ctx, { flashText, detailText = flashText, groupText, ...options }) {
 	// 群内回执按命令的「群内模式」分流（message.__moderationGroupMode，由各命令入口设定）：
 	//   未设 / 'full' → 群内发完整 detailText（/check 及全部历史调用，行为逐字节不变）
-	//   'silent'      → 群内不发任何 bot 消息（/ban、/spam：主人要求群内静默）
+	//   'silent'      → 群内不发任何 bot 消息（/sban：主人要求群里不留回执，完整明细私聊主人）
 	//   'brief'       → 群内发简洁 groupText，未传 groupText 时回退 detailText（/unban）
 	// 无论哪种模式，私聊第一主人（及 /ban·/spam 的副主人）【始终】收到完整 detailText，
 	// 主人侧信息量与改动前完全一致。groupText 在此解构掉，不透传给 replyToAdmin。
@@ -9609,10 +9609,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		await deleteAuthorizedGroupCommandMessage(message, commandName);
-		// 群聊简洁（主人要求）：在群内只发「目标 + 处置结果」的简洁汇总，与 /unban 同款
-		//（目标用 formatTargetFromBanResults / formatBatchUserTarget 渲染成可点击昵称 + 可复制 TGID）；
-		// 完整逐群明细仍私聊第一主人与副主人。撤回命令消息、副主人通知等原有行为一律不变。
-		message.__moderationGroupMode = 'brief';
+		// 群内回执按命令分流（replyToModerationAdmin 按 __moderationGroupMode 决定）：
+		//   /sban → 'silent'：群里不留任何回执痕迹。命令消息上一行已撤回，回执干脆不发
+		//           （发了再删会有可见窗口，而且多一次 deleteMessage），完整逐群明细
+		//           照旧走私聊第一主人与副主人 —— 那条路 replyToAdmin 本来就走，不用改。
+		//   /ban  → 'brief'：群内发「目标 + 处置结果」的简洁汇总，与 /unban 同款。
+		//           目标用 formatTargetFromBanResults / formatBatchUserTarget 渲染成
+		//           可点击昵称 + 可复制 TGID；完整逐群明细仍私聊第一主人与副主人。
+		// silent 只在配置了可私聊的主人时生效（见 silenceGroup）：OWNER_IDS 未配置的
+		// 退化部署会自动回退成群内发完整结果，避免操作完全零反馈。
+		// 撤回命令消息、副主人通知等原有行为一律不变。
+		message.__moderationGroupMode = isSban ? 'silent' : 'brief';
 
 		// 提取参数（支持单个 / 批量；开头 TGID 列表之后的文本作为执行原因）
 		// 用正则提取,与 /spam 完全对称:兼容 /ban、/ban@机器人名、/sban、多空格;彻底不依赖命令长度,

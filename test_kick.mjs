@@ -6600,8 +6600,16 @@ const sbanPost = (env, fakeCtx, message) => handler.fetch(
 	assert('/sban 撤回命令消息', callsOf('deleteMessage').some((c) => c.body.message_id === 1201));
 	const groupSend = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '-1001');
 	const dm = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
-	assert('/sban 群内简洁回执写明全群踢出', !!groupSend && groupSend.body.text.includes('全群踢出'), String(groupSend?.body.text || '').slice(0, 60));
+	// 群内零回执：命令消息已撤回（上一条断言），回执干脆不发 —— 群里不留任何痕迹。
+	// 原先这里是「群内简洁回执写明全群踢出」，改成 silent 模式后那条必然消失。
+	assert('/sban 群内零回执（命令撤回 + 回执不发）', !groupSend,
+		'实际群内回执: ' + String(groupSend?.body.text || '').slice(0, 120));
 	assert('/sban 私聊详情写明全群踢出', dm.some((c) => c.body.text.includes('全群踢出')));
+	// 完整通知 = 私聊拿到的是逐群明细，不是群里那句简短汇总。长度阈值用来区分
+	// 「完整 detailText」与「一句汇总」；断言失败时 detail 会把私聊原文打出来。
+	const dmText = dm.map((c) => c.body.text).join('\n----\n');
+	assert('/sban 私聊收到完整逐群明细（非一句汇总）', dmText.includes('全群踢出') && dmText.length > 150,
+		'私聊原文(' + dmText.length + '字符): ' + dmText.slice(0, 500));
 
 	// 对照：同一批 mock、同一环境里 /ban 走的是禁言 —— 两条命令的处置方式确实分道
 	resetCalls();
