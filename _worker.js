@@ -191,6 +191,11 @@ const AD_VOTE_RETENTION_SECONDS = 7 * 24 * 60 * 60;
 const AD_VOTE_BUTTON_PREFIX = 'adv:';
 // 演练通知上两个结论按钮的回调前缀。data 形如 dry:ok:12 / dry:no:12。
 const DRYRUN_BUTTON_PREFIX = 'dry:';
+// 封禁回执上两个纠错按钮的回调前缀。data 形如 adfix:ig:<seq> / adfix:ub:<uid>。
+// ig = ignore（按误判回滚全部），ub = unban（只解封、判定维持）——
+// 两档语义分开是 menshen 的做法：「撤判定」与「只放人」对判据库的影响完全不同，
+// 混成一个按钮就没了中间档，主人只能二选一地把指纹和样本也一起动了。
+const ADFIX_BUTTON_PREFIX = 'adfix:';
 const AD_WORDS_PAGINATION_PREFIX = 'adwords:';
 const AD_JOB_PAGINATION_PREFIX = 'adjob:';
 const AD_WORDS_PAGE_LIMIT = 20;
@@ -8046,6 +8051,10 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 		await handleBulkJobPaginationCallback(callbackQuery, env);
 		return;
 	}
+	if (data.startsWith(ADFIX_BUTTON_PREFIX)) {
+		await handleAdFixButtonCallback(callbackQuery, env);
+		return;
+	}
 	if (data.startsWith(DRYRUN_BUTTON_PREFIX)) {
 		await handleDryRunButtonCallback(callbackQuery, env);
 		return;
@@ -9207,7 +9216,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'',
 			'<b>━━ 广告自动检测（仅私聊）━━</b>',
 			'/pending [N]　列出待复核的自动判定快照，默认 10 条',
-			'/ignore 序号　判错回滚：解黑 + 全群解封 + 删掉学到的指纹和样本（支持 3 5 7 与 3-8）',
+			'/ignore 序号　判错回滚：解黑 + 全群解封 + 删掉学到的指纹和样本（支持 3 5 7 与 3-8）。封禁回执上也有两个按钮：↩️误判=回滚全部、🔓解封=只放人不动判据',
 			'/rescreen [N]　重新筛查观察窗口里的可疑用户，默认 10 人',
 			'/adstats　检测状态总览：指纹、样本向量、观察窗口、入群检查流水与本群演练状态',
 			'',
@@ -16211,6 +16220,83 @@ function renderAdDetectionNotice(evaluation, context) {
 }
 
 
+// 封禁回执上的两个纠错按钮。与演练那对（dry:ok / dry:no）分工不同：
+// 演练那对是【判前拍板】—— 还没封，决定要不要封；这对是【判后纠错】——
+// 已经封了，决定撤不撤。回调共用同一套基础设施（answerAdVoteCallback 回执 +
+// editTelegramMessage 原地补行），权限也都是仅第一主人。
+//
+// 两档的分界（照 menshen alert.go 的 adAlertRows）：
+//   ↩️ 误判 = 撤判定：解黑 + 全群解封 + 指纹/形状/AI 样本 purge + 清观察 + 删快照，
+//              即 /ignore <seq> 的完整 8 项回滚 —— 判据库跟着改，下次不再封同样的号。
+//   🔓 解封（判定维持）= 只把人放出来：移除黑名单记录 + 全群解封，指纹、样本、形状、
+//              快照、观察一律不动 —— 判定仍是「对的」，只是这次不执行处罚
+//              （典型场景：人是广告，但想先留着他配合查上下游）。
+//
+// 【为什么不直接调 /unban 命令那条路】它有硬闸门「目标仍在 D1 黑名单，已拒绝解封」，
+// 而刚被自动封的人【必然】还在黑名单里，直接调等于点了没反应。这里显式传
+// allowD1Removal: true 走管理层移除路径（checkManyUnbanEligibility 内部处理），
+// 语义与 menshen 的「解封（判定维持）」对齐：动限制、不动账本。
+function buildAdNoticeKeyboard(seq, userId) {
+	const uid = String(userId || '');
+	if (!/^\d+$/.test(uid)) return null;
+	const rows = [];
+	// 没有 seq 就没有回滚目标（快照没写成），此时只给解封那一档 ——
+	// 挂一个点了必报「序号不存在」的按钮，比不挂更让人困惑。
+	if (seq) rows.push([{ text: '↩️ 误判（回滚全部）', callback_data: ADFIX_BUTTON_PREFIX + 'ig:' + Number(seq) }]);
+	rows.push([{ text: '🔓 解封（判定维持）', callback_data: ADFIX_BUTTON_PREFIX + 'ub:' + uid }]);
+	return { inline_keyboard: rows };
+}
+
+async function handleAdFixButtonCallback(callbackQuery, env) {
+	const data = String(callbackQuery?.data || '');
+	const match = data.slice(ADFIX_BUTTON_PREFIX.length).match(/^(ig|ub):(\d+)$/);
+	if (!match) {
+		await answerAdVoteCallback(callbackQuery?.id);
+		return;
+	}
+	const action = match[1];
+	const payload = Number(match[2]);
+	const fromId = String(callbackQuery?.from?.id || '');
+	if (!isPrimaryOwner(fromId)) {
+		await answerAdVoteCallback(callbackQuery?.id, '这两个按钮只有第一主人能点', true);
+		return;
+	}
+	const chatId = String(callbackQuery?.message?.chat?.id || '');
+	const messageId = Number(callbackQuery?.message?.message_id) || 0;
+	const originText = String(callbackQuery?.message?.text || '');
+
+	if (action === 'ig') {
+		// 复用 /ignore 全链路：序号不存在、已复核过这两种情况它自己会回执，
+		// 不在这里预判 —— 预判与命令侧的口径迟早分叉，主人会看到两套说法。
+		await answerAdVoteCallback(callbackQuery?.id, '已按误判回滚 #' + payload);
+		await handleAdIgnoreCommand(env, chatId, fromId, String(payload));
+		await editTelegramMessage(chatId, messageId, originText + '\n─────\n↩️ 已按误判回滚　快照 #' + payload
+			+ '\n解封 + 指纹/形状/AI 样本修正已执行，明细在上一条消息。');
+		return;
+	}
+
+	const uid = String(payload);
+	const eligibility = await checkManyUnbanEligibility([uid], env, { allowD1Removal: true });
+	if (!eligibility.eligible.includes(uid)) {
+		const failure = (eligibility.failed || []).find((item) => String(item.id) === uid);
+		await answerAdVoteCallback(callbackQuery?.id, failure?.msg || '解封未执行：无法确认 D1 黑名单状态', true);
+		return;
+	}
+	let results = [];
+	try {
+		results = await unbanUserFromAllGroups(uid);
+	} catch (error) {
+		console.error('[封禁回执] 解封按钮执行失败:', error);
+	}
+	const okCount = (results || []).filter((item) => item.ok).length;
+	const d1Removed = (eligibility.d1Removed || []).includes(uid);
+	await answerAdVoteCallback(callbackQuery?.id, '已解封 ' + uid + '（' + okCount + ' 个群）');
+	await editTelegramMessage(chatId, messageId, originText + '\n─────\n🔓 已解封 <code>' + escapeHtml(uid) + '</code>　'
+		+ okCount + '/' + (results || []).length + ' 个群' + (d1Removed ? '　D1 记录已移除' : '')
+		+ '\n判定维持：指纹、AI 样本、形状、快照一律未动。');
+	console.log('[封禁回执] 主人点解封（判定维持）user=' + uid + ' 群=' + okCount + ' d1Removed=' + d1Removed);
+}
+
 // 演练命中的私聊通知。与正常封禁回执同一条链路（第一主人私聊），但标题与处置结果
 // 必须让人一眼看出【没有真的动手】—— 否则主人会以为广告已经清掉，转头去群里一看还在。
 async function pushAdDryRunNotice(env, context) {
@@ -16551,7 +16637,9 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			learnLine: learnParts.join('，')
 		});
 		try {
-			await sendTelegramMessageChunks(ownerId, notice);
+			// 回执底部挂两档纠错按钮：主人不用手打 /ignore <序号>（他手上未必有那个号），
+			// 也不用去查 /unban 的黑名单硬闸门 —— 看完判据当场就能点。见 buildAdNoticeKeyboard。
+			await sendTelegramMessageChunks(ownerId, notice, buildAdNoticeKeyboard(seq, userId));
 		} catch (error) {
 			console.error('[广告检测] 推送判定通知失败:', error);
 		}
