@@ -78,8 +78,8 @@ console.log('\n=== 1. 快照表已建 ===');
 await W.adDetectionReady(env);
 check('ad_learn_snapshots 存在',
 	env.DB.query("SELECT name FROM sqlite_master WHERE type='table' AND name='ad_learn_snapshots'").length === 1);
-check('schema 版本为 8',
-	Number(env.DB.query('SELECT version FROM schema_meta WHERE id=1')[0]?.version) === 8);
+check('schema 版本为 9',
+	Number(env.DB.query('SELECT version FROM schema_meta WHERE id=1')[0]?.version) === 9);
 
 console.log('\n=== 2. 灌入缓存：广告 + 闲聊混杂 ===');
 // 关键场景：这些消息稍后会被别的 bot 删掉，但缓存已经存下了正文

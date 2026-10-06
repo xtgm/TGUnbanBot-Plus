@@ -850,7 +850,11 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 // 消息缓存整体停写、/spam 的历史清扫连带失效（线上实际发生过）。
 // 后来者新增列时务必同步 +1。
 // 【8】2026-09-12：新增 ad_learn_snapshots（/recent 冻结快照，供 /learnlast 按序号学习）。
-const D1_SCHEMA_VERSION = 8;
+// 【9】2026-10-06：moderation_messages 新增 is_ad（演练/封禁/观察命中的消息照常进缓存，
+// 但要与 /search 检索源分开 —— 广告不进搜索库是第 2 批的既定规则，改用标记继承而不是靠不写表。
+// 此前「判过的消息不写缓存」导致 /spam 的同款连带与当前群清扫一条都追不到，演练模式下尤其明显。
+// 后来者新增列时务必同步 +1。
+const D1_SCHEMA_VERSION = 9;
 const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
@@ -1039,7 +1043,10 @@ async function ensureD1Table(env) {
 			// ③ 日后若扩展成「相似匹配」，算编辑距离必须有原文，否则历史数据补不回来
 			for (const [column, sql] of [
 				['text_hash', 'ALTER TABLE moderation_messages ADD COLUMN text_hash TEXT;'],
-				['text_norm', 'ALTER TABLE moderation_messages ADD COLUMN text_norm TEXT;']
+				['text_norm', 'ALTER TABLE moderation_messages ADD COLUMN text_norm TEXT;'],
+				// is_ad：1 = 这条是被判成广告的消息（含演练命中），写进缓存只为让
+				// /spam 的同款连带、当前群清扫追得到，不进 /search 检索源。
+				['is_ad', 'ALTER TABLE moderation_messages ADD COLUMN is_ad INTEGER NOT NULL DEFAULT 0;']
 			]) {
 				try {
 					if (!(await d1ColumnExists(env, 'moderation_messages', column))) {
@@ -6284,7 +6291,13 @@ async function recordSpamText(env, repliedMsg) {
 
 // 返回 { spamHit, norm }：spamHit = 这条消息的正文命中了同款直封名单（第一主人一周内 /spam 过）。
 // 名单查询嵌在 INSERT 的 RETURNING 子查询里，与消息缓存写入是【同一条 SQL】，不多付 D1 往返。
-async function cacheModerationMessage(env, message) {
+// options.isAd：这条消息已被判定为广告（封禁 / 演练命中 / 转入观察）。
+// 广告同样写缓存 —— /spam 的「当前群清扫」与「跨群连带」都只认 moderation_messages 这一张表，
+// 不写就一条都追不到，这正是 2026-10-06 报的「/spam 有的同款没删除」的根因。
+// 但它与 /search 的检索源是两件事：第 2 批定的「广告不进搜索库」改用 is_ad 标记继承，
+// 不再靠「不写表」实现（那张表同时还承担同款反查，两个职责必须分开）。
+async function cacheModerationMessage(env, message, options = {}) {
+	const isAd = options?.isAd === true;
 	const none = { spamHit: false, norm: '' };
 	// 双保险：即使调用点漏判，这里也拒绝服务消息进入清扫缓存。
 	if (isTelegramServiceMessage(message)) return none;
@@ -6294,7 +6307,9 @@ async function cacheModerationMessage(env, message) {
 		const textKey = buildModerationTextKey(message);
 		const nowIso = new Date().toISOString();
 		// 只有够长的正文才可能命中名单（写入端同一道 6 字门槛）；建表一次后按 DB 实例缓存，不逐条重复。
-		const canMatchSpam = Boolean(textKey && String(textKey.norm).length >= 6)
+		// 广告消息不查同款直封名单：调用方已经走过完整判定链（封禁 / 演练），再查一次只会重复处置。
+		const canMatchSpam = !isAd
+			&& Boolean(textKey && String(textKey.norm).length >= 6)
 			&& await ensureAdSpamTextsTable(env);
 		// 带新列写入；若库里还没有 text_hash / text_norm（迁移未跑或跑失败），
 		// 降级成旧的四列 INSERT。
@@ -6305,14 +6320,15 @@ async function cacheModerationMessage(env, message) {
 		let insertResult;
 		let spamHit = false;
 		try {
-			const baseSql = 'INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm) VALUES (?, ?, ?, ?, ?, ?)';
+			const baseSql = 'INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm, is_ad) VALUES (?, ?, ?, ?, ?, ?, ?)';
 			const baseArgs = [
 				message.message_id,
 				String(message.chat.id),
 				String(message.from.id),
 				nowIso,
 				textKey?.hash ?? null,
-				textKey?.norm ?? null
+				textKey?.norm ?? null,
+				isAd ? 1 : 0
 			];
 			if (canMatchSpam) {
 				// 同一条 SQL：写缓存 + 查名单。RETURNING 带回自增 id（供裁剪判断）与命中标记。
@@ -6332,6 +6348,9 @@ async function cacheModerationMessage(env, message) {
 			// 只对「列不存在」降级；其它错误（约束冲突、D1 不可用）照原样抛给外层日志，
 			// 否则真故障会被这道容错掩盖成「静默成功」。
 			if (!reason.includes('no such column') && !reason.includes('has no column')) throw error;
+			// 降级只服务正常消息。广告一旦走了这条 4 列路径，行里就没有 is_ad，
+			// 会反过来落进 /search 的检索源 —— 方向不安全，宁可不写（= 改动前的行为）。
+			if (isAd) return none;
 			console.error('[清扫缓存] text_hash/text_norm 列缺失，降级为基础写入（同款连带暂不可用，检查 D1 迁移）');
 			insertResult = await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
 				.bind(
@@ -6503,12 +6522,13 @@ async function loadRecentLearnCandidates(env, sourceChatId, limit) {
 	try {
 		await ensureD1Table(env);
 		// text_norm IS NOT NULL 过滤掉无正文的消息（图片、服务消息等）。
+		// is_ad 排除被判过的广告：学习候选是给人挑着学的，广告正文早由 /spam 人工定过罪。
 		// 多取一些再排序截断 —— 排序键是特征权重，不是时间，所以不能只取最新 N 条。
 		// LIMIT 1500 是为了配合 RECENT_LEARN_MAX_ITEMS=200：取样池必须远大于输出上限，
 		// 否则同款去重后不足 200 条，等于上限白提（原先取 300 只够支撑 50 条输出）。
 		const sql = scopeCurrentGroup
-			? 'SELECT mid, chat_id, from_id, text_norm, created_at FROM moderation_messages WHERE text_norm IS NOT NULL AND created_at >= ? AND chat_id = ? ORDER BY id DESC LIMIT 1500'
-			: 'SELECT mid, chat_id, from_id, text_norm, created_at FROM moderation_messages WHERE text_norm IS NOT NULL AND created_at >= ? ORDER BY id DESC LIMIT 1500';
+			? 'SELECT mid, chat_id, from_id, text_norm, created_at FROM moderation_messages WHERE text_norm IS NOT NULL AND (is_ad IS NULL OR is_ad = 0) AND created_at >= ? AND chat_id = ? ORDER BY id DESC LIMIT 1500'
+			: 'SELECT mid, chat_id, from_id, text_norm, created_at FROM moderation_messages WHERE text_norm IS NOT NULL AND (is_ad IS NULL OR is_ad = 0) AND created_at >= ? ORDER BY id DESC LIMIT 1500';
 		const stmt = scopeCurrentGroup
 			? env.DB.prepare(sql).bind(sinceIso, String(sourceChatId))
 			: env.DB.prepare(sql).bind(sinceIso);
@@ -8432,10 +8452,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
-	// detectAdOnMessage 三种返回：true = 已封禁处置（直接收尾）；
-	// 'observe' = 转入观察（继续走后续，但正文不进搜索库）；false = 放行。
+	// detectAdOnMessage 三种返回：true = 已封禁处置（含演练命中，直接收尾）；
+	// 'observe' = 转入观察（继续走后续）；false = 放行。
 	const adVerdict = await detectAdOnMessage(message, env);
 	if (adVerdict === true) {
+		// 判过的消息同样要进消息缓存：/spam 的「当前群清扫」与「跨群连带」只认这张表，
+		// 不写就一条都追不到 —— 演练模式下尤其明显（演练不删消息，人还在群里发着，
+		// 却因为这一行 return 而不进缓存，主人随后 /spam 同款时连带查了个空）。
+		// 打 is_ad=1：/search 仍检索不到它，广告不进搜索库的规则不变。
+		await cacheModerationMessage(env, message, { isAd: true });
 		return;
 	}
 	const adObserved = adVerdict === 'observe';
@@ -8496,9 +8521,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		message.from && !message.from.is_bot &&
 		message.message_id &&
 		!isTelegramServiceMessage(message) &&
-		!(text && text.startsWith('/')) &&
-		// 转入观察的那条不写：它是 /search 的检索源，广告正文不入库（方案「广告不记录」）。
-		!adObserved
+		!(text && text.startsWith('/'))
+		// 转入观察的那条照常写 —— 但标 is_ad=1，仍然进不了 /search 检索源。
+		// 此前它是「不写表」，代价是 /spam 的同款连带与当前群清扫同样追不到它。
 	) {
 		// 【同款直封】写缓存与查名单是同一条 SQL。只有「有资格被直封」的消息才需要等结果：
 		//   不带引用（群友回复广告只删不封，那条由重发通道处理）+ 发送者不是主人/副主人/超管。
@@ -8506,7 +8531,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const senderIdStr = String(message.from.id);
 		const spamEligible = !message.reply_to_message && !isOwner(senderIdStr) && !isSuperAdmin(senderIdStr);
 		if (spamEligible) {
-			const cached = await cacheModerationMessage(env, message);
+			const cached = await cacheModerationMessage(env, message, { isAd: adObserved });
 			// senderIdStr 已排除主人/副主人/超管；这里再补「任意配置群的群主/管理员」豁免。
 			if (cached?.spamHit && !(await isAdminInAnyConfiguredGroup(senderIdStr))) {
 				console.log('[同款直封] 群 ' + chatId + ' 用户 ' + senderIdStr + ' 直发第一主人 /spam 过的同款文案 → 删除 + 封禁');
@@ -8515,9 +8540,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				return;
 			}
 		} else if (ctx && typeof ctx.waitUntil === 'function') {
-			ctx.waitUntil(cacheModerationMessage(env, message));
+			ctx.waitUntil(cacheModerationMessage(env, message, { isAd: adObserved }));
 		} else {
-			await cacheModerationMessage(env, message);
+			await cacheModerationMessage(env, message, { isAd: adObserved });
 		}
 	}
 	// ===== 自动广告治理已全部移除 =====
@@ -16898,6 +16923,16 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		} catch (error) {
 			console.error('[广告检测·演练] 记录流水失败:', error);
 		}
+		// 演练只挡处置，不挡「同款」触发：先把这条文案记进重发只删名单。
+		// 演练不删消息，广告正文还留在群里，bot / 带引用体重发同一段时必须照样删得掉 ——
+		// 否则演练一开，主人连「这条广告被重发了几次」都观察不到。
+		// 【刻意只写这一份】ad_spam_texts（同款直封）命中会真加黑 + 全群封禁，
+		// 演练群里写了它，下一个人直发同款就被真封，演练就不成其为演练了。
+		try {
+			await recordHandledAdText(env, evaluation?.payload?.text || evaluation?.snapshot?.text || '');
+		} catch (_) {
+			// 记录失败只影响后续重发能否被删，不影响这次演练流水与通知。
+		}
 		await pushAdDryRunNotice(env, { userId, chatId, evaluation, input, dryRunId });
 		console.log('[广告检测·演练] 命中未处置 user=' + userId + ' chat=' + chatId
 			+ ' score=' + evaluation?.score + '/' + evaluation?.threshold
@@ -19697,6 +19732,10 @@ async function runSearchMessages(env, opts) {
 		params.push('%' + escaped + '%');
 	}
 	if (!where.length) return empty;
+	// 广告不进检索源（第 2 批既定规则）：is_ad=1 的行是被判过的消息 —— 封禁、演练命中、
+	// 转入观察的都写进了缓存，只为让 /spam 的同款反查与当前群清扫追得到，不给 /search 检索。
+	// 放在「至少一个条件」判定之后：否则无条件查询会因这条而不再返回空，行为就变了。
+	where.push('(is_ad IS NULL OR is_ad = 0)');
 	const whereSql = 'WHERE ' + where.join(' AND ');
 	try {
 		const totalRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM moderation_messages ' + whereSql).bind(...params).first();

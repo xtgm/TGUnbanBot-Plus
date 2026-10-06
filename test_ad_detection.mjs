@@ -1012,8 +1012,9 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 
 	// ===== 第2批 · 广告不进搜索库（/search 的检索源是 moderation_messages）=====
 	// 判定链：detectAdOnMessage 返回 'observe' → handleMessage 里 adObserved 为真 →
-	// 跳过 cacheModerationMessage。AD_CARD_KILL 设成 observe 是为了让【结构查杀】产出
-	// observe 而不是 ban（默认 ban 会直接封掉，走不到观察分支）。
+	// cacheModerationMessage 照常写，但带 is_ad=1，runSearchMessages 排除该标记。
+	// AD_CARD_KILL 设成 observe 是为了让【结构查杀】产出 observe 而不是 ban
+	//（默认 ban 会直接封掉，走不到观察分支）。
 	const envObs = makeEnv({ AD_CARD_KILL: 'observe' });
 	resetCalls();
 	setApi(plainProfile);
@@ -1023,9 +1024,16 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 		JSON.stringify(envObs.DB.query('SELECT user_id, score FROM ad_user_screening')));
 	assert('observe：不封禁、不删消息', countCalls('banChatMember') === 0 && countCalls('deleteMessage') === 0,
 		JSON.stringify(calls.map((c) => c.method)));
-	assert('observe：正文不写 moderation_messages（不进 /search 检索源）',
-		envObs.DB.query('SELECT COUNT(*) AS c FROM moderation_messages')[0].c === 0,
-		JSON.stringify(envObs.DB.query('SELECT mid, text_norm FROM moderation_messages')));
+	// 【2026-10-06 变更】此前是「不写表」，代价是 /spam 的同款连带与当前群清扫一条都追不到
+	//（2026-10-06 主人报的「/spam 有的同款没删除」，演练群尤其明显）。现在照常写并标 is_ad=1，
+	// 「广告不进 /search 检索源」这条第 2 批的规则改由标记继承，语义不变。
+	assert('observe：正文写进缓存并标 is_ad=1（同款反查才追得到）',
+		envObs.DB.query('SELECT COUNT(*) AS c FROM moderation_messages')[0].c === 1
+		&& Number(envObs.DB.query('SELECT is_ad FROM moderation_messages')[0]?.is_ad) === 1,
+		JSON.stringify(envObs.DB.query('SELECT mid, text_norm, is_ad FROM moderation_messages')));
+	const obsSearch = await W.runSearchMessages(envObs, { chatIds: [GROUP_ID], keyword: 'usdt' });
+	assert('observe：/search 仍检索不到这条观察中的广告',
+		obsSearch.total === 0, JSON.stringify(obsSearch.rows));
 	// 对照组：同一条链路的正常消息必须写进去 —— 否则上面那条「0 条」可能只是表没建，是假通过。
 	const envOk = makeEnv();
 	resetCalls();
@@ -1706,8 +1714,8 @@ section('[11] 回归：既有功能不被广告层吞掉');
 	// 写死数字而非引用常量：_worker.js 里 D1_SCHEMA_VERSION 是 const，不挂 vm 沙箱全局，
 	// 取出来是 undefined。写死的好处是「改了常量必须回来改这里」，
 	// 迫使后来者正面确认一次迁移影响，而不是让断言跟着常量静默滑过去。
-	assert('核心表 schema 版本为 8（新增 ad_learn_snapshots）',
-		Number(env.DB.query('SELECT version FROM schema_meta WHERE id = 1')[0]?.version) === 8,
+	assert('核心表 schema 版本为 9（新增 moderation_messages.is_ad）',
+		Number(env.DB.query('SELECT version FROM schema_meta WHERE id = 1')[0]?.version) === 9,
 		JSON.stringify(env.DB.query('SELECT * FROM schema_meta')));
 	assert('ad_learn_snapshots 表已建（/recent 冻结快照）',
 		env.DB.query("SELECT name FROM sqlite_master WHERE type='table' AND name='ad_learn_snapshots'").length === 1);
@@ -1716,6 +1724,7 @@ section('[11] 回归：既有功能不被广告层吞掉');
 		const modCols = env.DB.query('PRAGMA table_info(moderation_messages)').map((c) => c.name);
 		assert('moderation_messages 已含 text_hash 列', modCols.includes('text_hash'), modCols.join(','));
 		assert('moderation_messages 已含 text_norm 列', modCols.includes('text_norm'), modCols.join(','));
+		assert('moderation_messages 已含 is_ad 列（版本 9 迁移）', modCols.includes('is_ad'), modCols.join(','));
 	}
 	const tables = env.DB.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").map((r) => r.name);
 	for (const t of ['schema_meta', 'blacklist', 'moderation_messages', 'batch_jobs', 'dynamic_groups', 'ad_fingerprints', 'ad_user_screening', 'ad_sample_embeddings', 'ad_domain_whitelist', 'ad_pending_snapshots', 'ad_confirm_tokens']) {
