@@ -16211,8 +16211,11 @@ const AD_AVATAR_VISION_PROMPT = '这是一张社交软件的用户头像图片�
 // 与 $11/M Neurons 反推，单张约 35~50 Neurons —— 这是【估算值】，不是官方数。
 // 300 张/天 ≈ 1.5 万 Neurons，仅占免费额度的 1.5 倍量级，超出部分按单价计费。
 const AD_IMAGE_VISION_DAILY = 300;
-// 单轮 cron 最多推理多少张。队列靠 vision_checked_at 自平衡，轮与轮之间不会重复。
-const AD_IMAGE_VISION_BATCH = 100;
+// 单轮 cron 最多推理多少张。取「日预算 ÷ 每天轮次」，正好让两轮吃完 300：
+// crons 是每天 2 次（03:17 / 15:17），设 100 的话日预算永远用不完，
+// 配置上限与实际消耗对不上，看板上「当日 x/300」会一直停在 200 以下。
+// 队列靠 vision_checked_at 自平衡，轮与轮之间不会重复取同一条。
+const AD_IMAGE_VISION_BATCH = 150;
 const AD_IMAGE_VISION_MODEL = AD_AVATAR_VISION_MODEL;
 // 状态键与头像的 avatar_day / avatar_count 各自独立，两轨互不挤占。
 const AD_IMAGE_VISION_DAY_KEY = 'img_day';
