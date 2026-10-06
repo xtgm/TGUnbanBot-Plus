@@ -9920,6 +9920,24 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		} catch (error) {
 			console.error('[/start] 黑名单知情通报失败:', error);
 		}
+		// ===== 统计面板入口（仅第一主人）=====
+		// 私聊与群聊都只有第一主人拿到新面板；其余所有人走下面的原介绍语，逐字节不变。
+		// 群聊非第一主人在本分支开头已纯静默 return，所以能走到这里的群聊一定是第一主人。
+		// 回调端 handleMenuCallback 还会复查一次 isPrimaryOwner —— 按钮消息被转发出去也进不去。
+		if (isPrimaryOwner(userId)) {
+			try {
+				const home = await renderOwnerHome(env);
+				await sendTelegramMessage(chatId, home.text, home.keyboard);
+			} catch (error) {
+				console.error('[/start] 统计面板渲染失败:', error);
+				// 渲染失败必须回落介绍语，不能让第一主人收到空回复。
+				const fbTitle = START_WELCOME.includes('{title}') ? (await getGroupInfo()).title : '';
+				await sendTelegramMessage(chatId, START_WELCOME
+					.replaceAll('{userId}', String(userId))
+					.replaceAll('{title}', fbTitle));
+			}
+			return;
+		}
 		// {title} 需要额外一次 getChat，默认文案并不使用它，所以按需才查。
 		const startTitle = START_WELCOME.includes('{title}') ? (await getGroupInfo()).title : '';
 		await sendTelegramMessage(chatId, START_WELCOME
@@ -19122,7 +19140,25 @@ async function ensureStatTables(env) {
 			await runD1SchemaStatement(env, 'stat_speech',
 				'CREATE TABLE IF NOT EXISTS stat_speech (chat_id TEXT NOT NULL, user_id TEXT NOT NULL, day TEXT NOT NULL, '
 				+ 'msg_count INTEGER NOT NULL DEFAULT 0, display_name TEXT, username TEXT, updated_at INTEGER NOT NULL, '
+				+ 'last_msg_id INTEGER NOT NULL DEFAULT 0, '
 				+ 'PRIMARY KEY (chat_id, user_id, day))');
+			// 存量库补列：CREATE TABLE IF NOT EXISTS 对已存在的表完全无效，老部署必须单独 ALTER。
+			// 【先查后加】新建表在上面那句里已经带了 last_msg_id，无脑 ALTER 必然撞 duplicate column，
+			// 每次冷启动都在日志留一条无意义的 warn。先看列在不在，在就直接跳过。
+			try {
+				const colRows = await env.DB.prepare('PRAGMA table_info(stat_speech)').all();
+				const hasLastMsg = (colRows?.results || []).some((c) => String(c?.name || '') === 'last_msg_id');
+				if (!hasLastMsg) {
+					await runD1SchemaStatement(env, 'stat_speech.last_msg_id',
+						'ALTER TABLE stat_speech ADD COLUMN last_msg_id INTEGER NOT NULL DEFAULT 0', { optional: true });
+				}
+			} catch (error) {
+				// PRAGMA 查不到就当老库补一次列；补不上的后果是写入端 upsert 报错、只影响计数，
+				// 不该让整张统计表的初始化失败（那会连累发言/进退群全部功能）。
+				console.warn('[群统计] 检查 last_msg_id 列失败，尝试直接补列:', error && error.message);
+				await runD1SchemaStatement(env, 'stat_speech.last_msg_id',
+					'ALTER TABLE stat_speech ADD COLUMN last_msg_id INTEGER NOT NULL DEFAULT 0', { optional: true });
+			}
 			await runD1SchemaStatement(env, 'idx_stat_speech_chat_day',
 				'CREATE INDEX IF NOT EXISTS idx_stat_speech_chat_day ON stat_speech (chat_id, day)', { optional: true });
 			await runD1SchemaStatement(env, 'stat_member',
@@ -19161,13 +19197,19 @@ async function tryRecordSpeechStat(message, env, chatId, ctx) {
 	if (!message?.from || message.from.is_bot) return;
 	if (isTelegramServiceMessage(message)) return;
 	if (Array.isArray(message.new_chat_members) && message.new_chat_members.length) return;
-	if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(recordSpeechStat(env, chatId, message.from, Date.now()));
-	else await recordSpeechStat(env, chatId, message.from, Date.now());
+	// message_id 交给写入端做幂等：Telegram webhook 重投同一条消息时不再重复 +1。
+	const msgId = Number(message?.message_id) || 0;
+	if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(recordSpeechStat(env, chatId, message.from, Date.now(), msgId));
+	else await recordSpeechStat(env, chatId, message.from, Date.now(), msgId);
 }
 
 // 记一次发言（+1）。真人非服务消息由 handleMessage 钩子调用；用 ctx.waitUntil 后台写，不阻塞热路径。
 // 昵称/用户名每次覆盖为最新，供排行展示（Bot API 列不出全部成员，只能这样冗余存）。
-async function recordSpeechStat(env, chatId, from, nowMs = Date.now()) {
+// 【幂等 msg_id】msgId>0 时用 last_msg_id 判重：同一条消息被 webhook 重投，第二遍走
+// `stat_speech.last_msg_id IS NOT excluded.last_msg_id` 判 false，msg_count 不再 +1。
+// 关键是判重写在【同一条 upsert 里】，热路径 SQL 条数仍是 1 条，不碰 D1 预算断言。
+// msgId 拿不到（异常路径）时退回原来的无条件 +1 —— 宁可极小概率多计，也不能把计数弄丢。
+async function recordSpeechStat(env, chatId, from, nowMs = Date.now(), msgId = 0) {
 	if (!(await statReady(env))) return;
 	try {
 		const uid = String(from?.id || '');
@@ -19175,11 +19217,22 @@ async function recordSpeechStat(env, chatId, from, nowMs = Date.now()) {
 		const day = statDayString(env, nowMs);
 		const displayName = [from?.first_name, from?.last_name].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().slice(0, 120);
 		const username = String(from?.username || '').replace(/^@+/, '').slice(0, 64);
+		const at = Math.floor(nowMs / 1000);
+		if (Number(msgId) > 0) {
+			await env.DB.prepare(
+				'INSERT INTO stat_speech (chat_id, user_id, day, msg_count, display_name, username, updated_at, last_msg_id) VALUES (?, ?, ?, 1, ?, ?, ?, ?) '
+				+ 'ON CONFLICT(chat_id, user_id, day) DO UPDATE SET '
+				+ 'msg_count = msg_count + (CASE WHEN stat_speech.last_msg_id IS NOT excluded.last_msg_id THEN 1 ELSE 0 END), '
+				+ 'last_msg_id = excluded.last_msg_id, '
+				+ 'display_name = excluded.display_name, username = excluded.username, updated_at = excluded.updated_at'
+			).bind(String(chatId), uid, day, displayName, username, at, Number(msgId)).run();
+			return;
+		}
 		await env.DB.prepare(
 			'INSERT INTO stat_speech (chat_id, user_id, day, msg_count, display_name, username, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?) '
 			+ 'ON CONFLICT(chat_id, user_id, day) DO UPDATE SET msg_count = msg_count + 1, '
 			+ 'display_name = excluded.display_name, username = excluded.username, updated_at = excluded.updated_at'
-		).bind(String(chatId), uid, day, displayName, username, Math.floor(nowMs / 1000)).run();
+		).bind(String(chatId), uid, day, displayName, username, at).run();
 	} catch (error) { console.error('[群统计] 记录发言失败:', error); }
 }
 
@@ -19589,11 +19642,15 @@ function renderGroupSettingsMenu(chatId, title) {
 		const data = SETTINGS_MENU_PREFIX + encodeAdCallbackToken(action + '|' + String(chatId));
 		return adCallbackDataFits(data) ? { text: label, callback_data: data } : null;
 	};
-	const row1 = [mk('📊 群统计', 'stats'), mk('👤 资料卡', 'profile')];
+	const row1 = [mk('📊 统计', 'sm'), mk('👤 资料卡', 'profile')];
 	const row2 = [mk('🏥 运行检查', 'health')];
+	// 切换群：回到首页（群选择）。与「统计 → 返回首页」是同一个落点，
+	// 但按钮文案按他的原话分成两个场景，不合并成一颗。
+	const row3 = [mk('🔄 切换群', 'pk')];
 	const rows = [];
 	if (row1.every(Boolean)) rows.push(row1);
 	if (row2.every(Boolean)) rows.push(row2);
+	if (row3.every(Boolean)) rows.push(row3);
 	return {
 		text: [
 			'⚙️ <b>群设置</b> · ' + scope,
@@ -19602,6 +19659,219 @@ function renderGroupSettingsMenu(chatId, title) {
 		].join('\n'),
 		keyboard: rows.length ? { inline_keyboard: rows } : null
 	};
+}
+
+// ===== 统计面板（只读 D1，零建表零改列）=====
+// 层级（固定 4 层树）：首页 pk → 群设置 root → 统计子菜单 sm → 统计页 g1..g5。
+// 全部复用 menu: 前缀 + base64url("<action>|<chatId>[|<page>]")，与既有菜单页同一套 token。
+// 【为什么复用 menu: 不新开前缀】handleMenuCallback 走的就是 editAdPagedMessage 原地编辑，
+// 正好满足「按钮都在当前层返回、不新开另一条回复」这条硬要求；新开前缀还要同步改
+// handleAdCallbackQuery 的分流，白白多一处改点。
+// 【为什么返回键写死指向上一层】层级是固定树，token 里不带父指针 —— 带了会把
+// callback_data 撑到 Telegram 的 64 字节上限。
+// 【为什么不放「·发言统计·」这类分组标题按钮】Telegram 的 inline 键盘没有纯文本行，
+// 造那种按钮点了没有任何反应，就是死按钮；分组信息改用消息正文表达。
+
+// 统计子菜单 5 个入口（对应截图：去掉邀请两格 —— 邀请统计他没提，不渲染）。
+const STATS_PANEL_ENTRIES = [
+	{ action: 'g1', label: '今日发言排名', kind: 'today_rank' },
+	{ action: 'g2', label: '7日发言排名', kind: 'week_rank' },
+	{ action: 'g3', label: '7日发言统计', kind: 'week_daily' },
+	{ action: 'g4', label: '今日进退群数据', kind: 'today_jl' },
+	{ action: 'g5', label: '7日进退群统计', kind: 'week_jl' }
+];
+
+// 造一个 menu: 按钮；塞不下（群 ID 异常长）就返回 null，由调用方丢整行避免半残键盘。
+function mkMenuButton(action, chatId, label, page) {
+	const token = String(chatId) + (page ? '|' + String(page) : '');
+	const data = SETTINGS_MENU_PREFIX + encodeAdCallbackToken(action + '|' + token);
+	return adCallbackDataFits(data) ? { text: label, callback_data: data } : null;
+}
+
+// ===== 首页：群选择 + 添加按钮 =====
+// 【仅第一主人能到达】入口在 /start 分叉（非第一主人走原介绍语，根本到不了这里），
+// 回调端 handleMenuCallback 又复查了一次 isPrimaryOwner，双闸。
+// 【群名查询】每个群一次 getChat，用 mapWithConcurrency 限并发以免打满 Telegram 限流；
+// 单个群查失败回落成群 ID 文本，不整页崩掉。
+async function renderOwnerHome(env) {
+	const botName = String(await getBotUsername() || '').replace(/^@+/, '');
+	const targets = GROUP_IDS.filter(Boolean).map(String);
+	let titles = new Map();
+	if (targets.length) {
+		try {
+			const infos = await mapWithConcurrency(targets, 4, async (g) => {
+				try { const gi = await getChatInfoFromId(g); return [g, String(gi?.title || '')]; }
+				catch (_) { return [g, '']; }
+			});
+			titles = new Map(infos.filter(Boolean));
+		} catch (_) { /* 查不到就全部回落成群 ID */ }
+	}
+
+	const rows = [];
+	let row = [];
+	for (const g of targets) {
+		const name = titles.get(g) || ('群 ' + g);
+		const btn = mkMenuButton('root', g, '👥 ' + name);
+		if (!btn) continue;
+		row.push(btn);
+		if (row.length === 2) { rows.push(row); row = []; }
+	}
+	if (row.length) rows.push(row);
+
+	// 添加按钮走 url（Telegram 官方的 bot 深链），不需要 callback，也没有死按钮问题。
+	if (botName) {
+		rows.push([
+			{ text: '添加到群组 ➕', url: 'https://t.me/' + botName + '?startgroup=true' },
+			{ text: '添加到频道 ➕', url: 'https://t.me/' + botName + '?startchannel=true' }
+		]);
+	}
+
+	const lines = ['👋 <b>统计面板</b>', '', '👇 选择群组进行管理'];
+	if (!targets.length) lines.push('', '⚠️ 当前没有配置群。');
+	return {
+		text: lines.join('\n'),
+		keyboard: rows.length ? { inline_keyboard: rows } : null
+	};
+}
+
+// 导航键盘：返回上一层 + 首页。parentAction 是上一层的 action，写死不带参。
+function buildStatNavKeyboard(chatId, parentAction, withHome = true) {
+	const rows = [];
+	const up = mkMenuButton(parentAction, chatId, '↩️ 返回上一层');
+	if (up) rows.push([up]);
+	if (withHome) {
+		const home = mkMenuButton('pk', chatId, '🏠 返回首页');
+		if (home) rows.push([home]);
+	}
+	return rows.length ? { inline_keyboard: rows } : null;
+}
+
+// 统计子菜单。分组写进正文（Telegram 键盘没有分组标题位）。
+function renderStatsSubmenu(chatId, title) {
+	const scope = title ? escapeHtml(String(title)) : ('群 <code>' + escapeHtml(String(chatId)) + '</code>');
+	const rows = [];
+	const r1 = [mkMenuButton('g1', chatId, '今日发言排名'), mkMenuButton('g2', chatId, '7日发言排名')];
+	const r2 = [mkMenuButton('g3', chatId, '7日发言统计')];
+	const r3 = [mkMenuButton('g4', chatId, '今日进退群数据'), mkMenuButton('g5', chatId, '7日进退群统计')];
+	// 任一格塞不下就丢整行，宁可少一行也不要残缺行。
+	if (r1.every(Boolean)) rows.push(r1);
+	if (r2.every(Boolean)) rows.push(r2);
+	if (r3.every(Boolean)) rows.push(r3);
+	const nav = buildStatNavKeyboard(chatId, 'root');
+	if (nav) for (const r of nav.inline_keyboard) rows.push(r);
+	return {
+		text: [
+			'📊 <b>' + scope + ' · 统计</b>',
+			'',
+			'· 发言统计 ·',
+			'　今日发言排名 / 7日发言排名 / 7日发言统计',
+			'· 进退群统计 ·',
+			'　今日进退群数据 / 7日进退群统计'
+		].join('\n'),
+		keyboard: rows.length ? { inline_keyboard: rows } : null
+	};
+}
+
+// 排行榜渲染（今日 / 7日 共用）。文案对齐截图：`1. 昵称 80 条` + 翻页。
+function renderRankingLines(ranking) {
+	if (!ranking.rows.length) return ['（本时段暂无发言记录）'];
+	const lines = ['🏆 <b>发言排行</b>（第 ' + ranking.page + '/' + ranking.totalPages + ' 页）'];
+	for (const row of ranking.rows) {
+		const label = row.displayName || (row.username ? '@' + row.username : row.userId);
+		const link = '<a href="tg://user?id=' + escapeHtml(row.userId) + '">' + escapeHtml(label) + '</a>';
+		lines.push(row.rank + '. ' + link + ' <b>' + row.count + '</b> 条');
+	}
+	return lines;
+}
+
+// 排行页翻页键盘：翻页仍在本页（原地编辑），末行是导航。
+function buildRankingKeyboard(chatId, action, page, totalPages, parentAction) {
+	const rows = [];
+	const pager = [];
+	if (page > 1) {
+		const prev = mkMenuButton(action, chatId, '⬅️ 上一页', page - 1);
+		if (prev) pager.push(prev);
+	}
+	pager.push({ text: page + '/' + totalPages, callback_data: SETTINGS_MENU_PREFIX + 'noop' });
+	if (page < totalPages) {
+		const next = mkMenuButton(action, chatId, '下一页 ➡️', page + 1);
+		if (next) pager.push(next);
+	}
+	rows.push(pager);
+	const nav = buildStatNavKeyboard(chatId, parentAction);
+	if (nav) for (const r of nav.inline_keyboard) rows.push(r);
+	return { inline_keyboard: rows };
+}
+
+// 统计子页面（5 种）。全部只读既有查询，不新增任何 SQL、不改任何表。
+async function renderStatsSubPage(env, chatId, kind, title, page = 1, nowMs = Date.now()) {
+	const scope = title ? escapeHtml(String(title)) : ('群 <code>' + escapeHtml(String(chatId)) + '</code>');
+	const nav = (parent) => buildStatNavKeyboard(chatId, parent);
+
+	// 发言排名两档：汇总行 + 排行 + 翻页。
+	if (kind === 'today_rank' || kind === 'week_rank') {
+		const range = kind === 'today_rank' ? 'day' : '7d';
+		const [summary, ranking] = await Promise.all([
+			queryStatSummary(env, chatId, range, nowMs),
+			queryStatRanking(env, chatId, range, page, nowMs)
+		]);
+		const head = kind === 'today_rank'
+			? '今日总发言:<b>' + summary.totalMsg + '</b> 条；活跃人数:<b>' + summary.activeUsers + '</b>'
+			: '7日发言总数:<b>' + summary.totalMsg + '</b> 条；活跃人数:<b>' + summary.activeUsers + '</b>';
+		const action = kind === 'today_rank' ? 'g1' : 'g2';
+		const info = statRangeDays(env, range, nowMs);
+		const lines = [
+			(kind === 'today_rank' ? '📈 今日发言排名' : '📈 7日发言排名') + ' · ' + scope,
+			'📅 ' + info.label + ' ' + (info.start === info.end ? info.start : (info.start + ' ~ ' + info.end)) + '（北京时间）',
+			'',
+			head
+		].concat(renderRankingLines({ ...ranking, page }));
+		return {
+			text: lines.join('\n'),
+			keyboard: buildRankingKeyboard(chatId, action, page, ranking.totalPages, 'sm')
+		};
+	}
+
+	// 7日发言统计：逐日消息数。
+	if (kind === 'week_daily') {
+		const trend = await queryStatTrend(env, chatId, 7, nowMs);
+		const lines = ['📊 <b>7日发言统计</b> · ' + scope, ''];
+		let total = 0;
+		for (const d of trend.days) {
+			total += d.msg;
+			lines.push('<code>' + d.day + '</code>: <b>' + d.msg + '</b> 条');
+		}
+		lines.push('', '合计 <b>' + total + '</b> 条');
+		return { text: lines.join('\n'), keyboard: nav('sm') };
+	}
+
+	// 今日进退群数据。
+	if (kind === 'today_jl') {
+		const summary = await queryStatSummary(env, chatId, 'day', nowMs);
+		const lines = [
+			'👥 <b>今日进退群数据</b> · ' + scope,
+			'',
+			'今日进群:<b>' + summary.join + '</b>人，退群:<b>' + summary.leave + '</b>人',
+			'净增 <b>' + ((summary.join - summary.leave > 0 ? '+' : '') + (summary.join - summary.leave)) + '</b> 人',
+			'被移出 <b>' + summary.kicked + '</b> 人'
+		];
+		return { text: lines.join('\n'), keyboard: nav('sm') };
+	}
+
+	// 7日进退群统计：逐日 +入 / -出。
+	const trend = await queryStatTrend(env, chatId, 7, nowMs);
+	let j = 0; let l = 0;
+	for (const d of trend.days) { j += d.join; l += d.leave; }
+	const lines = [
+		'👥 <b>7日进退群统计</b> · ' + scope,
+		'',
+		'入群共:<b>' + j + '</b>人，退群共:<b>' + l + '</b>人',
+		''
+	];
+	for (const d of trend.days) {
+		lines.push('<code>' + d.day + '</code>: <b>+' + d.join + '</b> 人，<b>-' + d.leave + '</b> 人');
+	}
+	return { text: lines.join('\n'), keyboard: nav('sm') };
 }
 
 // 菜单里「资料卡」那一格：它需要一个 TGID 参数，按钮给不了 ——
@@ -20496,9 +20766,11 @@ async function handleStatsGoCallback(callbackQuery, env) {
 	let title = '';
 	try { const gi = await getChatInfoFromId(statChatId); title = String(gi?.title || ''); } catch (_) {}
 	const rendered = await renderStatPage(env, statChatId, range, 1, title, undefined, isPrimaryOwner(clickerId));
-	// 发到面板所在聊天（即本群）；面板消息不动，数据作为额外一条出现在下方。
-	const targetChat = String(callbackQuery?.message?.chat?.id || statChatId);
-	await sendAdPagedMessage(targetChat, rendered.text, rendered.keyboard, rendered.fallbackLine);
+	// 【原地编辑】原来是 sendAdPagedMessage 新发一条（面板不动、数据挂在下方），
+	// 与「按钮都在当前层返回、不新开另一条回复」冲突，改成与趋势页同款的原地编辑。
+	const msgChatId = String(callbackQuery?.message?.chat?.id || statChatId);
+	const messageId = Number(callbackQuery?.message?.message_id) || 0;
+	await editAdPagedMessage(msgChatId, messageId, rendered.text, rendered.keyboard);
 	await answerAdVoteCallback(callbackQuery?.id);
 }
 
@@ -20537,9 +20809,14 @@ async function handleMenuCallback(callbackQuery, env) {
 	const clickerId = String(callbackQuery?.from?.id || '');
 	if (!isPrimaryOwner(clickerId)) { await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人', true); return; }
 	const token = decodeAdCallbackToken(data.slice(SETTINGS_MENU_PREFIX.length));
-	const sep = token.indexOf('|');
-	const action = sep >= 0 ? token.slice(0, sep) : 'root';
-	const statChatId = sep >= 0 ? token.slice(sep + 1) : '';
+	// 页码指示位（第 x/y 页）点了什么都不做，只要应答，否则 Telegram 会一直转圈。
+	if (token === 'noop') { await answerAdVoteCallback(callbackQuery?.id); return; }
+	// token 支持第三段页码：action|chatId[|page]。既有 token 只有两段，split 后
+	// parts[2] 是 undefined → parseInt 得 NaN → 回落 1，老按钮行为完全不变。
+	const parts = String(token || '').split('|');
+	const action = parts[0] || 'root';
+	const statChatId = parts[1] || '';
+	const page = Math.max(1, parseInt(parts[2], 10) || 1);
 	if (!statChatId) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
 
 	const msgChatId = String(callbackQuery?.message?.chat?.id || '');
@@ -20565,8 +20842,20 @@ async function handleMenuCallback(callbackQuery, env) {
 	} else if (action === 'profile') {
 		const hint = renderProfileHint(statChatId, title);
 		text = hint.text; keyboard = hint.keyboard;
+	} else if (action === 'pk') {
+		// 首页（群选择 + 添加按钮）。statChatId 只是 token 占位，首页本身不依赖某个群。
+		const home = await renderOwnerHome(env);
+		text = home.text; keyboard = home.keyboard;
+	} else if (action === 'sm') {
+		const sub = renderStatsSubmenu(statChatId, title);
+		text = sub.text; keyboard = sub.keyboard;
 	} else {
-		await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return;
+		const entry = STATS_PANEL_ENTRIES.find((e) => e.action === action);
+		if (!entry) {
+			await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return;
+		}
+		const r = await renderStatsSubPage(env, statChatId, entry.kind, title, page);
+		text = r.text; keyboard = r.keyboard;
 	}
 	await editAdPagedMessage(msgChatId, messageId, text, keyboard);
 	await answerAdVoteCallback(callbackQuery?.id);

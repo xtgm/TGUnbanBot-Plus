@@ -4872,7 +4872,7 @@ console.log('\n[67] /help OWNER_IDS 专属');
 
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 4, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/start@TestBot' } }) }), env, fakeCtxAd);
-	assert('/start@机器人名 → 正常显示自助解封欢迎消息', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '999' && c.body.text.includes('自助解封机器人')));
+	assert('/start@机器人名 → 第一主人收到统计面板（原介绍语已改发给非第一主人）', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '999' && c.body.text.includes('统计面板')));
 }
 
 // ---------- [67a] 副主人私聊不变，群内命令零回执并给主人详情 ----------
@@ -4983,7 +4983,7 @@ console.log('\n[67a2] 群聊 /start 仅第一主人；私聊不变');
 		body: JSON.stringify({ message: { message_id: 3300, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false, first_name: '主人' }, text: '/start' } }),
 	}), groupSilentEnv(), fakeCtxAd);
 	const ownerGroupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
-	assert('第一主人群内 /start 保持原完整群回复', ownerGroupSends.length === 1 && ownerGroupSends[0].body.text.includes('自助解封机器人'));
+	assert('第一主人群内 /start → 统计面板（非第一主人仍纯静默）', ownerGroupSends.length === 1 && ownerGroupSends[0].body.text.includes('统计面板'));
 	assert('第一主人群内 /start 不删命令消息', !callsOf('deleteMessage').some((c) => c.body.message_id === 3300));
 
 	// 私聊行为完全不变：普通用户、黑名单用户各自照旧
@@ -6529,8 +6529,8 @@ console.log('\n[103] /menu 群设置菜单页');
 	const menuMsg = menuMsgs.find((x) => String(x.body.chat_id) === '-1001');
 	const rows = menuMsg?.body.reply_markup?.inline_keyboard || [];
 	const buttons = rows.flat();
-	assert('[103] 菜单三入口齐全（群统计 / 资料卡 / 运行检查）',
-		['群统计', '资料卡', '运行检查'].every((t) => buttons.some((b) => String(b.text).includes(t))),
+	assert('[103] 菜单四入口齐全（统计 / 资料卡 / 运行检查 / 切换群）',
+		['统计', '资料卡', '运行检查', '切换群'].every((t) => buttons.some((b) => String(b.text).includes(t))),
 		JSON.stringify(buttons.map((b) => b.text)));
 	assert('[103] 入口回调统一 menu: 前缀',
 		buttons.length > 0 && buttons.every((b) => String(b.callback_data || '').startsWith('menu:')),

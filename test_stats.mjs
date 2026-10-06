@@ -193,17 +193,20 @@ sent.length = 0;
 await W.handleStatsCommand({ chat: { id: '-100111', type: 'supergroup', title: '统计测试群' }, from: { id: Number(DEPUTY), is_bot: false }, text: '/stats month', message_id: 104 }, env, { waitUntil() {} });
 check('副主人随时可查', sent.some((x) => x.chatId === '-100111' && x.text.includes('本月')));
 
-console.log('\n=== 8b. 用法面板按钮：点一下新发数据（不改面板） ===');
+console.log('\n=== 8b. 用法面板按钮：原地编辑数据（不新开回复） ===');
 const goToday = 'statgo:' + W.encodeAdCallbackToken('day|-100111');
-sent.length = 0; currentAdmins = ['777'];
+sent.length = 0; edits.length = 0; currentAdmins = ['777'];
 await W.handleStatsGoCallback({ id: 'cb1', data: goToday, from: { id: 777 }, message: { chat: { id: '-100111' }, message_id: 102 } }, env);
-check('管理员点面板[今日] → 新发今日数据到本群', sent.some((x) => x.chatId === '-100111' && x.text.includes('消息 <b>')));
-sent.length = 0; currentAdmins = [];
+check('管理员点面板[今日] → 原地编辑出今日数据', edits.some((x) => x.chatId === '-100111' && x.text.includes('消息 <b>')));
+check('  ↑ 确实没新开一条回复', sent.length === 0, JSON.stringify(sent.map((x) => x.text.slice(0, 24))));
+sent.length = 0; edits.length = 0; currentAdmins = [];
 await W.handleStatsGoCallback({ id: 'cb2', data: 'statgo:' + W.encodeAdCallbackToken('week|-100111'), from: { id: Number(OWNER) }, message: { chat: { id: '-100111' }, message_id: 102 } }, env);
-check('主人点面板[本周] → 新发本周数据', sent.some((x) => x.chatId === '-100111' && x.text.includes('本周')));
-sent.length = 0; currentAdmins = [];
+check('主人点面板[本周] → 原地编辑出本周数据', edits.some((x) => x.chatId === '-100111' && x.text.includes('本周')));
+check('  ↑ 确实没新开一条回复', sent.length === 0, JSON.stringify(sent.map((x) => x.text.slice(0, 24))));
+sent.length = 0; edits.length = 0; currentAdmins = [];
 await W.handleStatsGoCallback({ id: 'cb3', data: goToday, from: { id: 555 }, message: { chat: { id: '-100111' }, message_id: 102 } }, env);
-check('非管理员点面板 → 不出数据（权限拦截）', !sent.some((x) => x.text.includes('总发言')));
+check('非管理员点面板 → 不出数据（权限拦截）',
+	!edits.some((x) => x.text.includes('总发言')) && !sent.some((x) => x.text.includes('总发言')));
 
 console.log('\n=== 9. /stats 输出内容 ===');
 sent.length = 0; currentAdmins = [];
@@ -691,8 +694,8 @@ console.log('\n=== 17. 群设置菜单：返回按钮按打开者身份 + menu �
 		message: { message_id: 712, chat: { id: Number(GROUP), type: 'supergroup' }, text: '子页' },
 		data: menuData('root', GROUP) });
 	e = edits.find((x) => x.chatId === GROUP);
-	check('点「返回群设置」→ 回菜单（含三个入口）', !!e && e.text.includes('群设置')
-		&& ['群统计', '资料卡', '运行检查'].every((t) => JSON.stringify(e.markup || '').includes(t)), JSON.stringify(e?.text));
+	check('点「返回群设置」→ 回菜单（四个入口含切换群）', !!e && e.text.includes('群设置')
+		&& ['统计', '资料卡', '运行检查', '切换群'].every((t) => JSON.stringify(e.markup || '').includes(t)), JSON.stringify(e?.text));
 
 	// ⑦ 权限：非第一主人点菜单 → 拒绝且不渲染
 	clear();
