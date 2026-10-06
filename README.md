@@ -185,14 +185,14 @@
 .
 ├── _worker.js             # Worker 主程序（单文件，含广告检测层）
 ├── wrangler.toml          # Cloudflare Wrangler 配置（D1 / Queue / AI 绑定）
-├── test_*.mjs             # 25 个离线测试文件
+├── test_*.mjs             # 26 个离线测试文件
 ├── README.md
 └── LICENSE
 ```
 
 | 项 | 数值 | 说明 |
 | --- | --- | --- |
-| 测试文件 | **25 个** | 合计 **3697 项**，全绿才允许推送 |
+| 测试文件 | **26 个** | 合计 **3741 项**，全绿才允许推送 |
 | 测试方式 | `node test_xxx.mjs` | 每个文件独立可跑，退出码非 0 即失败 |
 | 运行要求 | **Node 22+** | `node:sqlite` 内置模块要求 |
 | 测试环境 | 全部离线 | Bot API 全 mock，D1 用 `node:sqlite` 的 `DatabaseSync(':memory:')` **真实 SQLite 后端**（`ON CONFLICT`、`UNIQUE`、`batch` 事务真跑），Workers AI 用固定向量函数模拟 |

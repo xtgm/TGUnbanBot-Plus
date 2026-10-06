@@ -12742,6 +12742,42 @@ function judgeAdIdentityKill(payload) {
 	};
 }
 
+// 正文剥掉「非本人语言」之后还剩几个文字字符。
+//
+// 这是 menshen `prompts.go:140` 的 evasionClause 里那句
+// 「新成员只发一串 @xxxbot、**几乎没有别的内容**」的规则化落点 ——
+// menshen 把它写给模型判断，我方是规则化判据，所以要有一个可计算的定义。
+//
+// 剥掉的三类都不是「他真正在讲的东西」：
+//   · @handle     —— 艾特本身，也是形态 B 要计数的对象，不能既计数又当内容
+//   · URL         —— 链接是出口，不是话
+//   · /斜杠命令   —— 命令不是群聊内容（menshen pipeline.go:121 同口径：
+//                    「命令不是群聊内容：不留底，也不进判定」）
+// 剩下按 \p{L}\p{N} 数字数：中文、英文、数字都算，emoji 与标点不算。
+//
+// 【为什么是 4】与引用体通道的 AD_QUOTED_KILL_MAX_OWN_TEXT 同值。
+// 两处抓的是同一件事（「他自己几乎什么都没说」），用两个门槛迟早互相打架；
+// 引用体那条是主人早就拍过板的口径，这里直接沿用。
+const AD_NATURAL_TEXT_MAX = 4;
+
+// 形态 B 弱档的加分值。取 3 的理由：它比单个业务词强（三个账号并列确实是
+// 可疑形态），但离封禁线还差 4 分、离观察线差 2 分 —— 也就是说光靠弱档
+// 永远封不了人，必须再有别的证据（昵称、正文、指纹、AI）才够线。
+// 这正是「弱档只抬证据权重、不单独定罪」的数值表达。
+const AD_FORMB_WEAK_SCORE = 3;
+
+function adNaturalTextLength(text) {
+	const rest = String(text || '')
+		.replace(/@[A-Za-z0-9_]+/g, ' ')                    // ① @handle（连同其字母数字一起剥）
+		.replace(/(?:https?:\/\/|t\.me\/)\S+/gi, ' ')        // ② URL
+		.replace(/(^|\s)\/[A-Za-z0-9_]+/g, ' ');             // ③ /斜杠命令（命令本身，不吞后面的参数）
+	return (rest.match(/[\p{L}\p{N}]/gu) || []).length;
+}
+
+// 正文里有没有斜杠命令。用来把「有人在用 bot」与「召唤 bot 代发」分开：
+// 「@kickbot /ban @muter /mute」是群友在发命令，一条广告词都没有。
+const AD_SLASH_COMMAND_RE = /(^|\s)\/[A-Za-z0-9_]{2,}/;
+
 // 引流出口分析。核心约定：【自己的 @handle 不算出口】—— 它是身份标识，
 // 每个人都有；把它算进出口会让所有设了用户名的人凭空多一个「引流渠道」。
 function analyzeAdOutlets(text, selfUsername) {
@@ -12767,6 +12803,10 @@ function analyzeAdOutlets(text, selfUsername) {
 		mentions,
 		count: mentions.length + linkCount,
 		hasBot: mentions.some((x) => /bot$/.test(x)),
+		// 全部以 bot 结尾的那几个（形态 B 强档只认它们，见 judgeAdStructure）。
+		// TG 硬性规定 bot 用户名必须以 bot 结尾，这是「这是个代发工具」的硬标识；
+		// 普通人的 handle 恰好以 bot 结尾的极少（那本来就是给 bot 用的命名空间）。
+		botMentions: mentions.filter((x) => /bot$/.test(x)),
 		repeatedDigit,
 		sharedPrefix
 	};
@@ -12786,14 +12826,73 @@ function judgeAdStructure(text, selfUsername, channel) {
 	// 形态 A 明说型：招揽 ∧ 行业。刻意【不要求有联系出口】——
 	// 「大量收U 秒结」这句话本身就是广告，他会私聊你，不留联系方式一样是广告。
 	const formA = solicit && biz;
-	// 形态 B 引流矩阵型：不说业务，只堆账号。三个独立信号任一成立即可 ——
-	// 正常人 bio 里不会列 3 个账号、不会有同前缀小号群、不会有两个 8888 号。
-	const formB = outlets.mentions.length >= 3 || outlets.sharedPrefix || outlets.repeatedDigit.length >= 2;
 
+	// ===== 形态 B 引流矩阵型 —— 2026-10-06 拆成强 / 弱两档 =====
+	//
+	// 【为什么要拆】主人原话「这类很容易误判正常用户，所以一定要做好」。
+	// 离线实测 13 个案例（test_ad_formb）：旧写法「三个信号任一成立即定罪」
+	// 把三个正常场景全判成 ban ——
+	//   「@alice_1 @bob_22 @carol_33 约一下周末爬山」（mentions≥3）
+	//   「推荐 @a_bot @b_bot @c_bot 这三个自己挑」（mentions≥3）
+	//   「@user8888 @pass6666 登录测试一下」（repeatedDigit 只要 2 个）
+	// 而真正该拦的广告侧反而只覆盖「≥3 个艾特」，2 个 bot 的变体照旧漏放。
+	// 根因：三个信号没有一个区分「代发工具」与「普通人」，也没有一个看上下文 ——
+	// 注释里那句「正常人 bio 里不会列 3 个账号」说的是 bio，判的却是正文。
+	//
+	// 强档（guilty → hardHit，绕过分数线直接封），四条件同时成立：
+	//   ① ≥2 个 handle **全部**以 bot 结尾   —— menshen evasionClause 的 @xxxbot；
+	//      TG 硬性规定 bot 名以 bot 结尾，普通 handle 落进这个命名空间的极少
+	//   ② 剥掉艾特/命令/URL 后自然语言 < 4 字 —— 同款「几乎没有别的内容」
+	//   ③ 正文不含斜杠命令 ——「@a /help @b /status」是有人在用 bot，不是召唤代发；
+	//      menshen pipeline.go:121 对命令的处置是「不是群聊内容，不进判定」
+	//   ④ 只在 body 通道生效 —— 资料卡挂自己的 bot 是常态（menshen bioLinksClause
+	//      原话：「简介里挂自己的频道、群组、bot 是正常的」），而 card 通道拿不到
+	//      正文，「没有别的内容」这个前提对它根本不成立
+	//
+	// 【代价要写明】强档第 ② 条让广告号多打 4 个字就能绕过 —— 与引用体通道的门槛一
+	// 是同款代价，主人对那条的取舍是「认了，变体交给 /spam 学指纹」（命中即封、
+	// 比正则准）。刻意不把门槛放宽到十几个字：那样「@某人 你看这个广告」就进来了。
+	//
+	// 弱档（weak → 只加分 +3，仍要过分数线）：≥3 个 handle、重复数字账号 ≥2。
+	// 这两个信号都会在正常语料上触发（实测 `@alice_1 @bob_22 @carol_33 约一下`、
+	// `@user8888 @pass6666 登录测试`），所以不单独定罪。
+	//
+	// 【同前缀引流矩阵刻意留在强档】它是批量注册小号群的硬特征 —— 正常人的 handle
+	// 不会 4 字符同前缀（实测 `@tom_100 @tommy_x` 只有 3 字符，不命中）。「佳佳
+	// （邪恶姐姐）」那个号一个广告词都没有，定的就是这一条；把它一起降档会直接
+	// 放走它，test_ad_detection 的「佳佳引流矩阵应定罪」也钉着这一条。
+	const naturalLen = adNaturalTextLength(source);
+	const hasCommand = AD_SLASH_COMMAND_RE.test(source);
+	const formBBare = channel === 'body'
+		&& outlets.mentions.length >= 2
+		&& outlets.botMentions.length === outlets.mentions.length
+		&& naturalLen < AD_NATURAL_TEXT_MAX
+		&& !hasCommand;
+	const formBHard = outlets.sharedPrefix || formBBare;
+	const formBWeak = outlets.mentions.length >= 3
+		|| outlets.repeatedDigit.length >= 2;
+
+	const label = channel === 'card' ? '资料卡查杀' : (channel === 'quoted' ? '引用体查杀' : '正文查杀');
+
+	// 只有弱档成立：不进 hardHit、不定罪，但结论必须带出去（reasons 由上层在
+	// `!structure.guilty && structure.reasons.length` 那一支 push，weak 标记供加分用）。
+	if (!formA && !formBHard && formBWeak) {
+		const weakDetail = [];
+		if (outlets.count) weakDetail.push('引流出口×' + outlets.count + (outlets.hasBot ? '(含bot)' : ''));
+		if (outlets.repeatedDigit.length) weakDetail.push('重复数字账号×' + outlets.repeatedDigit.length);
+		return {
+			guilty: false,
+			weak: true,
+			channel,
+			form: 'B弱',
+			reasons: [label + '弱命中（形态 B 弱档，只加分不定罪）：' + weakDetail.join(' + ')]
+		};
+	}
+
+	const formB = formBHard || formBWeak;
 	const form = formA && formB ? 'A+B' : (formA ? 'A' : (formB ? 'B' : ''));
 	if (!form) return { guilty: false, channel, form: '', reasons: [] };
 
-	const label = channel === 'card' ? '资料卡查杀' : (channel === 'quoted' ? '引用体查杀' : '正文查杀');
 	const detail = [];
 	if (solicit) detail.push('招揽意图');
 	if (biz) detail.push('行业指向');
@@ -16361,7 +16460,11 @@ async function evaluateAdSuspect(env, input, options = {}) {
 				structure = identity;
 			} else {
 				const body = judgeAdBodyWithBio(payload);
-				structure = body.guilty ? body : judgeAdQuotedKill(payload);
+				// 弱档（形态 B 弱档，guilty=false 但 weak=true）必须一并带出来：
+				// 旧写法只在 body.guilty 时取 body，弱档会被 judgeAdQuotedKill 的结果
+				// 覆盖，weak 标记与 reasons 就此丢失 —— 上层既看不到也加不上分。
+				if (body.guilty || body.weak) structure = body;
+				else structure = judgeAdQuotedKill(payload);
 				// 引用体查杀被门槛二 / 豁免词放行时留一行记录 —— 主人复核时要能看出
 				// 「引用的确实是广告，但本人是在举报」，否则这条放行路径完全不可观测。
 				if (!structure.guilty && structure.reasons.length) reasons.push(...structure.reasons);
@@ -16371,6 +16474,16 @@ async function evaluateAdSuspect(env, input, options = {}) {
 			if (!structure.guilty && identity.reasons.length) reasons.push(...identity.reasons);
 		}
 		if (structure.guilty) reasons.push(...structure.reasons);
+		// ===== 形态 B 弱档：只加分，不进 hardHit =====
+		// reasons 上面已经在 `!guilty && reasons.length` 那一支写进去了（写着
+		//「弱命中…只加分不定罪」），这里只补分数本身。
+		// 放在结构块内而不是外面：structureKill = 'off' 时整块跳过，弱档也必须
+		// 跟着关掉 —— 关掉结构通道却还留一条结构分，是自相矛盾的。
+		if (!structure.guilty && structure.weak) {
+			score += AD_FORMB_WEAK_SCORE;
+			reasons.push('+' + AD_FORMB_WEAK_SCORE + ' 结构弱命中（形态 B 弱档：'
+				+ '多个引流出口同现但没有「裸艾特代发」形态，抬分不定罪）');
+		}
 	}
 	const structureBan = structure.guilty && config.structureKill === 'ban';
 
