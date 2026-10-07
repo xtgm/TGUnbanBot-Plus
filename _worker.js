@@ -16110,9 +16110,13 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input) {
 	if (String(current.verdict) === 'ban') return current;
 	const answer = await judgeAdByLLM(env, config, input);
 	if (!answer || !answer.ad) return current;
+	const line = Number(config?.llmConf) || AD_LLM_CONF;
+	// 观测：这一层到底有没有在起作用，必须能在 /adstats 上直接看到 ——
+	// 否则「调了但从没命中」与「压根没跑」在线上完全无法区分（上线首日就是这个状态）。
+	// 只在模型真给出 ad 结论时写（低频），也只有 /adstats 读它，热路径不为它多付 SQL。
+	await bumpAdLLMOutcome(env, answer.confidence >= line);
 	const reason = 'AI 深度判定命中（置信度 ' + answer.confidence.toFixed(2) + '）：' + answer.reason;
 	const reasons = (current.reasons || []).concat([reason]);
-	const line = Number(config?.llmConf) || AD_LLM_CONF;
 	if (answer.confidence >= line) {
 		return Object.assign({}, current, { verdict: 'ban', reasons });
 	}
@@ -17022,10 +17026,50 @@ async function readAdLLMQuota(env, nowSeconds) {
 	if (savedDay !== today) {
 		await writeAdScanState(env, 'llm_day', today, nowSeconds);
 		await writeAdScanState(env, 'llm_count', '0', nowSeconds);
+		// 观测计数一并归零：它们与额度同处一天窗口，只在这里清就永远是当天值
+		//（bumpAdLLMOutcome 写入时也判一次跨天，两头都兜住才不会残留）。
+		await writeAdScanState(env, 'llm_hits', '0', nowSeconds);
+		await writeAdScanState(env, 'llm_bans', '0', nowSeconds);
 		return { today, used: 0 };
 	}
 	const used = Number(await readAdScanState(env, 'llm_count', '0')) || 0;
 	return { today, used };
+}
+
+// 记第 ⑥ 层的观测计数：模型判为广告几次、其中真正达采信线几次。
+//
+// 【为什么要有它】上线首日的线上状态是「调了 5 次、0 命中」，而这个 0 在没有计数时
+// 与「压根没跑」完全无法区分 —— 主人问「修好了吗」时我只能靠 ad_scan_state 的调用
+// 次数反推，看不出判定结论。摆在 /adstats 上才是可自查的。
+//
+// 【开销】只在模型真给出 ad 结论时写（低频），也只有 /adstats 读它 —— 热路径不为
+// 它多付 SQL：judgeAdByLLM 那条路上一个字段都不读。
+async function bumpAdLLMOutcome(env, reachedLine) {
+	if (!env?.DB) return;
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		await writeAdScanState(env, 'llm_hits',
+			String((await readAdScanState(env, 'llm_hits', '0')) * 1 + 1), now);
+		if (reachedLine) {
+			await writeAdScanState(env, 'llm_bans',
+				String((await readAdScanState(env, 'llm_bans', '0')) * 1 + 1), now);
+		}
+	} catch (error) {
+		// 观测计数失败不影响判定 —— 宁可少记一次也不能把这条路径弄崩。
+		console.error('[广告检测·深度判定] 记录观测计数失败:', error);
+	}
+}
+
+// 读第 ⑥ 层的今日观测计数。只给 /adstats 用，不在任何判定路径上。
+// 与 readAdLLMQuota 同一把尺：day 不是今天就一律按 0 报，不读昨天的残留。
+async function readAdLLMOutcome(env, nowSeconds) {
+	const empty = { used: 0, hits: 0, bans: 0 };
+	if (!env?.DB) return empty;
+	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
+	const day = await readAdScanState(env, 'llm_day', '');
+	if (day !== today) return empty;
+	const num = async (key) => Number(await readAdScanState(env, key, '0')) || 0;
+	return { used: await num('llm_count'), hits: await num('llm_hits'), bans: await num('llm_bans') };
 }
 
 async function readAvatarVisionQuota(env, nowSeconds) {
@@ -19899,6 +19943,10 @@ async function handleAdStatsCommand(env, chatId) {
 		console.error('[广告检测] 统计查询失败:', error);
 	}
 
+	// 第 ⑥ 层的今日观测：调了几次、模型判了几次广告、其中几次真到采信线。
+	// 没有这三个数时，「调了但 0 命中」与「压根没跑」在线上完全无法区分。
+	const llmStat = await readAdLLMOutcome(env, Math.floor(Date.now() / 1000));
+
 	const lines = [
 		'<b>📊 广告检测状态</b>',
 		'',
@@ -19915,6 +19963,11 @@ async function handleAdStatsCommand(env, chatId) {
 			: (config.llmDaily <= 0
 				? '⏸️ 已关闭（AD_LLM_DAILY=0），前五层照跑'
 				: '✅ 已启用　每日 <b>' + config.llmDaily + '</b> 次　采信线 <b>' + config.llmConf + '</b>　模型 ' + escapeHtml(config.llmModel))),
+		'　↳ 今日调用 <b>' + llmStat.used + '</b>/' + config.llmDaily
+			+ '　模型判为广告 <b>' + llmStat.hits + '</b> 次　其中达线处置 <b>' + llmStat.bans + '</b> 次'
+			+ (llmStat.used > 0 && llmStat.hits === 0
+				? '　⚠️ 调用有、判定 0 命中 —— 说明这一层在跑但没起作用，别当成没接上'
+				: ''),
 		'',
 		'<b>指纹库</b>　共 <b>' + fpTotal + '</b> 条'
 	];

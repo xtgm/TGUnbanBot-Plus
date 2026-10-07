@@ -720,6 +720,98 @@ section('[9] 闸一可疑但不够封时同步调第⑥层');
 	}
 }
 
+
+// ================= [10] 第⑥层观测计数（/adstats 可自查） =================
+section('[10] 观测计数：调用 / 判广告 / 达线三个数');
+{
+	const NOW = () => Math.floor(Date.now() / 1000);
+	// /adstats 不 return 文本 —— 它直接 sendMessage，所以只能从 mock 的 calls 里取。
+	const lastSent = () => {
+		const sent = calls.filter((c) => c.method === 'sendMessage');
+		const body = sent[sent.length - 1]?.body || {};
+		return String(body.text || body.message || body.caption || '');
+	};
+
+	// ① 判为广告且达采信线 → 三个数都 +1
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.97) }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 1, reasons: [] },
+			cfg, { profile: { bio: 'x' }, text: '达线样本甲' });
+		const o = await W.readAdLLMOutcome(env, NOW());
+		assert('达线 → used=1', o.used === 1, JSON.stringify(o));
+		assert('达线 → hits=1（模型判为广告）', o.hits === 1, JSON.stringify(o));
+		assert('达线 → bans=1（真到采信线）', o.bans === 1, JSON.stringify(o));
+	}
+	// ② 判为广告但不到采信线 → hits 涨、bans 不涨
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.7) }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 1, reasons: [] },
+			cfg, { profile: { bio: 'x' }, text: '中段样本乙' });
+		const o = await W.readAdLLMOutcome(env, NOW());
+		assert('中段 → used=1', o.used === 1, JSON.stringify(o));
+		assert('★ 中段 → hits=1 但 bans=0（判了广告 ≠ 处置了）',
+			o.hits === 1 && o.bans === 0, JSON.stringify(o));
+	}
+	// ③ 判正常 → 三个数都 0（观察「调了但不命中」正是靠这个 0 看出来的）
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: '{"ad":false,"confidence":0.9,"reason":"正常"}' }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 1, reasons: [] },
+			cfg, { profile: { bio: 'x' }, text: '正常样本丙' });
+		const o = await W.readAdLLMOutcome(env, NOW());
+		assert('★ 判正常 → hits=0 bans=0', o.hits === 0 && o.bans === 0, JSON.stringify(o));
+		assert('但调用照记 used=1（否则看不出「跑过没」）', o.used === 1, JSON.stringify(o));
+	}
+	// ④ 模型没给出 ad 结论（解析失败）→ 不记 hits
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: '模型说了句人话，没有 JSON' }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 1, reasons: [] },
+			cfg, { profile: { bio: 'x' }, text: '解析失败样本丁' });
+		const o = await W.readAdLLMOutcome(env, NOW());
+		assert('解析失败 → 不记 hits（没结论就不能算「判为广告」）', o.hits === 0, JSON.stringify(o));
+	}
+	// ⑤ 跨天一律按 0 报，不读昨天残留
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.99) }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 1, reasons: [] },
+			cfg, { profile: { bio: 'x' }, text: '昨天的样本戊' });
+		assert('当天能读到', (await W.readAdLLMOutcome(env, NOW())).hits === 1);
+		env.DB.prepare("UPDATE ad_scan_state SET value = '2026-01-01' WHERE key = 'llm_day'").run();
+		const o = await W.readAdLLMOutcome(env, NOW());
+		assert('★ day 不是今天 → 三个数全 0（不拿昨天的残留充数）',
+			o.used === 0 && o.hits === 0 && o.bans === 0, JSON.stringify(o));
+	}
+	// ⑥ /adstats 输出里能看到这三个数，以及「调了但 0 命中」的提示
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.97) }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 1, reasons: [] },
+			cfg, { profile: { bio: 'x' }, text: '看板样本己' });
+		calls.length = 0;
+		await W.handleAdStatsCommand(env, GROUP_ID);
+		const text = lastSent();
+		assert('/adstats 显示今日调用数', text.includes('今日调用'), text.slice(0, 600));
+		assert('/adstats 显示「模型判为广告」', text.includes('模型判为广告'), text.slice(0, 600));
+		assert('/adstats 显示「其中达线处置」', text.includes('其中达线处置'), text.slice(0, 600));
+	}
+	// ⑦ 调用 >0 且 0 命中时给出「在跑但没起作用」的提示（上线首日正是这状态）
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: '{"ad":false,"confidence":0.1,"reason":"正常"}' }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 1, reasons: [] },
+			cfg, { profile: { bio: 'x' }, text: '零命中样本庚' });
+		calls.length = 0;
+		await W.handleAdStatsCommand(env, GROUP_ID);
+		const text = lastSent();
+		assert('★ 调了但 0 命中 → 提示「在跑但没起作用」',
+			text.includes('没起作用'), text.slice(0, 700));
+	}
+}
+
 // ================= 汇总 =================
 const summary = '=== 总计 ' + (pass + fail) + ' 项，通过 ' + pass + '，失败 ' + fail + ' ===';
 console.log('\n' + summary);
