@@ -11636,6 +11636,49 @@ const AD_SAMPLE_LEARNED_QUERY_LIMIT = 200;
 // bge-m3 是多语言模型，中文广告文本正是其适用场景；1024 维，60000 token 上下文。
 const AD_EMBEDDING_MODEL = '@cf/baai/bge-m3';
 const AD_EMBEDDING_DIMENSION = 1024;
+// === 第四路：生成式深度判定（LLM）===
+//
+// 【为什么必须有这一路】前三层全是【查表】性质：词表要列到才得分、指纹库要学过
+// 才命中、bge-m3 语义层要样本库里有近似才超阈值。样本外的新话术一律 0 分 ——
+// 线上实测一条 `来替我收米 一天9千` 拿 0 分：`收米` 在全文件出现 0 次，
+// `AD_MONEY_SOLICIT_RE` 有「收款/收钱」却没有「收米」，AI 语义层也没有相似样本。
+// 生成式模型不用查表就知道「收米」= 收钱，这正是 menshen 冷判定一路送 AI
+// 而不漏的原因（它的提示词里明写「赚米=赚钱」这类同音变形要先还原）。
+//
+// 【定位】只在前三层都【没能定罪】时补位，命中的理由写进 reasons 与 `/pending` 快照，
+// 与其它判据一样可用 `/ignore` 纠错。它是第四路，不是替代前三层：
+// 前三层零成本，这一路要花 Neurons，所以挂每日上限 + 同载荷内存去重。
+//
+// 【模型选型】qwen3-30b-a3b 是 MoE（30B 总参、3B 激活），中文广告语料能力远强于
+// llama-3.2-1b 这类 1B 小模型 —— 判据本身就是中文同音变形，模型认不出变形等于白花钱。
+// 换模型直接改环境变量，不动代码。
+const AD_LLM_MODEL = '@cf/qwen/qwen3-30b-a3b-fp8';
+// 【每日上限为什么是 200】免费层每天 10,000 Neurons，qwen3-30b-a3b 折算约
+// 每次判定 5 Neurons（约 500 输入 + 100 输出 token）→ 200 次 ≈ 1,000 Neurons，
+// 只占免费额度的一成，剩下九成留给 bge-m3 嵌入与两路视觉识别。
+// 0 = 关闭本路（只跑前三层，零 Neurons），与 AD_AVATAR_VISION_DAILY 的开关语义一致。
+const AD_LLM_DAILY = 200;
+// 【置信度线为什么是 0.85】对齐 menshen 冷判定的 antiad_cold_conf 采信线：
+// 它的注释写明「进群画像的证据比一条具体消息少得多」，所以宁可放过也不误伤。
+// 低于线的一律只进观察、不封 —— 模型输出「是广告」却只有 0.5 把握是常态。
+const AD_LLM_CONF = 0.85;
+// 观察线：命中但没到采信线时提到这一档（写观察窗口，窗口内再发即累加）。
+// 比 AD_OBSERVATION_SCORE（5）更高一档，因为这里是「模型怀疑」不是「词表命中」。
+const AD_LLM_OBSERVE_CONF = 0.6;
+const AD_LLM_PROMPT = '你是 Telegram 群组的反广告审核员。给你一份账号资料与它刚发出的消息，'
+	+ '判断这是不是广告号或引流号。\n'
+	+ '判据只有一条：username、first_name、last_name、bio、message 里是否写着推广文案、'
+	+ '收益承诺、引流话术或价目。写着的就是广告。\n'
+	+ '中文广告常靠变形规避：形近字或同音字替换（看煮页=看主页、赚米=赚钱、收米=收钱、'
+	+ '米=钱、薇信=微信、飞机=Telegram）、字母与数字互替（曰入5ooo+=日入5000+）、'
+	+ '拼音缩写、空格拆词 —— 先还原本意再判断。\n'
+	+ 't.me/+ 与 t.me/joinchat 开头的私密群邀请链接几乎只用于引流；'
+	+ '「看我主页」「私信我」这类把人导向账号资料的指引同理。\n'
+	+ '反过来，资料平平无奇、只有普通名字、或只写了兴趣爱好与所在地的，是正常用户。'
+	+ '没有用户名、没有简介、名字是随机字符、message 为空都不构成怀疑理由 —— 大量正常人就是这样。'
+	+ '拿不准就判 false，这一步会直接影响封禁，宁可放过也不要误伤。\n'
+	+ '只输出 JSON，不要任何其它文字，格式：{"ad":true 或 false,'
+	+ '"confidence":0.0到1.0 的小数,"reason":"一句话中文理由，指出具体是哪个字段的什么内容"}';
 // 筛查记录保留期（秒）：14 天后剪枝，防止 D1 无限增长
 const AD_SCREENING_RETENTION_SECONDS = 14 * 24 * 3600;
 // /pending 快照【长期保留】；/clearsamples 二次确认 60 秒
@@ -12195,7 +12238,16 @@ function loadAdDetectionConfig(env) {
 		avatarVisionDaily: pickInt(env.AD_AVATAR_VISION_DAILY, AD_AVATAR_VISION_DAILY, 0, 500),
 		// 正文图片视觉识别的每日张数上限（0 = 关闭 L2，只保留 L1 指纹查表）。
 		// 上限比头像宽一个量级（付费层超限是计费不是报错），理由见 AD_IMAGE_VISION_DAILY。
-		imageVisionDaily: pickInt(env.AD_IMAGE_VISION_DAILY, AD_IMAGE_VISION_DAILY, 0, 5000)
+		imageVisionDaily: pickInt(env.AD_IMAGE_VISION_DAILY, AD_IMAGE_VISION_DAILY, 0, 5000),
+		// 生成式深度判定的每日次数上限（0 = 关闭本路，只跑前三层）。
+		// 比视觉识别宽一点：它判的是文本不是图片，一次 5 Neurons 左右，
+		// 200 次约占免费额度一成，且有同载荷内存去重兜底（同一条广告只判一次）。
+		llmDaily: pickInt(env.AD_LLM_DAILY, AD_LLM_DAILY, 0, 5000),
+		// 采信线：命中且置信度 ≥ 此值才封，低于它只进观察。见 AD_LLM_CONF 说明。
+		llmConf: pickFloat(env.AD_LLM_CONF, AD_LLM_CONF, 0.5, 1),
+		// 换模型只改这个环境变量，不动代码（与 AD_EMBEDDING_MODEL 必须写死在代码里不同：
+		// 嵌入模型与向量维度绑定，LLM 模型没有维度包袱）。
+		llmModel: String(env.AD_LLM_MODEL || AD_LLM_MODEL).trim() || AD_LLM_MODEL
 	};
 }
 
@@ -15445,6 +15497,21 @@ function writeAdProfileCache(userId, profile) {
 	});
 }
 
+// getChat 失败时该不该重试、等多久。返回等待秒数 = 值得重试；返回 null = 不重试。
+//
+// 只有 429（Too Many Requests / flood control）是「等一下就会好」的，读 Telegram
+// 给的 retry_after；其余错误重试纯属浪费子请求预算 —— 最常见的是 400 chat not found，
+// 那是「对方从未与 bot 私聊过」的常态拒答，等多久都不会变。
+function adFetchRetryAfter(result) {
+	const code = Number(result?.error_code) || 0;
+	const desc = String(result?.description || '');
+	if (code !== 429 && !/too many requests|flood/i.test(desc)) return null;
+	const wait = Number(result?.parameters?.retry_after);
+	// 上限 3 秒：retry_after 再长也不值得把这一次判定挂住 —— 复查是按队列轮转的，
+	// 下一轮 cron 还会再取到这个人。
+	return Number.isFinite(wait) && wait > 0 ? Math.min(wait, 3) : 1;
+}
+
 async function fetchAdUserProfile(userId, fallback = {}) {
 	const profile = {
 		firstName: String(fallback.firstName ?? fallback.first_name ?? ''),
@@ -15480,12 +15547,25 @@ async function fetchAdUserProfile(userId, fallback = {}) {
 		return cached;
 	}
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ chat_id: String(userId) })
-		});
-		const result = await response.json();
+		// 【429 重试】定时滚动复查是一次性批量连打几十人，撞 Telegram 限流是常态
+		// （本文件另一处注释就写着「失败多半是 429」）。线上实测：入群线单发成功率
+		// 约 69%，复查线批量只有约 2% —— 名册 16109 人里走到判定的仅 6 人，绝大多数
+		// 卡在 bioFetched 处早退，闸三等于空转。只对可重试错误多试一次，见
+		// adFetchRetryAfter：429 才重试，400 chat not found 一次都不重试。
+		let result = null;
+		let retryWait = 0;
+		for (let attempt = 0; attempt < 2; attempt++) {
+			if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, retryWait * 1000));
+			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ chat_id: String(userId) })
+			});
+			result = await response.json();
+			if (result?.ok) break;
+			retryWait = adFetchRetryAfter(result);
+			if (retryWait === null) break;
+		}
 		const data = result?.result;
 		if (result?.ok && data) {
 			profile.firstName = String(data.first_name ?? profile.firstName);
@@ -15907,6 +15987,113 @@ async function applyBadgeToEvaluation(env, evaluation, profile) {
 		if (badge) current = applyBadgeVerdict(current, badge);
 	}
 	return current;
+}
+
+// ===== 第四路：生成式深度判定（LLM）=====
+//
+// 前三层全是【查表】：词表要列到、指纹库要学过、bge-m3 要样本库里有近似才超阈值。
+// 样本外的新话术一律 0 分（线上实测 `来替我收米 一天9千` 拿 0 分）。这一路不查表，
+// 直接把资料与正文交给生成式模型判 —— 模型不用有人教它「收米 = 收钱」。
+//
+// 定位是【补位不是替代】：只在前三层没能定罪时才跑，命中理由写进 reasons 与
+// `/pending` 快照，与其它判据一样可用 `/ignore` 纠错。
+
+// 载荷 → JSON 字符串。字段与前三层共用同一个 profile 对象，零额外 Telegram 请求。
+function buildAdLLMPayload(input) {
+	const profile = input?.profile || {};
+	return JSON.stringify({
+		username: String(profile.username || ''),
+		first_name: String(profile.firstName ?? profile.first_name ?? ''),
+		last_name: String(profile.lastName ?? profile.last_name ?? ''),
+		bio: String(profile.bio || ''),
+		message: String(input?.text || '').slice(0, 600)
+	});
+}
+
+// 从模型回答里抠 JSON。解析不出来一律按「未命中」处理 —— 宁可漏判也不能靠猜定罪。
+// 结构与 parseAvatarVisionAnswer 同构（同是「模型吐 JSON、抠不出就当没判」）。
+function parseAdLLMAnswer(raw) {
+	const text = String(raw || '').trim();
+	if (!text) return null;
+	const matched = text.match(/\{[\s\S]*\}/);
+	if (!matched) return null;
+	try {
+		const parsed = JSON.parse(matched[0]);
+		const ad = parsed?.ad === true || String(parsed?.ad).toLowerCase() === 'true';
+		const confidence = Number(parsed?.confidence);
+		return {
+			ad,
+			// 模型没给 confidence 时：判了广告就按满置信、判了正常就按 0 ——
+			// 缺字段不该把一次有效结论丢掉。
+			confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : (ad ? 1 : 0),
+			reason: String(parsed?.reason || '').slice(0, 200)
+		};
+	} catch (_) {
+		return null;
+	}
+}
+
+// 同载荷内存去重：同一条文案在一个 Worker 实例内只判一次。
+// Cloudflare 实例短命、这个 Set 会随实例回收 —— 它只是尽力省额度的兜底，
+// 真正的硬闸是每日上限。刻意不落库：那会往热路径加 SQL，撞「稳定态核心 ≤3 条」的断言。
+const adLLMSeen = new Set();
+
+// 跑一次深度判定。返回 {ad, confidence, reason} 或 null（未跑 / 失败 / 额度用尽）。
+async function judgeAdByLLM(env, config, input) {
+	// 未绑 Workers AI：与广告检测整体的降级口径一致 —— 跳过而不是报错。
+	if (!(env?.AI && typeof env.AI.run === 'function')) return null;
+	const daily = Number(config?.llmDaily);
+	if (!Number.isFinite(daily) || daily <= 0) return null;
+	const payload = buildAdLLMPayload(input);
+	const key = adTextHash(payload);
+	if (adLLMSeen.has(key)) return null;
+	const nowSeconds = Math.floor(Date.now() / 1000);
+	const quota = await readAdLLMQuota(env, nowSeconds);
+	if (quota.used >= daily) return null;
+	let answer = null;
+	try {
+		const aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
+			messages: [
+				{ role: 'system', content: AD_LLM_PROMPT },
+				{ role: 'user', content: payload }
+			],
+			max_tokens: 200,
+			temperature: 0.1
+		});
+		answer = parseAdLLMAnswer(aiResult?.response ?? aiResult?.result ?? aiResult);
+	} catch (error) {
+		console.error('[广告检测·深度判定] 调用失败:', error);
+		return null;
+	}
+	// 无论判没判出来都记额度与去重键：解析失败同样花了 Neurons，
+	// 不记的话同一条解析不出来的载荷会被反复重试，把当天预算烧在同一个坑上。
+	adLLMSeen.add(key);
+	await writeAdScanState(env, 'llm_count', String(quota.used + 1), nowSeconds);
+	return answer;
+}
+
+// 叠判入口：与 applyAvatarVerdict / applyBadgeVerdict 同位、同取向 ——
+// 只动 verdict 与 reasons，恒不改 score（改了会与历史分重复计）。
+async function applyAdLLMToEvaluation(env, evaluation, config, input) {
+	let current = evaluation;
+	if (!current) return current;
+	// 前三层已经定罪的不再花钱。
+	if (String(current.verdict) === 'ban') return current;
+	const answer = await judgeAdByLLM(env, config, input);
+	if (!answer || !answer.ad) return current;
+	const reason = 'AI 深度判定命中（置信度 ' + answer.confidence.toFixed(2) + '）：' + answer.reason;
+	const reasons = (current.reasons || []).concat([reason]);
+	const line = Number(config?.llmConf) || AD_LLM_CONF;
+	if (answer.confidence >= line) {
+		return Object.assign({}, current, { verdict: 'ban', reasons });
+	}
+	if (answer.confidence >= AD_LLM_OBSERVE_CONF) {
+		// 低于采信线只提观察：模型输出「是广告」却只有 0.5 把握是常态，
+		// 进门那一步直接限制人发言，误伤代价比漏一条大得多（menshen 同一取向）。
+		return Object.assign({}, current, { verdict: 'observe', reasons });
+	}
+	// 可疑度太低：理由留进快照供复核，verdict 与 score 都不动。
+	return Object.assign({}, current, { reasons });
 }
 
 // ===== 正文里的自定义贴纸 emoji（批次 B-2）=====
@@ -16545,7 +16732,11 @@ async function rescanAdMember(env, row, options = {}) {
 	const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
 	// 同款会员标叠加（无标则原样返回）：与头像同一层位、同一零开销条件，
 	// 排在头像之后 —— 两层都只加 reasons 不改 score，先后不影响分数。
-	const evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+	let evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+	// 第四路补位：这一轨扫的是「不发言的人」，正文恒空，模型判的就是资料本身 ——
+	// 正对准「改了 bio 的潜伏号」。日限 300 人，LLM 每日上限还绰绰有余。
+	evaluation = await applyAdLLMToEvaluation(env, evaluation,
+		options.config || loadAdDetectionConfig(env), { profile, text: '' });
 	// 写回形状与结论：pass 让下一轮能走门，observe / ban 则让门始终关着。
 	// 不碰 bio_checked_at —— 那个时间戳在判定之前已经推过一次（429 防卡死）。
 	await markAdProfileVerdict(env, userId, shape, evaluation.verdict);
@@ -16790,6 +16981,24 @@ function bytesToBase64(bytes) {
 }
 
 // 取消今日的头像推理额度（与 bio 扫描共用 ad_scan_state，key 不同互不干扰）。
+// 取今日的 LLM 深度判定额度。状态键 llm_day / llm_count 与头像、图片两轨各自独立。
+//
+// 【与 readAvatarVisionQuota 的一处刻意差异：跨天时把计数一并写回 0】
+// 那个函数只写 day 不写 count，于是「某天空跑一轮」（队列空提前 return、没走到写
+// count 那行）之后，第二天第一次读会把昨天的残留当成今天已用 —— 新轨道不复制这个隐患。
+// 这里不顺手改旧函数：它不在这次任务范围内，改它要连带复验视觉识别的额度行为。
+async function readAdLLMQuota(env, nowSeconds) {
+	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
+	const savedDay = await readAdScanState(env, 'llm_day', '');
+	if (savedDay !== today) {
+		await writeAdScanState(env, 'llm_day', today, nowSeconds);
+		await writeAdScanState(env, 'llm_count', '0', nowSeconds);
+		return { today, used: 0 };
+	}
+	const used = Number(await readAdScanState(env, 'llm_count', '0')) || 0;
+	return { today, used };
+}
+
 async function readAvatarVisionQuota(env, nowSeconds) {
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
 	const savedDay = await readAdScanState(env, 'avatar_day', '');
@@ -18248,7 +18457,11 @@ async function screenAdJoinMember(env, member, options = {}) {
 		const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
 		// 同款会员标同位叠加：走到这里已经为这次判定花过 getChat 了，
 		// 会员标就在那一份响应里，查一次库即可，零额外 Telegram 请求。
-		const evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+		let evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+		// ===== 第四路补位：前三层都没定罪时交给生成式模型 =====
+		// 入群时正文为空（他还没发过言），载荷里 message 就是空串 —— 提示词
+		// 明写「message 为空不构成怀疑理由」，所以这一路在这里判的纯粹是资料卡。
+		evaluation = await applyAdLLMToEvaluation(env, evaluation, config, { profile, text: '' });
 
 		// ===== 入群检查流水：任何 verdict 都记 =====
 		// 只记命中的话，看板上对绝大多数新成员是一片空白，管理员分不清
@@ -18717,7 +18930,14 @@ async function detectAdOnMessage(message, env) {
 	// 同款会员标叠在最外层：闸一那条零成本路径拿不到会员标（getChat 还没发），
 	// 所以这一层只在闸二及其后（入群线、AI 补查、cron 复查）生效 ——
 	// 与头像完全同位，热路径的 Telegram 请求数一个都不多。
-	const evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+	let evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+	// ===== 第四路补位：前三层都没定罪时交给生成式模型 =====
+	// 这是治「样本外话术」的那一处 —— 词表没列到、指纹没学过、bge-m3 样本库里
+	// 没有近似的正文，在这里由模型直接判。载荷口径与上面 evaluateAdSuspect 一致
+	// （text || contactName），两层看到的是同一份内容。
+	evaluation = await applyAdLLMToEvaluation(env, evaluation, config, {
+		profile, text: text || contactName
+	});
 
 	if (evaluation.verdict === 'ban') {
 		if (await isAdminInAnyConfiguredGroup(userId, chat.id)) {
@@ -19636,6 +19856,14 @@ async function handleAdStatsCommand(env, chatId) {
 		'观察窗口：' + config.observationHours + ' 小时',
 		'AI 语义阈值：' + config.aiSimilarityThreshold + '　指纹最低置信：' + config.fingerprintMinConfidence,
 		'第三层 AI：' + (config.aiEnabled ? '✅ 已绑定（' + AD_EMBEDDING_MODEL + ' / ' + AD_EMBEDDING_DIMENSION + ' 维）' : '⚠️ 未绑定，降级为评分 + 指纹两层'),
+		// 第 ⑥ 层必须在这里显式报状态：它与第三层共用一个 AI 绑定，绑了却把
+		// AD_LLM_DAILY 设成 0 时会静默不跑 —— 与「三个静默失效点」同一类问题，
+		// 不摆出来没人看得见自己关了它。
+		'第⑥层深度判定：' + (!config.aiEnabled
+			? '⚠️ 未绑定 Workers AI，本层跳过'
+			: (config.llmDaily <= 0
+				? '⏸️ 已关闭（AD_LLM_DAILY=0），前五层照跑'
+				: '✅ 已启用　每日 <b>' + config.llmDaily + '</b> 次　采信线 <b>' + config.llmConf + '</b>　模型 ' + escapeHtml(config.llmModel))),
 		'',
 		'<b>指纹库</b>　共 <b>' + fpTotal + '</b> 条'
 	];
