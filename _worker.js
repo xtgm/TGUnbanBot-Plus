@@ -18838,7 +18838,21 @@ async function detectAdOnMessage(message, env) {
 	// 即将发生的封禁。@svipultra 早就有 bio_checked_at 了，尊重冷却期等于第 2 次之后
 	// 永远查不到他的简介 —— 那正是他连中 5 次的原因。AI 单独定罪本身是低频事件，
 	// 为它多花一个 Telegram 请求，换的是把误封挡在发生之前。
-	let decision = cheap;
+	// ===== 可疑但不够封时，闸一同步跑第⑥层 =====
+	//
+	// 【为什么闸一是唯一还够得着的位置】闸二要等 bio 冷却到期，而入群那次查询
+	// 常常查到的是空 bio 却把之后两小时都挡在外面 —— 线上 11/15 人工封的号正是
+	// 这个形态（闸一 score 1 或 −1、闸二没进、观察窗口也没有）。冷却已由上面那步
+	// 压到 10 分钟，但 10 分钟内的广告消息仍然只有这一层够得着。
+	//
+	// 【成本为什么可以接受】触发条件是 suspectSignal —— 闸一本次真拿到了正分判据。
+	// 0 正分的普通聊天一个调用都不发（占绝大多数），「稳态零额外开销」不变；
+	// 可疑消息才花这一次，另有每日上限与同载荷内存去重两道闸兜着。
+	// 闸一本就有同步的 bge-m3 嵌入调用，这一层不改变它的性质，只是更慢一点。
+	// cheapProfile 没有 bio（闸一是零 getChat 路径），所以这一层判的是昵称 + 正文。
+	let decision = suspectSignal
+		? await applyAdLLMToEvaluation(env, cheap, config, { profile: cheapProfile, text: text || contactName })
+		: cheap;
 	let bioVerified = false;
 	if (cheap.verdict === 'ban' && cheap.layer === 'ai' && cheap.score < config.scoreThreshold) {
 		const verifyProfile = await fetchAdUserProfile(userId, from);

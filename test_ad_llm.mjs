@@ -617,6 +617,109 @@ section('[8] 可疑信号把 bio 冷却期压到 10 分钟');
 	}
 }
 
+
+// ================= [9] 闸一同步跑第⑥层（唯一还够得着的位置） =================
+section('[9] 闸一可疑但不够封时同步调第⑥层');
+{
+	// 复用 [8] 的辅助函数语义：bio_checked_at 直接写库，省掉真的发一轮消息做预热。
+	async function prime(env, userId, secondsAgo) {
+		const now = Math.floor(Date.now() / 1000);
+		const checked = secondsAgo === null ? 0 : now - secondsAgo;
+		await env.DB.prepare(
+			'INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at, profile_hash, last_verdict) VALUES (?,?,?,?,?,?,?,?,?,?) '
+			+ 'ON CONFLICT(user_id) DO UPDATE SET bio_checked_at = excluded.bio_checked_at'
+		).bind(String(userId), GROUP_ID, '用户', '', '', now, now, checked, '', '').run();
+	}
+	// 首尾对称 emoji → 闸一 +3，低于封禁线 7，所以必须靠第⑥层才能定罪。
+	const SUSPECT_TEXT = '🔥今天天气真好🔥';
+	const PLAIN_TEXT = '普通聊天内容';
+	const NEWCOMER_TIER = 7200;   // adRescanTierSeconds 对 first_seen 距今 <=6h
+
+	// ① 核心场景：闸一有正分但不够封 + bio 冷却中（闸二不进）→ 只有第⑥层够得着
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.96, '正文带引流话术') }) });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '闸一可疑用户甲', username: '', bio: ''
+		} } }) });
+		// ★ first_name 必须与 [8] 段那段区分：adLLMSeen 是【模块级】Set、跨段共享，
+		// 载荷一字不差时 judgeAdByLLM 会在去重处直接 return null，llmCalls 不涨 ——
+		// 症状与「闸一根本没调」完全一样，第一版就是这么误判的。
+		await prime(env, 771201, 60);   // 60 秒前查过：原档位 7200 与新冷却 600 都没到期 → 闸二不进
+		await send(groupMessage({ id: 771201, first_name: '闸一可疑用户甲' }, SUSPECT_TEXT), env);
+		assert('★ 冷却中且闸二不进 → 闸一这一层调到了第⑥层', ai.llmCalls >= 1, 'llmCalls=' + ai.llmCalls);
+		const row = env.DB.query('SELECT reason FROM blacklist WHERE id = ?', '771201');
+		assert('★ 模型达采信线 → 闸一就地封禁（不用等闸二）', row.length === 1, JSON.stringify(row));
+	}
+	// ② 0 正分 → 一个调用都不发（稳态保护，占绝大多数的普通聊天）
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.99) }) });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '普通用户', username: '', bio: ''
+		} } }) });
+		await prime(env, 771202, 60);
+		await send(groupMessage({ id: 771202, first_name: '普通用户' }, PLAIN_TEXT), env);
+		assert('★ 0 正分 → 闸一不调第⑥层（稳态零额外开销不变）', ai.llmCalls === 0, 'llmCalls=' + ai.llmCalls);
+		const row = env.DB.query('SELECT reason FROM blacklist WHERE id = ?', '771202');
+		assert('0 正分不会被误封', row.length === 0, JSON.stringify(row));
+	}
+	// ③ 有正分但模型判正常 → 不封（LLM 没有「见可疑就封」的权力）
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: '{"ad":false,"confidence":0.9,"reason":"普通发言"}' }) });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '正常用户', username: '', bio: ''
+		} } }) });
+		await prime(env, 771203, 60);
+		await send(groupMessage({ id: 771203, first_name: '正常用户' }, SUSPECT_TEXT), env);
+		assert('有正分确实调了第⑥层', ai.llmCalls >= 1, 'llmCalls=' + ai.llmCalls);
+		const row = env.DB.query('SELECT reason FROM blacklist WHERE id = ?', '771203');
+		assert('★ 模型判正常 → 不封（不误伤）', row.length === 0, JSON.stringify(row));
+	}
+	// ④ 模型置信度只到中段 → 进观察窗口，不封
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.7, '有点可疑但拿不准') }) });
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '中段用户', username: '', bio: ''
+		} } }) });
+		await prime(env, 771204, 60);
+		await send(groupMessage({ id: 771204, first_name: '中段用户' }, SUSPECT_TEXT), env);
+		const row = env.DB.query('SELECT reason FROM blacklist WHERE id = ?', '771204');
+		assert('★ 0.6 ≤ 置信度 < 采信线 → 转观察不封', row.length === 0, JSON.stringify(row));
+	}
+	// ⑤ 闸一已经定罪的（评分层自己够线）→ 不花第⑥层的钱
+	{
+		// 阈值压到 3：这段正文在闸一（无 bio）只能拿 4 分，默认线 7 要靠闸二才封，
+		// 那样闸一那一步仍会调第⑥层，验不到「已定罪就不花钱」这条。
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.99) }), AD_SCORE_THRESHOLD: '3' });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '已定罪用户', username: '', bio: ''
+		} } }) });
+		await prime(env, 771205, 60);
+		// 超封禁线的正文：评分层自己就判了
+		await send(groupMessage({ id: 771205, first_name: '已定罪用户' },
+			'招代理 一天8000 带单上分 私聊领福利'), env);
+		const row = env.DB.query('SELECT reason FROM blacklist WHERE id = ?', '771205');
+		assert('评分层够线 → 照样封禁', row.length === 1, JSON.stringify(row));
+		assert('但不重复花第⑥层的钱（前三层能解决的不劳第四路）', ai.llmCalls === 0,
+			'lllmCalls=' + ai.llmCalls);
+	}
+	// ⑥ 未绑 AI → 这条路径照样走完，不炸
+	{
+		const env = await makeReadyEnv();
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '无AI用户', username: '', bio: ''
+		} } }) });
+		await prime(env, 771206, 60);
+		let threw = null;
+		try { await send(groupMessage({ id: 771206, first_name: '无AI用户' }, SUSPECT_TEXT), env); }
+		catch (e) { threw = e; }
+		assert('未绑 AI + 有正分 → 走完不炸', threw === null, String(threw));
+	}
+}
+
 // ================= 汇总 =================
 const summary = '=== 总计 ' + (pass + fail) + ' 项，通过 ' + pass + '，失败 ' + fail + ' ===';
 console.log('\n' + summary);
