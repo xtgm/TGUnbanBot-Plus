@@ -15213,12 +15213,29 @@ function writeAdProfileCache(userId, profile) {
 		if (!oldest.done) AD_PROFILE_CACHE.delete(oldest.value);
 	}
 	AD_PROFILE_CACHE.set(String(userId), {
-		// badgeId 必须跟着进缓存：缓存命中时这份 profile 就是唯一的数据源，
-		// 漏存它会让「第二条消息起会员标判据全失效」—— 与 bio 同样的道理。
-		// 【avatarId 刻意仍未存】这是既有状态：头像判据在缓存命中时同样读不到
-		// （applyAvatarToEvaluation 拿到空串直接返回）。属于批次 C 之外的既有缺陷，
-		// 已单独报给主人，等他定方案，不趁本轮顺手改。
-		profile: { firstName: profile.firstName, lastName: profile.lastName, username: profile.username, bio: profile.bio, badgeId: profile.badgeId },
+		// 【avatarId / avatarFileId 必须跟着进缓存】原先这里只存
+		// firstName/lastName/username/bio 与后来补上的 badgeId，于是缓存命中时
+		// 这两个字段是 undefined —— applyAvatarToEvaluation 拿到空串直接返回，
+		// 【头像判据在 5 分钟缓存有效期内完全失效】：同一个人 5 分钟内第二条
+		// 消息起，头像指纹一次都不查。而刷屏 / 连续对话恰恰是缓存最热的时候，
+		// 也就是广告号连发消息时最查不到。实测（test_ad_badge [2] 段）：
+		// 修前 profile.avatarId 是 undefined，修后读得回 big_file_unique_id。
+		//
+		// avatarFileId 一并存的理由：registerAdAvatar 要靠它登记 L2 的下载句柄，
+		// 丢了它，「缓存命中且表里还没这行」会把空 file_id 写进去，
+		// 之后视觉识别无句柄可用。5 分钟内 file_id 必然还有效（图没换），
+		// 所以存它不会过期失效。
+		//
+		// badgeId 是批次 C 补的，理由相同（漏存则第二条消息起会员标判据失效）。
+		profile: {
+			firstName: profile.firstName,
+			lastName: profile.lastName,
+			username: profile.username,
+			bio: profile.bio,
+			avatarId: profile.avatarId,
+			avatarFileId: profile.avatarFileId,
+			badgeId: profile.badgeId
+		},
 		expiresAt: Date.now() + AD_PROFILE_CACHE_TTL_MS
 	});
 }

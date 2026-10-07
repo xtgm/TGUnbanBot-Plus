@@ -216,6 +216,24 @@ section('[2] fetchAdUserProfile 读 emoji_status_custom_emoji_id');
 	assert('缓存命中不发第二次 getChat', countCalls('getChat') === 0, String(countCalls('getChat')));
 	assert('缓存命中 badgeId 仍有效', profile.badgeId === BADGE_ID, JSON.stringify(profile.badgeId));
 
+	// ===== 既有缺陷的复现 =====
+	// writeAdProfileCache 原本只存 firstName/lastName/username/bio，
+	// 于是缓存命中时 avatarId 是 undefined → applyAvatarToEvaluation 拿到空串
+	// 直接返回 → 【头像判据在 5 分钟缓存有效期内完全失效】。
+	// 这两条断言先用来证明缺陷存在（跑一次应当变红），修完转为回归守卫。
+	env = makeEnv();
+	resetCalls();
+	setApi({ getChat: () => ({ ok: true, result: {
+		id: 559, first_name: 'WithAvatar', bio: '',
+		photo: { big_file_id: 'BF_1', big_file_unique_id: 'BU_1' },
+		emoji_status_custom_emoji_id: BADGE_ID
+	} } ) });
+	await W.fetchAdUserProfile(559, {});
+	resetCalls();
+	profile = await W.fetchAdUserProfile(559, {});
+	assert('【缺陷复现】缓存命中 avatarId 仍在', profile.avatarId === 'BU_1', JSON.stringify(profile.avatarId));
+	assert('【缺陷复现】缓存命中 avatarFileId 仍在', profile.avatarFileId === 'BF_1', JSON.stringify(profile.avatarFileId));
+
 	// getChat 失败 → 不写缓存、badgeId 留空
 	env = makeEnv();
 	resetCalls();
