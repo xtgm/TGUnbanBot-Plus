@@ -515,6 +515,108 @@ section('[7] readAdLLMQuota 跨天清零');
 	assert('跨天后第二次读仍是 0（残留真被清掉了）', again.used === 0, JSON.stringify(again));
 }
 
+
+// ================= [8] 可疑信号压短 bio 冷却期（第⑥层可达性） =================
+section('[8] 可疑信号把 bio 冷却期压到 10 分钟');
+{
+	// 判据本身：+0 不算正分信号（评分层的 add 没有 delta 保护，0 分照样 push 进 reasons）
+	const reSrc = src.match(/const AD_POSITIVE_SIGNAL_RE = \/(.+?)\/\s*;/)?.[1];
+	assert('能从源码取出 AD_POSITIVE_SIGNAL_RE', Boolean(reSrc), String(reSrc));
+	const POS = reSrc ? new RegExp(reSrc) : null;
+	if (POS) {
+		assert('+3 正文首尾对称 emoji → 算正分信号', POS.test('+3 正文首尾对称 emoji'));
+		assert('+1 正文重复段落 → 算', POS.test('+1 正文重复段落'));
+		assert('★ +0 来源频道名为随机字母串 → 不算（0 分不构成「有特征」）',
+			!POS.test('+0 来源频道名为随机字母串'), '+0 被误判成有特征');
+		assert('+0 随机字母数字 username → 不算', !POS.test('+0 随机字母数字 username'));
+		assert('-1 名称无 emoji 且无 Bio → 不算（减分项）', !POS.test('-1 名称无 emoji 且无 Bio'));
+		assert('AI 语义相似度那条 → 不算', !POS.test('AI 语义相似度 0.417 ≥ 阈值 0.78'));
+	}
+
+	// 端到端：三种冷却状态 × 有无正分，看闸二（及挂在它后面的第⑥层）到底进不进。
+	// LLM 一律回 ad:false —— 这里只测「够不够得着」，不测定罪（定罪在 [6] 已断言）。
+	const NO_ADB = '{"ad":false,"confidence":0.1,"reason":"正常用户"}';
+
+	// 把 bio_checked_at 直接写成给定值，省掉真的去发一轮消息做预热。
+	async function primeBioChecked(env, userId, secondsAgo) {
+		const now = Math.floor(Date.now() / 1000);
+		// secondsAgo === null 表示「从没查过」—— bio_checked_at 写 0，
+		// 与 shouldCheckAdBio 的 checked <= 0 分支同义。传 0 是「刚刚查过」，语义相反。
+		const checked = secondsAgo === null ? 0 : now - secondsAgo;
+		await env.DB.prepare(
+			'INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at, profile_hash, last_verdict) VALUES (?,?,?,?,?,?,?,?,?,?) '
+			+ 'ON CONFLICT(user_id) DO UPDATE SET bio_checked_at = excluded.bio_checked_at'
+		).bind(String(userId), GROUP_ID, '用户', '', '', now, now, checked, '', '').run();
+	}
+	const SUSPECT_CD = 10 * 60;   // 与 AD_SUSPECT_BIO_COOLDOWN_SECONDS 同值
+	// 新人档位（adRescanTierSeconds 对 first_seen 距今 <=6h 返回 7200 秒 = 2 小时）。
+	// 场景① 要的是「按原档位还在冷却中、按新逻辑已经到期」，所以取值必须落在 [7200, SUSPECT_CD) 之外的对侧：
+	//   610 秒 < 7200（原档位仍冷却）且 >= 600（新逻辑到期）—— 两头都满足才叫「压短了」。
+	const NEWCOMER_TIER = 7200;
+	const SYMMETRIC = '🔥今天天气真好🔥';   // 首尾对称 emoji → +3，仍低于封禁线 7
+	const PLAIN = '普通聊天内容';           // 0 正分
+
+	// ① 冷却期内 + 有正分 → 必须走闸二（第⑥层可达）
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '可疑用户', username: '', bio: ''
+		} } }) });
+		await primeBioChecked(env, 771101, SUSPECT_CD + 10);   // 610 秒前查过：原档位 7200 仍在冷却，新逻辑已到期
+		await send(groupMessage({ id: 771101, first_name: '可疑用户' }, SYMMETRIC), env);
+		assert('★ 原档位仍冷却（610s < 7200s）但有 +3 正分 → 压短后进闸二，第⑥层被调到',
+			ai.llmCalls >= 1, 'llmCalls=' + ai.llmCalls);
+	}
+	// ② 冷却期内 + 0 正分 → 不进闸二（稳态零请求的不变量原样保住）
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '普通用户', username: '', bio: ''
+		} } }) });
+		await primeBioChecked(env, 771102, 60);   // 1 分钟前查过 → 两条逻辑都不进
+		await send(groupMessage({ id: 771102, first_name: '普通用户' }, PLAIN), env);
+		assert('★ 冷却期内且 0 正分 → 不进闸二，一个 AI 调用都没有',
+			ai.llmCalls === 0, 'llmCalls=' + ai.llmCalls);
+	}
+	// ③ 冷却期外 + 0 正分 → 照旧进闸二（原有行为不变）
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '过期用户', username: '', bio: ''
+		} } }) });
+		await primeBioChecked(env, 771103, NEWCOMER_TIER + 60);   // 2 小时档位已过
+		await send(groupMessage({ id: 771103, first_name: '过期用户' }, PLAIN), env);
+		assert('冷却期已过 → 仍进闸二（原行为没被改掉）',
+			ai.llmCalls >= 1, 'llmCalls=' + ai.llmCalls);
+	}
+	// ④ 从没查过（bio_checked_at = 0）+ 0 正分 → 进闸二
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '新用户', username: '', bio: ''
+		} } }) });
+		await primeBioChecked(env, 771104, null);   // 从没查过（bio_checked_at = 0）
+		await send(groupMessage({ id: 771104, first_name: '新用户' }, PLAIN), env);
+		assert('首次发言（从没查过 bio）→ 进闸二', ai.llmCalls >= 1, 'llmCalls=' + ai.llmCalls);
+	}
+	// ⑤ 未绑 AI 时这条路径照样能走完（不炸）
+	{
+		const env = await makeReadyEnv();
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '无AI用户', username: '', bio: ''
+		} } }) });
+		await primeBioChecked(env, 771105, 60);
+		let threw = null;
+		try { await send(groupMessage({ id: 771105, first_name: '无AI用户' }, SYMMETRIC), env); }
+		catch (e) { threw = e; }
+		assert('未绑 AI + 有正分 → 走完不炸', threw === null, String(threw));
+	}
+}
+
 // ================= 汇总 =================
 const summary = '=== 总计 ' + (pass + fail) + ' 项，通过 ' + pass + '，失败 ' + fail + ' ===';
 console.log('\n' + summary);

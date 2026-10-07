@@ -11531,6 +11531,23 @@ const AD_RESTRICTED_STATUS_SCORE = 0;
 const AD_BIO_RECHECK_DAYS = 3;
 const AD_BIO_RECHECK_SECONDS = AD_BIO_RECHECK_DAYS * 24 * 3600;
 
+// 可疑信号下的 bio 冷却期：闸一【本次真拿到正分判据】时，把上面那个分档冷却压到 10 分钟。
+//
+// 【为什么必须有它】线上实测（2026-10-07）：最近 15 个人工封的号里 11 个入群判定
+// verdict=pass，理由清一色「+2 昵称为机器生成型西方全名 / -1 名称无 emoji 且无 Bio /
+// 语义 0.4x」，而他们在 ad_pending_snapshots 与 ad_user_screening 里都是 0 条 ——
+// 闸一评分不够、闸二又正处在入群时记下的 bio 冷却期内不进，四层判据与第⑥层一条都
+// 跑不到，最后只能人工封。广告号进群时 bio 常常还是空的，那次「查过」不该把之后
+// 整整两小时的发言都挡在深判之外。
+//
+// 【为什么不直接取消冷却期】0 正分的普通聊天必须原样走原分档，否则「稳态下每条消息
+// 0 个 Telegram 请求」就没了 —— test_kick 的稳定态断言用的正是 0 正分的普通文本。
+const AD_SUSPECT_BIO_COOLDOWN_SECONDS = 10 * 60;
+// 与前置分档的 AD_REASON_POSITIVE_RE 刻意不同：这里必须排除 +0。评分层的 add 没有
+// delta 保护，分数为 0 的判据照样 push 进 reasons（见 scoreAdForwardChat 的
+// 「来源频道名为随机字母串」，AD_RANDOM_CHANNEL_SCORE = 0），而 0 分不构成「有特征」。
+const AD_POSITIVE_SIGNAL_RE = /^\+[1-9]\d*\s/;
+
 // 名册保留期。超过这个时长没再发言的人从名册剪枝 —— 大概率已退群，
 // 留着只会白占扫描配额。90 天足够覆盖「长期潜水但仍在群」的正常用户。
 const AD_MEMBER_RETENTION_SECONDS = 90 * 24 * 3600;
@@ -18787,7 +18804,15 @@ async function detectAdOnMessage(message, env) {
 	// 所以「闸一零 getChat」那条不变量原样保住。
 	cheap = await applyBadgeToEvaluation(env, cheap, cheapProfile);
 
-	const needBio = shouldCheckAdBio(member, nowSeconds);
+	// ===== 可疑信号把 bio 冷却期压到 10 分钟（见 AD_SUSPECT_BIO_COOLDOWN_SECONDS）=====
+	// 闸一真拿到正分判据 → 不再让入群那次「bio 还是空的」查询把接下来两小时都挡在深判外；
+	// 0 正分的普通聊天照旧走原分档，稳态零 Telegram 请求的不变量对它原样成立。
+	const suspectSignal = Array.isArray(cheap.reasons)
+		&& cheap.reasons.some((line) => AD_POSITIVE_SIGNAL_RE.test(line));
+	const bioCheckedAt = Number(member?.bio_checked_at) || 0;
+	const needBio = suspectSignal
+		? (bioCheckedAt <= 0 || nowSeconds - bioCheckedAt >= AD_SUSPECT_BIO_COOLDOWN_SECONDS)
+		: shouldCheckAdBio(member, nowSeconds);
 
 	// ===== AI 层单独定罪 → 强制补查 bio 再复评（2026-09-22）=====
 	//
