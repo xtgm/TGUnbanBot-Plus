@@ -89,7 +89,11 @@ const LINK_RESULTS = {
 	scamchan: { id: -1002002, type: 'channel', title: '财富频道', description: '招代理 一天8000 带单上分 私聊领福利' },
 	emptychan: { id: -1002003, type: 'channel', title: '空简介频道', description: '' },
 	stranger: { id: 555999, type: 'private', first_name: '张三', last_name: '' },
-	adbot: { id: 777888, type: 'private', first_name: '', last_name: '' }   // handle 以 bot 结尾 → kind=bot
+	adbot: { id: 777888, type: 'private', first_name: '', last_name: '' },   // handle 以 bot 结尾 → kind=bot
+	// 自举案底用：简介含招揽（会先 +2，标记后变 +3 并跳过 +2）。
+	// 文案必须真的命中 AD_EXEMPT_CANCEL_RE，否则「未标记 +2」那两条无从谈起 ——
+	// 与 scamchan 同款，那条已在 [6] 被断言过确实触发「招揽」。
+	scamfeed: { id: -100777001, type: 'channel', title: '黑产频道', description: '招代理 一天8000 带单上分 私聊领福利' }
 };
 // bot 的简介只有公开预览页给得到（getChat 对别的 bot 只返回名字与用户名）。
 const OG_PAGES = {
@@ -307,6 +311,20 @@ section('[4] scoreAdProfileLinks：只加分、认得出「写明白了的」');
 	assert('挂个人号 → 0 分（个人号不构成广告位，招揽写在自己 bio 里由 bio 层判）',
 		personal.score === 0, JSON.stringify(personal));
 
+	// —— kind 口径一致（2026-10-07 丙）：+3 此前不筛 kind，会与上面那条承诺相悖 ——
+	const personalKnown = score([{ handle: 'stranger', kind: 'user', title: '张三', about: '', adKnown: true }]);
+	assert('丙：挂个人号【有案底】也不给分（+3 与 +2 同一批 kind 限制，反向断言）',
+		personalKnown.score === 0, JSON.stringify(personalKnown));
+	const chanKnown = score([{ handle: 'badchan', kind: 'channel', title: 'X', about: '', adKnown: true }]);
+	assert('丙：挂频道有案底仍 +3（收紧的只是 kind，不是案底本身）',
+		chanKnown.score === 3, JSON.stringify(chanKnown));
+	const botKnown = score([{ handle: 'badbot', kind: 'bot', title: 'B', about: '', adKnown: true }]);
+	assert('丙：挂 bot 有案底仍 +3（bot 也在广告位类型里）',
+		botKnown.score === 3, JSON.stringify(botKnown));
+	const userSelfAd = score([{ handle: 'stranger', kind: 'user', title: '张三', about: '招代理 一天8000', adConfirmed: true }]);
+	assert('丙：自举案底同样只认广告位类型（挂个人号即使被标过也 0 分）',
+		userSelfAd.score === 0, JSON.stringify(userSelfAd));
+
 	const both = score([
 		{ handle: 'bad1', kind: 'channel', title: 'X', about: '', adKnown: true },
 		{ handle: 'bad2', kind: 'channel', title: 'Y', about: '日入5000 私聊领福利', adKnown: false }
@@ -349,11 +367,17 @@ section('[6] 入群线：解析真的跑进判定');
 	await W.adDetectionReady(env);
 	resetCalls();
 
+	// 按 chat_id 区分两条查询：带 @ 前缀的是解析层在查【被挂的目标】，
+	// 数字 id 是入群线在查【这个人自己的资料】。前置分档要求这个人本身带广告
+	// 特征才往下查，所以被查的人必须是两类词同现（+6）的形态，否则会落低档
+	// 而解析根本不会发起 —— 那正是前置层该有的行为，不是测试坏掉。
 	setApi({
 		getChat: (body) => ({
 			payload: {
 				ok: true,
-				result: { id: body?.chat_id, first_name: '进群用户', username: '', bio: '看主页 t.me/scamchan 懂的都懂' }
+				result: String(body?.chat_id || '').startsWith('@')
+					? { id: -100222333, type: 'channel', title: '项目频道', description: '一手面交 USDT 日入过万' }
+					: { id: body?.chat_id, first_name: '进群用户', username: '', bio: '看主页 t.me/scamchan 一手面交 USDT' }
 			}
 		})
 	});
@@ -369,11 +393,11 @@ section('[6] 入群线：解析真的跑进判定');
 		reasons.some((r) => r.includes('scamchan') && r.includes('招揽')), JSON.stringify(reasons));
 	assert('入群流水记录了本次结论', Boolean(row), JSON.stringify(row));
 	// 链接分确实进了总分：拿同一份 bio 不带 adLinks 再算一次作为基准。
-	// （这个 bio 命中 t.me 豁免是 -3，所以总分未必是正数 —— 断言的是【差值】，
-	//  也就是 scoreAdProfileLinks 那 +2 有没有真加进去。）
+	// （这份 bio 有 t.me 豁免 -3、也有两类词同现 +6，所以总分未必是正数 ——
+	//  断言的是【差值】，也就是 scoreAdProfileLinks 那 +2 有没有真加进去。）
 	const whitelist = await W.loadAdDomainWhitelist(env);
 	const bare = await W.scoreAdProfile(
-		{ firstName: '进群用户', lastName: '', username: '', bio: '看主页 t.me/scamchan 懂的都懂', bioFetched: true },
+		{ firstName: '进群用户', lastName: '', username: '', bio: '看主页 t.me/scamchan 一手面交 USDT', bioFetched: true },
 		{ whitelist, skipMissingBioPenalty: false });
 	assert('链接分加进了入群总分（总分 = 基准分 + 2）',
 		Boolean(row) && Number(row.score) === bare.score + 2,
@@ -419,11 +443,14 @@ section('[8] 落点只在入群线与闸二，闸一不碰');
 {
 	const lines = src.split('\r\n');
 	const idx = lines
-		.map((line, i) => (line.includes('profile.adLinks = await resolveAdProfileLinks(env, profile)') ? i + 1 : 0))
+		.map((line, i) => (line.includes('profile.adLinks = await resolveAdProfileLinksElevated(env, profile') ? i + 1 : 0))
 		.filter(Boolean);
-	assert('解析接入点恰好 2 处', idx.length === 2, JSON.stringify(idx));
+	assert('解析接入点恰好 2 处（都走带前置的入口）', idx.length === 2, JSON.stringify(idx));
 	assert('两处分别在入群线与闸二（都是拉了 bio 的路径）', idx.length === 2 && idx[1] - idx[0] > 100,
 		JSON.stringify(idx));
+	// 两处都必须经过前置分档 —— 有一处绕过，那条路径上正常人照样会被查。
+	assert('两处调用都经过前置分档（没有一处直连裸解析）',
+		!lines.some((l) => l.includes('profile.adLinks = await resolveAdProfileLinks(env, profile)')));
 
 	const gate1Start = lines.findIndex((l) => l.includes('=========== 闸一 · 零成本判定'));
 	const gate1End = lines.findIndex((l, i) => i > gate1Start && l.includes('=========== 闸二'));
@@ -437,6 +464,118 @@ section('[8] 落点只在入群线与闸二，闸一不碰');
 		'未找到 bio 空串');
 	assert('scoreAdProfile 只在有 adLinks 时才加分（空字段零分）',
 		src.includes('const linkResult = scoreAdProfileLinks(profile?.adLinks);'));
+}
+
+// ================= [9] 前置分档：先判人，再查链接 =================
+section('[9] 前置分档：正常人不查，广告号必查');
+{
+	const clean = (p, text) => W.isAdProfileElevated(p, text ? { text } : {});
+
+	// —— 正常侧：这些人的资料净分本来就被豁免词压成负数，查与不查结局一样 ——
+	assert('挂自己频道的技术博主 → 不查', clean({ firstName: '老李', username: 'laoli_dev', bio: '我的频道 t.me/laoli_daily 分享编程' }) === false);
+	assert('误封样本 Lov1900 → 不查', clean({ firstName: 'Lov', lastName: '1900', username: 'MiLov1900', bio: '私信请走频道 https://t.me/joeychat001' }) === false);
+	assert('空资料新用户 → 不查', clean({ firstName: '新用户' }) === false);
+	assert('普通中文昵称 → 不查', clean({ firstName: '张三', bio: '在杭州，做财务' }) === false);
+	assert('代理群用户（官方中文/代理均在豁免）→ 不查',
+		clean({ firstName: '小王', username: 'wang_ops', bio: '自建机场，官方中文文档见主页' }) === false);
+
+	// —— 广告侧：这些人挂的链接必须查，否则 2~3 分的证据白丢 ——
+	assert('#19 挂 t.me/+ 私密邀请 → 查', clean({ firstName: 'Kami', lastName: 'Flores', bio: 't.me/+MvjFa-oXyhYzNTY1 进群了解项目 一天8000!' }) === true);
+	assert('#21 西方全名 + 招揽 bio → 查', clean({ firstName: 'Daniela', lastName: 'Maria', bio: '安全简单 一天稳定5万' }) === true);
+	// 【关键回归】挂【公开】t.me 的广告号：bio 含 t.me 吃 -3 豁免，净分被压成负数。
+	// 若档位看净分，这类人会和正常博主一起掉进低档 —— 恰恰漏掉最该查的那一次。
+	assert('挂公开 t.me 频道的广告号 → 必须查（豁免词不能把有特征的人压进低档）',
+		clean({ firstName: 'Kami', lastName: 'Flores', bio: '我的频道 t.me/scamfeed 更新项目' }) === true);
+	// —— 正文路径（闸二才有）：资料干净但正文多类词同现 ——
+	assert('资料干净 + 正文两类词同现 → 查（闸二必须传 text）',
+		clean({ firstName: '张三', bio: '' }, '一手渠道，加我 面交 拿 USDT') === true);
+	assert('资料干净 + 正文单类词 → 不查（主评分里也是 0 分，查了改不了结局）',
+		clean({ firstName: '张三', bio: '' }, '稳赚项目每天保底，点这里看') === false);
+
+	// —— 格式钉死：档位靠 reasons 的「+N 」识别加分项，格式一变就静默全落低档 ——
+	assert('AD_REASON_POSITIVE_RE 常量存在', src.includes('const AD_REASON_POSITIVE_RE = /^\\+\\d+\\s/;'), '');
+	// const 不挂 vm 全局，只能从源码抠原文编译执行（测真代码，不是复刻的等价正则）。
+	const posSrc = (src.match(/const AD_REASON_POSITIVE_RE = [^;]+;/) || [])[0];
+	assert('源码里抠得到该正则原文', !!posSrc, '没匹配到');
+	const pos = posSrc ? new Function(posSrc + '\nreturn AD_REASON_POSITIVE_RE;')() : { test: () => false };
+	assert('加分项格式「+2 昵称为…」被识别', pos.test('+2 昵称为机器生成型西方全名'));
+	assert('减分项「-3 命中豁免词」不被识别（豁免不能抹掉特征）', !pos.test('-3 命中豁免词：t.me'));
+	assert('不计分记录「（…单类词不计分…）」不被识别', !pos.test('（正文仅交易动词，单类词不计分：稳赚）'));
+
+	// —— 低档的下游行为与改动前逐字节一致 ——
+	assert('空 adLinks → 0 分 0 reasons（判定逻辑零变化）',
+		W.scoreAdProfileLinks([]).score === 0 && W.scoreAdProfileLinks([]).reasons.length === 0);
+	assert('没有 adLinks 字段同样 0 分（闸一 cheapProfile 的形态）',
+		W.scoreAdProfileLinks(undefined).score === 0);
+}
+
+// ================= [10] 自举案底：标记、读回、撤销 =================
+section('[10] 自举案底：案底存在 ad_link_cache，/ignore 可撤');
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	// 不用 setApi：本文件的 fetch mock 对「带 @ 前缀的 getChat」走 LINK_RESULTS 表驱动，
+	// 优先于 apiHandlers —— 挂一个表里没有的 handle 会拿到 400、kind 落 unknown，
+	// 那不是被测代码的问题，是 mock 的入口分流。scamfeed 已注册在表里。
+	const links = await W.resolveAdProfileLinks(env, { bio: 't.me/scamfeed' });
+	assert('解析出一条（顺带把缓存表建出来）',
+		links.length === 1 && links[0].handle === 'scamfeed', JSON.stringify(links));
+
+	// —— 未标记：简介含招揽 → +2，且进 scoredHandles（自举只认加过分的） ——
+	let r = W.scoreAdProfileLinks(links);
+	assert('未标记：简介含招揽 +2', r.score === 2, JSON.stringify(r));
+	assert('未标记：该 handle 进了 scoredHandles', r.scoredHandles.includes('scamfeed'),
+		JSON.stringify(r.scoredHandles));
+	assert('未标记时读回 adConfirmed 为 false', links[0].adConfirmed === false, JSON.stringify(links[0]));
+
+	// —— 定罪 → 标记 ——
+	const marked = await W.confirmAdLinkOnBan(env, { verdict: 'ban', snapshot: { scoredLinks: ['scamfeed'] } });
+	assert('定罪后标记 1 个', marked === 1, String(marked));
+
+	// —— 读回：+3 案底，且同一条简介不再重复 +2（否则 +5 虚高） ——
+	const relink = await W.resolveAdProfileLinks(env, { bio: 't.me/scamfeed' });
+	assert('缓存读回带 adConfirmed=true', relink[0]?.adConfirmed === true, JSON.stringify(relink[0]));
+	r = W.scoreAdProfileLinks(relink);
+	assert('已标记 → +3 案底', r.score === 3, JSON.stringify(r));
+	assert('已标记 → 跳过 +2（同一条简介不重复计分，反向断言）',
+		!r.reasons.some((x) => x.includes('招揽')), JSON.stringify(r.reasons));
+
+	// —— 不是 ban 就不许标（反向断言） ——
+	await W.clearAdLinkConfirmedOnIgnore(env, ['scamfeed']);
+	const notBan = await W.confirmAdLinkOnBan(env, { verdict: 'observe', snapshot: { scoredLinks: ['scamfeed'] } });
+	assert('verdict 非 ban → 不标记', notBan === 0, String(notBan));
+	const noHandles = await W.confirmAdLinkOnBan(env, { verdict: 'ban', snapshot: {} });
+	assert('没有 scoredLinks → 不标记（挂正常频道的广告号不会被盖章）', noHandles === 0, String(noHandles));
+
+	// —— 回滚 ——
+	await W.confirmAdLinkOnBan(env, { verdict: 'ban', snapshot: { scoredLinks: ['scamfeed'] } });
+	const cleared = await W.clearAdLinkConfirmedOnIgnore(env, ['scamfeed']);
+	assert('/ignore 撤销标记 → 1 行', cleared === 1, String(cleared));
+	const back = await W.resolveAdProfileLinks(env, { bio: 't.me/scamfeed' });
+	assert('撤销后读回 adConfirmed=false', back[0]?.adConfirmed === false, JSON.stringify(back[0]));
+
+	// —— 快照两端（白名单重建） ——
+	const restored = W.adPayloadFromSnapshot({ snapshot: { bio: 'x', scoredLinks: ['a', 'b'] } });
+	assert('快照还原 scoredLinks', JSON.stringify(restored.scoredLinks) === '["a","b"]',
+		JSON.stringify(restored.scoredLinks));
+	const oldSnap = W.adPayloadFromSnapshot({ snapshot: { bio: 'x' } });
+	assert('老快照还原空数组（不崩、回滚端循环不执行）',
+		Array.isArray(oldSnap.scoredLinks) && oldSnap.scoredLinks.length === 0,
+		JSON.stringify(oldSnap.scoredLinks));
+
+	// —— 建表 / 迁移：新列必须真的在 ——
+	const cols = env.DB.query('PRAGMA table_info(ad_link_cache)').map((c) => c.name);
+	assert('ad_link_cache 有 ad_confirmed 列', cols.includes('ad_confirmed'), JSON.stringify(cols));
+
+	// —— 标记的调用位置：必须在演练分支之后（演练一个动作都不做） ——
+	const start = src.indexOf('async function enforceAdDetection');
+	const body = src.slice(start, start + 9000);
+	assert('confirmAdLinkOnBan 在 enforceAdDetection 内被调用', body.includes('await confirmAdLinkOnBan(env, evaluation)'), '');
+	assert('标记位置在演练 return 之后',
+		body.indexOf('await confirmAdLinkOnBan(env, evaluation)') > body.indexOf("banSummary: '演练命中（未处置）'"),
+		JSON.stringify({ mark: body.indexOf('await confirmAdLinkOnBan(env, evaluation)'), dry: body.indexOf("banSummary: '演练命中（未处置）'") }));
+	// 写入端不得把已确认的案底冲回 0（一次 6 小时后的重查就会冲掉）
+	assert('写缓存对 ad_confirmed 取 MAX 而非覆盖', src.includes('ad_confirmed = MAX(ad_link_cache.ad_confirmed, excluded.ad_confirmed)'), '');
 }
 
 console.log(`\n========== 资料链接解析层：通过 ${pass} / 失败 ${fail} ==========`);

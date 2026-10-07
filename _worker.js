@@ -13294,7 +13294,16 @@ async function ensureAdLinkCacheTable(env) {
 	const init = (async () => {
 		try {
 			await runD1SchemaStatement(env, 'ad_link_cache',
-				'CREATE TABLE IF NOT EXISTS ad_link_cache (handle TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT \'\', title TEXT NOT NULL DEFAULT \'\', about TEXT NOT NULL DEFAULT \'\', ad_known INTEGER NOT NULL DEFAULT 0, fetched_at INTEGER NOT NULL DEFAULT 0)');
+				'CREATE TABLE IF NOT EXISTS ad_link_cache (handle TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT \'\', title TEXT NOT NULL DEFAULT \'\', about TEXT NOT NULL DEFAULT \'\', ad_known INTEGER NOT NULL DEFAULT 0, ad_confirmed INTEGER NOT NULL DEFAULT 0, fetched_at INTEGER NOT NULL DEFAULT 0)');
+			// 老库补列。CREATE IF NOT EXISTS 对已存在的表不生效，所以新列必须单独 ALTER；
+			// 而列已存在时 ALTER 会报错，故先 PRAGMA 探测。整段被 D1_AD_LINK_CACHE_INIT
+			// 的 WeakMap 缓存住，每个 DB 只跑一次，不进热路径（同 stat_speech 那处的写法）。
+			const cols = await env.DB.prepare('PRAGMA table_info(ad_link_cache)').all();
+			const names = new Set((cols?.results || []).map((c) => String(c.name || '')));
+			if (!names.has('ad_confirmed')) {
+				await runD1SchemaStatement(env, 'ad_link_cache.ad_confirmed',
+					'ALTER TABLE ad_link_cache ADD COLUMN ad_confirmed INTEGER NOT NULL DEFAULT 0;', { optional: true });
+			}
 			return true;
 		} catch (error) {
 			console.error('[广告检测·链接] 建表失败:', error);
@@ -13315,7 +13324,7 @@ async function readAdLinkCache(env, handle) {
 	if (!(await ensureAdLinkCacheTable(env))) return null;
 	try {
 		const row = await env.DB.prepare(
-			'SELECT handle, kind, title, about, ad_known, fetched_at FROM ad_link_cache WHERE handle = ? AND fetched_at > ?'
+			'SELECT handle, kind, title, about, ad_known, ad_confirmed, fetched_at FROM ad_link_cache WHERE handle = ? AND fetched_at > ?'
 		).bind(key, Math.floor(Date.now() / 1000) - AD_LINK_TTL_SECONDS).first();
 		if (!row) return null;
 		return {
@@ -13323,7 +13332,8 @@ async function readAdLinkCache(env, handle) {
 			kind: String(row.kind || 'unknown'),
 			title: String(row.title || ''),
 			about: String(row.about || ''),
-			adKnown: Number(row.ad_known) === 1
+			adKnown: Number(row.ad_known) === 1,
+			adConfirmed: Number(row.ad_confirmed) === 1
 		};
 	} catch (error) {
 		// 缓存读不到只意味着这次要真查一次，不能因此把整条解析链判死。
@@ -13338,11 +13348,16 @@ async function writeAdLinkCache(env, info) {
 	if (!(await ensureAdLinkCacheTable(env))) return;
 	try {
 		await env.DB.prepare(
-			'INSERT INTO ad_link_cache (handle, kind, title, about, ad_known, fetched_at) VALUES (?, ?, ?, ?, ?, ?)'
+			'INSERT INTO ad_link_cache (handle, kind, title, about, ad_known, ad_confirmed, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
 			+ ' ON CONFLICT(handle) DO UPDATE SET kind = excluded.kind, title = excluded.title,'
-			+ ' about = excluded.about, ad_known = excluded.ad_known, fetched_at = excluded.fetched_at'
+			+ ' about = excluded.about, ad_known = excluded.ad_known,'
+			// ad_confirmed 取 MAX：重新解析带进来的是 0（isAdProfileLinks 落案底那步
+			// 才会置 1），不能让一次 6 小时后的重查把已确认的案底冲回 0 —— 案底只有
+			// /ignore 纠错那一条路能撤，见 clearAdLinkConfirmedOnIgnore。
+			+ ' ad_confirmed = MAX(ad_link_cache.ad_confirmed, excluded.ad_confirmed),'
+			+ ' fetched_at = excluded.fetched_at'
 		).bind(key, String(info.kind || 'unknown'), String(info.title || '').slice(0, 200),
-			String(info.about || '').slice(0, 600), info.adKnown ? 1 : 0,
+			String(info.about || '').slice(0, 600), info.adKnown ? 1 : 0, info.adConfirmed ? 1 : 0,
 			Math.floor(Date.now() / 1000)).run();
 	} catch (error) {
 		console.error('[广告检测·链接] 写缓存失败:', error);
@@ -13437,7 +13452,7 @@ async function resolveAdLink(env, handle) {
 	const cached = await readAdLinkCache(env, key);
 	if (cached) return cached;
 
-	const info = { handle: key, kind: 'unknown', title: '', about: '', adKnown: false };
+	const info = { handle: key, kind: 'unknown', title: '', about: '', adKnown: false, adConfirmed: false };
 	// cacheable=false 表示这次是暂时性故障，别缓存 —— 否则一次 429 会把这条链路
 	// 按死 6 小时，期间这个号挂的频道永远显示 unknown。
 	let cacheable = true;
@@ -13490,6 +13505,48 @@ async function resolveAdProfileLinks(env, profile) {
 	return out;
 }
 
+// ===== 前置分档：先判这个人像不像广告，再决定要不要为他花 getChat 查挂的东西 =====
+//
+// 【为什么要有这道前置】2026-10-07 主人原话：「以正常用户跟广告用户作为前置判定条件，
+// 要做好区分。」在这之前，只要资料里有 @xxx / t.me/xxx 就查 —— 挂自己频道的正常技术
+// 博主、写「私信请走频道」的正常用户一样要付 0~5 个 getChat，而他们挂的东西查出来
+// 最多 +2/+3，加上他们本来就净负的资料卡分（豁免词 -3）根本够不到观察线 5 分，
+// 查与不查结局一样。分档把这类查询挡在门外，同时让「挂没挂链接」这件事彻底不进
+// 广告号的判定链 —— 分界仍然不在挂没挂，而在这个人本身像不像广告。
+//
+// 【判据同源，一个字不改】直接用已有的 scoreAdProfile 与 scoreAdMessageText 算分：
+// 不新建判据、不调阈值、不动词表。分档只决定「要不要解析」，本身不参与任何定罪，
+// 所以它算错的方向也只是少查一次 getChat，不会凭空多出一个可定罪的分数。
+// 加分项在 reasons 里恒以「+N 」开头（scoreAdProfile / scoreAdMessageText 的 add 约定）；
+// 减分是「-N 」，不计分的记录是全角括号。格式被 test_ad_links.mjs 钉死，改了会红。
+const AD_REASON_POSITIVE_RE = /^\+\d+\s/;
+
+function isAdProfileElevated(profile, options = {}) {
+	// 【为什么看「有没有加分项」而不是净分】净分会被豁免词压成负数：挂公开 t.me
+	// 链接的人一律 -3，而广告号的 bio 恰恰也常挂 t.me 频道 —— 拿净分当档位，
+	// 这类广告号会和正常博主一起掉进低档，正是要挡的那次漏。豁免词是【减分保护】，
+	// 它不能把「这个人身上有广告特征」这个事实一起抹掉。所以档位只问一件事：
+	// 资料卡与正文里，有没有任一条被计了分的特征。
+	const profileScore = scoreAdProfile(profile, {
+		whitelist: options.whitelist,
+		skipMissingBioPenalty: true
+	});
+	// 正文只在闸二那一侧有；入群线那时人刚进门、一条消息都没发过，据实传空。
+	// 漏传会让「资料干净但在正文里发广告」的人掉进低档，所以闸二必须传。
+	const textScore = options.text
+		? scoreAdMessageText(String(options.text), { whitelist: options.whitelist })
+		: { reasons: [] };
+	return profileScore.reasons.some((line) => AD_REASON_POSITIVE_RE.test(line))
+		|| textScore.reasons.some((line) => AD_REASON_POSITIVE_RE.test(line));
+}
+
+// 解析入口（带前置）：低档直接返回空数组 —— 与「资料干净的人」走形态闸的结果
+// 逐字节一致，下游 scoreAdProfileLinks([]) 得 0 分 0 条 reasons，判定逻辑零变化。
+async function resolveAdProfileLinksElevated(env, profile, options = {}) {
+	if (!isAdProfileElevated(profile, options)) return [];
+	return resolveAdProfileLinks(env, profile);
+}
+
 // 被挂账号的判据。【只加分，不产生 hardHit】—— 定罪仍要过原有阈值
 // （scoreThreshold / 指纹 / AI / 结构通道），链接这一层永远只是抬高总分的证据之一。
 //
@@ -13501,9 +13558,12 @@ async function resolveAdProfileLinks(env, profile) {
 // 串字符上，而在被挂账号写没写招揽、有没有案底。** 只挂链接、指向正常号、简介为空、
 // 查不到 —— 一律不加分，正常人挂自己的频道一个分都不涨。
 function scoreAdProfileLinks(links) {
-	if (!Array.isArray(links) || !links.length) return { score: 0, reasons: [] };
+	if (!Array.isArray(links) || !links.length) return { score: 0, reasons: [], scoredHandles: [] };
 	let score = 0;
 	const reasons = [];
+	// 本次【确实贡献了分】的 handle —— 自举案底只认这些。挂了个正常频道的广告号
+	// 被判广告时，那个正常频道一个分都没加，绝不该被标成广告位，否则连坐所有挂它的人。
+	const scoredHandles = [];
 	const add = (delta, label) => { score += delta; reasons.push((delta >= 0 ? '+' : '') + delta + ' ' + label); };
 
 	for (const link of links) {
@@ -13512,20 +13572,89 @@ function scoreAdProfileLinks(links) {
 		const kind = String(link.kind || 'unknown');
 		const title = String(link.title || '');
 		const about = String(link.about || '');
-		// ① 案底：我方账本判过它广告、或它还在黑名单里。这条最强 ——
-		//    它不是模式匹配，是已经发生过、还能被 /ignore 纠错掉的定罪。
-		if (link.adKnown) add(3, '挂的 @' + handle + ' 有广告案底（黑名单 / 曾被判定）');
+		// 广告位类型：只有频道 / 群 / bot 构成广告位，挂个人号一律不算 ——
+		// 与 +2 同一批。2026-09-08 主人口径是「挂个人号不构成广告位」，而 +3 此前
+		// 不筛 kind，会与它相悖：挂一个被封过的个人号照样 +3，测试里那条
+		//「挂个人号 → 0 分」的断言也就名不副实。两处口径现在一致。
+		const isAdSlot = ['channel', 'supergroup', 'group', 'bot'].includes(kind);
+		// 自举案底：这个 handle 已被我方确认过是广告位（见 confirmAdLinkOnBan）。
+		// 它与下面的「简介含招揽」同源 —— 当初正是那条 +2 触发后才标的，所以
+		// 已确认时只给 +3、跳过 +2，否则同一条简介会被算两遍（+5 虚高）。
+		const confirmed = link.adConfirmed === true;
+		// ① 案底：我方账本判过它广告、或它还在黑名单里、或已被自举确认。
+		//    这条最强 —— 它不是模式匹配，是已经发生过、还能被 /ignore 纠错掉的定罪。
+		//    【自举补上了原判据的死路】isAdKnownAccount 查的是用户黑名单，而频道/群的
+		//    chat id 是负数、两本账全是正数用户 id，永远查不到（线上 98 行案底命中 0）。
+		if (isAdSlot && (link.adKnown || confirmed)) {
+			add(3, '挂的 @' + handle + ' 有广告案底（黑名单 / 曾被判定）');
+			scoredHandles.push(handle);
+		}
 		// ② 被挂账号【自己写的简介】含招揽：这是攻击者写的引流落地页文案，
 		//    用打 bio 的同一条广告语境正则（金额承诺 / 灰产词 / 强招揽）打它 ——
-		//    判据同源，不新造一套。只认频道/群/bot：挂一个正常个人号不构成广告位。
-		if (['channel', 'supergroup', 'group', 'bot'].includes(kind)
-			&& about && AD_EXEMPT_CANCEL_RE.test(about)) {
+		//    判据同源，不新造一套。
+		if (isAdSlot && !confirmed && about && AD_EXEMPT_CANCEL_RE.test(about)) {
 			add(2, '挂的 @' + handle + '（' + kind + '「' + title.slice(0, 30) + '」）简介含招揽话术');
+			scoredHandles.push(handle);
 		}
 		// ③ 其余一律不加：kind=unknown（查不到）、about 为空（没设置或抓不到）、
 		//    kind=user（挂个人号）、正常技术/兴趣社群的简介。
 	}
-	return { score, reasons };
+	return { score, reasons, scoredHandles };
+}
+
+// ===== 自举案底：把这次判成广告的广告位记下来 =====
+//
+// 【补的是哪个洞】isAdKnownAccount 查的是「用户黑名单 + 判过且未回滚的用户快照」，
+// 这两本账里全是正数用户 id；而被挂频道/群的 getChat 返回的是负数 chat id。
+// 线上实测：blacklist 14934 行负数 0、有效快照 4546 行负数 0、ad_link_cache 98 行
+// 案底命中合计 0 —— 两个 id 命名空间永不相交，所以那条 +3 对频道/群从来没生效过。
+//
+// 案底因此改存在 ad_link_cache.ad_confirmed 上，语义是「这个 handle 被我方判过是
+// 广告位」。只在真正定罪时写、只写【本次贡献了分】的 handle，/ignore 可撤销。
+async function confirmAdLinkOnBan(env, evaluation) {
+	if (!env?.DB || evaluation?.verdict !== 'ban') return 0;
+	const handles = Array.isArray(evaluation?.snapshot?.scoredLinks)
+		? evaluation.snapshot.scoredLinks : [];
+	if (!handles.length) return 0;
+	if (!(await ensureAdLinkCacheTable(env))) return 0;
+	let marked = 0;
+	for (const handle of handles) {
+		const key = String(handle || '').toLowerCase();
+		if (!key) continue;
+		try {
+			const result = await env.DB.prepare(
+				'UPDATE ad_link_cache SET ad_confirmed = 1 WHERE handle = ?'
+			).bind(key).run();
+			// 影响 0 行 = 这个 handle 没进过缓存（写缓存那步被 D1 抖动吃掉了）——
+			// 记不住就不记，绝不为了「补一行」把 kind/about 猜着写进去。
+			if (Number(result?.meta?.changes || 0) > 0) marked += 1;
+		} catch (error) {
+			console.error('[广告检测·链接] 标记案底失败 handle=' + key + ':', error?.message || error);
+		}
+	}
+	if (marked) console.log('[广告检测·链接] 已标记广告位案底 ' + marked + ' 个');
+	return marked;
+}
+
+// /ignore 纠错：被误封的人挂的那个频道不能继续挂着「已确认广告位」，
+// 否则下一个人挂同款照样 +3 —— 与头像 / 会员标 / 正文图片的纠错完全同一理由。
+async function clearAdLinkConfirmedOnIgnore(env, handles) {
+	if (!env?.DB || !Array.isArray(handles) || !handles.length) return 0;
+	if (!(await ensureAdLinkCacheTable(env))) return 0;
+	let cleared = 0;
+	for (const handle of handles) {
+		const key = String(handle || '').toLowerCase();
+		if (!key) continue;
+		try {
+			const result = await env.DB.prepare(
+				'UPDATE ad_link_cache SET ad_confirmed = 0 WHERE handle = ?'
+			).bind(key).run();
+			if (Number(result?.meta?.changes || 0) > 0) cleared += 1;
+		} catch (error) {
+			console.error('[广告检测·链接] 撤销案底失败 handle=' + key + ':', error?.message || error);
+		}
+	}
+	return cleared;
 }
 
 function scoreAdProfile(profile, options = {}) {
@@ -13652,7 +13781,13 @@ function scoreAdProfile(profile, options = {}) {
 	}
 
 	// 下限 AD_SCORE_FLOOR（-3）而非 0：夹到 0 会让豁免词减分完全失效，详见该常量说明。
-	return { score: Math.max(AD_SCORE_FLOOR, score), rawScore: score, reasons, tradeHits, businessHits };
+	// scoredLinks：本次真的给分了的被挂 handle，随 evaluation 进快照 —— enforcement
+	// 那侧只拿得到 evaluation（与 badgeId / imageId / customEmojiIds 同一职责），
+	// 定罪时靠它决定要把哪些 handle 标成已确认广告位。上限 5 = AD_LINK_MAX_HANDLES。
+	return {
+		score: Math.max(AD_SCORE_FLOOR, score), rawScore: score, reasons, tradeHits, businessHits,
+		scoredLinks: (Array.isArray(linkResult.scoredHandles) ? linkResult.scoredHandles : []).slice(0, 5)
+	};
 }
 
 // 评分消息正文：入群后首条消息的兜底判定。
@@ -17465,6 +17600,11 @@ async function evaluateAdSuspect(env, input, options = {}) {
 			// 表现为「/ignore 说成功了，同模板下一个人照样被加 3 分」。
 			profileShape: shapeKey || '',
 
+			// 本次计了分的被挂 handle：定罪时拿它去标记自举案底（confirmAdLinkOnBan），
+			// /ignore 时拿它去撤标记（clearAdLinkConfirmedOnIgnore）。老快照没这个字段
+			// → 空数组 → 两端循环都不执行，与加它之前逐字节一致。
+			scoredLinks: (Array.isArray(profileResult?.scoredLinks) ? profileResult.scoredLinks : []).slice(0, 5),
+
 			forwardTitle: String(input?.forwardChat?.title || '').slice(0, 120)
 		}
 	};
@@ -17792,6 +17932,20 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		};
 	}
 
+	// ===== 自举案底：这次定罪把哪几个被挂 handle 坐实了 =====
+	// 【为什么在这个位置】必须在上面演练分支之后 —— 演练的定义是一个动作都不做，
+	// 给广告位盖章同样是「动作」。往下的 noteParts / 加黑 / 全群封禁 / 四类学习
+	// 也都在这里之后，与它们同一个位置语义。
+	// 只标 snapshot.scoredLinks 里【本次真的加过分】的 handle：挂了个正常频道的
+	// 广告号被封时，那个正常频道一个分都没加，绝不能被盖成广告位，否则连坐所有
+	// 挂它的人 —— 这正是会员标那次误封的同一类连坐。
+	try {
+		await confirmAdLinkOnBan(env, evaluation);
+	} catch (error) {
+		// 案底记不上只意味着下次少一条 +3，不能因此把整次处置判失败。
+		console.error('[广告检测·链接] 案底标记异常:', error?.message || error);
+	}
+
 	const noteParts = [
 		'广告自动判定',
 		AD_LAYER_LABELS[evaluation.layer] || evaluation.layer,
@@ -18050,15 +18204,20 @@ async function screenAdJoinMember(env, member, options = {}) {
 		profile.status = '';
 		await markAdBioChecked(env, userId, nowSeconds);
 
+		// config / whitelist 必须先于链接解析拿到：前置分档要用同一份白名单算资料卡分，
+		// 与下面 evaluateAdSuspect 里那次保持同源。两行都是幂等读取，提前不改语义。
+		const config = options.config || loadAdDetectionConfig(env);
+		const whitelist = options.whitelist || await loadAdDomainWhitelist(env);
+
 		// ===== 解析资料里挂的频道 / 群 / bot（对齐 menshen resolveLink）=====
 		// 放在这里的理由：入群是「一次定终身」的事件，前面还有三天冷却锁兜着，
 		// 多花的 0~5 个 getChat 摊到每个人一生只有一次；而进群那一刻正是 menshen
 		// 冷判定（coldjudge）跑链接解析的同一条时机 —— 你要的「进群直接拦」靠它。
 		// 形态闸在 extractAdProfileHandles：bio 里没有 @xxx / t.me/xxx 就一个请求都不发。
-		profile.adLinks = await resolveAdProfileLinks(env, profile);
-
-		const config = options.config || loadAdDetectionConfig(env);
-		const whitelist = options.whitelist || await loadAdDomainWhitelist(env);
+		// 【先判人，再查链接】2026-10-07 主人要的前置判定：资料卡与正文净分都不到 1 分的
+		// 正常人直接返回空数组，一个 getChat 都不花 —— 形态闸管「有没有链接可查」，
+		// 这道管「值不值得为他查」，两道各管一半。
+		profile.adLinks = await resolveAdProfileLinksElevated(env, profile, { whitelist });
 
 		// ===== 入群专用封禁线 =====
 		// 见 DEFAULT_AD_JOIN_SCORE_THRESHOLD 的说明：进群那一刻只有资料卡一份证据，
@@ -18524,7 +18683,14 @@ async function detectAdOnMessage(message, env) {
 	// 缓存 6 小时 —— 群里十个人挂同一个频道只查第一次。形态闸同样兜底：
 	// bio 里没有链接形态，这一步连一个请求都不发。
 	// 闸一不走这里，「闸一定罪零 getChat」三条断言不受影响。
-	profile.adLinks = await resolveAdProfileLinks(env, profile);
+	// 【先判人，再查链接】与入群线同一道前置。闸二这边必须把正文一起传进去 ——
+	// 资料卡干净但正文在发广告的人要靠 textScore 抬进高档，漏传就会把这类人
+	// 挡在解析之外，白丢掉他挂的链接那 2~3 分。口径与下面 evaluateAdSuspect
+	// 那次的 `text || contactName` 完全一致，两处算的是同一份证据。
+	profile.adLinks = await resolveAdProfileLinksElevated(env, profile, {
+		whitelist,
+		text: text || contactName
+	});
 
 	// 据实传：getChat 成功就正常判定（空 bio 该减分就减），失败则跳过减分。
 	// 两轨用同一个判断依据（profile.bioFetched），阈值与判据完全一致，不另立标准。
@@ -18622,6 +18788,10 @@ function adPayloadFromSnapshot(snapshot) {
 		// 就会「说成功了」却一行都没清，同款图下一个人照样命中。老快照无此字段，
 		// 还原成空串，回滚端读到空串自动跳过。
 		imageId: String(snap.imageId || ''),
+		// 本次计了分的被挂 handle。同样是【白名单重建】—— 漏了它，/ignore 就撤不掉
+		// 自举案底，被误封的人挂的那个频道仍挂着「已确认广告位」，下一个人挂同款
+		// 照样 +3。老快照无此字段 → 空数组 → 回滚端循环不执行。
+		scoredLinks: Array.isArray(snap.scoredLinks) ? snap.scoredLinks : [],
 		// 资料形状主键。与 avatarId 同理：这是一份【白名单重建】，
 		// 漏一个字段整条纠错链路就静默失效 —— /ignore 会「说成功了」，
 		// 但同模板的下一个人照样被加 3 分，谁也看不出来哪里断了。
@@ -18926,6 +19096,11 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	// 会被连坐，而且图片比头像更容易被多人正常转发，这个口子必须同时堵上。
 	// 老快照冻结于图片功能上线之前，还原出的 imageId 是空串 → 本步自动跳过。
 	const imageCleared = await clearAdImageOnIgnore(env, payload?.imageId);
+	// 被挂链接的自举案底同步纠错：与头像 / 会员标 / 正文图片完全同一理由 ——
+	// 这个号既然是误封，他挂的那个频道就不能继续挂着「已确认广告位」，否则
+	// 下一个人挂同款照样 +3，连坐持续到缓存被自然覆盖为止。
+	// 老快照没有 scoredLinks 字段 → 空数组 → 循环不执行，与加它之前逐字节一致。
+	const linkConfirmedCleared = await clearAdLinkConfirmedOnIgnore(env, payload?.scoredLinks);
 	// purge: true —— 主人已明确说这是误判，命中的指纹当次即删，不再攒 3 次误报。
 	// 同批改动拆掉了自动学习的强动词闸门，指纹写入变宽，纠错端必须同步变快。
 	const fp = await markAdFingerprintFalsePositive(env, payload, { purge: true });
@@ -18939,7 +19114,7 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
 	await deleteAdScreening(env, targetId);
 	await deleteAdPendingSnapshot(env, ownerId, seq);
-	return { targetId, removed, unbanSummary, fp, sampleRemoved, avatarCleared, badgeCleared, bodyEmojiCleared, imageCleared, shapeCleared };
+	return { targetId, removed, unbanSummary, fp, sampleRemoved, avatarCleared, badgeCleared, bodyEmojiCleared, imageCleared, linkConfirmedCleared, shapeCleared };
 }
 
 // /ignore 单次最多处理多少个序号。

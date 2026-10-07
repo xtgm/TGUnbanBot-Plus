@@ -394,7 +394,14 @@ section('[6] payload.badgeId 与 /ignore 快照往返');
 	// 快照还原端（白名单重建）—— 漏一个字段整条纠错链路静默失效
 	assert('adPayloadFromSnapshot 还原 badgeId', src.includes('badgeId: String(snap.badgeId || \'\'),'), '');
 	assert('/ignore 回滚调用 clearAdBadgeOnIgnore', src.includes('clearAdBadgeOnIgnore(env, payload?.badgeId)'), '');
-	assert('/ignore 返回结果含 badgeCleared', src.includes('avatarCleared, badgeCleared, bodyEmojiCleared, imageCleared, shapeCleared'), '');
+	// 逐字段断言 + 必须都在同一个 return 行里：比整串精确匹配健壮（新增纠错字段
+	// 不会撞红），又不像单看字段名那样松 —— 漏写在 return 里照样抓得到。
+	const ignoreReturnLine = src.split('\r\n')
+		.find((l) => l.includes('return { targetId, removed, unbanSummary, fp, sampleRemoved')) || '';
+	assert('/ignore 返回结果含 badgeCleared',
+		['avatarCleared', 'badgeCleared', 'bodyEmojiCleared', 'imageCleared', 'shapeCleared']
+			.every((f) => ignoreReturnLine.includes(f)),
+		ignoreReturnLine.slice(0, 200));
 }
 
 // ================= [7] 接入点与定罪即学习 =================
