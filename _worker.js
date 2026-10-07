@@ -15547,13 +15547,37 @@ async function applyAvatarToEvaluation(env, evaluation, profile) {
 // 一条 Telegram 消息只有一个媒体载体，按固定顺序取第一个命中的。
 // photo 是【升序的尺寸数组】，最后一项即最大尺寸 —— 同一张图各尺寸的
 // file_unique_id 是同一个，取哪项都对，取最大项只为语义清晰。
+//
+// 【visionFileId 才是真正该下载给模型的那个】官方对 Sticker 的原文：
+//   type   —— "regular"/"mask"/"custom_emoji"，与格式无关
+//   format —— 由 is_animated 与 is_video 决定：静态 .webp、animated .tgs、video .webm
+//   thumbnail —— "Sticker thumbnail in the .WEBP or .JPG format"
+// moondream 只吃位图，animated/video 贴纸的【本体不是位图】，拿
+// data:image/webp 去装 .tgs 字节必然解析失败 —— 而失败会计入 failed 并
+// 推进 vision_checked_at，等于这张图【永久跳过、再也不看】。Telegram 现在
+// 主推的正是这两类贴纸，所以必须改下它的静态 thumbnail。
+// 没有 thumbnail 的（如 document）返回空串，队列条件 file_id != '' 会把它
+// 挡在推理之外，只留 L1 同款复用这一条路 —— 宁可不判，也不能判一次就废。
 function extractAdMedia(message) {
 	if (!message) return null;
 	const pick = (node, kind) => {
 		if (!node) return null;
 		const fileUniqueId = String(node.file_unique_id || '');
 		if (!fileUniqueId) return null;
-		return { kind, fileUniqueId, fileId: String(node.file_id || '') };
+		const thumb = node.thumbnail || node.thumb || null;
+		const thumbFileId = String(thumb?.file_id || '');
+		// 本体是不是 moondream 能直接吃的静态位图
+		let bodyIsBitmap = false;
+		if (kind === 'photo') bodyIsBitmap = true;
+		else if (kind === 'sticker') bodyIsBitmap = !node.is_animated && !node.is_video;
+		// animation 是 GIF/H.264、video 是容器、document 格式未知 —— 一律不取本体。
+		const visionFileId = bodyIsBitmap ? String(node.file_id || '') : thumbFileId;
+		return {
+			kind,
+			fileUniqueId,
+			fileId: String(node.file_id || ''),
+			visionFileId
+		};
 	};
 	if (Array.isArray(message.photo) && message.photo.length) {
 		return pick(message.photo[message.photo.length - 1], 'photo') || null;
@@ -15562,6 +15586,23 @@ function extractAdMedia(message) {
 		|| pick(message.animation, 'animation')
 		|| pick(message.video, 'video')
 		|| pick(message.document, 'document');
+}
+
+// 按字节头猜图片 MIME。比「按 kind 猜」可靠得多 —— kind 只说明载体类型，
+// 说明不了里面到底是什么字节；而下载之后最权威的信息就是文件头。
+// 认不出来返回 null，调用方据此跳过推理（不去猜、不拿错格式硬喂模型）。
+function sniffImageMime(bytes) {
+	if (!bytes || bytes.length < 12) return null;
+	// PNG: 89 50 4E 47
+	if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+	// JPEG: FF D8 FF
+	if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+	// GIF: "GIF8"
+	if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) return 'image/gif';
+	// WEBP: "RIFF" .... "WEBP"
+	if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
+		&& bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp';
+	return null;
 }
 
 // 读一条图片指纹。查不到返回 null（= 未入库，既不是 ad 也不是 clean）。
@@ -15584,9 +15625,13 @@ async function readAdImage(env, fileUniqueId) {
 async function registerAdImage(env, media, userId) {
 	const fileUniqueId = String(media?.fileUniqueId || '');
 	if (!env?.DB || !fileUniqueId) return false;
+	// file_id 是【下载句柄】，存 visionFileId 而不是本体的 fileId ——
+	// animated/video 贴纸的本体不是位图，能下的是 thumbnail；
+	// visionFileId 为空（无 thumbnail）时写空串，队列条件 file_id != ''
+	// 会把它挡在推理队列外，只留 L1 同款复用，不给它一次必失败的推理机会。
 	return upsertAdImage(env, fileUniqueId, {
 		verdict: 'pending',
-		fileId: String(media?.fileId || ''),
+		fileId: String(media?.visionFileId || ''),
 		kind: String(media?.kind || ''),
 		lastUserId: String(userId || '')
 	});
@@ -16235,6 +16280,12 @@ const AD_IMAGE_VISION_PROMPT = '这是社交软件聊天记录里的一条【图
 	+ '以下一律【不是】广告：自拍、风景、宠物、家人、动漫与表情包、梗图、'
 	+ '群聊截图（截的是文字对话）、文档与代码截图、菜单与价目表照片、'
 	+ '游戏与软件界面、纯色与普通图案。'
+	// 【唯一例外，优先级高于上面那条豁免】色情本身就是一个广告类型（色情广告），
+	// 而贴纸 / 表情包 / 动漫只是载体 —— 载体不构成豁免。原措辞里
+	//「色情即广告」与「表情包一律不是广告」两条同时命中一张色情贴纸，
+	// 模型判哪边都算合规，等于这条判据随机失效。
+	+ '【唯一例外】上面任何一类只要含色情内容，一律判 true —— 色情是广告类型，'
+	+ '表情包 / 贴纸 / 动漫这个载体不豁免；普通表情包（不含色情）照旧不判。'
 	+ '拿不准就判 false —— 这一层只加分与进观察，宁可漏判也不能误伤正常发言。'
 	+ '只输出 JSON，不要任何其它文字，格式：{"ad":true 或 false,"text":"图中读到的文字，没有则空","reason":"一句话理由"}';
 
@@ -16440,9 +16491,12 @@ async function runAdImageVision(env, options = {}) {
 			const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
 			if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
 			const buffer = await imageResponse.arrayBuffer();
-			// photo 是 jpeg，sticker 是 webp —— data URI 的 MIME 按 kind 定，
-			// 与 getFile 返回的扩展名无关（Telegram 的 file_path 扩展名不可靠）。
-			const mime = String(row.kind) === 'sticker' ? 'image/webp' : 'image/jpeg';
+			// 按字节头认格式，不按 kind 猜。kind 只说明载体类型（photo/sticker），
+			// 说明不了里面是什么字节 —— 存量行存的可能是本体，新行存的是 thumbnail，
+			// 两者格式不同但都要能认出来。认不出就跳过，绝不拿错格式硬喂模型
+			// （喂错格式 = 模型抛错 = 计 failed，那正是这个 bug 的原貌）。
+			const mime = sniffImageMime(new Uint8Array(buffer));
+			if (!mime) throw new Error('下载到的不是位图（可能是 .tgs / .webm 容器），跳过推理');
 			const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
 			const aiResult = await env.AI.run(AD_IMAGE_VISION_MODEL, { image, task: 'query', question: AD_IMAGE_VISION_PROMPT });
 			const parsed = parseAvatarVisionAnswer(aiResult?.answer ?? aiResult?.output ?? aiResult);

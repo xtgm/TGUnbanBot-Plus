@@ -192,6 +192,47 @@ section('[1] ad_images 表与 extractAdMedia');
 		{ file_id: 'b', file_unique_id: 'U_BIG' }
 	] });
 	assert('photo 取最大尺寸那一项', p?.kind === 'photo' && p.fileUniqueId === 'U_BIG' && p.fileId === 'b', JSON.stringify(p));
+	// ===== visionFileId：真正该下载给模型的那个（批次 A 的核心）=====
+	// photo 本体是 jpeg，直接下本体
+	assert('photo 的 visionFileId = 本体', p.visionFileId === 'b', JSON.stringify(p));
+
+	// 静态贴纸（is_animated=false / is_video=false）本体是 .webp，也是位图 → 下本体
+	const staticSticker = W.extractAdMedia({ sticker: {
+		file_id: 'STK_BODY', file_unique_id: 'U_STK_STATIC', is_animated: false, is_video: false
+	} });
+	assert('静态贴纸 visionFileId = 本体', staticSticker.visionFileId === 'STK_BODY', JSON.stringify(staticSticker));
+
+	// animated 贴纸本体是 .tgs（Lottie 容器，不是位图）→ 必须改下 thumbnail
+	// （官方原文：Sticker thumbnail in the .WEBP or .JPG format）
+	const animSticker = W.extractAdMedia({ sticker: {
+		file_id: 'STK_TGS', file_unique_id: 'U_STK_ANIM', is_animated: true, is_video: false,
+		thumbnail: { file_id: 'STK_THUMB' }
+	} });
+	assert('animated 贴纸 visionFileId = thumbnail 而非本体',
+		animSticker.visionFileId === 'STK_THUMB' && animSticker.fileId === 'STK_TGS', JSON.stringify(animSticker));
+
+	// video 贴纸本体是 .webm → 同样走 thumbnail
+	const videoSticker = W.extractAdMedia({ sticker: {
+		file_id: 'STK_WEBM', file_unique_id: 'U_STK_VIDEO', is_animated: false, is_video: true,
+		thumbnail: { file_id: 'STK_THUMB2' }
+	} });
+	assert('video 贴纸 visionFileId = thumbnail', videoSticker.visionFileId === 'STK_THUMB2', JSON.stringify(videoSticker));
+
+	// 没有 thumbnail 的 animated 贴纸 → 空串，队列条件 file_id != '' 会把它挡在外面
+	// （宁可不判，也不能给它一次必然失败、失败后永久跳过的推理）
+	const noThumb = W.extractAdMedia({ sticker: {
+		file_id: 'STK_TGS2', file_unique_id: 'U_STK_NOTHUMB', is_animated: true, is_video: false
+	} });
+	assert('animated 且无 thumbnail → visionFileId 为空（不进推理队列）', noThumb.visionFileId === '', JSON.stringify(noThumb));
+
+	// document 格式未知，本体一律不下
+	const doc = W.extractAdMedia({ document: { file_id: 'DOC_1', file_unique_id: 'U_DOC_1' } });
+	assert('document 不下本体 → visionFileId 为空', doc.visionFileId === '', JSON.stringify(doc));
+	// animation 本体是 GIF/H.264，非位图；官方 Animation 有 thumbnail
+	const anim = W.extractAdMedia({ animation: {
+		file_id: 'GIF_1', file_unique_id: 'U_ANI_1', thumbnail: { file_id: 'GIF_THUMB' }
+	} });
+	assert('animation visionFileId = thumbnail', anim.visionFileId === 'GIF_THUMB', JSON.stringify(anim));
 
 	assert('sticker 能取', W.extractAdMedia({ sticker: { file_id: 's', file_unique_id: 'U_STK' } })?.kind === 'sticker');
 	assert('animation 能取', W.extractAdMedia({ animation: { file_id: 'g', file_unique_id: 'U_ANI' } })?.kind === 'animation');
@@ -200,6 +241,26 @@ section('[1] ad_images 表与 extractAdMedia');
 	assert('纯文本消息返回 null（不触发任何图片判据）', W.extractAdMedia({ text: '你好' }) === null);
 	assert('没有 file_unique_id 的媒体返回 null', W.extractAdMedia({ photo: [{ file_id: 'x' }] }) === null);
 	assert('空消息返回 null', W.extractAdMedia(null) === null);
+
+	// ===== sniffImageMime：按字节头认格式，认不出就返回 null =====
+	const bytes = (...arr) => new Uint8Array(arr);
+	const riff = (...tail) => new Uint8Array([...[0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0], ...tail, 0, 0, 0, 0]);
+	assert('PNG 头 → image/png',
+		W.sniffImageMime(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0)) === 'image/png');
+	assert('JPEG 头 → image/jpeg',
+		W.sniffImageMime(bytes(0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0)) === 'image/jpeg');
+	assert('WEBP 头 → image/webp',
+		W.sniffImageMime(riff(0x57, 0x45, 0x42, 0x50)) === 'image/webp');
+	assert('GIF 头 → image/gif',
+		W.sniffImageMime(bytes(0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0, 0, 0, 0, 0, 0)) === 'image/gif');
+	// .tgs 是 gzip 压的 Lottie JSON（头 1F 8B）、.webm 是 EBML（头 1A 45 DF A3）
+	// —— 两者都不是位图，返回 null 让调用方跳过推理，而不是喂错格式去烧额度
+	assert('.tgs(gzip) 不是位图 → null',
+		W.sniffImageMime(bytes(0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0, 0, 0)) === null);
+	assert('.webm(EBML) 不是位图 → null',
+		W.sniffImageMime(bytes(0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0, 0, 0, 0, 0)) === null);
+	assert('字节太少 → null', W.sniffImageMime(bytes(0x89, 0x50)) === null);
+	assert('空输入 → null', W.sniffImageMime(null) === null);
 }
 
 // ================= [2] 分档判据（纯函数，比头像严一档） =================
@@ -291,10 +352,25 @@ section('[4] readAdImage / loadAdImageForMessage');
 	assert('无媒体时零 D1 读', env.DB._sql.length === 0, JSON.stringify(env.DB._sql));
 
 	// 首次见到 → 登记 pending 并返回 null（未入库 ≠ clean，不参与裁决）
-	const firstSeen = await W.loadAdImageForMessage(env, { kind: 'photo', fileUniqueId: 'IMG_NEW_1', fileId: 'F_NEW' }, '999');
+	// 注意这里传 visionFileId：registerAdImage 存的是【该下载的那个】，
+	// 不是本体 fileId —— 批次 A 改的就是这一步，测试必须按新语义传参，
+	// 否则断言的是个代码根本不会读的字段（等于白测）。
+	const firstSeen = await W.loadAdImageForMessage(env, { kind: 'photo', fileUniqueId: 'IMG_NEW_1', fileId: 'BODY_1', visionFileId: 'VISION_1' }, '999');
 	assert('首次见到返回 null（未判，不参与裁决）', firstSeen === null, JSON.stringify(firstSeen));
 	assert('首次见到登记为 pending（L2 才有队列可取）',
 		env.DB.query('SELECT verdict FROM ad_images WHERE file_unique_id = ?', 'IMG_NEW_1')[0]?.verdict === 'pending');
+	assert('file_id 存的是 visionFileId（该下载的那个），不是本体 fileId',
+		env.DB.query('SELECT file_id FROM ad_images WHERE file_unique_id = ?', 'IMG_NEW_1')[0]?.file_id === 'VISION_1',
+		JSON.stringify(env.DB.query('SELECT file_id FROM ad_images WHERE file_unique_id = ?', 'IMG_NEW_1')));
+
+	// animated 贴纸且无 thumbnail → visionFileId 为空 → file_id 写空串
+	// → 队列条件 file_id != '' 把它挡在推理之外，只留 L1 同款复用。
+	await W.loadAdImageForMessage(env, { kind: 'sticker', fileUniqueId: 'IMG_NOVISON_1', fileId: 'TGS_BODY', visionFileId: '' }, '999');
+	assert('无 thumbnail 的贴纸 file_id 落成空串',
+		env.DB.query('SELECT file_id, verdict FROM ad_images WHERE file_unique_id = ?', 'IMG_NOVISON_1')[0]?.file_id === '',
+		JSON.stringify(env.DB.query('SELECT file_id, verdict FROM ad_images WHERE file_unique_id = ?', 'IMG_NOVISON_1')));
+	assert('它仍登记为 pending（L1 指纹照常可用）',
+		env.DB.query('SELECT verdict FROM ad_images WHERE file_unique_id = ?', 'IMG_NOVISON_1')[0]?.verdict === 'pending');
 	const secondSeen = await W.loadAdImageForMessage(env, { kind: 'photo', fileUniqueId: 'IMG_NEW_1', fileId: 'F_NEW' }, '999');
 	assert('第二次同款读得回行', secondSeen?.verdict === 'pending', JSON.stringify(secondSeen));
 }
@@ -339,9 +415,15 @@ section('[6] runAdImageVision · 队列 / kind 过滤 / 熔断 / 关闭');
 	await W.upsertAdImage(envKind, 'IMG_K_VID', { verdict: 'pending', fileId: 'F_VD', kind: 'video' });
 	await W.upsertAdImage(envKind, 'IMG_K_DOC', { verdict: 'pending', fileId: 'F_DC', kind: 'document' });
 	await W.upsertAdImage(envKind, 'IMG_K_STK', { verdict: 'pending', fileId: 'F_ST', kind: 'sticker' });
+	// 有 thumbnail 才有得下：animated 贴纸且无 thumbnail 的那类 file_id 是空串，
+	// 必须被 file_id != '' 挡住 —— 它 kind 也在白名单里，只能靠这一条拦。
+	await W.upsertAdImage(envKind, 'IMG_K_NOTHUMB', { verdict: 'pending', fileId: '', kind: 'sticker' });
 	resetCalls();
 	const kindStats = await W.runAdImageVision(envKind);
-	assert('队列只取 photo 与 sticker（4 张里取 2）', kindStats.queued === 2, JSON.stringify(kindStats));
+	assert('队列只取 photo 与 sticker 且 file_id 非空（5 行里取 2）', kindStats.queued === 2, JSON.stringify(kindStats));
+	assert('无 thumbnail 的贴纸没被取出来（不会白烧一次必然失败的推理）',
+		envKind.DB.query('SELECT vision_checked_at FROM ad_images WHERE file_unique_id = ?', 'IMG_K_NOTHUMB')[0]?.vision_checked_at === 0,
+		JSON.stringify(envKind.DB.query('SELECT vision_checked_at FROM ad_images WHERE file_unique_id = ?', 'IMG_K_NOTHUMB')));
 	assert('只调了 2 次 getFile', countCalls('getFile') === 2, 'getFile=' + countCalls('getFile'));
 	const animRow = envKind.DB.query('SELECT verdict, vision_checked_at FROM ad_images WHERE file_unique_id = ?', 'IMG_K_ANIM')[0];
 	assert('动图永远留在 pending 且不被反复取出', animRow.verdict === 'pending' && Number(animRow.vision_checked_at) === 0, JSON.stringify(animRow));
