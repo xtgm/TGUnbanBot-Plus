@@ -11940,6 +11940,21 @@ function containsAdProtectedUsername(value) {
 const AD_SYMMETRIC_EMOJI_RE = /^([\p{Emoji_Presentation}☀-➿]{1,3})(.+)\1$/u;
 const AD_NUMERIC_PREFIX_RE = /^[1-9][\p{Emoji_Presentation}☀-➿]/u;
 const AD_HAS_EMOJI_RE = /[\p{Emoji_Presentation}☀-➿]/u;
+// ===== emoji 伪装骨架（批次 B-1）=====
+// 广告把「点击查看」写成「点⚔️查」「点💰看」—— emoji 插进词的中间，
+// 词表按【连续字】匹配就直接失败。主人给的六张正文样本里 4/4 都是这个结尾，
+// 而现有的去混淆拦不住它，两个原因：
+//   ① 分隔符表里根本没有 emoji（AD_CHAR_SPLIT_SEP_STRICT / _LOOSE 都不含）
+//   ② 签名要求「连续 ≥3 组 CJK + 分隔符」，而「点⚔️查」只有 1 组，够不着门槛
+// 所以这一档判的是【规避行为本身】（用 emoji 切断关键词），不判 emoji 是什么 ——
+// emoji 内容随时换、包也随时换，切断这个词的动作不会变。
+//
+// 字符类要同时覆盖三种：Emoji_Presentation 属性字、☀-➿ 字面范围（⚔ U+2694 落在这里）、
+// 1F000-1FAFF（💰 U+1F4B0 这类）以及变体选择符 FE0F / FE0E ——
+// 漏掉 FE0F 会在「点⚔️查」的 ⚔ 和 查 之间断开，整条正则永远匹配不上。
+const AD_EMOJI_SPLICE_RE = /点(?:\p{Emoji_Presentation}|[☀-➿]|[\u{1F000}-\u{1FAFF}]|[\uFE0E\uFE0F]){1,6}[看查]/u;
+// 单证不定分：正常人也会发「点👍看教程」。计分必须同时有承诺/招揽语境。
+const AD_EMOJI_SPLICE_SCORE = 3;
 const AD_LINK_RE = /(@[A-Za-z0-9_]{5,}|t\.me\/[^\s]+|https?:\/\/[^\s]+)/;
 const AD_BOT_MENTION_RE = /@[A-Za-z0-9_]{2,}bot\b/i;
 // 随机 username：只认「字母与数字交替出现」的机器批量生成形态。
@@ -13639,6 +13654,26 @@ function scoreAdMessageText(text, options = {}) {
 	// 所以给到接近定罪的分量；配合 A2 的去混淆匹配，两条同时命中基本就是 7 分阈值。
 	if (hasAdCharSplitObfuscation(source)) add(4, '正文逐字分隔混淆（规避词表匹配）');
 	if (hasAdRepeatedSegment(source)) add(1, '正文重复段落');
+
+	// ===== emoji 切断关键词（批次 B-1）=====
+	// 形态：点 + emoji + 看/查（「点⚔️查」「点💰看」）—— 广告用 emoji 把「点击查看」
+	// 从中间切开，词表按连续字匹配就失效。这是【规避行为】不是内容，内容换多少次都一样。
+	//
+	// 【单证不定分】正常人也会发「点👍看教程」，所以只有骨架一律不计分、只记 reasons；
+	// 必须同时有承诺/招揽语境才加 —— 那正好是主人反复要求的「多特征组合，单特征易误封」。
+	// 承诺/招揽词一律复用现成的判据源（交易动词、业务关键词、金额收益、招揽动作），
+	// 不为此新建词表：每加一张词表就多一片误封面。
+	const emojiSpliceHit = AD_EMOJI_SPLICE_RE.test(source);
+	if (emojiSpliceHit) {
+		const spliceMatch = String(source.match(AD_EMOJI_SPLICE_RE) || '');
+		const hasSolicitContext = tradeHits.length > 0 || businessHits.length > 0
+			|| AD_MONEY_GAIN_RE.test(source) || AD_MONEY_SOLICIT_RE.test(source);
+		if (hasSolicitContext) {
+			add(AD_EMOJI_SPLICE_SCORE, 'emoji 切断关键词（' + spliceMatch + '）且有承诺/招揽语境');
+		} else {
+			reasons.push('（emoji 切断关键词，单证不定分：' + spliceMatch + '）');
+		}
+	}
 
 	const exemptHits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
 	if (exemptHits.length) {
@@ -15666,8 +15701,10 @@ function applyBadgeVerdict(evaluation, badge) {
 	if (String(badge.verdict || '') !== 'ad') return evaluation;
 	const hits = Number(badge.hits) || 0;
 	const hasCorroboration = (evaluation.reasons || []).length > 0 || (Number(evaluation.score) || 0) >= 2;
+	// 文案对两种来源都成立：昵称旁的会员标与正文里的贴纸 emoji 共用这张表、
+	// 这道阀，所以措辞是「自定义 emoji 素材」而不是专指会员标。
 	const reasons = (evaluation.reasons || []).concat([
-		'同款广告会员标（挂过它且被定罪 ' + hits + ' 次）'
+		'同款自定义 emoji 素材（挂过它且被定罪 ' + hits + ' 次）'
 		+ (hits >= AD_BADGE_BAN_HITS && hasCorroboration ? '' : '，单证不足不单独定罪')
 	]);
 	let verdict = evaluation.verdict;
@@ -15678,15 +15715,117 @@ function applyBadgeVerdict(evaluation, badge) {
 	return Object.assign({}, evaluation, { verdict, reasons });
 }
 
-// 异步包装：有会员标就读库叠判。没标（闸一恒为空、getChat 失败、挂官方蓝星的号
-// 若不带这个字段）直接原样返回 —— 于是闸一热路径零 D1 读、零 Telegram 请求。
+// 叠判入口：一次处理【昵称旁的会员标】与【正文里的自定义贴纸 emoji】两件事。
+// 两者同源（都是 custom emoji、同一个数字 id 体系）、同表（ad_badges）、同阀
+// （AD_BADGE_BAN_HITS + 必须有佐证），所以合成一个入口 —— 5 个调用点一个都不用改，
+// 只要调用方把 profile.customEmojiIds 挂上即可。
 async function applyBadgeToEvaluation(env, evaluation, profile) {
+	let current = evaluation;
+	if (!current) return current;
+	// ① 昵称旁的会员标（批次 C）：id 在 getChat 的 ChatFullInfo 里。
 	const badgeId = String(profile?.badgeId || '');
-	if (!evaluation || !badgeId) return evaluation;
-	const badge = await readAdBadge(env, badgeId);
-	if (!badge) return evaluation;
-	return applyBadgeVerdict(evaluation, badge);
+	if (badgeId) {
+		const badge = await readAdBadge(env, badgeId);
+		if (badge) current = applyBadgeVerdict(current, badge);
+	}
+	// ② 正文里的自定义贴纸 emoji（批次 B-2）：id 在 update 的 entities 里，
+	//    闸一就拿得到 —— 所以这一半连 getChat 都不需要，纯查库。
+	const ids = Array.isArray(profile?.customEmojiIds) ? profile.customEmojiIds : [];
+	for (const id of ids) {
+		if (!id || id === badgeId) continue;
+		const badge = await readAdBadge(env, id);
+		if (badge) current = applyBadgeVerdict(current, badge);
+	}
+	return current;
 }
+
+// ===== 正文里的自定义贴纸 emoji（批次 B-2）=====
+//
+// 【它与会员标是同一种东西】都叫 custom emoji、都由贴纸包生成、都只有一个数字 id；
+// 差别只在贴的位置 —— 贴在昵称旁是 emoji status（批次 C），插进消息正文是这一层。
+//
+// 【为什么必须读 entities】message.text 里【没有它】：正文位置只存一个 id，
+// 图不随消息走。全文件此前 custom_emoji 处理 0 处，等于这整类素材从未进过检测。
+//
+// 【成本怎么压】
+//   · 形态闸：正文没有 custom_emoji 实体 → 返回空数组 → 一个请求都不发
+//     （绝大多数消息是普通文本，连 ids 都凑不出来）
+//   · 闸一只做【查库】：ids 在 update 里现成带着，查 ad_badges 是 D1 不是 Telegram 请求
+//     —— 于是闸一「零 Telegram 请求」这个不变量原样保住
+//   · 闸二才调 getCustomEmojiStickers 拿贴纸包名（本来就已经为这次判定花过 getChat）
+//   · 结果按 id 进程内缓存，同一贴纸包第二次起零请求
+function extractCustomEmojiIds(message) {
+	const entities = message?.entities || message?.caption_entities;
+	if (!Array.isArray(entities) || !entities.length) return [];
+	// 去重：同一条正文里重复贴同一个 emoji 很常见，不去重会让同 id 被反复查库，
+	// 也会让定罪学习对同一个 id 重复 +1（hits 虚高会提前拱开安全阀）。
+	const seen = new Set();
+	const ids = [];
+	for (const entity of entities) {
+		if (entity?.type !== 'custom_emoji') continue;
+		const id = String(entity.custom_emoji_id || '');
+		if (!id || seen.has(id)) continue;
+		seen.add(id);
+		ids.push(id);
+	}
+	return ids;
+}
+
+// 进程内缓存：id → 贴纸包名 / 对应标准 emoji。TTL 与资料缓存对齐。
+const AD_CUSTOM_EMOJI_CACHE = new Map();
+const AD_CUSTOM_EMOJI_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const AD_CUSTOM_EMOJI_CACHE_MAX = 2000;
+
+// 查自定义 emoji 的完整信息（贴纸包名 set_name、对应的标准 emoji）。
+// 返回 { id → { set_name, emoji } }，查不到的 id 不进结果（由调用方按「未知」处理）。
+// 【429 / 5xx 不缓存】否则一次限流会把这条链路按死 6 小时，
+// 与 resolveAdLink 的 cacheable 处理同一口径。
+async function resolveCustomEmojiStickers(env, ids) {
+	const wanted = (Array.isArray(ids) ? ids : [])
+		.map((id) => String(id || '')).filter(Boolean);
+	const out = {};
+	if (!wanted.length || !BOT_TOKEN) return out;
+	const now = Date.now();
+	const pending = [];
+	for (const id of wanted) {
+		const hit = AD_CUSTOM_EMOJI_CACHE.get(id);
+		if (hit && hit.expiresAt > now) out[id] = hit.value;
+		else pending.push(id);
+	}
+	if (!pending.length) return out;
+	try {
+		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getCustomEmojiStickers', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ custom_emoji_ids: pending.slice(0, 200) })
+		});
+		const result = await response.json();
+		const cacheable = response.status !== 429 && response.status < 500
+			&& !/429|too many requests|internal server|timeout/i.test(String(result?.description || ''));
+		if (result?.ok && Array.isArray(result.result)) {
+			for (const sticker of result.result) {
+				const id = String(sticker?.custom_emoji_id || '');
+				if (!id) continue;
+				const value = {
+					setName: String(sticker?.set_name || ''),
+					emoji: String(sticker?.emoji || '')
+				};
+				out[id] = value;
+				if (cacheable) {
+					if (AD_CUSTOM_EMOJI_CACHE.size >= AD_CUSTOM_EMOJI_CACHE_MAX) {
+						const oldest = AD_CUSTOM_EMOJI_CACHE.keys().next();
+						if (!oldest.done) AD_CUSTOM_EMOJI_CACHE.delete(oldest.value);
+					}
+					AD_CUSTOM_EMOJI_CACHE.set(id, { value, expiresAt: now + AD_CUSTOM_EMOJI_CACHE_TTL_MS });
+				}
+			}
+		}
+	} catch (error) {
+		console.error('[广告检测·自定义emoji] 解析失败:', error?.message || error);
+	}
+	return out;
+}
+
 
 // ===== 正文图片指纹（L1）=====
 //
@@ -16926,6 +17065,38 @@ function scoreAdMoneySolicit(text) {
 	return { score: AD_MONEY_SOLICIT_SCORE, reason: '金额与' + labels + '同现（形态 E 金额招揽，达观察线不定罪）' };
 }
 
+// ===== 自定义 emoji 的贴纸包名判据（批次 B-2）=====
+// getCustomEmojiStickers 返回的 set_name 是这个 emoji 出自哪个贴纸包。
+// 广告组织的包名往往直接写着广告内容（加微信 / 日赚 / 看我简介 …），与
+// 「资料挂的频道简介含招揽」同一个打法：判的是【内容】，不是【有没有挂】。
+//
+// 判据源一律复用现成词表（业务关键词 + 招揽动作），不新建词表 ——
+// 每加一张词表就多一片误封面，这是本项目四次误封换来的规矩。
+// 【只加分不定罪】包名是共享资源：正常人转一个 emoji 也会带上同一个包名，
+// 与会员标、正文同款 id 一样，靠分值参与裁决而不是单独定罪。
+const AD_CUSTOM_EMOJI_PACK_SCORE = 2;
+function scoreAdCustomEmojiPacks(packs) {
+	if (!packs || typeof packs !== 'object') return null;
+	for (const info of Object.values(packs)) {
+		const name = String(info?.setName || '');
+		if (!name) continue;
+		const bizHits = countAdKeywordHits(name, AD_BUSINESS_KEYWORDS);
+		if (bizHits.length) {
+			return {
+				score: AD_CUSTOM_EMOJI_PACK_SCORE,
+				reason: '自定义 emoji 出自贴纸包「' + name.slice(0, 40) + '」含业务关键词：' + bizHits.slice(0, 3).join('/')
+			};
+		}
+		if (AD_MONEY_SOLICIT_RE.test(name)) {
+			return {
+				score: AD_CUSTOM_EMOJI_PACK_SCORE,
+				reason: '自定义 emoji 出自贴纸包「' + name.slice(0, 40) + '」含招揽词'
+			};
+		}
+	}
+	return null;
+}
+
 async function evaluateAdSuspect(env, input, options = {}) {
 	const config = options.config || loadAdDetectionConfig(env);
 	const whitelist = options.whitelist instanceof Set ? options.whitelist : await loadAdDomainWhitelist(env);
@@ -16966,6 +17137,13 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		score += moneySolicit.score;
 		reasons.push('+' + moneySolicit.score + ' ' + moneySolicit.reason);
 	}
+	// 自定义 emoji 的贴纸包名（批次 B-2）。只有闸二调过 getCustomEmojiStickers 才有
+	// 这个字段 —— 闸一与 cron 那两轨没有它，下面直接返回 null，零分零 reasons。
+	const emojiPack = scoreAdCustomEmojiPacks(profile.customEmojiPacks);
+	if (emojiPack) {
+		score += emojiPack.score;
+		reasons.push('+' + emojiPack.score + ' ' + emojiPack.reason);
+	}
 	let layer = 'score';
 
 	const payload = {
@@ -16989,6 +17167,11 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		// 闸一的 cheapProfile 没有这个字段 → 恒为空串 → 走补学队列异步补，
 		// 与头像的 immediateAvatar / queueAdAvatarLearning 是同一套分流。
 		badgeId: profile.badgeId || '',
+		// 正文里的自定义贴纸 emoji id 列表（批次 B-2）。与 avatarId 同职责：
+		// 定罪即学习与 /ignore 回滚都靠它定位 ad_badges 的行。
+		// 【这一项闸一就拿得到】id 在 update 的 entities 里，不依赖 getChat ——
+		// 所以闸一定罪时它可以立即学，不像头像那条必须等队列异步补拉。
+		customEmojiIds: Array.isArray(profile.customEmojiIds) ? profile.customEmojiIds.slice(0, 20) : [],
 		// 正文图片指纹主键（message 里那个媒体的 file_unique_id）。与 avatarId 同一职责：
 		// enforceAdDetection 只拿到 evaluation、没有 message，定罪即学习与 /ignore 回滚
 		// 都要靠它定位 ad_images 的行。同样【不进 domains / semanticText / 指纹学习】。
@@ -17235,6 +17418,9 @@ async function evaluateAdSuspect(env, input, options = {}) {
 			// 会员标指纹主键：与 avatarId 同一职责，/ignore 回滚时反查 ad_badges 那一行。
 			// 老快照冻结于会员标上线之前 → 空串 → 回滚端自动跳过。
 			badgeId: String(profile.badgeId || ''),
+			// 正文自定义 emoji id 列表：与 badgeId 同一职责，/ignore 回滚时逐个反查
+			// ad_badges。存进快照是因为 enforcement 那侧只拿得到 evaluation。
+			customEmojiIds: (Array.isArray(profile.customEmojiIds) ? profile.customEmojiIds : []).slice(0, 20),
 			// 正文图片指纹主键：与 avatarId 同一职责，/ignore 回滚时反查 ad_images 那一行。
 			// 没有媒体的消息是空串，回滚端读到空串自动跳过 —— 老快照同样如此。
 			imageId: String(payload.imageId || ''),
@@ -17615,6 +17801,15 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		// → 立即学，不排队。只有闸一那条零成本路径的 avatarId 为空，才走队列异步补。
 		const immediateAvatar = String(evaluation?.payload?.avatarId || '');
 		const immediateBadge = String(evaluation?.payload?.badgeId || '');
+		const immediateEmojiIds = Array.isArray(evaluation?.payload?.customEmojiIds)
+			? evaluation.payload.customEmojiIds : [];
+		// 正文自定义 emoji：id 在 update 的 entities 里现成，闸一就拿得到 ——
+		// 所以【永远立即学】，不必像头像那样等补学队列去补 getChat。
+		// 跳过与会员标重复的那个 id：hits 是 +1 语义，重复学会把安全阀提前拱开。
+		for (const emojiId of immediateEmojiIds) {
+			if (!emojiId || emojiId === immediateBadge) continue;
+			await learnAdBadgeOnBan(env, emojiId, userId);
+		}
 		if (immediateAvatar) {
 			await learnAdAvatarOnBan(env, immediateAvatar, userId);
 			// 会员标跟着同一条路径学：两者都来自同一份 getChat 响应，
@@ -18144,7 +18339,10 @@ async function detectAdOnMessage(message, env) {
 		lastName: from.last_name || '',
 		username: from.username || '',
 		bio: '',
-		status: ''
+		status: '',
+		// 正文里的自定义贴纸 emoji（批次 B-2）。ids 就在 update 的 entities 里现成带着，
+		// 不需要 getChat —— 这是本闸唯一新增的判据来源，且仍然一个 Telegram 请求都不发。
+		customEmojiIds: extractCustomEmojiIds(message)
 	};
 	let cheap = applyHistory(await evaluateAdSuspect(
 		env,
@@ -18160,6 +18358,15 @@ async function detectAdOnMessage(message, env) {
 	// 所以「图片是唯一证据」时闸一就能封，不必为一次图片判据多花一个 Telegram 请求。
 	// imageRow 为 null（无媒体 / 尚未入库）时 applyImageVerdict 原样返回，一个字节不改。
 	cheap = applyImageVerdict(cheap, imageRow);
+
+	// ===== 同款自定义 emoji 叠判（批次 B-2 的正文一半）=====
+	// 【为什么闸一也要叠】批次 C 时闸一没有这个调用点，因为 cheapProfile 拿不到
+	// badgeId（那要 getChat）。但正文里的自定义 emoji id 就在 update 的 entities 里，
+	// 闸一现成就有 —— 不叠等于这一层在最常用的那道闸上完全失效。
+	// 【成本】customEmojiIds 为空时函数立即返回，一个 D1 都不发；
+	// 有 id 时也只是查 ad_badges（D1），仍然零 Telegram 请求，
+	// 所以「闸一零 getChat」那条不变量原样保住。
+	cheap = await applyBadgeToEvaluation(env, cheap, cheapProfile);
 
 	const needBio = shouldCheckAdBio(member, nowSeconds);
 
@@ -18255,6 +18462,20 @@ async function detectAdOnMessage(message, env) {
 	// 由 formatAdMemberStatus 渲染成「未查询」。
 	profile.status = '';
 	await markAdBioChecked(env, userId, nowSeconds);
+
+	// ===== 正文里的自定义贴纸 emoji（批次 B-2）=====
+	// 【为什么闸二可以花这个钱】与链接解析同一个理由：走到这里 = needBio 为真，
+	// 本来就已经为这次判定花了一个 getChat；形态闸兜底 —— 正文没有 custom_emoji
+	// 实体时 ids 是空数组，下面连一个请求都不发（绝大多数消息走不到这一步）。
+	// 闸一只查库（id 在 update 的 entities 里现成），不碰这一步，
+	// 「闸一定罪零 getChat」那三条断言原样不受影响。
+	profile.customEmojiIds = extractCustomEmojiIds(message);
+	if (profile.customEmojiIds.length) {
+		// 拿贴纸包名（set_name）—— 它是这里唯一有判据价值的产出：广告组织的包名
+		// 往往直接写着广告内容，与「资料挂的频道简介含招揽」同一个打法。
+		// 结果按 id 进程内缓存 6 小时，同一个包第二次起零请求。
+		profile.customEmojiPacks = await resolveCustomEmojiStickers(env, profile.customEmojiIds);
+	}
 
 	// ===== 解析资料里挂的频道 / 群 / bot（对齐 menshen resolveLink）=====
 	// 【为什么闸二可以花这个钱】走到这里 = needBio 为真（首次发言或 bio 复查期已到），
@@ -18352,6 +18573,10 @@ function adPayloadFromSnapshot(snapshot) {
 		// 漏了它，/ignore 的会员标纠错就会「说成功了」却一行都没清，
 		// 同款标下一个人照样命中，而且标很少换，连坐会一直持续。
 		badgeId: String(snap.badgeId || ''),
+		// 正文自定义 emoji id 列表。同样是【白名单重建】—— 漏了它，
+		// /ignore 会「说成功了」却一行都没清，同款 emoji 下一个人照样命中。
+		// 老快照无此字段 → 空数组 → 回滚端逐个跳过。
+		customEmojiIds: Array.isArray(snap.customEmojiIds) ? snap.customEmojiIds : [],
 		// 正文图片主键。与 avatarId 完全同构 —— 漏了这一个字段，/ignore 的图片纠错
 		// 就会「说成功了」却一行都没清，同款图下一个人照样命中。老快照无此字段，
 		// 还原成空串，回滚端读到空串自动跳过。
@@ -18647,6 +18872,14 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	// 连坐的持续时间比头像长得多。误封一个就把它清掉，安全阀才有第二道。
 	// 老快照冻结于会员标功能上线之前，还原出的 badgeId 是空串 → 本步自动跳过。
 	const badgeCleared = await clearAdBadgeOnIgnore(env, payload?.badgeId);
+	// 正文自定义 emoji 同步纠错：逐个清。与会员标同一理由 —— 这类素材是
+	// 一个 id 被多人复用，误封一个却不清库，下一个人用同款 emoji 还会被命中。
+	// 老快照没有这个字段 → 数组为空 → 循环不执行，与改动前逐字节一致。
+	const bodyEmojiCleared = [];
+	for (const emojiId of (Array.isArray(payload?.customEmojiIds) ? payload.customEmojiIds : [])) {
+		if (!emojiId || emojiId === String(payload?.badgeId || '')) continue;
+		bodyEmojiCleared.push(await clearAdBadgeOnIgnore(env, emojiId));
+	}
 	// 正文图片同步纠错：与头像同一理由 —— 这个号既然是误封，这张图就不能继续挂着
 	// 「广告素材」标签，否则正常群里转发过同款图（梗图、截图、别人转的图）的人
 	// 会被连坐，而且图片比头像更容易被多人正常转发，这个口子必须同时堵上。
@@ -18665,7 +18898,7 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
 	await deleteAdScreening(env, targetId);
 	await deleteAdPendingSnapshot(env, ownerId, seq);
-	return { targetId, removed, unbanSummary, fp, sampleRemoved, avatarCleared, badgeCleared, imageCleared, shapeCleared };
+	return { targetId, removed, unbanSummary, fp, sampleRemoved, avatarCleared, badgeCleared, bodyEmojiCleared, imageCleared, shapeCleared };
 }
 
 // /ignore 单次最多处理多少个序号。
@@ -19237,7 +19470,8 @@ async function handleAdStatsCommand(env, chatId) {
 	const badgeAd = Number(badgeRows.find((r) => String(r.verdict) === 'ad')?.c) || 0;
 	const badgePending = Number(badgeRows.find((r) => String(r.verdict) === 'pending')?.c) || 0;
 	const badgeClean = Number(badgeRows.find((r) => String(r.verdict) === 'clean')?.c) || 0;
-	lines.push('<b>会员标指纹</b>　广告标 <b>' + badgeAd + '</b>　待识别 <b>' + badgePending + '</b>　已排除 <b>' + badgeClean + '</b>');
+	lines.push('<b>自定义 emoji 指纹</b>　广告素材 <b>' + badgeAd + '</b>　待识别 <b>' + badgePending + '</b>　已排除 <b>' + badgeClean + '</b>');
+	lines.push('　↳ 含昵称旁会员标与正文贴纸 emoji 两类来源，共用一张表');
 	lines.push('　↳ 同款定罪 <b>' + AD_BADGE_BAN_HITS + '</b> 次起、且本次有其他佐证才参与定罪（单证永不单独定罪，防常见标连坐）');
 	lines.push('<b>域名白名单</b>　生效 <b>' + whitelist.size + '</b> 条（D1 自定义 ' + whitelistRows + ' 条，内置种子 ' + AD_DOMAIN_WHITELIST_SEED.length + ' 条）');
 	// 入群检查流水。只记命中的话这一屏对绝大多数新成员是一片空白，

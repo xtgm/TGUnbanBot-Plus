@@ -373,14 +373,14 @@ section('[5] applyBadgeToEvaluation 的开销与跳过条件');
 	await W.learnAdBadgeOnBan(env, 'HIT_BADGE', 3);
 	out = await W.applyBadgeToEvaluation(env, mk(1, ['+1 有佐证']), { badgeId: 'HIT_BADGE' });
 	assert('hits=3 + 有佐证 → 叠判成 ban', out.verdict === 'ban', JSON.stringify(out));
-	assert('reasons 带上会员标那一条',
-		out.reasons.some((x) => x.includes('同款广告会员标')), JSON.stringify(out.reasons));
+	assert('reasons 带上同款素材那一条（文案已中性化，会员标与正文共用）',
+		out.reasons.some((x) => x.includes('同款自定义 emoji 素材')), JSON.stringify(out.reasons));
 
 	// 入库为 clean（被 /ignore 纠错过）→ 原样
 	await W.clearAdBadgeOnIgnore(env, 'HIT_BADGE');
 	out = await W.applyBadgeToEvaluation(env, mk(8, ['+6 佐证']), { badgeId: 'HIT_BADGE' });
 	assert('clean 的标：不改 verdict', out.verdict !== 'ban' || true, JSON.stringify(out));
-	assert('clean 的标不加 reasons', !out.reasons.some((x) => x.includes('同款广告会员标')), JSON.stringify(out.reasons));
+	assert('clean 的标不加 reasons', !out.reasons.some((x) => x.includes('同款自定义 emoji 素材')), JSON.stringify(out.reasons));
 }
 
 // ================= [6] payload 与快照往返（白名单重建） =================
@@ -394,15 +394,15 @@ section('[6] payload.badgeId 与 /ignore 快照往返');
 	// 快照还原端（白名单重建）—— 漏一个字段整条纠错链路静默失效
 	assert('adPayloadFromSnapshot 还原 badgeId', src.includes('badgeId: String(snap.badgeId || \'\'),'), '');
 	assert('/ignore 回滚调用 clearAdBadgeOnIgnore', src.includes('clearAdBadgeOnIgnore(env, payload?.badgeId)'), '');
-	assert('/ignore 返回结果含 badgeCleared', src.includes('avatarCleared, badgeCleared, imageCleared, shapeCleared'), '');
+	assert('/ignore 返回结果含 badgeCleared', src.includes('avatarCleared, badgeCleared, bodyEmojiCleared, imageCleared, shapeCleared'), '');
 }
 
 // ================= [7] 接入点与定罪即学习 =================
 section('[7] 五个叠判接入点 + 定罪即学习');
 {
-	// 叠判接入点：入群线、闸二、AI 补查、闸二主、cron 复查 —— 五处全接。
+	// 叠判接入点：闸一（批次 B-2 新增，正文 emoji 在 update 里现成就有）、入群线、闸二、AI 补查、闸二主、cron —— 六处全接；批次 C 时闸一没有，因为 cheapProfile 拿不到 badgeId（那要 getChat）。
 	const applyCount = (src.match(/applyBadgeToEvaluation\(env, /g) || []).length;
-	assert('applyBadgeToEvaluation 有 5 个接入点（含定义）', applyCount === 6, String(applyCount));
+	assert('applyBadgeToEvaluation 有 6 个接入点（含定义共 7 处）', applyCount === 7, String(applyCount));
 
 	// 定罪即学习的两处：立即学 + 补学队列
 	assert('detectAdOnMessage 立即学会员标', src.includes('learnAdBadgeOnBan(env, immediateBadge, userId)'), '');
@@ -447,7 +447,10 @@ section('[8] 闸一热路径不碰 ad_badges');
 // ================= [9] /adstats 计数行 =================
 section('[9] /adstats 展示会员标指纹');
 {
-	assert('看板有会员标指纹行', src.includes('会员标指纹'), '');
+	// 必须断言【看板实际输出的那行】，不能只断言 includes('会员标指纹') ——
+	// 那个词在多处注释里也出现，注释改了断言照样绿，等于没守看板。
+	assert('看板有自定义 emoji 指纹行（文案已中性化，两类来源共用）',
+		src.includes('<b>自定义 emoji 指纹</b>'), '');
 	assert('看板写明安全阀口径（多少次定罪才参与定罪）',
 		src.includes('同款定罪 <b>\' + AD_BADGE_BAN_HITS + \'</b> 次起'), '');
 	assert('看板说明 pending 恒为 0 是设计如此', src.includes('pending 恒为 0 是【设计如此】'), '');
