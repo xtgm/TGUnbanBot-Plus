@@ -378,13 +378,16 @@ section('[8] 强证据不走分数阈值（源码断言）');
 	assert('入群线只覆盖 scoreThreshold（走 joinConfig 分支）',
 			code.includes('{ config: joinConfig, whitelist, skipMissingBioPenalty'));
 	
-	// screenAdJoinMember 内的顺序：入群线 → 评分 → 头像覆盖。
-	// 头像定罪在评分之后、不经 joinConfig，属于另一条强证据通道。
+	// screenAdJoinMember 内的顺序：入群线 → 评分 → 头像覆盖 → 会员标覆盖。
+	// 头像与会员标都在评分之后、不经 joinConfig，属于另两条强证据通道；
+	// 会员标必须排在头像之后（applyBadgeToEvaluation 吃的是 avatarEvaluation）。
 	const iJoin = code.indexOf('const joinConfig =');
 	const iEval = code.indexOf('const baseEvaluation = await evaluateAdSuspect(', iJoin);
-	const iAvatar = code.indexOf('const evaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile)', iEval);
-	assert('入群路径顺序：入群线 → 评分 → 头像', iJoin > -1 && iEval > iJoin && iAvatar > iEval,
-			JSON.stringify({ iJoin, iEval, iAvatar }));
+	const iAvatar = code.indexOf('const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile)', iEval);
+	const iBadge = code.indexOf('const evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile)', iAvatar);
+	assert('入群路径顺序：入群线 → 评分 → 头像 → 会员标',
+			iJoin > -1 && iEval > iJoin && iAvatar > iEval && iBadge > iAvatar,
+			JSON.stringify({ iJoin, iEval, iAvatar, iBadge }));
 }
 
 // ================= [9] 默认配置下结构通道绕过入群线 =================

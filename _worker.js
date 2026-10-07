@@ -12162,11 +12162,12 @@ async function d1AdDetectionTablesExist(env) {
 		'ad_learn_snapshots',
 		'ad_avatars',
 		'ad_profile_shapes',
-		'ad_images'
+		'ad_images',
+		'ad_badges'
 	]);
 }
 
-// 建立广告检测的 13 张 D1 表（完整性复验另列 12 张，ad_spam_texts 按需建、不参与复验）。范式与 ensureAdVoteTables 一致：
+// 建立广告检测的 14 张 D1 表（完整性复验另列 13 张，ad_spam_texts 按需建、不参与复验）。范式与 ensureAdVoteTables 一致：
 // promise 去重 → 核心表先行 → 逐条建表/建索引 → 存在性复验 → 失败删缓存并冷却 60 秒。
 // 冷却是为了避免 D1 抖动时每条消息都重试一次迁移，把子请求预算耗光。
 async function ensureAdDetectionTables(env) {
@@ -12279,6 +12280,26 @@ async function ensureAdDetectionTables(env) {
 			// 完全一致，不会出现「头像能回滚、图片回滚不了」的半边失效。
 			await runD1SchemaStatement(env, 'ad_images', 'CREATE TABLE IF NOT EXISTS ad_images (file_unique_id TEXT PRIMARY KEY, verdict TEXT NOT NULL DEFAULT \'pending\', hits INTEGER NOT NULL DEFAULT 0, file_id TEXT, kind TEXT, source TEXT, last_user_id TEXT, vision_checked_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_images_verdict', 'CREATE INDEX IF NOT EXISTS idx_ad_images_verdict ON ad_images (verdict)', { optional: true });
+
+			// 同款会员标（emoji status）指纹库。主键是 emoji_status_custom_emoji_id。
+			//
+			// 【为什么值得单开一张表】主人给的六个广告号资料卡里，有三个挂的是
+			// 同一个自定义标（内容就是「看我简介」，与他们共用的那张头像同一套话术）。
+			// 标是【广告组织统一配的物料】，而正常用户挂的是官方 Premium 蓝星或
+			// 各自随便选的标 —— 于是「同一个标出现在多个被定罪的号身上」
+			// 恰好就是「同一批人在作案」这个信号，且零 Telegram 请求就拿得到。
+			//
+			// 【与 ad_avatars 的两处结构差异】
+			//   ① 主键叫 badge_id 不是 file_unique_id —— 它是一个自定义 emoji 标识，
+			//      不是文件，没有 file_id 可下载、也没有换图一说
+			//   ② 没有 vision_checked_at —— 这一层【不做视觉识别】。主人的口径是
+			//      「直接判定同款广告类型标」，看的是「是不是同一个标」，
+			//      不是「这个标长什么样」，所以连 L2 队列都不存在
+			//
+			// verdict / hits 语义与另两张表对齐（ad = 已定罪素材 / clean = /ignore 纠错过，
+			// hits = 挂过它且被定罪的次数），这样 /ignore 的纠错口径三张表一致。
+			await runD1SchemaStatement(env, 'ad_badges', 'CREATE TABLE IF NOT EXISTS ad_badges (badge_id TEXT PRIMARY KEY, verdict TEXT NOT NULL DEFAULT \'pending\', hits INTEGER NOT NULL DEFAULT 0, source TEXT, last_user_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
+			await runD1SchemaStatement(env, 'idx_ad_badges_verdict', 'CREATE INDEX IF NOT EXISTS idx_ad_badges_verdict ON ad_badges (verdict)', { optional: true });
 
 			// 资料形状库：bio 归一化后的形态指纹（见 adProfileShape）。
 			// 与 ad_fingerprints 分开的理由：那张表存的是【词】，靠子串匹配；
@@ -15192,7 +15213,12 @@ function writeAdProfileCache(userId, profile) {
 		if (!oldest.done) AD_PROFILE_CACHE.delete(oldest.value);
 	}
 	AD_PROFILE_CACHE.set(String(userId), {
-		profile: { firstName: profile.firstName, lastName: profile.lastName, username: profile.username, bio: profile.bio },
+		// badgeId 必须跟着进缓存：缓存命中时这份 profile 就是唯一的数据源，
+		// 漏存它会让「第二条消息起会员标判据全失效」—— 与 bio 同样的道理。
+		// 【avatarId 刻意仍未存】这是既有状态：头像判据在缓存命中时同样读不到
+		// （applyAvatarToEvaluation 拿到空串直接返回）。属于批次 C 之外的既有缺陷，
+		// 已单独报给主人，等他定方案，不趁本轮顺手改。
+		profile: { firstName: profile.firstName, lastName: profile.lastName, username: profile.username, bio: profile.bio, badgeId: profile.badgeId },
 		expiresAt: Date.now() + AD_PROFILE_CACHE_TTL_MS
 	});
 }
@@ -15212,6 +15238,11 @@ async function fetchAdUserProfile(userId, fallback = {}) {
 		//                     changed」→ 只在视觉识别那一刻用，绝不入库当主键。
 		avatarId: '',
 		avatarFileId: '',
+		// 会员标（emoji status）指纹主键 ← ChatFullInfo.emoji_status_custom_emoji_id。
+		// getChat 已经把整份 ChatFullInfo 带回来了，取它是零成本的（见 ad_badges）。
+		// 与 avatarId 一样，空串表示「此人没有自定义标」—— 没有标就无从谈同款，
+		// 既不查库也不登记。挂官方 Premium 蓝星的号若不带这个字段，同样落到空串。
+		badgeId: '',
 		// bioFetched：这次到底有没有真的从 Telegram 拿到资料。
 		// 调用方靠它决定要不要施加「无 emoji 且无 Bio」的减分 ——
 		// 抓取失败时 bio 是空串，但含义是「不知道」，拿它减分会把真广告的分压下去。
@@ -15244,6 +15275,10 @@ async function fetchAdUserProfile(userId, fallback = {}) {
 			const photo = data.photo || null;
 			profile.avatarId = String(photo?.big_file_unique_id || photo?.small_file_unique_id || '');
 			profile.avatarFileId = String(photo?.big_file_id || photo?.small_file_id || '');
+			// 会员标同样在这一份 ChatFullInfo 里（emoji_status_custom_emoji_id），
+			// 与头像并排取，不多花一个请求。空串 = 没有自定义标（含挂官方蓝星的号，
+			// 若官方标不走这个字段）—— 见 ad_badges 表注释里对蓝星的处理。
+			profile.badgeId = String(data.emoji_status_custom_emoji_id || '');
 			profile.bioFetched = true;
 			// 【写缓存必须在这个 if 内】。原先它在外面，于是 API 返回 ok:false
 			// （最常见的就是 429 Too Many Requests）也会把一个空 bio 缓存 5 分钟 ——
@@ -15528,6 +15563,112 @@ async function applyAvatarToEvaluation(env, evaluation, profile) {
 		return evaluation;
 	}
 	return applyAvatarVerdict(evaluation, avatar);
+}
+
+// ===== 同款会员标指纹（L1）=====
+//
+// 【它凭什么是一个判据】主人给的六个广告号里有三个挂同一个自定义标
+// （标上写的就是「看我简介」，与他们共用的那张头像同一套话术）——
+// 标是广告组织统一配发的物料，正常用户挂的是官方 Premium 蓝星或各挑各的，
+// 所以「同一个标出现在多个被定罪的号身上」= 同一批人在作案。
+// 主键 emoji_status_custom_emoji_id 是 getChat 顺带返回的，零 Telegram 请求。
+//
+// 【与头像层的三点不同，别照抄头像的分档】
+//   ① 没有 register / pending：这层不做视觉识别，没有队列可排队，
+//      查不到就是没入过库，直接原样返回（少一次写入，热路径更省）
+//   ② 分档【刻意比头像严】：头像是 `hits >= 2 单独即可封`，这里取消了那一档
+//   ③ 命中时【只加 reasons 不改 score】，与头像层一致，避免历史分重复计分
+//
+// 【安全阀：会员标永不单独定罪】这是这个判据唯一需要小心的地方 ——
+// 官方蓝星若也带 emoji_status_custom_emoji_id，那它对所有挂星的号是【同一个值】：
+// 只要一个挂星的号因头像/bio 被定罪，蓝星 id 就进库，之后所有挂星的人全命中。
+// 没有这道阀，一次误封会被同款指纹放大成一批误封，正好砸在「正常号 vs 广告号」
+// 这条主人反复强调的分界上。于是：
+//   · hits < 3（这个标最多只在 1~2 个被定罪的号上出现过）→ 无论本次多像广告都不由它定罪
+//   · 本次一条佐证都没有 → 同样不由它定罪（单证不定罪，与分档总原则一致）
+//   · 两者都满足才推封；否则原 verdict 一个字节不改，只在 reasons 里留痕
+// 真广告标会被反复定罪、hits 很快越过 3；而一个「碰巧常见」的标（蓝星）
+// 要越过 3 意味着已经有三个挂它的人各自因别的强证据被定罪 ——
+// 那时该封的本来也封了，badge 只是确认了他们同属一批。
+const AD_BADGE_BAN_HITS = 3;
+
+// 读一条会员标指纹。查不到返回 null（= 未入库，既不是 ad 也不是 clean）。
+async function readAdBadge(env, badgeId) {
+	const key = String(badgeId || '');
+	if (!env?.DB || !key) return null;
+	try {
+		const row = await env.DB.prepare('SELECT badge_id, verdict, hits, source, last_user_id, created_at, updated_at FROM ad_badges WHERE badge_id = ?').bind(key).first();
+		return row || null;
+	} catch (error) {
+		// 查不到不等于干净：失败按「未入库」处理，下一条消息再试，
+		// 绝不把查询失败当成 clean 去放行（与头像层同一条方向性要求）。
+		console.error('[广告检测] 读取会员标指纹失败:', error);
+		return null;
+	}
+}
+
+// 定罪即学习：这个号被封时，把他的会员标记成广告素材。
+// hits 累加 = 挂过这个标且被定罪的人数，正是安全阀读的那个数。
+async function learnAdBadgeOnBan(env, badgeId, userId) {
+	const key = String(badgeId || '');
+	if (!env?.DB || !key) return false;
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_badges (badge_id, verdict, hits, source, last_user_id, created_at, updated_at) '
+			+ 'VALUES (?, \'ad\', 1, \'learned\', ?, ?, ?) '
+			+ 'ON CONFLICT(badge_id) DO UPDATE SET verdict = \'ad\', hits = ad_badges.hits + 1, '
+			+ 'source = \'learned\', last_user_id = excluded.last_user_id, updated_at = excluded.updated_at'
+		).bind(key, String(userId || ''), now, now).run();
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 会员标定罪学习失败:', error);
+		return false;
+	}
+}
+
+// 误封纠错（/ignore 走这条路）：把这个标转成 clean 并把 hits 归零，
+// 防止「同标的人全被连坐」—— 与头像、图片两张表的纠错口径逐字一致。
+async function clearAdBadgeOnIgnore(env, badgeId) {
+	const key = String(badgeId || '');
+	if (!env?.DB || !key) return false;
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		await env.DB.prepare('INSERT INTO ad_badges (badge_id, verdict, hits, source, created_at, updated_at) VALUES (?, \'clean\', 0, \'manual\', ?, ?) ON CONFLICT(badge_id) DO UPDATE SET verdict = \'clean\', hits = 0, source = \'manual\', updated_at = excluded.updated_at').bind(key, now, now).run();
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 会员标纠错失败:', error);
+		return false;
+	}
+}
+
+// 把会员标命中叠加到已有判定结果上（纯函数，不动原对象）。
+// 结构对齐 applyAvatarVerdict，分档差异见 AD_BADGE_BAN_HITS 上方那段说明。
+function applyBadgeVerdict(evaluation, badge) {
+	if (!evaluation || !badge) return evaluation;
+	if (String(badge.verdict || '') !== 'ad') return evaluation;
+	const hits = Number(badge.hits) || 0;
+	const hasCorroboration = (evaluation.reasons || []).length > 0 || (Number(evaluation.score) || 0) >= 2;
+	const reasons = (evaluation.reasons || []).concat([
+		'同款广告会员标（挂过它且被定罪 ' + hits + ' 次）'
+		+ (hits >= AD_BADGE_BAN_HITS && hasCorroboration ? '' : '，单证不足不单独定罪')
+	]);
+	let verdict = evaluation.verdict;
+	if (hits >= AD_BADGE_BAN_HITS && hasCorroboration) verdict = 'ban';
+	// 其余情形 verdict 保持原样：不把 pass 提成 observe（那会让每一个撞上
+	// 常见标的人被记一笔、在观察窗口里叠历史分），也不降级。
+	// score 同样不改 —— 会员标不是评分口径的一部分，改了会与历史分重复计。
+	return Object.assign({}, evaluation, { verdict, reasons });
+}
+
+// 异步包装：有会员标就读库叠判。没标（闸一恒为空、getChat 失败、挂官方蓝星的号
+// 若不带这个字段）直接原样返回 —— 于是闸一热路径零 D1 读、零 Telegram 请求。
+async function applyBadgeToEvaluation(env, evaluation, profile) {
+	const badgeId = String(profile?.badgeId || '');
+	if (!evaluation || !badgeId) return evaluation;
+	const badge = await readAdBadge(env, badgeId);
+	if (!badge) return evaluation;
+	return applyBadgeVerdict(evaluation, badge);
 }
 
 // ===== 正文图片指纹（L1）=====
@@ -16075,7 +16216,10 @@ async function rescanAdMember(env, row, options = {}) {
 		{ config: options.config, whitelist: options.whitelist, skipMissingBioPenalty: false }
 	);
 	// 头像指纹叠加（无头像则原样返回，本轨零额外开销）
-	const evaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+	const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+	// 同款会员标叠加（无标则原样返回）：与头像同一层位、同一零开销条件，
+	// 排在头像之后 —— 两层都只加 reasons 不改 score，先后不影响分数。
+	const evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
 	// 写回形状与结论：pass 让下一轮能走门，observe / ban 则让门始终关着。
 	// 不碰 bio_checked_at —— 那个时间戳在判定之前已经推过一次（429 防卡死）。
 	await markAdProfileVerdict(env, userId, shape, evaluation.verdict);
@@ -16210,6 +16354,12 @@ async function drainAdAvatarLearningQueue(env, limit = 30) {
 			const profile = await fetchAdUserProfile(uid, {});
 			const avatarId = String(profile?.avatarId || '');
 			if (avatarId) await learnAdAvatarOnBan(env, avatarId, uid);
+			// 会员标搭同一趟补学：这一轨存在的唯一理由就是「闸一定罪时那份
+			// cheapProfile 没有 getChat 的字段」，而会员标正是那个响应里的字段，
+			// 与头像同源。复用同一个队列 = 不新增队列、不新增 Telegram 请求，
+			// 这次 fetchAdUserProfile 顺带就把它带回来了。
+			const badgeId = String(profile?.badgeId || '');
+			if (badgeId) await learnAdBadgeOnBan(env, badgeId, uid);
 			// 没头像的号也算处理完：不留队列里反复重试（他本来就没图可学）。
 		} catch (error) {
 			stats.failed += 1;
@@ -16816,6 +16966,12 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		// 它【不进 domains、不进 semanticText、不进指纹学习】：那是图片标识不是文本，
 		// 喂给任何文本判据都会变成噪声。
 		avatarId: profile.avatarId || '',
+		// 会员标指纹主键（emoji_status_custom_emoji_id）。与 avatarId 完全同职责：
+		// enforceAdDetection 只拿到 evaluation、没有 profile，定罪即学习与 /ignore 回滚
+		// 都要靠它定位 ad_badges 的行。同样【不进 domains / semanticText / 指纹学习】。
+		// 闸一的 cheapProfile 没有这个字段 → 恒为空串 → 走补学队列异步补，
+		// 与头像的 immediateAvatar / queueAdAvatarLearning 是同一套分流。
+		badgeId: profile.badgeId || '',
 		// 正文图片指纹主键（message 里那个媒体的 file_unique_id）。与 avatarId 同一职责：
 		// enforceAdDetection 只拿到 evaluation、没有 message，定罪即学习与 /ignore 回滚
 		// 都要靠它定位 ad_images 的行。同样【不进 domains / semanticText / 指纹学习】。
@@ -17059,6 +17215,9 @@ async function evaluateAdSuspect(env, input, options = {}) {
 			// 头像指纹主键：跟着快照进 D1，/ignore 回滚时才能找到该清哪一行。
 			// 不展示给主人（图片标识对人没意义），纯粹是回滚链路的外键。
 			avatarId: String(profile.avatarId || ''),
+			// 会员标指纹主键：与 avatarId 同一职责，/ignore 回滚时反查 ad_badges 那一行。
+			// 老快照冻结于会员标上线之前 → 空串 → 回滚端自动跳过。
+			badgeId: String(profile.badgeId || ''),
 			// 正文图片指纹主键：与 avatarId 同一职责，/ignore 回滚时反查 ad_images 那一行。
 			// 没有媒体的消息是空串，回滚端读到空串自动跳过 —— 老快照同样如此。
 			imageId: String(payload.imageId || ''),
@@ -17438,8 +17597,16 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		// 判定载荷里已经带着头像（闸二 / 入群筛查 / cron 复查定罪的都拉过 getChat）
 		// → 立即学，不排队。只有闸一那条零成本路径的 avatarId 为空，才走队列异步补。
 		const immediateAvatar = String(evaluation?.payload?.avatarId || '');
-		if (immediateAvatar) await learnAdAvatarOnBan(env, immediateAvatar, userId);
-		else await queueAdAvatarLearning(env, userId);
+		const immediateBadge = String(evaluation?.payload?.badgeId || '');
+		if (immediateAvatar) {
+			await learnAdAvatarOnBan(env, immediateAvatar, userId);
+			// 会员标跟着同一条路径学：两者都来自同一份 getChat 响应，
+			// 要么一起有（闸二 / 入群 / cron 定罪）要么一起空（闸一定罪）。
+			// 【刻意嵌在 if 里】否则「avatar 空 + badge 有」会既立即学一次、
+			// 又进队列被 worker 学第二次 —— hits 是 +1 语义，重复就虚高，
+			// 会把 AD_BADGE_BAN_HITS 的安全阀提前拱开。
+			if (immediateBadge) await learnAdBadgeOnBan(env, immediateBadge, userId);
+		} else await queueAdAvatarLearning(env, userId);
 	} catch (_) { /* 头像学习失败不影响本次处置 */ }
 	// 定罪即学习正文图片：与头像同一逻辑（引流素材是批量复用的，学一次拦住同款）。
 	// 【为什么不需要头像那套补学队列】头像要等 getChat 才拿得到，而闸一压根不调它，
@@ -17672,7 +17839,10 @@ async function screenAdJoinMember(env, member, options = {}) {
 		// 入群即判头像：这是「广告号还没发广告就被拦住」的主通道，
 		// 头像指纹命中时即便正文干净也能进判据（分档见 applyAvatarVerdict）。
 		// 头像与其它强证据一样不走入群线，仍按原样定罪。
-		const evaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+		const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+		// 同款会员标同位叠加：走到这里已经为这次判定花过 getChat 了，
+		// 会员标就在那一份响应里，查一次库即可，零额外 Telegram 请求。
+		const evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
 
 		// ===== 入群检查流水：任何 verdict 都记 =====
 		// 只记命中的话，看板上对绝大多数新成员是一片空白，管理员分不清
@@ -18011,7 +18181,8 @@ async function detectAdOnMessage(message, env) {
 				// 这次是【据实传】：bio 真查到了，空简介该减分就减分。
 				{ config, whitelist }
 			));
-			decision = await applyAvatarToEvaluation(env, verifyEvaluation, verifyProfile);
+			const verifyAvatarEvaluation = await applyAvatarToEvaluation(env, verifyEvaluation, verifyProfile);
+			decision = await applyBadgeToEvaluation(env, verifyAvatarEvaluation, verifyProfile);
 			console.log('[广告检测] AI 单独定罪已补查 bio 复评 user=' + userId
 				+ ' 闸一=' + cheap.verdict + '/' + cheap.score
 				+ ' 复评=' + decision.verdict + '/' + decision.score);
@@ -18093,11 +18264,15 @@ async function detectAdOnMessage(message, env) {
 	// 叠的是闸前已经读好的 imageRow —— 同一行不读第二遍，热路径 SQL 只付一次。
 	// 两者都只改 verdict / reasons 不碰 score，所以叠放顺序只影响 reasons 的排列，
 	// 不影响分值与阈值比较。
-	const evaluation = await applyAvatarToEvaluation(
+	const avatarEvaluation = await applyAvatarToEvaluation(
 		env,
 		applyImageVerdict(baseEvaluation, imageRow),
 		profile
 	);
+	// 同款会员标叠在最外层：闸一那条零成本路径拿不到会员标（getChat 还没发），
+	// 所以这一层只在闸二及其后（入群线、AI 补查、cron 复查）生效 ——
+	// 与头像完全同位，热路径的 Telegram 请求数一个都不多。
+	const evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
 
 	if (evaluation.verdict === 'ban') {
 		if (await isAdminInAnyConfiguredGroup(userId, chat.id)) {
@@ -18156,6 +18331,10 @@ function adPayloadFromSnapshot(snapshot) {
 		// 头像指纹主键。【白名单重建】这里漏一个字段，那条链路就整体静默失效 ——
 		// /ignore 的头像纠错必须从这里拿到 avatarId 才能定位到 ad_avatars 的行。
 		avatarId: String(snap.avatarId || ''),
+		// 会员标主键。与 avatarId 完全同构 —— 这同样是【白名单重建】，
+		// 漏了它，/ignore 的会员标纠错就会「说成功了」却一行都没清，
+		// 同款标下一个人照样命中，而且标很少换，连坐会一直持续。
+		badgeId: String(snap.badgeId || ''),
 		// 正文图片主键。与 avatarId 完全同构 —— 漏了这一个字段，/ignore 的图片纠错
 		// 就会「说成功了」却一行都没清，同款图下一个人照样命中。老快照无此字段，
 		// 还原成空串，回滚端读到空串自动跳过。
@@ -18446,6 +18625,11 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	// 否则同用这张图（自拍、风景、家人照被盗用）的正常用户会被连坐。
 	// 老快照冻结于头像功能上线之前，还原出的 avatarId 是空串 → 本步自动跳过。
 	const avatarCleared = await clearAdAvatarOnIgnore(env, payload?.avatarId);
+	// 会员标同步纠错：与头像同一理由，但更必须 —— 会员标是【一个数字串】，
+	// 一旦挂上「广告标」标签，挂同款的每个人都会命中；而标又很少换，
+	// 连坐的持续时间比头像长得多。误封一个就把它清掉，安全阀才有第二道。
+	// 老快照冻结于会员标功能上线之前，还原出的 badgeId 是空串 → 本步自动跳过。
+	const badgeCleared = await clearAdBadgeOnIgnore(env, payload?.badgeId);
 	// 正文图片同步纠错：与头像同一理由 —— 这个号既然是误封，这张图就不能继续挂着
 	// 「广告素材」标签，否则正常群里转发过同款图（梗图、截图、别人转的图）的人
 	// 会被连坐，而且图片比头像更容易被多人正常转发，这个口子必须同时堵上。
@@ -18464,7 +18648,7 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
 	await deleteAdScreening(env, targetId);
 	await deleteAdPendingSnapshot(env, ownerId, seq);
-	return { targetId, removed, unbanSummary, fp, sampleRemoved, avatarCleared, imageCleared, shapeCleared };
+	return { targetId, removed, unbanSummary, fp, sampleRemoved, avatarCleared, badgeCleared, imageCleared, shapeCleared };
 }
 
 // /ignore 单次最多处理多少个序号。
@@ -18947,6 +19131,7 @@ async function handleAdStatsCommand(env, chatId) {
 	let whitelistRows = 0;
 	let avatarRows = [];
 	let imageRows = [];
+	let badgeRows = [];
 	try {
 		const rows = await env.DB.batch([
 			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints'),
@@ -18958,7 +19143,11 @@ async function handleAdStatsCommand(env, chatId) {
 			// 头像指纹库按判决分档：ad = 已定为广告图、pending = 等 L2 判、clean = 已判干净。
 			env.DB.prepare('SELECT verdict, COUNT(*) AS c FROM ad_avatars GROUP BY verdict'),
 			// 正文图片指纹库同口径分档。
-			env.DB.prepare('SELECT verdict, COUNT(*) AS c FROM ad_images GROUP BY verdict')
+			env.DB.prepare('SELECT verdict, COUNT(*) AS c FROM ad_images GROUP BY verdict'),
+			// 会员标指纹库同口径分档。它没有「待识别」这一档（不做视觉识别），
+			// pending 恒为 0，但列结构与另两张对齐，所以照同一条 SQL 查，展示时
+			// 照样给出三档，主人看到 pending=0 不会以为卡住了 —— 说明行里写清原因。
+			env.DB.prepare('SELECT verdict, COUNT(*) AS c FROM ad_badges GROUP BY verdict')
 		]);
 		fpTotal = Number(rows[0]?.results?.[0]?.c) || 0;
 		fpByType = rows[1]?.results || [];
@@ -18968,6 +19157,7 @@ async function handleAdStatsCommand(env, chatId) {
 		whitelistRows = Number(rows[5]?.results?.[0]?.c) || 0;
 		avatarRows = rows[6]?.results || [];
 		imageRows = rows[7]?.results || [];
+		badgeRows = rows[8]?.results || [];
 	} catch (error) {
 		console.error('[广告检测] 统计查询失败:', error);
 	}
@@ -19025,6 +19215,13 @@ async function handleAdStatsCommand(env, chatId) {
 	lines.push('　↳ 视觉识别：' + (config.imageVisionDaily > 0
 		? '✅ 每日上限 ' + config.imageVisionDaily + ' 张（模型 ' + AD_IMAGE_VISION_MODEL + '，只判 photo / sticker）'
 		: '⏸️ 已关闭（AD_IMAGE_VISION_DAILY=0），只跑图片指纹，不调模型'));
+	// 同款会员标指纹库。pending 恒为 0 是【设计如此】—— 这一层只做同款复用，
+	// 不做视觉识别，没有排队判一说；命中要过 AD_BADGE_BAN_HITS 次定罪才算数。
+	const badgeAd = Number(badgeRows.find((r) => String(r.verdict) === 'ad')?.c) || 0;
+	const badgePending = Number(badgeRows.find((r) => String(r.verdict) === 'pending')?.c) || 0;
+	const badgeClean = Number(badgeRows.find((r) => String(r.verdict) === 'clean')?.c) || 0;
+	lines.push('<b>会员标指纹</b>　广告标 <b>' + badgeAd + '</b>　待识别 <b>' + badgePending + '</b>　已排除 <b>' + badgeClean + '</b>');
+	lines.push('　↳ 同款定罪 <b>' + AD_BADGE_BAN_HITS + '</b> 次起、且本次有其他佐证才参与定罪（单证永不单独定罪，防常见标连坐）');
 	lines.push('<b>域名白名单</b>　生效 <b>' + whitelist.size + '</b> 条（D1 自定义 ' + whitelistRows + ' 条，内置种子 ' + AD_DOMAIN_WHITELIST_SEED.length + ' 条）');
 	// 入群检查流水。只记命中的话这一屏对绝大多数新成员是一片空白，
 	// 主人分不清「检查过、这个人正常」和「压根没看过他」—— 后者正是漏放的形态。
@@ -19203,7 +19400,9 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 				{ config, whitelist }
 			);
 			// 重新筛查也看头像：观察窗口里的号可能改了 bio，但头像换不换都同库可查。
-			const evaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+			const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+			// 同款会员标同理 —— 会员标比头像更少换，观察窗口里命中它的概率更高。
+			const evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
 
 			if (evaluation.verdict === 'ban' && await isAdminInAnyConfiguredGroup(userId)) {
 				// 任意配置群的群主/管理员全群豁免，不封、清掉观察记录。
