@@ -6969,12 +6969,47 @@ function getInlineButtonPayloadText(message) {
 	return parts.filter(Boolean).join(' ');
 }
 
+// 提取【核对清单（checklist）】里的全部文字 —— 标题 + 每个任务项的正文。
+//
+// 【补的是哪个洞】checklist 是 Message 的一个独立字段（官方原文：「Message is a
+// checklist」），与 text / caption 互斥。所以 checklist 消息的 message.text 是
+// undefined，它在下面几处【一个字都读不到】：
+//   · detectAdOnMessage 的早退闸门 —— text / caption / 转发 / 引用体 / 名片 /
+//     媒体六样全空，整条消息在这里就 return，名册、评分、四条通道一条都跑不到
+//   · getAdDetectionBodyText —— 只读 text / caption / 名片 / 内联按钮
+//
+// 线上样本（2026-10-07 主人发来）：广告把话术拆成标题 + 6 个任务项，
+// 标题是「一手假钞假币包过验钞机可找妹嫖娼」，任务项里放招揽与两条 t.me 链接，
+// 进度显示「0 / 6 已完成」。这与批次 A 的裸图片消息【同一个缺口模式】：
+// 内容藏在检测链路根本没读的第六个字段里，整条消息进不了检测。
+//
+// 【零成本】纯函数，不发任何请求。文字一旦并进正文，现有的词表 / 指纹 /
+// AI 语义 / 四通道结构查杀【全部自动覆盖】—— 不为它新建任何判据：
+// 正常的「本周任务清单」也照进正文，而词表本来就不命中正常内容，
+// 所以这一层不引入新的误封面。
+function extractAdChecklistText(message) {
+	const checklist = message?.checklist;
+	if (!checklist) return '';
+	const parts = [String(checklist.title || '')];
+	const tasks = Array.isArray(checklist.tasks) ? checklist.tasks : [];
+	for (const task of tasks) {
+		const taskText = String(task?.text || '').trim();
+		if (taskText) parts.push(taskText);
+	}
+	// 用换行分隔而不是空格：保持与客户端呈现一致的行结构，
+	// 让「逐字分隔」等按行形态工作的判据读到的仍是原本的样子。
+	return parts.filter(Boolean).join('\n').trim();
+}
+
 function getAdDetectionBodyText(message) {
 	return [
 		message?.text,
 		message?.caption,
 		getContactText(message || {}),
 		getInlineButtonPayloadText(message || {}),
+		// checklist：与 text / caption 同级的第六类正文来源，漏了它 debug 与
+		// 依赖 bodyText 的那几处就会把 checklist 消息当空消息。
+		extractAdChecklistText(message)
 	].filter(Boolean).join(' ').trim();
 }
 
@@ -18205,7 +18240,13 @@ async function detectAdOnMessage(message, env) {
 	const userId = from.id;
 	if (isAdDetectionExemptUser(userId)) return false;
 
-	const text = String(message.text ?? message.caption ?? '').trim();
+	// checklist 消息的 text / caption 恒为 undefined（官方：checklist 与它互斥），
+	// 所以这里用短路回退 —— 有 text/caption 时行为与改动前逐字节一致，
+	// 只有 checklist 消息才会落到 checklist 那一支。这一处改完，下面的
+	// 早退闸门、闸一/闸二/AI 补查三处 payload.text、指纹、AI 语义、四通道
+	// 【全部自动看到 checklist 的文字】，不必逐处接线。
+	const text = String(message.text ?? message.caption ?? '').trim()
+		|| extractAdChecklistText(message);
 	if (isTelegramSlashCommand(text)) return false;
 	const forwardChat = message.forward_from_chat || message.forward_origin?.chat || null;
 	// 引用体正文：这条消息引用/回复的那条【别人的】消息里的文字。
