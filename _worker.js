@@ -13950,11 +13950,17 @@ function scoreAdForwardChat(chat) {
 	// 随机字母串频道名：线上那批广告全部转发自 bxbd / hjff 这类 4~6 位纯小写字母频道，
 	// 上面四条判据一条都不命中（实测 score=0 isAd=false），最强的信号反而被完全放过。
 	// 这类名字是批量注册的马甲频道特征：没有元音结构、不成词、长度极短。
-	// 权重给到 AD_RANDOM_CHANNEL_SCORE（4）= isAd 门槛：此前给 2 分达不到门槛，
-	// 而 evaluateAdSuspect 只在 isAd 为真时才累加来源分，等于这 2 分永远是废分。
-	// 判据本身足够严（4~6 位纯小写字母且零元音），正常频道极难命中，可以单独定来源。
+	// 判据本身足够严（4~6 位纯小写字母且零元音），正常频道极难命中。
+	// 【现状与上面这段意图不符，如实标注】AD_RANDOM_CHANNEL_SCORE 自 b5899ab 创建起
+	// 就是 0，从未落地过注释里说的「4 分 = isAd 门槛」（git -S 只有创建这一笔），
+	// 也从未落地过「此前给 2 分」。所以这条判据当前【完全不计分】，只留一条痕。
+	// 要恢复计分是改判据，得主人拍板，不在自动修复范围内。
 	if (isAdRandomChannelName(title) || isAdRandomChannelName(username)) {
-		add(AD_RANDOM_CHANNEL_SCORE, '来源频道名为随机字母串');
+		if (AD_RANDOM_CHANNEL_SCORE > 0) add(AD_RANDOM_CHANNEL_SCORE, '来源频道名为随机字母串');
+		// 0 分时走本文件其余 8 处统一的「不计分」留痕格式，不用 add(0, ...)：
+		// 后者会 push 出「+0 xxx」，与按前缀识别正分判据的 AD_REASON_POSITIVE_RE 撞车
+		//（虽然闸二那边已经改用 /^[1-9]/ 规避了，但格式不该有两种）。
+		else reasons.push('（来源频道名为随机字母串，不计分：AD_RANDOM_CHANNEL_SCORE 当前为 0）');
 	}
 
 	return { score, reasons, isAd: score >= 4 };

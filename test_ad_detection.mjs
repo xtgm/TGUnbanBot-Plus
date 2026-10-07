@@ -421,6 +421,17 @@ section('[1] 结构化评分层（纯函数，零网络）');
 	const forwardNormal = W.scoreAdForwardChat({ title: 'Cloudflare 官方公告', username: 'cf_news' });
 	assert('正常频道转发不判定为广告来源', forwardNormal.isAd === false, JSON.stringify(forwardNormal));
 
+	// 这条判据当前不可达（AD_FORWARD_JUDGE_ENABLED=false 在函数开头就 return 了），
+	// 但保留着「开关一开就恢复原行为」的契约，所以它 0 分时的留痕格式也得对：
+	// 必须走本文件统一的「（…，不计分：…）」，不能用 add(0, ...) —— 后者会 push 出
+	//「+0 xxx」，与按前缀识别正分判据的 AD_REASON_POSITIVE_RE 撞车。
+	// 行为测不到（常量写死 + 路径不可达），只能钉源码。
+	assert('★ 随机频道名 0 分走「不计分」留痕格式，不是裸 add(0,...)',
+		src.includes("else reasons.push('（来源频道名为随机字母串，不计分："),
+		'未找到不计分分支，可能被改回了 add(AD_RANDOM_CHANNEL_SCORE, ...)');
+	assert('注释如实标注该分值当前为 0（原先写的是「给到 4 分 = isAd 门槛」，从未落地）',
+		src.includes('AD_RANDOM_CHANNEL_SCORE 自 b5899ab 创建起'), '注释里的现状标注丢了');
+
 	assert('adTextHash 同文本稳定', W.adTextHash('测试文本') === W.adTextHash('测试文本'));
 	assert('adTextHash 不同文本不同', W.adTextHash('测试文本A') !== W.adTextHash('测试文本B'));
 	assert('adTextHash 输出 16 位 hex', /^[0-9a-f]{16}$/.test(W.adTextHash('x')), W.adTextHash('x'));
