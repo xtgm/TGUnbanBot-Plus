@@ -14915,7 +14915,13 @@ async function checkAdAiSimilarity(env, text, options = {}) {
 				isMatch = true;    // 必然成立：max 是 sorted[0]，hits≥min 已隐含 max 达线
 			} else {
 				isMatch = false;
-				topKInfo.rejected = true;   // 越线但证据不够 —— 留痕供 /pending 复核
+				// 【只有 max 确实越线、但达线条数不够】才配叫 rejected —— 那才是注释里的
+				//「越线但证据不够」。max 压根没越线的是普通未命中：原先无条件置 true，
+				// 会让使用处那条文案输出「相似度 0.417 ≥ 阈值 0.78」这种自相矛盾的话，
+				// 把「没达线」说成「达线了但证据不足」—— 线上 ad_join_checks 里大量存在，
+				// /pending 复核与诊断都会被它误导（本轮诊断就被带偏过一次）。
+				// isMatch 两种情况都是 false，判定结果一字不变，错的只是留痕。
+				topKInfo.rejected = best >= config.aiSimilarityThreshold;
 			}
 		}
 	}

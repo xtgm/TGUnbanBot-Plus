@@ -143,6 +143,19 @@ console.log('\n=== 2. K=3 打开：多证定罪 ===');
 	check('  ↑ rejected=true 留痕供 /pending 复核', r1.topK.rejected === true, show(r1));
 	check('  ↑ similarity 仍是 max（供 reasons 展示）', Number(r1.similarity.toFixed(3)) === 1, show(r1));
 	check('  ↑ isSoft 不受影响（此时 best≥阈值，恒为 false）', r1.isSoft === false, show(r1));
+
+	// ★ 线上 bug 回归：ad_join_checks 里出现过「AI 语义相似度 0.417 ≥ 阈值 0.78」这种
+	// 自相矛盾的文案。根因是 rejected 原先在「hits < minHits」时无条件置 true，把
+	// 「压根没达线」也说成「越线但证据不够」。判定结果两种情况都是 false，错的只是留痕 ——
+	// 所以这里断的是留痕口径，不是定罪结果。
+	const rAllMiss = await runCase(3, [VEC_M, VEC_M, VEC_M]);
+	check('K=3：三条全未超线 → isMatch=false（定罪结果不受本次修复影响）', rAllMiss.isMatch === false, show(rAllMiss));
+	check('  ↑ ★ 全未达线时 rejected=false（不再冒充「越线但证据不够」）',
+		rAllMiss.topK.rejected === false, show(rAllMiss));
+	check('  ↑ similarity 确实低于阈值（那句「≥ 阈值」本就是假的）',
+		rAllMiss.similarity < 0.78, show(rAllMiss));
+	check('  ↑ rejected 仍只在「max 越线但条数不够」时为真（上面 r1 已断）',
+		r1.topK.rejected === true && rAllMiss.topK.rejected === false, show(rAllMiss));
 }
 
 console.log('\n=== 3. 样本不足 K → fallback 回 max（冷启动保召回）===');
