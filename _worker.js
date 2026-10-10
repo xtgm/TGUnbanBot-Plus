@@ -18276,6 +18276,26 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 	let learned = 0;
 	let sampleAdded = false;
 
+	// ===== 自举案底：这次定罪把哪几个被挂 handle 坐实了 =====
+	//
+	// 【为什么要挪进学习函数】它与头像 / 指纹 / 资料形状那批一样是【判据学习】，
+	// 而不是「处置动作」。原先它单独挂在 enforceAdDetection 里、位置在演练分支之后，
+	// 注释写的理由是「演练的定义是一个动作都不做，给广告位盖章同样是动作」——
+	// 那是演练还不学的时候的口径。现在演练当场就学（主人口径：「演练就是为了
+	// 学习」「要的就是全学」），它必须跟着一起学，否则演练期封一批挂同款频道的
+	// 号，那个频道不会被标成案底，下一个人挂它还是只按普通链接算分。
+	//
+	// 只标 snapshot.scoredLinks 里【本次真的加过分】的 handle：挂了个正常频道的
+	// 广告号被封时，那个正常频道一个分都没加，绝不能被盖成广告位，否则连坐所有
+	// 挂它的人 —— 这正是会员标那次误封的同一类连坐。这条保护在 confirmAdLinkOnBan
+	// 内部，演练期调它同样受保护，风险与正式处置一致。
+	try {
+		await confirmAdLinkOnBan(env, evaluation);
+	} catch (error) {
+		// 案底记不上只意味着下次少一条 +3，不能因此让整次学习判失败。
+		console.error('[广告检测·链接] 案底标记异常:', error?.message || error);
+	}
+
 	// 定罪即学习头像：广告团队批量复用同一批素材头像，一次定罪就把这张图挂上黑名单，
 	// 之后用同一张头像进群的号在【入群那一步】就能被拦住（applyAvatarVerdict 分档）。
 	//
@@ -18481,18 +18501,8 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	}
 
 	// ===== 自举案底：这次定罪把哪几个被挂 handle 坐实了 =====
-	// 【为什么在这个位置】必须在上面演练分支之后 —— 演练的定义是一个动作都不做，
-	// 给广告位盖章同样是「动作」。往下的 noteParts / 加黑 / 全群封禁 / 四类学习
-	// 也都在这里之后，与它们同一个位置语义。
-	// 只标 snapshot.scoredLinks 里【本次真的加过分】的 handle：挂了个正常频道的
-	// 广告号被封时，那个正常频道一个分都没加，绝不能被盖成广告位，否则连坐所有
-	// 挂它的人 —— 这正是会员标那次误封的同一类连坐。
-	try {
-		await confirmAdLinkOnBan(env, evaluation);
-	} catch (error) {
-		// 案底记不上只意味着下次少一条 +3，不能因此把整次处置判失败。
-		console.error('[广告检测·链接] 案底标记异常:', error?.message || error);
-	}
+	// 已并入 learnAdFeaturesOnVerdict：它与头像 / 指纹 / 资料形状那批一样是【判据
+	// 学习】，正式处置与演练两条路共用一份，见该函数里这段的说明。
 
 	const noteParts = [
 		'广告自动判定',

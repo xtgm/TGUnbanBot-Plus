@@ -567,13 +567,22 @@ section('[10] 自举案底：案底存在 ad_link_cache，/ignore 可撤');
 	const cols = env.DB.query('PRAGMA table_info(ad_link_cache)').map((c) => c.name);
 	assert('ad_link_cache 有 ad_confirmed 列', cols.includes('ad_confirmed'), JSON.stringify(cols));
 
-	// —— 标记的调用位置：必须在演练分支之后（演练一个动作都不做） ——
-	const start = src.indexOf('async function enforceAdDetection');
-	const body = src.slice(start, start + 9000);
-	assert('confirmAdLinkOnBan 在 enforceAdDetection 内被调用', body.includes('await confirmAdLinkOnBan(env, evaluation)'), '');
-	assert('标记位置在演练 return 之后',
-		body.indexOf('await confirmAdLinkOnBan(env, evaluation)') > body.indexOf("banSummary: '演练命中（未处置）'"),
-		JSON.stringify({ mark: body.indexOf('await confirmAdLinkOnBan(env, evaluation)'), dry: body.indexOf("banSummary: '演练命中（未处置）'") }));
+	// —— 标记的调用位置 ——
+	//
+	// 旧版这里锁的是「必须在演练 return 之后（演练一个动作都不做）」，那是演练还不学
+	// 时候的口径。主人口径改成了「演练就是为了学习」「要的就是全学」，所以自举案底
+	// 跟着其余六类判据一起搬进了共用学习函数 learnAdFeaturesOnVerdict ——
+	// 正式处置与演练两条路都调它，判据不分叉。
+	const learnStart = src.indexOf('async function learnAdFeaturesOnVerdict');
+	const learnBody = src.slice(learnStart, learnStart + 6000);
+	assert('confirmAdLinkOnBan 在共用学习函数内被调用',
+		learnStart > 0 && learnBody.includes('await confirmAdLinkOnBan(env, evaluation)'), String(learnStart));
+	// 演练分支必须也调这个函数，否则演练期学不到案底：封一批挂同款频道的号，
+	// 那个频道不会被标成广告位，下一个人挂它还是只按普通链接算分。
+	const dryStart = src.indexOf('===== 演练模式：命中记流水 + 学特征 + 推私聊，处置一个都不做 =====');
+	const dryBody = src.slice(dryStart, dryStart + 5000);
+	assert('演练分支调用共用学习函数（演练也要学）',
+		dryStart > 0 && dryBody.includes('learnAdFeaturesOnVerdict('), String(dryStart));
 	// 写入端不得把已确认的案底冲回 0（一次 6 小时后的重查就会冲掉）
 	assert('写缓存对 ad_confirmed 取 MAX 而非覆盖', src.includes('ad_confirmed = MAX(ad_link_cache.ad_confirmed, excluded.ad_confirmed)'), '');
 }
