@@ -326,12 +326,19 @@ section('[3] 演练短路：一个人都不动');
 		snapshots: env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c,
 		drylog: env.DB.query('SELECT COUNT(*) AS c FROM ad_dryrun_log')[0].c
 	};
-	assert('演练不学指纹', countsOpen.fingerprints === countsClosed.fingerprints,
-		JSON.stringify({ before: countsClosed.fingerprints, after: countsOpen.fingerprints }));
-	assert('演练不学 AI 样本', countsOpen.samples === countsClosed.samples,
-		JSON.stringify({ before: countsClosed.samples, after: countsOpen.samples }));
-	assert('演练不学资料形状', countsOpen.shapes === countsClosed.shapes,
-		JSON.stringify({ before: countsClosed.shapes, after: countsOpen.shapes }));
+	// 【演练就是要学】主人口径「演练就是为了学习」「要的就是全学」，演练当场就学。
+	//
+	// 这里【不比对判据表行数】：同一个指纹/形状/样本第二次学是更新
+	// match_count / hits（INSERT OR IGNORE + DO UPDATE），行数不变 —— 比行数根本
+	// 测不出「学没学」，只会测出「这条恰好学过」（旧断言正是靠这个巧合过的）。
+	// 改断言流水的记账列，那才是每条演练都写、且能分清七类各学了多少的。
+	const dryLearnRow = env.DB.query('SELECT * FROM ad_dryrun_log WHERE user_id = ?', '666002')[0];
+	assert('演练流水记下学习量（指纹或语义样本至少一项）',
+		Boolean(dryLearnRow) && (Number(dryLearnRow.learned) > 0 || Number(dryLearnRow.sample) === 1),
+		JSON.stringify(dryLearnRow));
+	assert('演练流水记下了资料形状（关演练时的汇总靠它）',
+		Boolean(dryLearnRow) && Number(dryLearnRow.shapes) >= 1,
+		JSON.stringify(dryLearnRow && { shapes: dryLearnRow.shapes }));
 	assert('演练不写 /ignore 快照', countsOpen.snapshots === countsClosed.snapshots,
 		JSON.stringify({ before: countsClosed.snapshots, after: countsOpen.snapshots }));
 	assert('演练写入流水 +1', countsOpen.drylog === countsClosed.drylog + 1,

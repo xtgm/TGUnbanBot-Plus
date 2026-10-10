@@ -418,12 +418,15 @@ section('[7] 五个叠判接入点 + 定罪即学习');
 	// 【不重复计数】immediateBadge 必须嵌在 immediateAvatar 的 if 里：
 	// 否则「avatar 空 + badge 有」会既立即学一次、又进队列学第二次，
 	// hits 是 +1 语义，重复就虚高，会把安全阀提前拱开。
-	const nestOk = /if \(immediateAvatar\) \{[\s\S]{0,400}?if \(immediateBadge\) await learnAdBadgeOnBan/.test(src);
+	// 写法从 `if (immediateBadge) await learnAdBadgeOnBan(...)` 改成了
+	// `if (immediateBadge && await learnAdBadgeOnBan(...)) badges += 1`，
+	// 是为了给关演练时的汇总记账 —— 嵌套语义与先后顺序一字未变。
+	const nestOk = /if \(immediateAvatar\) \{[\s\S]{0,400}?if \(immediateBadge && await learnAdBadgeOnBan/.test(src);
 	assert('immediateBadge 嵌在 avatar 分支内（杜绝重复学习虚高 hits）', nestOk, '');
 
 	// 队列条件仍是原来的「avatar 拿不到才排队」，没被我改坏
 	assert('排队条件保持 !immediateAvatar 语义',
-		/else await queueAdAvatarLearning\(env, userId\);/.test(src), '');
+		/else if \(await queueAdAvatarLearning\(env, userId\)\)/.test(src), '');
 }
 
 // ================= [8] 热路径：闸一零开销 =================

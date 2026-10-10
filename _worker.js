@@ -5924,17 +5924,20 @@ async function ensureAdDryRunLogTable(env) {
 	const init = (async () => {
 		try {
 			await runD1SchemaStatement(env, 'ad_dryrun_log',
-				'CREATE TABLE IF NOT EXISTS ad_dryrun_log (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, user_id TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 0, verdict TEXT NOT NULL DEFAULT \'\', layer TEXT NOT NULL DEFAULT \'\', reasons TEXT NOT NULL DEFAULT \'\', snapshot TEXT NOT NULL DEFAULT \'\', evaluation TEXT NOT NULL DEFAULT \'\', fp INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, learned INTEGER NOT NULL DEFAULT 0, sample INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0)');
+				'CREATE TABLE IF NOT EXISTS ad_dryrun_log (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, user_id TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 0, verdict TEXT NOT NULL DEFAULT \'\', layer TEXT NOT NULL DEFAULT \'\', reasons TEXT NOT NULL DEFAULT \'\', snapshot TEXT NOT NULL DEFAULT \'\', evaluation TEXT NOT NULL DEFAULT \'\', fp INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, learned INTEGER NOT NULL DEFAULT 0, sample INTEGER NOT NULL DEFAULT 0, badges INTEGER NOT NULL DEFAULT 0, avatars INTEGER NOT NULL DEFAULT 0, images INTEGER NOT NULL DEFAULT 0, shapes INTEGER NOT NULL DEFAULT 0, links INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0)');
 			await runD1SchemaStatement(env, 'idx_ad_dryrun_created', 'CREATE INDEX IF NOT EXISTS idx_ad_dryrun_created ON ad_dryrun_log (created_at)', { optional: true });
-			// ===== 按钮五列（存量表迁移）=====
+			// ===== 按钮十列（存量表迁移）=====
 			// CREATE TABLE IF NOT EXISTS 对已存在的表完全无效，缺了这一步老部署会在
 			// 第一次点按钮时报 no such column —— 而错误被上层 catch 吞掉后，表现是
 			//「按钮点了没反应」，看不出哪里断了。
-			// 先判表再判列：表不存在 = 首次建表，上面的 CREATE 已经带齐五列。
-			// learned / sample 是演练期「已学特征」的记账：确认封时据此跳过重复学习，
+			// 先判表再判列：表不存在 = 首次建表，上面的 CREATE 已经带齐十列。
+			// learned/sample 是演练期「已学特征」的记账：确认封时据此跳过重复学习，
 			// 否则一次演练拍板会让头像与资料形状的 hits 各 +1，直接顶到封禁档。
+			// badges/avatars/images/shapes/links 五列服务于关演练时的汇总回执
+			// （summarizeDryRunLearning），说清这一轮七类各学了多少。
 			if (await d1TableExists(env, 'ad_dryrun_log')) {
-				for (const column of ['evaluation', 'fp', 'done', 'learned', 'sample']) {
+				for (const column of ['evaluation', 'fp', 'done', 'learned', 'sample',
+					'badges', 'avatars', 'images', 'shapes', 'links']) {
 					try {
 						if (!(await d1ColumnExists(env, 'ad_dryrun_log', column))) {
 							await runD1SchemaStatement(env, 'ad_dryrun_log.' + column,
@@ -6093,20 +6096,25 @@ async function markAdDryRunVerdict(env, id, field) {
 	}
 }
 
-// 记下这一条演练已经学过哪些特征（指纹条数 + 有没有学 AI 样本）。
+// 记下这一条演练已经学了哪些特征（七类各多少）。
 //
-// 用途只有一个：主人点「✅ 确认封」时据此跳过重复学习 —— hits 是 +1 语义，
-// 确认封那一次再学一遍会让头像与资料形状各 +1，直接顶到封禁档
-// （AD_PROFILE_SHAPE_MIN_HITS=2、头像 hits>=2），把安全阀提前拱开。
-// 同一个坑代码里已经踩过两次（会员标学习的「刻意嵌在 if 里」、头像补学队列）。
-async function markAdDryRunLearned(env, id, learned, sample) {
+// 两个用途：
+//   ① 主人点「✅ 确认封」时据此跳过重复学习 —— hits 是 +1 语义，确认封那一次
+//      再学一遍会让头像与资料形状各 +1，直接顶到封禁档（AD_PROFILE_SHAPE_MIN_HITS=2、
+//      头像 hits>=2），把安全阀提前拱开。同一个坑代码里已经踩过两次。
+//   ② 主人关演练时给一份「这一轮学到什么」的汇总（summarizeDryRunLearning）。
+async function markAdDryRunLearned(env, id, tally) {
 	const rowId = Number(id) || 0;
+	const t = tally || {};
 	if (!env?.DB || !rowId) return { ok: false, reason: 'bad_arg' };
 	if (!(await ensureAdDryRunLogTable(env))) return { ok: false, reason: 'no_table' };
 	try {
 		const res = await env.DB.prepare(
-			'UPDATE ad_dryrun_log SET learned = ?, sample = ? WHERE id = ?'
-		).bind(Number(learned) || 0, sample ? 1 : 0, rowId).run();
+			'UPDATE ad_dryrun_log SET learned = ?, sample = ?,'
+			+ ' badges = ?, avatars = ?, images = ?, shapes = ?, links = ? WHERE id = ?'
+		).bind(Number(t.learned) || 0, t.sampleAdded ? 1 : 0,
+			Number(t.badges) || 0, Number(t.avatars) || 0, Number(t.images) || 0,
+			Number(t.shapes) || 0, Number(t.links) || 0, rowId).run();
 		return { ok: Number(res?.meta?.changes || 0) > 0 };
 	} catch (error) {
 		console.error('[演练模式] 记录学习结果失败:', error);
@@ -9347,7 +9355,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'',
 			'<b>━━ 演练模式（仅第一主人 · 任意配置群）━━</b>',
 			'/dryrun　翻转本群开关；私聊发送则列出已开演练的群与命中数',
-			'/dryrun on　开启：判定照跑，但不删不封不学习，命中只写流水并私聊通知你，通知带两个按钮当场拍板（✅确认封 / ❌不该封标误报）',
+			'/dryrun on　开启：判定照跑，不删不封不加黑【但当场就学特征，全部配置群通用】，命中写流水并私聊通知你，通知带两个按钮拍板（✅确认封 / ❌不该封撤销特征+标误报）',
 			'/dryrun off　关闭：恢复自动处置（加黑 + 全群封禁 + 删消息 + 自动学习）',
 			'/dryrun status　查看本群当前状态',
 			'　　⚠️ 演练期间本群完全不设防、广告照发，调完阈值记得关',
@@ -17942,7 +17950,7 @@ function renderAdDetectionNotice(evaluation, context) {
 	// 主人会以为真封了，转头去群里一看人还在、消息也在。
 	if (context?.dryrun) {
 		lines.push('<b>🧪 广告号演练命中（未处置）</b>');
-		lines.push('演练模式：判定照跑，但本群不删不封、不加黑、不学习');
+		lines.push('演练模式：判定照跑，本群不删不封、不加黑，但当场就学特征（全部配置群通用）');
 	} else {
 		lines.push('<b>🚫 广告号自动封禁</b>');
 	}
@@ -18150,6 +18158,73 @@ async function revertDryRunLearning(env, evaluation) {
 	return out;
 }
 
+// 关演练时给一份「这一轮学到什么」的汇总。
+//
+// 窗口起点取 dryrun_groups.at（开演练那一刻写的 ISO 时间戳）：演练是按群开关的，
+// 主人关掉时想看的正是「这一次挂演练攒下了什么」，而不是历史全部。
+//
+// 数据来自 ad_dryrun_log 的记账列（见 markAdDryRunLearned）：演练当场就学，
+// 所以流水里的数字就是真实学到的量，不是「本来会学」。
+async function summarizeDryRunLearning(env, chatId, sinceISO) {
+	const out = { hits: 0, fingerprints: 0, samples: 0, badges: 0, avatars: 0, images: 0, shapes: 0, links: 0 };
+	if (!env?.DB) return out;
+	if (!(await ensureAdDryRunLogTable(env))) return out;
+	const since = sinceISO ? Math.floor(Date.parse(sinceISO) / 1000) : 0;
+	if (!Number.isFinite(since) || since <= 0) return out;
+	try {
+		const row = await env.DB.prepare(
+			'SELECT COUNT(*) AS hits, COALESCE(SUM(learned),0) AS fingerprints,'
+			+ ' COALESCE(SUM(sample),0) AS samples, COALESCE(SUM(badges),0) AS badges,'
+			+ ' COALESCE(SUM(avatars),0) AS avatars, COALESCE(SUM(images),0) AS images,'
+			+ ' COALESCE(SUM(shapes),0) AS shapes, COALESCE(SUM(links),0) AS links'
+			+ ' FROM ad_dryrun_log WHERE chat_id = ? AND created_at >= ?'
+		).bind(String(chatId), since).first();
+		if (row) {
+			out.hits = Number(row.hits) || 0;
+			out.fingerprints = Number(row.fingerprints) || 0;
+			out.samples = Number(row.samples) || 0;
+			out.badges = Number(row.badges) || 0;
+			out.avatars = Number(row.avatars) || 0;
+			out.images = Number(row.images) || 0;
+			out.shapes = Number(row.shapes) || 0;
+			out.links = Number(row.links) || 0;
+		}
+	} catch (error) {
+		console.error('[演练模式] 汇总学习成果失败:', error);
+	}
+	return out;
+}
+
+// 读这个群开演练的时刻（dryrun_groups.at，ISO 时间戳）。没开或读不到返回空串。
+async function readDryRunOpenedAt(env, chatId) {
+	if (!env?.DB) return '';
+	if (!(await ensureDryRunTable(env))) return '';
+	try {
+		const row = await env.DB.prepare('SELECT at FROM dryrun_groups WHERE chat_id = ?')
+			.bind(String(chatId || '')).first();
+		return String(row?.at || '');
+	} catch (error) {
+		return '';
+	}
+}
+
+// 把汇总渲染成关演练回执里的几行。0 的项不列，否则每次都是八行零蛋。
+function renderDryRunLearnSummary(t) {
+	const bits = [];
+	if (t.fingerprints) bits.push('指纹 +' + t.fingerprints + ' 条');
+	if (t.samples) bits.push('AI 语义样本 +' + t.samples + ' 条');
+	if (t.shapes) bits.push('资料形状 +' + t.shapes + ' 条');
+	if (t.avatars) bits.push('头像 +' + t.avatars + ' 张');
+	if (t.badges) bits.push('会员标/贴纸 +' + t.badges + ' 个');
+	if (t.images) bits.push('正文图片 +' + t.images + ' 张');
+	if (t.links) bits.push('自举案底 +' + t.links + ' 个');
+	if (!bits.length) {
+		return '本轮演练没有学到新特征（命中的要么与库中已有判据重复，要么资料里没有可学素材）。';
+	}
+	return '本轮演练命中 ' + t.hits + ' 条，学到：\n  ' + bits.join('　')
+		+ '\n这些判据【全部配置群通用】，广告号在申请进群那一步就会被拦下。';
+}
+
 // 演练通知上的两个结论按钮。只有第一主人能点 —— 一个会真的封人、一个往统计里
 // 写结论，与 /ignore 同一档权限。
 async function handleDryRunButtonCallback(callbackQuery, env) {
@@ -18275,6 +18350,10 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 	const userId = String(options.userId || '');
 	let learned = 0;
 	let sampleAdded = false;
+	// 各类计数：关演练时要给一份「这一轮学到什么」的汇总，光靠 learned/sample
+	// 两列说不清七类分别学了多少。布尔型学习函数成功记 1；
+	// confirmAdLinkOnBan 返回的就是本次盖章的 handle 数，直接累加。
+	let badges = 0, avatars = 0, images = 0, shapes = 0, links = 0;
 
 	// ===== 自举案底：这次定罪把哪几个被挂 handle 坐实了 =====
 	//
@@ -18290,7 +18369,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 	// 挂它的人 —— 这正是会员标那次误封的同一类连坐。这条保护在 confirmAdLinkOnBan
 	// 内部，演练期调它同样受保护，风险与正式处置一致。
 	try {
-		await confirmAdLinkOnBan(env, evaluation);
+		links += Number(await confirmAdLinkOnBan(env, evaluation)) || 0;
 	} catch (error) {
 		// 案底记不上只意味着下次少一条 +3，不能因此让整次学习判失败。
 		console.error('[广告检测·链接] 案底标记异常:', error?.message || error);
@@ -18317,17 +18396,21 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 		// 跳过与会员标重复的那个 id：hits 是 +1 语义，重复学会把安全阀提前拱开。
 		for (const emojiId of immediateEmojiIds) {
 			if (!emojiId || emojiId === immediateBadge) continue;
-			await learnAdBadgeOnBan(env, emojiId, userId);
+			if (await learnAdBadgeOnBan(env, emojiId, userId)) badges += 1;
 		}
 		if (immediateAvatar) {
-			await learnAdAvatarOnBan(env, immediateAvatar, userId);
+			if (await learnAdAvatarOnBan(env, immediateAvatar, userId)) avatars += 1;
 			// 会员标跟着同一条路径学：两者都来自同一份 getChat 响应，
 			// 要么一起有（闸二 / 入群 / cron 定罪）要么一起空（闸一定罪）。
 			// 【刻意嵌在 if 里】否则「avatar 空 + badge 有」会既立即学一次、
 			// 又进队列被 worker 学第二次 —— hits 是 +1 语义，重复就虚高，
 			// 会把 AD_BADGE_BAN_HITS 的安全阀提前拱开。
-			if (immediateBadge) await learnAdBadgeOnBan(env, immediateBadge, userId);
-		} else await queueAdAvatarLearning(env, userId);
+			if (immediateBadge && await learnAdBadgeOnBan(env, immediateBadge, userId)) badges += 1;
+		} else if (await queueAdAvatarLearning(env, userId)) {
+			// 进补学队列：cron 轨才真正学，这里只记「排上了」—— 汇总里要写明白
+			// 否则主人看到 avatars=0 会以为头像白学了。
+			avatars += 1;
+		}
 	} catch (_) { /* 头像学习失败不影响本次处置 */ }
 	// 定罪即学习正文图片：与头像同一逻辑（引流素材是批量复用的，学一次拦住同款）。
 	// 【为什么不需要头像那套补学队列】头像要等 getChat 才拿得到，而闸一压根不调它，
@@ -18335,14 +18418,14 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 	// 闸一就取得到 —— payload.imageId 在闸一定罪时已经非空，没有「恒为空」这个缺口。
 	try {
 		const learnedImageId = String(evaluation?.payload?.imageId || '');
-		if (learnedImageId) await learnAdImageOnBan(env, learnedImageId, userId);
+		if (learnedImageId && await learnAdImageOnBan(env, learnedImageId, userId)) images += 1;
 	} catch (_) { /* 图片学习失败不影响本次处置 */ }
 	// 定罪即学习资料形状：资料模板是批量号的【公开复用资产】，学一次之后同模板的号
 	// 在零 AI 下就能命中（只加分，仍要过原有阈值）。取 snapshot 里存好的形状，
 	// 不在这里重算 —— 重算要拿完整 bio，而处置端只拿到 evaluation。
 	try {
-		await learnAdProfileShape(env, evaluation?.snapshot?.profileShape || '',
-			String(evaluation?.snapshot?.bio || ''));
+		if (await learnAdProfileShape(env, evaluation?.snapshot?.profileShape || '',
+			String(evaluation?.snapshot?.bio || ''))) shapes += 1;
 	} catch (_) { /* 形状学习失败不影响本次处置 */ }
 
 	try {
@@ -18409,7 +18492,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 		console.error('[广告检测] 自动学习语义样本失败:', error);
 	}
 
-	return { learned, sampleAdded };
+	return { learned, sampleAdded, badges, avatars, images, shapes, links };
 }
 
 // === 处置执行 ===
@@ -18456,22 +18539,22 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			// 记录失败只影响后续重发能否被删，不影响这次演练流水与通知。
 		}
 		// 学特征（演练的核心目的）。与正式处置共用 learnAdFeaturesOnVerdict，
-		// 判据不另写一套。学完把结果写进流水，确认封时据此跳过重复学习。
-		let learnedCount = 0;
-		let sampleLearned = false;
+		// 判据不另写一套。学完把七类结果一并写进流水：确认封时据此跳过重复学习，
+		// 关演练时据此出汇总回执。
+		let tally = { learned: 0, sampleAdded: false, badges: 0, avatars: 0, images: 0, shapes: 0, links: 0 };
 		try {
-			const lr = await learnAdFeaturesOnVerdict(env, evaluation, {
+			tally = await learnAdFeaturesOnVerdict(env, evaluation, {
 				userId,
 				whitelist: options.whitelist
 			});
-			learnedCount = Number(lr.learned) || 0;
-			sampleLearned = Boolean(lr.sampleAdded);
 		} catch (error) {
 			console.error('[广告检测·演练] 特征学习失败:', error);
 		}
+		const learnedCount = Number(tally.learned) || 0;
+		const sampleLearned = Boolean(tally.sampleAdded);
 		if (dryRunId) {
 			try {
-				await markAdDryRunLearned(env, dryRunId, learnedCount, sampleLearned);
+				await markAdDryRunLearned(env, dryRunId, tally);
 			} catch (error) {
 				// 写不进去只意味着「确认封时会再学一次」，不影响本次演练。
 				console.error('[广告检测·演练] 记录学习结果失败:', error);
@@ -18484,7 +18567,9 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		console.log('[广告检测·演练] 命中未处置 user=' + userId + ' chat=' + chatId
 			+ ' score=' + evaluation?.score + '/' + evaluation?.threshold
 			+ ' layer=' + evaluation?.layer + ' 流水=' + dryRunId
-			+ ' 学指纹=' + learnedCount + ' AI样本=' + (sampleLearned ? 1 : 0));
+			+ ' 指纹=' + learnedCount + ' 样本=' + (sampleLearned ? 1 : 0)
+			+ ' 形状=' + tally.shapes + ' 头像=' + tally.avatars
+			+ ' 会员标=' + tally.badges + ' 图片=' + tally.images + ' 案底=' + tally.links);
 		// 返回结构刻意对齐正常处置，只是 banned=false、seq=null：
 		// cron 那条调用点读的是 result?.banned !== false，会正确记成「未封」；
 		// banSummary 给非空值是让 /spam 那条群内闪屏读到时能显示演练字样而不是「未知」。
@@ -20264,7 +20349,7 @@ async function handleAdStatsCommand(env, chatId) {
 	// 主人调阈值时要的正是「刚才有没有命中、命中是因为什么」。
 	if (isConfiguredGroup(chatId)) {
 		const dryOn = await isDryRunGroup(env, chatId);
-		lines.push('<b>演练模式</b>　' + (dryOn ? '🧪 本群【开启】—— 判定照跑，但不删不封、不加黑、不学习' : '✅ 本群关闭（正常自动处置）'));
+		lines.push('<b>演练模式</b>　' + (dryOn ? '🧪 本群【开启】—— 判定照跑，不删不封不加黑，但当场学特征（全部配置群通用）' : '✅ 本群关闭（正常自动处置）'));
 		const dryCounts = await countAdDryRun(env, chatId);
 		if (dryCounts.total > 0) {
 			lines.push('　↳ 命中：今日 <b>' + dryCounts.today + '</b> 条，累计 <b>' + dryCounts.total + '</b> 条（流水保留 30 天）');
@@ -20465,7 +20550,7 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 	}
 	if (dryRunHits.length) {
 		lines.push('');
-		lines.push('🧪 演练命中（不删不封，命中只记流水）：');
+		lines.push('🧪 演练命中（不删不封，已学特征并记流水）：');
 		for (const item of dryRunHits.slice(0, 10)) lines.push('· <code>' + escapeHtml(item) + '</code>');
 	}
 	if (failed.length) {
@@ -22169,6 +22254,9 @@ async function handleDryRunCommand(message, env) {
 	else if (/^(off|关|关闭)$/.test(arg)) target = false;
 	else target = !currentlyOn;   // 裸 /dryrun = 翻转
 
+	// 关演练前先取开演练的时刻：setDryRun 会覆盖 dryrun_groups.at，晚一步就取不到
+	// 「本轮」的窗口了。目标仍是「开」= 本轮没结束，不取。
+	const openedAt = currentlyOn && !target ? await readDryRunOpenedAt(env, chatId) : '';
 	const r = await setDryRun(env, chatId, target, userId);
 	if (!r.ok) {
 		await reply('❌ 切换失败：' + escapeHtml(toChineseErrorText(r.error || '未知错误')));
@@ -22176,22 +22264,33 @@ async function handleDryRunCommand(message, env) {
 	}
 	const groupLabel = escapeHtml(String(message.chat?.title || '') || chatId);
 	const counts = await countAdDryRun(env, chatId);
+	// 关掉演练时给一份「这一轮学到什么」：演练当场就学，所以这份汇总就是判据库
+	// 真实的增量，不是「本来会学」。
+	let learnSummary = '';
+	if (!target && openedAt) {
+		const tally = await summarizeDryRunLearning(env, chatId, openedAt);
+		learnSummary = '\n\n' + renderDryRunLearnSummary(tally);
+	}
 	const short = target
 		? '🧪 <b>演练模式已开启</b>\n'
-			+ '判定照常跑，但本群【不删消息、不封禁、不加黑、不学指纹与样本】，命中只写流水，并私聊通知你。\n'
+			+ '判定照常跑，本群【不删消息、不封禁、不加黑】，命中只写流水并私聊通知你。\n'
+			+ '✅ 但当场就学特征：头像 / 会员标 / 资料形状 / 正文图片 / 指纹 / AI 样本 / 自举案底，\n'
+			+ '学到的判据【全部配置群通用】，广告号在申请进群那一步就会被拦下。\n'
 			+ '⚠️ 演练期间本群完全不设防，广告照发 —— 调完阈值记得再发一次 <code>/dryrun</code> 关闭。\n'
 			+ '查看命中：<code>/adstats</code>'
-	: '✅ <b>演练模式已关闭</b>\n本群恢复自动处置（加黑 + 全群封禁 + 删消息 + 自动学习）。';
+	: '✅ <b>演练模式已关闭</b>\n本群恢复自动处置（加黑 + 全群封禁 + 删消息）。' + learnSummary;
 	const detail = target
 		? '<b>🧪 演练模式已开启</b>\n'
 			+ '群：<b>' + groupLabel + '</b> <code>' + escapeHtml(chatId) + '</code>\n'
-			+ '判定照常跑，但本群【不删消息、不封禁、不加黑、不学指纹与样本】，命中只写流水。\n'
+			+ '判定照常跑，本群【不删消息、不封禁、不加黑】，命中只写流水。\n'
+			+ '✅ 但当场就学特征：头像 / 会员标 / 资料形状 / 正文图片 / 指纹 / AI 样本 / 自举案底。\n'
+			+ '学到的判据【全部配置群通用】，广告号在申请进群那一步就会被拦下。\n'
 			+ '本群命中：今日 ' + counts.today + ' 条，累计 ' + counts.total + ' 条。\n'
 			+ '⚠️ 演练期间本群完全不设防，广告照发 —— 调完阈值记得再发一次 <code>/dryrun</code> 关闭。\n'
 			+ '查看：<code>/adstats</code>'
 		: '<b>✅ 演练模式已关闭</b>\n'
 			+ '群：<b>' + groupLabel + '</b> <code>' + escapeHtml(chatId) + '</code>\n'
-			+ '恢复自动处置（加黑 + 全群封禁 + 删消息 + 自动学习）。';
+			+ '恢复自动处置（加黑 + 全群封禁 + 删消息）。' + learnSummary;
 	await reply(short, detail);
 	return true;
 }
