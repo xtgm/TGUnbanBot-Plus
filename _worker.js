@@ -20657,27 +20657,46 @@ async function handleAdReplyLearning(message, env, ctx) {
 			unbanTotal = results.length;
 			unbanOk = results.filter((r) => r.ok).length;
 		}
-		// purge: true —— 管理员已经明确声明这是误判，指纹当次即删，不再攒 3 次误报。
-		// 主人原话：「除非说误判了，我就可以通过指定的指令执行全群解封并给指纹记误报 + 删除记录的指纹。」
-		const fp = await markAdFingerprintFalsePositive(env, payload, { purge: true });
-		// 资料形状同步纠错：同一份 bio 判成误封时，它的形状也必须跟着撤 ——
-		// 否则下一个人只是碰巧用了同一套模板，就会被这条错形状再加一次分。
-		const shapeCleared = await markAdProfileShapeFalsePositive(env, payload?.profileShape, { purge: true });
-
-		// 同步清掉当初自动学进去的那条 AI 语义样本。拼法必须走 buildAdSampleText，
-		// 与 enforceAdDetection 写入时完全一致，否则 text_hash 对不上、静默删不掉，
-		// 错样本会永久留在库里继续把相似的正常用户往高相似度上拉（AI 层是硬命中即封）。
-		const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
-		await deleteAdScreening(env, targetId);
+		// ===== 判据回滚（删指纹 / 形状 / AI 样本）只给第一主人 =====
+		//
+		// 解封与删判据是两件事。群管理员、副主人、超管可以解封一个他们认为误封的人 ——
+		// 这个权限一字不动。但删判据会让主人演练与 /spam 一点点攒起来的特征当场作废：
+		// purge 是【整条删】而不是 hits 减一，同一条指纹在别处也被正式封禁学过的话一并没。
+		// 所以这里拆两档：
+		//   · 第一主人：解封 + 判据回滚（原行为不变）
+		//   · 其他人：只解封，指纹 / 形状 / AI 样本 / 观察记录一个都不动，
+		//     回执写「未执行」而不是「删除失败」—— 写成失败会让人以为出了故障去重试，
+		//     而它本来就不该由这些人执行。
+		//
+		// 【为什么现在就要堵】这条路径今天踩不到：AD_REPLY_LEARN_NEGATORS 是空数组，
+		// classifyAdReplyIntent 永远返回不了 negative。但权限写在代码里、安全却靠的是
+		// 「词表恰好空着」—— 哪天往里加一个「误判」，副主人和群管理员立刻就能删判据。
+		const canRollback = isPrimaryOwner(operatorId);
+		let fp = { ok: false, affected: 0, retired: 0 };
+		let shapeCleared = { ok: false, removed: 0 };
+		let sampleRemoved = { ok: false, removed: 0 };
+		if (canRollback) {
+			// purge: true —— 第一主人已经明确声明这是误判，指纹当次即删，不再攒 3 次误报。
+			// 主人原话：「除非说误判了，我就可以通过指定的指令执行全群解封并给指纹记误报 + 删除记录的指纹。」
+			fp = await markAdFingerprintFalsePositive(env, payload, { purge: true });
+			// 资料形状同步纠错：同一份 bio 判成误封时，它的形状也必须跟着撤 ——
+			// 否则下一个人只是碰巧用了同一套模板，就会被这条错形状再加一次分。
+			shapeCleared = await markAdProfileShapeFalsePositive(env, payload?.profileShape, { purge: true });
+			// 同步清掉当初自动学进去的那条 AI 语义样本。拼法必须走 buildAdSampleText，
+			// 与 enforceAdDetection 写入时完全一致，否则 text_hash 对不上、静默删不掉，
+			// 错样本会永久留在库里继续把相似的正常用户往高相似度上拉（AI 层是硬命中即封）。
+			sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
+			await deleteAdScreening(env, targetId);
+		}
+		const skipNote = '⏭️ 未执行（判据回滚仅限第一主人）';
 		await sendTelegramMessage(chat.id, [
 			'<b>♻️ 已按误判处理</b>',
 			'用户：<code>' + escapeHtml(targetId) + '</code>',
 			'黑名单：' + (removed.success ? '已移除' : (removed.code === 'NOT_FOUND' ? '本就不在黑名单' : '移除失败')),
 			'解封：' + unbanOk + '/' + unbanTotal + ' 个群成功',
-			'指纹修正：' + (fp.ok ? '标记 ' + (fp.affected || 0) + ' 条误判，删除 ' + (fp.retired || 0) + ' 条' : '标记失败'),
-			'形状修正：' + (shapeCleared.ok ? (shapeCleared.removed > 0 ? '已删除 ' + shapeCleared.removed + ' 条模板形状' : '无对应形状') : '删除失败'),
-
-			'AI 样本：' + (sampleRemoved.ok ? (sampleRemoved.removed > 0 ? '已删除 ' + sampleRemoved.removed + ' 条' : '无对应样本') : '删除失败')
+			'指纹修正：' + (canRollback ? (fp.ok ? '标记 ' + (fp.affected || 0) + ' 条误判，删除 ' + (fp.retired || 0) + ' 条' : '标记失败') : skipNote),
+			'形状修正：' + (canRollback ? (shapeCleared.ok ? (shapeCleared.removed > 0 ? '已删除 ' + shapeCleared.removed + ' 条模板形状' : '无对应形状') : '删除失败') : skipNote),
+			'AI 样本：' + (canRollback ? (sampleRemoved.ok ? (sampleRemoved.removed > 0 ? '已删除 ' + sampleRemoved.removed + ' 条' : '无对应样本') : '删除失败') : skipNote)
 		].join('\n'));
 		return true;
 	}

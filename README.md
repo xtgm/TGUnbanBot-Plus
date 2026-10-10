@@ -174,7 +174,7 @@
 └── LICENSE
 ```
 
-- **测试** —— **35 个文件、合计 4245 项**，全绿才允许推送；`node test_xxx.mjs` 单跑，退出码非 0 即失败
+- **测试** —— **35 个文件、合计 4251 项**，全绿才允许推送；`node test_xxx.mjs` 单跑，退出码非 0 即失败
 - **运行要求** —— **Node 22+**（`node:sqlite` 内置模块要求）
 - **测试环境** —— 全部离线：Bot API 全 mock，D1 用 `DatabaseSync(':memory:')` **真实 SQLite 后端**（`ON CONFLICT`、`UNIQUE`、`batch` 事务真跑），Workers AI 用固定向量函数模拟
 

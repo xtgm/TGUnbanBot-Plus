@@ -337,6 +337,39 @@ section('[6] 分发分支是活的');
 		&& !'adfix:'.startsWith('dry:') && !'dry:'.startsWith('adfix:'));
 }
 
+
+section('[7] 删判据的路径全部卡在第一主人门槛内');
+{
+	// 这一节是【纯源码守卫】，因为被守的那条路今天踩不到：handleAdReplyLearning 的
+	// 纠错分支要 classifyAdReplyIntent 返回 negative，而 AD_REPLY_LEARN_NEGATORS 是空数组
+	//（2026-09-12 三张词表全部清空的结果）—— 行为断言测不到它，只能钉住代码。
+	//
+	// 【为什么要钉】权限写在代码里，安全却靠「词表恰好空着」。哪天往里加一个「误判」，
+	// 副主人和群管理员立刻就能 purge 掉主人演练与 /spam 攒起来的判据，而 purge 是
+	// 整条删不是 hits 减一 —— 同一条指纹在别处也被正式封禁学过的话一并没。
+	// 主人的原话：「如果其他权限通过 /unban 解封并删除了指纹特征，那么我之前演练学习
+	// 的特征全部都白费。」/unban 三条执行路今天本来就不删判据（已逐条核实），
+	// 真正的口子在这一条，所以卡死的是它。
+	assert('↩️ 误判按钮：入口卡 isPrimaryOwner',
+		/handleAdFixButtonCallback\([\s\S]{0,500}isPrimaryOwner\(fromId\)/.test(src));
+	assert('演练「不该封」按钮：入口卡 isPrimaryOwner',
+		/handleDryRunButtonCallback\([\s\S]{0,500}isPrimaryOwner\(fromId\)/.test(src));
+	assert('/ignore 等广告管理命令：整段入口卡 isPrimaryOwner',
+		/handleAdDetectionCommands\(message[\s\S]{0,900}!isPrimaryOwner\(userId\)/.test(src));
+	assert('★ 引用回复纠错：删判据这一步卡 isPrimaryOwner(operatorId)',
+		/handleAdReplyLearning\(message[\s\S]{0,4000}isPrimaryOwner\(operatorId\)/.test(src),
+		'没找到第一主人门槛，判据回滚可能又对群管理员敞开了');
+	// purge: true = 第一主人明确表态后当次整条删。全项目只有 3 处，各自挂着一道门槛：
+	// 演练按钮 / /ignore 命令 / 引用回复纠错。新加第 4 处必须同时想清楚谁的门槛。
+	const purgeSites = src.match(/markAdFingerprintFalsePositive\([^)]*purge: true/g) || [];
+	assert('purge: true 的删指纹调用点仍是 3 处（加第 4 处前先想清楚谁的门槛）',
+		purgeSites.length === 3, '实际 ' + purgeSites.length + ' 处');
+	// 非第一主人走纠错分支时，回执必须明说「未执行」而不是「删除失败」——
+	// 写成失败会让人以为出了故障去重试，而它本来就不该由这些人执行。
+	assert('非第一主人的回执写「未执行」而非「删除失败」',
+		src.includes('⏭️ 未执行（判据回滚仅限第一主人）'));
+}
+
 console.log(`\n========== 封禁回执纠错按钮：通过 ${pass} / 失败 ${fail} ==========`);
 if (fail > 0) {
 	console.log('失败项：');
