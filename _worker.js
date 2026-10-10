@@ -1631,10 +1631,7 @@ async function banUserFromAllGroups(userId, options = {}) {
 // 对「本就不存在的状态」（没被禁言的人 / 没被封的人）报错即吞掉 —— 至少一步成功就算该群成功。
 async function unbanUserFromAllGroups(userId) {
 	const results = [];
-	// 【群内两步保持串行、跨群并发】「先恢复发言、后解除封禁」是同一群内的语义，
-	// 不许打乱；但不同群之间没有先后关系，原先 for 串行遍历等于 2 × 群数 次 HTTP
-	// 依次排队 —— 20 个群要好几秒，而这条路上往往是人在群里等着。
-	await mapWithConcurrency(GROUP_IDS, BAN_ALL_GROUPS_CONCURRENCY, async (groupId) => {
+	for (const groupId of GROUP_IDS) {
 		let restrictOk = false;
 		let restrictError = null;
 		let unbanOk = false;
@@ -1654,7 +1651,6 @@ async function unbanUserFromAllGroups(userId) {
 			unbanError = error.message || String(error);
 		}
 		const ok = restrictOk || unbanOk;
-		// push 在 worker 里是安全的：JS 单线程，数组追加不会与别的 worker 交错。
 		results.push({
 			groupId,
 			userId: String(userId),
@@ -1664,8 +1660,7 @@ async function unbanUserFromAllGroups(userId) {
 			unbanned: unbanOk,
 			dual: true
 		});
-		return null;
-	});
+	}
 	return results;
 }
 
@@ -10065,14 +10060,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		await sendTelegramMessage(chatId, approvedReply.text, approvedReply.replyMarkup);
 
 		// 遍历所有配置群组，按用户在每个群的状态分别尝试解封/解禁
-		//
-		// 【群内两步保持串行、跨群并发】查状态 → 处置是同一群内的先后关系；
-		// 不同群之间没有依赖，原先 for 串行 = 每群 2~3 次 HTTP 依次排队，
-		// 20 个群要好几秒，而这条路上是人在群里等着看结果。
-		// 结果按【群的原始顺序】落位（index 写入而不是 push）：并发完成顺序是不确定的，
-		// 直接 push 会让回执里的群列表乱序。
-		const perGroupResults = new Array(GROUP_IDS.length);
-		await mapWithConcurrency(GROUP_IDS, BAN_ALL_GROUPS_CONCURRENCY, async (groupId, index) => {
+		const perGroupResults = [];
+		for (const groupId of GROUP_IDS) {
 			let groupLabel = `<code>${escapeHtml(groupId)}</code>`;
 			try {
 				const chatInfo = await getChatInfoFromId(groupId);
@@ -10090,37 +10079,36 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 				if (userStatus === 'kicked') {
 					await unbanUser(userId, groupId);
-					perGroupResults[index] = `✅ ${groupLabel}：已解封，可重新加入。`;
+					perGroupResults.push(`✅ ${groupLabel}：已解封，可重新加入。`);
 				} else if (userStatus === 'restricted') {
 					await restrictUser(userId, groupId);
-					perGroupResults[index] = `✅ ${groupLabel}：禁言已解除。`;
+					perGroupResults.push(`✅ ${groupLabel}：禁言已解除。`);
 				} else if (userStatus === 'left' || userStatus === 'member') {
 					if (userPermissions.can_send_messages === false) {
 						await restrictUser(userId, groupId);
-						perGroupResults[index] = `✅ ${groupLabel}：发言限制已解除。`;
+						perGroupResults.push(`✅ ${groupLabel}：发言限制已解除。`);
 					} else {
-						perGroupResults[index] = `ℹ️ ${groupLabel}：账号无明显限制。`;
+						perGroupResults.push(`ℹ️ ${groupLabel}：账号无明显限制。`);
 					}
 				} else {
-					perGroupResults[index] = `❌ ${groupLabel}：无法确定账号状态（${escapeHtml(userStatus)}）。`;
+					perGroupResults.push(`❌ ${groupLabel}：无法确定账号状态（${escapeHtml(userStatus)}）。`);
 				}
 			} catch (error) {
 				console.error(`处理群 ${groupId} 自助解封失败:`, error);
 				// 单群失败时回退尝试解禁→解封（保持原回退链行为）
 				try {
 					await restrictUser(userId, groupId);
-					perGroupResults[index] = `✅ ${groupLabel}：禁言已解除（兜底处理）。`;
+					perGroupResults.push(`✅ ${groupLabel}：禁言已解除（兜底处理）。`);
 				} catch (restrictError) {
 					try {
 						await unbanUser(userId, groupId);
-						perGroupResults[index] = `✅ ${groupLabel}：已解封（兜底处理）。`;
+						perGroupResults.push(`✅ ${groupLabel}：已解封（兜底处理）。`);
 					} catch (unbanError) {
-						perGroupResults[index] = `❌ ${groupLabel}：解封失败，请联系管理员。`;
+						perGroupResults.push(`❌ ${groupLabel}：解封失败，请联系管理员。`);
 					}
 				}
 			}
-			return null;
-		});
+		}
 
 		await sendTelegramMessage(chatId, perGroupResults.join('\n'));
 
