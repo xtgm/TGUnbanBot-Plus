@@ -5924,15 +5924,17 @@ async function ensureAdDryRunLogTable(env) {
 	const init = (async () => {
 		try {
 			await runD1SchemaStatement(env, 'ad_dryrun_log',
-				'CREATE TABLE IF NOT EXISTS ad_dryrun_log (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, user_id TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 0, verdict TEXT NOT NULL DEFAULT \'\', layer TEXT NOT NULL DEFAULT \'\', reasons TEXT NOT NULL DEFAULT \'\', snapshot TEXT NOT NULL DEFAULT \'\', evaluation TEXT NOT NULL DEFAULT \'\', fp INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0)');
+				'CREATE TABLE IF NOT EXISTS ad_dryrun_log (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, user_id TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 0, verdict TEXT NOT NULL DEFAULT \'\', layer TEXT NOT NULL DEFAULT \'\', reasons TEXT NOT NULL DEFAULT \'\', snapshot TEXT NOT NULL DEFAULT \'\', evaluation TEXT NOT NULL DEFAULT \'\', fp INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, learned INTEGER NOT NULL DEFAULT 0, sample INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0)');
 			await runD1SchemaStatement(env, 'idx_ad_dryrun_created', 'CREATE INDEX IF NOT EXISTS idx_ad_dryrun_created ON ad_dryrun_log (created_at)', { optional: true });
-			// ===== 按钮三列（存量表迁移）=====
+			// ===== 按钮五列（存量表迁移）=====
 			// CREATE TABLE IF NOT EXISTS 对已存在的表完全无效，缺了这一步老部署会在
 			// 第一次点按钮时报 no such column —— 而错误被上层 catch 吞掉后，表现是
 			//「按钮点了没反应」，看不出哪里断了。
-			// 先判表再判列：表不存在 = 首次建表，上面的 CREATE 已经带齐三列。
+			// 先判表再判列：表不存在 = 首次建表，上面的 CREATE 已经带齐五列。
+			// learned / sample 是演练期「已学特征」的记账：确认封时据此跳过重复学习，
+			// 否则一次演练拍板会让头像与资料形状的 hits 各 +1，直接顶到封禁档。
 			if (await d1TableExists(env, 'ad_dryrun_log')) {
-				for (const column of ['evaluation', 'fp', 'done']) {
+				for (const column of ['evaluation', 'fp', 'done', 'learned', 'sample']) {
 					try {
 						if (!(await d1ColumnExists(env, 'ad_dryrun_log', column))) {
 							await runD1SchemaStatement(env, 'ad_dryrun_log.' + column,
@@ -6063,7 +6065,7 @@ async function readAdDryRunRow(env, id) {
 	if (!(await ensureAdDryRunLogTable(env))) return null;
 	try {
 		return await env.DB.prepare(
-			'SELECT id, chat_id, user_id, score, threshold, verdict, layer, reasons, evaluation, fp, done, created_at'
+			'SELECT id, chat_id, user_id, score, threshold, verdict, layer, reasons, evaluation, fp, done, learned, sample, created_at'
 			+ ' FROM ad_dryrun_log WHERE id = ?'
 		).bind(rowId).first();
 	} catch (error) {
@@ -6087,6 +6089,27 @@ async function markAdDryRunVerdict(env, id, field) {
 		return { ok: changed > 0, changed };
 	} catch (error) {
 		console.error('[演练模式] 写入结论失败:', error);
+		return { ok: false, reason: 'error', error: error.message || String(error) };
+	}
+}
+
+// 记下这一条演练已经学过哪些特征（指纹条数 + 有没有学 AI 样本）。
+//
+// 用途只有一个：主人点「✅ 确认封」时据此跳过重复学习 —— hits 是 +1 语义，
+// 确认封那一次再学一遍会让头像与资料形状各 +1，直接顶到封禁档
+// （AD_PROFILE_SHAPE_MIN_HITS=2、头像 hits>=2），把安全阀提前拱开。
+// 同一个坑代码里已经踩过两次（会员标学习的「刻意嵌在 if 里」、头像补学队列）。
+async function markAdDryRunLearned(env, id, learned, sample) {
+	const rowId = Number(id) || 0;
+	if (!env?.DB || !rowId) return { ok: false, reason: 'bad_arg' };
+	if (!(await ensureAdDryRunLogTable(env))) return { ok: false, reason: 'no_table' };
+	try {
+		const res = await env.DB.prepare(
+			'UPDATE ad_dryrun_log SET learned = ?, sample = ? WHERE id = ?'
+		).bind(Number(learned) || 0, sample ? 1 : 0, rowId).run();
+		return { ok: Number(res?.meta?.changes || 0) > 0 };
+	} catch (error) {
+		console.error('[演练模式] 记录学习结果失败:', error);
 		return { ok: false, reason: 'error', error: error.message || String(error) };
 	}
 }
@@ -18057,15 +18080,25 @@ async function pushAdDryRunNotice(env, context) {
 			chatTitle: context?.input?.chatTitle || '',
 			seq: null,
 			dryrun: true,
-			banResultLine: '演练命中，未处置（不加黑 / 不封禁 / 不删消息 / 不学习）'
+			banResultLine: '演练命中，处置未执行（不加黑 / 不封禁 / 不删消息），但本次特征已学入判据库'
 		});
+		const learnedCount = Number(context?.learnedCount) || 0;
+		const sampleLearned = context?.sampleLearned === true;
+		const learnBits = [];
+		if (learnedCount) learnBits.push('指纹 +' + learnedCount + ' 条');
+		if (sampleLearned) learnBits.push('AI 样本 +1 条');
+		const learnLine = learnBits.length
+			? '✅ 已学特征：' + learnBits.join('，') + ' —— 同款【申请进群】即拦'
+			: '本次没有学到新特征（指纹与样本都已存在，或载荷里没有可用素材）';
 		const tail = [
 			'',
-			'本来会执行：加黑 + 全群封禁 + 删消息 + 学指纹与 AI 样本',
+			learnLine,
+			'本来会执行但没做：加黑 + 全群封禁 + 删消息',
 			'流水号：' + (context?.dryRunId ? '#' + context.dryRunId : '（未写入，D1 写失败）'),
 			'',
 			'<b>你判断这条该不该封？</b>',
-			'✅ 确认封 = 当场真处置　　❌ 不该封 = 标为误报（只统计，不动判据库）',
+			'✅ 确认封 = 当场真处置（特征演练期已学，不会重复学）',
+			'❌ 不该封 = 撤销本次学到的特征 + 标为误报',
 			'查看本群命中：<code>/adstats</code>　关闭本群演练：<code>/dryrun</code>',
 			'⚠️ 演练期间本群完全不设防，广告照发 —— 看完记得关。'
 		];
@@ -18081,6 +18114,40 @@ async function pushAdDryRunNotice(env, context) {
 	} catch (error) {
 		console.error('[广告检测·演练] 推送通知失败:', error);
 	}
+}
+
+// 演练的「❌ 不该封」：把这一条演练【已经学进去】的特征撤掉。
+//
+// 演练一开就学（见 enforceAdDetection 的演练分支），误学的出口必须同时在场 ——
+// 否则主人误标一条，同款的正常人之后在【申请进群】那一步就被必封，而他还得逐个
+// 找出来用 /ignore 回滚。
+//
+// 与 /ignore 走【同一批 purge 函数】（purge: true = 主人已明确表态这是误判，当次
+// 即删，不再攒 3 次误报）。「❌ 不该封」同样是主人的明确表态，语义应当一致。
+//
+// 【代价说清楚】purge 是【整条删】而不是「hits 减一」：如果同一个指纹在别处也被
+// 正式封禁学过，这一次会把它一并删掉。这与 /ignore 的既有取舍相同 —— 主人随后再
+// 封一个同款就会重新学回来。真要精确减一得另写一套计数回退，目前没有这个需求。
+//
+// 任何一步失败都只影响撤销的完整度，不能影响「标为误报」这个标记本身。
+async function revertDryRunLearning(env, evaluation) {
+	const payload = evaluation?.payload || {};
+	const out = { avatar: null, badge: null, image: null, shape: false, fp: null, sample: null };
+	try { out.avatar = await clearAdAvatarOnIgnore(env, payload.avatarId); } catch (_) { /* 撤销失败只记日志 */ }
+	try { out.badge = await clearAdBadgeOnIgnore(env, payload.badgeId); } catch (_) { /* 同上 */ }
+	// 正文自定义 emoji 逐个撤，跳过与会员标重复的那个 —— 学的时候就是这么跳的，
+	// 两端不对称会把会员标误撤掉。
+	for (const emojiId of (Array.isArray(payload.customEmojiIds) ? payload.customEmojiIds : [])) {
+		if (!emojiId || emojiId === String(payload.badgeId || '')) continue;
+		try { await clearAdBadgeOnIgnore(env, emojiId); } catch (_) { /* 同上 */ }
+	}
+	try { out.image = await clearAdImageOnIgnore(env, payload.imageId); } catch (_) { /* 同上 */ }
+	try {
+		out.shape = await markAdProfileShapeFalsePositive(env, evaluation?.snapshot?.profileShape, { purge: true });
+	} catch (_) { /* 同上 */ }
+	try { out.fp = await markAdFingerprintFalsePositive(env, payload, { purge: true }); } catch (_) { /* 同上 */ }
+	try { out.sample = await removeAdSampleByText(env, buildAdSampleText(payload)); } catch (_) { /* 同上 */ }
+	return out;
 }
 
 // 演练通知上的两个结论按钮。只有第一主人能点 —— 一个会真的封人、一个往统计里
@@ -18114,27 +18181,39 @@ async function handleDryRunButtonCallback(callbackQuery, env) {
 	const messageId = Number(callbackQuery?.message?.message_id) || 0;
 	const originText = String(callbackQuery?.message?.text || '');
 
+	// 两个分支都要用这份判定：❌ 撤销演练期学到的特征、✅ 原样交回处置链。
+	let evaluation = null;
+	try { evaluation = JSON.parse(String(row.evaluation || '{}')); } catch (_) { evaluation = null; }
+
 	if (action === 'no') {
-		// 误报：只标记，判据库一个字不动（指纹/形状/AI 样本都不碰）。
+		// 误报：标记统计 + 【撤销演练期已经学进去的特征】。
+		// 演练一开就学（见 enforceAdDetection 的演练分支），所以撤销的出口必须同时在场，
+		// 否则主人误标一条，同款的正常人之后在申请进群那一步就被必封。
 		const marked = await markAdDryRunVerdict(env, rowId, 'fp');
 		if (!marked.ok) {
 			await answerAdVoteCallback(callbackQuery?.id, '标记失败：' + (marked.reason || '未知'), true);
 			return;
 		}
-		await answerAdVoteCallback(callbackQuery?.id, '已标为误报（只统计，不动判据库）');
+		if (evaluation && typeof evaluation === 'object' && Array.isArray(evaluation.reasons)) {
+			try {
+				await revertDryRunLearning(env, evaluation);
+			} catch (error) {
+				// 撤销不完整只影响这一条，标记本身已经落库 —— 回执照实说。
+				console.error('[演练模式] 撤销学到的特征失败:', error);
+			}
+		}
+		await answerAdVoteCallback(callbackQuery?.id, '已标为误报，并撤销本次学到的特征');
 		const fpLine = [
 			'─────',
 			'❌ 已标为误报　流水 #' + rowId + '　得分 ' + (Number(row.score) || 0) + '/' + (Number(row.threshold) || 0),
-			'只计入 /adstats 的演练统计，判据库一字未动。',
-			'看统计：/adstats'
+			'已撤销本次演练学到的特征（指纹 / 资料形状 / 头像 / 会员标 / 正文图片 / AI 样本）。',
+			'只计入 /adstats 的演练统计。看统计：/adstats'
 		];
 		await editTelegramMessage(chatId, messageId, originText + '\n' + fpLine.join('\n'));
 		return;
 	}
 
 	// 确认封：把流水里存的整份判定原样交回处置链，force 绕过演练短路。
-	let evaluation = null;
-	try { evaluation = JSON.parse(String(row.evaluation || '{}')); } catch (_) { evaluation = null; }
 	if (!evaluation || typeof evaluation !== 'object' || !Array.isArray(evaluation.reasons)) {
 		await answerAdVoteCallback(callbackQuery?.id, '流水里没有可用的判定数据，无法处置', true);
 		return;
@@ -18142,6 +18221,10 @@ async function handleDryRunButtonCallback(callbackQuery, env) {
 
 	const config = loadAdDetectionConfig(env);
 	const whitelist = await loadAdDomainWhitelist(env);
+	// 演练期已经学过的特征不再学第二次：hits 是 +1 语义，确认封那一次再学一遍会让
+	// 头像与资料形状各 +1，直接顶到封禁档（AD_PROFILE_SHAPE_MIN_HITS=2、头像 hits>=2），
+	// 等于主人点一次按钮就把安全阀拱开。记账见 markAdDryRunLearned。
+	const alreadyLearned = Number(row.learned) > 0 || Number(row.sample) === 1;
 	let result = null;
 	try {
 		result = await enforceAdDetection(env, {
@@ -18149,7 +18232,9 @@ async function handleDryRunButtonCallback(callbackQuery, env) {
 			chatId: String(row.chat_id),
 			chatTitle: String(callbackQuery?.message?.chat?.title || ''),
 			messageId: null
-		}, Object.assign({}, evaluation, { verdict: 'ban' }), { config, whitelist, force: true });
+		}, Object.assign({}, evaluation, { verdict: 'ban' }), {
+			config, whitelist, force: true, skipLearning: alreadyLearned
+		});
 	} catch (error) {
 		console.error('[演练模式] 确认封执行失败:', error);
 	}
@@ -18173,6 +18258,140 @@ async function handleDryRunButtonCallback(callbackQuery, env) {
 function nowStampLine() {
 	return new Date().toLocaleString('zh-CN', { hour12: false });
 }
+// ===== 定罪即学习：把这次定罪的特征学进判据库 =====
+//
+// 两个调用点，判据必须同一份（否则一改就分叉）：
+//   ① 正式处置（enforceAdDetection 主流程）
+//   ② 演练模式 —— 主人的口径是「演练就是为了学习」：演练期学到的特征立刻在
+//      【申请进群】那一步生效，等关掉演练时判据库已经攒够了，同款再来直接拦。
+//
+// 撤销出口在 /ignore（markAdFingerprintFalsePositive / markAdProfileShapeFalsePositive /
+// clearAd*OnIgnore / removeAdSampleByText），演练的「❌ 不该封」走同一批函数。
+//
+// 顺序：原来是「学头像那批 → 统计封禁结果 → 学指纹+样本」，抽函数后合并成一次。
+// 两批之间没有依赖（都是独立的 D1 写入，统计读的是 banResults 不是学习结果），
+// 且 learned / sampleAdded 只在后面的通知与返回值里用到 —— 合并后仍然先算后用。
+async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
+	const userId = String(options.userId || '');
+	let learned = 0;
+	let sampleAdded = false;
+
+	// 定罪即学习头像：广告团队批量复用同一批素材头像，一次定罪就把这张图挂上黑名单，
+	// 之后用同一张头像进群的号在【入群那一步】就能被拦住（applyAvatarVerdict 分档）。
+	//
+	// 【为什么只排队、不在这里拉资料】闸一（零成本判定）封禁时 profile.avatarId 恒为空 ——
+	// 那条路径压根不调 getChat，而它恰恰是最常见的封禁路径。三条既有断言
+	// （test_ad_detection ×2、test_ad_name_strip ×1）守的正是「闸一定罪零 getChat」，
+	// 在这里补一次 fetchAdUserProfile 会让它们全红 —— 那不是断言过时，而是热路径成本
+	// 真的涨了。所以改成写一个待学队列，由 cron 轨异步补拉：热路径只多一次 D1 写，
+	// Telegram 请求一次不加，闸一保持零成本。
+	try {
+		// 判定载荷里已经带着头像（闸二 / 入群筛查 / cron 复查定罪的都拉过 getChat）
+		// → 立即学，不排队。只有闸一那条零成本路径的 avatarId 为空，才走队列异步补。
+		const immediateAvatar = String(evaluation?.payload?.avatarId || '');
+		const immediateBadge = String(evaluation?.payload?.badgeId || '');
+		const immediateEmojiIds = Array.isArray(evaluation?.payload?.customEmojiIds)
+			? evaluation.payload.customEmojiIds : [];
+		// 正文自定义 emoji：id 在 update 的 entities 里现成，闸一就拿得到 ——
+		// 所以【永远立即学】，不必像头像那样等补学队列去补 getChat。
+		// 跳过与会员标重复的那个 id：hits 是 +1 语义，重复学会把安全阀提前拱开。
+		for (const emojiId of immediateEmojiIds) {
+			if (!emojiId || emojiId === immediateBadge) continue;
+			await learnAdBadgeOnBan(env, emojiId, userId);
+		}
+		if (immediateAvatar) {
+			await learnAdAvatarOnBan(env, immediateAvatar, userId);
+			// 会员标跟着同一条路径学：两者都来自同一份 getChat 响应，
+			// 要么一起有（闸二 / 入群 / cron 定罪）要么一起空（闸一定罪）。
+			// 【刻意嵌在 if 里】否则「avatar 空 + badge 有」会既立即学一次、
+			// 又进队列被 worker 学第二次 —— hits 是 +1 语义，重复就虚高，
+			// 会把 AD_BADGE_BAN_HITS 的安全阀提前拱开。
+			if (immediateBadge) await learnAdBadgeOnBan(env, immediateBadge, userId);
+		} else await queueAdAvatarLearning(env, userId);
+	} catch (_) { /* 头像学习失败不影响本次处置 */ }
+	// 定罪即学习正文图片：与头像同一逻辑（引流素材是批量复用的，学一次拦住同款）。
+	// 【为什么不需要头像那套补学队列】头像要等 getChat 才拿得到，而闸一压根不调它，
+	// 所以那条路径 avatarId 恒为空、只能排队异步补；媒体却是 update 自带的字段，
+	// 闸一就取得到 —— payload.imageId 在闸一定罪时已经非空，没有「恒为空」这个缺口。
+	try {
+		const learnedImageId = String(evaluation?.payload?.imageId || '');
+		if (learnedImageId) await learnAdImageOnBan(env, learnedImageId, userId);
+	} catch (_) { /* 图片学习失败不影响本次处置 */ }
+	// 定罪即学习资料形状：资料模板是批量号的【公开复用资产】，学一次之后同模板的号
+	// 在零 AI 下就能命中（只加分，仍要过原有阈值）。取 snapshot 里存好的形状，
+	// 不在这里重算 —— 重算要拿完整 bio，而处置端只拿到 evaluation。
+	try {
+		await learnAdProfileShape(env, evaluation?.snapshot?.profileShape || '',
+			String(evaluation?.snapshot?.bio || ''));
+	} catch (_) { /* 形状学习失败不影响本次处置 */ }
+
+	try {
+		// structureConfirmed 传参已随「强动词闸门」一起去掉（2026-09-08）：
+		// 那道闸门是 source='auto' 唯一的前置条件，而本函数是 source='auto' 的唯一调用点，
+		// 且只在已定罪时走到这里 —— 主人的口径是「已经确定并执行封禁的就自动学习指纹」，
+		// 定罪本身就是学习凭据，不需要再问一遍「结构层同不同意」。
+		const learn = await learnAdFingerprints(env, evaluation.payload, {
+			source: 'auto',
+			createdBy: 'system',
+			whitelist: options.whitelist
+		});
+		learned = Number(learn?.learned) || 0;
+	} catch (error) {
+		console.error('[广告检测] 自动学习指纹失败:', error);
+	}
+
+	// ===== 自动学进 AI 语义样本库（2026-09-08 新增）=====
+	// 主人的口径：「AI 是通过 spam 执行自我学习的」「AI 必须学习原有的中心指纹以及 spam
+	// 的变体，然后它会自我优化更多的广告类型变体特征」。
+	//
+	// 在这批改动之前，addAdSample 全文件只有三个调用点：/confirm、/addsample、/spam ——
+	// 全是【人工触发】。也就是说自动封禁（评分层撞阈值、指纹层命中、AI 层硬命中、
+	// 四通道结构查杀）抓到的号，一条都不会进 AI 样本库，AI 的「广告概念」只能靠主人手工喂。
+	// 加上这一段之后，四层里任何一层定罪都会把现场语义沉淀进样本库，
+	// 下一个换了词但语义相同的变体就能被第三层直接认出来。
+	//
+	// 【失败绝不影响主流程】黑名单、全群封禁、消息删除都已经做完了，
+	// 样本写不进去最多是少学一条，不能因此让回执报错或中断通知。
+	try {
+		// options.sampleText 让调用方覆盖取材口径。目前唯一的覆盖方是 /spam 的回复学习：
+		// 那条路径碰到「本人正文一个字母 + 广告全在引用块里」时会拿引用体当样本，
+		// 比这里默认的 name + bio + text 准得多。有覆盖就用覆盖，避免同一次处置写两条样本
+		// （其中一条还是「英文人名 + 单字母」那种纯噪声）。
+		const sampleOverridden = options.sampleText != null;
+		const sampleText = sampleOverridden
+			? String(options.sampleText).trim()
+			: buildAdSampleText(evaluation.payload);
+		// ===== 剥昵称复检：断掉「误封 → 学样本 → 下次更容易误封」的闭环（2026-09-22）=====
+		//
+		// 这是 @svipultra 连环误封的第 ④ 环，也是让相似度单调爬升的那一环：
+		// 每误封一次就把「Angel ×××」学进样本库，下次他说任何话，昵称都跟库里的样本重合，
+		// 相似度必然更高 —— 0.794 → 0.798 → 0.811 → 0.815 → 0.828，五次封禁一次比一次稳。
+		// 检测端的昵称剥离复验（见 evaluateAdSuspect）已经拦住了这类定罪，但那只挡住了「入口」；
+		// 样本仍可能从别的定罪层（评分层撞阈值、结构查杀）流进来，所以出口也必须堵。
+		// 两端共用 adSampleBodyCoreLength，保证判据永不分叉。
+		//
+		// 【存进去的仍是完整文本，拼法一个字都没动】收紧的只是「准不准进」这道闸 ——
+		// buildAdSampleText 照旧返回 name + bio + text，adTextHash 因此完全不变，
+		// 全库存量样本与历史 /ignore、/unban 的双 hash 试删【全部继续有效】。
+		//
+		// 【/spam 回复学习不受此闸约束】options.sampleText 覆盖时取材的是引用体正文，
+		// 那段文本本来就不含昵称，再套一次剥昵称检查等于凭空多一道无关门槛。
+		const sampleSubstantial = sampleOverridden
+			|| adSampleBodyCoreLength(evaluation.payload) >= AD_SAMPLE_MIN_CORE_LENGTH;
+		// 长度门槛与 addAdSample 内部一致（< 4 字符直接拒），这里先判一次是为了少一次 D1 往返。
+		// 引用体形态的号（本人正文只有一个字母）在这里拼出来的通常只有昵称，
+		// 短到 4 字符以下就跳过 —— 那种样本语义太稀薄，进库只会拉高误判面。
+		if (sampleText.length >= 4 && sampleSubstantial) {
+			const sample = await addAdSample(env, sampleText, { source: String(options.sampleSource || 'auto') });
+			sampleAdded = Boolean(sample?.ok && sample?.added);
+		}
+	} catch (error) {
+		console.error('[广告检测] 自动学习语义样本失败:', error);
+	}
+
+	return { learned, sampleAdded };
+}
+
 // === 处置执行 ===
 // 判定为广告后的统一处置链：加黑 → 全群封禁 → 删触发消息 → 自动学指纹 → 存快照 → 推私聊 → 清观察记录。
 // 每一步独立容错：加黑失败仍继续封禁，封禁部分失败仍推送通知，
@@ -18182,10 +18401,16 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	const chatId = input?.chatId != null ? String(input.chatId) : '';
 	if (!userId) return { banned: false, seq: null, reason: 'no_user' };
 
-	// ===== 演练模式：命中只记流水 + 推私聊，一个人都不动 =====
+	// ===== 演练模式：命中记流水 + 学特征 + 推私聊，处置一个都不做 =====
 	//
-	// 【必须插在这个位置】在 noteParts、加黑、全群封禁、删消息、四类学习、
-	// /ignore 快照之前 —— 演练的定义就是这些动作一个都不做，挪到后面就晚了。
+	// 【必须插在这个位置】在 noteParts、加黑、全群封禁、删消息、/ignore 快照之前 ——
+	// 演练的定义就是这些动作一个都不做，挪到后面就晚了。
+	//
+	// 【但学习【照做】】主人口径：「演练就是为了学习」「只有演练学习的特征多、搭配多
+	// 特征封禁，广告号命中率才会更高，特征学习才会更快更精准」。学到的头像 / 会员标 /
+	// 资料形状 / 正文图片 / 指纹 / AI 样本立刻在【申请进群】那一步生效（screenJoinRequestAd
+	// 与入群筛查读的是同一批表），等主人关掉演练时判据库已经攒够了。
+	// 误学有出口：点「❌ 不该封」会把这一条学到的特征撤掉，见 revertDryRunLearning。
 	//
 	// 【chatId 为空不演练】演练开关是按群开的，chatId 空说明这次处置没有可归属的群，
 	// 查不出属于哪个群就不该猜，按正常处置继续。
@@ -18210,10 +18435,36 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		} catch (_) {
 			// 记录失败只影响后续重发能否被删，不影响这次演练流水与通知。
 		}
-		await pushAdDryRunNotice(env, { userId, chatId, evaluation, input, dryRunId });
+		// 学特征（演练的核心目的）。与正式处置共用 learnAdFeaturesOnVerdict，
+		// 判据不另写一套。学完把结果写进流水，确认封时据此跳过重复学习。
+		let learnedCount = 0;
+		let sampleLearned = false;
+		try {
+			const lr = await learnAdFeaturesOnVerdict(env, evaluation, {
+				userId,
+				whitelist: options.whitelist
+			});
+			learnedCount = Number(lr.learned) || 0;
+			sampleLearned = Boolean(lr.sampleAdded);
+		} catch (error) {
+			console.error('[广告检测·演练] 特征学习失败:', error);
+		}
+		if (dryRunId) {
+			try {
+				await markAdDryRunLearned(env, dryRunId, learnedCount, sampleLearned);
+			} catch (error) {
+				// 写不进去只意味着「确认封时会再学一次」，不影响本次演练。
+				console.error('[广告检测·演练] 记录学习结果失败:', error);
+			}
+		}
+		await pushAdDryRunNotice(env, {
+			userId, chatId, evaluation, input, dryRunId,
+			learnedCount, sampleLearned
+		});
 		console.log('[广告检测·演练] 命中未处置 user=' + userId + ' chat=' + chatId
 			+ ' score=' + evaluation?.score + '/' + evaluation?.threshold
-			+ ' layer=' + evaluation?.layer + ' 流水=' + dryRunId);
+			+ ' layer=' + evaluation?.layer + ' 流水=' + dryRunId
+			+ ' 学指纹=' + learnedCount + ' AI样本=' + (sampleLearned ? 1 : 0));
 		// 返回结构刻意对齐正常处置，只是 banned=false、seq=null：
 		// cron 那条调用点读的是 result?.banned !== false，会正确记成「未封」；
 		// banSummary 给非空值是让 /spam 那条群内闪屏读到时能显示演练字样而不是「未知」。
@@ -18223,9 +18474,9 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			seq: null,
 			dryRunId,
 			blacklistCode: null,
-			banSummary: '演练命中（未处置）',
-			learned: 0,
-			sampleAdded: false
+			banSummary: '演练命中（已学特征，未处置）',
+			learned: learnedCount,
+			sampleAdded: sampleLearned
 		};
 	}
 
@@ -18286,54 +18537,23 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	try {
 		await recordHandledAdText(env, evaluation?.payload?.text || evaluation?.snapshot?.text || '');
 	} catch (_) { /* 记录失败不影响本次处置 */ }
-	// 定罪即学习头像：广告团队批量复用同一批素材头像，一次定罪就把这张图挂上黑名单，
-	// 之后用同一张头像进群的号在【入群那一步】就能被拦住（applyAvatarVerdict 分档）。
+	// 定罪即学习：头像 / 会员标 / 正文 emoji / 正文图片 / 资料形状 / 指纹 / AI 样本。
+	// 与演练模式共用同一个函数 —— 判据一旦分叉，「演练学到的」和「正式学到的」就会
+	// 随时间漂移，主人会看到同一批号在两条路上判据不同。见 learnAdFeaturesOnVerdict。
 	//
-	// 【为什么只排队、不在这里拉资料】闸一（零成本判定）封禁时 profile.avatarId 恒为空 ——
-	// 那条路径压根不调 getChat，而它恰恰是最常见的封禁路径。三条既有断言
-	// （test_ad_detection ×2、test_ad_name_strip ×1）守的正是「闸一定罪零 getChat」，
-	// 在这里补一次 fetchAdUserProfile 会让它们全红 —— 那不是断言过时，而是热路径成本
-	// 真的涨了。所以改成写一个待学队列，由 cron 轨异步补拉：热路径只多一次 D1 写，
-	// Telegram 请求一次不加，闸一保持零成本。
-	try {
-		// 判定载荷里已经带着头像（闸二 / 入群筛查 / cron 复查定罪的都拉过 getChat）
-		// → 立即学，不排队。只有闸一那条零成本路径的 avatarId 为空，才走队列异步补。
-		const immediateAvatar = String(evaluation?.payload?.avatarId || '');
-		const immediateBadge = String(evaluation?.payload?.badgeId || '');
-		const immediateEmojiIds = Array.isArray(evaluation?.payload?.customEmojiIds)
-			? evaluation.payload.customEmojiIds : [];
-		// 正文自定义 emoji：id 在 update 的 entities 里现成，闸一就拿得到 ——
-		// 所以【永远立即学】，不必像头像那样等补学队列去补 getChat。
-		// 跳过与会员标重复的那个 id：hits 是 +1 语义，重复学会把安全阀提前拱开。
-		for (const emojiId of immediateEmojiIds) {
-			if (!emojiId || emojiId === immediateBadge) continue;
-			await learnAdBadgeOnBan(env, emojiId, userId);
-		}
-		if (immediateAvatar) {
-			await learnAdAvatarOnBan(env, immediateAvatar, userId);
-			// 会员标跟着同一条路径学：两者都来自同一份 getChat 响应，
-			// 要么一起有（闸二 / 入群 / cron 定罪）要么一起空（闸一定罪）。
-			// 【刻意嵌在 if 里】否则「avatar 空 + badge 有」会既立即学一次、
-			// 又进队列被 worker 学第二次 —— hits 是 +1 语义，重复就虚高，
-			// 会把 AD_BADGE_BAN_HITS 的安全阀提前拱开。
-			if (immediateBadge) await learnAdBadgeOnBan(env, immediateBadge, userId);
-		} else await queueAdAvatarLearning(env, userId);
-	} catch (_) { /* 头像学习失败不影响本次处置 */ }
-	// 定罪即学习正文图片：与头像同一逻辑（引流素材是批量复用的，学一次拦住同款）。
-	// 【为什么不需要头像那套补学队列】头像要等 getChat 才拿得到，而闸一压根不调它，
-	// 所以那条路径 avatarId 恒为空、只能排队异步补；媒体却是 update 自带的字段，
-	// 闸一就取得到 —— payload.imageId 在闸一定罪时已经非空，没有「恒为空」这个缺口。
-	try {
-		const learnedImageId = String(evaluation?.payload?.imageId || '');
-		if (learnedImageId) await learnAdImageOnBan(env, learnedImageId, userId);
-	} catch (_) { /* 图片学习失败不影响本次处置 */ }
-	// 定罪即学习资料形状：资料模板是批量号的【公开复用资产】，学一次之后同模板的号
-	// 在零 AI 下就能命中（只加分，仍要过原有阈值）。取 snapshot 里存好的形状，
-	// 不在这里重算 —— 重算要拿完整 bio，而处置端只拿到 evaluation。
-	try {
-		await learnAdProfileShape(env, evaluation?.snapshot?.profileShape || '',
-			String(evaluation?.snapshot?.bio || ''));
-	} catch (_) { /* 形状学习失败不影响本次处置 */ }
+	// skipLearning：演练期已经学过、主人这时才点「✅ 确认封」。hits 是 +1 语义，
+	// 确认封那一次再学一遍会让头像与资料形状各 +1，直接顶到封禁档
+	// （AD_PROFILE_SHAPE_MIN_HITS=2、头像 hits>=2），把安全阀提前拱开。
+	let learned = 0;
+	let sampleAdded = false;
+	if (options.skipLearning !== true) {
+		({ learned, sampleAdded } = await learnAdFeaturesOnVerdict(env, evaluation, {
+			userId,
+			whitelist: options.whitelist,
+			sampleText: options.sampleText,
+			sampleSource: options.sampleSource
+		}));
+	}
 
 	const okCount = banResults.filter((r) => r.ok).length;
 	const failedBans = banResults.filter((r) => !r.ok);
@@ -18358,72 +18578,6 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		}
 	}
 
-	let learned = 0;
-	try {
-		// structureConfirmed 传参已随「强动词闸门」一起去掉（2026-09-08）：
-		// 那道闸门是 source='auto' 唯一的前置条件，而本函数是 source='auto' 的唯一调用点，
-		// 且只在已定罪时走到这里 —— 主人的口径是「已经确定并执行封禁的就自动学习指纹」，
-		// 定罪本身就是学习凭据，不需要再问一遍「结构层同不同意」。
-		const learn = await learnAdFingerprints(env, evaluation.payload, {
-			source: 'auto',
-			createdBy: 'system',
-			whitelist: options.whitelist
-		});
-		learned = Number(learn?.learned) || 0;
-	} catch (error) {
-		console.error('[广告检测] 自动学习指纹失败:', error);
-	}
-
-	// ===== 自动学进 AI 语义样本库（2026-09-08 新增）=====
-	// 主人的口径：「AI 是通过 spam 执行自我学习的」「AI 必须学习原有的中心指纹以及 spam
-	// 的变体，然后它会自我优化更多的广告类型变体特征」。
-	//
-	// 在这批改动之前，addAdSample 全文件只有三个调用点：/confirm、/addsample、/spam ——
-	// 全是【人工触发】。也就是说自动封禁（评分层撞阈值、指纹层命中、AI 层硬命中、
-	// 四通道结构查杀）抓到的号，一条都不会进 AI 样本库，AI 的「广告概念」只能靠主人手工喂。
-	// 加上这一段之后，四层里任何一层定罪都会把现场语义沉淀进样本库，
-	// 下一个换了词但语义相同的变体就能被第三层直接认出来。
-	//
-	// 【失败绝不影响主流程】黑名单、全群封禁、消息删除都已经做完了，
-	// 样本写不进去最多是少学一条，不能因此让回执报错或中断通知。
-	let sampleAdded = false;
-	try {
-		// options.sampleText 让调用方覆盖取材口径。目前唯一的覆盖方是 /spam 的回复学习：
-		// 那条路径碰到「本人正文一个字母 + 广告全在引用块里」时会拿引用体当样本，
-		// 比这里默认的 name + bio + text 准得多。有覆盖就用覆盖，避免同一次处置写两条样本
-		// （其中一条还是「英文人名 + 单字母」那种纯噪声）。
-		const sampleOverridden = options.sampleText != null;
-		const sampleText = sampleOverridden
-			? String(options.sampleText).trim()
-			: buildAdSampleText(evaluation.payload);
-		// ===== 剥昵称复检：断掉「误封 → 学样本 → 下次更容易误封」的闭环（2026-09-22）=====
-		//
-		// 这是 @svipultra 连环误封的第 ④ 环，也是让相似度单调爬升的那一环：
-		// 每误封一次就把「Angel ×××」学进样本库，下次他说任何话，昵称都跟库里的样本重合，
-		// 相似度必然更高 —— 0.794 → 0.798 → 0.811 → 0.815 → 0.828，五次封禁一次比一次稳。
-		// 检测端的昵称剥离复验（见 evaluateAdSuspect）已经拦住了这类定罪，但那只挡住了「入口」；
-		// 样本仍可能从别的定罪层（评分层撞阈值、结构查杀）流进来，所以出口也必须堵。
-		// 两端共用 adSampleBodyCoreLength，保证判据永不分叉。
-		//
-		// 【存进去的仍是完整文本，拼法一个字都没动】收紧的只是「准不准进」这道闸 ——
-		// buildAdSampleText 照旧返回 name + bio + text，adTextHash 因此完全不变，
-		// 全库存量样本与历史 /ignore、/unban 的双 hash 试删【全部继续有效】。
-		//
-		// 【/spam 回复学习不受此闸约束】options.sampleText 覆盖时取材的是引用体正文，
-		// 那段文本本来就不含昵称，再套一次剥昵称检查等于凭空多一道无关门槛。
-		const sampleSubstantial = sampleOverridden
-			|| adSampleBodyCoreLength(evaluation.payload) >= AD_SAMPLE_MIN_CORE_LENGTH;
-		// 长度门槛与 addAdSample 内部一致（< 4 字符直接拒），这里先判一次是为了少一次 D1 往返。
-		// 引用体形态的号（本人正文只有一个字母）在这里拼出来的通常只有昵称，
-		// 短到 4 字符以下就跳过 —— 那种样本语义太稀薄，进库只会拉高误判面。
-		if (sampleText.length >= 4 && sampleSubstantial) {
-			const sample = await addAdSample(env, sampleText, { source: String(options.sampleSource || 'auto') });
-			sampleAdded = Boolean(sample?.ok && sample?.added);
-		}
-	} catch (error) {
-		console.error('[广告检测] 自动学习语义样本失败:', error);
-	}
-
 	// 快照与通知只发第一主人：序号是 /ignore 的唯一入口，多人共用会互相抢号。
 	const ownerId = getOwnerNotifyTargets()[0] || '';
 	let seq = null;
@@ -18438,6 +18592,11 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		const learnParts = [];
 		if (learned) learnParts.push('指纹 +' + learned + ' 条');
 		if (sampleAdded) learnParts.push('AI 样本 +1 条');
+		// 演练期已经学过就不重复学（见 skipLearning）：回执照实说，
+		// 别让主人以为这次确认封又学了一遍。
+		if (!learned && !sampleAdded && options.skipLearning === true) {
+			learnParts.push('特征已在演练期学入，未重复学习');
+		}
 		const notice = renderAdDetectionNotice(evaluation, {
 			userId,
 			chatTitle: input?.chatTitle || '',

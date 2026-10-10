@@ -466,11 +466,25 @@ section('[7] 演练通知的结论按钮（✅确认封 / ❌不该封）');
 	};
 
 	// 造两条演练流水：A 用来点「❌不该封」，B 用来点「✅确认封」
+	//
+	// 【演练就是要学】演练期学到的特征当场进判据库，并立刻在【申请进群】那一步生效
+	// （screenJoinRequestAd 与入群筛查读的是同一批表）。所以先记指纹数，造完流水立刻验 ——
+	// 旧版是「演练只记流水、点确认封才学」，那条路学得慢，而且要主人逐条点按钮。
+	const fpBeforeDryRun = env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c;
 	resetCalls();
 	await W.enforceAdDetection(env, { userId: '666010', chatId: GROUP_ID, chatTitle: '测试群', messageId: 510 },
 		await mkBanEval('按钮A'), { config, whitelist });
 	await W.enforceAdDetection(env, { userId: '666011', chatId: GROUP_ID, chatTitle: '测试群', messageId: 511 },
 		await mkBanEval('按钮B'), { config, whitelist });
+	assert('演练命中当场学入指纹（不是等确认封才学）',
+		env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c > fpBeforeDryRun,
+		JSON.stringify({ before: fpBeforeDryRun, after: env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c }));
+	// 资料形状同理：演练期就得学进去，否则「同模板批量号」这一路要等主人逐条
+	// 点确认封才攒得起来。AD_PROFILE_SHAPE_MIN_HITS = 2，两次演练各学一次。
+	assert('演练命中当场学入资料形状（两次演练 = hits 达到封禁档）',
+		env.DB.query('SELECT shape, hits FROM ad_profile_shapes WHERE shape = ?',
+			W.adProfileShape({ bio: AD_BIO })).length >= 1,
+		JSON.stringify(env.DB.query('SELECT shape, hits FROM ad_profile_shapes')));
 	const rowOf = (id) => env.DB.query('SELECT * FROM ad_dryrun_log WHERE id = ?', id)[0];
 	// 两条流水按 user_id 认人：A 对应第一封通知（下面的 notices[0]），B 用来点确认封。
 	const rowA = env.DB.query('SELECT * FROM ad_dryrun_log WHERE user_id = ?', '666010')[0];
@@ -533,14 +547,21 @@ section('[7] 演练通知的结论按钮（✅确认封 / ❌不该封）');
 	assert('误报不发起封禁、不删消息',
 		callsOf('banChatMember').length === 0 && callsOf('deleteMessage').length === 0,
 		JSON.stringify({ ban: callsOf('banChatMember').length, del: callsOf('deleteMessage').length }));
-	assert('误报不动判据库（指纹/形状/黑名单/快照全零变化）',
-		env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c === before.fp
-		&& env.DB.query('SELECT COUNT(*) AS c FROM ad_profile_shapes')[0].c === before.shape
-		&& env.DB.query('SELECT COUNT(*) AS c FROM blacklist')[0].c === before.black
-		&& env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c === before.snap,
+	// 演练期学到的特征在这里被撤掉（见 revertDryRunLearning）。purge 是【整条删】
+	// 不是 hits 减一，与 /ignore 同口径，所以指纹与形状的行数只会减少或持平，
+	// 绝不会增加 —— 增加就说明撤销根本没跑。
+	assert('误报撤销演练期学到的特征（指纹/形状不增）',
+		env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c <= before.fp
+		&& env.DB.query('SELECT COUNT(*) AS c FROM ad_profile_shapes')[0].c <= before.shape,
 		JSON.stringify({ before, after: {
 			fp: env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c,
-			shape: env.DB.query('SELECT COUNT(*) AS c FROM ad_profile_shapes')[0].c,
+			shape: env.DB.query('SELECT COUNT(*) AS c FROM ad_profile_shapes')[0].c
+		} }));
+	// 处置链一个都不碰：黑名单与快照零变化（人没被封，就不该有快照或黑名单记录）。
+	assert('误报不动黑名单与快照',
+		env.DB.query('SELECT COUNT(*) AS c FROM blacklist')[0].c === before.black
+		&& env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c === before.snap,
+		JSON.stringify({ before, after: {
 			black: env.DB.query('SELECT COUNT(*) AS c FROM blacklist')[0].c,
 			snap: env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c
 		} }));
@@ -556,6 +577,9 @@ section('[7] 演练通知的结论按钮（✅确认封 / ❌不该封）');
 	assert('重复点没有第二次编辑', callsOf('editMessageText').length === 0, JSON.stringify(callsOf('editMessageText').length));
 
 	// ---- ⑥ 点「✅确认封」：force 绕过演练短路，真处置 ----
+	// 基准必须在这里重新取：上面 ⑤ 点「❌」已经撤销过一批指纹（purge 是整条删），
+	// 继续用 before.fp 当基准等于把「撤销」算到「确认封」头上。
+	const fpBeforeConfirm = env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c;
 	resetCalls();
 	const confirm = await W.handleDryRunButtonCallback(cbOf(String(OWNER_ID), 'dry:ok:' + rowB.id), env);
 	const afterRowB = rowOf(rowB.id);
@@ -565,9 +589,12 @@ section('[7] 演练通知的结论按钮（✅确认封 / ❌不该封）');
 		JSON.stringify(env.DB.query('SELECT id FROM blacklist')));
 	assert('真发起了封禁（force 穿透演练开关）', callsOf('banChatMember').length >= 1,
 		JSON.stringify(callsOf('banChatMember')));
-	assert('确认封后会学习（指纹至少 +1）',
-		env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c > before.fp,
-		JSON.stringify({ before: before.fp, after: env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c }));
+	// 演练期已经学过（上面那条「演练命中当场学入指纹」锁着），确认封【不再学第二次】：
+	// hits 是 +1 语义，确认封再学一遍会让头像与资料形状各 +1，直接顶到封禁档
+	// （AD_PROFILE_SHAPE_MIN_HITS=2、头像 hits>=2），等于主人点一次按钮就把安全阀拱开。
+	assert('确认封不重复学习（演练期已学，hits 不虚高）',
+		env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c === fpBeforeConfirm,
+		JSON.stringify({ before: fpBeforeConfirm, after: env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c }));
 	assert('通知被补上「已确认封禁」',
 		callsOf('editMessageText').some((c) => String(c.body?.text || '').includes('已确认封禁')),
 		JSON.stringify(callsOf('editMessageText').map((c) => String(c.body?.text || '').slice(-80))));
@@ -589,6 +616,40 @@ section('[7] 演练通知的结论按钮（✅确认封 / ❌不该封）');
 		JSON.stringify({ dryIdx, voteIdx }));
 	assert('分发分支里调的正是按钮处理器',
 		srcLines[dryIdx + 1].includes('handleDryRunButtonCallback'), srcLines[dryIdx + 1]);
+
+	// ---- ⑨ 端到端：学到的特征，在【申请进群】那一刻就拦得住 ----
+	//
+	// 主人口径：「我要的目的就是广告号从申请进群时就直接拦截掉踢出全群」「演练就是
+	// 为了学习」。这里换一个【全新的 uid】、同一份资料走申请路径（screenJoinRequestAd
+	// 调的就是它）。
+	//
+	// 归因要干净，两个变量都得排除：
+	//   ① 关掉演练 —— 演练开着的话申请路径会短路成 'dryrun'，测不出「拦下」本身；
+	//   ② 关掉结构通道 —— AD_BIO 会被「招揽∧行业」形态直接定罪，那封它的就不是
+	//      学来的特征了。而 AD_BIO 只有 6 分、不够入群线 7，分数这条路也排除。
+	// 两个都排除之后还能拦下，就只可能是学进去的特征。
+	await W.setDryRun(env, GROUP_ID, false, OWNER_ID);
+	const learnConfig = Object.assign({}, config, { structureKill: 'off' });
+	const shapeKey = W.adProfileShape({ bio: AD_BIO });
+	// 资料形状要 2 次才到封禁档（AD_PROFILE_SHAPE_MIN_HITS = 2）。
+	await W.learnAdProfileShape(env, shapeKey, AD_BIO);
+	await W.learnAdProfileShape(env, shapeKey, AD_BIO);
+	const learnEval = await W.evaluateAdSuspect(
+		env, { profile: { bio: AD_BIO, firstName: '同款新人', username: '', bioFetched: true }, text: '', forwardChat: null },
+		{ config: learnConfig, whitelist, skipMissingBioPenalty: false });
+	assert('同款资料命中已学进库的资料形状',
+		(learnEval.reasons || []).some((r) => String(r).includes('资料形状')),
+		JSON.stringify((learnEval.reasons || [])));
+	setApi({
+		getChat: () => ({ payload: { ok: true, result: { id: 777888, first_name: '同款新人', username: '', bio: AD_BIO } } }),
+		getChatAdministrators: () => ({ payload: { ok: true, result: [] } })
+	});
+	const joinVerdict = await W.screenAdJoinMember(env, { id: 777888, is_bot: false, first_name: '同款新人' }, {
+		chatId: GROUP_ID, chatTitle: '测试群', messageId: null,
+		skipBlacklistCheck: true, noBioLock: true, source: 'join_request', config: learnConfig, whitelist
+	});
+	setApi();
+	assert('同款新号申请进群被拦下（踢出全群）', joinVerdict === 'banned', String(joinVerdict));
 }
 
 console.log(`\n========== 演练模式：通过 ${pass} / 失败 ${fail} ==========`);
