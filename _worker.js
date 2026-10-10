@@ -18506,7 +18506,10 @@ async function screenAdJoinMember(env, member, options = {}) {
 		// 复用闸二那把三天冷却锁即可，不需要新机制。
 		// 残留竞态：两个 update 几乎同时到达时可能都读到 existing === null 而各查一次 bio，
 		// 但 fetchAdUserProfile 有 5 分钟按人缓存，第二次不会真的发出请求，代价为零。
-		if (!shouldCheckAdBio(existing, nowSeconds)) return 'cooled';
+		// 申请进群那条路传 noBioLock，不受这把三天冷却锁约束：广告号被拒后等三天
+		// 再申请就绕过去了，而申请阶段正是「还没让他进门就拦住」的唯一机会。
+		// 其余两条入群路径照旧走锁（同一次进群会推两种 update，靠它去重）。
+		if (!options.noBioLock && !shouldCheckAdBio(existing, nowSeconds)) return 'cooled';
 
 		const profile = await fetchAdUserProfile(userId, member);
 		// 不查 getChatMember：restricted 已归零不计分，入群时状态必然是 member，
@@ -21677,24 +21680,87 @@ async function handleSearchCommand(message, env) {
 }
 
 // chat_join_request 处理：申请人「发起申请」的那一刻（还不是群成员）。
-// 只记时间，不批准/拒绝 —— 审批是管理员在 Telegram 客户端点的，bot 不代劳。
+// 先记时间线，再做广告筛查 —— 命中就【预封 + 拒绝申请】，人在管理员点同意之前
+// 就被拦下，压根进不了群。
 // 群未开启入群审批时，这个 update 永远不会推送，本函数不会被执行。
 // （函数名原为 handleBotChatJoinRequest，2026-10-02 随 update 名纠正一并改名。）
+//
+// 【2026-10-10 起不再「只记时间」】原先这里对审批一律不碰，结果广告号提交申请时
+// 无人过问：要等管理员手动批准、人进了群，chat_member / new_chat_members 那两条路
+// 才筛查得到，而那时人已经在群里活动过了。改成申请那一刻就判，判成广告当场预封。
 async function handleChatJoinRequest(req, env) {
+	const chat = req?.chat;
+	const user = req?.user;
+	const chatId = String(chat?.id || '');
+	const userId = String(user?.id || '');
+	if (!chatId || !userId || !isConfiguredGroup(chatId)) return;
+
 	try {
-		const chat = req?.chat;
-		const user = req?.user;
-		const chatId = String(chat?.id || '');
-		const userId = String(user?.id || '');
-		if (!chatId || !userId) return;
-		// 非配置群不记：时间线只服务我们治理的群。
-		if (!isConfiguredGroup(chatId)) return;
 		await recordMemberEventDetail(env, chatId, userId, 'join_request', req.date ? req.date * 1000 : Date.now(), {
 			inviteLink: req.invite_link?.invite_link || null,
 			viaRequest: true,
 		});
 	} catch (error) {
 		console.error('[入群记录] 申请事件处理失败:', error);
+	}
+
+	// 筛查与记录各自 try：记录写不进去不能吞掉筛查，筛查炸了也不能吞掉记录。
+	try {
+		await screenJoinRequestAd(env, user, chatId, String(chat?.title || ''));
+	} catch (error) {
+		console.error('[申请筛查] 异常:', error);
+	}
+}
+
+// === 申请进群即筛查 ===
+//
+// 【为什么复用 screenAdJoinMember 而不是另写一套判据】判据一旦分叉，两条路的宽严
+// 就会随时间漂移：这边漏掉的形态那边照样抓，管理员会看到「同一份资料，申请时放过、
+// 进群时又封」。所以这里只加一个 noBioLock 开关，评分 / 指纹 / 头像 / 会员标 / LLM
+// 全部与进群后逐字节同源。
+//
+// chat_join_request.user 与入群事件里的 member 同为 User 结构，可直接传入。
+async function screenJoinRequestAd(env, user, chatId, chatTitle) {
+	const userId = String(user?.id || '');
+	if (!userId || user?.is_bot) return;
+	if (!env?.DB) return;
+	if (!(await adDetectionReady(env))) return;
+
+	const verdict = await screenAdJoinMember(env, user, {
+		chatId,
+		chatTitle,
+		messageId: null,			// 申请阶段没有消息可删
+		skipBlacklistCheck: false,	// 已在 D1 黑名单的人由下面这一步拦，不必再筛一遍
+		noBioLock: true,			// 被拒后等三天再申请就绕过去了，不能套这把锁
+		source: 'join_request'
+	});
+	if (verdict !== 'banned') return;
+
+	// enforceAdDetection 已经做过 banUserFromAllGroups：对【还不在群里】的人，
+	// banChatMember 会把他加进群封禁列表（预封），申请随之失效、日后也进不来。
+	// 再显式拒一次申请，是让审批列表里不留一个「点了同意也不生效」的死条目 ——
+	// 管理员看到的应该是干净的列表，而不是一个需要他去猜的申请。
+	await declineJoinRequest(env, chatId, userId);
+	console.log('[申请筛查] 广告号在进群前被拦下 user=' + userId + ' chat=' + chatId);
+}
+
+// 拒绝一条入群申请。返回是否成功；失败只记日志 —— 预封已经生效，这一步只是收尾。
+async function declineJoinRequest(env, chatId, userId) {
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/declineChatJoinRequest`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: String(chatId), user_id: Number(userId) })
+		});
+		const result = await response.json();
+		if (!result?.ok) {
+			console.log('[申请筛查] 拒绝申请失败 chat=' + chatId + ' user=' + userId
+				+ ' desc=' + (result?.description || ('HTTP ' + response.status)));
+		}
+		return result?.ok === true;
+	} catch (error) {
+		console.error('[申请筛查] 拒绝申请异常:', error);
+		return false;
 	}
 }
 
