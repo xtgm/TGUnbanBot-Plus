@@ -1599,11 +1599,26 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 	};
 }
 
+// 全群封禁的并发度。取 5：Telegram 全局约 30 msg/s，入群高峰（一次拉十几个人）
+// 时 5 路并发仍在限内；真撞上 429 由 banUserFromGroup 内的重试兜底。
+const BAN_ALL_GROUPS_CONCURRENCY = 5;
+
+// options.primaryGroupId：事发群（人从这里进来的那个群）。给了它就【先同步封这一个】，
+// 其余群并发补上 —— 入群封禁要的是「进群那一刻」被请出去，不该先在别的群上排队。
+// 不给时行为与改动前一致（全部群一起并发），只是从串行变成并发。
 async function banUserFromAllGroups(userId, options = {}) {
+	const primary = String(options.primaryGroupId || '');
+	const rest = GROUP_IDS.filter((groupId) => String(groupId) !== primary);
 	const results = [];
-	for (const groupId of GROUP_IDS) {
-		results.push(await applyGroupModeration(groupId, userId, options.mode, options));
+	if (primary) {
+		results.push(await applyGroupModeration(primary, userId, options.mode, options));
 	}
+	await mapWithConcurrency(rest, BAN_ALL_GROUPS_CONCURRENCY, async (groupId) => {
+		const r = await applyGroupModeration(groupId, userId, options.mode, options);
+		// push 在 worker 里是安全的：JS 单线程，数组追加不会与别的 worker 交错。
+		results.push(r);
+		return r;
+	});
 	return results;
 }
 
@@ -18247,7 +18262,20 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 
 	let banResults = [];
 	try {
-		banResults = await banUserFromAllGroups(userId, { probeMembership: true, revokeMessages: true });
+		banResults = await banUserFromAllGroups(userId, {
+			// 入群路径会传 primaryGroupId：事发群【同步】先封，其余群并发补上。
+			// 改动前是 for 串行遍历全部群，每个群 2 次 HTTP（探测 + 封禁）依次排队 ——
+			// 20 个群就是 40 次串行往返，人进群后要好几秒才被请出去。见 banUserFromAllGroups。
+			// 其余 6 个调用点不传，走「全部群一起并发」，与改动前只有并发度的差别。
+			primaryGroupId: options.primaryGroupId,
+			// 默认仍探测（`!== false`：不传 = true，逐字节等于改动前的硬编码 true）。
+			// /ban、/spam、批量那些回执靠 memberProbe 渲染「昵称 + 状态」，砍掉会让回执
+			// 从「昵称 + TGID」退化成只剩一串 TGID。入群路径显式传 false：人刚进群状态
+			// 必然是 member，这一次 getChatMember 纯属浪费（与 screenAdJoinMember 里
+			// 「不查 getChatMember」那条注释同一取向）。
+			probeMembership: options.probeMembership !== false,
+			revokeMessages: true
+		});
 	} catch (error) {
 		console.error('[广告检测] 全群封禁失败:', error);
 	}
@@ -18557,7 +18585,18 @@ async function screenAdJoinMember(env, member, options = {}) {
 				chatId,
 				chatTitle: options.chatTitle || '',
 				messageId: options.messageId ?? null
-			}, evaluation, { config, whitelist });
+			}, evaluation, {
+				config,
+				whitelist,
+				// 【入群秒封的两条提速】
+				// ① primaryGroupId：他刚进的这个群同步先封（1 次 banChatMember 就把人
+				//    请出去），其余群并发补上。改动前是 for 串行遍历全部群，每群还多一次
+				//    成员探测，20 个群 = 40 次串行往返 —— 人进群后要好几秒才被踢。
+				// ② probeMembership: false：人刚进群状态必然是 member，那次 getChatMember
+				//    换不来任何信息，入群回执也不展示 memberProbe（见 renderAdDetectionNotice）。
+				primaryGroupId: chatId,
+				probeMembership: false
+			});
 			// 风控·新人治理（方案 b 精确计数）：只统计【入群筛查当场处置】的新人，
 			// 口径严格等于「新人被处理数」—— 不含老成员被违规踢出（那是 kicked_count 的事）。
 			// 上面管理员豁免的分支已经 return，走不到这里，不会把豁免记成治理。
