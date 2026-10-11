@@ -283,6 +283,42 @@ section('[4] 判据 —— 广告清单得分，正常清单零误伤');
 	const meeting = W.scoreAdMessageText(
 		W.extractAdChecklistText({ checklist: { title: '团建安排', tasks: [{ id: 1, text: '周六下午两点集合' }, { id: 2, text: '记得带身份证' }] } }), {});
 	assert('日常清单同样不为正', meeting.score <= 0, JSON.stringify(meeting));
+
+	// ===== 2026-10-11 线上漏放样本的端到端回归 =====
+	// 群 -1001883549197 那条「假钞」清单：广告词全在 checklist 里，正文侧此前唯一
+	// 的分项是「-3 命中豁免词：t.me」，净分 -3，四层判据与第⑥层一条都够不着。
+	// 这组断言锁的是【那条真实样本必须被定罪】，不是锁某个中间量 —— 换判据、调分值
+	// 都行，只要这条线上样本仍然撞得上封禁线。
+	const LIVE_TITLE = '假钞玩妹嗨嗨 🔥 假钞日常出货都可';
+	const LIVE_TASKS = [
+		'假钞赌博 🔥 ktv日常使用',
+		'假钞嫖娼 🔥 约炮白嫖婊子专用',
+		'假钞商k 🔥 摆拍日常装逼',
+		'假钞日常 🔥 使用交流群',
+		'⬇️⬇️⬇️ 下方假钞交流群',
+		'https://t.me/+giwR6i9pU-A4ZGRk'
+	];
+	const liveEval = W.scoreAdMessageText(
+		W.extractAdChecklistText({
+			checklist: {
+				title: LIVE_TITLE,
+				tasks: LIVE_TASKS.map((text, i) => ({ id: i + 1, text, is_completed: false }))
+			}
+		}), {});
+	assert('线上样本 · 净分越过封禁线（改前是 -3）', liveEval.score >= 7, liveEval.score + ' | ' + liveEval.reasons.join(' / '));
+	assert('线上样本 · 私有邀请链接分项在', liveEval.reasons.some((r) => r.includes('私有群一次性邀请链接')), liveEval.reasons.join(' / '));
+	assert('线上样本 · 行业词复读分项在', liveEval.reasons.some((r) => r.includes('私有群邀请 + 同一招揽/行业词重复')), liveEval.reasons.join(' / '));
+	assert('线上样本 · t.me 豁免没有把分压回去', !liveEval.reasons.some((r) => r.startsWith('-3 正文命中豁免词')), liveEval.reasons.join(' / '));
+
+	// 反向：同一个清单把私有邀请换成公开频道链接 → 判据不该触发，不误杀正常清单。
+	const publicOnly = W.scoreAdMessageText(
+		W.extractAdChecklistText({
+			checklist: {
+				title: '本周任务清单',
+				tasks: ['写完周报', '更新文档', '代码评审', 'https://t.me/mychannel']
+			}
+		}), {});
+	assert('线上样本 · 公开链接的正常清单不为正（反向断言）', publicOnly.score <= 0, publicOnly.score + ' | ' + publicOnly.reasons.join(' / '));
 }
 
 // ================= [5] 空消息仍早退（零成本不变量不被破坏） =================

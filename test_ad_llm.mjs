@@ -580,6 +580,33 @@ section('[8] 可疑信号把 bio 冷却期压到 10 分钟');
 		assert('★ 冷却期内且 0 正分 → 不进闸二，一个 AI 调用都没有',
 			ai.llmCalls === 0, 'llmCalls=' + ai.llmCalls);
 	}
+	// ②b 【2026-10-11 新增触发路径】正文只有业务词 → 0 正分，但第⑥层必须够得着
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '行业词用户', username: '', bio: ''
+		} } }) });
+		await primeBioChecked(env, 771112, 60);   // 1 分钟前查过：与 ② 同档，差别只在正文
+		// 「假钞」只命中业务词表 → 掉进「单类词不计分」→ reasons 里一行以 + 开头的都没有，
+		// 旧行为下 suspectSignal 恒为 false，第⑥层永远够不着 —— 正是 2026-10-11 那条
+		// 漏放清单的机制。
+		await send(groupMessage({ id: 771112, first_name: '行业词用户' }, '这批假钞成色不错'), env);
+		assert('★ 正文只命中业务词（0 正分）→ 第⑥层仍被调到（词表外话术的唯一出路）',
+			ai.llmCalls >= 1, 'llmCalls=' + ai.llmCalls);
+	}
+	// ②c 反向：技术词不触发 —— 「订阅」是豁免词，不在招揽/业务两张表里，稳态不变量守住
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '技术用户', username: '', bio: ''
+		} } }) });
+		await primeBioChecked(env, 771113, 60);
+		await send(groupMessage({ id: 771113, first_name: '技术用户' }, '订阅订阅订阅 论坛'), env);
+		assert('★ 豁免词复读不触发新路径（技术讨论仍零 AI 调用）',
+			ai.llmCalls === 0, 'llmCalls=' + ai.llmCalls);
+	}
 	// ③ 冷却期外 + 0 正分 → 照旧进闸二（原有行为不变）
 	{
 		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });

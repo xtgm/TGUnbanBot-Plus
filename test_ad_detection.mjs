@@ -3112,10 +3112,27 @@ section('[18] 方案 C · 私有群邀请链接单独计分（不动主人指定
 	// 而「交流cd」（c/d 非表内词）救不了 —— 钉死「完整词条才豁免」的语义。
 	assert('误封面 · 「交流cd」不是豁免词，仍 7 分', W.scoreAdProfile({ first_name: '小美', username: 'xiaomei', bio: '读书会成员进群 t.me/+abcdefghij 欢迎交流cd' }).score >= 7);
 
-	// —— 正文一个字都没动（本次授权只覆盖资料卡）——
+	// —— 2026-10-11 私有邀请链接从资料卡侧扩到正文侧 ——
+	// 主人定的分档：正文只【记账不定罪】（3 分），定罪交给下面那条复读判据。
+	// 资料卡 7 分与正文 3 分的差别，是「本人长期挂着的自证」与「群里转发一条链接」的差别。
 	const bodyPriv = W.scoreAdMessageText('进群 https://t.me/+abcdefghij');
-	assert('正文 · 私有链接不计分（与改动前逐字一致）', bodyPriv.score === -3, bodyPriv.score + ' | ' + bodyPriv.reasons.join(' / '));
-	assert('正文 · 不出现私有邀请链接分项', !bodyPriv.reasons.some((r) => r.includes('私有群一次性邀请链接')), bodyPriv.reasons.join(' / '));
+	assert('正文 · 私有邀请记 +3（与资料卡侧 7 分不同档）', bodyPriv.score === 3, bodyPriv.score + ' | ' + bodyPriv.reasons.join(' / '));
+	assert('正文 · 出现私有邀请链接分项', bodyPriv.reasons.some((r) => r.includes('私有群一次性邀请链接')), bodyPriv.reasons.join(' / '));
+	assert('正文 · 私有邀请不吃 t.me 豁免（剔除生效）', bodyPriv.reasons.some((r) => r.includes('不吃')), bodyPriv.reasons.join(' / '));
+	assert('正文 · 单发一条邀请链接仍 PASS（误封面保护：拉群是正常行为）', bodyPriv.score < 5, bodyPriv.score + '');
+
+	// 正文真的带着行业词复读 → 3 + 8 撞封禁线。这是 2026-10-11 那条漏放清单的定罪路径。
+	const bodyRepeat = W.scoreAdMessageText('假钞假钞假钞 https://t.me/+abcdefghij');
+	assert('正文 · 私有邀请 + 行业词复读 3 次 → 撞封禁线', bodyRepeat.score >= 7, bodyRepeat.score + ' | ' + bodyRepeat.reasons.join(' / '));
+	assert('正文 · 复读分项写明次数', bodyRepeat.reasons.some((r) => r.includes('重复 3 次')), bodyRepeat.reasons.join(' / '));
+
+	// 反向：公开频道链接照旧吃豁免 —— 正常人分享自己的公开群/频道不该被这套判据盯上。
+	const bodyPublic = W.scoreAdMessageText('这个频道不错 https://t.me/mychannel');
+	assert('正文 · 公开链接仍吃 t.me 豁免（不误伤正常分享）', bodyPublic.score <= 0, bodyPublic.score + ' | ' + bodyPublic.reasons.join(' / '));
+
+	// 反向：豁免词复读不触发 —— 计数只看招揽动词与业务词，技术讨论连说三遍「订阅」不算。
+	const bodyTech = W.scoreAdMessageText('订阅订阅订阅 https://t.me/+abcdefghij');
+	assert('正文 · 豁免词复读不触发判据', bodyTech.score < 7, bodyTech.score + ' | ' + bodyTech.reasons.join(' / '));
 
 	// —— 累积误封的根治点仍然有效 ——
 	// 7 分加在 scoreAdProfile（静态资料分）里，而观察窗口留存的是 retainScore = max(0, behaviorScore)，

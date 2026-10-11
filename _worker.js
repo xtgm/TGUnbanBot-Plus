@@ -13960,10 +13960,59 @@ function scoreAdMessageText(text, options = {}) {
 		}
 	}
 
-	const exemptHits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
+	// ===== 私有群一次性邀请链接（2026-10-11：从资料卡侧扩到正文侧）=====
+	//
+	// 【补的是哪个洞】同一套判据在 scoreAdProfile 里 2026-09-09 就落地了，
+	// 当时的注释写明「【只管资料卡、不管正文】……要扩到正文得另开一轮」。
+	// 这一轮就是那个「另开一轮」：2026-10-11 线上样本（群 -1001883549197，checklist 消息）
+	// 把广告全写在【正文】里，于是在这一侧一个字都没被读到 ——
+	// 正文侧唯一的分项是「-3 命中豁免词：t.me」，广告号拿主人给正常用户的护身符
+	// 把自己从 0 分压到 -3 分，与 9 月那两张资料卡【同一个漏放模式，只是换了一侧】。
+	//
+	// 【判据复用资料卡侧、分值刻意低一档】判据（什么算私有邀请链接）完全复用
+	// hasAdPrivateInviteLink，不另写正则 —— 两条正则分散在文件两头早晚会一改一漏。
+	// 分值用 AD_BODY_PRIVATE_INVITE_SCORE（3 分）而不是资料卡那个 7 分，理由见常量说明：
+	// 简介是本人长期挂着的自证，正文只是一条转发链接，误封面差着一个数量级。
+	const privateInvite = hasAdPrivateInviteLink(source);
+	if (privateInvite) add(AD_BODY_PRIVATE_INVITE_SCORE, '正文含私有群一次性邀请链接（t.me/+ 或 joinchat）');
+
+	let exemptHits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
+	// 私有邀请链接不吃 t.me 豁免 —— 与资料卡侧同一条分流规则：同时写了
+	// t.me/mychannel（公开频道）和 t.me/+xxx（私有群）的人，公开那条仍是正常用法，
+	// 豁免照给；只有正文里【只有私有形态】时才剔。
+	if (privateInvite && exemptHits.length && !hasAdPublicTelegramLink(source)) {
+		const isTelegramExempt = (word) => AD_TELEGRAM_LINK_EXEMPT_WORDS.has(String(word).toLowerCase());
+		const dropped = exemptHits.filter(isTelegramExempt);
+		if (dropped.length) {
+			exemptHits = exemptHits.filter((word) => !isTelegramExempt(word));
+			reasons.push('（私有群邀请链接不吃 ' + dropped.join('/') + ' 豁免：该豁免只保护公开账号链接）');
+		}
+	}
 	if (exemptHits.length) {
 		const penalty = tradeHits.length ? AD_EXEMPT_PENALTY_WITH_TRADE : AD_EXEMPT_PENALTY;
 		add(penalty, '正文命中豁免词：' + exemptHits.slice(0, 3).join('/') + (tradeHits.length ? '（含交易动词，减免打折）' : ''));
+	}
+
+	// ===== 私有邀请 + 同一个招揽/行业词重复 ≥3 次（2026-10-11 新增）=====
+	//
+	// 【治什么】词表盖不住的那一类 —— 线上样本正文里只有行业词（「假钞」×5、约炮），
+	// 一个招揽动词都没有，于是掉进「单类词不计分」。私有邀请那条只给 3 分，
+	// 单靠它到不了封禁线（这是刻意的，见 AD_BODY_PRIVATE_INVITE_SCORE），
+	// 所以必须有第二条独立的定罪路径：不依赖招揽动词，看的是【规避行为本身】。
+	// 3 + 8 = 11 撞线；正文里还带别的豁免词（「下载」「教程」这类）时 11 - 3 = 8，仍在封禁线之上。
+	//
+	// 【为什么是「同一个词 ≥3 次」而不是「合计 ≥3 次」】合计会把技术群里
+	//「代理」+「订阅」+「节点」各出现一次算成 3 次，那是日常讨论。单个词连说三遍
+	// 配上私有邀请码，在正常语境里只有一种解释：他要你扫码进群看这个。
+	//
+	// 【为什么不计豁免词】下面这个函数只数 AD_TRADE_VERBS 与 AD_BUSINESS_KEYWORDS，
+	// 豁免词本来就不在其中 —— 「反复说『订阅』再拉群」不会误杀，正是这层想要的边界。
+	if (privateInvite) {
+		const repeat = findAdRepeatedSolicitWord(source);
+		if (repeat.count >= AD_INVITE_REPEAT_MIN) {
+			add(AD_INVITE_REPEAT_SCORE, '私有群邀请 + 同一招揽/行业词重复 '
+				+ repeat.count + ' 次（' + repeat.word + '）');
+		}
 	}
 
 	// 与 scoreAdProfile 同一个下限，理由见 AD_SCORE_FLOOR。
@@ -15128,6 +15177,21 @@ const AD_SAMPLE_MIN_CORE_LENGTH = 6;
 // 的恶性循环 —— 那正是 @MiLov1900 两次被误封的机制，已于 2026-09-08 根治，这里不能把它请回来。
 const AD_PRIVATE_INVITE_SCORE = 7;
 
+// 正文侧的私有邀请分值 —— 【与资料卡侧刻意不同档，是 3 分而不是 7 分】
+//
+// 【为什么正文要低一档】资料卡那个 7 分的全部依据是主人那句「正常用户是不会放私有群
+// 在用户简介上的」，而简介是【他写的、长期挂着的】，写进去等于自己站台。
+// 正文不是：群里发一条邀请链接（拉人进群、分享自己的群、群活动报名）是极常见的正常行为，
+// 现有注释也写着「正文里发群链接在正常群聊里远比写进个人简介常见」。
+// 所以正文侧拿 +7 会让「谁发一次邀请链接就封谁」成为现实的误封面 —— 那不是判据，是陷阱。
+//
+// 【为什么是 3】它只负责把这条证据【记账】，不负责定罪。定罪交给下面那条
+// 「私有邀请 + 同一招揽/行业词复读 ≥3 次」（AD_INVITE_REPEAT_SCORE = 8）——
+// 单发一条链接是 3 分（< 观察线 5，直接 PASS）；
+// 带着行业词复读三遍再拉群的才是广告，3 + 8 = 11 分撞封禁线。
+// 这样分层后，两侧行为不同却各自说得通：资料卡 = 自己站台（重判），正文 = 转发一条链接（轻判）。
+const AD_BODY_PRIVATE_INVITE_SCORE = 3;
+
 // 只做 test、不做 replace，所以【不带 g 标志】（带 g 的正则对象自带 lastIndex，
 // 反复 test 同一个对象会时真时假）。邀请码下限 5 字符：Telegram 实际生成的是 16 位上下，
 // 卡 5 是为了不把 `t.me/+` 这种半截链接或纯手打的 `t.me/+86` 电话号误认成邀请码。
@@ -15150,6 +15214,49 @@ function hasAdPublicTelegramLink(text) {
 // 且 'telegram.me' 这个串本身不含子串 't.me'，所以不会被 countAdKeywordHits 命中）。
 // 做成 Set 是留给以后往豁免表里加 telegram 域名变体时不必再改剔除逻辑。
 const AD_TELEGRAM_LINK_EXEMPT_WORDS = new Set(['t.me', 'telegram.me', 'telegram.dog']);
+
+// ===== 私有邀请 + 招揽词复读（2026-10-11）=====
+// 判据本体见 scoreAdMessageText 里那一段。这两个常量与 AD_PRIVATE_INVITE_SCORE 放在
+// 同一处物理位置 —— 它们描述的是同一个形态（私有群一次性邀请链接）的两档证据强度。
+const AD_INVITE_REPEAT_MIN = 3;
+// 【8 分而不是 7】这条判据必须在【豁免扣分之后】叠加，而正文侧仍有别的豁免词可能生效
+//（比如同一句里带「下载」「教程」）。取 7 时被 -3 压到 4 分，刚好掉出观察线，
+// 这条判据就白加了；取 8 则最坏情形 8 - 3 = 5 仍在观察线之上。
+// 正常情形（无其它豁免词）8 分直接越过封禁线 7 —— 与私有邀请那条的分值不冲突，
+// 两者同命中时叠加到 15 分，语义上也对：这是两条互相独立的证据。
+const AD_INVITE_REPEAT_SCORE = 8;
+
+// 找出正文里【出现次数最多的那一个】招揽动词或行业词，返回 { word, count }。
+//
+// 【为什么不去重后只看命中列表】countAdKeywordHits 返回的是去重后的词列表，
+// 「假钞」出现 5 次和出现 1 次在它眼里完全一样，而这两者的含义天差地别 ——
+// 复读本身是行为特征，不是内容特征。
+//
+// 【为什么要同时比对去混淆文本】与全项目词表匹配同一个口径（buildAdMatchTexts）：
+// 逐字分隔、全角半角混排这类规避手法换个写法就绕过了 includes，那就等于没判。
+//
+// 【为什么不查重叠词】`假钞` 与 `假钞嫖娼` 里的 `假钞` 是同一个 needle，
+// 子串计数天然算作两次，这正是想要的（复读计的是「这个词被写了几次」）。
+function findAdRepeatedSolicitWord(text) {
+	const source = String(text ?? '');
+	if (!source) return { word: '', count: 0 };
+	const variants = buildAdMatchTexts(source).map((v) => v.toLowerCase());
+	let best = { word: '', count: 0 };
+	for (const word of [...AD_TRADE_VERBS, ...AD_BUSINESS_KEYWORDS]) {
+		const needle = String(word).toLowerCase();
+		if (!needle) continue;
+		for (const variant of variants) {
+			let count = 0;
+			let index = variant.indexOf(needle);
+			while (index !== -1) {
+				count += 1;
+				index = variant.indexOf(needle, index + needle.length);
+			}
+			if (count > best.count) best = { word, count };
+		}
+	}
+	return best;
+}
 
 // 从判定载荷拼出 AI 语义样本文本。
 //
@@ -19153,8 +19260,27 @@ async function detectAdOnMessage(message, env) {
 	// ===== 可疑信号把 bio 冷却期压到 10 分钟（见 AD_SUSPECT_BIO_COOLDOWN_SECONDS）=====
 	// 闸一真拿到正分判据 → 不再让入群那次「bio 还是空的」查询把接下来两小时都挡在深判外；
 	// 0 正分的普通聊天照旧走原分档，稳态零 Telegram 请求的不变量对它原样成立。
-	const suspectSignal = Array.isArray(cheap.reasons)
-		&& cheap.reasons.some((line) => AD_POSITIVE_SIGNAL_RE.test(line));
+	//
+	// ===== 2026-10-11：新增第二条触发路径（业务词 / 交易动词命中，不论分正负）=====
+	//
+	// 【补的是哪个洞】原判据只认「本次真拿到正分」，而线上漏放的两类样本恰恰拿不到正分：
+	//   · checklist 广告正文只有行业词（「假钞」×5、约炮）→ 掉进「单类词不计分」，
+	//     reasons 里一行以 + 开头的都没有，suspectSignal 恒为 false；
+	//   · 名片广告显示名（「新澳🔥六合彩内幕发布群」）四张词表逐词零命中，同理。
+	// 于是第⑥层生成式判定 —— 它存在的理由正是「词表外话术」—— 对这两类永远够不着。
+	// 这是设计上的自相矛盾：越是词表抓不住的东西越需要它，而它偏偏被关在门外。
+	//
+	// 【为什么这个条件安全】触发之后只做两件事：① bio 冷却期压到 10 分钟（多一次 getChat）；
+	// ② 送一次 LLM（有 AD_LLM_DAILY 每日上限 + 同载荷内存去重兜着）。
+	// 封不禁人仍然由原有评分阈值与 LLM 的 0.85 采信线说了算，这一行【不改任何裁决】。
+	// 技术群里天天说的「代理 / 订阅 / 节点 / 教程」全是豁免词，不在下面这两张表里，
+	// 普通技术讨论一条都不会被它拉起来 —— 这两行的命中者，本来就已经在 reasons 里
+	// 留下了「仅业务关键词」「仅交易动词」的记录，它们只是此前没资格往下走而已。
+	const solicitHits = countAdKeywordHits(text || contactName, AD_TRADE_VERBS).length
+		+ countAdKeywordHits(text || contactName, AD_BUSINESS_KEYWORDS).length;
+	const suspectSignal = solicitHits > 0
+		|| (Array.isArray(cheap.reasons)
+			&& cheap.reasons.some((line) => AD_POSITIVE_SIGNAL_RE.test(line)));
 	const bioCheckedAt = Number(member?.bio_checked_at) || 0;
 	const needBio = suspectSignal
 		? (bioCheckedAt <= 0 || nowSeconds - bioCheckedAt >= AD_SUSPECT_BIO_COOLDOWN_SECONDS)
