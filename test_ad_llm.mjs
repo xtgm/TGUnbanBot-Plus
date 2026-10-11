@@ -851,8 +851,9 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		calls.length = 0;
 		await W.handleAdStatsCommand(env, GROUP_ID);
 		const text = lastSent();
-		assert('★ 解析失败 → 提示这些调用白烧额度',
-			text.includes('白烧额度'), text.slice(0, 700));
+		// 文案已改为按健康状态分流：最后一次失败之后没有成功过 → 警告（原来是固定写死的「白烧额度」）
+		assert('★ 解析失败且之后无成功 → 挂警告（不是固定写死的旧文案）',
+			text.includes('⚠️ 最近一次解析失败'), text.slice(0, 700));
 	}
 	// ⑦d 【2026-10-11 线上实锤】Workers AI 对 chat 模型返回的是 OpenAI 兼容结构，
 	// 正文在 choices[0].message.content；旧写法只认 response / result，两个都取不到，
@@ -924,6 +925,42 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		const stats = await W.readAdLLMOutcome(env, Math.floor(Date.now() / 1000));
 		assert('★ 成败交替 → 连续失败被清零、不熔断',
 			stats.broken === false && stats.consecFail === 0, JSON.stringify(stats));
+	}
+
+	// ⑦h 看板健康判断：【最后一次失败之后有没有成功过】，不是「今天失败过几次」。
+	// 主人原话：「我希望它完美的打勾」——累计失败数只会单调上涨，修好了也不归零，
+	// 挂着一个吓人的感叹号却什么都没坏（2026-10-11 实例：81 次失败里 76 次是修复前的存量）。
+	{
+		let n = 0;
+		const env = await makeReadyEnv({ AI: makeAI({ onLlm: () => {
+			n += 1;
+			return n === 1 ? { nope: 1 } : { response: adAnswer(0.9) };
+		} }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '100', AD_LLM_DAILY_MESSAGE: '100' });
+		await W.judgeAdByLLM(env, cfg, { profile: { bio: 'a' }, text: '健康样本甲' });
+		await W.judgeAdByLLM(env, cfg, { profile: { bio: 'b' }, text: '健康样本乙' });
+		calls.length = 0;
+		await W.handleAdStatsCommand(env, GROUP_ID);
+		const text = lastSent();
+		assert('★ 历史有失败但已恢复 → 打勾，不挂感叹号',
+			text.includes('✅ 解析正常') && !text.includes('⚠️ 最近一次解析失败'),
+			(text.match(/解析失败[^\n]{0,80}/) || [''])[0]);
+	}
+	// ⑦i 反向：最后一次就是失败、之后没有成功 → 必须仍是警告，不能假装健康
+	{
+		let n = 0;
+		const env = await makeReadyEnv({ AI: makeAI({ onLlm: () => {
+			n += 1;
+			return n <= 1 ? { response: adAnswer(0.9) } : { nope: 1 };
+		} }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '100', AD_LLM_DAILY_MESSAGE: '100' });
+		await W.judgeAdByLLM(env, cfg, { profile: { bio: 'a' }, text: '告警样本甲' });
+		await W.judgeAdByLLM(env, cfg, { profile: { bio: 'b' }, text: '告警样本乙' });
+		calls.length = 0;
+		await W.handleAdStatsCommand(env, GROUP_ID);
+		const text = lastSent();
+		assert('★ 最后一次是失败且之后无成功 → 仍挂警告',
+			text.includes('⚠️ 最近一次解析失败'), text.slice(0, 900));
 	}
 
 	// ⑦c 分池：消息池打满后，入群池仍有额度 —— 三条轨不再互相挤占

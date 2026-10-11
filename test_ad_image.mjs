@@ -454,6 +454,29 @@ section('[6] runAdImageVision · 队列 / kind 过滤 / 熔断 / 关闭');
 	const second = await W.runAdImageVision(envFail);
 	assert('失败项不会被第二轮再取出来', second.queued === 0, JSON.stringify(second));
 
+	// 6.5 失败熔断（2026-10-11）：连续 AD_VISION_FAIL_BREAK 次失败后，当天不再调用 moondream。
+	// 线上真实状态是头像与正文图【全线失败】、一天 350 张一张没判成却照样烧额度 ——
+	// 视觉识别是【可延迟】的活：一张图今天不判明天还能判，额度烧掉就没了。
+	{
+		let brkAiCalls = 0;
+		const envBreak = makeEnv({ AI: { run: async () => { brkAiCalls += 1; return { answer: '抱歉我判断不了' }; } } });
+		await W.adDetectionReady(envBreak);
+		for (let i = 0; i < 20; i++) {
+			await W.upsertAdImage(envBreak, 'IMG_BRK_' + i, { verdict: 'pending', fileId: 'F_BRK' + i, kind: 'photo' });
+		}
+		const brkFirst = await W.runAdImageVision(envBreak, { batchSize: 50 });
+		assert('连续失败都被计入 failed', brkFirst.failed === 20, JSON.stringify(brkFirst));
+
+		await W.upsertAdImage(envBreak, 'IMG_BRK_X', { verdict: 'pending', fileId: 'F_BRKX', kind: 'photo' });
+		const brkSecond = await W.runAdImageVision(envBreak, { batchSize: 50 });
+		assert('★ 熔断后不再调用模型（这才是省额度的关键）',
+			brkSecond.skipped === 'broken' && brkAiCalls === 20,
+			JSON.stringify(brkSecond) + ' aiCalls=' + brkAiCalls);
+		assert('★ 熔断时已失败的行不会被重复取出',
+			envBreak.DB.query('SELECT count(*) c FROM ad_images WHERE file_unique_id = ?', 'IMG_BRK_X')[0].c === 1);
+	}
+
+
 	// 6.5 状态键与头像互不挤占
 	const envQuota = makeEnv({ AI: { run: async () => ({ answer: '{"ad":false,"text":"","reason":"普通图"}' }) } });
 	await W.adDetectionReady(envQuota);

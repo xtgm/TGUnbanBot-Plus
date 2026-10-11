@@ -16558,16 +16558,21 @@ async function judgeAdByLLM(env, config, input, options) {
 		// 排查需要的只是「正文在哪个字段」，而返回体里带着别人的 bio 与消息片段。
 		await writeAdScanState(env, 'llm_last_shape',
 			JSON.stringify(Object.keys(aiResult || {}).slice(0, 12)), nowSeconds);
+		await writeAdScanState(env, 'llm_last_fail_seq', String(quota.used + 1), nowSeconds);
 		if (consecFail >= AD_LLM_FAIL_BREAK) {
 			await writeAdScanState(env, 'llm_broken_day', String(quota.today), nowSeconds);
 			console.error('[广告检测·深度判定] 已熔断：连续 ' + consecFail + ' 次取不到模型回答，'
 				+ '今日不再调用第⑥层。返回结构的字段名见 /adstats 的「上次返回字段」。');
 		}
-	} else if (Number(quota.consecFail) > 0) {
+	} else {
+		// 成功时刻要记：看板判断「链路健康」靠的就是「最后一次失败之后有没有成功过」。
+		await writeAdScanState(env, 'llm_last_success_seq', String(quota.used + 1), nowSeconds);
 		// 一次成功就说明链路是通的，把连续失败计数清零。不清的话，一天里夹着的
 		// 零星失败（模型偶尔不守 JSON 格式、thinking 偶尔过长）会累计到熔断线，
 		// 把一条其实正常的第⑥层误关掉 —— 那比不加熔断更糟。
-		await writeAdScanState(env, 'llm_consec_fail', '0', nowSeconds);
+		if (Number(quota.consecFail) > 0) {
+			await writeAdScanState(env, 'llm_consec_fail', '0', nowSeconds);
+		}
 	}
 	return answer;
 }
@@ -17435,6 +17440,19 @@ const AD_AVATAR_VISION_PROMPT = '这是一张社交软件的用户头像图片�
 // 与 $11/M Neurons 反推，单张约 35~50 Neurons —— 这是【估算值】，不是官方数。
 // 300 张/天 ≈ 1.5 万 Neurons，仅占免费额度的 1.5 倍量级，超出部分按单价计费。
 const AD_IMAGE_VISION_DAILY = 300;
+
+// ===== 视觉识别失败熔断（2026-10-11，与第⑥层的 AD_LLM_FAIL_BREAK 同一套机制）=====
+//
+// 【治什么】线上真实状态：头像与正文图视觉识别【全线失败】，一天 350 张一张都没判成，
+// 却照样把 moondream 的额度全烧掉（每张 35~50 Neurons，350 张 ≈ 1.5 万）。
+// 与第⑥层那个「取值取错」是同一类病：调用发出去了、额度扣掉了、结论拿不到，
+// 而所有既有的闸（每日张数上限、队列推进）都只管「跑了多少」，不管「跑成没有」。
+//
+// 【为什么必须失败即停】视觉识别是【可延迟】的活：一张图今天不判，明天还能判；
+// 但额度烧掉就没了。链路坏着的时候继续跑，等于拿钱换一堆 failed 计数。
+// 失败即停之后，/adstats 会显示「⛔ 已熔断」，主人一眼就知道该来查了 ——
+// 这比「每天 350 条 error 日志但功能照常显示启用」要诚实得多。
+const AD_VISION_FAIL_BREAK = 20;
 // 单轮 cron 最多推理多少张。取「日预算 ÷ 每天轮次」，正好让两轮吃完 300：
 // crons 是每天 2 次（03:17 / 15:17），设 100 的话日预算永远用不完，
 // 配置上限与实际消耗对不上，看板上「当日 x/300」会一直停在 200 以下。
@@ -17526,6 +17544,9 @@ async function readAdLLMQuota(env, nowSeconds) {
 		await writeAdScanState(env, 'llm_consec_fail', '0', nowSeconds);
 		await writeAdScanState(env, 'llm_broken_day', '', nowSeconds);
 		await writeAdScanState(env, 'llm_last_shape', '', nowSeconds);
+		// 解析成功 / 失败的时间戳也一并清 —— 它们只对「当天链路现在健不健康」有意义。
+		await writeAdScanState(env, 'llm_last_fail_seq', '0', nowSeconds);
+		await writeAdScanState(env, 'llm_last_success_seq', '0', nowSeconds);
 		return { today, used: 0, pools: { message: 0, join: 0, cron: 0 }, broken: false, consecFail: 0, lastShape: '' };
 	}
 	const used = Number(await readAdScanState(env, 'llm_count', '0')) || 0;
@@ -17571,7 +17592,7 @@ async function bumpAdLLMOutcome(env, reachedLine) {
 // 读第 ⑥ 层的今日观测计数。只给 /adstats 用，不在任何判定路径上。
 // 与 readAdLLMQuota 同一把尺：day 不是今天就一律按 0 报，不读昨天的残留。
 async function readAdLLMOutcome(env, nowSeconds) {
-	const empty = { used: 0, hits: 0, bans: 0, parseFail: 0, pools: { message: 0, join: 0, cron: 0 }, broken: false, consecFail: 0, lastShape: '' };
+	const empty = { used: 0, hits: 0, bans: 0, parseFail: 0, pools: { message: 0, join: 0, cron: 0 }, broken: false, consecFail: 0, lastShape: '', lastFailSeq: 0, lastSuccessSeq: 0 };
 	if (!env?.DB) return empty;
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
 	const day = await readAdScanState(env, 'llm_day', '');
@@ -17591,7 +17612,15 @@ async function readAdLLMOutcome(env, nowSeconds) {
 		broken: String(await readAdScanState(env, 'llm_broken_day', '')) === today,
 		consecFail: await num('llm_consec_fail'),
 		// 上次解析失败时返回对象的字段名清单（不含内容，理由见 readAdLLMQuota）。
-		lastShape: String(await readAdScanState(env, 'llm_last_shape', ''))
+		lastShape: String(await readAdScanState(env, 'llm_last_shape', '')),
+		// 最后一次失败 / 成功的时刻。看板据此判断「链路现在健不健康」，
+		// 而不是看「今天失败过几次」—— 那个数字只会单调上涨，修好了也不归零，
+		// 挂着一个吓人的感叹号却什么都没坏（2026-10-11 主人的原话：「我希望它完美的打勾」）。
+		// 【用调用序号不用时间戳】同一秒内「先失败后成功」时两个时间戳相等，
+		// 按 >= 判断会误报「链路坏了」，按 > 判断又会漏报。序号（本次调用后的总次数）
+		// 天然单调，谁先谁后一目了然。
+		lastFailSeq: Number(await readAdScanState(env, 'llm_last_fail_seq', '0')) || 0,
+		lastSuccessSeq: Number(await readAdScanState(env, 'llm_last_success_seq', '0')) || 0
 	};
 }
 
@@ -17623,6 +17652,53 @@ function logAdVisionFailure(kind, stage, id, error) {
 		+ ' stack=' + String(error?.stack || '').replace(/\s+/g, ' ').slice(0, 300));
 }
 
+// 视觉识别熔断状态（头像与正文图【共用一套】—— 同一个模型、同一根因，分两套只会让排查翻倍）。
+// 跨天自动恢复：熔断标记存的是「触发当天的日期」，过期即失效。
+// 把视觉识别的熔断状态渲染成一行后缀。健康时返回空串 —— 看板上不添废话。
+function describeVisionBreak(visionBreak) {
+	if (visionBreak?.broken) {
+		return '　⛔ 已熔断：连续 ' + Number(visionBreak.consecFail || 0) + ' 次识别失败，'
+			+ '今日不再调用 moondream（排查见「识别失败 stage=」日志）';
+	}
+	if (Number(visionBreak?.consecFail) > 0) {
+		return '　⚠️ 已连续失败 ' + Number(visionBreak.consecFail) + ' 次（满 ' + AD_VISION_FAIL_BREAK + ' 次自动熔断）';
+	}
+	return '';
+}
+
+async function readVisionBreakState(env, nowSeconds) {
+	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
+	const savedDay = String(await readAdScanState(env, 'vision_day', ''));
+	if (savedDay !== today) {
+		await writeAdScanState(env, 'vision_day', today, nowSeconds);
+		await writeAdScanState(env, 'vision_consec_fail', '0', nowSeconds);
+		await writeAdScanState(env, 'vision_broken_day', '', nowSeconds);
+		return { broken: false, consecFail: 0 };
+	}
+	const broken = String(await readAdScanState(env, 'vision_broken_day', '')) === today;
+	const consecFail = Number(await readAdScanState(env, 'vision_consec_fail', '0')) || 0;
+	return { broken, consecFail };
+}
+
+// 记一次视觉识别结果：成功清零连续失败，失败累加，连着 AD_VISION_FAIL_BREAK 次就熔断。
+// 视觉识别是【可延迟】的活 —— 一张图今天不判明天还能判，但额度烧掉就没了，
+// 所以链路坏着的时候继续跑等于拿钱换一堆 failed 计数。
+async function bumpVisionBreakState(env, ok, nowSeconds) {
+	const { consecFail } = await readVisionBreakState(env, nowSeconds);
+	if (ok) {
+		if (consecFail > 0) await writeAdScanState(env, 'vision_consec_fail', '0', nowSeconds);
+		return;
+	}
+	const next = consecFail + 1;
+	await writeAdScanState(env, 'vision_consec_fail', String(next), nowSeconds);
+	if (next >= AD_VISION_FAIL_BREAK) {
+		const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
+		await writeAdScanState(env, 'vision_broken_day', today, nowSeconds);
+		console.error('[广告检测·视觉识别] 已熔断：连续 ' + next + ' 次识别失败，今日不再调用 moondream。'
+			+ '排查线索见「识别失败 stage=」那几行日志。');
+	}
+}
+
 async function runAdAvatarVision(env, options = {}) {
 	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '' };
 	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
@@ -17644,6 +17720,8 @@ async function runAdAvatarVision(env, options = {}) {
 	const remaining = dailyLimit - quota.used;
 	if (dailyLimit <= 0) { stats.skipped = 'disabled'; return stats; }
 	if (remaining <= 0) { stats.skipped = 'daily_limit_reached'; stats.queued = quota.used; return stats; }
+	// 熔断：连续 AD_VISION_FAIL_BREAK 次失败后当天不再调用 moondream —— 理由见 AD_VISION_FAIL_BREAK。
+	if ((await readVisionBreakState(env, nowSeconds)).broken) { stats.skipped = 'broken'; return stats; }
 
 	let rows = [];
 	try {
@@ -17712,6 +17790,9 @@ async function runAdAvatarVision(env, options = {}) {
 		} catch (error) {
 			console.error('[广告检测·头像] 写回结果失败:', error);
 		}
+		// 熔断计数：verdict 仍是 'pending' 就是这次没判成（失败或跳过），
+		// 连着 AD_VISION_FAIL_BREAK 次没判成，当天就别再烧 moondream 额度了。
+		await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
 		if (verdict === 'ad') stats.ad += 1;
 		else if (verdict === 'clean') stats.clean += 1;
 		if (verdict !== 'pending') stats.done += 1;
@@ -17761,6 +17842,8 @@ async function runAdImageVision(env, options = {}) {
 	const remaining = dailyLimit - quota.used;
 	if (dailyLimit <= 0) { stats.skipped = 'disabled'; return stats; }
 	if (remaining <= 0) { stats.skipped = 'daily_limit_reached'; stats.queued = quota.used; return stats; }
+	// 熔断：连续 AD_VISION_FAIL_BREAK 次失败后当天不再调用 moondream —— 理由见 AD_VISION_FAIL_BREAK。
+	if ((await readVisionBreakState(env, nowSeconds)).broken) { stats.skipped = 'broken'; return stats; }
 
 	let rows = [];
 	try {
@@ -17834,6 +17917,9 @@ async function runAdImageVision(env, options = {}) {
 		} catch (error) {
 			console.error('[广告检测·图片] 写回结果失败:', error);
 		}
+		// 熔断计数：verdict 仍是 'pending' 就是这次没判成（失败或跳过），
+		// 连着 AD_VISION_FAIL_BREAK 次没判成，当天就别再烧 moondream 额度了。
+		await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
 		if (verdict === 'ad') stats.ad += 1;
 		else if (verdict === 'clean') stats.clean += 1;
 		if (verdict !== 'pending') stats.done += 1;
@@ -20821,9 +20907,16 @@ async function handleAdStatsCommand(env, chatId) {
 			+ (llmStat.used > 0 && llmStat.hits === 0 && llmStat.parseFail === 0
 				? '　⚠️ 调用有、0 命中且 0 解析失败 —— 模型确实判了「不是广告」，问题在送进去的载荷内容，不在输出格式'
 				: '')
-			+ (llmStat.parseFail > 0
-				? '　⚠️ 有解析失败 —— 模型返回了内容却没抠出 JSON，这些调用等于白烧额度'
-				: ''),
+			// 【健康判断看「最后一次失败之后有没有成功过」，不是「今天失败过几次」】
+			// 累计失败数只会单调上涨，修好了也不归零 —— 挂着感叹号却什么都没坏，
+			// 正是主人 2026-10-11 说的「我希望它完美的打勾」。
+			// 2026-10-11 实例：81 次失败里 76 次是修复前的存量，之后连续 42 次调用 0 失败，
+			// 看板却一直挂着「⚠️ 有解析失败」。
+			+ (llmStat.lastFailSeq > llmStat.lastSuccessSeq
+				? '　⚠️ 最近一次解析失败之后没有成功过 —— 链路可能又坏了'
+				: (llmStat.parseFail > 0
+					? '　✅ 解析正常（' + llmStat.parseFail + ' 次历史失败已被后续成功证明链路已恢复）'
+					: (llmStat.used > 0 ? '　✅ 解析正常' : ''))),
 		// 分池：哪条轨吃了多少额度。旧配置三条轨共用一个 200 次的池，而入群与 cron 两条轨
 		// 没有触发门槛、送进去的 message 恒为空 —— 额度全被普通新用户吃光，
 		// 消息路径（广告真正出现的地方）一次都轮不到。摆出来才看得见分得对不对。
@@ -20872,12 +20965,16 @@ async function handleAdStatsCommand(env, chatId) {
 	// 头像指纹库：广告头像的复用是批量化马甲的核心特征，这一行让主人一眼看到
 	// 「L1 攒了多少、L2 还有多少没判、模型开关是什么状态」。
 	const avatarAd = Number(avatarRows.find((r) => String(r.verdict) === 'ad')?.c) || 0;
+	const visionBreak = await readVisionBreakState(env, Math.floor(Date.now() / 1000));
 	const avatarPending = Number(avatarRows.find((r) => String(r.verdict) === 'pending')?.c) || 0;
 	const avatarClean = Number(avatarRows.find((r) => String(r.verdict) === 'clean')?.c) || 0;
 	lines.push('<b>头像指纹</b>　广告图 <b>' + avatarAd + '</b>　待识别 <b>' + avatarPending + '</b>　已排除 <b>' + avatarClean + '</b>');
+	// 视觉识别的熔断状态必须摆出来：旧版这里永远显示「✅ 每日上限 50 张」，
+	// 而线上真实状态是【全线失败、一张没判成却照样烧额度】—— 配置正常 ≠ 链路健康。
 	lines.push('　↳ 视觉识别：' + (config.avatarVisionDaily > 0
 		? '✅ 每日上限 ' + config.avatarVisionDaily + ' 张（模型 ' + AD_AVATAR_VISION_MODEL + '）'
-		: '⏸️ 已关闭（AD_AVATAR_VISION_DAILY=0），只跑头像指纹，不调模型'));
+		: '⏸️ 已关闭（AD_AVATAR_VISION_DAILY=0），只跑头像指纹，不调模型')
+		+ describeVisionBreak(visionBreak));
 	// 正文图片指纹库。与头像同口径，但「待识别」里混着三类【永远不进推理队列】的载体
 	// （动图 / 视频 / 文件）—— moondream 只吃静态位图，它们只能靠 L1 同款复用命中，
 	// 所以这个数字不会随 L2 跑完归零，不是卡住了。
@@ -20887,7 +20984,8 @@ async function handleAdStatsCommand(env, chatId) {
 	lines.push('<b>正文图片指纹</b>　广告图 <b>' + imageAd + '</b>　待识别 <b>' + imagePending + '</b>　已排除 <b>' + imageClean + '</b>');
 	lines.push('　↳ 视觉识别：' + (config.imageVisionDaily > 0
 		? '✅ 每日上限 ' + config.imageVisionDaily + ' 张（模型 ' + AD_IMAGE_VISION_MODEL + '，只判 photo / sticker）'
-		: '⏸️ 已关闭（AD_IMAGE_VISION_DAILY=0），只跑图片指纹，不调模型'));
+		: '⏸️ 已关闭（AD_IMAGE_VISION_DAILY=0），只跑图片指纹，不调模型')
+		+ describeVisionBreak(visionBreak));
 	// 同款会员标指纹库。pending 恒为 0 是【设计如此】—— 这一层只做同款复用，
 	// 不做视觉识别，没有排队判一说；命中要过 AD_BADGE_BAN_HITS 次定罪才算数。
 	const badgeAd = Number(badgeRows.find((r) => String(r.verdict) === 'ad')?.c) || 0;
