@@ -17604,7 +17604,20 @@ const AD_IMAGE_VISION_DAILY = 300;
 // 但额度烧掉就没了。链路坏着的时候继续跑，等于拿钱换一堆 failed 计数。
 // 失败即停之后，/adstats 会显示「⛔ 已熔断」，主人一眼就知道该来查了 ——
 // 这比「每天 350 条 error 日志但功能照常显示启用」要诚实得多。
-const AD_VISION_FAIL_BREAK = 20;
+// 【20 → 3】2026-10-11 线上连败 21 次才熔断，前 20 次全是白烧。
+// 视觉识别一天只跑 50 + 300 张，连着 3 次失败已经不可能是波动 —— 是链路故障。
+// 失败即停的代价只是当天少判几张图（跨天自动恢复），
+// 而多烧 17 次的代价是实打实的 Neurons 与一屏 error 日志。
+const AD_VISION_FAIL_BREAK = 3;
+
+// moondream 输入图的字节上限。官方未公布精确值，取 2MB ——
+// 头像（几 KB~几十 KB）永不触发；正文图里只有超大原图会被跳过，
+// 而那些本来就喂不进去。宁可少判几张，也不能拿额度去赌。
+// 【为什么要这一道】线上连败的 errorMessage 是「模型回答无法解析: {}」——
+// 调用成功、无网络错、无权限错，就是模型吞下去吐不出东西；
+// 参数名与返回字段又都与官方文档一致（task / image / question → answer），
+// 唯一剩下的变量就是【输入图本身】。而这里取的是原图、不是缩略图。
+const AD_VISION_MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 // 单轮 cron 最多推理多少张。取「日预算 ÷ 每天轮次」，正好让两轮吃完 300：
 // crons 是每天 2 次（03:17 / 15:17），设 100 的话日预算永远用不完，
 // 配置上限与实际消耗对不上，看板上「当日 x/300」会一直停在 200 以下。
@@ -17852,7 +17865,7 @@ async function bumpVisionBreakState(env, ok, nowSeconds) {
 }
 
 async function runAdAvatarVision(env, options = {}) {
-	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '' };
+	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0 };
 	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
 	if (!(await adDetectionReady(env))) { stats.skipped = 'not_ready'; return stats; }
 
@@ -17921,6 +17934,12 @@ async function runAdAvatarVision(env, options = {}) {
 			const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
 			if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
 			const buffer = await imageResponse.arrayBuffer();
+			// 【尺寸闸】超限的图喂进去必然失败，直接跳过 —— 理由见 AD_VISION_MAX_IMAGE_BYTES。
+			if (buffer.byteLength > AD_VISION_MAX_IMAGE_BYTES) {
+				stats.skippedLarge += 1;
+				console.log('[视觉识别] 图片超过尺寸上限，跳过推理', JSON.stringify({ 字节: buffer.byteLength, 上限: AD_VISION_MAX_IMAGE_BYTES }));
+				continue;
+			}
 			stage = 'encode';
 			const image = 'data:image/jpeg;base64,' + bytesToBase64(new Uint8Array(buffer));
 			stage = 'ai.run';
@@ -17980,7 +17999,7 @@ async function readImageVisionQuota(env, nowSeconds) {
 // 模型调用，挂在消息上会拖慢每一次回复，且撞子请求配额；付费层解决的是
 // 「超限报错」，解决不了「每条消息慢半秒」。
 async function runAdImageVision(env, options = {}) {
-	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '' };
+	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0 };
 	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
 	if (!(await adDetectionReady(env))) { stats.skipped = 'not_ready'; return stats; }
 	// 未绑 Workers AI：与广告检测整体的降级口径一致 —— 跳过而不是报错。
@@ -18039,6 +18058,12 @@ async function runAdImageVision(env, options = {}) {
 			const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
 			if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
 			const buffer = await imageResponse.arrayBuffer();
+			// 【尺寸闸】超限的图喂进去必然失败，直接跳过 —— 理由见 AD_VISION_MAX_IMAGE_BYTES。
+			if (buffer.byteLength > AD_VISION_MAX_IMAGE_BYTES) {
+				stats.skippedLarge += 1;
+				console.log('[视觉识别] 图片超过尺寸上限，跳过推理', JSON.stringify({ 字节: buffer.byteLength, 上限: AD_VISION_MAX_IMAGE_BYTES }));
+				continue;
+			}
 			// 按字节头认格式，不按 kind 猜。kind 只说明载体类型（photo/sticker），
 			// 说明不了里面是什么字节 —— 存量行存的可能是本体，新行存的是 thumbnail，
 			// 两者格式不同但都要能认出来。认不出就跳过，绝不拿错格式硬喂模型
