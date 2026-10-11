@@ -16594,23 +16594,29 @@ async function judgeAdByLLM(env, config, input, options) {
 //
 // 【不改变已定罪的情形】有出口时行为与改动前逐字节一致；无出口时降级为 observe
 //（进观察窗口、推快照等人工复核），不是静默放行 —— 判定理由照常留痕。
-function hasAdLlmKillEvidence(input) {
+function classifyAdLLMEvidence(input) {
 	const profile = input?.profile || {};
 	const text = [profile.firstName, profile.lastName, profile.bio, input?.text]
 		.filter(Boolean).join(' ');
-	if (!text.trim()) return false;
+	if (!text.trim()) return 'none';
+	// 【硬证据：私有群一次性邀请链接】主人 2026-09 定过的口径 ——
+	//「正常用户是不会放私有群在用户简介上的，放的都是公开的频道或者群组链接，或者@用户名」。
+	// 它是这一层唯一够格单独定罪的形态：一次性、不可搜索、点进去直接进群，
+	// 正常人没有任何理由把它写进自己发的东西里。命中即封，不必等你复核。
+	if (hasAdPrivateInviteLink(text)) return 'hard';
 	// ① 域名 / t.me —— 广告的主出口
-	if (extractAdDomains(text).length) return true;
+	// 【软证据】有出口 / 金额，但没有硬证据 —— 通知主人复核，不自动封。
+	if (extractAdDomains(text).length) return 'soft';
 	// ② @handle —— 引流到某个账号
-	if (/@[A-Za-z0-9_]{4,}/.test(text)) return true;
+	if (/@[A-Za-z0-9_]{4,}/.test(text)) return 'soft';
 	// ③ 电话形态
-	if (/[+\d][\d\s-]{9,}/.test(text)) return true;
+	if (/[+\d][\d\s-]{9,}/.test(text)) return 'soft';
 	// ④ 强招揽动词（复用现成的 AD_TRADE_VERBS，不新建词表）
-	if (countAdKeywordHits(text, AD_TRADE_VERBS).length) return true;
+	if (countAdKeywordHits(text, AD_TRADE_VERBS).length) return 'soft';
 	// ⑤ 把人引向自己的动作词。
 	// 【刻意不用「加」「联系」这种单字】「加个好友聊聊」「请联系管理员」都是正常语境，
 	// 放进来等于让这道闸形同虚设 —— 宁可严一点，漏掉的那类反正也进观察窗口。
-	if (/加我|加微|加薇|私聊|私信|进群|扫码|看我(?:主页|简介|头像)|点击(?:链接|下方)/.test(text)) return true;
+	if (/加我|加微|加薇|私聊|私信|进群|扫码|看我(?:主页|简介|头像)|点击(?:链接|下方)/.test(text)) return 'soft';
 	// ⑥ 具体金额 —— 第二类定罪证据。
 	// 【为什么还要这一条】第一版闸只认引流出口，结果把第⑥层存在的理由一起拦掉了：
 	// 线上测试样本「来替我收米 一天9千」（同音变形、词表抓不到、没写任何联系方式）
@@ -16619,7 +16625,9 @@ function hasAdLlmKillEvidence(input) {
 	// 很少带具体金额】—— 2026-10-11 那起误封（#6005）的原文是
 	// 「能赚钱的确是写在字里的。太们们调教好AI，找出突破口」，一个数字都没有。
 	// 这是区分「招揽」与「讨论」最稳的一条特征：出口管引流意图，金额管收益承诺。
-	return AD_MONEY_AMOUNT_RE.test(text);
+	if (AD_MONEY_AMOUNT_RE.test(text)) return 'soft';
+	// 既没有出口也没有金额 —— 那是讨论不是广告。
+	return 'none';
 }
 
 async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
@@ -16634,30 +16642,38 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	// 观测：这一层到底有没有在起作用，必须能在 /adstats 上直接看到 ——
 	// 否则「调了但从没命中」与「压根没跑」在线上完全无法区分（上线首日就是这个状态）。
 	// 只在模型真给出 ad 结论时写（低频），也只有 /adstats 读它，热路径不为它多付 SQL。
-	// 【证据闸】LLM 单独定罪前必须确认有引流出口或具体金额 —— 理由见 hasAdLlmKillEvidence。
-	// 它排在计数之前：没有出口就不算「达线处置」，否则 /adstats 的达线数会把
-	// 被这道闸拦下的误判也算进去，看起来像第⑥层封了很多，实际一条都没处置。
-	const hasEvidence = hasAdLlmKillEvidence(input);
-	// 【计数只记「达线」本身】，不含证据闸的结果 —— 证据闸现在只影响「要不要进观察」，
+	// ===== 三档裁决（2026-10-11 修正）=====
+	//
+	// 【为什么必须分三档】乙方案第一版把达线一律改成 observe，而 observe 分支
+	// 【一条通知都不发】—— 只写 ad_user_screening、24 小时后过期。
+	// 那等于把第⑥层【静默废掉】：发现了可疑，却没有任何人知道，比误封还隐蔽。
+	// 主人的口径是「快照是自动判断的，完全不用我操作，只有误判才需要我操作」——
+	// 正确的形态是【能确定的自动封、不确定的明确告诉他】，而不是静默存库。
+	const evidence = classifyAdLLMEvidence(input);
+	// 【计数只记「达线」本身】，不含证据分级 —— 分级只决定「怎么处置」，
 	// 不影响「模型判了广告且够采信线」这个事实。混在一起会让 /adstats 的数字
 	// 既不代表达线也不代表处置，两边都对不上。
 	await bumpAdLLMOutcome(env, answer.confidence >= line);
 	const reason = 'AI 深度判定命中（置信度 ' + answer.confidence.toFixed(2) + '）：' + answer.reason;
 	let reasons = (current.reasons || []).concat([reason]);
-	// ===== 乙方案：第⑥层【不再单独定罪】（2026-10-11 主人拍板）=====
-	//
-	// 【为什么不封】这一层的产出是【判断】不是【证据】。判断是模型生成的，
-	// 没有任何规则能核验 —— #6005 那起误封就是「模型说它像广告」直接封了 12 个群，
-	// 而它给的理由「'调教好AI'可能隐含推广文案」纯属联想，指纹库里没有那个词。
-	// 封禁需要的是证据，判断只值得被当作【线索】。
-	//
-	// 【不浪费它的能力】它照跑、照判、照留痕：达线的照样进观察窗口、推快照等复核，
-	// 词表外的话术照样能被它发现。变的只有一件事 —— 它不再有权直接封人。
-	// 前三层（评分 / 指纹 / AI 语义）的定罪能力一个字没动。
 	if (answer.confidence >= line) {
-		reasons = reasons.concat([hasEvidence
-			? '（第⑥层达采信线且有引流出口 / 金额佐证，按现行口径【不单独封禁】—— 进观察窗口 + 推快照等人工复核）'
-			: '（第⑥层达采信线但正文与资料里既没有引流出口也没有具体金额 —— 按现行口径不封禁，进观察窗口供复核）']);
+		// ① 硬证据：私有群一次性邀请链接。主人定过「正常用户不会放私有群，
+		// 放的都是公开频道链接或 @用户名」—— 这是这一层唯一够格单独定罪的形态，
+		// 自动封，不必他复核。前三层封不动的词表外话术，靠这一条兜回来。
+		if (evidence === 'hard') {
+			reasons = reasons.concat(['（命中私有群一次性邀请链接 —— 主人已定调「正常用户不会放私有群」，按硬证据定罪）']);
+			return Object.assign({}, current, { verdict: 'ban', reasons });
+		}
+		// ② 软证据：有出口或金额，但没有硬证据。通知主人复核，不自动封。
+		// notifyOwner 被上面几处 observe 分支读到并推一条通知 —— 这一档
+		// 【绝不能静默】，那正是乙方案第一版的漏。
+		if (evidence === 'soft') {
+			reasons = reasons.concat(['（第⑥层达采信线且有引流出口 / 金额佐证，但没有私有群邀请链接这类硬证据 —— 按现行口径不自动封，已通知主人复核）']);
+			return Object.assign({}, current, { verdict: 'observe', notifyOwner: true, reasons });
+		}
+		// ③ 纯讨论嫌疑：既无出口也无金额。静默进观察窗口 —— 这一档本来就是
+		//「模型多想了」，专门去打扰主人只会淹没真正要他看的那批。
+		reasons = reasons.concat(['（第⑥层达采信线但正文与资料里既没有引流出口也没有具体金额 —— 按现行口径不封，静默进观察窗口）']);
 		return Object.assign({}, current, { verdict: 'observe', reasons });
 	}
 	if (answer.confidence >= AD_LLM_OBSERVE_CONF) {
@@ -18613,6 +18629,35 @@ const AD_LAYER_LABELS = {
 	contact: '名片广告查杀（显示名+手机号）'
 };
 
+// ===== 第⑥层【软证据档】的通知 =====
+//
+// 【为什么必须有它】乙方案第一版把达线一律改成 observe，而 observe 分支
+// 【一条通知都不发】—— 只写 ad_user_screening、24 小时后过期删除。
+// 那等于把第⑥层【静默废掉】：发现了可疑，却没有任何人知道，比误封还隐蔽。
+// 主人的口径是「快照是自动判断的，完全不用我操作，只有误判才需要我操作」，
+// 所以这一档必须【明确告诉他】，而不是让他去翻那个已经有几千条的 /pending 列表。
+//
+// 【与封禁通知的区别】标题不同、不带纠错按钮、正文写明「未封禁」——
+// 看到这条【不需要做任何事】，除非他判断确实是广告，那才 /ban。
+// 这是刻意的：如果每条都要他动手，这一层就从「自动治理」退化成「人工筛」。
+async function notifyAdLLMSuspect(env, userId, chatId, chatTitle, evaluation) {
+	if (!OWNER_IDS.length) return;
+	const lines = ['⚠️ <b>第⑥层发现可疑（未封禁）</b>', '用户：<code>' + escapeHtml(String(userId)) + '</code>'];
+	if (evaluation?.snapshot?.name) lines.push('名称：' + escapeHtml(evaluation.snapshot.name));
+	if (evaluation?.snapshot?.text) lines.push('消息：' + escapeHtml(String(evaluation.snapshot.text).slice(0, 200)));
+	lines.push('来源群组：' + escapeHtml(String(chatTitle || '')));
+	lines.push('得分：<b>' + Number(evaluation?.score || 0) + '</b> / 阈值 ' + Number(evaluation?.threshold || 0));
+	if (Array.isArray(evaluation?.reasons) && evaluation.reasons.length) {
+		lines.push('判定依据：');
+		for (const r of evaluation.reasons.slice(0, 8)) lines.push('· ' + escapeHtml(String(r)));
+	}
+	lines.push('');
+	lines.push('这一档【没有封禁】—— 按现行口径第⑥层只报线索；只有命中私有群邀请链接这类硬证据才会自动封。');
+	lines.push('确认是广告：<code>/ban ' + escapeHtml(String(userId)) + '</code>　　判定正常：什么都不用做，观察记录 24 小时后自动清除。');
+	// 只发第一主人：这是「需要你看一眼」而不是「出事了」，群发只会让每个主人都以为要处理。
+	await notifyAllOwners(lines.join('\n'), null, false);
+}
+
 // 渲染推送给第一主人的判定通知。序号是 /ignore 的唯一入口。
 function renderAdDetectionNotice(evaluation, context) {
 	const lines = [];
@@ -19546,6 +19591,9 @@ async function screenAdJoinMember(env, member, options = {}) {
 			console.log('[广告检测] 入群转入观察 user=' + userId + ' 来源=' + (options.source || 'join')
 				+ ' score=' + evaluation.score + '/' + config.scoreThreshold
 				+ ' 留存行为分=' + (evaluation.retainScore ?? 0));
+			if (evaluation?.notifyOwner) {
+				await notifyAdLLMSuspect(env, userId, chatId, String(options?.chatTitle || ''), evaluation);
+			}
 			return 'observed';
 		}
 		return 'clean';
@@ -19952,6 +20000,10 @@ async function detectAdOnMessage(message, env) {
 			}, config);
 			console.log('[广告检测] 闸一转入观察 user=' + userId + ' score=' + decision.score + '/' + config.scoreThreshold
 				+ ' 留存行为分=' + (decision.retainScore ?? 0));
+			// 软证据档：通知主人复核。observe 分支【本身不发任何通知】，不接这一行的话
+			if (decision?.notifyOwner) {
+				await notifyAdLLMSuspect(env, userId, chat.id, chat.title || '', decision);
+			}
 		}
 		return false;
 	}
@@ -20060,6 +20112,10 @@ async function detectAdOnMessage(message, env) {
 		}, config);
 		console.log('[广告检测] 闸二转入观察 user=' + userId + ' score=' + evaluation.score + '/' + config.scoreThreshold
 			+ ' 留存行为分=' + (evaluation.retainScore ?? 0));
+	// 软证据档：通知主人复核（observe 本身不发通知，详见 notifyAdLLMSuspect）。
+	if (evaluation?.notifyOwner) {
+		await notifyAdLLMSuspect(env, userId, chat.id, chat.title || '', evaluation);
+	}
 		// 【第2批 · 广告不进搜索库】转入观察 = 已经可疑但还没定罪，这条正文不该留在
 		// moderation_messages 里供 /search 检索（已封的那条天然不写 —— detectAdOnMessage
 		// 返回 true 时调用方直接收尾，根本走不到写缓存；缺口只有 observe 这一条）。
@@ -21262,6 +21318,11 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 					snapshot: evaluation.snapshot,
 					layer: evaluation.layer
 				}, config);
+				// 软证据档：cron 复查同样要通知 —— 这一轨扫的正是「改了 bio 的潜伏号」，
+				// 正是第⑥层最该报给主人的那类。不通知的话它会一直静默躺在观察表里。
+				if (evaluation?.notifyOwner) {
+					await notifyAdLLMSuspect(env, userId, targetChatId, '', evaluation);
+				}
 				kept.push(userId + '(' + evaluation.score + ')');
 			} else {
 				await deleteAdScreening(env, userId);

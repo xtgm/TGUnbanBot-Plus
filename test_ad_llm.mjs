@@ -988,7 +988,8 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 			cfg,
 			{ profile: { firstName: '流氓兔', lastName: '', username: 'ggyy001001', bio: '' },
 				text: '能赚钱的确是写在字里的。太们们调教好AI，找出突破口！！！🤒🤒🤒' });
-		assert('★ #6005 线上样本 → 不封，降级为观察', got.verdict === 'observe', JSON.stringify(got.reasons));
+		assert('★ #6005 线上样本 → 不封（无出口也无金额 = 纯讨论）', got.verdict === 'observe', JSON.stringify(got.reasons));
+		assert('★ #6005 不置 notifyOwner（纯讨论不该打扰主人）', got.notifyOwner === undefined, JSON.stringify(got.notifyOwner));
 		assert('★ 理由写明为什么没封（否则复核的人看不懂）',
 			got.reasons.some(r => r.includes('引流出口')), got.reasons.join(' / '));
 	}
@@ -998,13 +999,15 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
 		const withLink = await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 0, reasons: [] },
 			cfg, { profile: { firstName: 'x', bio: '日入五千 进群 t.me/+abcdefghij' }, text: '能赚钱的确写在字里' });
-		assert('★ 有引流出口（域名）→ 乙口径下仍不封，只进观察', withLink.verdict === 'observe', JSON.stringify(withLink.reasons));
+		assert('★ 私有群邀请链接 = 硬证据 → 照旧自动封', withLink.verdict === 'ban', JSON.stringify(withLink.reasons));
 		const withSolicit = await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 0, reasons: [] },
 			cfg, { profile: { firstName: 'x', bio: '' }, text: '想赚的私聊我，带你入门' });
-		assert('★ 有引流动作词（私聊）→ 乙口径下仍不封', withSolicit.verdict === 'observe', JSON.stringify(withSolicit.reasons));
+		assert('★ 只有动作词 = 软证据 → 不封，只进观察', withSolicit.verdict === 'observe', JSON.stringify(withSolicit.reasons));
+		assert('★ 软证据必须置 notifyOwner（否则这一档会静默，第⑥层等于被废掉）',
+			withSolicit.notifyOwner === true, JSON.stringify(withSolicit.notifyOwner));
 		const withHandle = await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 0, reasons: [] },
 			cfg, { profile: { firstName: 'x', bio: '详谈 @adseller888' }, text: '能赚钱的确写在字里' });
-		assert('★ 有引流 @handle → 乙口径下仍不封', withHandle.verdict === 'observe', JSON.stringify(withHandle.reasons));
+		assert('★ 只有 @handle = 软证据 → 不封', withHandle.verdict === 'observe', JSON.stringify(withHandle.reasons));
 	}
 	// ⑦l 出口闸不改变 0.6~0.85 那一档的行为（本来就只进观察）
 	{
@@ -1013,6 +1016,27 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		const got = await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 0, reasons: [] },
 			cfg, { profile: { firstName: 'x', bio: '' }, text: '正常讨论' });
 		assert('★ 置信度 0.7（低于采信线）→ 仍是观察，不受出口闸影响', got.verdict === 'observe', JSON.stringify(got));
+	}
+
+	// ⑦m 【软证据档的通知必须真的发出去】observe 分支本身【一条通知都不发】，
+	// 只写 ad_user_screening 然后 24 小时后过期 —— 乙方案第一版就是这么把第⑥层
+	// 静默废掉的：发现了可疑，却没有任何人知道。
+	// 上面 ⑦j 已经断言「软证据档会置 notifyOwner」，这里补上「置了之后真的发出去」。
+	{
+		const env = await makeReadyEnv();
+		calls.length = 0;
+		await W.notifyAdLLMSuspect(env, 771301, GROUP_ID, '测试治理群', {
+			verdict: 'observe', score: 0, threshold: 7,
+			reasons: ['AI 深度判定命中（置信度 0.95）：正文里有收益承诺和招揽动作'],
+			snapshot: { name: '软证据用户', text: '想赚的私聊我' }
+		});
+		const texts = calls.map((c) => String(c.body?.text || ''));
+		assert('★ 通知真的发出去了', texts.some((t) => t.includes('第⑥层发现可疑')), texts.join(' | ').slice(0, 300));
+		assert('★ 通知写明「未封禁」（否则他会以为出事了）', texts.some((t) => t.includes('未封禁')));
+		assert('★ 只发第一主人（这是「看一眼」不是「出事了」）',
+			calls.some((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(OWNER_ID)),
+			JSON.stringify(calls.map((c) => [c.method, String(c.body?.chat_id)])));
+		assert('★ 通知里带上判定依据', texts.some((t) => t.includes('判定依据')));
 	}
 
 	// ⑦c 分池：消息池打满后，入群池仍有额度 —— 三条轨不再互相挤占
