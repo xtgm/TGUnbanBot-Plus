@@ -9484,6 +9484,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/ignore 序号　判错回滚：解黑 + 全群解封 + 删掉学到的指纹和样本（支持 3 5 7 与 3-8）。封禁回执上也有两个按钮：↩️误判=回滚全部、🔓解封=只放人不动判据',
 			'/rescreen [N]　重新筛查观察窗口里的可疑用户，默认 10 人',
 			'/adstats　检测状态总览：指纹、样本向量、观察窗口、入群检查流水与本群演练状态',
+			'/vision　手动触发一轮视觉识别（头像 + 正文图），出问题时不必等 cron 那两轮',
 			'',
 			'<b>━━ 指纹与样本维护（仅私聊）━━</b>',
 			'/words [关键词] [页码]　翻看 / 搜索指纹库，按命中次数倒序，按钮翻页',
@@ -14640,7 +14641,13 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 	}
 
 	const name = String(payload?.name ?? '').trim();
-	if (name && (AD_SYMMETRIC_EMOJI_RE.test(name) || AD_NUMERIC_PREFIX_RE.test(name))) push('keyword', name, 1);
+	// 【2026-10-11 放宽：显示名一律整名入库】原先只在「首尾对称 emoji」或「数字前缀」
+	// 两种形态下才学，而线上广告号的显示名大量是【模板化的竖线标签串】
+	//（「云海联盟|新闻.投稿.合作|入口点头像」），三样一样都不占 —— 于是一个候选都抽不出来。
+	// 这是「演练跑一天学了个寂寞」的机制根因：学习的输入依赖词表与形态，
+	// 而词表与形态恰恰抓不住新话术，于是自动学习永远学不到新东西。
+	// 整名入库的误伤面极小 —— 匹配是归一化后【精确相等】，同名同字才命中。
+	if (name && name.length >= 4) push('keyword', name, 1);
 
 	// 正文是斜杠命令时整体剔除，不参与任何抽取（短语截取、域名扫描都吃 combined）。
 	// 与下面「整段正文兜底」那道过滤同源：命令文本是操作指令而非广告内容，
@@ -14652,6 +14659,26 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 	// 此前只截交易动词周边，于是「操逼赚钱，招探花9000一单，提供设备」这种一个交易动词都不命中的
 	// 正文抽不出任何候选，learnAdFingerprints 直接返回 no_candidate —— 线上表现为「指纹 +0」，
 	// 连 /spam 人工提交也救不回来，同款文案会无限次重放。
+	// 【2026-10-11 新增：正文整段兜底】下面的短语路径【只在词表命中处】截 24 字，
+	// 词表零命中时一条候选都抽不出 —— 而新话术第一次出现时词表本来就不命中。
+	// 学习不该等人工把新词喂进表：整段兜底让【第一次出现就学进去，第二次同款直接命中】。
+	// 权重 0.5 与短语路径同档：整段归一化后精确相等才命中，只计分不定罪 ——
+	// 配合多特征门槛，就算学进一段正常人的普通发言，也不会因此封人。
+	if (textForLearning && String(textForLearning).trim().length >= 6) {
+		push('keyword', String(textForLearning).trim(), 0.5);
+	}
+
+	// 【2026-10-11 恢复：@提及的引流 handle】广告把出口写成 @xxx，这是迁移价值最高的复用键
+	// —— 同一个组织的批量号互相艾特同一个 handle。
+	// 【为什么这次可以恢复】#143 的根因是【学成 username 类型 + 权重 1】：广告号艾特主人
+	// → 主人的 handle 变成指纹 → 此后【任何人艾特主人都被封】。现在四道改法逐条对上：
+	//   类型走 keyword 不走 username、权重 0.5（只计分不定罪）、权限人白名单在 push 里已拦、
+	//   配额独立 —— 就算误学一个正常人的 handle，也要配合其他特征才封，不会重演 #143。
+	const mentionedHandles = String(textForLearning || '').match(/@[A-Za-z0-9_]{4,}/g) || [];
+	for (const handle of [...new Set(mentionedHandles)]) {
+		push('keyword', handle, 0.5);
+	}
+
 	for (const word of [
 		...countAdKeywordHits(combined, AD_TRADE_VERBS),
 		...countAdKeywordHits(combined, AD_BUSINESS_KEYWORDS)
@@ -20265,6 +20292,7 @@ async function handleAdDetectionCommands(message, env, ctx) {
 			case 'addsample': await handleAdAddSampleCommand(env, chatId, arg); break;
 			case 'clearsamples': await handleAdClearSamplesCommand(env, chatId, ownerId, arg); break;
 			case 'adstats': await handleAdStatsCommand(env, chatId); break;
+			case 'vision': await handleAdVisionCommand(env, chatId); break;
 			case 'whitelist': await handleAdWhitelistCommand(env, chatId, ownerId, arg); break;
 			case 'rescreen': await handleAdRescreenCommand(env, chatId, arg); break;
 			case 'warmup': await handleAdWarmupCommand(env, chatId); break;
@@ -20994,6 +21022,40 @@ async function handleAdClearSamplesCommand(env, chatId, ownerId, arg) {
 }
 
 // /adstats：一屏看全检测状态 —— 配置、指纹库、样本库、观察窗口、待确认快照、域名白名单。
+// ===== 手动触发视觉识别（2026-10-11）=====
+//
+// 【为什么要有它】头像与正文图的视觉识别只在 cron 里跑（UTC 3:17 / 15:17 两轮），
+// 出问题时要等下一轮才能拿到日志。2026-10-11 线上【全线失败】—— ad_images 表里
+// 「广告图 0、待识别 215」，一张都没判成，而 L1 同款指纹【依赖 L2 的结论】
+//（复用定罪 ≥5 次才封），于是 L2 挂掉等于整条图片通道瘫痪：色情图片广告一张都杀不掉，
+// 却跟文本通道的修复完全无关，不手动触发就得干等大半天才能定位。
+//
+// 【只给第一主人私聊用】这个分发入口本身就是第一主人的私聊命令（与 /adstats 同一批），
+// 群里发不出去 —— 它会真的调 moondream、真的花 Neurons，不能让群里任何人随手点。
+async function handleAdVisionCommand(env, chatId) {
+	const now = Math.floor(Date.now() / 1000);
+	const avatar = await runAdAvatarVision(env);
+	const image = await runAdImageVision(env, { batchSize: AD_IMAGE_VISION_BATCH });
+	const brk = await readVisionBreakState(env, now);
+	const line = (label, s) => '<b>' + label + '</b>　队列 ' + Number(s.queued || 0)
+		+ '　完成 ' + Number(s.done || 0)
+		+ '　广告 <b>' + Number(s.ad || 0) + '</b>'
+		+ '　干净 ' + Number(s.clean || 0)
+		+ '　失败 <b>' + Number(s.failed || 0) + '</b>'
+		+ (s.skipped ? '　⏸️ 跳过：' + escapeHtml(String(s.skipped)) : '');
+	const lines = [
+		'<b>🖼 视觉识别 · 手动触发一轮</b>',
+		'',
+		line('头像', avatar),
+		line('正文图', image),
+		describeVisionBreak(brk),
+		'',
+		'失败原因去 Workers 日志搜「识别失败 stage=」—— stage 后面那个词直接指明挂在哪一步：',
+		'getFile = 拿不到文件路径　download = 下载失败　encode = 编码　sniff = 不是位图　ai.run = moondream 调用本身失败',
+	];
+	await sendTelegramMessage(chatId, lines.filter(Boolean).join('\n'));
+}
+
 async function handleAdStatsCommand(env, chatId) {
 	const config = loadAdDetectionConfig(env);
 	// 顺带补一批样本向量。此前 topUpAdSampleEmbeddings 的唯一调用点在 checkAdAiSimilarity 内部，
