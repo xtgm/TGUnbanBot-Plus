@@ -16638,18 +16638,27 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	// 它排在计数之前：没有出口就不算「达线处置」，否则 /adstats 的达线数会把
 	// 被这道闸拦下的误判也算进去，看起来像第⑥层封了很多，实际一条都没处置。
 	const hasEvidence = hasAdLlmKillEvidence(input);
-	const reachedLine = answer.confidence >= line && hasEvidence;
-	await bumpAdLLMOutcome(env, reachedLine);
+	// 【计数只记「达线」本身】，不含证据闸的结果 —— 证据闸现在只影响「要不要进观察」，
+	// 不影响「模型判了广告且够采信线」这个事实。混在一起会让 /adstats 的数字
+	// 既不代表达线也不代表处置，两边都对不上。
+	await bumpAdLLMOutcome(env, answer.confidence >= line);
 	const reason = 'AI 深度判定命中（置信度 ' + answer.confidence.toFixed(2) + '）：' + answer.reason;
 	let reasons = (current.reasons || []).concat([reason]);
-	if (answer.confidence >= line && !hasEvidence) {
-		// 模型判了广告、也够采信线，但正文与资料里【一个引流出口都没有】——
-		// 那是讨论不是广告。降级进观察窗口，理由必须写清楚为什么没封。
-		reasons = reasons.concat(['（已拦下：AI 判为广告且够采信线，但正文与资料里既没有引流出口也没有具体金额 —— 没有出口也没有金额的「赚钱」话术只是讨论，降级为观察，不封禁）']);
+	// ===== 乙方案：第⑥层【不再单独定罪】（2026-10-11 主人拍板）=====
+	//
+	// 【为什么不封】这一层的产出是【判断】不是【证据】。判断是模型生成的，
+	// 没有任何规则能核验 —— #6005 那起误封就是「模型说它像广告」直接封了 12 个群，
+	// 而它给的理由「'调教好AI'可能隐含推广文案」纯属联想，指纹库里没有那个词。
+	// 封禁需要的是证据，判断只值得被当作【线索】。
+	//
+	// 【不浪费它的能力】它照跑、照判、照留痕：达线的照样进观察窗口、推快照等复核，
+	// 词表外的话术照样能被它发现。变的只有一件事 —— 它不再有权直接封人。
+	// 前三层（评分 / 指纹 / AI 语义）的定罪能力一个字没动。
+	if (answer.confidence >= line) {
+		reasons = reasons.concat([hasEvidence
+			? '（第⑥层达采信线且有引流出口 / 金额佐证，按现行口径【不单独封禁】—— 进观察窗口 + 推快照等人工复核）'
+			: '（第⑥层达采信线但正文与资料里既没有引流出口也没有具体金额 —— 按现行口径不封禁，进观察窗口供复核）']);
 		return Object.assign({}, current, { verdict: 'observe', reasons });
-	}
-	if (reachedLine) {
-		return Object.assign({}, current, { verdict: 'ban', reasons });
 	}
 	if (answer.confidence >= AD_LLM_OBSERVE_CONF) {
 		// 低于采信线只提观察：模型输出「是广告」却只有 0.5 把握是常态，
@@ -20956,7 +20965,7 @@ async function handleAdStatsCommand(env, chatId) {
 				? '⏸️ 已关闭（AD_LLM_DAILY=0），前五层照跑'
 				: '✅ 已启用　每日 <b>' + config.llmDaily + '</b> 次　采信线 <b>' + config.llmConf + '</b>　模型 ' + escapeHtml(config.llmModel))),
 		'　↳ 今日调用 <b>' + llmStat.used + '</b>/' + config.llmDaily
-			+ '　模型判为广告 <b>' + llmStat.hits + '</b> 次　其中达线处置 <b>' + llmStat.bans + '</b> 次'
+			+ '　模型判为广告 <b>' + llmStat.hits + '</b> 次　其中达线 <b>' + llmStat.bans + '</b> 次（按现行口径只进观察窗口，不直接封禁）'
 			+ '　解析失败 <b>' + llmStat.parseFail + '</b> 次'
 			+ (llmStat.used > 0 && llmStat.hits === 0 && llmStat.parseFail === 0
 				? '　⚠️ 调用有、0 命中且 0 解析失败 —— 模型确实判了「不是广告」，问题在送进去的载荷内容，不在输出格式'

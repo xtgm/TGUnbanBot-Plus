@@ -444,9 +444,9 @@ section('[6] 接线：入群线 / 消息线 / 复查线都真的调用了第四�
 			chatId: GROUP_ID, chatTitle: '测试群', messageId: null,
 			skipBlacklistCheck: true, source: 'new_chat_members'
 		});
-		const row = env.DB.query('SELECT reason FROM blacklist WHERE id = ?', '771001');
-		assert('入群线：前三层不够分 + 模型达线 → 封禁入册',
-			row.length === 1, JSON.stringify({ result, rows: row }));
+		const scr1 = env.DB.query('SELECT user_id FROM ad_user_screening WHERE user_id = ?', '771001');
+		assert('入群线：前三层不够分 + 模型达线 → 进观察窗口（乙口径：不封）',
+			scr1.length === 1, JSON.stringify(scr1));
 		const checks = env.DB.query('SELECT reasons, verdict FROM ad_join_checks WHERE user_id = ?', '771001');
 		assert('入群线：流水里能看到模型理由',
 			checks.length > 0 && String(checks[0].reasons).includes('AI 深度判定命中'),
@@ -461,9 +461,9 @@ section('[6] 接线：入群线 / 消息线 / 复查线都真的调用了第四�
 			id: body?.chat_id, first_name: '小明', username: '', bio: ''
 		} } }) });
 		await send(groupMessage({ id: 771002, first_name: '小明' }, '来替我收米 一天9千'), env);
-		const row = env.DB.query('SELECT reason FROM blacklist WHERE id = ?', '771002');
-		assert('消息线：样本外话术靠第四路定罪（这正是线上 0 分漏掉的那类）',
-			row.length === 1, JSON.stringify(row));
+		const scr2 = env.DB.query('SELECT user_id FROM ad_user_screening WHERE user_id = ?', '771002');
+		assert('消息线：样本外话术靠第四路发现（乙口径：进观察窗口不封）',
+			scr2.length === 1, JSON.stringify(scr2));
 		assert('消息线：AI 确实被调到了', env.AI.llmCalls >= 1, String(env.AI.llmCalls));
 	}
 
@@ -480,9 +480,12 @@ section('[6] 接线：入群线 / 消息线 / 复查线都真的调用了第四�
 			user_id: '771003', chat_id: GROUP_ID, first_name: '潜伏号', last_name: '', username: '',
 			profile_hash: '', last_verdict: '', bio_checked_at: 0
 		}, { config: W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' }) });
-		const row = env.DB.query('SELECT reason FROM blacklist WHERE id = ?', '771003');
-		assert('复查线：不发言的人也走第四路并定罪',
-			row.length === 1, JSON.stringify({ r, rows: row }));
+		// 【cron 复查轨不写观察记录】那是既有设计：它扫的正是不发言的人，
+		// 给他们写观察记录只会让 ad_user_screening 每天灌进 300 条、把真正需要盯的
+		// 新入群用户挤掉。所以这一轨的 observe 结论落在 last_verdict 上。
+		const lastVerdict771003 = env.DB.query('SELECT last_verdict FROM ad_group_members WHERE user_id = ?', '771003')[0];
+		assert('复查线：不发言的人也走第四路，结论记为 observe（乙口径：不封）',
+			String(lastVerdict771003?.last_verdict) === 'observe', JSON.stringify(lastVerdict771003));
 	}
 	// 未绑 AI 时三条线都必须照样能跑（降级不炸）
 	{
@@ -685,8 +688,8 @@ section('[9] 闸一可疑但不够封时同步调第⑥层');
 		await prime(env, 771201, 60);   // 60 秒前查过：原档位 7200 与新冷却 600 都没到期 → 闸二不进
 		await send(groupMessage({ id: 771201, first_name: '闸一可疑用户甲' }, SUSPECT_TEXT), env);
 		assert('★ 冷却中且闸二不进 → 闸一这一层调到了第⑥层', ai.llmCalls >= 1, 'llmCalls=' + ai.llmCalls);
-		const row = env.DB.query('SELECT reason FROM blacklist WHERE id = ?', '771201');
-		assert('★ 模型达采信线 → 闸一就地封禁（不用等闸二）', row.length === 1, JSON.stringify(row));
+		const scr4 = env.DB.query('SELECT user_id FROM ad_user_screening WHERE user_id = ?', '771201');
+		assert('★ 模型达采信线 → 闸一就地进观察窗口（乙口径：不再就地封禁）', scr4.length === 1, JSON.stringify(scr4));
 	}
 	// ② 0 正分 → 一个调用都不发（稳态保护，占绝大多数的普通聊天）
 	{
@@ -833,7 +836,7 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		const text = lastSent();
 		assert('/adstats 显示今日调用数', text.includes('今日调用'), text.slice(0, 600));
 		assert('/adstats 显示「模型判为广告」', text.includes('模型判为广告'), text.slice(0, 600));
-		assert('/adstats 显示「其中达线处置」', text.includes('其中达线处置'), text.slice(0, 600));
+		assert('/adstats 显示「其中达线」并写明不直接封禁', text.includes('其中达线') && text.includes('不直接封禁'), text.slice(0, 600));
 	}
 	// ⑦ 调用 >0 且 0 命中时给出提示，且必须与「解析失败」区分开
 	{
@@ -995,13 +998,13 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
 		const withLink = await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 0, reasons: [] },
 			cfg, { profile: { firstName: 'x', bio: '日入五千 进群 t.me/+abcdefghij' }, text: '能赚钱的确写在字里' });
-		assert('★ 有引流出口（域名）→ 照旧封', withLink.verdict === 'ban', JSON.stringify(withLink.reasons));
+		assert('★ 有引流出口（域名）→ 乙口径下仍不封，只进观察', withLink.verdict === 'observe', JSON.stringify(withLink.reasons));
 		const withSolicit = await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 0, reasons: [] },
 			cfg, { profile: { firstName: 'x', bio: '' }, text: '想赚的私聊我，带你入门' });
-		assert('★ 有引流动作词（私聊）→ 照旧封', withSolicit.verdict === 'ban', JSON.stringify(withSolicit.reasons));
+		assert('★ 有引流动作词（私聊）→ 乙口径下仍不封', withSolicit.verdict === 'observe', JSON.stringify(withSolicit.reasons));
 		const withHandle = await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 0, reasons: [] },
 			cfg, { profile: { firstName: 'x', bio: '详谈 @adseller888' }, text: '能赚钱的确写在字里' });
-		assert('★ 有引流 @handle → 照旧封', withHandle.verdict === 'ban', JSON.stringify(withHandle.reasons));
+		assert('★ 有引流 @handle → 乙口径下仍不封', withHandle.verdict === 'observe', JSON.stringify(withHandle.reasons));
 	}
 	// ⑦l 出口闸不改变 0.6~0.85 那一档的行为（本来就只进观察）
 	{
