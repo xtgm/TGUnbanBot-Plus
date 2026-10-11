@@ -854,13 +854,48 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		assert('★ 解析失败 → 提示这些调用白烧额度',
 			text.includes('白烧额度'), text.slice(0, 700));
 	}
+	// ⑦d 【2026-10-11 线上实锤】Workers AI 对 chat 模型返回的是 OpenAI 兼容结构，
+	// 正文在 choices[0].message.content；旧写法只认 response / result，两个都取不到，
+	// 于是兜底到整个对象、String 化成 "[object Object]" —— 第⑥层【从上线至今一次都没
+	// 真正读到过模型的回答】，242 次调用 0 命中就是这么来的。
+	{
+		const openaiShape = (json) => ({
+			id: 'cmpl-1', object: 'chat.completion', created: 1, model: 'qwen3-30b-a3b-fp8',
+			choices: [{ index: 0, message: { role: 'assistant', content: json }, finish_reason: 'stop' }],
+			usage: { prompt_tokens: 10, completion_tokens: 20 }
+		});
+		assert('★ OpenAI 兼容结构 → 正文从 choices[0].message.content 取',
+			W.extractAdLLMResponseText(openaiShape('正文甲')) === '正文甲',
+			JSON.stringify(W.extractAdLLMResponseText(openaiShape('正文甲'))));
+		assert('★ 旧式 response 字段仍兼容（别因为修这里砸掉别的模型）',
+			W.extractAdLLMResponseText({ response: '正文乙' }) === '正文乙');
+		assert('★ result 字段仍兼容',
+			W.extractAdLLMResponseText({ result: '正文丙' }) === '正文丙');
+		assert('★ 认不出的结构返回空串，不返回 [object Object]',
+			W.extractAdLLMResponseText({ foo: 1 }) === '',
+			W.extractAdLLMResponseText({ foo: 1 }));
+		assert('★ null / undefined 返回空串',
+			W.extractAdLLMResponseText(null) === '' && W.extractAdLLMResponseText(undefined) === '');
+
+		const env = await makeReadyEnv({ AI: makeAI({ onLlm: () => openaiShape(adAnswer(0.97)) }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		const got = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'x' }, text: '开放结构样本子丑' });
+		assert('★ 走真实链路（OpenAI 结构）也能拿到答案并判为广告',
+			got !== null && got.ad === true, JSON.stringify(got));
+	}
+	// ⑦e 返回结构完全不认识时，日志必须把结构本身打出来（否则又是一次 [object Object] 排查）
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ onLlm: () => ({ totally: 'unknown shape' }) }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		const got = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'x' }, text: '未知结构样本寅卯' });
+		assert('★ 认不出的返回 → 判定为未命中（不瞎猜）', got === null, JSON.stringify(got));
+	}
 	// ⑦c 分池：消息池打满后，入群池仍有额度 —— 三条轨不再互相挤占
 	{
 		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.97) }) });
 		const cfg = W.loadAdDetectionConfig({
 			AD_LLM_DAILY: '100', AD_LLM_DAILY_MESSAGE: '1', AD_LLM_DAILY_JOIN: '5', AD_LLM_DAILY_CRON: '0'
 		});
-		// 消息池上限 1：第一次进得去，第二次被本池拦下（总池 100 还远没满）
 		const r1 = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'x' }, text: '分池样本壬' }, { pool: 'message' });
 		const r2 = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'y' }, text: '分池样本癸' }, { pool: 'message' });
 		const r3 = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'z' }, text: '分池样本子' }, { pool: 'join' });

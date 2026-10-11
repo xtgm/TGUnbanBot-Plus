@@ -6998,6 +6998,59 @@ function looksLikePersonName(name) {
 	// 西文人名：1~3 个词，每词首字母大写
 	return /^[A-Z][a-z'’-]+(?:\s[A-Z][a-z'’-]+){0,2}$/.test(value);
 }
+
+// ===== 名片广告专用定罪通道（2026-10-11）=====
+//
+// 【补的是哪个洞】两条线上名片广告离线实测（群 -1001883549197）：
+//   Rachel「新澳 🔥 六合彩内幕发布群」→ 六合彩 / 内幕 / 发布群四张词表【零命中】，净 0 分；
+//   Amani「🔥 代开增值税发票 另高价收发票粉 🔥」→ 发票 / 增值税 / 代开 / 票粉零命中，
+//   只有「高价收」命中交易动词 → 掉进「单类词不计分」，净 3 分（首尾对称 emoji）。
+// 两条都被别的机器人删掉了，本项目一条都没反应。链路本身是通的 —— 显示名早在
+// getAdDetectionBodyText 与闸一的 text || contactName 里接好了，缺的是【定罪形态】：
+// 名片走的是普通正文那套「两类同现才 +6」，而名片根本没有正文，永远凑不齐第二类。
+//
+// 【为什么名片可以比正文严一档】正文里的词表命中可能只是聊天内容（「帮我开张发票」），
+// 而名片是【本人主动分发的联系方式】：把这句话写在自己名片上、配着手机号发给所有人。
+// 同一个词在正文里是谈资，在名片上是招揽 —— 这是结构差异，不是词表差异，
+// 所以这里【不要求两类同现】，命中任一类即成立。
+//
+// 【三重门槛，缺一不封】
+//   A 必须是 message.contact 且带手机号 —— 证明这是张名片，不是普通文本
+//   B 显示名【不像人名】（looksLikePersonName 反向白名单）—— 张三 / 妈妈 / 便利店店主
+//      这类正常名片在第一步就被摘出去，是这块的主力挡板
+//   C 显示名命中业务词或交易动词 —— 「财务小李」发的名片不含招揽词，不命中
+//
+// 【手机号不参与计分】主人 2026-10-11 原话：「定罪不看手机号为特征，因为正常用户
+// 如果也会发手机号名片就会被误杀，那么定位是只看手机号+广告，所以广告指纹特征是
+// 关键定位，而不是手机号是定位。」号码在这里只证明「这是张名片」，
+// 真正的复用键在下面的指纹学习里：这个号有案底，再出现才杀。
+function applyContactCardVerdict(evaluation, message) {
+	const contact = message?.contact;
+	if (!contact) return evaluation;
+	// 手机号必须存在：没有号码的 contact（罕见但可能）不走这条通道，
+	// 以免把「只发了个名字」的普通消息误当成名片处理。
+	if (!String(contact.phone_number || '').trim()) return evaluation;
+	const displayName = [contact.first_name, contact.last_name].filter(Boolean).join(' ').trim();
+	if (!displayName || looksLikePersonName(displayName)) return evaluation;
+	const hits = [
+		...countAdKeywordHits(displayName, AD_TRADE_VERBS),
+		...countAdKeywordHits(displayName, AD_BUSINESS_KEYWORDS)
+	];
+	if (!hits.length) return evaluation;
+	// 已被前面某层定罪的不再改写结论 —— 保留第一个定罪者的 layer 与理由，
+	// 否则 /pending 复核时会看到「明明是指纹封的，却显示成名片封的」。
+	if (String(evaluation?.verdict) === 'ban') return evaluation;
+	return Object.assign({}, evaluation, {
+		verdict: 'ban',
+		layer: 'contact',
+		reasons: (evaluation?.reasons || []).concat([
+			'名片广告定罪：显示名「' + displayName.slice(0, 40) + '」不像人名且命中 '
+				+ hits.slice(0, 3).join('/')
+				+ '（名片是本人主动分发的联系方式，同词在正文里是谈资、在名片上是招揽）'
+		])
+	});
+}
+
 function getInlineButtonPayloadText(message) {
 	const parts = [];
 	for (const row of message?.reply_markup?.inline_keyboard || []) {
@@ -16227,6 +16280,41 @@ function buildAdLLMPayload(input) {
 
 // 从模型回答里抠 JSON。解析不出来一律按「未命中」处理 —— 宁可漏判也不能靠猜定罪。
 // 结构与 parseAvatarVisionAnswer 同构（同是「模型吐 JSON、抠不出就当没判」）。
+// 从 Workers AI 的返回里取出模型的文本回答。
+//
+// 【治的是什么】2026-10-11 线上日志实锤：`原文前200字: [object Object]` ——
+// 旧代码只认 `aiResult.response ?? aiResult.result`，而 Workers AI 对【chat 模型】
+// 返回的是 OpenAI 兼容结构 `{ id, object, created, model, choices[0].message.content, usage }`，
+// 两个字段名都不在，于是兜底到整个对象、String 化成 `[object Object]`。
+// 结果是第⑥层【从上线到今天一次都没真正读到过模型的回答】——
+// 242 次调用、0 次判为广告，不是模型保守，是答案根本没被取出来。
+//
+// 【为什么要留旧字段名】Workers AI 对不同模型返回的外壳并不统一：
+// 部分视觉 / 嵌入模型走 `{ result: ... }`，早期版本与部分任务走 `{ response: ... }`。
+// 一律按「能拿到字符串就用」的顺序兜，宁可多认几个字段，
+// 也不要因为换了个模型又静默回到「读不出来但不报错」的老状态。
+//
+// 【顺序有讲究】choices 必须排最前 —— 它是 chat 模型唯一权威的正文位置。
+// 排在 response 之后的话，某些返回同时带这两个字段时会取到外壳而不是正文。
+function extractAdLLMResponseText(aiResult) {
+	if (!aiResult) return '';
+	// ① OpenAI 兼容结构（chat 模型的默认返回）
+	const content = aiResult?.choices?.[0]?.message?.content;
+	if (typeof content === 'string' && content.trim()) return content;
+	// ② 旧式单字段结构与嵌套变体
+	for (const key of ['response', 'result', 'output', 'answer']) {
+		const value = aiResult?.[key];
+		if (typeof value === 'string' && value.trim()) return value;
+		if (value && typeof value === 'object') {
+			const nested = value?.response ?? value?.content ?? value?.text;
+			if (typeof nested === 'string' && nested.trim()) return nested;
+		}
+	}
+	// ③ 整个返回本身就是一段纯文本
+	if (typeof aiResult === 'string' && aiResult.trim()) return aiResult;
+	return '';
+}
+
 function parseAdLLMAnswer(raw) {
 	const text = String(raw || '').trim();
 	if (!text) return null;
@@ -16349,8 +16437,9 @@ async function judgeAdByLLM(env, config, input, options) {
 	if (poolUsed >= poolDaily) return null;
 	let answer = null;
 	let rawText = '';
+	let aiResult = null;
 	try {
-		const aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
+		aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
 			messages: [
 				{ role: 'system', content: AD_LLM_PROMPT },
 				{ role: 'user', content: payload }
@@ -16362,7 +16451,9 @@ async function judgeAdByLLM(env, config, input, options) {
 			max_tokens: 600,
 			temperature: 0.1
 		});
-		rawText = String(aiResult?.response ?? aiResult?.result ?? aiResult ?? '');
+		// Workers AI 对 chat 模型返回 OpenAI 兼容结构，正文在 choices[0].message.content，
+		// 旧写法 `aiResult?.response ?? aiResult?.result` 两个字段都取不到 —— 详见 extractAdLLMResponseText。
+		rawText = extractAdLLMResponseText(aiResult);
 		answer = parseAdLLMAnswer(rawText);
 	} catch (error) {
 		console.error('[广告检测·深度判定] 调用失败:', error);
@@ -16379,7 +16470,12 @@ async function judgeAdByLLM(env, config, input, options) {
 		// 线上真实状态正是「221 调用、0 命中、22 解析失败」，其中那 22 次此前无从查证。
 		console.error('[广告检测·深度判定] 模型输出未能解析 pool=' + pool
 			+ ' model=' + String(config?.llmModel || AD_LLM_MODEL)
-			+ ' 原文前200字: ' + rawText.slice(0, 200));
+			// rawText 为空 = extractAdLLMResponseText 没认出这个返回外壳。
+			// 那时必须把整个返回结构打出来 —— 否则又是一次「只有 [object Object]」的排查，
+			// 2026-10-11 那轮就卡在这里：日志确实打了，但打的正是那个没用的对象字符串。
+			+ (rawText
+				? ' 原文前200字: ' + rawText.slice(0, 200)
+				: ' 取不到文本字段，返回结构前300字: ' + String(JSON.stringify(aiResult)).slice(0, 300)));
 		await bumpAdLLMParseFail(env);
 	}
 	return answer;
@@ -18247,7 +18343,8 @@ async function evaluateAdSuspect(env, input, options = {}) {
 
 const AD_LAYER_LABELS = {
 	score: '结构化评分', fingerprint: '指纹库', ai: 'AI 语义',
-	card: '资料卡查杀（用户名+简介）', body: '正文查杀（简介+正文）'
+	card: '资料卡查杀（用户名+简介）', body: '正文查杀（简介+正文）',
+	contact: '名片广告查杀（显示名+手机号）'
 };
 
 // 渲染推送给第一主人的判定通知。序号是 /ignore 的唯一入口。
@@ -19456,6 +19553,14 @@ async function detectAdOnMessage(message, env) {
 	// 有 id 时也只是查 ad_badges（D1），仍然零 Telegram 请求，
 	// 所以「闸一零 getChat」那条不变量原样保住。
 	cheap = await applyBadgeToEvaluation(env, cheap, cheapProfile);
+
+	// ===== 名片广告专用定罪（2026-10-11）=====
+	// 与头像、会员标同一层位：message.contact 在 update 里现成带着，
+	// 零 Telegram 请求、零 D1 查询 —— 「闸一零 getChat」的不变量原样保住。
+	// 纯函数，非名片消息一次判定都不做（contact 为空直接原样返回）。
+	// 排在 applyBadgeToEvaluation 之后：名片定罪会覆盖 layer，放在前面会被会员标的
+	// reasons 顺序弄乱（/pending 复核要能一眼看出是哪一层定的罪）。
+	cheap = applyContactCardVerdict(cheap, message);
 
 	// ===== 可疑信号把 bio 冷却期压到 10 分钟（见 AD_SUSPECT_BIO_COOLDOWN_SECONDS）=====
 	// 闸一真拿到正分判据 → 不再让入群那次「bio 还是空的」查询把接下来两小时都挡在深判外；
