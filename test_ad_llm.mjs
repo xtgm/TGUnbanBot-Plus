@@ -890,12 +890,49 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		const got = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'x' }, text: '未知结构样本寅卯' });
 		assert('★ 认不出的返回 → 判定为未命中（不瞎猜）', got === null, JSON.stringify(got));
 	}
+	// ⑦f 熔断：连着取不到回答就必须停掉第⑥层 —— 2026-10-11 线上那轮就是
+	// 276 次调用全部取错字段、一次次白烧 Neurons，却没有任何机制发现链路坏了。
+	// 分池、每日上限、同载荷去重，没有一道闸挡得住「调用成功但取值取错」。
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ onLlm: () => ({ nope: 1 }) }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '500', AD_LLM_DAILY_MESSAGE: '500' });
+		for (let i = 0; i < 20; i++) {
+			await W.judgeAdByLLM(env, cfg, { profile: { bio: 'x' }, text: '熔断样本' + i });
+		}
+		const before = env.AI.llmCalls;
+		const after = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'x' }, text: '熔断样本末尾' });
+		assert('★ 连续 20 次取不到回答 → 第 21 次不再调用模型（省额度的关键）',
+			after === null && env.AI.llmCalls === before,
+			'调用前=' + before + ' 调用后=' + env.AI.llmCalls);
+		const stats = await W.readAdLLMOutcome(env, Math.floor(Date.now() / 1000));
+		assert('★ 熔断状态能被 /adstats 读到', stats.broken === true, JSON.stringify(stats));
+		assert('★ 上次返回字段名被记下（不含内容，隐私面）',
+			typeof stats.lastShape === 'string' && stats.lastShape.includes('nope'), stats.lastShape);
+	}
+	// ⑦g 成功一次就清零连续失败 —— 否则一天里夹着的零星失败（模型偶尔不守
+	// JSON 格式、thinking 偶尔过长）会累计到熔断线，把一条正常的第⑥层误关掉。
+	{
+		let n = 0;
+		const env = await makeReadyEnv({ AI: makeAI({ onLlm: () => {
+			n += 1;
+			return n % 2 ? { nope: 1 } : { response: adAnswer(0.9) };
+		} }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '500', AD_LLM_DAILY_MESSAGE: '500' });
+		for (let i = 0; i < 40; i++) {
+			await W.judgeAdByLLM(env, cfg, { profile: { bio: 'x' }, text: '清零样本' + i });
+		}
+		const stats = await W.readAdLLMOutcome(env, Math.floor(Date.now() / 1000));
+		assert('★ 成败交替 → 连续失败被清零、不熔断',
+			stats.broken === false && stats.consecFail === 0, JSON.stringify(stats));
+	}
+
 	// ⑦c 分池：消息池打满后，入群池仍有额度 —— 三条轨不再互相挤占
 	{
 		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.97) }) });
 		const cfg = W.loadAdDetectionConfig({
 			AD_LLM_DAILY: '100', AD_LLM_DAILY_MESSAGE: '1', AD_LLM_DAILY_JOIN: '5', AD_LLM_DAILY_CRON: '0'
 		});
+		// 消息池上限 1：第一次进得去，第二次被本池拦下（总池 100 还远没满）
 		const r1 = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'x' }, text: '分池样本壬' }, { pool: 'message' });
 		const r2 = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'y' }, text: '分池样本癸' }, { pool: 'message' });
 		const r3 = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'z' }, text: '分池样本子' }, { pool: 'join' });

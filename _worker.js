@@ -11803,6 +11803,22 @@ const AD_LLM_DAILY = 1000;
 const AD_LLM_DAILY_MESSAGE = 500;
 const AD_LLM_DAILY_JOIN = 300;
 const AD_LLM_DAILY_CRON = 100;
+
+// 【解析失败熔断】连续这么多次取不到模型回答，当天直接关掉第⑥层，一次都不再调。
+//
+// 【为什么必须有它】2026-10-11 线上真实事故：取模型回答的字段名写错了
+//（Workers AI 对 chat 模型返回 choices[0].message.content，代码只认 response / result），
+// 结果每一次调用都把答案当成 "[object Object]" 丢掉 —— 276 次调用、76 次解析失败、
+// 每一次都是白烧 Neurons，而且【这个失败从上线到今天没有任何机制能发现它】。
+// 分池、每日上限、同载荷去重，没有一道闸能挡住「调用成功但取值取错」这种失败：
+// 额度照扣、计数照涨、判定照常返回 null，一切看起来都正常。
+// 所以必须有一道【以失败本身为触发条件】的闸：连着失败就说明这条链路坏了，
+// 坏掉的时候继续花钱不是谨慎，是浪费。
+//
+// 【20 这个数怎么来的】正常波动的解析失败（模型偶尔不守 JSON 格式、thinking 太长
+// 被 max_tokens 截断）是零星的，一天几十次里夹着几次；连着 20 次一次都没成功，
+// 已经不是波动而是链路故障 —— 这时停掉它，主人看 /adstats 一眼就知道该来查了。
+const AD_LLM_FAIL_BREAK = 20;
 // 【置信度线为什么是 0.85】对齐 menshen 冷判定的 antiad_cold_conf 采信线：
 // 它的注释写明「进群画像的证据比一条具体消息少得多」，所以宁可放过也不误伤。
 // 低于线的一律只进观察、不封 —— 模型输出「是广告」却只有 0.5 把握是常态。
@@ -16432,6 +16448,9 @@ async function judgeAdByLLM(env, config, input, options) {
 	// 两道闸：总池（所有轨共用的天花板）先挡，再挡本轨的分池。
 	// 顺序不能反 —— 总池打满时本池再有余量也不该继续烧，
 	// 那等于用本轨的额度把视觉识别与其他轨一起拖下水。
+	// 熔断优先于一切额度判断 —— 链路已经坏掉的时候，再花一次钱去验证它坏没坏，
+	// 是纯粹的浪费（这正是 2026-10-11 那轮：276 次调用全部取错字段，一次次白烧）。
+	if (quota.broken) return null;
 	if (quota.used >= daily) return null;
 	const poolUsed = Number(quota.pools?.[pool]) || 0;
 	if (poolUsed >= poolDaily) return null;
@@ -16477,6 +16496,23 @@ async function judgeAdByLLM(env, config, input, options) {
 				? ' 原文前200字: ' + rawText.slice(0, 200)
 				: ' 取不到文本字段，返回结构前300字: ' + String(JSON.stringify(aiResult)).slice(0, 300)));
 		await bumpAdLLMParseFail(env);
+		// 连续失败计数：连着 AD_LLM_FAIL_BREAK 次取不到回答就熔断，当天不再花钱。
+		const consecFail = (Number(quota.consecFail) || 0) + 1;
+		await writeAdScanState(env, 'llm_consec_fail', String(consecFail), nowSeconds);
+		// 只记【字段名】不记内容（隐私面见 readAdLLMQuota 里的说明）：
+		// 排查需要的只是「正文在哪个字段」，而返回体里带着别人的 bio 与消息片段。
+		await writeAdScanState(env, 'llm_last_shape',
+			JSON.stringify(Object.keys(aiResult || {}).slice(0, 12)), nowSeconds);
+		if (consecFail >= AD_LLM_FAIL_BREAK) {
+			await writeAdScanState(env, 'llm_broken_day', String(quota.today), nowSeconds);
+			console.error('[广告检测·深度判定] 已熔断：连续 ' + consecFail + ' 次取不到模型回答，'
+				+ '今日不再调用第⑥层。返回结构的字段名见 /adstats 的「上次返回字段」。');
+		}
+	} else if (Number(quota.consecFail) > 0) {
+		// 一次成功就说明链路是通的，把连续失败计数清零。不清的话，一天里夹着的
+		// 零星失败（模型偶尔不守 JSON 格式、thinking 偶尔过长）会累计到熔断线，
+		// 把一条其实正常的第⑥层误关掉 —— 那比不加熔断更糟。
+		await writeAdScanState(env, 'llm_consec_fail', '0', nowSeconds);
 	}
 	return answer;
 }
@@ -17430,14 +17466,27 @@ async function readAdLLMQuota(env, nowSeconds) {
 		for (const pool of AD_LLM_POOLS) {
 			await writeAdScanState(env, 'llm_pool_' + pool, '0', nowSeconds);
 		}
-		return { today, used: 0, pools: { message: 0, join: 0, cron: 0 } };
+		// 熔断状态也只在跨天清 —— 昨天链路坏了不等于今天也坏；不清的话
+		// 第二天第一次调用仍读到「已熔断」，第⑥层会被永久关掉，比不加熔断更糟。
+		await writeAdScanState(env, 'llm_consec_fail', '0', nowSeconds);
+		await writeAdScanState(env, 'llm_broken_day', '', nowSeconds);
+		await writeAdScanState(env, 'llm_last_shape', '', nowSeconds);
+		return { today, used: 0, pools: { message: 0, join: 0, cron: 0 }, broken: false, consecFail: 0, lastShape: '' };
 	}
 	const used = Number(await readAdScanState(env, 'llm_count', '0')) || 0;
 	const pools = {};
 	for (const pool of AD_LLM_POOLS) {
 		pools[pool] = Number(await readAdScanState(env, 'llm_pool_' + pool, '0')) || 0;
 	}
-	return { today, used, pools };
+	// 熔断标记存的是「触发当天的日期」而不是布尔 —— 这样过期的标记天然失效，
+	// 不需要在别处再写一遍「昨天的不算」的判断。
+	const broken = String(await readAdScanState(env, 'llm_broken_day', '')) === today;
+	const consecFail = Number(await readAdScanState(env, 'llm_consec_fail', '0')) || 0;
+	// 上次解析失败时，Workers AI 返回对象的【字段名清单】。只记字段名不记内容 ——
+	// 那里面带着别人的 bio 与消息片段，摆到 /adstats 上是实打实的隐私泄露面；
+	// 而排查需要的恰恰只是「正文在哪个字段」，字段名足够。
+	const lastShape = String(await readAdScanState(env, 'llm_last_shape', ''));
+	return { today, used, pools, broken, consecFail, lastShape };
 }
 
 // 记第 ⑥ 层的观测计数：模型判为广告几次、其中真正达采信线几次。
@@ -17467,7 +17516,7 @@ async function bumpAdLLMOutcome(env, reachedLine) {
 // 读第 ⑥ 层的今日观测计数。只给 /adstats 用，不在任何判定路径上。
 // 与 readAdLLMQuota 同一把尺：day 不是今天就一律按 0 报，不读昨天的残留。
 async function readAdLLMOutcome(env, nowSeconds) {
-	const empty = { used: 0, hits: 0, bans: 0, parseFail: 0, pools: { message: 0, join: 0, cron: 0 } };
+	const empty = { used: 0, hits: 0, bans: 0, parseFail: 0, pools: { message: 0, join: 0, cron: 0 }, broken: false, consecFail: 0, lastShape: '' };
 	if (!env?.DB) return empty;
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
 	const day = await readAdScanState(env, 'llm_day', '');
@@ -17482,7 +17531,12 @@ async function readAdLLMOutcome(env, nowSeconds) {
 		hits: await num('llm_hits'),
 		bans: await num('llm_bans'),
 		parseFail: await num('llm_parse_fail'),
-		pools
+		pools,
+		// 熔断状态与连续失败数：摆出来才知道第⑥层到底是「没起作用」还是「已经停了」。
+		broken: String(await readAdScanState(env, 'llm_broken_day', '')) === today,
+		consecFail: await num('llm_consec_fail'),
+		// 上次解析失败时返回对象的字段名清单（不含内容，理由见 readAdLLMQuota）。
+		lastShape: String(await readAdScanState(env, 'llm_last_shape', ''))
 	};
 }
 
@@ -20705,6 +20759,19 @@ async function handleAdStatsCommand(env, chatId) {
 		'　↳ 分池　消息 <b>' + Number(llmStat.pools?.message || 0) + '</b>/' + config.llmDailyMessage
 			+ '　入群 <b>' + Number(llmStat.pools?.join || 0) + '</b>/' + config.llmDailyJoin
 			+ '　定时扫描 <b>' + Number(llmStat.pools?.cron || 0) + '</b>/' + config.llmDailyCron,
+		// 熔断状态：连着 AD_LLM_FAIL_BREAK 次取不到模型回答，第⑥层当天自动停。
+		// 这一行回答的是「第⑥层到底还活着吗」—— 2026-10-11 那轮它一直在空转烧钱，
+		// 看板上却只显示「调用 276 次、命中 0 次」，怎么看都像模型保守，
+		// 实际是取值取错、一次都没读到答案。
+		(llmStat.broken
+			? '　⛔ 已熔断：连续 ' + Number(llmStat.consecFail || 0) + ' 次取不到模型回答，今日不再调用第⑥层。'
+				+ '修好返回结构后等跨天自动恢复。'
+			: (Number(llmStat.consecFail) > 0
+				? '　⚠️ 已连续 ' + Number(llmStat.consecFail) + ' 次取不到回答（满 ' + AD_LLM_FAIL_BREAK + ' 次自动熔断）'
+				: ''))
+			// 上次解析失败时返回对象的【字段名】—— 直接回答「正文到底在哪个字段」。
+			// 只有字段名不含内容：返回体里带着别人的 bio 与消息片段，摆出来是隐私泄露面。
+			+ (llmStat.lastShape ? '　↳ 上次返回字段：' + escapeHtml(llmStat.lastShape) : ''),
 		'',
 		'<b>指纹库</b>　共 <b>' + fpTotal + '</b> 条'
 	];
