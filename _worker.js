@@ -1565,12 +1565,46 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 			: (isGroupMuteMode(groupId) ? 'mute' : 'kick');
 	if (effective === 'mute') {
 		// 禁言：不踢、不预封，只对【已在群里】的人永久禁言（restrictChatMember）。
-		// 目标不在群时 Telegram 报错 → ok:false，这是预期（禁言接口没有预封能力，靠 D1 黑名单 + 复入群拦截兜底）。
-		// probe 照旧执行（仅当调用方要求）：它同时是回执里「可点击昵称 + 状态」的数据来源，
-		// 砍掉会让 /ban 回执从「昵称 + TGID」退化成只剩一串 TGID —— 那是信息量倒退，不是省请求。
+		//
+		// 【禁言前先问一句（2026-10-11）】原先这里假定「目标不在群时 Telegram 会报错 → ok:false」，
+		// 这个前提【是错的】。线上实测：对【已离群】的黑名单用户执行 restrictChatMember，
+		// Telegram 不报错，而是把他【拉回群并设为受限】—— 批量拉黑时日志里成片的
+		//「旧状态:left → 新状态:restricted」就是它造成的，随后又触发「复入群拦截」把人踢回，
+		// 刷一堆通知。副作用是把已经踢走的人再拉回来一次，纯属自己给自己找事。
+		//
+		// 【为什么只在 probeMembership 为真时才跳过】探测本身是一次 getChatMember，
+		// 批量场景下是【目标数 × 群数】次调用，无条件探测会直接翻倍热路径开销。
+		// 而调用方要求探测的那条路（/purge、批量拉黑）恰好就是会把人扫进来的那条 ——
+		// 复用它已经拿到的结果，既治住副作用，又一个请求都不多发。
+		// 没有探测结果时照旧尝试，行为与改动前逐字节一致（那条路的风险由乙的
+		// actorIsSelfBot 兜住：就算把人拉回来，也不会再被判成「复入群」刷通知）。
+		// 注意与 ban 分支的差异：踢出有「预封」能力，人不在群照样封得住；禁言没有。
 		const memberProbe = options.probeMembership
 			? await probeTargetMemberBeforeBan(groupId, userId)
 			: null;
+		const notInGroup = Boolean(memberProbe)
+			&& (memberProbe.state === 'not_in_group' || memberProbe.state === 'already_banned');
+		if (notInGroup) {
+			console.log('[禁言前探测] 目标不在群内，跳过 restrictChatMember（避免把人拉回来）',
+				JSON.stringify({ 群ID: groupId, 用户ID: String(userId), 探测状态: memberProbe?.label || '' }));
+			return {
+				groupId,
+				userId: String(userId),
+				ok: false,
+				// 文案要一次说清三件事：为什么没禁言、为什么这是对的、接下来会怎样。
+				// 只写「不在群内」会让回执看起来像失败 —— 而实际上 D1 黑名单已经生效、
+				// 后续进群照样会被拦，这才是主人真正需要知道的。
+				error: '目标不在群内，已跳过禁言（不把已离群的人拉回来）；D1 黑名单已生效，'
+					+ '该用户若后续进群/发言仍会按 D1 黑名单拦截',
+				retried: false,
+				muted: true,
+				mutedBy: mode === 'human' ? 'human' : 'killer',
+				memberProbe,
+				// skipped 让回执能分辨「探测后主动跳过」与「真的调用失败」——
+				// 两者都是 ok:false，但含义完全不同，混在一起会让回执说不清发生了什么。
+				skipped: 'not_in_group'
+			};
+		}
 		const r = await muteUserInGroup(groupId, userId);
 		return {
 			groupId,
@@ -5359,9 +5393,22 @@ async function handleChatMemberUpdate(chatMember, env) {
 
 	// 复入群拦截：用户从非成员状态变为 member/restricted（被拉进群、点链接加群、unban 后自加回）
 	// 先于"操作人 === 用户本人"检查，因为自加群时 from === target，会被后面跳过逻辑拦掉
+	//
+	// 【bot 自己的操作不算复入群（2026-10-11）】
+	// 线上实测：批量拉黑时日志里成片的「旧状态:left → 新状态:restricted」，同一秒跨十几个群、
+	// 三个用户同时发生 —— 真人不可能这么进群。根因是 bot 对【已离群】的黑名单用户执行
+	// restrictChatMember 时，Telegram 不报错、反而把他【拉回群并设为受限】，
+	// 于是产生一条 left → restricted 的 chat_member 事件，被下面的 enteredGroup 判成「复入群」，
+	// 而此刻正在拉黑、黑名单当然命中 → 踢回 + 发通知。
+	// 净效果是把人拉回来又踢走，还刷一堆「复入群拦截」——功能没错（人仍在黑名单、群仍干净），
+	// 但噪音和副作用都是实打实的。from 是【操作者】，等于 bot 自己就是始作俑者，必须先摘出去。
+	// 真人 / 其它管理员造成的复入群，from.id 不是 bot，拦截照旧生效。
+	const selfBotId = await getBotId();
+	const actorIsSelfBot = Boolean(selfBotId) && String(chatMember?.from?.id || '') === String(selfBotId);
 	const oldStatusEarly = oldMember.status;
 	const newStatusEarly = newMember.status;
 	const enteredGroup =
+		!actorIsSelfBot &&
 		(newStatusEarly === 'member' || newStatusEarly === 'restricted') &&
 		oldStatusEarly !== 'member' &&
 		oldStatusEarly !== 'restricted' &&
@@ -5417,7 +5464,6 @@ async function handleChatMemberUpdate(chatMember, env) {
 	if (targetIdStr === fromIdStr) return;
 
 	// 跳过：操作人是机器人自己（避免与自助解封形成循环）
-	const selfBotId = await getBotId();
 	if (selfBotId && fromIdStr === String(selfBotId)) return;
 
 	const oldStatus = oldMember.status;
