@@ -1734,9 +1734,14 @@ console.log('\n[10b4] /ban 目标不在群内但 Telegram 预封成功');
 	// 禁言接口没有预封能力：probe 仍执行（供回执显示昵称与状态），但不再产生预封效果
 	assert('/ban 目标不在群:仍然探测状态以显示昵称', callsOf('getChatMember').length === 2);
 	assert('/ban 目标不在群:不再调用封禁接口', callsOf('banChatMember').length === 0);
-	assert('/ban 目标不在群:确实走了禁言接口两次', callsOf('restrictChatMember').length === 2);
+	// 2026-10-11：探测到不在群就【不再调用禁言接口】—— restrictChatMember 对已离群的人
+	// 不报错，Telegram 会把他【拉回群并设为受限】，那正是批量拉黑时成片
+	//「left → restricted」事件的来源（随后又被判成复入群踢回，刷一堆通知）。
+	assert('/ban 目标不在群:不再调用禁言接口（避免把人拉回来）', callsOf('restrictChatMember').length === 0, 'restrictChatMember=' + callsOf('restrictChatMember').length);
 	assert('/ban 目标不在群:汇总说明 D1 已生效', dmSend.body.text.includes('D1 黑名单已生效'));
-	assert('/ban 目标不在群:提示 Telegram 当前无法识别', dmSend.body.text.includes('Telegram 当前无法识别该 TGID'));
+	// 2026-10-11：现在 error 说的是【探测后主动跳过】而不是 Telegram 报错 ——
+	// 旧文案「Telegram 当前无法识别该 TGID」会让人以为出故障了，实际是正确行为。
+	assert('/ban 目标不在群:回执说清是主动跳过禁言', dmSend.body.text.includes('已跳过禁言'), dmSend.body.text.slice(0, 400));
 	assert('/ban 目标不在群:说明后续进群仍会被拦', dmSend.body.text.includes('后续进群/发言仍会按 D1 黑名单拦截'));
 	assert('/ban 目标不在群:不再承诺预封', !dmSend.body.text.includes('预封'));
 }
@@ -4611,7 +4616,13 @@ console.log('\n[25] 重复加黑同一用户:已在黑名单仍继续踢出');
 	assert('字段:目标用户ID 12345', ownerDm.body.text.includes('12345'));
 	assert('字段:操作人"台风"', ownerDm.body.text.includes('台风'));
 	assert('重复提示:含"已在黑名单"', ownerDm.body.text.includes('已在黑名单'));
-	assert('已在黑名单仍会全群禁言', callsOf('restrictChatMember').length === 2 && callsOf('banChatMember').length === 0);
+	// 2026-10-11：探测到目标【已被踢出】(kicked) 就不再禁言 —— restrictChatMember 对已离群的人
+	// 不报错，Telegram 会把他【拉回群并设为受限】，那正是批量拉黑时成片「left → restricted」
+	// 事件的来源（随后又被判成复入群踢回，刷一堆通知）。他已在封禁列表里，D1 黑名单 +
+	// 复入群拦截足以兜住，没有理由再拉回来一次。
+	assert('已在黑名单且已被踢出 → 不再禁言（不把人拉回来）',
+		callsOf('restrictChatMember').length === 0 && callsOf('banChatMember').length === 0,
+		'restrict=' + callsOf('restrictChatMember').length + ' ban=' + callsOf('banChatMember').length);
 }
 
 // ---------- [25b] 作为管理员的机器人发 /ban → 不写入 D1 黑名单（仅真人可加黑）----------
