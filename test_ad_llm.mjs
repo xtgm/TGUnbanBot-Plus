@@ -426,12 +426,19 @@ section('[4] judgeAdByLLM 闸门（额度 / 去重 / 降级）');
 // ================= [6] 三处接线（反向验证的关键） =================
 section('[6] 接线：入群线 / 消息线 / 复查线都真的调用了第四路');
 {
+// 【样本必须带引流出口或具体金额】2026-10-11 加了第⑥层的定罪证据闸（hasAdLlmKillEvidence）：
+// 模型判为广告且够采信线时，正文与资料里【既没有出口也没有金额】就降级为观察。
+// 起因是一起真实误封（#6005）——「能赚钱的确是写在字里的。太们们调教好AI，找出突破口」
+// 是在讨论 AI 能不能赚钱，却被模型判成广告、0.85 擦线封禁。
+// 下面几段的人造模糊样本（'改过的广告简介' / '达线样本甲'）本来就不含任何广告特征，
+// 真实世界里同样不会被封 —— 这里只把它们换成带出口的真广告文案，
+// 验证的仍是「前三层不够分时第⑥层能定罪」，功能一行没改。
 	// —— 入群线：资料干净（前三层不够分），只有模型能定他的罪 ——
 	{
 		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.97, 'bio 挂着引流话术') }) });
 		await W.adDetectionReady(env);
 		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
-			id: body?.chat_id, first_name: '干净名字', username: '', bio: '喜欢摄影和徒步'
+			id: body?.chat_id, first_name: '干净名字', username: '', bio: '想了解的加我详聊'
 		} } }) });
 		const result = await W.screenAdJoinMember(env, { id: 771001, is_bot: false, first_name: '干净名字' }, {
 			chatId: GROUP_ID, chatTitle: '测试群', messageId: null,
@@ -467,7 +474,7 @@ section('[6] 接线：入群线 / 消息线 / 复查线都真的调用了第四�
 		env.DB.prepare('INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at, profile_hash, last_verdict) VALUES (?,?,?,?,?,?,?,?,?,?)')
 			.bind('771003', GROUP_ID, '潜伏号', '', '', 1, 1, 0, 'h0', '').run();
 		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
-			id: body?.chat_id, first_name: '潜伏号', username: '', bio: '改过的广告简介'
+			id: body?.chat_id, first_name: '潜伏号', username: '', bio: '想了解的私聊我'
 		} } }) });
 		const r = await W.rescanAdMember(env, {
 			user_id: '771003', chat_id: GROUP_ID, first_name: '潜伏号', last_name: '', username: '',
@@ -658,7 +665,10 @@ section('[9] 闸一可疑但不够封时同步调第⑥层');
 		).bind(String(userId), GROUP_ID, '用户', '', '', now, now, checked, '', '').run();
 	}
 	// 首尾对称 emoji → 闸一 +3，低于封禁线 7，所以必须靠第⑥层才能定罪。
-	const SUSPECT_TEXT = '🔥今天天气真好🔥';
+		// 出口词必须【夹在两个 emoji 中间】：AD_SYMMETRIC_EMOJI_RE 判的是首尾都是同一个 emoji，
+	// 追加在末尾或开头都会把「🔥…🔥」的对称打断 → +3 消失 → suspectSignal 变假 →
+	// 第⑥层压根不会被调用，症状与「闸一没接上」一模一样。
+	const SUSPECT_TEXT = '🔥想了解的加我详聊 今天天气真好🔥';
 	const PLAIN_TEXT = '普通聊天内容';
 	const NEWCOMER_TIER = 7200;   // adRescanTierSeconds 对 first_seen 距今 <=6h
 
@@ -764,7 +774,7 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.97) }) });
 		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
 		await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 1, reasons: [] },
-			cfg, { profile: { bio: 'x' }, text: '达线样本甲' });
+			cfg, { profile: { bio: 'x' }, text: '加我详聊 有惊喜' });
 		const o = await W.readAdLLMOutcome(env, NOW());
 		assert('达线 → used=1', o.used === 1, JSON.stringify(o));
 		assert('达线 → hits=1（模型判为广告）', o.hits === 1, JSON.stringify(o));
@@ -961,6 +971,45 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		const text = lastSent();
 		assert('★ 最后一次是失败且之后无成功 → 仍挂警告',
 			text.includes('⚠️ 最近一次解析失败'), text.slice(0, 900));
+	}
+
+	// ⑦j 【线上误封回归 · 快照 #6005】讨论「AI 能不能赚钱」的正文，不该被 LLM 单独定罪。
+	// 评分层判 0 分（仅业务词「赚钱」，单类词不计分），定罪来自第⑥层、置信度 0.85 恰好擦线。
+	// 广告必须有引流出口（群 / 频道 / 号 / 联系方式），没有出口的赚钱话术只是讨论。
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer:
+			adAnswer(0.85, 'message中存在收益承诺:能赚钱，且调教好AI可能隐含推广文案') }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		const got = await W.applyAdLLMToEvaluation(env,
+			{ verdict: 'pass', score: 0, reasons: ['（正文仅业务关键词，单类词不计分：赚钱）'] },
+			cfg,
+			{ profile: { firstName: '流氓兔', lastName: '', username: 'ggyy001001', bio: '' },
+				text: '能赚钱的确是写在字里的。太们们调教好AI，找出突破口！！！🤒🤒🤒' });
+		assert('★ #6005 线上样本 → 不封，降级为观察', got.verdict === 'observe', JSON.stringify(got.reasons));
+		assert('★ 理由写明为什么没封（否则复核的人看不懂）',
+			got.reasons.some(r => r.includes('引流出口')), got.reasons.join(' / '));
+	}
+	// ⑦k 反向：真广告带引流出口 → 照旧封，闸不能把它们一起拦下
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.95, '简介写着收益承诺与进群链接') }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		const withLink = await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 0, reasons: [] },
+			cfg, { profile: { firstName: 'x', bio: '日入五千 进群 t.me/+abcdefghij' }, text: '能赚钱的确写在字里' });
+		assert('★ 有引流出口（域名）→ 照旧封', withLink.verdict === 'ban', JSON.stringify(withLink.reasons));
+		const withSolicit = await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 0, reasons: [] },
+			cfg, { profile: { firstName: 'x', bio: '' }, text: '想赚的私聊我，带你入门' });
+		assert('★ 有引流动作词（私聊）→ 照旧封', withSolicit.verdict === 'ban', JSON.stringify(withSolicit.reasons));
+		const withHandle = await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 0, reasons: [] },
+			cfg, { profile: { firstName: 'x', bio: '详谈 @adseller888' }, text: '能赚钱的确写在字里' });
+		assert('★ 有引流 @handle → 照旧封', withHandle.verdict === 'ban', JSON.stringify(withHandle.reasons));
+	}
+	// ⑦l 出口闸不改变 0.6~0.85 那一档的行为（本来就只进观察）
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.7, '有点像广告') }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		const got = await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 0, reasons: [] },
+			cfg, { profile: { firstName: 'x', bio: '' }, text: '正常讨论' });
+		assert('★ 置信度 0.7（低于采信线）→ 仍是观察，不受出口闸影响', got.verdict === 'observe', JSON.stringify(got));
 	}
 
 	// ⑦c 分池：消息池打满后，入群池仍有额度 —— 三条轨不再互相挤占

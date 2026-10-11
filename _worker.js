@@ -16579,6 +16579,49 @@ async function judgeAdByLLM(env, config, input, options) {
 
 // 叠判入口：与 applyAvatarVerdict / applyBadgeVerdict 同位、同取向 ——
 // 只动 verdict 与 reasons，恒不改 score（改了会与历史分重复计）。
+// ===== 第⑥层单独定罪的前置闸：必须有【引流出口】或【具体金额】=====
+//
+// 【治什么】2026-10-11 取值修复上线后的第一起线上误封（快照 #6005，群 天诚技术交流社区）：
+//   「能赚钱的确是写在字里的。太们们调教好AI，找出突破口！！！🤒🤒🤒」
+// 评分层判 0 分（仅业务词「赚钱」，单类词不计分），是第⑥层【单独定的罪】，
+// 置信度 0.85 恰好擦过采信线。这条消息在【讨论 AI 能不能赚钱】，不是广告。
+//
+// 【为什么出口是必要条件】广告的目的是把人引到某个地方去 —— 群、频道、号、联系方式。
+// 没有任何出口的「赚钱」话术，就算内容真在谈钱，也【不可能构成广告】：
+// 它连被人看见并转化的路径都没有。四条结构查杀通道本来就都要求「招揽 ∧ 引流出口」，
+// 只有第⑥层绕过了这道要求 —— 它读的是语义，而语义恰恰分不出「我在讨论赚钱」
+// 与「我在招你赚钱」；【出口才是区分这两者的硬特征】。
+//
+// 【不改变已定罪的情形】有出口时行为与改动前逐字节一致；无出口时降级为 observe
+//（进观察窗口、推快照等人工复核），不是静默放行 —— 判定理由照常留痕。
+function hasAdLlmKillEvidence(input) {
+	const profile = input?.profile || {};
+	const text = [profile.firstName, profile.lastName, profile.bio, input?.text]
+		.filter(Boolean).join(' ');
+	if (!text.trim()) return false;
+	// ① 域名 / t.me —— 广告的主出口
+	if (extractAdDomains(text).length) return true;
+	// ② @handle —— 引流到某个账号
+	if (/@[A-Za-z0-9_]{4,}/.test(text)) return true;
+	// ③ 电话形态
+	if (/[+\d][\d\s-]{9,}/.test(text)) return true;
+	// ④ 强招揽动词（复用现成的 AD_TRADE_VERBS，不新建词表）
+	if (countAdKeywordHits(text, AD_TRADE_VERBS).length) return true;
+	// ⑤ 把人引向自己的动作词。
+	// 【刻意不用「加」「联系」这种单字】「加个好友聊聊」「请联系管理员」都是正常语境，
+	// 放进来等于让这道闸形同虚设 —— 宁可严一点，漏掉的那类反正也进观察窗口。
+	if (/加我|加微|加薇|私聊|私信|进群|扫码|看我(?:主页|简介|头像)|点击(?:链接|下方)/.test(text)) return true;
+	// ⑥ 具体金额 —— 第二类定罪证据。
+	// 【为什么还要这一条】第一版闸只认引流出口，结果把第⑥层存在的理由一起拦掉了：
+	// 线上测试样本「来替我收米 一天9千」（同音变形、词表抓不到、没写任何联系方式）
+	// 也被降级 —— 那正是第⑥层被造出来要抓的东西。
+	// 广告几乎都写具体数字（日入5000 / 一单9k / 月入三万），而【讨论「能不能赚钱」
+	// 很少带具体金额】—— 2026-10-11 那起误封（#6005）的原文是
+	// 「能赚钱的确是写在字里的。太们们调教好AI，找出突破口」，一个数字都没有。
+	// 这是区分「招揽」与「讨论」最稳的一条特征：出口管引流意图，金额管收益承诺。
+	return AD_MONEY_AMOUNT_RE.test(text);
+}
+
 async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	let current = evaluation;
 	if (!current) return current;
@@ -16591,10 +16634,21 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	// 观测：这一层到底有没有在起作用，必须能在 /adstats 上直接看到 ——
 	// 否则「调了但从没命中」与「压根没跑」在线上完全无法区分（上线首日就是这个状态）。
 	// 只在模型真给出 ad 结论时写（低频），也只有 /adstats 读它，热路径不为它多付 SQL。
-	await bumpAdLLMOutcome(env, answer.confidence >= line);
+	// 【证据闸】LLM 单独定罪前必须确认有引流出口或具体金额 —— 理由见 hasAdLlmKillEvidence。
+	// 它排在计数之前：没有出口就不算「达线处置」，否则 /adstats 的达线数会把
+	// 被这道闸拦下的误判也算进去，看起来像第⑥层封了很多，实际一条都没处置。
+	const hasEvidence = hasAdLlmKillEvidence(input);
+	const reachedLine = answer.confidence >= line && hasEvidence;
+	await bumpAdLLMOutcome(env, reachedLine);
 	const reason = 'AI 深度判定命中（置信度 ' + answer.confidence.toFixed(2) + '）：' + answer.reason;
-	const reasons = (current.reasons || []).concat([reason]);
-	if (answer.confidence >= line) {
+	let reasons = (current.reasons || []).concat([reason]);
+	if (answer.confidence >= line && !hasEvidence) {
+		// 模型判了广告、也够采信线，但正文与资料里【一个引流出口都没有】——
+		// 那是讨论不是广告。降级进观察窗口，理由必须写清楚为什么没封。
+		reasons = reasons.concat(['（已拦下：AI 判为广告且够采信线，但正文与资料里既没有引流出口也没有具体金额 —— 没有出口也没有金额的「赚钱」话术只是讨论，降级为观察，不封禁）']);
+		return Object.assign({}, current, { verdict: 'observe', reasons });
+	}
+	if (reachedLine) {
 		return Object.assign({}, current, { verdict: 'ban', reasons });
 	}
 	if (answer.confidence >= AD_LLM_OBSERVE_CONF) {
