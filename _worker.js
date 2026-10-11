@@ -16231,21 +16231,56 @@ function parseAdLLMAnswer(raw) {
 	const text = String(raw || '').trim();
 	if (!text) return null;
 	const matched = text.match(/\{[\s\S]*\}/);
-	if (!matched) return null;
-	try {
-		const parsed = JSON.parse(matched[0]);
-		const ad = parsed?.ad === true || String(parsed?.ad).toLowerCase() === 'true';
-		const confidence = Number(parsed?.confidence);
-		return {
-			ad,
-			// 模型没给 confidence 时：判了广告就按满置信、判了正常就按 0 ——
-			// 缺字段不该把一次有效结论丢掉。
-			confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : (ad ? 1 : 0),
-			reason: String(parsed?.reason || '').slice(0, 200)
-		};
-	} catch (_) {
-		return null;
+	if (matched) {
+		try {
+			return buildAdLLMAnswer(JSON.parse(matched[0]));
+		} catch (_) {
+			// JSON 抠到了但解析失败 —— 多半是 max_tokens 截断把右括号切掉了，
+			// 落到下面的宽松兜底再试一次，别直接判死。
+		}
 	}
+	// ===== 宽松兜底（2026-10-11 新增）=====
+	//
+	// 【治什么】线上 /adstats 实测 221 次调用里有 22 次解析失败，日志却是一片空白 ——
+	// 因为这里失败只返回 null，不打任何东西，而命中计数只在 answer 非空时才写，
+	// 于是「模型判 false」与「模型压根没输出 JSON」在看板上长得一模一样。
+	// qwen3-30b-a3b 是 Reasoning 模型（官方标注 Reasoning: Yes），思考内容会先于
+	// 正文输出并占用 max_tokens —— 旧配置只给 200，JSON 经常被切在半截。
+	//
+	// 【为什么兜底不算「靠猜定罪」】它只认【完整字段名】的字面量："ad": true / false。
+	// 抠不到这个字段就返回 null，与改动前完全一致。confidence 缺失时按「判了广告就满置信、
+	// 判了正常就 0」处理，与 JSON 分支同一口径 —— 不给兜底结果任何额外权重。
+	// 风险敞口只有「模型在一段无关文本里写了 "ad": false」，而 false 本身不处置任何东西。
+	return parseAdLLMAnswerLoose(text);
+}
+
+// 从残缺 / 被包裹的模型输出里按字段抠答案。抠不出 ad 字段一律返回 null。
+function parseAdLLMAnswerLoose(text) {
+	const adMatch = /"ad"\s*:\s*(true|false)/i.exec(String(text || ''));
+	if (!adMatch) return null;
+	const ad = adMatch[1].toLowerCase() === 'true';
+	const confMatch = /"confidence"\s*:\s*([0-9]*\.?[0-9]+)/.exec(text);
+	const confidence = confMatch ? Number(confMatch[1]) : (ad ? 1 : 0);
+	const reasonMatch = /"reason"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(text);
+	return {
+		ad,
+		confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : (ad ? 1 : 0),
+		reason: String((reasonMatch && reasonMatch[1]) || '').slice(0, 200)
+	};
+}
+
+// 统一组装：两个分支共用同一套字段归一化，避免 JSON 分支与兜底分支各写一遍、
+// 以后一改一漏（那正是「兜底比正路宽松」最容易发生的地方）。
+function buildAdLLMAnswer(parsed) {
+	const ad = parsed?.ad === true || String(parsed?.ad).toLowerCase() === 'true';
+	const confidence = Number(parsed?.confidence);
+	return {
+		ad,
+		// 模型没给 confidence 时：判了广告就按满置信、判了正常就按 0 ——
+		// 缺字段不该把一次有效结论丢掉。
+		confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : (ad ? 1 : 0),
+		reason: String(parsed?.reason || '').slice(0, 200)
+	};
 }
 
 // 同载荷内存去重：同一条文案在一个 Worker 实例内只判一次。
@@ -16313,16 +16348,22 @@ async function judgeAdByLLM(env, config, input, options) {
 	const poolUsed = Number(quota.pools?.[pool]) || 0;
 	if (poolUsed >= poolDaily) return null;
 	let answer = null;
+	let rawText = '';
 	try {
 		const aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
 			messages: [
 				{ role: 'system', content: AD_LLM_PROMPT },
 				{ role: 'user', content: payload }
 			],
-			max_tokens: 200,
+			// 【600 而不是 200】qwen3-30b-a3b 是 Reasoning 模型（官方标注 Reasoning: Yes），
+			// 思考内容先于正文输出、并且计入 max_tokens。线上实测 221 次调用有 22 次解析失败
+			//（10%），多给的 400 output token ≈ 12 Neurons/次，换这 10% 不再白烧。
+			// 加上 parseAdLLMAnswer 的宽松兜底，两道一起治。
+			max_tokens: 600,
 			temperature: 0.1
 		});
-		answer = parseAdLLMAnswer(aiResult?.response ?? aiResult?.result ?? aiResult);
+		rawText = String(aiResult?.response ?? aiResult?.result ?? aiResult ?? '');
+		answer = parseAdLLMAnswer(rawText);
 	} catch (error) {
 		console.error('[广告检测·深度判定] 调用失败:', error);
 		return null;
@@ -16331,8 +16372,16 @@ async function judgeAdByLLM(env, config, input, options) {
 	// 不记的话同一条解析不出来的载荷会被反复重试，把当天预算烧在同一个坑上。
 	adLLMSeen.add(key);
 	await bumpAdLLMQuota(env, quota.used + 1, pool, poolUsed + 1, nowSeconds);
-	// 解析不出来要能被看见 —— 理由见 bumpAdLLMParseFail。
-	if (!answer) await bumpAdLLMParseFail(env);
+	if (!answer) {
+		// 解析不出来要能被看见 —— 理由见 bumpAdLLMParseFail。
+		// 【这行日志是排查这一层的唯一抓手】命中计数只在 answer 非空时才写，
+		// 没有它的话，解析失败与「模型判 false」在线上完全无法区分 ——
+		// 线上真实状态正是「221 调用、0 命中、22 解析失败」，其中那 22 次此前无从查证。
+		console.error('[广告检测·深度判定] 模型输出未能解析 pool=' + pool
+			+ ' model=' + String(config?.llmModel || AD_LLM_MODEL)
+			+ ' 原文前200字: ' + rawText.slice(0, 200));
+		await bumpAdLLMParseFail(env);
+	}
 	return answer;
 }
 
@@ -17349,6 +17398,26 @@ async function readAvatarVisionQuota(env, nowSeconds) {
 	return { today, used: count };
 }
 
+// 视觉识别失败的统一日志。
+//
+// 【为什么单独抽一个函数】头像与正文图两条轨的失败日志原本是
+// `console.error('识别失败 id=' + id + ':', error)`。线上真实日志里这个 error 的
+// message 是【空的】—— Workers Logs 只打印出裸栈「at runAdImageVision (_worker.js:13084:26)」，
+// 看不出是 getFile 401、下载 404、图片超限，还是 AI 调用被拒。
+// 2026-10-11 那轮头像与正文图【全线失败】，几十条 error 日志一条都没带出可用信息。
+// 把 name / message / 字符串化结果 / stack 全部拆开打，再带上阶段标记，才是可排查的日志。
+//
+// 【不改变任何处置】只多打几行日志。失败仍照旧计数、仍照旧推进 vision_checked_at，
+// 不会让一张失败的图被反复重试烧额度（那是 upsertAdAvatar 那侧的既有保证）。
+function logAdVisionFailure(kind, stage, id, error) {
+	console.error('[广告检测·' + kind + '] 识别失败 stage=' + stage
+		+ ' id=' + String(id || '')
+		+ ' errorName=' + String(error?.name || '(无)')
+		+ ' errorMessage=' + String(error?.message || '(空)')
+		+ ' errorString=' + String(error).slice(0, 200)
+		+ ' stack=' + String(error?.stack || '').replace(/\s+/g, ' ').slice(0, 300));
+}
+
 async function runAdAvatarVision(env, options = {}) {
 	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '' };
 	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
@@ -17396,7 +17465,12 @@ async function runAdAvatarVision(env, options = {}) {
 		// 每轮都被取出来反复烧额度，把当天预算全耗在同一个失败项上。
 		let verdict = 'pending';
 		let note = '';
+		// 失败定位用。线上真实日志里这个 error 的 message 是【空的】，Workers Logs 只打出了
+		// 裸栈「at runAdImageVision …」—— getFile 401、下载 404、图片超限、AI 调用被拒，
+		// 在看板上长得一模一样。有这个变量才知道挂在哪一步。
+		let stage = 'init';
 		try {
+			stage = 'getFile';
 			// 与全文件其它 Telegram 调用同一写法（项目没有通用封装，一律直连 fetch）。
 			const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
 				method: 'POST',
@@ -17408,10 +17482,13 @@ async function runAdAvatarVision(env, options = {}) {
 			const filePath = String(fileResult?.result?.file_path || '');
 			if (!filePath) throw new Error('file_path 为空');
 			// 官方：该下载链接至少 1 小时有效，文件上限 20MB（头像远小于它）。
+			stage = 'download';
 			const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
 			if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
 			const buffer = await imageResponse.arrayBuffer();
+			stage = 'encode';
 			const image = 'data:image/jpeg;base64,' + bytesToBase64(new Uint8Array(buffer));
+			stage = 'ai.run';
 			const aiResult = await env.AI.run(AD_AVATAR_VISION_MODEL, { image, task: 'query', question: AD_AVATAR_VISION_PROMPT });
 			const parsed = parseAvatarVisionAnswer(aiResult?.answer ?? aiResult?.output ?? aiResult);
 			if (!parsed) throw new Error('模型回答无法解析: ' + String(JSON.stringify(aiResult)).slice(0, 200));
@@ -17419,7 +17496,7 @@ async function runAdAvatarVision(env, options = {}) {
 			lastNote = (parsed.text ? ' 文字:' + parsed.text : '') + (parsed.reason ? ' 理由:' + parsed.reason : '');
 		} catch (error) {
 			stats.failed += 1;
-			console.error('[广告检测·头像] 识别失败 id=' + row.file_unique_id + ':', error);
+			logAdVisionFailure('头像', stage, row.file_unique_id, error);
 		}
 		try {
 			await upsertAdAvatar(env, row.file_unique_id, {
@@ -17505,7 +17582,10 @@ async function runAdImageVision(env, options = {}) {
 		// 每轮都被取出来反复烧额度 —— 付费层虽然不报错，但会照单计费。
 		let verdict = 'pending';
 		let note = '';
+		// 失败定位用，理由见 logAdVisionFailure。
+		let stage = 'init';
 		try {
+			stage = 'getFile';
 			const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
@@ -17515,6 +17595,7 @@ async function runAdImageVision(env, options = {}) {
 			if (!fileResult?.ok) throw new Error(fileResult?.description || 'getFile 失败');
 			const filePath = String(fileResult?.result?.file_path || '');
 			if (!filePath) throw new Error('file_path 为空');
+			stage = 'download';
 			const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
 			if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
 			const buffer = await imageResponse.arrayBuffer();
@@ -17522,9 +17603,12 @@ async function runAdImageVision(env, options = {}) {
 			// 说明不了里面是什么字节 —— 存量行存的可能是本体，新行存的是 thumbnail，
 			// 两者格式不同但都要能认出来。认不出就跳过，绝不拿错格式硬喂模型
 			// （喂错格式 = 模型抛错 = 计 failed，那正是这个 bug 的原貌）。
+			stage = 'sniff';
 			const mime = sniffImageMime(new Uint8Array(buffer));
 			if (!mime) throw new Error('下载到的不是位图（可能是 .tgs / .webm 容器），跳过推理');
+			stage = 'encode';
 			const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
+			stage = 'ai.run';
 			const aiResult = await env.AI.run(AD_IMAGE_VISION_MODEL, { image, task: 'query', question: AD_IMAGE_VISION_PROMPT });
 			const parsed = parseAvatarVisionAnswer(aiResult?.answer ?? aiResult?.output ?? aiResult);
 			if (!parsed) throw new Error('模型回答无法解析: ' + String(JSON.stringify(aiResult)).slice(0, 200));
@@ -17533,7 +17617,7 @@ async function runAdImageVision(env, options = {}) {
 			lastNote = note;
 		} catch (error) {
 			stats.failed += 1;
-			console.error('[广告检测·图片] 识别失败 id=' + row.file_unique_id + ':', error);
+			logAdVisionFailure('图片', stage, row.file_unique_id, error);
 		}
 		try {
 			await upsertAdImage(env, row.file_unique_id, {
