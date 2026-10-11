@@ -20205,7 +20205,7 @@ async function detectAdOnMessage(message, env) {
 // /learnlast 放进这里是因为它与本组命令的约束完全一致：仅第一主人、强制私聊。
 // /recent 【刻意不在】这里 —— 它必须群内可用（在群里看到广告被删就顺手拉列表），
 // 而本函数对群内命令一律撤回 + 引导私聊，会把 /recent 的主用法直接堵死。
-const AD_COMMAND_RE = /^\/(pending|ignore|addword|delword|words|addsample|clearsamples|adstats|whitelist|rescreen|warmup|learnlast)(?:@[^\s]+)?(?:\s|$)/i;
+const AD_COMMAND_RE = /^\/(pending|ignore|addword|delword|words|addsample|clearsamples|adstats|vision|whitelist|rescreen|warmup|learnlast)(?:@[^\s]+)?(?:\s|$)/i;
 
 // 快照 → 判定载荷。/ignore 标误判、删 AI 样本都要用同一份载荷，保证两边命中的集合一致。
 function adPayloadFromSnapshot(snapshot) {

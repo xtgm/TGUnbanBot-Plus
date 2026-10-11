@@ -277,5 +277,23 @@ console.log('\n=== 8. 写入仍是单条 SQL（不碰热路径预算） ===');
 	check('单次记发言只发 1 条 SQL', sqlLog.length === 1, JSON.stringify(sqlLog.map((s) => s.slice(0, 30))));
 }
 
+// === 9. 管理命令：白名单正则与 switch 分支必须成对 ===
+// 【2026-10-11 的真实坑】加 /vision 时只加了 switch 分支、忘了加进 AD_COMMAND_RE ——
+// 那条正则排在命令分发【之前】，不匹配就直接 return，switch 分支成了死代码。
+// 症状是「私聊发 /vision 完全没反应」：不报错、不提示、也不执行，极难从现象定位。
+console.log('\n=== 9. 管理命令白名单与 switch 分支成对 ===');
+{
+	const workerSrc = fs.readFileSync('./_worker.js', 'utf8');
+	const reLine = workerSrc.split('\n').find((l) => l.includes('const AD_COMMAND_RE')) || '';
+	const cases = new Set([...workerSrc.matchAll(/case '([a-z]+)':/g)].map((m) => m[1]));
+	const adCommands = ['pending', 'ignore', 'addword', 'delword', 'words', 'addsample',
+		'clearsamples', 'adstats', 'vision', 'whitelist', 'rescreen', 'warmup', 'learnlast'];
+	for (const cmd of adCommands) {
+		check('/' + cmd + ' 在 AD_COMMAND_RE 白名单里', reLine.includes(cmd), reLine.slice(0, 140));
+		check('/' + cmd + ' 在 switch 有分支', cases.has(cmd), '缺 case ' + cmd);
+	}
+}
+
+
 console.log('\n统计面板验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 process.exit(fail ? 1 : 0);
