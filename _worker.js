@@ -11941,7 +11941,20 @@ const AD_BUSINESS_KEYWORDS = [
 	// 行业指向（2026-10-05 名片②④漏检后补，与 AD_TRADE_VERBS 的「上新」「七折」配对）。
 	// 「专卖店」是零售形态词；「pro max」是具体商品型号 —— 两者都只作行业指向，
 	// 单独出现【不计分不封禁】，仍要招揽动词同现才构成形态 A（「我买了 pro max」不会命中）。
-	'专卖店', 'pro max'
+	'专卖店', 'pro max',
+	// —— 2026-10-11 主人截图的两条名片广告逐词实测后补 ——
+	// Rachel「新澳 🔥 六合彩内幕发布群」：六合彩 / 内幕 / 发布群【四张词表零命中】→ 0 分；
+	// Amani「🔥 代开增值税发票 另高价收发票粉 🔥」：发票 / 增值税 / 代开 / 票粉零命中，
+	// 只有「高价收」命中交易动词 → 单类词不计分，净 3 分（首尾对称 emoji）放行。
+	// 两条都被别的机器人删了，本项目一条都没反应 —— 缺的不是判据链路，是这几个词。
+	//
+	// 【误封面说明】「内幕」「发票」在正常语境确实会出现（股市群聊内幕、报销聊开发票），
+	// 所以它们只作行业指向、单独出现不计分；名片那条定罪通道另有三重门槛
+	//（必须是名片消息 + 显示名不像人名 + 命中词），普通正文里说「帮我开张发票」不会命中任何东西。
+	'六合彩', '开奖', '内幕', '发票', '增值税', '代开', '普票', '专票', '票粉',
+	// 色情引流补词：清单样本里「假钞嫖娼」「假钞玩妹」逐词实测零命中 ——
+	// 表里有「约炮 / 操逼 / 楼凤」这类黑话，却没有最直白的这两个词。
+	'嫖娼', '玩妹'
 ];
 
 // 豁免词：命中且无交易动词时整体减分，保护正常用户。
@@ -12083,11 +12096,12 @@ const AD_REPLY_LEARN_TRIGGERS = [];
 const AD_REPLY_LEARN_TRIGGER_PATTERNS = [];
 const AD_REPLY_LEARN_NEGATORS = [];
 
-// 指纹类型白名单：/addword 只接受这四类，防止脏类型污染指纹库。
+// 指纹类型白名单：/addword 只接受这五类，防止脏类型污染指纹库。
 // 【方案 A】'username' 保留在列表里【仅为兼容历史数据】—— loadAdFingerprints 仍要能
 // 读出库里的旧 username 行交给 markAdFingerprintFalsePositive 清理；
 // 但 matchAdFingerprints 会跳过它们、addAdFingerprint 也拒绝新写入。
-const AD_FINGERPRINT_TYPES = ['keyword', 'domain', 'username', 'bio'];
+// 【'phone' · 2026-10-11 新增】名片广告的复用键，只比对名片里的手机号，不扫 haystack。
+const AD_FINGERPRINT_TYPES = ['keyword', 'domain', 'username', 'bio', 'phone'];
 
 // ===== 权限人 username 永不学习白名单（2026-09-10 主人下令）=====
 // 主人 / 副主人的 @handle 绝不允许进指纹库。
@@ -14275,6 +14289,20 @@ function normalizeAdFingerprintValue(value) {
 		.slice(0, 200);
 }
 
+// \u624B\u673A\u53F7\u6307\u7EB9\u7684\u5F52\u4E00\u5316\uFF1A\u5265\u6389 +\u3001\u7A7A\u683C\u3001\u8FDE\u5B57\u7B26\uFF0C\u53EA\u7559\u6570\u5B57\u3002
+//
+// \u3010\u4E3A\u4EC0\u4E48\u5FC5\u987B\u5355\u72EC\u5F52\u4E00\u3011\u540C\u4E00\u4E2A\u53F7\u5728\u4E0D\u540C\u540D\u7247\u91CC\u5199\u6CD5\u4F1A\u53D8\uFF1A\u300C+1 667 701 4838\u300D
+// \u300C+16677014838\u300D\u300C1-667-701-4838\u300D\u3002\u53F7\u7801\u662F\u3010\u4E3B\u952E\u3011\uFF0C\u683C\u5F0F\u5DEE\u5F02\u4E0D\u8BE5\u8BA9\u5B83\u53D8\u6210\u4E09\u4E2A\u53F7 \u2014\u2014
+// \u5E7F\u544A\u7EC4\u7EC7\u6362\u884C\u53F7\u683C\u5F0F\u518D\u6765\u4E00\u6B21\uFF0C\u6B63\u662F\u8FD9\u6761\u6307\u7EB9\u8981\u6321\u4F4F\u7684\u4E8B\u3002
+//
+// \u301010~15 \u4F4D\u7684\u4E0B\u4E0A\u9650\u3011E.164 \u5141\u8BB8\u6700\u957F 15 \u4F4D\uFF1B\u4E0B\u9650 10 \u4F4D\u662F\u4E3A\u4E86\u4E0D\u628A\u300C2026101112\u300D
+// \u8FD9\u7C7B\u8BEF\u6293\u7684\u957F\u6570\u5B57\u4E32\u5F53\u6210\u53F7\u7801\u5165\u5E93 \u2014\u2014 \u4F4D\u6570\u4E0D\u591F\u7684\u591A\u534A\u4E0D\u662F\u7535\u8BDD\uFF0C\u5B81\u53EF\u4E0D\u5B66\u3002
+function normalizeAdPhoneNumber(value) {
+	const digits = String(value ?? '').replace(/[^\d]/g, '');
+	if (digits.length < 10 || digits.length > 15) return '';
+	return digits;
+}
+
 // ===== 资料形状哈希 · 同模板批量号跨账号复用 =====
 //
 // 批量广告号常常同模板：bio 是同一套文案，只换邀请链接、号码或昵称。第一个号被定罪后把
@@ -14470,6 +14498,21 @@ async function matchAdFingerprints(env, payload, options = {}) {
 			if (hits.length >= 8) break;
 			continue;
 		}
+		// phone 型指纹只比对名片里的手机号，不扫 haystack —— 与 username 同一个道理：
+		// 号码是【主键】不是【文本】，扫进正文里会把「群里贴了个广告号码」的旁观者也命中。
+		//
+		// 【命中的语义】这个号码【有广告案底】（曾被定罪并入库），不是「有号码就算广告」。
+		// 正常人的号码永远不会进库，自然永远命不中 —— 这正是主人 2026-10-11 定的口径：
+		// 号码不是定位特征，已收录的广告指纹特征才是。
+		if (row.type === 'phone') {
+			const selfPhone = String(payload?.phone || '');
+			if (!selfPhone || selfPhone !== row.normalized) continue;
+			hits.push(row);
+			if (row.weight > maxWeight) maxWeight = row.weight;
+			if (!row.singleWord && row.weight > nonSingleMaxWeight) nonSingleMaxWeight = row.weight;
+			if (hits.length >= 8) break;
+			continue;
+		}
 		let matched = false;
 		if (row.type === 'domain') {
 			for (const domain of domains) {
@@ -14512,7 +14555,7 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 	// 原注释「放在提及扫描之前入库，避免被文本里的引流账号把上限占满」防的是
 	// username 内部互相挤占，没防到 keyword 跨类挤占，这里一并解决。
 	// username 配额恢复为 2：只学账号自身 handle，@提及扫描路径保持删除（#143 根因，永不恢复）。
-	const AD_FINGERPRINT_QUOTA = { keyword: 6, bio: 1, domain: 3, username: 2 };
+	const AD_FINGERPRINT_QUOTA = { keyword: 6, bio: 1, domain: 3, username: 2, phone: 1 };
 	const push = (type, value, weight) => {
 		const normalized = normalizeAdFingerprintValue(value);
 		if (!normalized || normalized.length < 2) return;
@@ -14540,6 +14583,15 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 		if (quota != null && candidates.filter((c) => c.type === type).length >= quota) return;
 		candidates.push({ type, value: String(value).slice(0, 200), weight });
 	};
+
+	// 手机号指纹（2026-10-11）。【只有名片消息才会有值】—— 非名片消息的 payload.phone
+	// 恒为空串，这里连候选都不产生，学习路径零开销。
+	// 权重给满 1：它与 domain / username 同属「身份复用键」，命中即定罪；
+	// 误封面的挡板不在权重，而在【这个号必须先被定罪过才会进库】。
+	if (payload?.phone) {
+		const phone = normalizeAdPhoneNumber(payload.phone);
+		if (phone) push('phone', phone, 1);
+	}
 
 	const name = String(payload?.name ?? '').trim();
 	if (name && (AD_SYMMETRIC_EMOJI_RE.test(name) || AD_NUMERIC_PREFIX_RE.test(name))) push('keyword', name, 1);
@@ -16463,11 +16515,14 @@ async function judgeAdByLLM(env, config, input, options) {
 				{ role: 'system', content: AD_LLM_PROMPT },
 				{ role: 'user', content: payload }
 			],
-			// 【600 而不是 200】qwen3-30b-a3b 是 Reasoning 模型（官方标注 Reasoning: Yes），
-			// 思考内容先于正文输出、并且计入 max_tokens。线上实测 221 次调用有 22 次解析失败
-			//（10%），多给的 400 output token ≈ 12 Neurons/次，换这 10% 不再白烧。
-			// 加上 parseAdLLMAnswer 的宽松兜底，两道一起治。
-			max_tokens: 600,
+			// 【1000 而不是 200】qwen3-30b-a3b 是 Reasoning 模型（官方标注 Reasoning: Yes），
+			// 思考内容先于正文输出、并且【计入 max_tokens】—— 旧配置给 200，JSON 经常被切在
+			// 半截，第⑥层从上线到 2026-10-11 一次都没真正读到过模型的回答。
+			// 【600 → 1000】修好取值路径后实测仍有约 7% 解析失败（thinking 偶尔写得更长），
+			// 主人拍板买断这一类故障：1000 次调用 ≈ 22,000 Neurons，
+			// 超免费额度 12,000 ≈ $4/月，换来的是「解析失败」不再是随时会放大的坑。
+			// 真实输出只有 100~200 token（一条 JSON 判据），多给的是思考空间不是正文空间。
+			max_tokens: 1000,
 			temperature: 0.1
 		});
 		// Workers AI 对 chat 模型返回 OpenAI 兼容结构，正文在 choices[0].message.content，
@@ -18122,6 +18177,14 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		// 闸一的 cheapProfile 没有这个字段 → 恒为空串 → 走补学队列异步补，
 		// 与头像的 immediateAvatar / queueAdAvatarLearning 是同一套分流。
 		badgeId: profile.badgeId || '',
+		// 手机号（只来自名片消息 message.contact.phone_number）。【已归一成纯数字】。
+		// 【它只做指纹复用键，不参与任何评分】主人 2026-10-11 定的口径：
+		// 「定罪不看手机号为特征，因为正常用户如果也会发手机号名片就会被误杀，
+		//   那么定位是只看手机号+广告，所以广告指纹特征是关键定位，而不是手机号是定位。」
+		// 也就是说：号码本身不构成证据，【这个号有广告案底】才构成 ——
+		// 所以它进指纹库当主键，命中即杀；而没进过库的号码（正常人发的名片）一分都不加。
+		// 非名片消息恒为空串 → matchAdFingerprints 的 phone 分支直接跳过，零开销。
+		phone: normalizeAdPhoneNumber(input?.phone || ''),
 		// 正文里的自定义贴纸 emoji id 列表（批次 B-2）。与 avatarId 同职责：
 		// 定罪即学习与 /ignore 回滚都靠它定位 ad_badges 的行。
 		// 【这一项闸一就拿得到】id 在 update 的 entities 里，不依赖 getChat ——
@@ -19589,7 +19652,10 @@ async function detectAdOnMessage(message, env) {
 		// text || contactName：名片消息的 text 恒为空，所以不存在覆盖正文的情况。
 		// 用「短路取值」而非拼接，是为了让名片显示名走进 payload.text 后，
 		// 结构评分 / 指纹库 / AI 语义 / 四通道结构查杀【四层全都能看到它】。
-		{ profile: cheapProfile, text: text || contactName, quotedText, forwardChat, media },
+		{ profile: cheapProfile, text: text || contactName, quotedText, forwardChat, media,
+				// 名片消息的手机号（已归一成纯数字）。零 Telegram 请求 —— 就在 update 里。
+				// 只用于指纹复用键，不参与评分，理由见 payload.phone 的说明。
+				phone: message?.contact?.phone_number },
 		// skipMissingBioPenalty：这一闸的 bio 是「没查」而不是「没有」，不能拿它减分。
 		{ config, whitelist, skipMissingBioPenalty: true }
 	));
@@ -19690,7 +19756,10 @@ async function detectAdOnMessage(message, env) {
 			bioVerified = true;
 			const verifyEvaluation = applyHistory(await evaluateAdSuspect(
 				env,
-				{ profile: verifyProfile, text: text || contactName, quotedText, forwardChat },
+				{ profile: verifyProfile, text: text || contactName, quotedText, forwardChat,
+				// 名片手机号同样带进复评：复评是换 bio 重跑整条判据链，
+				// 漏了它会让同一个人的号码指纹在这条路上查不到。
+				phone: message?.contact?.phone_number },
 				// 这次是【据实传】：bio 真查到了，空简介该减分就减分。
 				{ config, whitelist }
 			));
@@ -19788,7 +19857,9 @@ async function detectAdOnMessage(message, env) {
 		// 与闸一同一口径传名片显示名。漏传这里会造成一种诡异形态：
 		// 名片消息在闸一（无 bio）没定罪 → 走到闸二拉了 bio 本该更容易定罪，
 		// 结果因为 text 又变回空串，反而比闸一更判不出来。
-		{ profile, text: text || contactName, quotedText, forwardChat, media },
+		{ profile, text: text || contactName, quotedText, forwardChat, media,
+			// 闸二同样带名片手机号 —— 与闸一同源，否则闸二的复评读不到号码指纹。
+			phone: message?.contact?.phone_number },
 		{ config, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
 	));
 	// 闸二已拉到 getChat，头像就在响应里 —— 读指纹零成本，叠加在历史分之后作最终裁决。
