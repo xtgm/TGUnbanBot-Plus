@@ -825,7 +825,7 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		assert('/adstats 显示「模型判为广告」', text.includes('模型判为广告'), text.slice(0, 600));
 		assert('/adstats 显示「其中达线处置」', text.includes('其中达线处置'), text.slice(0, 600));
 	}
-	// ⑦ 调用 >0 且 0 命中时给出「在跑但没起作用」的提示（上线首日正是这状态）
+	// ⑦ 调用 >0 且 0 命中时给出提示，且必须与「解析失败」区分开
 	{
 		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: '{"ad":false,"confidence":0.1,"reason":"正常"}' }) });
 		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
@@ -834,8 +834,41 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		calls.length = 0;
 		await W.handleAdStatsCommand(env, GROUP_ID);
 		const text = lastSent();
-		assert('★ 调了但 0 命中 → 提示「在跑但没起作用」',
-			text.includes('没起作用'), text.slice(0, 700));
+		assert('★ 调了但 0 命中 → 提示「模型确实判了不是广告」',
+			text.includes('模型确实判了'), text.slice(0, 700));
+		assert('★ 0 命中 + 0 解析失败 → 指向载荷内容而非输出格式',
+			text.includes('不在输出格式'), text.slice(0, 700));
+		assert('★ 解析失败计数出现在 /adstats 上', text.includes('解析失败'), text.slice(0, 700));
+		assert('★ 分池行出现在 /adstats 上', text.includes('分池'), text.slice(0, 700));
+	}
+	// ⑦b 模型返回了内容但抠不出 JSON → 必须报「解析失败」而不是「模型判 false」
+	// （这两种在旧版 /adstats 上长得一模一样，都是「调用 N 次、命中 0 次」）
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: '抱歉我判断不了，这里没有 JSON' }) });
+		const cfg = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		await W.applyAdLLMToEvaluation(env, { verdict: 'pass', score: 1, reasons: [] },
+			cfg, { profile: { bio: 'x' }, text: '解析失败样本辛' });
+		calls.length = 0;
+		await W.handleAdStatsCommand(env, GROUP_ID);
+		const text = lastSent();
+		assert('★ 解析失败 → 提示这些调用白烧额度',
+			text.includes('白烧额度'), text.slice(0, 700));
+	}
+	// ⑦c 分池：消息池打满后，入群池仍有额度 —— 三条轨不再互相挤占
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.97) }) });
+		const cfg = W.loadAdDetectionConfig({
+			AD_LLM_DAILY: '100', AD_LLM_DAILY_MESSAGE: '1', AD_LLM_DAILY_JOIN: '5', AD_LLM_DAILY_CRON: '0'
+		});
+		// 消息池上限 1：第一次进得去，第二次被本池拦下（总池 100 还远没满）
+		const r1 = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'x' }, text: '分池样本壬' }, { pool: 'message' });
+		const r2 = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'y' }, text: '分池样本癸' }, { pool: 'message' });
+		const r3 = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'z' }, text: '分池样本子' }, { pool: 'join' });
+		assert('★ 消息池上限 1 → 第一次进得去', r1 !== null, JSON.stringify(r1));
+		assert('★ 消息池打满 → 第二次被本池拦下（总池还有余量）', r2 === null, JSON.stringify(r2));
+		assert('★ 入群池独立 → 同一时刻仍进得去', r3 !== null, JSON.stringify(r3));
+		const zero = await W.judgeAdByLLM(env, cfg, { profile: { bio: 'w' }, text: '分池样本丑' }, { pool: 'cron' });
+		assert('★ 某池配 0 → 该路 LLM 直接关闭', zero === null, JSON.stringify(zero));
 	}
 }
 

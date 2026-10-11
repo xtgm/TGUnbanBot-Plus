@@ -11716,11 +11716,40 @@ const AD_EMBEDDING_DIMENSION = 1024;
 // llama-3.2-1b 这类 1B 小模型 —— 判据本身就是中文同音变形，模型认不出变形等于白花钱。
 // 换模型直接改环境变量，不动代码。
 const AD_LLM_MODEL = '@cf/qwen/qwen3-30b-a3b-fp8';
-// 【每日上限为什么是 200】免费层每天 10,000 Neurons，qwen3-30b-a3b 折算约
-// 每次判定 5 Neurons（约 500 输入 + 100 输出 token）→ 200 次 ≈ 1,000 Neurons，
-// 只占免费额度的一成，剩下九成留给 bge-m3 嵌入与两路视觉识别。
+// 【每日上限：2026-10-11 从 200 提到 1000，并拆成三个池】
+//
+// 【旧配置的病】三个调用点共用一个 200 次的池，而其中两个轨（入群筛查、cron bio 扫描）
+// 【没有触发门槛】，每个新成员 / 每个扫描对象都送一次，且送进去的载荷 message 恒为空。
+// 实测 /adstats：10:58 就 200/200 打满，模型判为广告 0 次 —— 不是模型保守，
+// 是额度全被「正常新用户」的空载荷吃光了，消息路径（广告真正出现的地方）一次都轮不到。
+// 注释里那句「日限 300 人，LLM 每日上限还绰绰有余」从一开始就不成立：
+// cron 一条轨就要 300 次，而总池只有 200 次。
+//
+// 【成本账（官方定价页 2026-10-11 查）】Workers Paid 计划每天含 10,000 Neurons 免费额度，
+// 超出部分 $0.011 / 1,000 Neurons —— 本账号是付费版，额度可以按需往外买，不存在硬顶。
+// qwen3-30b-a3b-fp8 = input 4,625 / output 30,475 每百万 token；
+// 一次调用按 input ~1,500 token + output ~100 token 折算 ≈ 10 Neurons。
+//   1,000 次  ≈ 10,000 Neurons（正好顶免费额度，$0）
+//   2,000 次  ≈ 20,000 Neurons（超出 10,000 → $0.11/天 ≈ $3.3/月）
+// 所以真正的约束【不是钱】，是与其他 Workers AI 调用共用同一个 10,000 免费额度池 ——
+// moondream 视觉识别（头像 50 + 正文图 300，27,273/M input token）按满载 ≈ 15,750 Neurons，
+// 它自己就吃穿了免费额度。这也是 LLM 这边【必须自带保底额度】的理由：
+// 不能等视觉识别用完再捡剩下的，那正是旧配置 200 次早早就空转的原因。
+//
+// 【三个池各管一轨】消息路径（闸一 + 闸二）是广告真正出现的地方，给 500 次保底；
+// 入群筛查 300 次；cron bio 扫描 100 次。
+// 【cron 的 LLM 池给 100，但 AD_SCAN_DAILY_LIMIT 仍是 300，不降】——
+// 那一轨扫 300 个人是靠 getChat + 评分层抓「bio 改成广告的潜伏号」，这条能力
+// 与 LLM 无关：bio 命中业务词 + 交易动词的号，前三层就定罪了，根本走不到第四路。
+// LLM 只是给前三层没定罪的那部分补位，100 次够用；把扫描日限一起降下来，
+// 等于为了给补位省额度，先把主力判据的覆盖面积砍掉九成。
 // 0 = 关闭本路（只跑前三层，零 Neurons），与 AD_AVATAR_VISION_DAILY 的开关语义一致。
-const AD_LLM_DAILY = 200;
+const AD_LLM_DAILY = 1000;
+// 各池默认值。三个相加必须 < AD_LLM_DAILY，否则总闸会先一步拦掉后面的池。
+// 留 100 次余量：某池突发打满时不至于把总闸撞上、连带断掉别的池。
+const AD_LLM_DAILY_MESSAGE = 500;
+const AD_LLM_DAILY_JOIN = 300;
+const AD_LLM_DAILY_CRON = 100;
 // 【置信度线为什么是 0.85】对齐 menshen 冷判定的 antiad_cold_conf 采信线：
 // 它的注释写明「进群画像的证据比一条具体消息少得多」，所以宁可放过也不误伤。
 // 低于线的一律只进观察、不封 —— 模型输出「是广告」却只有 0.5 把握是常态。
@@ -12302,10 +12331,14 @@ function loadAdDetectionConfig(env) {
 		// 正文图片视觉识别的每日张数上限（0 = 关闭 L2，只保留 L1 指纹查表）。
 		// 上限比头像宽一个量级（付费层超限是计费不是报错），理由见 AD_IMAGE_VISION_DAILY。
 		imageVisionDaily: pickInt(env.AD_IMAGE_VISION_DAILY, AD_IMAGE_VISION_DAILY, 0, 5000),
-		// 生成式深度判定的每日次数上限（0 = 关闭本路，只跑前三层）。
-		// 比视觉识别宽一点：它判的是文本不是图片，一次 5 Neurons 左右，
-		// 200 次约占免费额度一成，且有同载荷内存去重兜底（同一条广告只判一次）。
+		// 生成式深度判定的【总】每日次数上限（0 = 关闭本路，只跑前三层）。
+		// 2026-10-11 从 200 提到 1000，并拆出下面三个分池 —— 详见 AD_LLM_DAILY 的成本账。
 		llmDaily: pickInt(env.AD_LLM_DAILY, AD_LLM_DAILY, 0, 5000),
+		// 三个分池：谁消耗额度由哪个池记账，互不挤占。
+		// 环境变量名固定，改数不用改代码；任一池填 0 = 关掉那一路的 LLM（其余照跑）。
+		llmDailyMessage: pickInt(env.AD_LLM_DAILY_MESSAGE, AD_LLM_DAILY_MESSAGE, 0, 5000),
+		llmDailyJoin: pickInt(env.AD_LLM_DAILY_JOIN, AD_LLM_DAILY_JOIN, 0, 5000),
+		llmDailyCron: pickInt(env.AD_LLM_DAILY_CRON, AD_LLM_DAILY_CRON, 0, 5000),
 		// 采信线：命中且置信度 ≥ 此值才封，低于它只进观察。见 AD_LLM_CONF 说明。
 		llmConf: pickFloat(env.AD_LLM_CONF, AD_LLM_CONF, 0.5, 1),
 		// 换模型只改这个环境变量，不动代码（与 AD_EMBEDDING_MODEL 必须写死在代码里不同：
@@ -16221,17 +16254,64 @@ function parseAdLLMAnswer(raw) {
 const adLLMSeen = new Set();
 
 // 跑一次深度判定。返回 {ad, confidence, reason} 或 null（未跑 / 失败 / 额度用尽）。
-async function judgeAdByLLM(env, config, input) {
+// 取某一个池的今日上限。config 里没有这个键时回落到代码默认值，【不是回落到 0】——
+// 0 的语义是「关掉这一路的 LLM」，拿它当缺省会让没传分池配置的调用方静默失去第⑥层。
+function adLLMPoolLimit(config, pool) {
+	const fallback = {
+		message: AD_LLM_DAILY_MESSAGE,
+		join: AD_LLM_DAILY_JOIN,
+		cron: AD_LLM_DAILY_CRON
+	};
+	const raw = ({
+		message: config?.llmDailyMessage,
+		join: config?.llmDailyJoin,
+		cron: config?.llmDailyCron
+	})[pool];
+	if (raw === undefined || raw === null) return fallback[pool];
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) ? parsed : fallback[pool];
+}
+
+// 记第⑥层的【解析失败】次数。
+//
+// 【为什么必须单独记】parseAdLLMAnswer 抠不出 JSON 就返回 null（宁可漏判也不能靠猜定罪），
+// 而 answer 为 null 时 bumpAdLLMOutcome 一次都不会调 —— 于是「模型判 false」
+// 与「模型输出压根没解析出来」在 /adstats 上长得一模一样，都是「调用 N 次、命中 0 次」。
+// 线上 2026-10-11 的真实状态就是 200/200 调用、0 命中，排查时唯一能排除的是
+// 调用异常（日志空白），这一层到底有没有真跑过，没有任何手段能证明。
+// 加这个计数之后：命中 0 但解析失败也 0 = 模型确实判 false；解析失败一大片 = 输出格式跑偏。
+async function bumpAdLLMParseFail(env) {
+	if (!env?.DB) return;
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		await writeAdScanState(env, 'llm_parse_fail',
+			String((await readAdScanState(env, 'llm_parse_fail', '0')) * 1 + 1), now);
+	} catch (error) {
+		console.error('[广告检测·深度判定] 记录解析失败计数失败:', error);
+	}
+}
+
+async function judgeAdByLLM(env, config, input, options) {
 	// 未绑 Workers AI：与广告检测整体的降级口径一致 —— 跳过而不是报错。
 	if (!(env?.AI && typeof env.AI.run === 'function')) return null;
 	const daily = Number(config?.llmDaily);
 	if (!Number.isFinite(daily) || daily <= 0) return null;
+	// 调用方不指名池时按 message 记账 —— 那是「消息路径」的池，
+	// 也是最该拿额度的一路；宁可把来路不明的调用记给主池，也不能记给谁都不算。
+	const pool = AD_LLM_POOLS.includes(String(options?.pool || '')) ? String(options.pool) : 'message';
+	const poolDaily = adLLMPoolLimit(config, pool);
+	if (poolDaily <= 0) return null;
 	const payload = buildAdLLMPayload(input);
 	const key = adTextHash(payload);
 	if (adLLMSeen.has(key)) return null;
 	const nowSeconds = Math.floor(Date.now() / 1000);
 	const quota = await readAdLLMQuota(env, nowSeconds);
+	// 两道闸：总池（所有轨共用的天花板）先挡，再挡本轨的分池。
+	// 顺序不能反 —— 总池打满时本池再有余量也不该继续烧，
+	// 那等于用本轨的额度把视觉识别与其他轨一起拖下水。
 	if (quota.used >= daily) return null;
+	const poolUsed = Number(quota.pools?.[pool]) || 0;
+	if (poolUsed >= poolDaily) return null;
 	let answer = null;
 	try {
 		const aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
@@ -16250,18 +16330,21 @@ async function judgeAdByLLM(env, config, input) {
 	// 无论判没判出来都记额度与去重键：解析失败同样花了 Neurons，
 	// 不记的话同一条解析不出来的载荷会被反复重试，把当天预算烧在同一个坑上。
 	adLLMSeen.add(key);
-	await writeAdScanState(env, 'llm_count', String(quota.used + 1), nowSeconds);
+	await bumpAdLLMQuota(env, quota.used + 1, pool, poolUsed + 1, nowSeconds);
+	// 解析不出来要能被看见 —— 理由见 bumpAdLLMParseFail。
+	if (!answer) await bumpAdLLMParseFail(env);
 	return answer;
 }
 
 // 叠判入口：与 applyAvatarVerdict / applyBadgeVerdict 同位、同取向 ——
 // 只动 verdict 与 reasons，恒不改 score（改了会与历史分重复计）。
-async function applyAdLLMToEvaluation(env, evaluation, config, input) {
+async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	let current = evaluation;
 	if (!current) return current;
 	// 前三层已经定罪的不再花钱。
 	if (String(current.verdict) === 'ban') return current;
-	const answer = await judgeAdByLLM(env, config, input);
+	// options 透传给 judgeAdByLLM，唯一被读的键是 pool（这一轨归哪个额度池记账）。
+	const answer = await judgeAdByLLM(env, config, input, options);
 	if (!answer || !answer.ad) return current;
 	const line = Number(config?.llmConf) || AD_LLM_CONF;
 	// 观测：这一层到底有没有在起作用，必须能在 /adstats 上直接看到 ——
@@ -16922,7 +17005,7 @@ async function rescanAdMember(env, row, options = {}) {
 	// 第四路补位：这一轨扫的是「不发言的人」，正文恒空，模型判的就是资料本身 ——
 	// 正对准「改了 bio 的潜伏号」。日限 300 人，LLM 每日上限还绰绰有余。
 	evaluation = await applyAdLLMToEvaluation(env, evaluation,
-		options.config || loadAdDetectionConfig(env), { profile, text: '' });
+		options.config || loadAdDetectionConfig(env), { profile, text: '' }, { pool: 'cron' });
 	// 写回形状与结论：pass 让下一轮能走门，observe / ban 则让门始终关着。
 	// 不碰 bio_checked_at —— 那个时间戳在判定之前已经推过一次（429 防卡死）。
 	await markAdProfileVerdict(env, userId, shape, evaluation.verdict);
@@ -17173,6 +17256,19 @@ function bytesToBase64(bytes) {
 // 那个函数只写 day 不写 count，于是「某天空跑一轮」（队列空提前 return、没走到写
 // count 那行）之后，第二天第一次读会把昨天的残留当成今天已用 —— 新轨道不复制这个隐患。
 // 这里不顺手改旧函数：它不在这次任务范围内，改它要连带复验视觉识别的额度行为。
+// 分池记账键。四个调用点各归各的池，谁也挤不掉谁 —— 详见 AD_LLM_DAILY 的说明。
+const AD_LLM_POOLS = ['message', 'join', 'cron'];
+
+// 一次消耗同时写总计数与分池计数。两笔必须在同一个函数里写完 ——
+// 拆成两个调用点的话，中间任何一步失败都会留下「总池扣了、分池没扣」的账，
+// 分池从此虚高、永远够不着上限，白分。
+async function bumpAdLLMQuota(env, nextTotal, pool, nextPoolUsed, nowSeconds) {
+	await writeAdScanState(env, 'llm_count', String(nextTotal), nowSeconds);
+	if (AD_LLM_POOLS.includes(String(pool))) {
+		await writeAdScanState(env, 'llm_pool_' + pool, String(nextPoolUsed), nowSeconds);
+	}
+}
+
 async function readAdLLMQuota(env, nowSeconds) {
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
 	const savedDay = await readAdScanState(env, 'llm_day', '');
@@ -17183,10 +17279,20 @@ async function readAdLLMQuota(env, nowSeconds) {
 		//（bumpAdLLMOutcome 写入时也判一次跨天，两头都兜住才不会残留）。
 		await writeAdScanState(env, 'llm_hits', '0', nowSeconds);
 		await writeAdScanState(env, 'llm_bans', '0', nowSeconds);
-		return { today, used: 0 };
+		await writeAdScanState(env, 'llm_parse_fail', '0', nowSeconds);
+		// 分池计数同样必须在这里清 —— 只清总计数不清池，第二天第一轮会把
+		// 昨天各池的消耗当成今天的，池额度在凌晨直接就是满的，等于白分。
+		for (const pool of AD_LLM_POOLS) {
+			await writeAdScanState(env, 'llm_pool_' + pool, '0', nowSeconds);
+		}
+		return { today, used: 0, pools: { message: 0, join: 0, cron: 0 } };
 	}
 	const used = Number(await readAdScanState(env, 'llm_count', '0')) || 0;
-	return { today, used };
+	const pools = {};
+	for (const pool of AD_LLM_POOLS) {
+		pools[pool] = Number(await readAdScanState(env, 'llm_pool_' + pool, '0')) || 0;
+	}
+	return { today, used, pools };
 }
 
 // 记第 ⑥ 层的观测计数：模型判为广告几次、其中真正达采信线几次。
@@ -17216,13 +17322,23 @@ async function bumpAdLLMOutcome(env, reachedLine) {
 // 读第 ⑥ 层的今日观测计数。只给 /adstats 用，不在任何判定路径上。
 // 与 readAdLLMQuota 同一把尺：day 不是今天就一律按 0 报，不读昨天的残留。
 async function readAdLLMOutcome(env, nowSeconds) {
-	const empty = { used: 0, hits: 0, bans: 0 };
+	const empty = { used: 0, hits: 0, bans: 0, parseFail: 0, pools: { message: 0, join: 0, cron: 0 } };
 	if (!env?.DB) return empty;
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
 	const day = await readAdScanState(env, 'llm_day', '');
 	if (day !== today) return empty;
 	const num = async (key) => Number(await readAdScanState(env, key, '0')) || 0;
-	return { used: await num('llm_count'), hits: await num('llm_hits'), bans: await num('llm_bans') };
+	const pools = {};
+	for (const pool of AD_LLM_POOLS) pools[pool] = await num('llm_pool_' + pool);
+	// parseFail：模型返回了内容但抠不出 JSON 的次数。与 hits 一起看才能分辨
+	// 「模型判 false」与「输出格式跑偏」—— 详见 bumpAdLLMParseFail。
+	return {
+		used: await num('llm_count'),
+		hits: await num('llm_hits'),
+		bans: await num('llm_bans'),
+		parseFail: await num('llm_parse_fail'),
+		pools
+	};
 }
 
 async function readAvatarVisionQuota(env, nowSeconds) {
@@ -18926,7 +19042,7 @@ async function screenAdJoinMember(env, member, options = {}) {
 		// ===== 第四路补位：前三层都没定罪时交给生成式模型 =====
 		// 入群时正文为空（他还没发过言），载荷里 message 就是空串 —— 提示词
 		// 明写「message 为空不构成怀疑理由」，所以这一路在这里判的纯粹是资料卡。
-		evaluation = await applyAdLLMToEvaluation(env, evaluation, config, { profile, text: '' });
+		evaluation = await applyAdLLMToEvaluation(env, evaluation, config, { profile, text: '' }, { pool: 'join' });
 
 		// ===== 入群检查流水：任何 verdict 都记 =====
 		// 只记命中的话，看板上对绝大多数新成员是一片空白，管理员分不清
@@ -19317,7 +19433,7 @@ async function detectAdOnMessage(message, env) {
 	// 闸一本就有同步的 bge-m3 嵌入调用，这一层不改变它的性质，只是更慢一点。
 	// cheapProfile 没有 bio（闸一是零 getChat 路径），所以这一层判的是昵称 + 正文。
 	let decision = suspectSignal
-		? await applyAdLLMToEvaluation(env, cheap, config, { profile: cheapProfile, text: text || contactName })
+		? await applyAdLLMToEvaluation(env, cheap, config, { profile: cheapProfile, text: text || contactName }, { pool: 'message' })
 		: cheap;
 	let bioVerified = false;
 	if (cheap.verdict === 'ban' && cheap.layer === 'ai' && cheap.score < config.scoreThreshold) {
@@ -19454,7 +19570,7 @@ async function detectAdOnMessage(message, env) {
 	// （text || contactName），两层看到的是同一份内容。
 	evaluation = await applyAdLLMToEvaluation(env, evaluation, config, {
 		profile, text: text || contactName
-	});
+	}, { pool: 'message' });
 
 	if (evaluation.verdict === 'ban') {
 		if (await isAdminInAnyConfiguredGroup(userId, chat.id)) {
@@ -20387,9 +20503,19 @@ async function handleAdStatsCommand(env, chatId) {
 				: '✅ 已启用　每日 <b>' + config.llmDaily + '</b> 次　采信线 <b>' + config.llmConf + '</b>　模型 ' + escapeHtml(config.llmModel))),
 		'　↳ 今日调用 <b>' + llmStat.used + '</b>/' + config.llmDaily
 			+ '　模型判为广告 <b>' + llmStat.hits + '</b> 次　其中达线处置 <b>' + llmStat.bans + '</b> 次'
-			+ (llmStat.used > 0 && llmStat.hits === 0
-				? '　⚠️ 调用有、判定 0 命中 —— 说明这一层在跑但没起作用，别当成没接上'
+			+ '　解析失败 <b>' + llmStat.parseFail + '</b> 次'
+			+ (llmStat.used > 0 && llmStat.hits === 0 && llmStat.parseFail === 0
+				? '　⚠️ 调用有、0 命中且 0 解析失败 —— 模型确实判了「不是广告」，问题在送进去的载荷内容，不在输出格式'
+				: '')
+			+ (llmStat.parseFail > 0
+				? '　⚠️ 有解析失败 —— 模型返回了内容却没抠出 JSON，这些调用等于白烧额度'
 				: ''),
+		// 分池：哪条轨吃了多少额度。旧配置三条轨共用一个 200 次的池，而入群与 cron 两条轨
+		// 没有触发门槛、送进去的 message 恒为空 —— 额度全被普通新用户吃光，
+		// 消息路径（广告真正出现的地方）一次都轮不到。摆出来才看得见分得对不对。
+		'　↳ 分池　消息 <b>' + Number(llmStat.pools?.message || 0) + '</b>/' + config.llmDailyMessage
+			+ '　入群 <b>' + Number(llmStat.pools?.join || 0) + '</b>/' + config.llmDailyJoin
+			+ '　定时扫描 <b>' + Number(llmStat.pools?.cron || 0) + '</b>/' + config.llmDailyCron,
 		'',
 		'<b>指纹库</b>　共 <b>' + fpTotal + '</b> 条'
 	];
