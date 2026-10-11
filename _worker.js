@@ -12607,6 +12607,12 @@ async function ensureAdDetectionTables(env) {
 			// 完全一致，不会出现「头像能回滚、图片回滚不了」的半边失效。
 			await runD1SchemaStatement(env, 'ad_images', 'CREATE TABLE IF NOT EXISTS ad_images (file_unique_id TEXT PRIMARY KEY, verdict TEXT NOT NULL DEFAULT \'pending\', hits INTEGER NOT NULL DEFAULT 0, file_id TEXT, kind TEXT, source TEXT, last_user_id TEXT, vision_checked_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_images_verdict', 'CREATE INDEX IF NOT EXISTS idx_ad_images_verdict ON ad_images (verdict)', { optional: true });
+			// 【2026-10-11】图片跨用户复用：记录「同一张图被谁发过」。
+			// 【为什么是独立表而不是给 ad_images 加列】加列要在建表流程里跑 d1ColumnExists，
+			// 而那条流程每条群消息都会走 —— 直接撞红「稳定态普通群消息核心 D1 SQL 不超过 3 条」
+			// 那条防退化守卫。独立表只在【有媒体的消息】上读写，普通文本消息一次都不碰。
+			await runD1SchemaStatement(env, 'ad_image_senders',
+				'CREATE TABLE IF NOT EXISTS ad_image_senders (file_unique_id TEXT NOT NULL, user_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (file_unique_id, user_id))');
 
 			// 同款会员标（emoji status）指纹库。主键是 emoji_status_custom_emoji_id。
 			//
@@ -16951,10 +16957,67 @@ function applyImageVerdict(evaluation, image) {
 // 结果与各读各的完全一致，代价只是第一次 D1 读。
 //
 // 返回值语义与 readAdImage 一致：null = 未入库（既不是 ad 也不是 clean，不参与裁决）。
+// 同一张图至少被这么多个【不同】用户发过，就标记为广告素材。
+//
+// 【为什么是 3 不是 2】正常群里两个人转同一张梗图太常见了，2 会误伤；
+// 3 个互不相干的陌生人各发一次同一张图，正常语境下几乎不发生 ——
+// 而广告组织批量投放时，同一个素材会被一批号轮流发，很容易撞到。
+const AD_IMAGE_CROSS_USER_MIN = 3;
+const AD_IMAGE_CROSS_USER_CAP = 20;
+
+// 记录「这张图又被谁发了一次」。返回 true 表示【本次刚把它标记为广告素材】。
+//
+// 【为什么要有它】moondream 视觉识别 2026-10-11 起全线失败（模型返回空对象 {}），
+// ad_images 里「广告图」恒为 0，L1 同款指纹因此没料可依 —— 图片广告一张都杀不掉。
+// 这条判据【不调任何模型、不花一个 Neurons】，用的是「跨用户复用」这个
+// moondream 也给不了的信号，作为它恢复之前的兜底；模型修好之后两者并存，
+// 谁先命中都算数。
+async function bumpAdImageSender(env, fileUniqueId, userId, row) {
+	if (!env?.DB) return false;
+	const uid = String(userId || '');
+	const key = String(fileUniqueId || '');
+	if (!uid || !key) return false;
+	// 只管「还没判过的图」。已判 clean 的是正常图（含人工 /ignore 纠错的），
+	// 已判 ad 的早已进库，两者都不该被这条路径翻案。
+	if (String(row?.verdict || '') !== 'pending') return false;
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		// INSERT OR IGNORE：同一个 file + 同一个人只留一行。
+		// 【同一个人反复发同一张图不计】广告号刷屏是一个人干的，这条判据抓的是
+		//【跨账号复用】；不排掉的话单人刷屏就能把计数顶上去，误伤正常梗图。
+		const inserted = await env.DB.prepare(
+			'INSERT OR IGNORE INTO ad_image_senders (file_unique_id, user_id, created_at) VALUES (?, ?, ?)')
+			.bind(key, uid, now).run();
+		if (!(inserted?.results?.[0]?.meta?.changes > 0)) return false;
+		const row2 = await env.DB.prepare(
+			'SELECT COUNT(*) AS c FROM ad_image_senders WHERE file_unique_id = ?').bind(key).first();
+		const senders = Number(row2?.c) || 0;
+		if (senders < AD_IMAGE_CROSS_USER_MIN) return false;
+		// verdict 仍是 pending 才改：与 upsertAdImage 同一守则，任何地方都不能把
+		// 已经定过的 ad 翻回 pending。
+		const updated = await env.DB.prepare(
+			"UPDATE ad_images SET verdict = 'ad', source = COALESCE(source, 'cross_user'), updated_at = ? "
+			+ "WHERE file_unique_id = ? AND verdict = 'pending'").bind(now, key).run();
+		if (!(updated?.results?.[0]?.meta?.changes > 0)) return false;
+		console.log('[图片跨用户复用] 同一张图被 ' + senders + ' 个用户发过，标记为广告素材',
+			JSON.stringify({ file: key.slice(0, 24) }));
+		return true;
+	} catch (error) {
+		console.error('[图片跨用户复用] 处理失败:', error);
+		return false;
+	}
+}
+
 async function loadAdImageForMessage(env, media, userId) {
 	if (!media?.fileUniqueId) return null;
 	const row = await readAdImage(env, media.fileUniqueId);
-	if (row) return row;
+	if (row) {
+		// 【2026-10-11 跨用户复用】这是图片内容判据（moondream）之外、
+		// 唯一不依赖模型的第一发之后的信号 —— 同一张图被多个【不同】用户发出来。
+		// 只在 verdict 仍是 pending 时累加：已判 clean 的是正常图、已判 ad 的早已入库。
+		if (await bumpAdImageSender(env, media.fileUniqueId, userId, row)) return { ...row, verdict: 'ad' };
+		return row;
+	}
 	// 首次见到这张图：登记成 pending，L2 视觉识别才有东西可排队。
 	// 只发生一次 —— 行存在之后就走稳定态的「只读不写」。
 	await registerAdImage(env, media, userId);

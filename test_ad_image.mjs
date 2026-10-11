@@ -592,6 +592,70 @@ section('[9] /adstats 展示正文图片指纹 + 计数守卫');
 }
 
 // ================= 汇总 =================
+// ---------- [7] 跨用户复用：不依赖 moondream 的兜底判据 ----------
+// moondream 2026-10-11 起全线失败（模型返回空对象），ad_images 里「广告图」恒为 0，
+// L1 同款指纹因此没料可依 —— 图片广告一张都杀不掉。这条判据用「同一张图被多个
+// 不同用户发过」这个信号兜底，不调模型、零 Neurons。
+console.log('\n[7] 图片跨用户复用');
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	const FILE = 'IMG_CROSS_A';
+	await W.upsertAdImage(env, FILE, { verdict: 'pending', fileId: 'F_CROSS', kind: 'photo' });
+
+	const seen = {};
+	for (const uid of ['user1', 'user2', 'user3']) {
+		seen[uid] = await W.loadAdImageForMessage(env, { fileUniqueId: FILE }, uid);
+	}
+	assert('第 1、2 个用户只记账不定罪', String(seen.user1?.verdict) === 'pending' && String(seen.user2?.verdict) === 'pending',
+		JSON.stringify([seen.user1?.verdict, seen.user2?.verdict]));
+	assert('★ 第 3 个用户发同一张图 → 标记为广告素材', String(seen.user3?.verdict) === 'ad', JSON.stringify(seen.user3));
+
+	const row = env.DB.query('SELECT verdict, source FROM ad_images WHERE file_unique_id = ?', FILE)[0];
+	assert('★ 库里 verdict = ad', String(row?.verdict) === 'ad', JSON.stringify(row));
+	assert('来源标成 cross_user（复核时能看出是这条判据定的罪）', String(row?.source) === 'cross_user', JSON.stringify(row));
+	const senders = env.DB.query('SELECT user_id FROM ad_image_senders WHERE file_unique_id = ?', FILE);
+	assert('发送者名单留痕 3 人', senders.length === 3, JSON.stringify(senders));
+}
+
+// 同一个人反复发同一张图【不计】—— 广告号刷屏是一个人干的，这条判据抓的是跨账号复用；
+// 不排掉的话单人刷屏就能把计数顶上去，误伤正常梗图。
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	const FILE = 'IMG_CROSS_B';
+	await W.upsertAdImage(env, FILE, { verdict: 'pending', fileId: 'F_B', kind: 'photo' });
+	for (let i = 0; i < 5; i++) await W.loadAdImageForMessage(env, { fileUniqueId: FILE }, 'same_user');
+	const row = env.DB.query('SELECT verdict FROM ad_images WHERE file_unique_id = ?', FILE)[0];
+	const senders = env.DB.query('SELECT user_id FROM ad_image_senders WHERE file_unique_id = ?', FILE);
+	assert('★ 同一个人发 5 次 → 仍不判定（只算 1 个发送者）',
+		String(row?.verdict) === 'pending' && senders.length === 1,
+		JSON.stringify(row) + ' senders=' + JSON.stringify(senders));
+}
+
+// 已判 clean 的图不被翻案（含人工 /ignore 纠错的）
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	const FILE = 'IMG_CROSS_C';
+	await W.upsertAdImage(env, FILE, { verdict: 'clean', fileId: 'F_C', kind: 'photo' });
+	for (const uid of ['a', 'b', 'c', 'd']) await W.loadAdImageForMessage(env, { fileUniqueId: FILE }, uid);
+	const row = env.DB.query('SELECT verdict FROM ad_images WHERE file_unique_id = ?', FILE)[0];
+	assert('★ 已判 clean 的图不被跨用户复用翻案', String(row?.verdict) === 'clean', JSON.stringify(row));
+}
+
+// 已判 ad 的图不会被重置
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	const FILE = 'IMG_CROSS_D';
+	await W.upsertAdImage(env, FILE, { verdict: 'ad', fileId: 'F_D', kind: 'photo' });
+	await W.loadAdImageForMessage(env, { fileUniqueId: FILE }, 'someone');
+	const row = env.DB.query('SELECT verdict FROM ad_images WHERE file_unique_id = ?', FILE)[0];
+	assert('已判 ad 的图不被重置', String(row?.verdict) === 'ad', JSON.stringify(row));
+}
+
+
 console.log(`\n===== 正文图片检测测试：通过 ${pass} / 失败 ${fail} =====`);
 if (fail > 0) {
 	console.log('失败项：');
