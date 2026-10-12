@@ -1944,6 +1944,13 @@ function getBanResultStats(banResults) {
 
 function formatBanSuccessResult(r) {
 	// mutedBy：'human' = 人工命令口径（/ban /spam 默认禁言）；'killer' = 杀手模式关闭状态。
+	//
+	// 【探测后主动跳过要排在最前】这一支【压根没调接口】，说成「已永久禁言」是假的 ——
+	// 2026-10-12 主人就是在 /ban 一个已在黑名单的人时，看到 14 个群全写「已永久禁言」
+	// 而实际一个都没禁。两种跳过都说清楚：已在封禁列表（目标状态已达成，这是好事）、
+	// 不在群内（预封 + 等他进来）。
+	if (r?.skipped === 'already_banned') return '已确认在群封禁列表，无需重复处置';
+	if (r?.skipped === 'not_in_group') return '已加入群封禁列表（预封，目标当前不在群内，本次未禁言）';
 	if (r?.muted) return r?.mutedBy === 'human' ? '已永久禁言（未踢出）' : '已永久禁言（杀手模式关闭，未踢出）';
 	const state = r?.memberProbe?.state;
 	if (state === 'in_group') return '已封禁并移出群聊';
@@ -21412,7 +21419,11 @@ async function handleAdStatsCommand(env, chatId) {
 				? '⏸️ 已关闭（AD_LLM_DAILY=0），前五层照跑'
 				: '✅ 已启用　每日 <b>' + config.llmDaily + '</b> 次　采信线 <b>' + config.llmConf + '</b>　模型 ' + escapeHtml(config.llmModel))),
 		'　↳ 今日调用 <b>' + llmStat.used + '</b>/' + config.llmDaily
-			+ '　模型判为广告 <b>' + llmStat.hits + '</b> 次　其中达线处置 <b>' + llmStat.bans + '</b> 次'
+			+ '　模型判为广告 <b>' + llmStat.hits + '</b> 次　其中达线 <b>' + llmStat.bans + '</b> 次'
+			// 【不写「达线处置」】2026-10-12 起达线不等于处置：还要看代码能核验的硬证据
+			//（真私有邀请链接 / 出口∧招揽同现），没有就降级观察窗口、不封禁。
+			// 写「处置」会让人以为第⑥层在自动封人，而它现在多数是「达线但降级」。
+			+ '（达线后还要看代码证据，有硬证据才封，否则进观察窗口）'
 			+ '　解析失败 <b>' + llmStat.parseFail + '</b> 次'
 			+ (llmStat.used > 0 && llmStat.hits === 0 && llmStat.parseFail === 0
 				? '　⚠️ 调用有、0 命中且 0 解析失败 —— 模型确实判了「不是广告」，问题在送进去的载荷内容，不在输出格式'

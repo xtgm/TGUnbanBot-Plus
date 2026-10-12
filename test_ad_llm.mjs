@@ -827,7 +827,7 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		const text = lastSent();
 		assert('/adstats 显示今日调用数', text.includes('今日调用'), text.slice(0, 600));
 		assert('/adstats 显示「模型判为广告」', text.includes('模型判为广告'), text.slice(0, 600));
-		assert('/adstats 显示「其中达线处置」', text.includes('其中达线处置'), text.slice(0, 600));
+		assert('/adstats 显示「其中达线」并说明达线不等于处置', text.includes('其中达线') && text.includes('有硬证据才封'), text.slice(0, 600));
 	}
 	// ⑦ 调用 >0 且 0 命中时给出提示，且必须与「解析失败」区分开
 	{
