@@ -16769,6 +16769,98 @@ function collectAdLLMHardEvidence(input) {
 	return hits;
 }
 
+// ===== 误判反例池（/ignore 的「不白判」那一半）=====
+//
+// 【治什么】此前 /ignore 只做【删除】：删指纹、删 AI 样本、删模板形状、移出黑名单。
+// 删完之后，模型下次看到【同类内容】还会再判一次 —— 因为没有任何东西告诉它
+// 「这个形态主人已经确认过是正常的」。menshen 的做法是把反例【直接写进判定提示词】，
+// 本项目改为【代码侧比对】：每次调用不膨胀 prompt（那会让 1000 次/天的调用每条多
+// 花 2 Neurons，且 prompt 越长模型越容易跑偏），代价只是达线时多一次 D1 查询。
+//
+// 【存片段不存整句】整句会因为空格、标点、emoji 差异匹配不上；存 30 字片段做
+// 【子串比对】，既能覆盖「同款改写」（换几个字、加个表情），又不会因为一个词就
+// 放行整类 —— 主人确认的是【这一段话】不是【这一个词】。
+const AD_FALSE_POSITIVE_MAX = 20;
+const AD_FALSE_POSITIVE_CLIP = 30;
+
+// 判定载荷里用于比对的正文（与 payload.text 同源，不带引用体 —— 那不是本人写的）。
+function adFalsePositiveSource(input) {
+	const profile = input?.profile || {};
+	const text = [profile.firstName, profile.lastName, profile.bio, input?.text]
+		.filter(Boolean).join(' ');
+	return normalizeAdFingerprintValue(text).slice(0, AD_FALSE_POSITIVE_CLIP);
+}
+
+// 主人 /ignore 时调用：把这次的正文片段记进反例池。
+// 【幂等】同值重复写只刷新时间，不新增行；超出上限丢最旧的，表永远很小。
+// 【绝不影响 /ignore 本职】失败只记日志，回滚照常完成。
+// 【懒建表】首次读写时自动建，不动 D1_SCHEMA_VERSION —— 与 ad_spam_texts 同一取向：
+// 这是 /ignore 的附属能力，不该因为它的 schema 变更去触发整套核心迁移。
+const D1_FP_INIT = new WeakMap();
+async function ensureAdFalsePositivesTable(env) {
+	if (!env?.DB) return false;
+	let init = D1_FP_INIT.get(env.DB);
+	if (!init) {
+		init = (async () => {
+			try {
+				await runD1SchemaStatement(env, 'ad_false_positives',
+					"CREATE TABLE IF NOT EXISTS ad_false_positives (value TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'ignore', at INTEGER NOT NULL)");
+				return true;
+			} catch (error) {
+				console.error('[广告检测] 误判反例表初始化失败:', error);
+				return false;
+			}
+		})();
+		D1_FP_INIT.set(env.DB, init);
+	}
+	const ok = await init;
+	if (!ok) D1_FP_INIT.delete(env.DB);   // 失败不缓存，下次再试
+	return ok;
+}
+
+
+async function addAdFalsePositive(env, rawText) {
+	if (!env?.DB) return 0;
+	if (!(await ensureAdFalsePositivesTable(env))) return 0;
+	const value = normalizeAdFingerprintValue(rawText).slice(0, AD_FALSE_POSITIVE_CLIP);
+	// 短于 4 字的片段比对价值为零（「签到」「你好」会把太多东西放进放行名单）
+	if (value.length < 4) return 0;
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_false_positives (value, source, at) VALUES (?, ?, ?) '
+			+ 'ON CONFLICT(value) DO UPDATE SET at = excluded.at')
+			.bind(value, 'ignore', Date.now()).run();
+		// LRU：只保留最近 N 条。按时间倒序删，超过上限的自然被淘汰。
+		await env.DB.prepare(
+			'DELETE FROM ad_false_positives WHERE value NOT IN '
+			+ '(SELECT value FROM ad_false_positives ORDER BY at DESC LIMIT ?)')
+			.bind(AD_FALSE_POSITIVE_MAX).run();
+		return 1;
+	} catch (error) {
+		console.error('[广告检测] 写入误判反例失败:', error);
+		return 0;
+	}
+}
+
+// 达线之后先问一句反例池：主人确认过的形态，模型再判也只降级。
+async function matchAdFalsePositive(env, input) {
+	if (!env?.DB) return null;
+	if (!(await ensureAdFalsePositivesTable(env))) return null;
+	const value = adFalsePositiveSource(input);
+	if (value.length < 4) return null;
+	try {
+		const rows = await env.DB.prepare(
+			'SELECT value, at FROM ad_false_positives ORDER BY at DESC').all();
+		const list = (rows && rows.results) || rows || [];
+		// 子串比对：本次正文里【包含】任何一条反例片段就算命中。
+		return list.find((r) => r && String(r.value) && value.includes(String(r.value))) || null;
+	} catch (error) {
+		console.error('[广告检测] 查询误判反例失败:', error);
+		return null;
+	}
+}
+
+
 async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	let current = evaluation;
 	if (!current) return current;
@@ -16796,6 +16888,18 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 		// 所以：模型达线 ∧ 代码验证有硬证据 → 封；只有模型一句话 → 降级观察，不封。
 		// 降级的那些写进观察窗口（/pending 可见），主人可以 /ban 手动处置 ——
 		// 而 /ban 会自动学特征（learnAdFromOperatorAction），下一次同类就能拦住。
+		// ===== 反例池优先级最高 =====
+		// 主人 /ignore 过的形态 —— 他看过完整判据后拍板说这是正常内容，
+		// 模型再判也只降级。排在硬证据之前：反例是【人给的结论】，证据是【代码算的】，
+		// 人给的结论优先。
+		const knownFP = await matchAdFalsePositive(env, input);
+		if (knownFP) {
+			return Object.assign({}, current, {
+				verdict: 'observe',
+				reasons: reasons.concat(['（已拦下：这个形态主人此前 /ignore 判过误判'
+					+ ' —— 反例片段「' + String(knownFP.value || '').slice(0, 20) + '」。模型再判也只降级）'])
+			});
+		}
 		const hardEvidence = collectAdLLMHardEvidence(input);
 		// 【不能给 reasons 重新赋值】它是 const —— 直接 `reasons = reasons.concat(...)`
 		// 会抛 Assignment to constant variable，整条检测链在 try 里炸掉、返回 result: error。
@@ -20825,6 +20929,17 @@ async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
 			continue;
 		}
 		const r = await rollbackAdPendingSnapshot(env, ownerId, seq, snapshot);
+
+			// ===== 记反例（/ignore 的「不白判」那一半）=====
+			// 回滚只是【删掉特征】—— 删完之后模型下次看到同类内容还会再判一次，
+			// 因为没有任何东西告诉它「这段话主人已经确认过是正常的」。
+			// 记下这次的正文片段，下次达线时先问反例池，命中就降级不封。
+			// 【绝不影响 /ignore 本职】失败只记日志，回滚照常完成。
+			try {
+				await addAdFalsePositive(env, String(snapshot?.text || ''));
+			} catch (error) {
+				console.error('[广告检测] /ignore 记反例失败:', error);
+			}
 		rolled += 1;
 		const fpNote = r.fp.ok
 			? ('指纹 标记 ' + (r.fp.affected || 0) + ' / 删除 ' + (r.fp.retired || 0))

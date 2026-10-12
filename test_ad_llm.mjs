@@ -986,6 +986,61 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 }
 
 // ================= 汇总 =================
+// ===== [11] 误判反例池（/ignore 的「不白判」那一半）=====
+// 【2026-10-12】此前 /ignore 只做【删除】—— 删完之后模型下次看到同类内容还会再判一次，
+// 因为没有任何东西告诉它「这段话主人已经确认过是正常的」。
+// menshen 的做法是把反例直接写进判定提示词；本项目改为【代码侧比对】，
+// 每次调用不膨胀 prompt（那会让 1000 次/天的调用每条多花 2 Neurons），
+// 代价只是达线时多一次 D1 查询。
+console.log('\n===== [11] 误判反例池 =====');
+{
+	const envFP = await makeReadyEnv();
+	const sample = '能赚钱的确实是写在刑法里的。大佬们调教好AI，找出突破口';
+
+	// ① 存片段
+	const added = await W.addAdFalsePositive(envFP, sample);
+	assert('★ /ignore 记反例', added === 1, String(added));
+	const rows = envFP.DB.query('SELECT value FROM ad_false_positives');
+	assert('★ 片段入库且截断到 30 字', rows.length === 1
+		&& String(rows[0].value).length <= 30 && String(rows[0].value).includes('刑法'), JSON.stringify(rows));
+
+	// ② 同值重复写不新增行（幂等）
+	await W.addAdFalsePositive(envFP, sample);
+	assert('★ 同值重复写只刷新时间，不新增行',
+		envFP.DB.query('SELECT COUNT(*) AS c FROM ad_false_positives')[0].c === 1);
+
+	// ③ 命中：子串比对（本次正文包含反例片段）
+	const hit = await W.matchAdFalsePositive(envFP, {
+		profile: { firstName: 'x', bio: sample }, text: '这条是引用了他的正文'
+	});
+	assert('★ 本次正文包含反例片段 → 命中', !!hit, JSON.stringify(hit));
+
+	// ④ 不命中：正文里没有那段
+	const miss = await W.matchAdFalsePositive(envFP, { profile: { firstName: 'y', bio: '' }, text: '完全无关的另一条消息' });
+	assert('★ 无关内容不命中', miss === null, JSON.stringify(miss));
+
+	// ⑤ 短片段不入库（「签到」这种会把太多东西放进放行名单）
+	const shortAdded = await W.addAdFalsePositive(envFP, '签到');
+	assert('★ 短于 4 字的片段不入库', shortAdded === 0
+		&& envFP.DB.query('SELECT COUNT(*) AS c FROM ad_false_positives')[0].c === 1);
+
+	// ⑥ 达线时反例优先级最高：命中就降级，不看硬证据
+	const envL = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.95, '疑似广告') }) });
+	await W.adDetectionReady(envL);
+	await W.addAdFalsePositive(envL, '一手货源出货微信联系');
+	const cfgL = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+	const got = await W.applyAdLLMToEvaluation(envL, { verdict: 'pass', score: 0, reasons: [] }, cfgL,
+		{ profile: { firstName: 'x', bio: '' }, text: '一手货源出货微信联系，欢迎洽谈' });
+	assert('★ 命中反例 → 降级不封', got.verdict === 'observe', JSON.stringify(got.reasons).slice(0, 300));
+	assert('★ 理由写明是主人判过的误判',
+		got.reasons.some((r) => r.includes('误判')), JSON.stringify(got.reasons).slice(0, 300));
+
+	// ⑦ LRU 上限
+	const envLRU = await makeReadyEnv();
+	for (let i = 0; i < 25; i++) await W.addAdFalsePositive(envLRU, '反例样本片段编号' + i);
+	const total = envLRU.DB.query('SELECT COUNT(*) AS c FROM ad_false_positives')[0].c;
+	assert('★ 上限 20 条（LRU 淘汰最旧的）', total === 20, 'count=' + total);
+}
 const summary = '=== 总计 ' + (pass + fail) + ' 项，通过 ' + pass + '，失败 ' + fail + ' ===';
 console.log('\n' + summary);
 // ===== [10] 第⑥层达线后的代码证据闸 =====
@@ -1035,6 +1090,8 @@ console.log('\n===== [10] 第⑥层达线后的代码证据闸 =====');
 		{ profile: { firstName: 'x', bio: '' }, text: '普通讨论' });
 	assert('★ 置信度 0.7（低于采信线）→ 仍是观察，证据闸不介入', gotC.verdict === 'observe', JSON.stringify(gotC));
 }
+
+
 
 
 if (fail) {
