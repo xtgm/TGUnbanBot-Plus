@@ -8,10 +8,7 @@ keep_vars = true
 [[d1_databases]]
 binding = "DB"								# D1 绑定名默认不可修改
 database_name = "tc033-apac"
-# database_id 不写明文 —— 它是账号内部资源标识。真实值放在 Cloudflare Dashboard 的
-# 「设置 → 环境变量」里（变量名 D1_DATABASE_ID，勾选加密），构建时由 Cloudflare 注入。
-# 【少这个变量部署会失败】wrangler 拿不到 database_id 就绑定不了 D1。
-database_id = "${D1_DATABASE_ID}"
+database_id = "eb0cdc8c-5284-4ddf-ba34-338fed1fa6f8"
 
 # Cloudflare Workers AI：广告检测第三层（语义相似度）。未绑定时检测自动降级为「评分 + 指纹」两层，不影响其它功能。
 [ai]
