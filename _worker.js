@@ -16785,7 +16785,31 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	const reason = 'AI 深度判定命中（置信度 ' + answer.confidence.toFixed(2) + '）：' + answer.reason;
 	const reasons = (current.reasons || []).concat([reason]);
 	if (answer.confidence >= line) {
-		return Object.assign({}, current, { verdict: 'ban', reasons });
+		// ===== 达线之后还要看【代码算得出的】硬证据 =====
+		//
+		// 【主人的硬口径】单特征不封。模型的判断是【生成的】不是【证据】——
+		// #6269 就是模型说「bio 含私有群邀请链接 t.me/jphrcjy」，而代码一验就穿帮：
+		// t.me/jphrcjy 是公开的用户名链接，私有邀请链接的形态是 t.me/+xxx 或
+		// t.me/joinchat/xxx（一次性、不可搜索、点进去直接进群）。
+		// 那一条评分层算出来是【-2 分】，第⑥层一句话就把它封了 12 个群。
+		//
+		// 所以：模型达线 ∧ 代码验证有硬证据 → 封；只有模型一句话 → 降级观察，不封。
+		// 降级的那些写进观察窗口（/pending 可见），主人可以 /ban 手动处置 ——
+		// 而 /ban 会自动学特征（learnAdFromOperatorAction），下一次同类就能拦住。
+		const hardEvidence = collectAdLLMHardEvidence(input);
+		// 【不能给 reasons 重新赋值】它是 const —— 直接 `reasons = reasons.concat(...)`
+		// 会抛 Assignment to constant variable，整条检测链在 try 里炸掉、返回 result: error。
+		if (hardEvidence.length) {
+			return Object.assign({}, current, {
+				verdict: 'ban',
+				reasons: reasons.concat(['（代码验证：' + hardEvidence.join('、') + '）'])
+			});
+		}
+		return Object.assign({}, current, {
+			verdict: 'observe',
+			reasons: reasons.concat(['（已拦下：模型判为广告且够采信线，但【代码算不出任何硬证据】'
+				+ '—— 没有私有群邀请链接，也没有引流出口与招揽同现。降级为观察，不封禁）'])
+		});
 	}
 	if (answer.confidence >= AD_LLM_OBSERVE_CONF) {
 		// 低于采信线只提观察：模型输出「是广告」却只有 0.5 把握是常态，

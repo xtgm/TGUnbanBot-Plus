@@ -431,7 +431,7 @@ section('[6] 接线：入群线 / 消息线 / 复查线都真的调用了第四�
 		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.97, 'bio 挂着引流话术') }) });
 		await W.adDetectionReady(env);
 		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
-			id: body?.chat_id, first_name: '干净名字', username: '', bio: '喜欢摄影和徒步'
+			id: body?.chat_id, first_name: '干净名字', username: '', bio: '有问题找 @joinbuyer888 日结'
 		} } }) });
 		const result = await W.screenAdJoinMember(env, { id: 771001, is_bot: false, first_name: '干净名字' }, {
 			chatId: GROUP_ID, chatTitle: '测试群', messageId: null,
@@ -453,7 +453,7 @@ section('[6] 接线：入群线 / 消息线 / 复查线都真的调用了第四�
 		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
 			id: body?.chat_id, first_name: '小明', username: '', bio: ''
 		} } }) });
-		await send(groupMessage({ id: 771002, first_name: '小明' }, '来替我收米 一天9千'), env);
+		await send(groupMessage({ id: 771002, first_name: '小明' }, '来替我收米 一天9千 加我详聊 @mibuyer888 日结'), env);
 		const row = env.DB.query('SELECT reason FROM blacklist WHERE id = ?', '771002');
 		assert('消息线：样本外话术靠第四路定罪（这正是线上 0 分漏掉的那类）',
 			row.length === 1, JSON.stringify(row));
@@ -467,7 +467,7 @@ section('[6] 接线：入群线 / 消息线 / 复查线都真的调用了第四�
 		env.DB.prepare('INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at, profile_hash, last_verdict) VALUES (?,?,?,?,?,?,?,?,?,?)')
 			.bind('771003', GROUP_ID, '潜伏号', '', '', 1, 1, 0, 'h0', '').run();
 		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
-			id: body?.chat_id, first_name: '潜伏号', username: '', bio: '改过的广告简介'
+			id: body?.chat_id, first_name: '潜伏号', username: '', bio: '有问题找 @rescanbuyer888 日结'
 		} } }) });
 		const r = await W.rescanAdMember(env, {
 			user_id: '771003', chat_id: GROUP_ID, first_name: '潜伏号', last_name: '', username: '',
@@ -675,8 +675,12 @@ section('[9] 闸一可疑但不够封时同步调第⑥层');
 		await prime(env, 771201, 60);   // 60 秒前查过：原档位 7200 与新冷却 600 都没到期 → 闸二不进
 		await send(groupMessage({ id: 771201, first_name: '闸一可疑用户甲' }, SUSPECT_TEXT), env);
 		assert('★ 冷却中且闸二不进 → 闸一这一层调到了第⑥层', ai.llmCalls >= 1, 'llmCalls=' + ai.llmCalls);
-		const row = env.DB.query('SELECT reason FROM blacklist WHERE id = ?', '771201');
-		assert('★ 模型达采信线 → 闸一就地封禁（不用等闸二）', row.length === 1, JSON.stringify(row));
+		// 证据闸拦下之后走的是【观察窗口】不是黑名单 —— 断言对象要跟着换，
+		// 否则会看到「没封」就误以为功能坏了。
+		const scr = env.DB.query('SELECT user_id FROM ad_user_screening WHERE user_id = ?', '771201');
+		// 样本「🔥今天天气真好🔥」没有硬证据（无私有邀请链接、无出口∧招揽），
+		// 按 2026-10-12 的证据闸：达线也只进观察窗口，不就地封禁。
+		assert('★ 模型达采信线 → 闸一就地进观察窗口（无硬证据不封）', scr.length === 1, JSON.stringify(scr));
 	}
 	// ② 0 正分 → 一个调用都不发（稳态保护，占绝大多数的普通聊天）
 	{
@@ -984,6 +988,55 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 // ================= 汇总 =================
 const summary = '=== 总计 ' + (pass + fail) + ' 项，通过 ' + pass + '，失败 ' + fail + ' ===';
 console.log('\n' + summary);
+// ===== [10] 第⑥层达线后的代码证据闸 =====
+// 【2026-10-12 线上误封 #6269】用户 7303290631「初照」，正文只有一个「签到」，
+// bio 是「私聊请 @chuzhaoxi_bot 或 t.me/jphrcjy」。评分层算出【-2 分】明确不是广告，
+// 第⑥层却单独定罪（置信度 0.90），理由是「bio 中包含私有群邀请链接 t.me/jphrcjy」。
+// 而代码一验就穿帮：t.me/jphrcjy 是公开的用户名链接，私有邀请链接的形态是
+// t.me/+xxx 或 t.me/joinchat/xxx（一次性、不可搜索、点进去直接进群）。
+// 主人的硬口径：【单特征不封】—— 模型的判断是生成的，不是证据。
+console.log('\n===== [10] 第⑥层达线后的代码证据闸 =====');
+{
+	// ① collectAdLLMHardEvidence 逐形态验证
+	assert('#6269 的 bio（公开链接）不算硬证据',
+		W.collectAdLLMHardEvidence({ profile: { bio: '私聊请 @chuzhaoxi_bot 或 t.me/jphrcjy' }, text: '签到' }).length === 0,
+		JSON.stringify(W.collectAdLLMHardEvidence({ profile: { bio: '私聊请 @chuzhaoxi_bot 或 t.me/jphrcjy' }, text: '签到' })));
+	assert('真私有群邀请链接算硬证据',
+		W.collectAdLLMHardEvidence({ profile: { bio: '' }, text: '进群 https://t.me/+giwR6i9pU' }).includes('私有群邀请链接'));
+	assert('joinchat 形态同样算',
+		W.collectAdLLMHardEvidence({ profile: { bio: '' }, text: 'https://t.me/joinchat/AAAAAE' }).includes('私有群邀请链接'));
+	assert('引流出口 + 招揽同现算硬证据',
+		W.collectAdLLMHardEvidence({ profile: { bio: '收购网赚老号 日结5000' }, text: '联系我 @seller888' }).includes('引流出口与招揽同现'));
+	assert('只有出口没有招揽 → 不算（单特征不封）',
+		W.collectAdLLMHardEvidence({ profile: { bio: '' }, text: '有问题找 @someone888' }).length === 0,
+		JSON.stringify(W.collectAdLLMHardEvidence({ profile: { bio: '' }, text: '有问题找 @someone888' })));
+	assert('空载荷不算', W.collectAdLLMHardEvidence({}).length === 0);
+
+	// ② 裁决：达线 + 无证据 → observe（不封），且理由写明
+	const envA = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.90, 'bio 中包含私有群组邀请链接 t.me/jphrcjy') }) });
+	const cfgA = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+	const gotA = await W.applyAdLLMToEvaluation(envA, { verdict: 'pass', score: -2, reasons: [] }, cfgA,
+		{ profile: { firstName: '初照', lastName: '', username: 'chuzhaoxi_bot', bio: '私聊请 @chuzhaoxi_bot 或 t.me/jphrcjy' }, text: '签到' });
+	assert('★ #6269 线上样本 → 不封（模型说的私有邀请链接是假的）', gotA.verdict === 'observe', JSON.stringify(gotA.reasons).slice(0, 300));
+	assert('★ 理由写明为什么没封', gotA.reasons.some((r) => r.includes('代码算不出任何硬证据')), JSON.stringify(gotA.reasons).slice(0, 300));
+
+	// ③ 达线 + 有硬证据 → 封，且理由带上代码验证
+	const envB = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.95, '引流广告') }) });
+	const cfgB = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+	const gotB = await W.applyAdLLMToEvaluation(envB, { verdict: 'pass', score: 0, reasons: [] }, cfgB,
+		{ profile: { firstName: 'x', bio: '' }, text: '进群 https://t.me/+giwR6i9pU 一手货源' });
+	assert('★ 达线 + 真私有邀请链接 → 封', gotB.verdict === 'ban', JSON.stringify(gotB.reasons).slice(0, 300));
+	assert('★ 理由带上代码验证出的证据', gotB.reasons.some((r) => r.includes('代码验证')), JSON.stringify(gotB.reasons).slice(0, 300));
+
+	// ④ 低于采信线那一档行为不变（不受证据闸影响）
+	const envC = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.7, '有点像广告') }) });
+	const cfgC = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+	const gotC = await W.applyAdLLMToEvaluation(envC, { verdict: 'pass', score: 0, reasons: [] }, cfgC,
+		{ profile: { firstName: 'x', bio: '' }, text: '普通讨论' });
+	assert('★ 置信度 0.7（低于采信线）→ 仍是观察，证据闸不介入', gotC.verdict === 'observe', JSON.stringify(gotC));
+}
+
+
 if (fail) {
 	console.log('失败项：\n - ' + failures.join('\n - '));
 	process.exit(1);
