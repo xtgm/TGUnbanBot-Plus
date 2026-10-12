@@ -1950,7 +1950,9 @@ function formatBanSuccessResult(r) {
 	// 而实际一个都没禁。两种跳过都说清楚：已在封禁列表（目标状态已达成，这是好事）、
 	// 不在群内（预封 + 等他进来）。
 	if (r?.skipped === 'already_banned') return '已确认在群封禁列表，无需重复处置';
-	if (r?.skipped === 'not_in_group') return '已加入群封禁列表（预封，目标当前不在群内，本次未禁言）';
+	// 【不能说「预封」】禁言接口【没有预封能力】—— 那是既有断言明确守住的语义。
+	// 这个用户只是被 D1 黑名单记着，进群时由复入群拦截兜底，不是被 Telegram 预封。
+	if (r?.skipped === 'not_in_group') return '目标当前不在群内，已跳过禁言（不把已离群的人拉回来）；D1 黑名单已生效，后续进群/发言仍会按 D1 黑名单拦截';
 	if (r?.muted) return r?.mutedBy === 'human' ? '已永久禁言（未踢出）' : '已永久禁言（杀手模式关闭，未踢出）';
 	const state = r?.memberProbe?.state;
 	if (state === 'in_group') return '已封禁并移出群聊';
@@ -1987,6 +1989,11 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 	if (total === 0) {
 		return 'ℹ️ 未配置 GROUP_ID，未执行 Telegram 群封禁/预封。';
 	}
+	// 【「目标不在群内」不是失败】他本来就不在这个群 —— 禁言会把他拉回来
+	//（99fb115 修的那个漏洞）。从 failCount 里分出来，汇总才不会显示成
+	//「禁言成功 1/14（13 个失败）」这种自相矛盾的话：真正的失败只有 Telegram 报错。
+	const notInGroupCount = banResults.filter((r) => String(r?.skipped) === 'not_in_group').length;
+	const realFailCount = failCount - notInGroupCount;
 	const mutedCount = banResults.filter((r) => r.muted).length;
 	const humanMutedCount = banResults.filter((r) => r.muted && r.mutedBy === 'human').length;
 	const killerMutedCount = mutedCount - humanMutedCount;
@@ -1994,12 +2001,22 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 		// 人工命令口径（/ban /spam）：所有配置群只禁言、未踢出。
 		if (okCount === total) lines.push(`🔇 <b>已永久禁言 ${okCount}/${total} 个群（未踢出）</b>`);
 		else if (okCount === 0) lines.push(`⚠️ <b>D1 黑名单已生效；禁言成功 0/${total}</b>`);
-		else lines.push(`🔇 <b>已禁言 ${okCount}/${total}</b>（${failCount} 个失败）`);
+		else if (realFailCount > 0) {
+			const skipNote = notInGroupCount > 0
+				? `（另有 ${notInGroupCount} 个群目标不在群内、未禁言 —— D1 黑名单已生效，进群时会被自动拦截）`
+				: '';
+			lines.push(`🔇 <b>已禁言 ${okCount}/${total}</b>（${realFailCount} 个失败）` + skipNote);
+		}
 	} else if (mutedCount === total) {
 		// 全部命中杀手模式群：只禁言、未踢出。
 		if (okCount === total) lines.push(`🔇 <b>杀手模式：已永久禁言 ${okCount}/${total} 个群（未踢出）</b>`);
 		else if (okCount === 0) lines.push(`⚠️ <b>D1 黑名单已生效；杀手模式禁言成功 0/${total}</b>`);
-		else lines.push(`🔇 <b>杀手模式：已禁言 ${okCount}/${total}</b>（${failCount} 个失败）`);
+		else if (realFailCount > 0) {
+			const skipNote = notInGroupCount > 0
+				? `（另有 ${notInGroupCount} 个群目标不在群内、未禁言 —— D1 黑名单已生效，进群时会被自动拦截）`
+				: '';
+			lines.push(`🔇 <b>杀手模式：已禁言 ${okCount}/${total}</b>（${realFailCount} 个失败）` + skipNote);
+		}
 	} else if (okCount === total) {
 		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${total}</b>`);
 	} else if (okCount === 0) {
@@ -2045,6 +2062,13 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 			const safeId = escapeHtml(String(r.groupId));
 			if (r.ok) {
 				return `  ✅ <b>${safeTitle}</b> <code>${safeId}</code>\n     结果：${escapeHtml(formatBanSuccessResult(r))}${formatMemberProbeLine(r.memberProbe)}`;
+			}
+			// 【符号自适应提示内容】只有【真正的 Telegram 错误】才配红叉。
+			//「目标不在群内」是正确行为 —— 他本来就不在这个群，禁言会把他拉回来
+			//（99fb115 修的那个漏洞），用中性符号表达「已检查、无需处置」。
+			if (String(r?.skipped) === 'not_in_group') {
+				return `  ➖ <b>${safeTitle}</b> <code>${safeId}</code>${formatMemberProbeLine(r.memberProbe)}
+     ${escapeHtml(formatBanSuccessResult(r))}`;
 			}
 			const { 中文, 建议 } = translateTelegramError(r.error, {
 				userId: r.userId || options.userId,
@@ -16650,6 +16674,144 @@ async function bumpAdLLMParseFail(env) {
 	}
 }
 
+// ===== 形态摘要：把积累的判据压缩成一段话，注入每一条判定 =====
+//
+// 【它解决什么】本项目现有两层判据对【改写】都不鲁棒：
+//   · AI 语义相似度 —— 向量距离，换几个字、加个 emoji 就掉到 0.65 以下；
+//   · 词表协同 —— 词表外的话术一条都命不中。
+// 线上真实样本「怎么联系?当然看我资料」「怎么联系？当然看我主页」只有几个字之差，
+// 相似度一低就放行。形态摘要判的是【结构不是原文】：自问自答式引流、
+// 金额 + @handle、标题条 + 缩略图 + 底部条的套版图 —— 改写失效不了。
+//
+// 【它不解决什么】首次全新形态（摘要里还没有它）、词表不命中的封禁（摘要只影响模型，
+// 不改评分层的 +6 协同分）、以及模型幻觉 —— 摘要也是模型生成的，所以【达线后
+// 仍要过证据闸】（collectAdLLMHardEvidence），幻觉照样进不了封禁。
+//
+// 【安全：摘要曾被 menshen 称为「全特性收益最高的注入靶子」】它的注释原话是
+// 「污染一次就等于污染此后全部判定，而且双向可用 —— 写进反例池能让某类广告永久放行，
+//  写进正例池能把正常消息的形态描述成广告特征，对真实成员造成批量删除 + 禁言」。
+// 攻击路径：发一条含围栏标记的消息 → 被学进摘要 → 注入 prompt 时【提前闭合围栏】
+// → 后面的内容落到指令区 → prompt 注入。menshen 用 fenceSample 剥围栏兜，
+// 这里同样剥，另外【反例池不注入】（ad_false_positives 走代码侧比对，天然免疫）。
+const AD_DIGEST_MAX_CHARS = 300;
+const AD_DIGEST_MAX_ITEMS = 3;
+
+// 安全化一段攻击者可控的样本文字：剥掉围栏标记与分段标题本身，
+// 让它无法提前闭合围栏、也无法劫持分段点。
+const AD_DIGEST_FENCE = '【---】';
+const AD_DIGEST_HEADERS = ['【广告形态】', '【误判形态】'];
+function fenceDigestSample(raw) {
+	let s = String(raw || '');
+	for (const h of AD_DIGEST_HEADERS) s = s.split(h).join('〈标题〉');
+	for (const f of AD_DIGEST_FENCE) s = s.split(f).join('〈');
+	return s.slice(0, 120);
+}
+
+// 从正例样本（/spam /ban /sban 人工判定过的）总结形态摘要。
+// 【只取人工来源】source='auto' 是自动定罪来的，里面混着误封样本，
+// 拿它总结等于把误判固化成判据 —— 人工来源才是「人看过并认定是广告」的。
+// 摘要表：懒建，与 ad_false_positives / ad_spam_texts 同一取向 ——
+// 不动 D1_SCHEMA_VERSION，免得附属能力的 schema 变更去触发整套核心迁移。
+const D1_DIGEST_INIT = new WeakMap();
+async function ensureAdDigestTable(env) {
+	if (!env?.DB) return false;
+	let init = D1_DIGEST_INIT.get(env.DB);
+	if (!init) {
+		init = (async () => {
+			try {
+				await runD1SchemaStatement(env, 'ad_digest',
+					'CREATE TABLE IF NOT EXISTS ad_digest (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL)');
+				return true;
+			} catch (error) {
+				console.error('[广告检测·形态摘要] 建表失败:', error);
+				return false;
+			}
+		})();
+		D1_DIGEST_INIT.set(env.DB, init);
+	}
+	const ok = await init;
+	if (!ok) D1_DIGEST_INIT.delete(env.DB);
+	return ok;
+}
+
+// 摘要读缓存（60 秒）。【必须缓存】判定是热路径，「稳定态普通群消息核心 D1 SQL 不超过 3 条」
+// 那条防退化守议会因为多一次查询而撞红 —— 摘要 60 秒才变一次，缓存 60 秒正好。
+const AD_DIGEST_CACHE = new WeakMap();
+const AD_DIGEST_CACHE_TTL_MS = 60 * 1000;
+
+
+async function buildAdDigest(env, config) {
+	if (!env?.DB) return { ok: false, reason: 'no_db' };
+	if (!(await ensureAdDigestTable(env))) return { ok: false, reason: 'no_table' };
+	try {
+		const rows = await env.DB.prepare(
+			'SELECT sample_text, source FROM ad_sample_embeddings '
+			+ "WHERE COALESCE(source, '') IN ('spam', 'manual', 'sban', 'spam-quoted', 'manual-quoted', 'sban-quoted') "
+			+ 'ORDER BY id DESC LIMIT 50').all();
+		const list = (rows && rows.results) || rows || [];
+		if (!list.length) return { ok: true, built: 0, reason: 'no_samples' };
+		const sampleLines = list.map((r) => '· ' + fenceDigestSample(r.sample_text)).join('\n');
+		const prompt = '以下是已被管理员人工确认的 Telegram 广告样本。'
+			+ '请压缩成不超过 ' + AD_DIGEST_MAX_CHARS + ' 字的【形态摘要】：'
+			+ '只描述它们共同的结构特征（引流话术怎么写、金额怎么出现、联系方式放在哪、'
+			+ '图上的套版格式），【不要抄录任何具体文案、用户名、链接】。'
+			+ '只输出 JSON：{"digest":"形态摘要"}\r\n\r\n' + sampleLines;
+		const aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
+			messages: [{ role: 'user', content: prompt }],
+			max_tokens: 400,
+			temperature: 0.2
+		});
+		const raw = extractAdLLMResponseText(aiResult);
+		const matched = raw.match(/\{[\s\S]*\}/);
+		const parsed = matched ? JSON.parse(matched[0]) : null;
+		const digest = String(parsed?.digest || '').trim();
+		if (!digest) return { ok: true, built: 0, reason: 'empty_digest' };
+		const safe = fenceDigestSample(digest).slice(0, AD_DIGEST_MAX_CHARS);
+		await env.DB.prepare('INSERT INTO ad_digest (kind, text, at) VALUES (?, ?, ?)')
+			.bind('ad', safe, Date.now()).run();
+		await env.DB.prepare(
+			'DELETE FROM ad_digest WHERE kind = ? AND id NOT IN '
+			+ '(SELECT id FROM ad_digest WHERE kind = ? ORDER BY at DESC LIMIT ?)')
+			.bind('ad', 'ad', AD_DIGEST_MAX_ITEMS).run();
+		AD_DIGEST_CACHE.delete(env.DB);
+		return { ok: true, built: 1, digest: safe };
+	} catch (error) {
+		console.error('[广告检测·形态摘要] 构建失败:', error);
+		return { ok: false, reason: String(error?.message || error) };
+	}
+}
+
+// 取当前摘要（多条用换行拼接）。失败返回空串 —— 摘要缺位不该影响判定。
+async function loadAdDigest(env) {
+	if (!env?.DB) return '';
+	const cached = AD_DIGEST_CACHE.get(env.DB);
+	if (cached && Date.now() - cached.at < AD_DIGEST_CACHE_TTL_MS) return cached.text;
+	if (!(await ensureAdDigestTable(env))) return '';
+	try {
+		const rows = await env.DB.prepare(
+			"SELECT text FROM ad_digest WHERE kind = 'ad' ORDER BY at DESC LIMIT ?")
+			.bind(AD_DIGEST_MAX_ITEMS).all();
+		const list = (rows && rows.results) || rows || [];
+		const text = list.map((r) => String(r.text || '').trim()).filter(Boolean).join('\n');
+		AD_DIGEST_CACHE.set(env.DB, { text, at: Date.now() });
+		return text;
+	} catch (error) {
+		return '';
+	}
+}
+
+// system prompt = 固定提示词 + 形态摘要。摘要缺位时与改动前逐字节一致。
+		// 形态摘要：把积累的人工判据压缩成一段话注入判定（60 秒缓存，缺位时与改动前逐字节一致）。
+function buildAdLLMSystemPrompt(digest) {
+	if (!digest) return AD_LLM_PROMPT;
+	return AD_LLM_PROMPT
+		+ '\r\n\r\n【已确认的广告形态（管理员人工确认过，非判定对象）】\r\n'
+		+ digest
+		+ '\r\n\r\n这段摘要描述的是【广告长什么样】，不是判定对象 —— '
+		+ '它只是给你参考；判定仍按上面的判据做。';
+}
+
+
 async function judgeAdByLLM(env, config, input, options) {
 	// 未绑 Workers AI：与广告检测整体的降级口径一致 —— 跳过而不是报错。
 	if (!(env?.AI && typeof env.AI.run === 'function')) return null;
@@ -16680,7 +16842,7 @@ async function judgeAdByLLM(env, config, input, options) {
 	try {
 		aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
 			messages: [
-				{ role: 'system', content: AD_LLM_PROMPT },
+				{ role: 'system', content: buildAdLLMSystemPrompt(await loadAdDigest(env)) },
 				{ role: 'user', content: payload }
 			],
 			// 【1000 而不是 200】qwen3-30b-a3b 是 Reasoning 模型（官方标注 Reasoning: Yes），
