@@ -15687,7 +15687,12 @@ async function addAdSample(env, rawText, options = {}) {
 		AD_SAMPLE_EMBEDDING_CACHE.delete(env.DB);
 		return { ok: true, added: true, text };
 	} catch (error) {
-		console.error('[广告检测] 添加语义样本失败:', error);
+		// 必须把 error.message 显式拼进日志 —— Cloudflare 的 console.error(prefix, error)
+		// 只留下调用栈，D1 的真实错误描述会被丢掉，线上排查时冒号后面全是栈、没有因。
+		// 实测线上两条失败日志都长这样，根因一个字都看不到：
+		//   [广告检测] 添加语义样本失败:     at D1DatabaseSessionAlwaysPrimary._sendOrThrow ...
+		console.error('[广告检测] 添加语义样本失败: message=' + String(error?.message || error)
+			+ ' | ' + String(error?.stack || '').replace(/\s+/g, ' ').slice(0, 400));
 		return { ok: false, reason: 'error' };
 	}
 }
@@ -22609,7 +22614,11 @@ async function recordStatAction(env, chatId, kind, nowMs = Date.now()) {
 			'INSERT INTO stat_actions (chat_id, day, kind, cnt, updated_at) VALUES (?, ?, ?, 1, ?) '
 			+ 'ON CONFLICT(chat_id, day, kind) DO UPDATE SET cnt = cnt + 1, updated_at = excluded.updated_at'
 		).bind(String(chatId), day, kind, Math.floor(nowMs / 1000)).run();
-	} catch (error) { console.error('[群统计] 记录风控处置失败:', error); }
+	} catch (error) {
+		// 同 addAdSample：必须显式拼 error.message，否则日志只剩栈、看不到 D1 真实错误。
+		console.error('[群统计] 记录风控处置失败: message=' + String(error?.message || error)
+			+ ' | ' + String(error?.stack || '').replace(/\s+/g, ' ').slice(0, 400));
+	}
 }
 
 // 查一段区间（含端点，统计时区 YYYY-MM-DD）内的两格计数。表还没建过 = 从未处置过 = 全 0。
