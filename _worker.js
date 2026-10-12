@@ -6354,7 +6354,13 @@ function isTelegramServiceMessage(message) {
 const MODERATION_TEXT_MIN_LENGTH = 1;
 
 function buildModerationTextKey(message) {
-	const raw = String(message?.text ?? message?.caption ?? '').trim();
+	// 【2026-10-12 接第六类正文来源】checklist 是与 text/caption 互斥的字段，
+	// 清单消息的 text 恒为 undefined —— 这里漏读的后果是【整条同款链路对清单失效】：
+	// /spam 引用清单时 key 为 null（写不进名单），清单消息再来时 spamHit 恒 false
+	//（同款直封不触发）。主人都 /spam 过了，同款照发不误。
+	// 【改这一处就够】recordSpamText（/spam 学）与 cacheModerationMessage（同款直封）
+	// 都调这个函数；extractAdChecklistText 对非清单消息返回空串，其余消息逐字节不变。
+	const raw = String(message?.text ?? message?.caption ?? extractAdChecklistText(message)).trim();
 	if (!raw) return null;
 	// 斜杠命令永不参与连带：命令文本是操作指令而非广告内容，
 	// 与 extractAdFingerprintCandidates 里那道过滤同源（管理员 /ban 自噬事故）。
@@ -6826,9 +6832,11 @@ async function recordHandledAdText(env, rawText) {
 // 重发形态正是「引用主人的命令消息 + 自己贴广告正文」，所以两边都要看。
 async function matchHandledAdText(env, message) {
 	if (!env?.DB) return false;
+	// 同上：清单消息的 text 是 undefined，不接 checklist 就永远匹配不上已处置名单。
 	const candidates = [
-		String(message?.text ?? message?.caption ?? ''),
-		String(message?.reply_to_message?.text ?? message?.reply_to_message?.caption ?? '')
+		String(message?.text ?? message?.caption ?? extractAdChecklistText(message)),
+		String(message?.reply_to_message?.text ?? message?.reply_to_message?.caption
+			?? extractAdChecklistText(message?.reply_to_message))
 	].map((t) => normalizeAdFingerprintValue(t)).filter((t) => t.length >= 6);
 	if (!candidates.length) return false;
 	try {
@@ -8979,7 +8987,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			try {
 			// 学习逻辑已抽成 learnAdFromOperatorAction（/spam /ban /sban 三条命令共用），
 			// 这里只传【引用的那条消息】+ source='spam'，三段内容与改动前逐字一致。
-			const spamTextForLearn = String(repliedMsg.text || repliedMsg.caption || '');
+			// 清单消息的 text 是 undefined，接上 checklist 才学得到正文（同 buildModerationTextKey）。
+			const spamTextForLearn = String(repliedMsg.text || repliedMsg.caption || extractAdChecklistText(repliedMsg));
 			const spamLearn = await learnAdFromOperatorAction(env, repliedUserId, repliedMsg, {
 				source: 'spam',
 				createdBy: String(operatorId ?? ''),
@@ -14776,7 +14785,10 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 	const createdBy = String(options.createdBy || '');
 	const out = { learned: 0, sampleAdded: 0, enriched: 0 };
 	try {
-		const text = String(options.text ?? message?.text ?? message?.caption ?? '');
+		// checklist 是与 text/caption 互斥的第六类正文来源 —— /spam /ban /sban 引用【清单】时
+		// message.text 恒为 undefined，不接它就只学得到一张空正文的资料卡。
+		const text = String(options.text ?? message?.text ?? message?.caption
+			?? extractAdChecklistText(message));
 		const profile = await fetchAdUserProfile(targetUserId, message?.from || {});
 		const name = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
 		const payload = {
@@ -16721,6 +16733,42 @@ async function judgeAdByLLM(env, config, input, options) {
 
 // 叠判入口：与 applyAvatarVerdict / applyBadgeVerdict 同位、同取向 ——
 // 只动 verdict 与 reasons，恒不改 score（改了会与历史分重复计）。
+// ===== 第⑥层单独定罪所需的【代码可核验】硬证据 =====
+//
+// 【治什么】2026-10-12 线上快照 #6269：用户 7303290631「初照」，正文只有一个「签到」，
+// bio 是「私聊请 @chuzhaoxi_bot 或 t.me/jphrcjy」。
+//   · 评分层算出来【-2 分】，明确判定不是广告；
+//   · 第⑥层却单独定罪（置信度 0.90），理由是「bio 中包含私有群组邀请链接 t.me/jphrcjy」。
+// 而【代码一验就是假的】：t.me/jphrcjy 是公开的用户名链接，私有邀请链接的形态是
+// t.me/+xxx 或 t.me/joinchat/xxx（一次性、不可搜索、点进去直接进群）。
+// 实测：t.me/jphrcjy → false，t.me/+giwR6i… → true，t.me/username → false。
+//
+// 根因是主人反复强调的那条：【单特征不封】。模型的判断是【生成的】不是【证据】，
+// 它说「这是私有邀请链接」而代码一验就穿帮 —— 这种话不能拿来封人。
+// 所以达线之后还要看【代码算得出来的】硬证据，两者都成立才动手。
+//
+// 【只认能被代码验证的】不放任何「模型说像」的东西进来：
+//   ① 真私有群邀请链接 —— 形态写死在 AD_PRIVATE_INVITE_RE，一次都骗不过
+//   ② 引流出口 ∧ 招揽动作 —— 两类同现，与结构查杀同口径
+function collectAdLLMHardEvidence(input) {
+	const profile = input?.profile || {};
+	const text = [profile.firstName, profile.lastName, profile.bio, input?.text]
+		.filter(Boolean).join(' ');
+	if (!text.trim()) return [];
+	const hits = [];
+	// ① 真私有群一次性邀请链接：正常人发的是 t.me/username，不是 t.me/+xxx
+	if (hasAdPrivateInviteLink(text)) hits.push('私有群邀请链接');
+	// ② 引流出口（@handle / 电话）∧ 招揽动作（强交易动词 / 收益承诺 / 招揽词）
+	const hasExit = /@[A-Za-z0-9_]{4,}/.test(text) || /[+\d][\d\s-]{9,}/.test(text);
+	if (hasExit
+		&& (countAdKeywordHits(text, AD_TRADE_VERBS).length
+			|| AD_MONEY_GAIN_RE.test(text)
+			|| AD_MONEY_SOLICIT_RE.test(text))) {
+		hits.push('引流出口与招揽同现');
+	}
+	return hits;
+}
+
 async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	let current = evaluation;
 	if (!current) return current;

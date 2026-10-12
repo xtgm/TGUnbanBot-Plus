@@ -343,6 +343,43 @@ section('[5] 空消息仍早退 —— 不因这次改动放宽闸门');
 
 // ================= 收尾 =================
 console.log('\n========================================');
+// ================= [5] 清单消息的同款链路（/spam 学 + 同款直封）=================
+// 【2026-10-12】主人线上现象：/spam 引用清单之后，同款清单照发不误。
+// 根因：buildModerationTextKey 只读 text/caption，而清单消息的 text 恒为 undefined
+// → key 为 null → 写不进 ad_spam_texts → 再来时 spamHit 恒 false。
+// 这是「checklist 正文来源」老缺口的【第三处】（前两处在检测链路，早已修好）。
+section('[5] 清单消息的同款链路');
+{
+	const env5 = makeEnv();
+	await W.adDetectionReady(env5);   // 建齐 moderation_messages / ad_spam_texts 等表
+
+	const listMsg = adChecklistMessage({ id: 51 }, AD_TASKS, AD_TITLE);
+	const listKey = W.buildModerationTextKey(listMsg);
+	assert('★ 清单消息能算出同款 key（此前恒 null）',
+		!!listKey && String(listKey.norm).includes('假钞'), JSON.stringify(listKey).slice(0, 160));
+
+	await W.ensureAdSpamTextsTable(env5);
+	await W.recordSpamText(env5, listMsg);
+	const listRows = env5.DB.query('SELECT text_norm FROM ad_spam_texts');
+	assert('★ /spam 引用清单 → 正文写进同款名单（此前写的是空串、被门槛拦掉）',
+		listRows.length >= 1 && listRows.some((r) => String(r.text_norm).includes('假钞')),
+		JSON.stringify(listRows).slice(0, 200));
+
+	const againCached = await W.cacheModerationMessage(env5,
+		adChecklistMessage({ id: 52 }, AD_TASKS, AD_TITLE), {});
+	assert('★ 同款清单写进缓存时正文不为空（此前恒空）',
+		!!againCached?.norm && String(againCached.norm).includes('假钞'),
+		JSON.stringify(againCached).slice(0, 160));
+
+	// 对照组：文本消息的取文不受影响
+	const txtKey = W.buildModerationTextKey({ message_id: 903, text: '清仓大甩卖token 0.01x 看头' });
+	assert('★ 对照：文本消息的 norm 照旧算得出来',
+		!!txtKey && txtKey.norm === '清仓大甩卖token 0.01x 看头', JSON.stringify(txtKey));
+	// 门槛与斜杠命令两条不变
+	assert('raw 为空仍返回 null', W.buildModerationTextKey({ text: '' }) === null && W.buildModerationTextKey({}) === null);
+	assert('斜杠命令永不进同款名单', W.buildModerationTextKey({ text: '/ban 123456' }) === null);
+}
+
 if (fail) {
 	console.log(`checklist 检测测试：通过 ${pass} / 失败 ${fail}`);
 	for (const f of failures) console.log('  ✗ ' + f);
