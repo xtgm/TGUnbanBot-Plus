@@ -408,7 +408,7 @@ section('[6] runAdImageVision · 队列 / kind 过滤 / 熔断 / 关闭');
 	assert('未绑 AI 时不调 getFile', countCalls('getFile') === 0, 'getFile=' + countCalls('getFile'));
 
 	// 6.2 kind 过滤：动图 / 视频 / 文件不进推理队列（moondream 只吃静态位图）
-	const envKind = makeEnv({ AI: { run: async () => ({ answer: '{"ad":true,"text":"点我一下","reason":"引流图"}' }) } });
+	const envKind = makeEnv({ AI: { run: async () => ({ response: '{"ad":true,"text":"点我一下","reason":"引流图"}' }) } });
 	await W.adDetectionReady(envKind);
 	await W.upsertAdImage(envKind, 'IMG_K_PHOTO', { verdict: 'pending', fileId: 'F_PH', kind: 'photo' });
 	await W.upsertAdImage(envKind, 'IMG_K_ANIM', { verdict: 'pending', fileId: 'F_AN', kind: 'animation' });
@@ -431,7 +431,7 @@ section('[6] runAdImageVision · 队列 / kind 过滤 / 熔断 / 关闭');
 	assert('来源标记 vision', envKind.DB.query('SELECT source FROM ad_images WHERE file_unique_id = ?', 'IMG_K_PHOTO')[0]?.source === 'vision');
 
 	// 6.3 日预算：额度用尽 → 直接返回，不再取队列
-	const envBudget = makeEnv({ AI: { run: async () => ({ answer: '{"ad":false,"text":"","reason":"风景照"}' }) } });
+	const envBudget = makeEnv({ AI: { run: async () => ({ response: '{"ad":false,"text":"","reason":"风景照"}' }) } });
 	await W.adDetectionReady(envBudget);
 	await W.upsertAdImage(envBudget, 'IMG_BUD_1', { verdict: 'pending', fileId: 'F_BUD', kind: 'photo' });
 	resetCalls();
@@ -442,7 +442,7 @@ section('[6] runAdImageVision · 队列 / kind 过滤 / 熔断 / 关闭');
 		envBudget.DB.query('SELECT verdict FROM ad_images WHERE file_unique_id = ?', 'IMG_BUD_1')[0]?.verdict === 'pending');
 
 	// 6.4 失败也推进 vision_checked_at（防反复烧额度）
-	const envFail = makeEnv({ AI: { run: async () => ({ answer: '抱歉我判断不了' }) } });
+	const envFail = makeEnv({ AI: { run: async () => ({ response: '抱歉我判断不了' }) } });
 	await W.adDetectionReady(envFail);
 	await W.upsertAdImage(envFail, 'IMG_FAIL_1', { verdict: 'pending', fileId: 'F_FAIL', kind: 'photo' });
 	const failStats = await W.runAdImageVision(envFail);
@@ -459,7 +459,7 @@ section('[6] runAdImageVision · 队列 / kind 过滤 / 熔断 / 关闭');
 	// 视觉识别是【可延迟】的活：一张图今天不判明天还能判，额度烧掉就没了。
 	{
 		let brkAiCalls = 0;
-		const envBreak = makeEnv({ AI: { run: async () => { brkAiCalls += 1; return { answer: '抱歉我判断不了' }; } } });
+		const envBreak = makeEnv({ AI: { run: async () => { brkAiCalls += 1; return { response: '抱歉我判断不了' }; } } });
 		await W.adDetectionReady(envBreak);
 		for (let i = 0; i < 20; i++) {
 			await W.upsertAdImage(envBreak, 'IMG_BRK_' + i, { verdict: 'pending', fileId: 'F_BRK' + i, kind: 'photo' });
@@ -478,7 +478,7 @@ section('[6] runAdImageVision · 队列 / kind 过滤 / 熔断 / 关闭');
 
 
 	// 6.5 状态键与头像互不挤占
-	const envQuota = makeEnv({ AI: { run: async () => ({ answer: '{"ad":false,"text":"","reason":"普通图"}' }) } });
+	const envQuota = makeEnv({ AI: { run: async () => ({ response: '{"ad":false,"text":"","reason":"普通图"}' }) } });
 	await W.adDetectionReady(envQuota);
 	await W.upsertAdImage(envQuota, 'IMG_QUOTA_1', { verdict: 'pending', fileId: 'F_Q', kind: 'photo' });
 	await W.runAdImageVision(envQuota, { dailyLimit: 1 });
@@ -653,6 +653,49 @@ console.log('\n[7] 图片跨用户复用');
 	await W.loadAdImageForMessage(env, { fileUniqueId: FILE }, 'someone');
 	const row = env.DB.query('SELECT verdict FROM ad_images WHERE file_unique_id = ?', FILE)[0];
 	assert('已判 ad 的图不被重置', String(row?.verdict) === 'ad', JSON.stringify(row));
+}
+
+
+// ---------- [8] 视觉模型换代（moondream → llama-3.2-11b-vision）----------
+// moondream3.1 实测调用成功但返回空对象 {}，四条路（正确账号 ID / URL 与 base64 /
+// task=query 与 caption）全试过，模型就是不输出。换 llama 后返回结构也完全不同：
+// 答案在前、prompt 回显在 <image> 之后，参数是 image_url.url 而不是 image。
+console.log('\n[8] 视觉模型返回解析与重试');
+{
+	// ① 实测的返回形态：答案在最前，后面是被回显的完整 prompt
+	const raw = '蓝色\n<image>\n这是一张社交软件的头像。回答：图上主色是什么？只答一个词。蓝色\n<image>\n蓝色\n<image>\n';
+	assert('★ 截掉 prompt 回显，只留模型自己写的部分',
+		W.extractVisionResponseText(raw) === '蓝色', JSON.stringify(W.extractVisionResponseText(raw)));
+	assert('不带 <image> 的原文原样返回', W.extractVisionResponseText('红色') === '红色');
+	assert('null / 空串返回空', W.extractVisionResponseText(null) === '' && W.extractVisionResponseText('') === '');
+
+	// ② 调用参数
+	const inputs = [];
+	const envM = makeEnv({ AI: { run: async (model, input) => { inputs.push({ model, input }); return { response: '{"ad":false,"text":"x","reason":"正常"}' }; } } });
+	const got = await W.runVisionModel(envM, 'MODEL_X', 'data:image/png;base64,AAA', '测试提示词');
+	assert('★ 拿到模型回答', got.includes('"ad"'), got);
+	assert('★ 参数用 image_url.url（不是 image）',
+		inputs[0].input.image_url?.url === 'data:image/png;base64,AAA', JSON.stringify(Object.keys(inputs[0].input)));
+	assert('★ prompt 前缀是 <image>', inputs[0].input.prompt.startsWith('<image>'), inputs[0].input.prompt.slice(0, 30));
+
+	// ③ 空响应重试一次（menshen 同款：推理模型偶发吐空）
+	let callsN = 0;
+	const envR = makeEnv({ AI: { run: async () => { callsN += 1; return callsN < 2 ? { response: '' } : { response: '第二次有内容' }; } } });
+	const retry = await W.runVisionModel(envR, 'MODEL_X', 'data:image/png;base64,AAA', '提示词');
+	assert('★ 空响应会重试一次', callsN === 2 && retry === '第二次有内容', 'calls=' + callsN);
+
+	// ④ 两次都空 → 返回空串且确实调了两次（不抛错，由调用方走失败路径）
+	let calls2 = 0;
+	const envE = makeEnv({ AI: { run: async () => { calls2 += 1; return { response: '' }; } } });
+	const empty = await W.runVisionModel(envE, 'MODEL_X', 'data:image/png;base64,AAA', '提示词');
+	assert('★ 两次都空 → 返回空串且调了两次', empty === '' && calls2 === 2, 'calls=' + calls2);
+
+	// ⑤ 调用异常直接抛（不在这里吞掉重试 —— 网络/权限类错误重试也是同样的错）
+	let callsX = 0;
+	const envX = makeEnv({ AI: { run: async () => { callsX += 1; throw new Error('上游 500'); } } });
+	let threw = null;
+	try { await W.runVisionModel(envX, 'MODEL_X', 'data:image/png;base64,AAA', '提示词'); } catch (e) { threw = e; }
+	assert('★ 调用异常直接抛出（不重试）', threw !== null && callsX === 1, String(threw) + ' calls=' + callsX);
 }
 
 

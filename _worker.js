@@ -17523,7 +17523,16 @@ async function drainAdAvatarLearningQueue(env, limit = 30) {
 // 【为什么按张数熔断而不是按 Neurons】免费层每天 10,000 Neurons 且超限【直接报错】，
 // 而单张图的 Neurons 消耗官方文档没有给出，按未验证的单价做预算等于拿线上可用性赌。
 // 张数上限 + 每张最多一次推理，最坏消耗是可数的；宁可少判几十张也不能让 cron 天天报错。
-const AD_AVATAR_VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
+// 【2026-10-11 换模型：moondream → llama-3.2-11b-vision】
+// moondream3.1-9B-A2B 实测【调用成功但返回空对象 {}】—— 正确账号 ID、URL 与 base64
+// 两种入参、task=query 与 caption 两种任务，四条路全部一样，模型就是不输出。
+// 换成 llama 视觉（许可已同意，账号级一次性），实测能正常返回，
+// 且单张约 4 Neurons —— 350 张/天 ≈ 1400 Neurons，付费版完全无压力。
+//
+// 【为什么不用 Cloudflare 的专用小模型】menshen 的做法是走上游多模态模型
+//（openrouter/openai/gpt-4o），不绑死在一家的视觉模型上 —— 模型坏了换一个上游就行。
+// 本项目在 Workers AI 里跑，等效做法就是换一个能用的多模态模型。
+const AD_AVATAR_VISION_MODEL = '@cf/meta/llama-3.2-11b-vision-instruct';
 const AD_AVATAR_VISION_DAILY = 50;
 const AD_AVATAR_VISION_PROMPT = '这是一张社交软件的用户头像图片。判断它是否属于广告用途：'
 	+ '图里若有引流文字（赚钱、代理、代购、招租、微信号、二维码、"看主页/看简介"）、'
@@ -17589,6 +17598,53 @@ const AD_IMAGE_VISION_PROMPT = '这是社交软件聊天记录里的一条【图
 	+ '只输出 JSON，不要任何其它文字，格式：{"ad":true 或 false,"text":"图中读到的文字，没有则空","reason":"一句话理由"}';
 
 // 从模型回答里抠 JSON。解析不出来一律按「未判」处理 —— 宁可漏判也不能靠猜定罪。
+// ===== 视觉模型的统一调用口 =====
+//
+// 【返回结构与 moondream 完全不同】llama 系返回 {"response":"..."}，而且会把
+// prompt【一起回显】在答案后面 —— 实测是「答案在前，<image> 之后是完整 prompt」。
+// 所以必须先截到第一个 <image> 之前，剩下的才是模型自己写的。
+//
+// 【空响应重试一次】menshen 同款处理（HANDOFF.md：「识图拿思考内容兜底，
+// 推理模型偶发正文为空 + 空响应重试一次」）。推理模型确实会偶发吐空，
+// 一次重试能把这种抖动挡住，而单张只花 4 Neurons。
+async function runVisionModel(env, model, imageUri, prompt) {
+	let lastText = '';
+	for (let attempt = 1; attempt <= 2; attempt++) {
+		let aiResult = null;
+		try {
+			aiResult = await env.AI.run(model, {
+				prompt: '<image>\n' + prompt,
+				image_url: { url: imageUri },
+				max_tokens: 512,
+				temperature: 0.2
+			});
+		} catch (error) {
+			// 调用异常直接抛给调用方（它有 stage 日志），不在这里吞掉重试 ——
+			// 网络/权限类错误重试也是同样的错，白花一次。
+			throw error;
+		}
+		const raw = aiResult?.response ?? aiResult?.result ?? aiResult;
+		lastText = extractVisionResponseText(raw);
+		if (lastText) return lastText;
+		// 两次都空：把返回字段名打出来。今天连栽两次都是「返回结构靠猜」，
+		// 这行日志是唯一能一次定位的东西（只记字段名不记内容，不泄露图上信息）。
+		console.error('[广告检测·视觉识别] 模型返回里取不到文本', JSON.stringify({
+			model,
+			keys: raw && typeof raw === 'object' ? Object.keys(raw).slice(0, 12) : typeof raw
+		}));
+	}
+	return lastText;
+}
+
+// 从模型返回里抠出「模型自己写的那部分」：截掉 prompt 回显。
+function extractVisionResponseText(raw) {
+	if (raw == null) return '';
+	const text = String(raw).trim();
+	if (!text) return '';
+	const cut = text.indexOf('<image>');
+	return (cut >= 0 ? text.slice(0, cut) : text).trim();
+}
+
 function parseAvatarVisionAnswer(raw) {
 	const text = String(raw || '').trim();
 	if (!text) return null;
@@ -17881,9 +17937,9 @@ async function runAdAvatarVision(env, options = {}) {
 			stage = 'encode';
 			const image = 'data:image/jpeg;base64,' + bytesToBase64(new Uint8Array(buffer));
 			stage = 'ai.run';
-			const aiResult = await env.AI.run(AD_AVATAR_VISION_MODEL, { image, task: 'query', question: AD_AVATAR_VISION_PROMPT });
-			const parsed = parseAvatarVisionAnswer(aiResult?.answer ?? aiResult?.output ?? aiResult);
-			if (!parsed) throw new Error('模型回答无法解析: ' + String(JSON.stringify(aiResult)).slice(0, 200));
+			const answerText = await runVisionModel(env, AD_AVATAR_VISION_MODEL, image, AD_AVATAR_VISION_PROMPT);
+			const parsed = parseAvatarVisionAnswer(answerText);
+			if (!parsed) throw new Error('模型回答无法解析: ' + String(answerText).slice(0, 200));
 			verdict = parsed.ad ? 'ad' : 'clean';
 			lastNote = (parsed.text ? ' 文字:' + parsed.text : '') + (parsed.reason ? ' 理由:' + parsed.reason : '');
 		} catch (error) {
@@ -18006,9 +18062,9 @@ async function runAdImageVision(env, options = {}) {
 			stage = 'encode';
 			const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
 			stage = 'ai.run';
-			const aiResult = await env.AI.run(AD_IMAGE_VISION_MODEL, { image, task: 'query', question: AD_IMAGE_VISION_PROMPT });
-			const parsed = parseAvatarVisionAnswer(aiResult?.answer ?? aiResult?.output ?? aiResult);
-			if (!parsed) throw new Error('模型回答无法解析: ' + String(JSON.stringify(aiResult)).slice(0, 200));
+			const answerText = await runVisionModel(env, AD_IMAGE_VISION_MODEL, image, AD_IMAGE_VISION_PROMPT);
+			const parsed = parseAvatarVisionAnswer(answerText);
+			if (!parsed) throw new Error('模型回答无法解析: ' + String(answerText).slice(0, 200));
 			verdict = parsed.ad ? 'ad' : 'clean';
 			note = (parsed.text ? ' 文字:' + parsed.text : '') + (parsed.reason ? ' 理由:' + parsed.reason : '');
 			lastNote = note;

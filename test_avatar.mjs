@@ -368,7 +368,7 @@ section('[7] runAdAvatarVision · 队列 / 熔断 / 解析');
 
 	// 7.2 绑 AI：消费队列，模型判广告 → verdict=ad
 	const fakeAI = {
-		run: async () => ({ answer: '{"ad":true,"text":"主页赚钱","reason":"图上有引流大字"}' })
+		run: async () => ({ response: '{"ad":true,"text":"主页赚钱","reason":"图上有引流大字"}' })
 	};
 	const env = makeEnv({ AI: fakeAI });
 	await W.adDetectionReady(env);
@@ -386,7 +386,7 @@ section('[7] runAdAvatarVision · 队列 / 熔断 / 解析');
 	assert('调过图片下载', countCalls('downloadFile') === 1, 'download=' + countCalls('downloadFile'));
 
 	// 7.3 模型回答无法解析 → 保持 pending，绝不靠猜写 ad
-	const envBad = makeEnv({ AI: { run: async () => ({ answer: '抱歉我无法判断这张图片' }) } });
+	const envBad = makeEnv({ AI: { run: async () => ({ response: '抱歉我无法判断这张图片' }) } });
 	await W.adDetectionReady(envBad);
 	await W.upsertAdAvatar(envBad, 'AV_VIS_BAD', { verdict: 'pending', fileId: 'FILE_BAD' });
 	const stats2 = await W.runAdAvatarVision(envBad);
@@ -420,7 +420,7 @@ section('[7] runAdAvatarVision · 队列 / 熔断 / 解析');
 		Number(stats5.learnQueue?.learned) >= 0, JSON.stringify(stats5.learnQueue));
 
 	// 7.5 模型判定的干净头像
-	const envClean = makeEnv({ AI: { run: async () => ({ answer: '{"ad":false,"text":"","reason":"普通头像"}' }) } });
+	const envClean = makeEnv({ AI: { run: async () => ({ response: '{"ad":false,"text":"","reason":"普通头像"}' }) } });
 	await W.adDetectionReady(envClean);
 	await W.upsertAdAvatar(envClean, 'AV_VIS_CLEAN', { verdict: 'pending', fileId: 'FILE_CLEAN' });
 	const stats4 = await W.runAdAvatarVision(envClean);
