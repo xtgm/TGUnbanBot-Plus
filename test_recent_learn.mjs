@@ -229,5 +229,57 @@ check('/learnlast 已纳入 AD_COMMAND_RE（仅第一主人 + 强制私聊）',
 	/learnlast/.test(String(W.AD_COMMAND_RE ?? '')) || true);
 
 console.log('\n' + '='.repeat(52));
+// ===== 人工判定学习（/spam /ban /sban 三条命令共用）=====
+// 起因：此前只有 /spam 引用回复与自动定罪学，/ban /sban【一个特征都不学】。
+// 而 /ban 是人已经看过并认定的，比模型判得准 —— 净效果是「封得越多、漏得越多」，
+// 因为封掉的那些判定链压根没命中过，特征一条都没进库。
+console.log('\n===== 人工判定学习 =====');
+{
+	const realFetch = W.fetchAdUserProfile;
+	W.fetchAdUserProfile = async () => ({ firstName: '假钞交流群', lastName: '', username: 'ad999', bio: '日结5000 加我详聊' });
+
+	// ① 有正文 → 学指纹 + 加语义样本
+	const r1 = await W.learnAdFromOperatorAction(env, '990001', { text: '', from: {} }, {
+		source: 'manual', createdBy: '1', text: '收购网赚老号 日结5000'
+	});
+	check('有正文 → 学到指纹', r1.learned > 0, JSON.stringify(r1));
+	check('有正文 → 加了语义样本', r1.sampleAdded === 1, JSON.stringify(r1));
+
+	// ② text 传空串时只学资料卡 —— 命令消息的内容是「/ban 123」，学它等于把命令当广告样本
+	const r2 = await W.learnAdFromOperatorAction(env, '990002', { text: '/ban 123', from: {} }, {
+		source: 'manual', createdBy: '1', text: ''
+	});
+	check('text 空 → 仍学（资料卡有内容）', r2.learned > 0 || r2.sampleAdded === 1, JSON.stringify(r2));
+
+	// ③ 回执文案
+	const lines = W.renderAdLearnLines({ learned: 2, sampleAdded: 1, enriched: 0 }, 'ban');
+	check('回执含指纹行', lines.some((l) => l.includes('已学习广告指纹:2 条')), lines.join('|'));
+	check('回执标明来源 /ban', lines.some((l) => l.includes('/ban 人工判定')), lines.join('|'));
+	check('全 0 时回执为空（不刷屏）',
+		W.renderAdLearnLines({ learned: 0, sampleAdded: 0, enriched: 0 }, 'sban').length === 0);
+
+	// ④ 学习失败绝不能影响命令本职 —— 加黑与封禁已经做完了
+	W.fetchAdUserProfile = async () => { throw new Error('Bad Request: chat not found'); };
+	const r3 = await W.learnAdFromOperatorAction(env, '990003', null, { source: 'sban', text: '' });
+	check('★ 学习失败不影响本职（返回全 0 而不是抛错）',
+		r3 && r3.learned === 0 && r3.sampleAdded === 0, JSON.stringify(r3));
+
+	// ⑤ source 分档保留（将来按来源批量回滚要用）
+	// 【必须先把 ④ 改坏的资料卡查询恢复回来】否则这次学不进去，断言会假失败。
+	W.fetchAdUserProfile = async () => ({ firstName: '假钞交流群', lastName: '', username: 'ad999', bio: '日结5000 加我详聊' });
+	const r4 = await W.learnAdFromOperatorAction(env, '990004', { text: '', from: {} }, {
+		// 【必须用不同内容】指纹有唯一键，与前面相同的文案会被去重，
+		// source 不会改写，断言就会假失败。
+		source: 'sban', createdBy: '1', text: '招代理 一条龙 sban专属文案2026'
+	});
+	const src = env.DB.query("SELECT DISTINCT source FROM ad_fingerprints WHERE source IN ('sban','manual') ORDER BY source");
+	check('★ source 分档落库（sban 与 manual 各自独立）',
+		src.some((r) => String(r.source) === 'sban') && src.some((r) => String(r.source) === 'manual'),
+		JSON.stringify(src));
+
+	W.fetchAdUserProfile = realFetch;
+}
+
+
 console.log('/recent + /learnlast 验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 process.exit(fail > 0 ? 1 : 0);

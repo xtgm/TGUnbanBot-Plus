@@ -2558,6 +2558,12 @@ function chunkBatchItems(items, size = D1_BATCH_MUTATION_SIZE) {
 }
 
 // 批量添加：每 20 个 TGID 一条多行 SQL；RETURNING 精确区分新增与已存在。
+// 批量封禁时的学习上限与并发。人工批量封禁动辄上百个号，逐个拉一次资料卡
+// 会让回执卡很久；取 100 是「绝大多数人工批次都在这个量级」与「不把回执拖垮」的平衡。
+// 超出的那些不学 —— 它们还在黑名单里、还会发言，将来 /spam 或自动定罪仍有机会补学。
+const BULK_LEARN_LIMIT = 100;
+const BULK_LEARN_CONCURRENCY = 3;
+
 async function addManyToBlacklist(ids, env, options = {}) {
 	const results = { success: [], exists: [], failed: [] };
 	const uniqueIds = normalizeBatchMutationIds(ids);
@@ -3250,6 +3256,32 @@ async function performBulkJobD1Mutation(job, env, ids) {
 				by: job.createdBy,
 				note: job.note
 			});
+		// 人工批量判定的学习：/ban /sban /spam 的批量任务都汇到这里（job.reason / job.mode）。
+		// 此前只有 /spam 引用回复与自动定罪学，批量封禁一个特征都不学 ——
+		// 而批量恰恰是日常主力场景，封得越多漏得越多。详见 learnAdFromOperatorAction。
+		//【队列里没有 message】引用块兜底用不上，只学资料卡（bio / 昵称 / 域名）。
+		// 重复学习是幂等的：指纹有唯一键、语义样本有 hash，重试也不会重复入库。
+		if (job.reason) {
+			const learnSource = String(job.action) === 'spam' ? 'spam'
+				: String(job.mode) === 'kick' ? 'sban' : 'manual';
+			const learnIds = [...(lastResults.success || [])].slice(0, BULK_LEARN_LIMIT);
+			let learnedTotal = 0;
+			let sampleTotal = 0;
+			await mapWithConcurrency(learnIds, BULK_LEARN_CONCURRENCY, async (uid) => {
+				const r = await learnAdFromOperatorAction(env, uid, null, {
+					source: learnSource,
+					createdBy: String(job.createdBy || ''),
+					text: ''
+				});
+				learnedTotal += Number(r.learned || 0);
+				sampleTotal += Number(r.sampleAdded || 0);
+				return r;
+			});
+			console.log('[广告检测] 批量封禁学习完成', JSON.stringify({
+				来源: learnSource, 学习目标数: learnIds.length,
+				指纹: learnedTotal, 语义样本: sampleTotal
+			}));
+		}
 		if (!lastResults.failed.length) return lastResults;
 		if (attempt < BULK_TASK_D1_RETRY_LIMIT) {
 			await new Promise((resolve) => setTimeout(resolve, BULK_TASK_D1_RETRY_DELAY_MS));
@@ -8814,6 +8846,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					if (alreadyExists) {
 						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行全群处置</b>');
 					}
+				// /spam <id>（不带引用）此前同样不学 —— 只有「引用回复 + /spam」那条
+				// 路径有正文可学。这里能学的只有资料卡：正文无从得知，
+				// 【text 传空串】命令消息的内容是「/spam 123」，学它等于把命令文本当广告样本。
+				const spamIdLearn = await learnAdFromOperatorAction(env, valid[0], message, {
+					source: 'spam',
+					createdBy: String(operatorId ?? ''),
+					text: ''
+				});
+				lines.push(...renderAdLearnLines(spamIdLearn, 'spam'));
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
 					flashText = `${result.success ? '✅ 已加黑并全群禁言' : '⚠️ 已在黑名单，已继续全群禁言'}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
 				} else {
@@ -8936,52 +8977,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			let spamSampleAdded = 0;
 			let spamEnriched = 0;
 			try {
-				const spamText = String(repliedMsg.text || repliedMsg.caption || '');
-				const spamProfile = await fetchAdUserProfile(repliedUserId, repliedMsg.from || {});
-				const spamName = [spamProfile.firstName, spamProfile.lastName].filter(Boolean).join(' ').trim();
-				const spamPayload = {
-					name: spamName,
-					username: spamProfile.username ? '@' + String(spamProfile.username).replace(/^@/, '') : '',
-					bio: spamProfile.bio || '',
-					text: spamText,
-					domains: extractAdDomains([spamName, spamProfile.bio, spamText].filter(Boolean).join('\n'))
-				};
-				const spamLearn = await learnAdFingerprints(env, spamPayload, {
-					source: 'spam',
-					createdBy: String(operatorId ?? '')
-				});
-				spamLearned = Number(spamLearn?.learned || 0);
-
-				// ===== 语义样本：AI 通过 /spam 自我学习（2026-09-08 补）=====
-				// 主人原话：「AI 是通过 spam 执行自我学习的」。此前 /spam 只学指纹、不碰样本库，
-				// 而 AI 层是硬命中即封，一条都不喂的话样本库永远停留在中心特征 + 手工 /addsample。
-				// 取材对齐回复学习路径（项 6，_worker.js 12930-12940）：本人正文太短且不含
-				// 举报 / 吐槽语义时，改用引用块内容当样本正文。线上漏放 50+ 个号的共同形态正是
-				// 「正文只有一个字母 c、广告全在引用块里」—— 不这样做学进去的就是「Maybell Tillman c」
-				// 这种纯噪声，对召回零帮助、还会把「英文人名 + 单字母」推成广告特征误伤正常外国用户。
-				const spamQuoted = getAdQuotedText(repliedMsg);
-				const useQuotedForSample = Boolean(spamQuoted)
-					&& spamText.trim().length <= AD_QUOTED_KILL_MAX_OWN_TEXT
-					&& !countAdKeywordHits(spamText, AD_QUOTED_KILL_NEGATORS).length;
-				const spamSampleText = buildAdSampleText({
-					name: spamName,
-					bio: spamProfile.bio || '',
-					text: useQuotedForSample ? spamQuoted : spamText
-				});
-				if (spamSampleText.length >= 4) {
-					const spamSample = await addAdSample(env, spamSampleText, {
-						source: useQuotedForSample ? 'spam-quoted' : 'spam'
-					});
-					if (spamSample.added) spamSampleAdded = 1;
-				}
-				// ===== 短语自我泛化（方案 E）：每攒够一批新样本就提炼一次共现短语 =====
-				// 设计：见 enrichAdCommonPhrases 上方注释。这里【无条件】调用 —— 即使本次是
-				// 重复样本（added=false），也可能已有若干条新样本在等提炼，由函数内部检查点
-				// 判断是否到触发线。
-				// 【不传 createdBy】刻意让它落回默认的 'enrich' —— 那是批量回滚的抓手，
-				// 写成操作人 id 就没法按来源整批清理了（理由见函数内 createdBy 处注释）。
-				const enrichResult = await enrichAdCommonPhrases(env, loadAdDetectionConfig(env), {});
-				if (enrichResult && enrichResult.learned > 0) spamEnriched = enrichResult.learned;
+			// 学习逻辑已抽成 learnAdFromOperatorAction（/spam /ban /sban 三条命令共用），
+			// 这里只传【引用的那条消息】+ source='spam'，三段内容与改动前逐字一致。
+			const spamTextForLearn = String(repliedMsg.text || repliedMsg.caption || '');
+			const spamLearn = await learnAdFromOperatorAction(env, repliedUserId, repliedMsg, {
+				source: 'spam',
+				createdBy: String(operatorId ?? ''),
+				text: spamTextForLearn
+			});
+			spamLearned = spamLearn.learned;
+			spamSampleAdded = spamLearn.sampleAdded;
+			spamEnriched = spamLearn.enriched;
 			} catch (error) {
 				// 学习失败绝不能影响 /spam 的本职（加黑 + 全群封禁 + 清扫）—— 那些已经做完了。
 				console.error('[广告检测] /spam 学习指纹失败:', error);
@@ -9856,6 +9862,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				if (alreadyExists) {
 					lines.push(`⚠️ <b>该用户已在黑名单中,本次已继续执行${isSban ? '全群踢出' : '全群处置'}</b>`);
 				}
+								// /ban 与 /sban 的学习（这段两者共用，只差 source）——
+				// 此前这两条命令一个特征都不学：封得越多、漏得越多，因为封掉的那些
+				//【判定链压根没命中过】，特征一条都没进库。详见 learnAdFromOperatorAction。
+				// 【text 传空串】命令消息的内容是「/ban 123」，学它等于把命令文本当广告样本。
+				// 引用块兜底仍在生效 —— 命令如果是引用回复发的，广告就在那个引用块里。
+				const manualLearn = await learnAdFromOperatorAction(env, valid[0], message, {
+					source: isSban ? 'sban' : 'manual',
+					createdBy: String(operatorId ?? ''),
+					text: ''
+				});
+				lines.push(...renderAdLearnLines(manualLearn, isSban ? 'sban' : 'ban'));
 				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: commandName }));
 				if (cleanupResult) {
 					lines.push(renderCurrentChatCleanupResult(cleanupResult));
@@ -14734,6 +14751,79 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 //      —— manual 才享有退役豁免；
 //   3) /ignore 一次即删该号带来的全部指纹（同批改动的项 4）。
 // 手动来源（/addword、/spam、/unban 回滚）本来就不走这段逻辑。
+// ===== 人工判定的学习：/spam /ban /sban 三条命令共用 =====
+//
+// 【为什么 /ban 与 /sban 也要学】此前只有 /spam 和自动定罪学，/ban 一个特征都不学。
+// 而 /ban 是【人已经看过并认定是广告】，比模型判得准 —— menshen 把 /ban 的人工标记
+// 称作「质量最高的训练样本」（它的闭环学习一节）。本项目此前的净效果是：
+// 主人封得越多、漏得越多：封掉的那些【判定链压根没命中过】，特征一条都没进库，
+// 下一批换个说法照样漏。演练同理 —— 它学的是「判定链命中过的」，而人工封的那些
+// 恰恰是判定链没命中的。
+//
+// 【三段内容与 /spam 原有实现逐字一致，只是抽出来复用，逻辑一个字没改】
+//   ① learnAdFingerprints —— 学指纹（keyword / domain / bio / phone）
+//   ② addAdSample —— 加 AI 语义样本，正文太短时用引用块兜底
+//   ③ enrichAdCommonPhrases —— 攒够一批新样本就提炼共现短语
+//
+// 【source 三档 spam / manual / sban】分开是为了将来按来源批量回滚。
+// learnAdFingerprints 的豁免词闸门【只对 source='auto' 生效】，人工路径自动跳过 ——
+// 那是既有设计（人工判定可信），这里不需要任何额外处理。
+//
+// 【options.text】调用方没给正文时才回退到 message 的 text/caption。
+// 「不带引用的 /ban <id>」就走这条路：正文无从得知，只学资料卡。
+async function learnAdFromOperatorAction(env, targetUserId, message, options = {}) {
+	const source = String(options.source || 'manual');
+	const createdBy = String(options.createdBy || '');
+	const out = { learned: 0, sampleAdded: 0, enriched: 0 };
+	try {
+		const text = String(options.text ?? message?.text ?? message?.caption ?? '');
+		const profile = await fetchAdUserProfile(targetUserId, message?.from || {});
+		const name = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
+		const payload = {
+			name,
+			username: profile.username ? '@' + String(profile.username).replace(/^@/, '') : '',
+			bio: profile.bio || '',
+			text,
+			domains: extractAdDomains([name, profile.bio, text].filter(Boolean).join('\n'))
+		};
+		const learn = await learnAdFingerprints(env, payload, { source, createdBy });
+		out.learned = Number(learn?.learned || 0);
+
+		// 语义样本：正文太短且不含举报 / 吐槽语义时改用引用块内容。
+		// 线上漏放 50+ 个号的共同形态正是「正文只有一个字母 c、广告全在引用块里」——
+		// 不这样做学进去的就是纯噪声，对召回零帮助还会误伤正常外国用户。
+		const quoted = message ? getAdQuotedText(message) : '';
+		const useQuoted = Boolean(quoted)
+			&& text.trim().length <= AD_QUOTED_KILL_MAX_OWN_TEXT
+			&& !countAdKeywordHits(text, AD_QUOTED_KILL_NEGATORS).length;
+		const sampleText = buildAdSampleText({ name, bio: profile.bio || '', text: useQuoted ? quoted : text });
+		if (sampleText.length >= 4) {
+			const sample = await addAdSample(env, sampleText,
+				{ source: useQuoted ? source + '-quoted' : source });
+			if (sample.added) out.sampleAdded = 1;
+		}
+
+		// 短语提炼【无条件调用】—— 即使本次是重复样本，也可能已有若干新样本在等提炼，
+		// 由函数内部的检查点判断是否到触发线。
+		const enrich = await enrichAdCommonPhrases(env, loadAdDetectionConfig(env), {});
+		if (enrich && enrich.learned > 0) out.enriched = enrich.learned;
+	} catch (error) {
+		// 【学习失败绝不影响命令本职】—— 加黑与封禁已经做完了，学习只是附带。
+		console.error('[广告检测] 人工判定学习失败（' + source + '）:', error);
+	}
+	return out;
+}
+
+// 渲染学习回执。三条命令用同一套文案，只是来源不同。
+function renderAdLearnLines(learn, source) {
+	const lines = [];
+	if (!learn) return lines;
+	if (learn.learned > 0) lines.push('🧬 已学习广告指纹:' + learn.learned + ' 条(来源 /' + source + ' 人工判定)');
+	if (learn.sampleAdded > 0) lines.push('🧠 已加 AI 语义样本:' + learn.sampleAdded + ' 条');
+	if (learn.enriched > 0) lines.push('🧠 共性提炼:从新样本自动提炼出 ' + learn.enriched + ' 条指纹(共现 ≥2 次)');
+	return lines;
+}
+
 async function learnAdFingerprints(env, payload, options = {}) {
 	if (!(await adDetectionReady(env))) return { ok: false, learned: 0, reason: 'unavailable' };
 	const source = String(options.source || 'auto');
