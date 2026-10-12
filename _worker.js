@@ -23257,7 +23257,7 @@ async function handleDryRunCommand(message, env) {
 	if (/^(status|状态)$/.test(arg)) {
 		await reply(
 			currentlyOn
-				? '🧪 当前：演练模式【开启】—— 判定照跑，但不删不封、不学习，只写流水并私聊通知你。'
+				? '🧪 当前：演练模式【开启】—— 判定照跑，不删不封，但【当场就学特征】（全部配置群通用，入群申请那一步立刻生效），只写流水并私聊通知你。'
 				: '✅ 当前：演练模式【关闭】—— 正常自动处置。');
 		return true;
 	}
