@@ -465,12 +465,20 @@ section('[6] runAdImageVision · 队列 / kind 过滤 / 熔断 / 关闭');
 			await W.upsertAdImage(envBreak, 'IMG_BRK_' + i, { verdict: 'pending', fileId: 'F_BRK' + i, kind: 'photo' });
 		}
 		const brkFirst = await W.runAdImageVision(envBreak, { batchSize: 50 });
-		assert('连续失败都被计入 failed', brkFirst.failed === 20, JSON.stringify(brkFirst));
+		// 【2026-10-12 期望值 20 → 10】熔断原先只在函数开头查一次，批次内第 10 次失败后
+		// 剩余的图照样跑完 —— 线上实测 vision_consec_fail 从 10 涨到 28，一批 50 张
+		// 串行要跑好几分钟，等于当批的熔断完全没拦住烧钱。现在每张图开头复核、触发即 break。
+		// 断言的【意图没变】（熔断省额度），只是触发时机从「跑满后」提前到「第 10 次」。
+		// 旧值 20 就是被修掉的那个烧钱行为本身。
+		assert('第 10 次失败即熔断并中止本批次（不跑满 20 张烧额度）',
+			brkFirst.failed === 10 && brkFirst.skipped === 'broken', JSON.stringify(brkFirst));
 
 		await W.upsertAdImage(envBreak, 'IMG_BRK_X', { verdict: 'pending', fileId: 'F_BRKX', kind: 'photo' });
 		const brkSecond = await W.runAdImageVision(envBreak, { batchSize: 50 });
+		// aiCalls 20 → 10：第一轮在第 10 次失败就熔断中止（AI 只被调用 10 次），
+		// 第二轮因熔断标记整个早退（AI 调用数不增）—— 「熔断后不再调用模型」这层意图原样保留。
 		assert('★ 熔断后不再调用模型（这才是省额度的关键）',
-			brkSecond.skipped === 'broken' && brkAiCalls === 20,
+			brkSecond.skipped === 'broken' && brkAiCalls === 10,
 			JSON.stringify(brkSecond) + ' aiCalls=' + brkAiCalls);
 		assert('★ 熔断时已失败的行不会被重复取出',
 			envBreak.DB.query('SELECT count(*) c FROM ad_images WHERE file_unique_id = ?', 'IMG_BRK_X')[0].c === 1);

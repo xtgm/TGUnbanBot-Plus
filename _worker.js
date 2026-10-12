@@ -18120,10 +18120,30 @@ function extractVisionResponseText(raw) {
 function parseAvatarVisionAnswer(raw) {
 	const text = String(raw || '').trim();
 	if (!text) return null;
-	const matched = text.match(/\{[\s\S]*\}/);
-	if (!matched) return null;
+	// 【贪婪正则 → 括号配平】模型会复读：2026-10-12 用本文件逐字相同的 prompt 实测，
+	// llama 把同一段 JSON 重复了 40+ 次并烧满 max_tokens=512。
+	// 旧写法 text.match(/\{[\s\S]*\}/) 从第一个 { 一直吃到最后一个 }，
+	// 把 40 段 JSON 连成一段 → JSON.parse 报 Extra data → catch 吞成 null →
+	// 上层 throw「模型回答无法解析」→ stage=ai.run → 计失败并触发熔断（实测烧到 28 次）。
+	// 现在从第一个 { 做括号配平，取第一个完整闭合的 JSON；字符串内的花括号用 inStr 跳过。
+	const start = text.indexOf('{');
+	if (start < 0) return null;
+	let depth = 0, inStr = false, esc = false, end = -1;
+	for (let i = start; i < text.length; i += 1) {
+		const ch = text[i];
+		if (esc) { esc = false; continue; }
+		if (ch === '\\') { esc = true; continue; }
+		if (ch === '"') { inStr = !inStr; continue; }
+		if (inStr) continue;
+		if (ch === '{') { depth += 1; continue; }
+		if (ch === '}') {
+			depth -= 1;
+			if (depth === 0) { end = i; break; }
+		}
+	}
+	if (end < 0) return null;
 	try {
-		const parsed = JSON.parse(matched[0]);
+		const parsed = JSON.parse(text.slice(start, end + 1));
 		const ad = parsed?.ad === true || String(parsed?.ad).toLowerCase() === 'true';
 		return { ad, text: String(parsed?.text || '').slice(0, 120), reason: String(parsed?.reason || '').slice(0, 120) };
 	} catch (_) {
@@ -18400,6 +18420,15 @@ async function runAdAvatarVision(env, options = {}) {
 	// 而这个函数整趟跑在 cron 里，崩了就等于当天头像识别全部白跑。
 	let lastNote = '';
 	for (const row of rows) {
+		// 【批次内熔断】熔断检查原本只在函数开头做一次 —— 第 10 张失败把标记写进去之后，
+		// 本批剩余的图照样跑完（2026-10-12 实测 vision_consec_fail 从 10 一路涨到 28，
+		// 一批 50 张串行要跑好几分钟，等于当批的熔断完全没拦住烧钱）。
+		// 现在每张图开头都复核一次，触发就中止本批次；下一轮 cron 会在函数开头被拦。
+		if ((await readVisionBreakState(env, nowSeconds)).broken) {
+			stats.skipped = 'broken';
+			console.log('[广告检测·头像] 熔断已触发，中止本批次剩余（本批已失败 ' + Number(stats.failed || 0) + ' 张）');
+			break;
+		}
 		// 无论成败都推进 vision_checked_at：否则一次 429 或模型抽风会让这张图
 		// 每轮都被取出来反复烧额度，把当天预算全耗在同一个失败项上。
 		let verdict = 'pending';
@@ -18538,6 +18567,13 @@ async function runAdImageVision(env, options = {}) {
 	let used = quota.used;
 	let lastNote = '';
 	for (const row of rows) {
+		// 【批次内熔断】理由与头像轨完全相同：熔断标记原本只在函数开头查一次，
+		// 写进去之后本批剩余的图照样跑完，等于当批的熔断没拦住烧钱。每张图开头复核。
+		if ((await readVisionBreakState(env, nowSeconds)).broken) {
+			stats.skipped = 'broken';
+			console.log('[广告检测·图片] 熔断已触发，中止本批次剩余（本批已失败 ' + Number(stats.failed || 0) + ' 张）');
+			break;
+		}
 		// 无论成败都推进 vision_checked_at：否则一次 429 或模型抽风会让这张图
 		// 每轮都被取出来反复烧额度 —— 付费层虽然不报错，但会照单计费。
 		let verdict = 'pending';
