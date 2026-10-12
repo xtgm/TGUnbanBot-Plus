@@ -1585,24 +1585,31 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 		const notInGroup = Boolean(memberProbe)
 			&& (memberProbe.state === 'not_in_group' || memberProbe.state === 'already_banned');
 		if (notInGroup) {
+			// 【已经在封禁列表 = 目标状态已达成】不是失败。
+			// 2026-10-12 主人反馈：/ban 一个已在黑名单的人，14 个群全部显示红叉、
+			// 汇总写「禁言成功 0/14」，看起来像全失败 —— 而实际上这个人在每个群都
+			// 早就在封禁列表里，根本无需再处置。语义必须按探测结果分开说。
+			const alreadyBanned = memberProbe?.state === 'already_banned';
 			console.log('[禁言前探测] 目标不在群内，跳过 restrictChatMember（避免把人拉回来）',
 				JSON.stringify({ 群ID: groupId, 用户ID: String(userId), 探测状态: memberProbe?.label || '' }));
 			return {
 				groupId,
 				userId: String(userId),
-				ok: false,
-				// 文案要一次说清三件事：为什么没禁言、为什么这是对的、接下来会怎样。
-				// 只写「不在群内」会让回执看起来像失败 —— 而实际上 D1 黑名单已经生效、
-				// 后续进群照样会被拦，这才是主人真正需要知道的。
-				error: '目标不在群内，已跳过禁言（不把已离群的人拉回来）；D1 黑名单已生效，'
-					+ '该用户若后续进群/发言仍会按 D1 黑名单拦截',
+				// already_banned 记成功：目标状态早已达成，计入失败会让回执显示成 0/N 的假失败。
+				ok: alreadyBanned,
+				// 文案按探测结果分开说。两种情况都会提醒 D1 黑名单已生效、后续进群仍会被拦 ——
+				// 那才是主人真正需要知道的。
+				error: alreadyBanned
+					? '目标已在群封禁列表，无需重复处置；D1 黑名单已生效'
+					: '目标不在群内，已跳过禁言（不把已离群的人拉回来）；D1 黑名单已生效，'
+						+ '该用户若后续进群/发言仍会按 D1 黑名单拦截',
 				retried: false,
 				muted: true,
 				mutedBy: mode === 'human' ? 'human' : 'killer',
 				memberProbe,
 				// skipped 让回执能分辨「探测后主动跳过」与「真的调用失败」——
-				// 两者都是 ok:false，但含义完全不同，混在一起会让回执说不清发生了什么。
-				skipped: 'not_in_group'
+				// 两者都可能 ok:false，但含义完全不同，混在一起会让回执说不清发生了什么。
+				skipped: alreadyBanned ? 'already_banned' : 'not_in_group'
 			};
 		}
 		const r = await muteUserInGroup(groupId, userId);
