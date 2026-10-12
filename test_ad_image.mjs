@@ -699,6 +699,44 @@ console.log('\n[8] 视觉模型返回解析与重试');
 }
 
 
+// ---------- [9] 429 限流容错 ----------
+// Workers AI 对【需付费计划的模型】限 20 RPM，llama-3.2-11b-vision 就属于这类。
+// 两轨串行跑几百张，撞 429 是【必然】不是故障。若把它算进 failed：
+// 熔断会被限流触发，当天识图全部停摆 —— 拿可用性换一个本来就会自己恢复的状态。
+console.log('\n[9] 429 限流容错');
+{
+	const env = makeEnv({ AI: { run: async () => { throw new Error('429 Too Many Requests'); } } });
+	await W.adDetectionReady(env);
+	await W.upsertAdImage(env, 'IMG_429', { verdict: 'pending', fileId: 'F429', kind: 'photo' });
+	const s1 = await W.runAdImageVision(env, { batchSize: 10, dailyLimit: 10 });
+	assert('★ 429 → 计入 rateLimited、不计入 failed',
+		Number(s1.rateLimited) === 1 && Number(s1.failed) === 0, JSON.stringify(s1));
+
+	const row = env.DB.query('SELECT vision_checked_at FROM ad_images WHERE file_unique_id = ?', 'IMG_429')[0];
+	assert('★ 429 后 vision_checked_at 仍为 0（下一轮 cron 会重判）',
+		Number(row?.vision_checked_at) === 0, JSON.stringify(row));
+
+	// 连续多次 429 也不熔断
+	for (let i = 0; i < 11; i++) {
+		await W.upsertAdImage(env, 'IMG_429_' + i, { verdict: 'pending', fileId: 'F429_' + i, kind: 'photo' });
+		await W.runAdImageVision(env, { batchSize: 10, dailyLimit: 100 });
+	}
+	const brk = await W.readVisionBreakState(env, Math.floor(Date.now() / 1000));
+	assert('★ 连续 11 次 429 也不熔断（限流不是链路故障）', brk.broken === false, JSON.stringify(brk));
+
+	// 真失败仍然照旧计数并触发熔断（别把限流容错做成「什么都不失败」）
+	const env2 = makeEnv({ AI: { run: async () => { throw new Error('model exploded'); } } });
+	await W.adDetectionReady(env2);
+	for (let i = 0; i < 10; i++) {
+		await W.upsertAdImage(env2, 'IMG_REALFAIL_' + i, { verdict: 'pending', fileId: 'R' + i, kind: 'photo' });
+	}
+	const s2 = await W.runAdImageVision(env2, { batchSize: 50, dailyLimit: 100 });
+	const brk2 = await W.readVisionBreakState(env2, Math.floor(Date.now() / 1000));
+	assert('★ 非限流的真失败仍会计入 failed 并触发熔断',
+		Number(s2.failed) > 0 && brk2.broken === true, JSON.stringify(s2) + JSON.stringify(brk2));
+}
+
+
 console.log(`\n===== 正文图片检测测试：通过 ${pass} / 失败 ${fail} =====`);
 if (fail > 0) {
 	console.log('失败项：');

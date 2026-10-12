@@ -17912,6 +17912,21 @@ async function readAvatarVisionQuota(env, nowSeconds) {
 //
 // 【不改变任何处置】只多打几行日志。失败仍照旧计数、仍照旧推进 vision_checked_at，
 // 不会让一张失败的图被反复重试烧额度（那是 upsertAdAvatar 那侧的既有保证）。
+// 这个错误是不是「限流」而不是「链路故障」。
+//
+// 【为什么必须分开】Workers AI 对【需付费计划的模型】限 **20 RPM**
+//（官方 limits 页：标准计费 20 RPM，预付 AI Gateway 50 RPM），
+// 而 llama-3.2-11b-vision-instruct 就属于这类。两轨串行跑几百张，
+// 撞上 429 是【必然】，不是故障。
+//
+// 如果把它算进 failed：熔断会被限流触发，当天识图全部停摆 ——
+// 拿可用性换了一个本来就会自己恢复的临时状态。
+// 正确处理是【跳过这一张、下一轮 cron 再来】：不烧额度、不计失败、不触发熔断。
+function isVisionRateLimited(error) {
+	const msg = String(error?.message || error || '');
+	return /429|too many requests|rate\s*limit/i.test(msg);
+}
+
 function logAdVisionFailure(kind, stage, id, error) {
 	console.error('[广告检测·' + kind + '] 识别失败 stage=' + stage
 		+ ' id=' + String(id || '')
@@ -17969,7 +17984,7 @@ async function bumpVisionBreakState(env, ok, nowSeconds) {
 }
 
 async function runAdAvatarVision(env, options = {}) {
-	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0 };
+	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0 };
 	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
 	if (!(await adDetectionReady(env))) { stats.skipped = 'not_ready'; return stats; }
 
@@ -18055,6 +18070,14 @@ async function runAdAvatarVision(env, options = {}) {
 			verdict = parsed.ad ? 'ad' : 'clean';
 			lastNote = (parsed.text ? ' 文字:' + parsed.text : '') + (parsed.reason ? ' 理由:' + parsed.reason : '');
 		} catch (error) {
+			// 【429 不计入失败、不触发熔断】限流是必然会遇到的临时状态，不是链路故障 ——
+			// Workers AI 对需付费计划的模型限 20 RPM，串行跑几百张【必然】撞上。
+			// 而且【不推进 vision_checked_at】：这张图下一轮 cron 还会被取出来重判，
+			// 这中间一个 Neurons 都没花（调用本身就被拒了）。
+			if (isVisionRateLimited(error)) {
+				stats.rateLimited += 1;
+				continue;
+			}
 			stats.failed += 1;
 			logAdVisionFailure('头像', stage, row.file_unique_id, error);
 		}
@@ -18105,7 +18128,7 @@ async function readImageVisionQuota(env, nowSeconds) {
 // 模型调用，挂在消息上会拖慢每一次回复，且撞子请求配额；付费层解决的是
 // 「超限报错」，解决不了「每条消息慢半秒」。
 async function runAdImageVision(env, options = {}) {
-	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0 };
+	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0 };
 	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
 	if (!(await adDetectionReady(env))) { stats.skipped = 'not_ready'; return stats; }
 	// 未绑 Workers AI：与广告检测整体的降级口径一致 —— 跳过而不是报错。
@@ -18189,6 +18212,14 @@ async function runAdImageVision(env, options = {}) {
 			note = (parsed.text ? ' 文字:' + parsed.text : '') + (parsed.reason ? ' 理由:' + parsed.reason : '');
 			lastNote = note;
 		} catch (error) {
+			// 【429 不计入失败、不触发熔断】限流是必然会遇到的临时状态，不是链路故障 ——
+			// Workers AI 对需付费计划的模型限 20 RPM，串行跑几百张【必然】撞上。
+			// 而且【不推进 vision_checked_at】：这张图下一轮 cron 还会被取出来重判，
+			// 这中间一个 Neurons 都没花（调用本身就被拒了）。
+			if (isVisionRateLimited(error)) {
+				stats.rateLimited += 1;
+				continue;
+			}
 			stats.failed += 1;
 			logAdVisionFailure('图片', stage, row.file_unique_id, error);
 		}
