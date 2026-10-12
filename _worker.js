@@ -1642,6 +1642,10 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 
 // 全群封禁的并发度。取 5：Telegram 全局约 30 msg/s，入群高峰（一次拉十几个人）
 // 时 5 路并发仍在限内；真撞上 429 由 banUserFromGroup 内的重试兜底。
+// 【实际速率是这里的 2 倍】每个群跑 2 次调用（banChatMember 封禁 + restrictChatMember 禁言），
+// 所以 5 路并发 = 同时最多 10 个在途请求。2026-10-12 线上实测：14 群 28 次调用挤在 0.576 秒
+// （约 49 次/秒）—— 超了 30 msg/s 的公开限速，但全程 200、未触发 429，靠 retry_after 重试兜底。
+// 这里刻意【不降】：主人要求不制造限流、批量处置不能变慢；真要再压就降这个值。
 const BAN_ALL_GROUPS_CONCURRENCY = 5;
 
 // options.primaryGroupId：事发群（人从这里进来的那个群）。给了它就【先同步封这一个】，
@@ -5281,7 +5285,9 @@ function logBotModeration(step, details = {}) {
 	const label = BOT_MODERATION_LOG_LABELS[step] || step;
 
 	try {
-		console.log(`[机器人风控] ${label}: ${JSON.stringify(details)}`);
+		// 【机器人风控】→【执行处置】：原前缀会被读成「bot 被风控」，
+		// 而它记录的其实是 bot 正在执行处置动作（2026-10-12 已因此误判一次）。
+		console.log(`[执行处置] ${label}: ${JSON.stringify(details)}`);
 	} catch (error) {
 		console.log(`[机器人风控] ${label}: 日志详情序列化失败：${error.message}`);
 	}
@@ -16765,7 +16771,10 @@ async function buildAdDigest(env, config) {
 			+ '只输出 JSON：{"digest":"形态摘要"}\r\n\r\n' + sampleLines;
 		const aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
 			messages: [{ role: 'user', content: prompt }],
-			max_tokens: 400,
+			// 【400 → 1000】qwen3-30b 是 reasoning 模型，thinking 会先吃掉 max_tokens；
+			// 400 是全文件最小值（第⑥层 1000、视觉 512 都正常），thinking 耗光后正文为空
+			// → 解析不出 {"digest":...} → 空摘要，回执却显示成「没有可总结的样本」。
+			max_tokens: 1000,
 			temperature: 0.2
 		});
 		const raw = extractAdLLMResponseText(aiResult);
@@ -18299,9 +18308,12 @@ function logAdVisionFailure(kind, stage, id, error) {
 // 跨天自动恢复：熔断标记存的是「触发当天的日期」，过期即失效。
 // 把视觉识别的熔断状态渲染成一行后缀。健康时返回空串 —— 看板上不添废话。
 function describeVisionBreak(visionBreak) {
+	// 模型名从常量取，别写死 —— 2026-10-11 已从 moondream 换成 llama，文案却还写着旧名，
+	// 主人照文案去查 moondream 的问题，查不到（实测误导过一次）。
+	const modelName = String(AD_AVATAR_VISION_MODEL || '').split('/').pop() || '视觉模型';
 	if (visionBreak?.broken) {
 		return '　⛔ 已熔断：连续 ' + Number(visionBreak.consecFail || 0) + ' 次识别失败，'
-			+ '今日不再调用 moondream（排查见「识别失败 stage=」日志）';
+			+ '今日不再调用 ' + modelName + '（排查见「识别失败 stage=」日志）';
 	}
 	if (Number(visionBreak?.consecFail) > 0) {
 		return '　⚠️ 已连续失败 ' + Number(visionBreak.consecFail) + ' 次（满 ' + AD_VISION_FAIL_BREAK + ' 次自动熔断）';
@@ -18337,7 +18349,8 @@ async function bumpVisionBreakState(env, ok, nowSeconds) {
 	if (next >= AD_VISION_FAIL_BREAK) {
 		const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
 		await writeAdScanState(env, 'vision_broken_day', today, nowSeconds);
-		console.error('[广告检测·视觉识别] 已熔断：连续 ' + next + ' 次识别失败，今日不再调用 moondream。'
+		console.error('[广告检测·视觉识别] 已熔断：连续 ' + next + ' 次识别失败，今日不再调用 '
+			+ String(AD_AVATAR_VISION_MODEL || '').split('/').pop() + '。'
 			+ '排查线索见「识别失败 stage=」那几行日志。');
 	}
 }
@@ -21569,8 +21582,20 @@ async function handleAdDigestCommand(env, chatId, arg) {
 			return;
 		}
 		if (!r.built) {
-			await reply('⚠️ 没有可总结的样本（' + escapeHtml(String(r.reason || '')) + '）。'
-				+ '摘要只取【人工确认过】的样本（/spam /ban /sban 来源），自动定罪的不算 —— 那里面混着误封。');
+			// 【按 reason 分流】原先不分青红皂白都显示「没有可总结的样本」——
+			// 而 empty_digest 的真因是「模型没返回可解析的摘要」，表里其实躺着 650 条人工样本。
+			// 说谎的文案会把排查带偏到「是不是样本没学进去」，实际问题在模型输出这一环。
+			const reason = String(r.reason || '');
+			if (reason === 'empty_digest') {
+				await reply('⚠️ 形态摘要【生成失败】（empty_digest）：样本已读到，'
+					+ '但模型没返回可解析的摘要。表里有样本，问题在模型输出这一环 —— '
+					+ 'qwen3-30b 是 reasoning 模型，thinking 会先吃掉 max_tokens（已从 400 提到 1000）。');
+			} else if (reason === 'no_samples') {
+				await reply('⚠️ 没有可总结的样本（no_samples）。'
+					+ '摘要只取【人工确认过】的样本（/spam /ban /sban 来源），自动定罪的不算 —— 那里面混着误封。');
+			} else {
+				await reply('⚠️ 未构建形态摘要（' + escapeHtml(reason || '未知原因') + '）。');
+			}
 			return;
 		}
 		await reply('✅ 已构建形态摘要：\n<code>' + escapeHtml(String(r.digest || '')) + '</code>'
