@@ -271,10 +271,13 @@ section('[4] 头像自动登记');
 	resetCalls();
 	setApi({ getChat: chatWithAvatar('AV_NEW_1', 'F_NEW_1') });
 	await sendUpdate({ message: groupMessage({ id: 556001, first_name: '新面孔' }, '在吗') }, env);
-	const row = env.DB.query('SELECT verdict, vision_checked_at, file_id FROM ad_avatars WHERE file_unique_id = ?', 'AV_NEW_1');
+	const row = env.DB.query('SELECT verdict, vision_checked_at, file_id, last_user_id FROM ad_avatars WHERE file_unique_id = ?', 'AV_NEW_1');
 	assert('首次见到的头像已登记进库', row.length === 1, JSON.stringify(row));
 	assert('登记状态为 pending（等 L2 判）', row[0]?.verdict === 'pending', JSON.stringify(row[0]));
 	assert('file_id 已存（L2 下载要用；unique_id 不能下载）', String(row[0]?.file_id || '') !== '', JSON.stringify(row[0]));
+	// 归属必须随登记一起落库：漏了它，巡检登记的头像就成了查不到出处的孤儿
+	// （线上 1,561/3,434 张 last_user_id 为空，全是这条路登记的）。
+	assert('登记时记下归属用户 last_user_id', String(row[0]?.last_user_id || '') === '556001', JSON.stringify(row[0]));
 	assert('登记本身不改变判定（这轮不封）', countCalls('banChatMember') === 0);
 }
 

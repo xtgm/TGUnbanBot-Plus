@@ -16058,7 +16058,11 @@ function writeAdProfileCache(userId, profile) {
 		// 所以存它不会过期失效。
 		//
 		// badgeId 是批次 C 补的，理由相同（漏存则第二条消息起会员标判据失效）。
+		//
+		// userId 同理：缓存命中走的是 cached 这条路，不存它，第二条消息登记头像时
+		// profile.userId 就是 undefined，last_user_id 又会写成空串。
 		profile: {
+			userId: profile.userId,
 			firstName: profile.firstName,
 			lastName: profile.lastName,
 			username: profile.username,
@@ -16088,6 +16092,9 @@ function adFetchRetryAfter(result) {
 
 async function fetchAdUserProfile(userId, fallback = {}) {
 	const profile = {
+		// userId：这份 profile 属于谁。registerAdAvatar 要靠它写 ad_avatars.last_user_id，
+		// 漏了它，巡检登记的头像就查不到出处（线上 1,561/3,434 张为空，全是这条路登记的）。
+		userId: String(userId || ''),
 		firstName: String(fallback.firstName ?? fallback.first_name ?? ''),
 		lastName: String(fallback.lastName ?? fallback.last_name ?? ''),
 		username: String(fallback.username ?? ''),
@@ -16435,7 +16442,7 @@ async function applyAvatarToEvaluation(env, evaluation, profile) {
 	if (!avatar) {
 		// 首次见到这个头像：登记成 pending，L2 视觉识别才有东西可排队。
 		// 只发生一次 —— 行存在之后就走稳定态的「只读不写」，热路径零额外写入。
-		await registerAdAvatar(env, profile);
+		await registerAdAvatar(env, profile, profile.userId);
 		return evaluation;
 	}
 	return applyAvatarVerdict(evaluation, avatar);
