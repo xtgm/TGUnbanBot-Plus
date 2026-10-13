@@ -22363,7 +22363,11 @@ async function handleAdStatsCommand(env, chatId) {
 		lines.push('　　 用 /clearsamples 清空后重新 /warmup 生成');
 	}
 	lines.push('<b>观察窗口</b>　窗口内 <b>' + screeningCount + '</b> 人');
-	lines.push('<b>待确认快照</b>　<b>' + pendingCount + '</b> 条（保留 1 小时）');
+	// 【2026-10-13 修文案】这里原来写「保留 1 小时」，与实际行为完全相反 ——
+	// 2026-09-08 主人要求快照长期保留，pruneAdDetectionData 从那时起就刻意
+	// 不剪枝这张表，新快照的 expires_at = now + 100 年。主人原话：
+	// 「我之前说的是永久保留，所以文案要改对。」
+	lines.push('<b>待确认快照</b>　<b>' + pendingCount + '</b> 条（永久保留，供 /ignore 纠错与追溯当时判据）');
 	// 头像指纹库：广告头像的复用是批量化马甲的核心特征，这一行让主人一眼看到
 	// 「L1 攒了多少、L2 还有多少没判、模型开关是什么状态」。
 	const avatarAd = Number(avatarRows.find((r) => String(r.verdict) === 'ad')?.c) || 0;
