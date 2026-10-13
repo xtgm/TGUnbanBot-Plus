@@ -10651,11 +10651,38 @@ async function buildProfileBlock(env, groupId, tgid, isGroupChat = false) {
 	};
 	const joinCount = evts.filter((x) => x?.kind === 'join').length;
 	const joinEv = evts.find((x) => x?.kind === 'join');
+	// 【甲方案：本群无记录时补跨群汇总】线上实测：用户在天诚群显示「入群时间 未记录」，
+	// 但他其实有 3 次入群记录 —— 只是都发生在该群记录起点（2026-10-05，bot 进群/回填那天）
+	// 之前。本群查不到、跨群查得到，只显示一个孤零零的「未记录」会让人以为功能坏了。
+	// 口径仍守主人定的「群内围绕本群」：【只在本群没有 join 记录时】才补这一行，
+	// 本群有记录时一行都不多加（否则「本群 1 次、别群不算」的既有语义被冲掉）。
+	let crossJoin = null;
+	let crossCount = 0;
+	if (isGroupChat && !joinEv) {
+		const allEvts = await readMemberEvents(env, tgid, undefined);
+		const crossJoins = (Array.isArray(allEvts) ? allEvts : []).filter((x) => x?.kind === 'join' && Number(x.at) > 0);
+		if (crossJoins.length) {
+			// readMemberEvents 已 ORDER BY at DESC，第一条就是最近一次入群。
+			crossCount = crossJoins.length;
+			crossJoin = crossJoins[0];
+		}
+	}
 	lines.push('');
 	lines.push('<b>━━ 时间线 ━━</b>');
 	if (!isGroupChat) lines.push('<i>（私聊查询无群上下文，以下为跨群原样记录）</i>');
 	lines.push('申请时间　' + latest('join_request') + '（群未开启入群审批则永不出现）');
-	lines.push('入群时间　' + (joinEv ? formatBeijingTime(joinEv.at) : '未记录'));
+	lines.push('入群时间　' + (joinEv ? formatBeijingTime(joinEv.at) : (crossCount ? '本群无记录' : '未记录')));
+	if (!joinEv && crossCount) {
+		// 群名只是锦上添花：一次 getChat 失败就退回 chat_id，绝不因为拿不到名字
+		// 把整行跨群信息丢掉 —— 时间和次数才是这行要交代的事实。
+		let crossTitle = String(crossJoin?.chat_id || '');
+		try {
+			const crossInfo = await getChatInfoFromId(crossJoin?.chat_id);
+			if (crossInfo?.title) crossTitle = crossInfo.title;
+		} catch (_) { /* 拿不到群名不影响主信息 */ }
+		lines.push('　　　　　跨群 ' + crossCount + ' 次 · 最近 ' + formatBeijingTime(crossJoin.at)
+			+ '（' + escapeHtml(crossTitle) + '）');
+	}
 	lines.push('退群时间　' + (latest('leave') !== '未记录' ? latest('leave') : latest('kicked')));
 	// 任命管理员：MTProto 协议【不提供任命时间】，这一项永远是未记录。
 	// 官方文档原文：channelParticipantAdmin 的 date = "When did the user join"（入群时间，
@@ -10667,7 +10694,8 @@ async function buildProfileBlock(env, groupId, tgid, isGroupChat = false) {
 	const m = await readAdGroupMember(env, tgid);
 	lines.push('最早发言　' + (Number(m?.first_seen) > 0 ? formatBeijingTime(m.first_seen) : '未记录'));
 	lines.push('最后发言　' + (Number(m?.last_seen) > 0 ? formatBeijingTime(m.last_seen) : '未记录'));
-	lines.push('总入群　　' + (joinCount > 0 ? joinCount + ' 次' : '未记录'));
+	lines.push('总入群　　' + (joinCount > 0 ? joinCount + ' 次'
+		: (crossCount ? '本群无记录 / 跨群 ' + crossCount + ' 次' : '未记录')));
 	// 黑名单与 GKY 不在这里查：/check 与 /profile 都要，由调用方的
 	// buildBanlistCheckResponse 统一查一次（GKY 是外部 HTTP，重复查浪费且更慢）。
 	return lines;

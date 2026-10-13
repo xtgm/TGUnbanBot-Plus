@@ -283,6 +283,29 @@ console.log('\n=== 4. /profile 输出 ===');
 			&& outG.includes('任命管理员　未记录（MTProto 协议不提供任命时间）'),
 		outG.slice(outG.indexOf('入群时间'), outG.indexOf('任命管理员') + 40));
 
+	// ── 甲方案：群内【本群没有 join 记录】时补一行跨群汇总（2026-10-13 主人要的「支持跨群」）──
+	// 场景来自线上：用户在天诚群显示「入群时间 未记录」，而他其实有 3 次入群记录，
+	// 只是都发生在该群记录起点（2026-10-05）之前 —— 本群查不到，跨群其实查得到。
+	// 口径仍守「群内围绕本群」：只在本群无记录时才补跨群，本群有记录时一行都不多加
+	// （否则上面那条 `!outG.includes('2 次')` 必红）。
+	{
+		reset();
+		// 必须用【配置群】：非配置群的斜杠命令会被 handleMessage 的 isNonConfiguredGroup
+		// 分支整个拦掉，命令压根不执行，断言只能看到空输出（首跑就栽这儿，
+		// 我用了 -1009999999999 这种不在 GROUP_ID 里的群）。
+		// 造「本群无记录、跨群有记录」：删掉本群那条，再往别群加一条。
+		env.DB.exec("DELETE FROM stat_member_events WHERE chat_id='" + GROUP + "' AND user_id='699658898'");
+		await W.recordMemberEventDetail(env, '-100222', '699658898', 'join', Date.parse('2026-10-04T09:00:00+08:00'));
+		await drive({ message: { chat: { id: Number(GROUP), type: 'supergroup' }, from: { id: Number(OWNER), is_bot: false }, text: '/profile 699658898', message_id: 206 } });
+		const outN = sent.find((s) => s.chatId === GROUP && s.text.includes('资料卡'))?.text || '';
+		check('[甲] 群内本群无记录 → 显示跨群汇总（不再只有一个孤零零的「未记录」）',
+			outN.includes('跨群'), outN.slice(outN.indexOf('入群时间'), outN.indexOf('入群时间') + 70));
+		check('[甲] 跨群次数为 2（本群那条已删、别群两条）',
+			outN.includes('2 次'), outN.slice(outN.indexOf('总入群'), outN.indexOf('总入群') + 30));
+		check('[甲] 跨群里带最近一次入群时间（2026-10-04 09:00）',
+			/跨群.*2026-10-04 09:00/.test(outN.replace(/\n/g, ' ')), outN.slice(outN.indexOf('时间线'), outN.indexOf('时间线') + 200));
+	}
+
 	// 6 种身份逐一验证映射精准（bot 必须在管理员列表里，否则不会去查状态）
 	adminLists[GROUP] = [
 		{ user: { id: 42, is_bot: true, username: 'testbot' }, status: 'administrator' },
