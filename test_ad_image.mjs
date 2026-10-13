@@ -745,6 +745,66 @@ console.log('\n[9] 429 限流容错');
 }
 
 
+// ================= [7] 实时图片判定（2026-10-13）=================
+//
+// 这一节治的是「第一次出现的广告图完全不产生判据」：旧链路把它登记成 pending
+// 就返回，等 cron（一天两班）判完还要等【下一次】有人发才命中。实时化之后，
+// 没判过的当场调一次 clef 出结论并落库。下面每一条断言在改动【之前】都是红的 ——
+// 旧行为下 verdict 恒为 pending、getFile 一次都不会发。
+section('[7] 带图消息当场判定（不再等 cron）');
+{
+	const env = makeEnv({
+		AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'ad', probabilities: { ad: 0.95, clean: 0.05 }, confidence: 0.9 } } }) }
+	});
+	await W.adDetectionReady(env);
+	resetCalls();
+	await send(barePhotoMessage({ id: 880001, first_name: '广告号' }, 'IMG_RT_AD_1', 'F_RT_AD_1'), env);
+
+	const row = env.DB.query('SELECT verdict, source, hits, vision_checked_at FROM ad_images WHERE file_unique_id = ?', 'IMG_RT_AD_1');
+	assert('带图消息已登记进库', row.length === 1, JSON.stringify(row));
+	assert('★ 当场判定，不再停在 pending', row[0]?.verdict === 'ad', JSON.stringify(row[0]));
+	// source 是 vision，但如果这条消息当场触发了封禁，「定罪即学习」（learnAdImageOnBan）
+	// 会把它覆盖成 learned 并把 hits +1 —— 那是既有设计，不是实时判定丢了来源。
+	assert('判定结果已落库（vision，或定罪后被学习覆盖为 learned）',
+		row[0]?.source === 'vision' || row[0]?.source === 'learned', JSON.stringify(row[0]));
+	assert('★ 当场封禁了发广告的人（这才是「检测就杀」）',
+		countCalls('banChatMember') >= 1, 'banChatMember=' + countCalls('banChatMember'));
+	assert('vision_checked_at 已推进（cron 不会再重判这张）', Number(row[0]?.vision_checked_at) > 0, JSON.stringify(row[0]));
+	assert('★ 高置信(0.95≥0.9)顶到单证定罪线 hits≥5', Number(row[0]?.hits) >= 5, JSON.stringify(row[0]));
+	assert('调过 getFile（真的下了图去判，不是只登记）', countCalls('getFile') >= 1, 'getFile=' + countCalls('getFile'));
+}
+
+section('[7b] 模糊区不单证定罪 + 第二次出现不重复花钱');
+{
+	const env = makeEnv({
+		AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'ad', probabilities: { ad: 0.7, clean: 0.3 }, confidence: 0.6 } } }) }
+	});
+	await W.adDetectionReady(env);
+	resetCalls();
+	await send(barePhotoMessage({ id: 880011, first_name: '模糊广告' }, 'IMG_RT_MID_1', 'F_RT_MID_1'), env);
+	const mid = env.DB.query('SELECT verdict, hits FROM ad_images WHERE file_unique_id = ?', 'IMG_RT_MID_1')[0];
+	assert('0.7 同样当场判成广告', mid?.verdict === 'ad', JSON.stringify(mid));
+	assert('★ 模糊区(0.5~0.9)不顶定罪线，仍走多特征原则', Number(mid?.hits) < 5, JSON.stringify(mid));
+
+	// 同一张图第二次出现：库里已有结论，一个模型调用都不该再发。
+	resetCalls();
+	await send(barePhotoMessage({ id: 880012, first_name: '另一个人' }, 'IMG_RT_MID_1', 'F_RT_MID_1'), env);
+	assert('★ 第二次出现不重复调模型（零 getFile）', countCalls('getFile') === 0, 'getFile=' + countCalls('getFile'));
+}
+
+section('[7c] 干净图当场判干净，正常表情包不受影响');
+{
+	const env = makeEnv({
+		AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'clean', probabilities: { ad: 0.04, clean: 0.96 }, confidence: 0.9 } } }) }
+	});
+	await W.adDetectionReady(env);
+	resetCalls();
+	await send(barePhotoMessage({ id: 880021, first_name: '路人' }, 'IMG_RT_CLEAN_1', 'F_RT_CLEAN_1'), env);
+	const clean = env.DB.query('SELECT verdict, hits FROM ad_images WHERE file_unique_id = ?', 'IMG_RT_CLEAN_1')[0];
+	assert('★ 干净图当场判成 clean（不是 pending）', clean?.verdict === 'clean', JSON.stringify(clean));
+	assert('clean 不抬定罪线', Number(clean?.hits) === 0, JSON.stringify(clean));
+}
+
 console.log(`\n===== 正文图片检测测试：通过 ${pass} / 失败 ${fail} =====`);
 if (fail > 0) {
 	console.log('失败项：');

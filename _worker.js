@@ -17431,6 +17431,14 @@ async function clearAdImageOnIgnore(env, fileUniqueId) {
 // 别人转的图都可能被多人正常转发 —— 复用门槛必须更高，否则一张被 2 个人
 // 转过的普通图就会开始单独定罪。单证（本次干净）一律不定罪这条两层一致。
 const AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS = 5;
+// 实时判定的「一眼广告」线。达到它就顶到上面那个单证定罪线 —— 即主人要的
+// 「检测到了就立刻处理，没有一丝犹豫」；0.5~0.9 之间的模糊区仍按多特征走
+// （有正文词表 / 简介 / 跨用户复用 / 案底任一佐证才封，否则只进观察窗口）。
+//
+// 0.9 这个数是实测定的：2026-10-13 拿 40 张真实库图跑 clef-flash，
+// 广告 0.827~0.9412、正常毛绒玩具与笑脸表情包 0.0404~0.0458，两簇之间
+// 没有重叠区，0.9 落在空档里 —— 既不放过一眼广告，也不误伤正常表情包。
+const AD_IMAGE_RT_BAN_PROB = 0.9;
 function applyImageVerdict(evaluation, image) {
 	if (!evaluation || !image) return evaluation;
 	if (String(image.verdict || '') !== 'ad') return evaluation;
@@ -18794,9 +18802,15 @@ async function runAdImageVision(env, options = {}) {
 			const judge = await runVisionJudge(env, image, CLEF_IMAGE_STATE);
 			if (!judge) throw new Error('clef 未返回判定');
 			verdict = judge.ad ? 'ad' : 'clean';
+			// 【2026-10-13 修：这里原本还有一行 note = (parsed.text ? ...)，
+			// 而 parsed 是 moondream 时代「模型生成 JSON 再解析」的产物，
+			// 换成 clef 之后整个函数里已经没有任何 parsed 定义 —— 于是每张判成功
+			// 的图都会在这里抛 ReferenceError，被下面的 catch 吞成 failed：
+			// 日志里天天刷「识别失败 stage=ai.run」，但 verdict 在抛异常【之前】
+			// 就已赋好值、落库也是对的，纯属吓人的假故障。
+			// 结论与理由：clef 是结构化分类器，answers.ad 里只有 choice 与
+			// probabilities，本来就没有 text / reason 字段可读，这行直接删。】
 			lastNote = '判定=' + (judge.ad ? '广告' : '干净') + ' 概率=' + judge.prob.toFixed(4);
-			note = (parsed.text ? ' 文字:' + parsed.text : '') + (parsed.reason ? ' 理由:' + parsed.reason : '');
-			lastNote = note;
 		} catch (error) {
 			// 【429 不计入失败、不触发熔断】限流是必然会遇到的临时状态，不是链路故障 ——
 			// Workers AI 对需付费计划的模型限 20 RPM，串行跑几百张【必然】撞上。
@@ -18838,6 +18852,132 @@ async function runAdImageVision(env, options = {}) {
 		+ ' 广告=' + stats.ad + ' 干净=' + stats.clean + ' 失败=' + stats.failed
 		+ ' 当日=' + used + '/' + dailyLimit + (lastNote ? ' 末条:' + lastNote : ''));
 	return stats;
+}
+
+// ===== 实时图片判定（2026-10-13）=====
+//
+// 【治什么】在此之前，正文图 / 贴纸 / 表情包走的是【建库 + 命中】：
+// 新图登记 pending → 等 cron（一天两班 11:17 / 23:17）→ 进队列 → 判完落库
+// → 【下一次】有人发才命中。于是「第一次出现」的广告图完全不产生任何判据。
+// 实测积压：ad_images 306 条里 photo 165 + sticker 130 全是 pending，
+// ad_avatars 队列积压 988 张、头像日上限 50 → 20 天才轮得到一遍。
+// 主人的原话是「广告用户发出广告图片、广告贴纸，AI 检测到了就立刻处理」——
+// 而模型其实完全认得出（同批 40 张实测 40/40 成功、广告 0.827~0.9412 vs
+// 正常表情包 0.0404~0.0458、output_tokens 恒 0），缺的从来只是「没人调它」。
+//
+// 【改什么】把「等 cron 来判」改成「判到这张图时当场判」。发言线、入群线、
+// 命令复评三条路共用这一个函数。判过的直接命中库（零模型成本），
+// 只有第一次见到的图才真的调一次模型 —— 判完立刻落库，同一张图第二次
+// 出现走 verdict='ad'/'clean' 分支，一个 Neurons 都不花。
+//
+// 【退回旧行为的四道闸】任一闸拦下都【原样返回登记行】，与实时化之前的线上
+// 行为完全一致 —— 这条链路只会更准，不可能更差：
+//   · 没绑 AI / 没绑 DB → 返回 null，判定链原样走；
+//   · 每日上限 AD_IMAGE_VISION_DAILY（默认 300）跑满 → 退回只命中已知图；
+//   · 连续失败 AD_VISION_FAIL_BREAK 次熔断 → 当天不再调用；
+//   · 超 AD_VISION_MAX_IMAGE_BYTES 或不是位图（.tgs / .webm 容器）→ 跳过。
+// 429 限流既不推熔断也不落库，与 cron 轨同一口径。
+async function judgeAdMediaRealtime(env, media, userId) {
+	if (!media?.fileUniqueId) return null;
+	if (!env?.DB) return null;
+	const key = String(media.fileUniqueId);
+	const uid = String(userId || '');
+
+	// ① 已判过的图：直接用库里的结论，一个 Neurons 都不花。
+	const row = await readAdImage(env, key);
+	if (row) {
+		// 跨用户复用照旧（不调模型）：同一张图被多个【不同】用户发过 → 标成广告素材。
+		if (await bumpAdImageSender(env, key, uid, row)) {
+			return { ...row, verdict: 'ad', hits: (Number(row.hits) || 0) + 1 };
+		}
+		// pending 但没有可下载句柄的，退回旧行为 —— 那种图当下判不了，只能先登记着。
+		if (String(row.verdict || '') !== 'pending' || !String(row.file_id || '')) return row;
+	} else {
+		// 首次见到：登记成 pending。登记本身零成本，实时判定紧接在后面。
+		await registerAdImage(env, media, uid);
+	}
+
+	// 【没绑 AI 的部署】登记照做（L2 排队等 cron），只是不当场判 ——
+	// 与实时化之前的线上行为一字不差，不能因为实时化把「登记」这条也弄丢。
+	if (!env.AI) return row || null;
+
+	// ② 额度闸与熔断闸，与 cron 轨【共用同一个池】（前缀 'img'）——
+	// 实时判用掉的额度会记进 cron 的账，两边不会各花各的、把日预算翻倍。
+	const config = loadAdDetectionConfig(env);
+	const dailyLimit = Number(config.imageVisionDaily);
+	if (dailyLimit <= 0) return null;
+	const nowSeconds = Math.floor(Date.now() / 1000);
+	const quota = await readImageVisionQuota(env, nowSeconds, 'img');
+	if (dailyLimit - quota.used <= 0) return null;
+	if ((await readVisionBreakState(env, nowSeconds)).broken) return null;
+
+	// ③ 当场判。media.visionFileId 是 extractAdMedia 挑好的「能喂模型的那一份」：
+	// 照片与静态贴纸取本体，动态贴纸 / 视频 / 动图取缩略图。
+	const visionFileId = String(media.visionFileId || '');
+	if (!visionFileId) return null;
+	let verdict = 'pending';
+	let prob = 0;
+	let skipBump = false;
+	try {
+		const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ file_id: visionFileId })
+		});
+		const fileResult = await fileResponse.json();
+		if (!fileResult?.ok) throw new Error(fileResult?.description || 'getFile 失败');
+		const filePath = String(fileResult?.result?.file_path || '');
+		if (!filePath) throw new Error('file_path 为空');
+		const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
+		if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
+		const buffer = await imageResponse.arrayBuffer();
+		// 尺寸闸与格式闸与 cron 轨完全一致：喂错格式 = 模型抛错 = 白烧一次额度。
+		if (buffer.byteLength > AD_VISION_MAX_IMAGE_BYTES) return null;
+		const mime = sniffImageMime(new Uint8Array(buffer));
+		if (!mime) return null;
+		const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
+		const judge = await runVisionJudge(env, image, CLEF_IMAGE_STATE);
+		if (!judge) throw new Error('clef 未返回判定');
+		verdict = judge.ad ? 'ad' : 'clean';
+		prob = Number(judge.prob) || 0;
+		console.log('[图片实时判定] ' + (judge.ad ? '广告' : '干净') + ' 概率=' + prob.toFixed(4)
+			+ ' kind=' + String(media.kind || '') + ' 图=' + key.slice(0, 20)
+			+ ' 当日=' + (quota.used + 1) + '/' + dailyLimit);
+	} catch (error) {
+		// 429 是临时状态不是链路故障：不推熔断、不落库（理由见 runAdImageVision 同名分支）。
+		if (isVisionRateLimited(error)) return null;
+		if (isVisionFileMissing(error)) skipBump = true;
+		logAdVisionFailure('图片·实时', 'ai.run', key, error);
+	}
+	try {
+		await upsertAdImage(env, key, {
+			verdict,
+			source: verdict === 'pending' ? null : 'vision',
+			kind: String(media.kind || ''),
+			lastUserId: uid || null,
+			visionCheckedAt: Math.floor(Date.now() / 1000)
+		});
+	} catch (error) {
+		console.error('[图片实时判定] 写回结果失败:', error);
+	}
+	if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
+	await writeAdScanState(env, 'img_count', String(quota.used + 1), Math.floor(Date.now() / 1000));
+
+	if (verdict !== 'ad') return verdict === 'clean' ? { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid } : null;
+	// 高置信「一眼广告」：直接顶到单证定罪线，让它当场就能封，不等复用次数积累。
+	// 这是主人要的「检测到了就立刻处理」；0.5~0.9 的模糊区仍按多特征走，
+	// 有正文词表 / 简介 / 跨用户 / 案底任一佐证才封，否则只进观察窗口。
+	if (prob >= AD_IMAGE_RT_BAN_PROB) {
+		try {
+			await env.DB.prepare(
+				'UPDATE ad_images SET hits = ? WHERE file_unique_id = ? AND hits < ?')
+				.bind(AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS, key, AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS).run();
+		} catch (error) {
+			console.error('[图片实时判定] 抬升定罪强度失败:', error);
+		}
+	}
+	const finalRow = await readAdImage(env, key);
+	return finalRow || { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid };
 }
 
 async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 1000)) {
@@ -20684,7 +20824,13 @@ async function detectAdOnMessage(message, env) {
 	// 不花 Telegram 请求，而它们正是自动学习与 /spam 学习成果的落地点，压后到 3 天一次会白费。
 	// 图片指纹【一条消息只读这一次】，闸一闸二共用同一份结果（理由见 loadAdImageForMessage）。
 	// media 为空（纯文本消息）时本行一个 D1 都不发，热路径预算与改动前完全一致。
-	const imageRow = media ? await loadAdImageForMessage(env, media, userId) : null;
+	// 【2026-10-13 改：loadAdImageForMessage → judgeAdMediaRealtime】
+	// 原来这张图如果是第一次出现，只会被登记成 pending 就返回 null —— 等 cron
+	// （一天两班）来判，判完还要等【下一次】有人发才命中，等于第一次出现时
+	// 图片这一路完全不产生判据。实时化之后：没判过的当场调一次 clef 出结论
+	// 并落库，判过的直接命中库（零模型成本），跨用户复用照旧。
+	// 退回旧行为的四道闸（无 AI / 额度跑满 / 熔断 / 不是位图）见函数注释。
+	const imageRow = media ? await judgeAdMediaRealtime(env, media, userId) : null;
 	const cheapProfile = {
 		firstName: from.first_name || '',
 		lastName: from.last_name || '',
