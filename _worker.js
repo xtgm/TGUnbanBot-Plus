@@ -18312,7 +18312,42 @@ async function readAvatarVisionQuota(env, nowSeconds) {
 // 正确处理是【跳过这一张、下一轮 cron 再来】：不烧额度、不计失败、不触发熔断。
 function isVisionRateLimited(error) {
 	const msg = String(error?.message || error || '');
-	return /429|too many requests|rate\s*limit/i.test(msg);
+	return /429|too many requests|rate\s*limit/i.test(msg);
+}
+
+// 文件本身没了（头像被换 / file_id 过期 / Telegram 侧临时不可用）。
+// 这类失败【不可恢复】且一个 Neurons 都没花 —— 却和链路故障同等计入熔断：
+// 连续 10 条失效文件就会把正常头像一起停掉（2026-10-13 /adstats 的「已连续失败 N 次」
+// 就是这么攒起来的）。所以它必须与 429 一样被单独识别：不计 failed、不 bump 熔断。
+function isVisionFileMissing(error) {
+	const msg = String(error?.message || error || '');
+	return /wrong file_id|file is temporarily unavailable|file not found|file .* expired/i.test(msg);
+}
+
+// 失效后重新取该用户【当前】头像的 file_id。
+// 头像 file_id 原本来自 getChat（fetchAdUserProfile 采的），但 getChat 对
+// 【从未与 bot 私聊过】的用户恒返回 chat not found —— 那批人一个都取不到。
+// getUserProfilePhotos 按 user_id 查、不依赖是否私聊过，所以补这一路。
+// 拿不到返回 null，由调用方走「跳过且不计熔断」的兜底，不抛错。
+async function refreshAvatarFileId(env, userId) {
+	const uid = Number(userId);
+	if (!Number.isFinite(uid) || uid <= 0) return null;
+	try {
+		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getUserProfilePhotos', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ user_id: uid, limit: 1 })
+		});
+		const result = await response.json();
+		const photos = result?.result?.photos;
+		if (!result?.ok || !Array.isArray(photos) || !photos.length) return null;
+		const sizes = photos[0];
+		const best = sizes[sizes.length - 1] || null;
+		return String(best?.file_id || '') || null;
+	} catch (error) {
+		console.error('[广告检测·头像] 刷新头像 file_id 失败: ' + String(error?.message || error));
+		return null;
+	}
 }
 
 function logAdVisionFailure(kind, stage, id, error) {
@@ -18376,7 +18411,7 @@ async function bumpVisionBreakState(env, ok, nowSeconds) {
 }
 
 async function runAdAvatarVision(env, options = {}) {
-	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0 };
+	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0, skippedMissing: 0 };
 	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
 	if (!(await adDetectionReady(env))) { stats.skipped = 'not_ready'; return stats; }
 
@@ -18437,6 +18472,8 @@ async function runAdAvatarVision(env, options = {}) {
 		// 裸栈「at runAdImageVision …」—— getFile 401、下载 404、图片超限、AI 调用被拒，
 		// 在看板上长得一模一样。有这个变量才知道挂在哪一步。
 		let stage = 'init';
+		// 文件永久失效时置位：这种失败不推熔断（见 isVisionFileMissing 注释）。
+		let skipBump = false;
 		try {
 			stage = 'getFile';
 			// 与全文件其它 Telegram 调用同一写法（项目没有通用封装，一律直连 fetch）。
@@ -18445,7 +18482,27 @@ async function runAdAvatarVision(env, options = {}) {
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ file_id: String(row.file_id) })
 			});
-			const fileResult = await fileResponse.json();
+			let fileResult = await fileResponse.json();
+			// 【失效 file_id → 换成用户【当前】的头像再试】头像被换掉或 file_id 过期时
+			// 旧值怎么调都拿不到，但那正是最该判的时候 —— 换成当前头像判才有意义。
+			// 取不到就落空，交给 catch 里的 isVisionFileMissing 走「跳过且不计熔断」。
+			if (!fileResult?.ok && isVisionFileMissing({ message: String(fileResult?.description || '') })) {
+				const freshFileId = await refreshAvatarFileId(env, row.last_user_id);
+				if (freshFileId) {
+					console.log('[广告检测·头像] file_id 失效，换用当前头像重试 id=' + String(row.file_unique_id || ''));
+					try {
+						await upsertAdAvatar(env, row.file_unique_id, { fileId: freshFileId });
+					} catch (writeError) {
+						console.error('[广告检测·头像] 回写新 file_id 失败: ' + String(writeError?.message || writeError));
+					}
+					const retryResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ file_id: freshFileId })
+					});
+					fileResult = await retryResponse.json();
+				}
+			}
 			if (!fileResult?.ok) throw new Error(fileResult?.description || 'getFile 失败');
 			const filePath = String(fileResult?.result?.file_path || '');
 			if (!filePath) throw new Error('file_path 为空');
@@ -18479,8 +18536,16 @@ async function runAdAvatarVision(env, options = {}) {
 				stats.rateLimited += 1;
 				continue;
 			}
-			stats.failed += 1;
-			logAdVisionFailure('头像', stage, row.file_unique_id, error);
+			// 【文件永久失效】不计 failed、不推熔断，但仍推进 vision_checked_at
+			// （下方 upsert 照跑），所以不会下一轮又取出来反复失败。
+			if (isVisionFileMissing(error)) {
+				stats.skippedMissing += 1;
+				skipBump = true;
+				logAdVisionFailure('头像', stage, row.file_unique_id, error);
+			} else {
+				stats.failed += 1;
+				logAdVisionFailure('头像', stage, row.file_unique_id, error);
+			}
 		}
 		try {
 			await upsertAdAvatar(env, row.file_unique_id, {
@@ -18493,7 +18558,8 @@ async function runAdAvatarVision(env, options = {}) {
 		}
 		// 熔断计数：verdict 仍是 'pending' 就是这次没判成（失败或跳过），
 		// 连着 AD_VISION_FAIL_BREAK 次没判成，当天就别再烧 moondream 额度了。
-		await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
+		// skipBump = 文件失效：这种失败证明不了链路坏了，不参与熔断判定。
+		if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
 		if (verdict === 'ad') stats.ad += 1;
 		else if (verdict === 'clean') stats.clean += 1;
 		if (verdict !== 'pending') stats.done += 1;
@@ -18529,7 +18595,7 @@ async function readImageVisionQuota(env, nowSeconds) {
 // 模型调用，挂在消息上会拖慢每一次回复，且撞子请求配额；付费层解决的是
 // 「超限报错」，解决不了「每条消息慢半秒」。
 async function runAdImageVision(env, options = {}) {
-	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0 };
+	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0, skippedMissing: 0 };
 	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
 	if (!(await adDetectionReady(env))) { stats.skipped = 'not_ready'; return stats; }
 	// 未绑 Workers AI：与广告检测整体的降级口径一致 —— 跳过而不是报错。
@@ -18580,6 +18646,10 @@ async function runAdImageVision(env, options = {}) {
 		let note = '';
 		// 失败定位用，理由见 logAdVisionFailure。
 		let stage = 'init';
+		// 文件永久失效时置位：这种失败不推熔断（见 isVisionFileMissing 注释）。
+		// 正文图没有「换一张再试」的余地（图片来自群消息本身，取不到就是取不到），
+		// 所以这里只做甲那半：跳过且不计熔断。
+		let skipBump = false;
 		try {
 			stage = 'getFile';
 			const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
@@ -18628,8 +18698,14 @@ async function runAdImageVision(env, options = {}) {
 				stats.rateLimited += 1;
 				continue;
 			}
-			stats.failed += 1;
-			logAdVisionFailure('图片', stage, row.file_unique_id, error);
+			if (isVisionFileMissing(error)) {
+				stats.skippedMissing += 1;
+				skipBump = true;
+				logAdVisionFailure('图片', stage, row.file_unique_id, error);
+			} else {
+				stats.failed += 1;
+				logAdVisionFailure('图片', stage, row.file_unique_id, error);
+			}
 		}
 		try {
 			await upsertAdImage(env, row.file_unique_id, {
@@ -18643,7 +18719,7 @@ async function runAdImageVision(env, options = {}) {
 		}
 		// 熔断计数：verdict 仍是 'pending' 就是这次没判成（失败或跳过），
 		// 连着 AD_VISION_FAIL_BREAK 次没判成，当天就别再烧 moondream 额度了。
-		await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
+		if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
 		if (verdict === 'ad') stats.ad += 1;
 		else if (verdict === 'clean') stats.clean += 1;
 		if (verdict !== 'pending') stats.done += 1;
@@ -20824,7 +20900,7 @@ async function handleAdDetectionCommands(message, env, ctx) {
 			case 'addsample': await handleAdAddSampleCommand(env, chatId, arg); break;
 			case 'clearsamples': await handleAdClearSamplesCommand(env, chatId, ownerId, arg); break;
 			case 'adstats': await handleAdStatsCommand(env, chatId); break;
-			case 'vision': await handleAdVisionCommand(env, chatId); break;
+			case 'vision': await handleAdVisionCommand(env, chatId, ctx); break;
 			case 'digest': await handleAdDigestCommand(env, chatId, arg); break;
 			case 'whitelist': await handleAdWhitelistCommand(env, chatId, ownerId, arg); break;
 			case 'rescreen': await handleAdRescreenCommand(env, chatId, arg); break;
@@ -21573,30 +21649,46 @@ async function handleAdClearSamplesCommand(env, chatId, ownerId, arg) {
 // 真因卡在「等 23:17」上大半天 —— ad_images 里「广告图 0、待识别 215」，
 // 而 L1 同款指纹【依赖 L2 的结论】，等于整条图片通道瘫痪。
 // 这个命令触发一轮并把结果（队列 / 完成 / 广告 / 干净 / 失败 + 熔断状态）直接回执。
-async function handleAdVisionCommand(env, chatId) {
-	const now = Math.floor(Date.now() / 1000);
-	const avatar = await runAdAvatarVision(env);
-	const image = await runAdImageVision(env, { batchSize: AD_IMAGE_VISION_BATCH });
-	const brk = await readVisionBreakState(env, now);
-	const line = (label, s) => '<b>' + label + '</b>　队列 ' + Number(s.queued || 0)
-		+ '　完成 ' + Number(s.done || 0)
-		+ '　广告 <b>' + Number(s.ad || 0) + '</b>'
-		+ '　干净 ' + Number(s.clean || 0)
-		+ '　失败 <b>' + Number(s.failed || 0) + '</b>'
-		+ (Number(s.skippedLarge) > 0 ? '　超限跳过 ' + Number(s.skippedLarge) : '')
-		+ (Number(s.rateLimited) > 0 ? '　限流跳过 ' + Number(s.rateLimited) : '')
-		+ (s.skipped ? '　⏸️ 跳过：' + escapeHtml(String(s.skipped)) : '');
-	const parts = [
-		'<b>🖼 视觉识别 · 手动触发一轮</b>',
-		'',
-		line('头像', avatar),
-		line('正文图', image),
-		describeVisionBreak(brk),
-		'',
-		'失败原因去 Workers 日志搜「识别失败」—— stage 后面那个词直接指明挂在哪一步：',
-		'getFile 拿不到文件路径　download 下载失败　encode 编码　sniff 不是位图　ai.run 模型调用本身失败',
-	];
-	await sendTelegramMessage(chatId, parts.filter(Boolean).join('\n'));
+async function handleAdVisionCommand(env, chatId, ctx) {
+	// 【先回执、再后台跑】原实现是「跑完才回复」，而一轮最多跑头像 500 + 正文图 150
+	// = 650 张，每张 getFile + 下载 + 推理几秒 → 请求挂十几分钟、waitUntil 调用为 0。
+	// webhook 一直收不到 2xx，后续消息全被堵 —— 2026-10-13 00:36 触发后私聊命令
+	// 集体无反应，回退/重部署让实例重建才一次性释放（主人看到「一瞬间返回全部内容」）。
+	// 现在立刻回一条，再用 ctx.waitUntil 丢到后台，请求马上返回 200。
+	await sendTelegramMessage(chatId,
+		'⏳ <b>视觉识别已开始</b>\n正在后台处理队列，完成后会再发一条结果，期间其它命令不受影响。');
+	const run = async () => {
+		const now = Math.floor(Date.now() / 1000);
+		const avatar = await runAdAvatarVision(env);
+		const image = await runAdImageVision(env, { batchSize: AD_IMAGE_VISION_BATCH });
+		const brk = await readVisionBreakState(env, now);
+		const line = (label, s) => '<b>' + label + '</b>　队列 ' + Number(s.queued || 0)
+			+ '　完成 ' + Number(s.done || 0)
+			+ '　广告 <b>' + Number(s.ad || 0) + '</b>'
+			+ '　干净 ' + Number(s.clean || 0)
+			+ '　失败 <b>' + Number(s.failed || 0) + '</b>'
+			+ (Number(s.skippedLarge) > 0 ? '　超限跳过 ' + Number(s.skippedLarge) : '')
+			+ (Number(s.rateLimited) > 0 ? '　限流跳过 ' + Number(s.rateLimited) : '')
+			+ (Number(s.skippedMissing) > 0 ? '　📁 失效跳过 ' + Number(s.skippedMissing) + '（文件没了，不计熔断）' : '')
+			+ (s.skipped ? '　⏸️ 跳过：' + escapeHtml(String(s.skipped)) : '');
+		const parts = [
+			'<b>🖼 视觉识别 · 结果</b>',
+			'',
+			line('头像', avatar),
+			line('正文图', image),
+			describeVisionBreak(brk),
+			'',
+			'失败原因去 Workers 日志搜「识别失败」—— stage 后面那个词直接指明挂在哪一步：',
+			'getFile 拿不到文件路径　download 下载失败　encode 编码　sniff 不是位图　ai.run 模型调用本身失败',
+		];
+		await sendTelegramMessage(chatId, parts.filter(Boolean).join('\n'));
+	};
+	// 拿不到 ctx（测试或降级环境）时退回同步，行为与旧版一致 —— 至少不会静默丢任务。
+	if (ctx && typeof ctx.waitUntil === 'function') {
+		ctx.waitUntil(run());
+		return;
+	}
+	await run();
 }
 
 // ===== 形态摘要命令（/digest）=====
