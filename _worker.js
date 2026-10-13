@@ -12565,9 +12565,9 @@ function loadAdDetectionConfig(env) {
 		llmDaily: pickInt(env.AD_LLM_DAILY, AD_LLM_DAILY, 0, 100000),
 		// 三个分池：谁消耗额度由哪个池记账，互不挤占。
 		// 环境变量名固定，改数不用改代码；任一池填 0 = 关掉那一路的 LLM（其余照跑）。
-		llmDailyMessage: pickInt(env.AD_LLM_DAILY_MESSAGE, AD_LLM_DAILY_MESSAGE, 0, 5000),
-		llmDailyJoin: pickInt(env.AD_LLM_DAILY_JOIN, AD_LLM_DAILY_JOIN, 0, 5000),
-		llmDailyCron: pickInt(env.AD_LLM_DAILY_CRON, AD_LLM_DAILY_CRON, 0, 5000),
+		llmDailyMessage: pickInt(env.AD_LLM_DAILY_MESSAGE, AD_LLM_DAILY_MESSAGE, 0, 100000),
+		llmDailyJoin: pickInt(env.AD_LLM_DAILY_JOIN, AD_LLM_DAILY_JOIN, 0, 100000),
+		llmDailyCron: pickInt(env.AD_LLM_DAILY_CRON, AD_LLM_DAILY_CRON, 0, 100000),
 		// 采信线：命中且置信度 ≥ 此值才封，低于它只进观察。见 AD_LLM_CONF 说明。
 		llmConf: pickFloat(env.AD_LLM_CONF, AD_LLM_CONF, 0.5, 1),
 		// 换模型只改这个环境变量，不动代码（与 AD_EMBEDDING_MODEL 必须写死在代码里不同：

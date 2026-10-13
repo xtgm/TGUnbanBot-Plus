@@ -11,6 +11,8 @@
 //   [1] AD_AVATAR_VISION_DAILY=10000 → 10000（改前回退成 50 → 红）
 //   [2] AD_IMAGE_VISION_DAILY=10000  → 10000（改前回退成 300 → 红）
 //   [3] AD_LLM_DAILY=10000           → 10000（改前回退成 1000 → 红）
+//   [3a][3b][3c] 三个 LLM 子池同理 —— 主人设了主池 10000 却没设子池，
+//       子池默认 500/300/100 才是实际瓶颈（三池独立计数，主池的 10000 根本轮不到）
 //   [4] 反证：0 仍是「关闭」语义，不能被放开改坏
 //   [5] 反证：不设环境变量时仍用代码默认值（fallback 路径没坏）
 
@@ -58,6 +60,13 @@ console.log('  实际: avatar=' + big.avatarVisionDaily + ' image=' + big.imageV
 assert('[1] AD_AVATAR_VISION_DAILY=10000 生效', Number(big.avatarVisionDaily) === 10000, `实际=${big.avatarVisionDaily}`);
 assert('[2] AD_IMAGE_VISION_DAILY=10000 生效', Number(big.imageVisionDaily) === 10000, `实际=${big.imageVisionDaily}`);
 assert('[3] AD_LLM_DAILY=10000 生效', Number(big.llmDaily) === 10000, `实际=${big.llmDaily}`);
+
+console.log('\n=== LLM 三子池（主池放开了，子池仍是实际瓶颈）===');
+const sub = cfg({ AD_LLM_DAILY_MESSAGE: '10000', AD_LLM_DAILY_JOIN: '10000', AD_LLM_DAILY_CRON: '10000' });
+console.log('  实际: message=' + sub.llmDailyMessage + ' join=' + sub.llmDailyJoin + ' cron=' + sub.llmDailyCron);
+assert('[3a] AD_LLM_DAILY_MESSAGE=10000 生效', Number(sub.llmDailyMessage) === 10000, `实际=${sub.llmDailyMessage}`);
+assert('[3b] AD_LLM_DAILY_JOIN=10000 生效', Number(sub.llmDailyJoin) === 10000, `实际=${sub.llmDailyJoin}`);
+assert('[3c] AD_LLM_DAILY_CRON=10000 生效', Number(sub.llmDailyCron) === 10000, `实际=${sub.llmDailyCron}`);
 
 console.log('\n=== 反证：不该被放开改坏的 ===');
 const zero = cfg({ AD_AVATAR_VISION_DAILY: '0', AD_IMAGE_VISION_DAILY: '0', AD_LLM_DAILY: '0' });
