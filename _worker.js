@@ -18309,11 +18309,15 @@ async function readAdLLMOutcome(env, nowSeconds) {
 	};
 }
 
-async function readAvatarVisionQuota(env, nowSeconds) {
+// prefix 参数化额度键：cron 走默认 'avatar'（→ avatar_day / avatar_count，与改动前
+// 逐字一致），/vision 手动触发走 'vision_manual_avatar'（→ vision_manual_avatar_day /
+// vision_manual_avatar_count）。原先两者共用一个池，手动跑满 500 后当天 cron 直接
+// daily_limit_reached 早退 —— 而 cron 才是日常消化队列的主力。
+async function readAvatarVisionQuota(env, nowSeconds, prefix = 'avatar') {
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
-	const savedDay = await readAdScanState(env, 'avatar_day', '');
-	const count = savedDay === today ? (Number(await readAdScanState(env, 'avatar_count', '0')) || 0) : 0;
-	if (savedDay !== today) await writeAdScanState(env, 'avatar_day', today, nowSeconds);
+	const savedDay = await readAdScanState(env, prefix + '_day', '');
+	const count = savedDay === today ? (Number(await readAdScanState(env, prefix + '_count', '0')) || 0) : 0;
+	if (savedDay !== today) await writeAdScanState(env, prefix + '_day', today, nowSeconds);
 	return { today, used: count };
 }
 
@@ -18455,7 +18459,8 @@ async function runAdAvatarVision(env, options = {}) {
 	// options.dailyLimit 仅供测试注入，传了就覆盖。
 	const dailyLimit = Number(options.dailyLimit) >= 0 ? Number(options.dailyLimit) : config.avatarVisionDaily;
 	const nowSeconds = Math.floor(Date.now() / 1000);
-	const quota = await readAvatarVisionQuota(env, nowSeconds);
+	const quotaPrefix = String(options.quotaPrefix || 'avatar');
+	const quota = await readAvatarVisionQuota(env, nowSeconds, quotaPrefix);
 	const remaining = dailyLimit - quota.used;
 	if (dailyLimit <= 0) { stats.skipped = 'disabled'; return stats; }
 	if (remaining <= 0) { stats.skipped = 'daily_limit_reached'; stats.queued = quota.used; return stats; }
@@ -18592,7 +18597,7 @@ async function runAdAvatarVision(env, options = {}) {
 		else if (verdict === 'clean') stats.clean += 1;
 		if (verdict !== 'pending') stats.done += 1;
 		used += 1;
-		await writeAdScanState(env, 'avatar_count', String(used), Math.floor(Date.now() / 1000));
+		await writeAdScanState(env, quotaPrefix + '_count', String(used), Math.floor(Date.now() / 1000));
 	}
 	console.log('[广告检测·头像] 本轮 队列=' + stats.queued + ' 完成=' + stats.done
 		+ ' 广告=' + stats.ad + ' 干净=' + stats.clean + ' 失败=' + stats.failed
@@ -18609,11 +18614,13 @@ const AD_IMAGE_VISION_KINDS = ['photo', 'sticker'];
 
 // 取今日的正文图片推理额度。与头像的 avatar_day / avatar_count 各自独立，
 // 两轨互不挤占 —— 正文图片量大，共用一个计数器会把头像那 50 张挤成零。
-async function readImageVisionQuota(env, nowSeconds) {
+// 同 readAvatarVisionQuota：prefix 默认 'img'（→ img_day / img_count，与改动前一致），
+// /vision 手动触发传 'vision_manual_img'，两池互不挤占。
+async function readImageVisionQuota(env, nowSeconds, prefix = 'img') {
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
-	const savedDay = await readAdScanState(env, AD_IMAGE_VISION_DAY_KEY, '');
-	const count = savedDay === today ? (Number(await readAdScanState(env, AD_IMAGE_VISION_COUNT_KEY, '0')) || 0) : 0;
-	if (savedDay !== today) await writeAdScanState(env, AD_IMAGE_VISION_DAY_KEY, today, nowSeconds);
+	const savedDay = await readAdScanState(env, prefix + '_day', '');
+	const count = savedDay === today ? (Number(await readAdScanState(env, prefix + '_count', '0')) || 0) : 0;
+	if (savedDay !== today) await writeAdScanState(env, prefix + '_day', today, nowSeconds);
 	return { today, used: count };
 }
 
@@ -18633,7 +18640,8 @@ async function runAdImageVision(env, options = {}) {
 	// 环境变量 AD_IMAGE_VISION_DAILY=0 即关闭 L2（只保留 L1 指纹查表，零 Neurons）。
 	const dailyLimit = Number(options.dailyLimit) >= 0 ? Number(options.dailyLimit) : config.imageVisionDaily;
 	const nowSeconds = Math.floor(Date.now() / 1000);
-	const quota = await readImageVisionQuota(env, nowSeconds);
+	const quotaPrefix = String(options.quotaPrefix || 'img');
+	const quota = await readImageVisionQuota(env, nowSeconds, quotaPrefix);
 	const remaining = dailyLimit - quota.used;
 	if (dailyLimit <= 0) { stats.skipped = 'disabled'; return stats; }
 	if (remaining <= 0) { stats.skipped = 'daily_limit_reached'; stats.queued = quota.used; return stats; }
@@ -18752,7 +18760,7 @@ async function runAdImageVision(env, options = {}) {
 		else if (verdict === 'clean') stats.clean += 1;
 		if (verdict !== 'pending') stats.done += 1;
 		used += 1;
-		await writeAdScanState(env, AD_IMAGE_VISION_COUNT_KEY, String(used), Math.floor(Date.now() / 1000));
+		await writeAdScanState(env, quotaPrefix + '_count', String(used), Math.floor(Date.now() / 1000));
 	}
 	console.log('[广告检测·图片] 本轮 队列=' + stats.queued + ' 完成=' + stats.done
 		+ ' 广告=' + stats.ad + ' 干净=' + stats.clean + ' 失败=' + stats.failed
@@ -21687,8 +21695,16 @@ async function handleAdVisionCommand(env, chatId, ctx) {
 		'⏳ <b>视觉识别已开始</b>\n正在后台处理队列，完成后会再发一条结果，期间其它命令不受影响。');
 	const run = async () => {
 		const now = Math.floor(Date.now() / 1000);
-		const avatar = await runAdAvatarVision(env);
-		const image = await runAdImageVision(env, { batchSize: AD_IMAGE_VISION_BATCH });
+		const avatar = await runAdAvatarVision(env, { quotaPrefix: 'vision_manual_avatar' });
+		const image = await runAdImageVision(env, { quotaPrefix: 'vision_manual_img', batchSize: AD_IMAGE_VISION_BATCH });
+		// 两个池的当前用量并列显示 —— 手动跑满多少、还剩多少给 cron，一眼可读。
+		const manualAvatarQuota = await readAvatarVisionQuota(env, now, 'vision_manual_avatar');
+		const cronAvatarQuota = await readAvatarVisionQuota(env, now, 'avatar');
+		const manualImgQuota = await readImageVisionQuota(env, now, 'vision_manual_img');
+		const cronImgQuota = await readImageVisionQuota(env, now, 'img');
+		const quotaLine = '📊 <b>额度</b>　头像 手动 ' + manualAvatarQuota.used + ' · cron ' + cronAvatarQuota.used
+			+ '　｜　图片 手动 ' + manualImgQuota.used + ' · cron ' + cronImgQuota.used
+			+ '<br><i>手动与 cron 各走各的池，手动跑满不会让当天 cron 早退</i>';
 		const brk = await readVisionBreakState(env, now);
 		const line = (label, s) => '<b>' + label + '</b>　队列 ' + Number(s.queued || 0)
 			+ '　完成 ' + Number(s.done || 0)
@@ -21704,6 +21720,7 @@ async function handleAdVisionCommand(env, chatId, ctx) {
 			'',
 			line('头像', avatar),
 			line('正文图', image),
+			quotaLine,
 			describeVisionBreak(brk),
 			'',
 			'失败原因去 Workers 日志搜「识别失败」—— stage 后面那个词直接指明挂在哪一步：',
