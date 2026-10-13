@@ -844,6 +844,51 @@ section('[8] /spam /ban /sban 引用的图片也进广告素材库');
 	assert('★ 没有引用消息时不误学图片', after === before, before + '→' + after);
 }
 
+// ================= [9] /user 按 TGID 查案底（2026-10-13）=================
+//
+// 治的是「6857 条快照只能按序号翻、实际翻不到底」—— 主人原话「必须加，通过 TGID
+// 去查是最有效的方法，可以直接查这个人发言说过什么」与「痕迹必须完整」：
+// 所以已复核的也要列出，正文与判据都不截断。
+section('[9] /user 按 TGID 查这个人的全部案底');
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	const sentText = () => calls.filter((c) => c.method === 'sendMessage')
+		.map((c) => String(c.body?.text || '')).join('\n');
+
+	// 造两条：一条未复核、一条已复核（expires_at 被置 0，行留着占序号）
+	await W.allocateAdPendingSnapshot(env, 'OWNER_1', {
+		userId: '888001', chatId: '-1001', score: 5,
+		reasons: ['消息图片命中广告素材库（复用定罪 0 次）'],
+		snapshot: { name: '假钞妹子', username: 'fake_girl', bio: '出货都可', text: '假钞妹子嫩妹 🔥 假钞日常出货都可' }
+	});
+	const seq2 = await W.allocateAdPendingSnapshot(env, 'OWNER_1', {
+		userId: '888001', chatId: '-1002', score: 2, reasons: ['昵称命中指纹'],
+		snapshot: { name: '第二条', text: 'x' }
+	});
+	await env.DB.prepare('UPDATE ad_pending_snapshots SET expires_at = 0 WHERE seq = ?').bind(seq2).run();
+
+	resetCalls();
+	await W.handleAdUserCommand(env, '-100999', 'OWNER_1', '888001');
+	const out = sentText();
+	assert('★ 能按 TGID 查到案底', out.includes('888001'), out.slice(0, 200));
+	assert('两条案底都列出（含已复核的）', out.includes('假钞妹子') && out.includes('第二条'), out.slice(0, 400));
+	assert('★ 正文完整不截断', out.includes('假钞妹子嫩妹 🔥 假钞日常出货都可'), out.slice(0, 400));
+	assert('★ 判据也列出来', out.includes('消息图片命中广告素材库'), out.slice(0, 400));
+	assert('已复核的那条有标注', out.includes('已复核'), out.slice(0, 400));
+	assert('简介与 @用户名也带出来', out.includes('出货都可') && out.includes('fake_girl'), out.slice(0, 400));
+
+	// 没有记录的 TGID：给出明确的「没有」而不是报错
+	resetCalls();
+	await W.handleAdUserCommand(env, '-100999', 'OWNER_1', '123456789');
+	assert('查不到时明确说没有', sentText().includes('没有这个人的判定记录'), sentText().slice(0, 200));
+
+	// 非法参数：给用法提示，不抛异常
+	resetCalls();
+	await W.handleAdUserCommand(env, '-100999', 'OWNER_1', 'abc');
+	assert('非法 TGID 给用法提示', sentText().includes('用法'), sentText().slice(0, 200));
+}
+
 console.log(`\n===== 正文图片检测测试：通过 ${pass} / 失败 ${fail} =====`);
 if (fail > 0) {
 	console.log('失败项：');

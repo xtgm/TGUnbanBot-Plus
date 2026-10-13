@@ -9545,6 +9545,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'',
 			'<b>━━ 广告自动检测（仅私聊）━━</b>',
 			'/pending [N]　列出待复核的自动判定快照，默认 10 条',
+			'/user TGID　按 Telegram 用户 ID 查这个人的全部案底：每次判定的时间、得分、名称、当时发的内容原文与判据（已复核过的也一并列出）',
 			'/ignore 序号　判错回滚：解黑 + 全群解封 + 删掉学到的指纹和样本（支持 3 5 7 与 3-8）。封禁回执上也有两个按钮：↩️误判=回滚全部、🔓解封=只放人不动判据',
 			'/rescreen [N]　重新筛查观察窗口里的可疑用户，默认 10 人',
 			'/adstats　检测状态总览：指纹、样本向量、观察窗口、入群检查流水与本群演练状态',
@@ -21279,7 +21280,7 @@ async function detectAdOnMessage(message, env) {
 // /learnlast 放进这里是因为它与本组命令的约束完全一致：仅第一主人、强制私聊。
 // /recent 【刻意不在】这里 —— 它必须群内可用（在群里看到广告被删就顺手拉列表），
 // 而本函数对群内命令一律撤回 + 引导私聊，会把 /recent 的主用法直接堵死。
-const AD_COMMAND_RE = /^\/(pending|ignore|addword|delword|words|addsample|clearsamples|adstats|vision|digest|whitelist|rescreen|warmup|learnlast)(?:@[^\s]+)?(?:\s|$)/i;
+const AD_COMMAND_RE = /^\/(pending|user|ignore|addword|delword|words|addsample|clearsamples|adstats|vision|digest|whitelist|rescreen|warmup|learnlast)(?:@[^\s]+)?(?:\s|$)/i;
 
 // 快照 → 判定载荷。/ignore 标误判、删 AI 样本都要用同一份载荷，保证两边命中的集合一致。
 function adPayloadFromSnapshot(snapshot) {
@@ -21359,6 +21360,7 @@ async function handleAdDetectionCommands(message, env, ctx) {
 	try {
 		switch (command) {
 			case 'pending': await handleAdPendingCommand(env, chatId, ownerId, arg); break;
+			case 'user': await handleAdUserCommand(env, chatId, ownerId, arg); break;
 			case 'ignore': await handleAdIgnoreCommand(env, chatId, ownerId, arg); break;
 			case 'addword': await handleAdAddWordCommand(env, chatId, ownerId, arg); break;
 			case 'delword': await handleAdDelWordCommand(env, chatId, ownerId, arg); break;
@@ -21541,6 +21543,92 @@ async function handleAdLearnLastCommand(env, chatId, ownerId, arg) {
 }
 
 // /pending [数量]：列出待确认的判定快照，1 小时后自动过期。
+// /user <TGID> —— 按 Telegram 用户 ID 查这个人的全部案底（2026-10-13 主人要求）
+//
+// 【为什么要有它】快照按 user_id 存着完整的现场记录（名称 / @用户名 / 简介 /
+// 触发判定的消息原文 / 当时判它有罪的全部理由），但原先唯一的入口是 /pending 按
+// 【序号】翻 —— 6857 条一次只显示 20 条，实际翻不到底，等于根本没法按人查。
+// 主人原话：「必须加，通过 TGID 去查是最有效的方法，可以直接查这个人发言说过什么」
+// 以及「痕迹必须完整」—— 所以这里【已复核过的也一并列出】、正文与判据【都不截断】。
+//
+// 【为什么完整只到封禁那一刻】快照写在 enforceAdDetection（执行处置）里，
+// 是封禁当时的现场；人被封之后不再发言，也就不会再产生新痕迹 —— 这份记录
+// 就是他在本 bot 手上留下的全部内容。
+//
+// 【只读】一条 SELECT + 一次黑名单计数，不改数据、不影响封禁状态、不花模型额度。
+async function handleAdUserCommand(env, chatId, ownerId, arg) {
+	const uid = String(arg || '').trim();
+	if (!/^-?\d+$/.test(uid)) {
+		await sendTelegramMessage(chatId,
+			'❌ 用法：/user &lt;TGID&gt;\n例：/user 6996977947\n\n'
+			+ '查这个人在本 bot 手上的全部案底：每次判定的时间、得分、名称、\n'
+			+ '当时发的内容原文、以及判它有罪的全部理由。\n'
+			+ '已经 /ignore 复核过的也一并列出，并标注「已复核」。');
+		return;
+	}
+	if (!(await adDetectionReady(env))) {
+		await sendTelegramMessage(chatId, '❌ 广告检测尚未就绪。');
+		return;
+	}
+	const lines = [];
+	let blacklisted = false;
+	try {
+		const row = await env.DB.prepare('SELECT COUNT(*) AS c FROM blacklist WHERE id = ?').bind(uid).first();
+		blacklisted = Number(row?.c || 0) > 0;
+	} catch (error) {
+		console.error('[广告检测] 查黑名单状态失败:', error);
+	}
+	let results = [];
+	try {
+		const res = await env.DB.prepare(
+			'SELECT seq, chat_id, score, reasons, snapshot, created_at, expires_at '
+			+ 'FROM ad_pending_snapshots WHERE user_id = ? ORDER BY created_at DESC LIMIT 100'
+		).bind(uid).all();
+		results = (res && res.results) || res || [];
+	} catch (error) {
+		console.error('[广告检测] 按用户查案底失败:', error);
+		await sendTelegramMessage(chatId, '❌ 查询失败，详见 Worker 日志。');
+		return;
+	}
+
+	lines.push('<b>🔎 用户案底　TGID <code>' + escapeHtml(uid) + '</code></b>');
+	lines.push('当前状态：' + (blacklisted ? '<b>在黑名单中</b>' : '不在黑名单'));
+	lines.push(results.length
+		? '案底 <b>' + results.length + '</b> 条（最多显示 100 条，最新在前）'
+		: '📭 没有这个人的判定记录。');
+	if (!results.length) {
+		await sendTelegramMessageChunks(chatId, lines.join('\n'));
+		return;
+	}
+	lines.push('');
+	for (const row of results) {
+		let snapshot = {};
+		let reasons = [];
+		try { snapshot = JSON.parse(String(row.snapshot || '{}')); } catch { snapshot = {}; }
+		try { reasons = JSON.parse(String(row.reasons || '[]')); } catch { reasons = []; }
+		const when = Number(row.created_at)
+			? new Date(Number(row.created_at) * 1000).toISOString().replace('T', ' ').slice(0, 19) : '未知';
+		// expires_at = 0 表示这条已经 /ignore 复核过（回滚），行留着占序号 —— 照样列出并标注。
+		const reviewed = Number(row.expires_at) === 0;
+		lines.push('━━━━━━━━━━━━━━');
+		lines.push('<b>#' + Number(row.seq || 0) + '</b>　' + when
+			+ ' UTC　得分 <b>' + Number(row.score || 0) + '</b>' + (reviewed ? '　（已复核 /ignore）' : ''));
+		if (snapshot.name) lines.push('名称：' + escapeHtml(String(snapshot.name)));
+		if (snapshot.username) lines.push('用户名：' + escapeHtml(String(snapshot.username)));
+		if (snapshot.bio) lines.push('简介：' + escapeHtml(String(snapshot.bio)));
+		if (snapshot.status) lines.push('在线状态：' + escapeHtml(String(snapshot.status)));
+		// 【痕迹完整】正文与判据都不截断 —— 主人原话「痕迹必须完整」。
+		// 超长由 sendTelegramMessageChunks 按 4096 字上限分块发送，不会被吞。
+		if (snapshot.text) lines.push('正文：<code>' + escapeHtml(String(snapshot.text)) + '</code>');
+		if (Array.isArray(reasons) && reasons.length) {
+			lines.push('判据：');
+			for (const r of reasons) lines.push('　· ' + escapeHtml(String(r)));
+		}
+		if (row.chat_id) lines.push('群：' + escapeHtml(String(row.chat_id)));
+	}
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
+}
+
 async function handleAdPendingCommand(env, chatId, ownerId, arg) {
 	const parsed = parseInt(arg, 10);
 	const limit = Number.isFinite(parsed) && parsed > 0
