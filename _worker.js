@@ -12556,13 +12556,13 @@ function loadAdDetectionConfig(env) {
 		// 头像视觉识别的每日张数上限（0 = 只跑 L1 指纹库，不调模型）。
 		// 免费层每天 10,000 Neurons 且超限【直接报错】，所以默认给个保守值，
 		// 并允许主人先设 0 关掉 L2、确认 L1 效果后再开 —— 两层可独立灰度。
-		avatarVisionDaily: pickInt(env.AD_AVATAR_VISION_DAILY, AD_AVATAR_VISION_DAILY, 0, 500),
+		avatarVisionDaily: pickInt(env.AD_AVATAR_VISION_DAILY, AD_AVATAR_VISION_DAILY, 0, 100000),
 		// 正文图片视觉识别的每日张数上限（0 = 关闭 L2，只保留 L1 指纹查表）。
 		// 上限比头像宽一个量级（付费层超限是计费不是报错），理由见 AD_IMAGE_VISION_DAILY。
-		imageVisionDaily: pickInt(env.AD_IMAGE_VISION_DAILY, AD_IMAGE_VISION_DAILY, 0, 5000),
+		imageVisionDaily: pickInt(env.AD_IMAGE_VISION_DAILY, AD_IMAGE_VISION_DAILY, 0, 100000),
 		// 生成式深度判定的【总】每日次数上限（0 = 关闭本路，只跑前三层）。
 		// 2026-10-11 从 200 提到 1000，并拆出下面三个分池 —— 详见 AD_LLM_DAILY 的成本账。
-		llmDaily: pickInt(env.AD_LLM_DAILY, AD_LLM_DAILY, 0, 5000),
+		llmDaily: pickInt(env.AD_LLM_DAILY, AD_LLM_DAILY, 0, 100000),
 		// 三个分池：谁消耗额度由哪个池记账，互不挤占。
 		// 环境变量名固定，改数不用改代码；任一池填 0 = 关掉那一路的 LLM（其余照跑）。
 		llmDailyMessage: pickInt(env.AD_LLM_DAILY_MESSAGE, AD_LLM_DAILY_MESSAGE, 0, 5000),
