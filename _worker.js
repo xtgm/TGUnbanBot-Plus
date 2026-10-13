@@ -6567,6 +6567,11 @@ async function cacheModerationMessage(env, message, options = {}) {
 //   30 个号 ≈ 1047 → 撞 Cloudflare 单请求 1000 子请求硬限，会直接失败
 // 所以硬上限取 20（≈707，留 30% 余量），超出部分只列 TGID 交给主人手动处理。
 const LINKED_SPAM_LOOKBACK_MS = 24 * 60 * 60 * 1000; // 追溯窗口：24 小时
+// 自动封禁同款连带的人数上限。enforceLinkedSpamTargets 是【同步串行】执行的 ——
+// 20 人 × 14 群 = 280 次 HTTP 会把整个请求拖到超时，而超时会让后面的删消息、快照、
+// 通知全丢。超出上限的不丢：recordSpamText 已把同款文案写进 ad_spam_texts，
+// 他们再发一次就被「同款直封」当场拦下。
+const AD_AUTO_LINKED_MAX = 10;
 const LINKED_SPAM_MAX_TARGETS = 20;                  // 单次连带硬上限（子请求预算所限）
 
 // 同步 or 转批量：【按子请求预算动态判断，不写死号数】。
@@ -20067,6 +20072,60 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		});
 	} catch (error) {
 		console.error('[广告检测] 全群封禁失败:', error);
+	}
+
+	// ===== 同款连带：自动封禁与 /spam 走同一套 =====
+	//
+	// 【补这个缺口的理由】findLinkedSpamTargets / recordSpamText / enforceLinkedSpamTargets
+	// 三者原先只在 /spam 引用回复路径（9069 / 9073 / 9090）调用，自动封禁只封触发者本人 ——
+	// 线上表现：14:39 自动封了 A，14:41 另一个号发同一句「来码单结 工资5千」，
+	// 仍要主人手动 /spam 才连带出 4 个目标。可 /spam 是人工动作，与自动检测判据无关，
+	// 等于「自动检测判出来的广告，其同款反倒要人工再来一遍」。
+	//
+	// 【主人口径】「同款就是为了针对同类广告而做的功能，正常人怎么可能会触及同款。
+	// 触及了再修就是了。」所以不额外设门槛 —— 受保护角色剔除是唯一防线
+	// （isProtectedFromAutoModeration：豁免名单 + 任一配置群管理员/群主）。
+	//
+	// 【入群秒封天然跳过】那条路 payload.text 为空（用户还没发言），autoKey 为 null。
+	try {
+		const autoText = String(evaluation?.payload?.text ?? '').trim();
+		const autoKey = autoText ? buildModerationTextKey({ text: autoText }) : null;
+		if (autoKey) {
+			// ① 写同款名单：之后任何人再发同款 → 发言时即删 + 封，不需要二次定罪。
+			await recordSpamText(env, { text: autoText });
+			// ② 反查 24 小时内发过同款的其他号（跨全部配置群，不含触发者本人）。
+			const found = await findLinkedSpamTargets(env, autoKey, userId);
+			if (found?.targets?.length) {
+				const kept = [];
+				for (const t of found.targets) {
+					if (await isProtectedFromAutoModeration(t.userId)) {
+						console.log('[同款连带·自动] 目标 ' + t.userId + ' 是受保护角色，跳过不封');
+					} else {
+						kept.push(t);
+					}
+				}
+				// ③ 人数封顶：enforceLinkedSpamTargets 同步串行，20 人 × 14 群 = 280 次 HTTP
+				// 会把请求拖到超时，超时又会让后面的删消息 / 快照 / 通知全丢。
+				const capped = kept.slice(0, AD_AUTO_LINKED_MAX);
+				if (kept.length > capped.length) {
+					console.log('[同款连带·自动] 反查到 ' + kept.length + ' 人，超过上限 ' + AD_AUTO_LINKED_MAX
+						+ '，先连带 ' + capped.length + ' 人；其余由 ad_spam_texts 名单下次直封');
+				}
+				if (capped.length) {
+					// ④ 连带封禁：内部会删同款消息 + 加黑 + 全群封禁
+					//（banUserFromAllGroups 未传 revokeMessages → 默认 true → Telegram 撤回其历史发言）。
+					const done = await enforceLinkedSpamTargets(env, capped, {
+						operatorId: 'system',
+						note: '同款广告连带(自动封禁 ' + userId + ')'
+					});
+					console.log('[同款连带·自动] 触发者 ' + userId + ' → 反查 ' + kept.length
+						+ ' 人 → 连带封禁 ' + Number(done?.length || 0) + ' 人');
+				}
+			}
+		}
+	} catch (error) {
+		// 连带失败绝不影响自动封禁本职：当事人的加黑 + 封禁 + 删消息早已完成。
+		console.error('[同款连带·自动] 执行失败:', error);
 	}
 
 	// 记下这次处置的广告文案，供【重发删除通道】比对。

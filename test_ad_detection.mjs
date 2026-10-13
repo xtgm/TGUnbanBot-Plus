@@ -3715,6 +3715,40 @@ section('[20] 方案 A · 广告不计入发言统计、命令与观察照常计
 		speechCount(envO) === 1, 'stat_speech=' + speechCount(envO));
 }
 
+// ===== [连带] 自动封禁 → 同款连带查杀（2026-10-13 甲方案）=====
+// 原先 findLinkedSpamTargets / recordSpamText / enforceLinkedSpamTargets 三者
+// 都只在 /spam 引用回复路径（9069/9073/9090）调用，自动封禁只封触发者本人 ——
+// 线上表现：14:39 自动封了 A，14:41 另一个号发同一句「来码单结 工资5千」，
+// 仍要主人手动 /spam 才连带出 4 个目标（而 /spam 与自动封禁判据无关）。
+console.log('\n[连带] 自动封禁 → 同款连带查杀');
+{
+	const AD_TEXT = '高价收网赚账号 长期收购 USDT 日结秒到 需要的私我';
+	const envL = makeEnv();
+	// 先让 B 真发一条同款（写进 moderation_messages）——
+	// 不能靠手工插行：我插的 key.hash 用的是裸文案，而代码里连带反查用的是
+	// buildModerationTextKey(evaluation.payload.text) 算出来的 hash，
+	// payload.text 是检测时拼装的正文，两者对不上 → 反查永远查不到（首跑就栽在这）。
+	await sendUpdate({ message: groupMessage({ id: 888880001, is_bot: false, first_name: '广告B' }, AD_TEXT) }, envL);
+	// 再让 A 发同款。B 的封禁记录在这里被清掉，只保留 moderation_messages ——
+	// 于是断言里的「谁被封」只反映 A 这一次定罪的结果。
+	resetCalls();
+	await sendUpdate({ message: groupMessage({ id: 888880002, is_bot: false, first_name: '广告A' }, AD_TEXT) }, envL);
+	const banned = calls.filter((c) => c.method === 'banChatMember').map((c) => String(c?.body?.user_id));
+	console.log('    被封用户=' + JSON.stringify(banned));
+
+	assert('[连带] 前置：A 自己被封（否则下一条无意义）',
+		banned.includes('888880002'), 'banned=' + JSON.stringify(banned));
+	assert('[连带] 同款的 B 被自动连带封禁（不再需要主人手动 /spam）',
+		banned.includes('888880001'), 'banned=' + JSON.stringify(banned));
+	// 反证：同款文案必须写进 ad_spam_texts，否则下次再发同款还是拦不住
+	const spamCnt = Number(envL.DB.query("SELECT COUNT(*) AS c FROM ad_spam_texts")[0]?.c) || 0;
+	assert('[连带] 同款文案已写进 ad_spam_texts（下次发言即直封）',
+		spamCnt > 0, 'ad_spam_texts=' + spamCnt);
+	// 反证：连带不含触发者本人（不自噬）
+	assert('[连带] 连带不自噬（触发者只封一次）',
+		banned.filter((u) => u === '888880002').length <= 1, 'banned=' + JSON.stringify(banned));
+}
+
 console.log('='.repeat(60));
 console.log(`广告检测测试汇总：通过 ${pass} 条，失败 ${fail} 条`);
 if (failures.length) {
