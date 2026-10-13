@@ -18023,7 +18023,19 @@ async function drainAdAvatarLearningQueue(env, limit = 30) {
 // 【为什么不用 Cloudflare 的专用小模型】menshen 的做法是走上游多模态模型
 //（openrouter/openai/gpt-4o），不绑死在一家的视觉模型上 —— 模型坏了换一个上游就行。
 // 本项目在 Workers AI 里跑，等效做法就是换一个能用的多模态模型。
-const AD_AVATAR_VISION_MODEL = '@cf/meta/llama-3.2-11b-vision-instruct';
+// 【2026-10-13 换模型：llama-3.2-11b-vision → clef-flash】
+// 主人反馈「漏了好几个用户的广告头像没识别到」。用他给的一张真实广告头像
+// （写着「晨曦 代发 ✈️ @tz666」）实测全部候选模型：
+//   llama-3.2-11b          → {"ad":false,"reason":"纯色背景"}（整图 / 只裁文字区放大，两次都错）
+//   llama-4-scout-17b      → 返回空；kimi-k2.6 → 返回空；moondream3.1 → {}
+//   glm-5.3-flash          → HTTP 400（No route）
+//   mistral-small-3.1-24b  → {"ad":false,"reason":"图片是一张风景照"}
+// 换 prompt 强制「先抄文字再判断」也救不回来：复读 800 token、正文全是 [图片]。
+// clef-flash 用正确格式实测同一张图：answers.ad.choice = "ad"，probabilities.ad = 0.9369，
+// has_text.noul = 0.96；三张非广告图（纯色 / 渐变 / 含大量中文的资料卡截图）
+// 全部 clean，ad 概率 0.037~0.099 —— 0.9369 vs 0.0985 的区分度，阈值 0.5 即可干净分离。
+// 另外它 output_tokens = 0（不收输出费），而 llama 那边每次白烧 512~800 个复读 token。
+const AD_AVATAR_VISION_MODEL = '@cf/cloudflare/clef-flash';
 const AD_AVATAR_VISION_DAILY = 50;
 const AD_AVATAR_VISION_PROMPT = '这是一张社交软件的用户头像图片。判断它是否属于广告用途：'
 	+ '图里若有引流文字（赚钱、代理、代购、招租、微信号、二维码、"看主页/看简介"）、'
@@ -18075,7 +18087,14 @@ const AD_VISION_FAIL_BREAK = 10;
 // 而正文图下载的就是原图不是缩略图。超限的图喂进去必然失败 ——
 // 白烧额度、计入失败计数，还可能连带触发熔断把正常图一起停掉。
 // 跳过是省额度不是降功能：那些图本来一条都判不出。
-const AD_VISION_MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+// 【2026-10-13 2MB → 4MB，且尺寸自适应交给模型】
+// 旧的 2MB 字节闸与真实限制对不上：字节够小的高分辨率图照样把 token 顶穿 ——
+// 实测一张 741×694 / 421KB 的头像喂给 llama 直接 413，模型报
+// 「197867 tokens exceeded context window (128000)」，而它通过了 2MB 字节闸。
+// clef-flash 自带缩放：边长取整到 32px 倍数，面积 <65k px 放大、>1MP 缩小，
+// 每图封顶 1024 tokens（≈1024×1024），单图上限 4 MiB / 16 MP、请求体 13 MiB ——
+// 「不限尺寸自适应识别」是模型自己做的，这里只留一道兜底防止下载超大文件白跑一趟。
+const AD_VISION_MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 // 单轮 cron 最多推理多少张。取「日预算 ÷ 每天轮次」，正好让两轮吃完 300：
 // crons 是每天 2 次（03:17 / 15:17），设 100 的话日预算永远用不完，
 // 配置上限与实际消耗对不上，看板上「当日 x/300」会一直停在 200 以下。
@@ -18112,6 +18131,48 @@ const AD_IMAGE_VISION_PROMPT = '这是社交软件聊天记录里的一条【图
 // 【空响应重试一次】menshen 同款处理（HANDOFF.md：「识图拿思考内容兜底，
 // 推理模型偶发正文为空 + 空响应重试一次」）。推理模型确实会偶发吐空，
 // 一次重试能把这种抖动挡住，而单张只花 4 Neurons。
+// ===== clef-flash 判定（头像与正文图共用）=====
+//
+// 与 runVisionModel 的根本差别：那条路是【让模型生成一段 JSON 文本再解析】，
+// 而 clef 直接返回结构化概率（answers.ad.choice / probabilities）——
+// 不需要解析、不会复读、output_tokens 恒为 0（不收输出费）。
+// 图片走 images[]（必须是 data URI，远程 URL 会被拒），模型自己做尺寸自适应。
+const CLEF_AVATAR_STATE = '这是一张 Telegram 用户头像，判断它是否用于广告引流。';
+const CLEF_IMAGE_STATE = '这是一张 Telegram 群消息里的图片或表情包，判断它是否用于广告引流。';
+const CLEF_AD_QUESTION = {
+	type: 'choice',
+	instructions: '图中是否含有广告引流内容？',
+	criteria: {
+		ad: '有引流或代发类文字、代理兼职赚钱招租、联系方式、@用户名或频道名、二维码、赌博或灰产图案',
+		clean: '自拍、风景、宠物、家人、动漫、纯色背景或不含引流信息的装饰图'
+	}
+};
+
+// 返回 { ad, prob, confidence }；拿不到判定返回 null（调用方按失败处理 → stage=ai.run）。
+async function runVisionJudge(env, imageUri, state) {
+	const result = await env.AI.run(AD_AVATAR_VISION_MODEL, {
+		model: 'clef-flash',
+		state,
+		images: [String(imageUri || '')],
+		questions: { ad: CLEF_AD_QUESTION }
+	});
+	const ans = result?.answers?.ad;
+	const choice = String(ans?.choice || '');
+	if (!choice) {
+		// 只记字段名不记内容 —— 不泄露图上信息，同时能一眼看出是不是又换了返回结构。
+		console.error('[广告检测·视觉识别] clef 未返回判定', JSON.stringify({
+			keys: result && typeof result === 'object' ? Object.keys(result).slice(0, 10) : typeof result,
+			answerKeys: ans && typeof ans === 'object' ? Object.keys(ans).slice(0, 8) : typeof ans
+		}));
+		return null;
+	}
+	return {
+		ad: choice === 'ad',
+		prob: Number(ans?.probabilities?.ad ?? 0),
+		confidence: Number(ans?.confidence ?? 0)
+	};
+}
+
 async function runVisionModel(env, model, imageUri, prompt) {
 	let lastText = '';
 	for (let attempt = 1; attempt <= 2; attempt++) {
@@ -18560,11 +18621,10 @@ async function runAdAvatarVision(env, options = {}) {
 			stage = 'encode';
 			const image = 'data:image/jpeg;base64,' + bytesToBase64(new Uint8Array(buffer));
 			stage = 'ai.run';
-			const answerText = await runVisionModel(env, AD_AVATAR_VISION_MODEL, image, AD_AVATAR_VISION_PROMPT);
-			const parsed = parseAvatarVisionAnswer(answerText);
-			if (!parsed) throw new Error('模型回答无法解析: ' + String(answerText).slice(0, 200));
-			verdict = parsed.ad ? 'ad' : 'clean';
-			lastNote = (parsed.text ? ' 文字:' + parsed.text : '') + (parsed.reason ? ' 理由:' + parsed.reason : '');
+			const judge = await runVisionJudge(env, image, CLEF_AVATAR_STATE);
+			if (!judge) throw new Error('clef 未返回判定');
+			verdict = judge.ad ? 'ad' : 'clean';
+			lastNote = '判定=' + (judge.ad ? '广告' : '干净') + ' 概率=' + judge.prob.toFixed(4);
 		} catch (error) {
 			// 【429 不计入失败、不触发熔断】限流是必然会遇到的临时状态，不是链路故障 ——
 			// Workers AI 对需付费计划的模型限 20 RPM，串行跑几百张【必然】撞上。
@@ -18724,10 +18784,10 @@ async function runAdImageVision(env, options = {}) {
 			stage = 'encode';
 			const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
 			stage = 'ai.run';
-			const answerText = await runVisionModel(env, AD_IMAGE_VISION_MODEL, image, AD_IMAGE_VISION_PROMPT);
-			const parsed = parseAvatarVisionAnswer(answerText);
-			if (!parsed) throw new Error('模型回答无法解析: ' + String(answerText).slice(0, 200));
-			verdict = parsed.ad ? 'ad' : 'clean';
+			const judge = await runVisionJudge(env, image, CLEF_IMAGE_STATE);
+			if (!judge) throw new Error('clef 未返回判定');
+			verdict = judge.ad ? 'ad' : 'clean';
+			lastNote = '判定=' + (judge.ad ? '广告' : '干净') + ' 概率=' + judge.prob.toFixed(4);
 			note = (parsed.text ? ' 文字:' + parsed.text : '') + (parsed.reason ? ' 理由:' + parsed.reason : '');
 			lastNote = note;
 		} catch (error) {

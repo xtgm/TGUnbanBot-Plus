@@ -127,7 +127,7 @@ async function runScenario(refreshWorks) {
 	// 15 行而不是 1 行：熔断阈值是 10，只放 1 行时「失效是否推高熔断」两种实现都是 0，
 	// 那条断言就成了假绿（首跑就是这么绿的）。15 行才能让改前的实现真正熔断。
 	const rows = Array.from({ length: 15 }, (_, i) => ({ file_unique_id: 'AV' + i, file_id: 'OLD_DEAD', last_user_id: '9000' + i }));
-	const env = { DB: makeD1(state, rows), TOKEN: 'T', BOT_TOKEN: '1:fake', GROUP_ID: '-1001111111111', OWNER_IDS: '10001', AI: { run: async () => ({ response: '{"ad":false,"text":"","reason":"x"}' }) } };
+	const env = { DB: makeD1(state, rows), TOKEN: 'T', BOT_TOKEN: '1:fake', GROUP_ID: '-1001111111111', OWNER_IDS: '10001', AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'clean', probabilities: { ad: 0.05, clean: 0.95 }, confidence: 0.9 } } }) } };
 	const orig = sandbox.fetch;
 	sandbox.fetch = makeFetch(refreshWorks);
 	let stats = null, err = null;

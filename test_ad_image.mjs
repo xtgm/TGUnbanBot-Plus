@@ -408,7 +408,7 @@ section('[6] runAdImageVision · 队列 / kind 过滤 / 熔断 / 关闭');
 	assert('未绑 AI 时不调 getFile', countCalls('getFile') === 0, 'getFile=' + countCalls('getFile'));
 
 	// 6.2 kind 过滤：动图 / 视频 / 文件不进推理队列（moondream 只吃静态位图）
-	const envKind = makeEnv({ AI: { run: async () => ({ response: '{"ad":true,"text":"点我一下","reason":"引流图"}' }) } });
+	const envKind = makeEnv({ AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'ad', probabilities: { ad: 0.95, clean: 0.05 }, confidence: 0.9 } } }) } });
 	await W.adDetectionReady(envKind);
 	await W.upsertAdImage(envKind, 'IMG_K_PHOTO', { verdict: 'pending', fileId: 'F_PH', kind: 'photo' });
 	await W.upsertAdImage(envKind, 'IMG_K_ANIM', { verdict: 'pending', fileId: 'F_AN', kind: 'animation' });
@@ -431,7 +431,7 @@ section('[6] runAdImageVision · 队列 / kind 过滤 / 熔断 / 关闭');
 	assert('来源标记 vision', envKind.DB.query('SELECT source FROM ad_images WHERE file_unique_id = ?', 'IMG_K_PHOTO')[0]?.source === 'vision');
 
 	// 6.3 日预算：额度用尽 → 直接返回，不再取队列
-	const envBudget = makeEnv({ AI: { run: async () => ({ response: '{"ad":false,"text":"","reason":"风景照"}' }) } });
+	const envBudget = makeEnv({ AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'clean', probabilities: { ad: 0.05, clean: 0.95 }, confidence: 0.9 } } }) } });
 	await W.adDetectionReady(envBudget);
 	await W.upsertAdImage(envBudget, 'IMG_BUD_1', { verdict: 'pending', fileId: 'F_BUD', kind: 'photo' });
 	resetCalls();

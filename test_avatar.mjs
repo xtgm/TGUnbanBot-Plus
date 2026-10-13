@@ -368,7 +368,7 @@ section('[7] runAdAvatarVision · 队列 / 熔断 / 解析');
 
 	// 7.2 绑 AI：消费队列，模型判广告 → verdict=ad
 	const fakeAI = {
-		run: async () => ({ response: '{"ad":true,"text":"主页赚钱","reason":"图上有引流大字"}' })
+		run: async () => ({ answers: { ad: { type: 'choice', choice: 'ad', probabilities: { ad: 0.95, clean: 0.05 }, confidence: 0.9 } } })
 	};
 	const env = makeEnv({ AI: fakeAI });
 	await W.adDetectionReady(env);
@@ -420,7 +420,7 @@ section('[7] runAdAvatarVision · 队列 / 熔断 / 解析');
 		Number(stats5.learnQueue?.learned) >= 0, JSON.stringify(stats5.learnQueue));
 
 	// 7.5 模型判定的干净头像
-	const envClean = makeEnv({ AI: { run: async () => ({ response: '{"ad":false,"text":"","reason":"普通头像"}' }) } });
+	const envClean = makeEnv({ AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'clean', probabilities: { ad: 0.05, clean: 0.95 }, confidence: 0.9 } } }) } });
 	await W.adDetectionReady(envClean);
 	await W.upsertAdAvatar(envClean, 'AV_VIS_CLEAN', { verdict: 'pending', fileId: 'FILE_CLEAN' });
 	const stats4 = await W.runAdAvatarVision(envClean);
