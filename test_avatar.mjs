@@ -446,6 +446,49 @@ section('[8] parseAvatarVisionAnswer 容错');
 }
 
 // ================= 汇总 =================
+// ================= [6] 头像实时判定（2026-10-13）=================
+//
+// 治的是「广告号顶着广告头像出现时，这一路是瞎的」：原来首次见到只登记 pending
+// 就返回，等 cron 判完还要等【下一次】有人发消息才命中（队列实测积压 988 张、
+// 日上限默认 50 → 20 天一轮）。现在没判过的当场调一次 clef 出结论并落库。
+// 下面每一条断言在改动【之前】都是红的 —— 旧行为下 verdict 恒为 pending、
+// getFile 一次都不会发。
+section('[6] 广告头像当场判定（不再等 cron）');
+{
+	const env = makeEnv({
+		AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'ad', probabilities: { ad: 0.93, clean: 0.07 }, confidence: 0.9 } } }) }
+	});
+	await W.adDetectionReady(env);
+	resetCalls();
+	setApi({ getChat: chatWithAvatar('AV_RT_AD_1', 'F_RT_AD_1') });
+	// 正文干净、只有头像可疑 —— 正是「广告号还没发广告就被拦住」那条主通道。
+	await sendUpdate({ message: groupMessage({ id: 990001, first_name: '新面孔' }, '在吗') }, env);
+
+	const row = env.DB.query('SELECT verdict, source, vision_checked_at, last_user_id FROM ad_avatars WHERE file_unique_id = ?', 'AV_RT_AD_1');
+	assert('头像已登记进库', row.length === 1, JSON.stringify(row));
+	assert('★ 头像当场判定，不再停在 pending', row[0]?.verdict === 'ad', JSON.stringify(row[0]));
+	// source 是 vision，但如果这条消息当场触发了封禁，「定罪即学习」会把它覆盖成
+	// learned（把这张头像记进素材库并给复用次数 +1）—— 那是既有设计，不是实时判定丢了来源。
+	assert('头像判定已落库（vision，或定罪后被学习覆盖为 learned）',
+		row[0]?.source === 'vision' || row[0]?.source === 'learned', JSON.stringify(row[0]));
+	assert('头像归属随判定落库', String(row[0]?.last_user_id || '') === '990001', JSON.stringify(row[0]));
+	assert('vision_checked_at 已推进（cron 不会再重判这张）', Number(row[0]?.vision_checked_at) > 0, JSON.stringify(row[0]));
+	assert('★ 调过 getFile（真的下了头像去判，不是只登记）', countCalls('getFile') >= 1, 'getFile=' + countCalls('getFile'));
+}
+
+section('[6b] 干净头像当场判干净，正常自拍不受影响');
+{
+	const env = makeEnv({
+		AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'clean', probabilities: { ad: 0.03, clean: 0.97 }, confidence: 0.9 } } }) }
+	});
+	await W.adDetectionReady(env);
+	resetCalls();
+	setApi({ getChat: chatWithAvatar('AV_RT_CLEAN_1', 'F_RT_CLEAN_1') });
+	await sendUpdate({ message: groupMessage({ id: 990011, first_name: '路人' }, '你好') }, env);
+	const clean = env.DB.query('SELECT verdict FROM ad_avatars WHERE file_unique_id = ?', 'AV_RT_CLEAN_1')[0];
+	assert('★ 干净头像当场判成 clean（不是 pending）', clean?.verdict === 'clean', JSON.stringify(clean));
+}
+
 console.log(`\n===== 头像检测测试：通过 ${pass} / 失败 ${fail} =====`);
 if (fail > 0) {
 	console.log('失败项：');

@@ -270,12 +270,15 @@ section('[2] applyImageVerdict 分档（比头像严一档）');
 	const cleanBase = { verdict: 'pass', score: 0, reasons: [] };
 	const withEvidence = { verdict: 'observe', score: 3, reasons: ['+3 正文交易动词'] };
 
-	assert('图片 ad + 本次零判据 → 只进观察（单证不定罪）',
-		W.applyImageVerdict({ ...cleanBase }, adRow(1)).verdict === 'observe');
-	assert('图片 ad + 复用 4 次 → 仍只观察（头像在 2 次就单独定罪）',
-		W.applyImageVerdict({ ...cleanBase }, adRow(4)).verdict === 'observe',
+	// 【2026-10-13 口径变更】这里原先是「单证不定罪、复用 4 次仍只观察」，
+	// 主人随后拍板改成【图片 / 贴纸 / 表情包判为广告即单证据封】（含色情 /
+	// 赌博 / 诈骗全部类型），断言预期跟着改 —— 不是删测试凑绿。
+	assert('图片 ad + 本次零判据 → 当场封（单证据定罪）',
+		W.applyImageVerdict({ ...cleanBase }, adRow(1)).verdict === 'ban');
+	assert('图片 ad + 复用 4 次 → 照样封',
+		W.applyImageVerdict({ ...cleanBase }, adRow(4)).verdict === 'ban',
 		W.applyImageVerdict({ ...cleanBase }, adRow(4)).verdict);
-	assert('同一行喂给头像判据 → ban（证实两层门槛确实不同）',
+	assert('同一行喂给头像判据 → ban（头像仍按自己的门槛，hits≥2 即封）',
 		W.applyAvatarVerdict({ ...cleanBase }, adRow(4)).verdict === 'ban',
 		W.applyAvatarVerdict({ ...cleanBase }, adRow(4)).verdict);
 	assert('图片 ad + 复用 >= 5 次 → 单独即可封',
@@ -770,11 +773,11 @@ section('[7] 带图消息当场判定（不再等 cron）');
 	assert('★ 当场封禁了发广告的人（这才是「检测就杀」）',
 		countCalls('banChatMember') >= 1, 'banChatMember=' + countCalls('banChatMember'));
 	assert('vision_checked_at 已推进（cron 不会再重判这张）', Number(row[0]?.vision_checked_at) > 0, JSON.stringify(row[0]));
-	assert('★ 高置信(0.95≥0.9)顶到单证定罪线 hits≥5', Number(row[0]?.hits) >= 5, JSON.stringify(row[0]));
+	assert('★ 判广告的图 hits 抬到定罪线（展示用；封禁已由判据无条件执行）', Number(row[0]?.hits) >= 5, JSON.stringify(row[0]));
 	assert('调过 getFile（真的下了图去判，不是只登记）', countCalls('getFile') >= 1, 'getFile=' + countCalls('getFile'));
 }
 
-section('[7b] 模糊区不单证定罪 + 第二次出现不重复花钱');
+section('[7b] 图片单证据封禁 + 第二次出现不重复花钱');
 {
 	const env = makeEnv({
 		AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'ad', probabilities: { ad: 0.7, clean: 0.3 }, confidence: 0.6 } } }) }
@@ -784,7 +787,12 @@ section('[7b] 模糊区不单证定罪 + 第二次出现不重复花钱');
 	await send(barePhotoMessage({ id: 880011, first_name: '模糊广告' }, 'IMG_RT_MID_1', 'F_RT_MID_1'), env);
 	const mid = env.DB.query('SELECT verdict, hits FROM ad_images WHERE file_unique_id = ?', 'IMG_RT_MID_1')[0];
 	assert('0.7 同样当场判成广告', mid?.verdict === 'ad', JSON.stringify(mid));
-	assert('★ 模糊区(0.5~0.9)不顶定罪线，仍走多特征原则', Number(mid?.hits) < 5, JSON.stringify(mid));
+	// 【2026-10-13 口径变更】这条断言的预期本身变了：原先断言「0.5~0.9 的模糊区
+	// 不顶定罪线、仍走多特征」，主人随后拍板【图片 / 贴纸 / 表情包判为广告即
+	// 单证据封】（含色情 / 赌博 / 诈骗全部类型），于是改成断言它当场封了人。
+	// 不是删测试凑绿 —— 回退 _worker.js 之后这条同样会红（banChatMember=0）。
+	assert('★ 单证据封禁：0.7 没有第二证据也当场封了人',
+		countCalls('banChatMember') >= 1, 'banChatMember=' + countCalls('banChatMember'));
 
 	// 同一张图第二次出现：库里已有结论，一个模型调用都不该再发。
 	resetCalls();
@@ -803,6 +811,37 @@ section('[7c] 干净图当场判干净，正常表情包不受影响');
 	const clean = env.DB.query('SELECT verdict, hits FROM ad_images WHERE file_unique_id = ?', 'IMG_RT_CLEAN_1')[0];
 	assert('★ 干净图当场判成 clean（不是 pending）', clean?.verdict === 'clean', JSON.stringify(clean));
 	assert('clean 不抬定罪线', Number(clean?.hits) === 0, JSON.stringify(clean));
+}
+
+// ================= [8] 学习链路必须也学图片（2026-10-13）=================
+//
+// 治的是主人原话「手动类的都是秒杀，这不用管，你要确定的是学习没有问题就行了」——
+// 而学习链路【确实有问题】：learnAdFromOperatorAction 的 payload 只有
+// name / username / bio / text / domains 五样，主人引用一张广告贴纸去 /spam 时
+// message.text 是 undefined，这张图一个字节都没进库。线上铁证：ad_images 的
+// source='learned' 只有 1 条，而 ad_avatars 有 1880 条，差 1880 倍。
+// 下面每条断言在改动【之前】都是红的：旧行为下库里根本没有这行。
+section('[8] /spam /ban /sban 引用的图片也进广告素材库');
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	const imgMessage = barePhotoMessage({ id: 770001, first_name: '广告号' }, 'IMG_LEARN_1', 'F_LEARN_1');
+	const out = await W.learnAdFromOperatorAction(env, 770001, imgMessage, { source: 'spam', createdBy: 'owner' });
+
+	const row = env.DB.query('SELECT verdict, source, kind, last_user_id FROM ad_images WHERE file_unique_id = ?', 'IMG_LEARN_1');
+	assert('★ 引用的图片已进广告素材库', row.length === 1, JSON.stringify(row));
+	assert('verdict 直接是 ad（人工结论，不再等模型）', row[0]?.verdict === 'ad', JSON.stringify(row[0]));
+	assert('来源记为 /spam', row[0]?.source === 'spam', JSON.stringify(row[0]));
+	assert('kind 记为 photo', row[0]?.kind === 'photo', JSON.stringify(row[0]));
+	assert('归属记为被处置的那个人', String(row[0]?.last_user_id || '') === '770001', JSON.stringify(row[0]));
+	const lines = W.renderAdLearnLines(out, 'spam');
+	assert('回执里有图片那一行', lines.some((l) => l.includes('广告图片')), JSON.stringify(lines));
+
+	// /ban 12345 这种直接给 id 的用法没有引用消息 —— 不该误学出一张空图。
+	const before = env.DB.query('SELECT COUNT(*) AS c FROM ad_images')[0].c;
+	await W.learnAdFromOperatorAction(env, 770002, null, { source: 'ban', createdBy: 'owner' });
+	const after = env.DB.query('SELECT COUNT(*) AS c FROM ad_images')[0].c;
+	assert('★ 没有引用消息时不误学图片', after === before, before + '→' + after);
 }
 
 console.log(`\n===== 正文图片检测测试：通过 ${pass} / 失败 ${fail} =====`);

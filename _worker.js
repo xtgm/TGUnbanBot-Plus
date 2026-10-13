@@ -14862,7 +14862,7 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 async function learnAdFromOperatorAction(env, targetUserId, message, options = {}) {
 	const source = String(options.source || 'manual');
 	const createdBy = String(options.createdBy || '');
-	const out = { learned: 0, sampleAdded: 0, enriched: 0 };
+	const out = { learned: 0, sampleAdded: 0, enriched: 0, imageLearned: 0 };
 	try {
 		// checklist 是与 text/caption 互斥的第六类正文来源 —— /spam /ban /sban 引用【清单】时
 		// message.text 恒为 undefined，不接它就只学得到一张空正文的资料卡。
@@ -14879,6 +14879,30 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 		};
 		const learn = await learnAdFingerprints(env, payload, { source, createdBy });
 		out.learned = Number(learn?.learned || 0);
+
+		// 【2026-10-13 补：学习链路必须也学图片】
+		// payload 只有 name / username / bio / text / domains 五样 —— 主人引用一张
+		// 广告贴纸或图片去 /spam /ban /sban 时，这张图【一个字节都没进库】。
+		// 线上铁证：ad_images 的 source='learned' 只有 1 条，而 ad_avatars 有 1880 条，
+		// 差 1880 倍，而下游是通的（applyImageVerdict 早已支持 verdict='ad' 定罪），
+		// 断的就是学习这一段。主人原话：「手动类的都是秒杀，这不用管，你要确定的是
+		// 学习没有问题就行了」—— 这里就是那个「问题」。
+		//
+		// 引用消息里的媒体直接标成广告素材：verdict='ad'，source 记 /spam /ban /sban
+		// 里的哪一个，归属记被处置的那个 user id。下次【任何人】发同一张就命中。
+		// 没有引用消息（如 /ban 12345 直接给 id）时 message 为空，自然跳过。
+		const learnMedia = message ? extractAdMedia(message) : null;
+		if (learnMedia?.fileUniqueId) {
+			const wrote = await upsertAdImage(env, learnMedia.fileUniqueId, {
+				verdict: 'ad',
+				source,
+				kind: String(learnMedia.kind || ''),
+				lastUserId: String(targetUserId || ''),
+				// 视觉识别就不必再判这张了 —— 人工已经给了结论，省一次模型调用。
+				visionCheckedAt: Math.floor(Date.now() / 1000)
+			});
+			if (wrote) out.imageLearned = 1;
+		}
 
 		// 语义样本：正文太短且不含举报 / 吐槽语义时改用引用块内容。
 		// 线上漏放 50+ 个号的共同形态正是「正文只有一个字母 c、广告全在引用块里」——
@@ -14910,6 +14934,7 @@ function renderAdLearnLines(learn, source) {
 	const lines = [];
 	if (!learn) return lines;
 	if (learn.learned > 0) lines.push('🧬 已学习广告指纹:' + learn.learned + ' 条(来源 /' + source + ' 人工判定)');
+	if (learn.imageLearned > 0) lines.push('🖼 已学习广告图片/贴纸: 引用消息里的那张已入库，下次任何人发同一张即命中');
 	if (learn.sampleAdded > 0) lines.push('🧠 已加 AI 语义样本:' + learn.sampleAdded + ' 条');
 	if (learn.enriched > 0) lines.push('🧠 共性提炼:从新样本自动提炼出 ' + learn.enriched + ' 条指纹(共现 ≥2 次)');
 	return lines;
@@ -16438,13 +16463,12 @@ function applyAvatarVerdict(evaluation, avatar) {
 async function applyAvatarToEvaluation(env, evaluation, profile) {
 	const avatarId = String(profile?.avatarId || '');
 	if (!evaluation || !avatarId) return evaluation;
-	const avatar = await readAdAvatar(env, avatarId);
-	if (!avatar) {
-		// 首次见到这个头像：登记成 pending，L2 视觉识别才有东西可排队。
-		// 只发生一次 —— 行存在之后就走稳定态的「只读不写」，热路径零额外写入。
-		await registerAdAvatar(env, profile, profile.userId);
-		return evaluation;
-	}
+	// 【2026-10-13 改：读库叠判 → 实时判定】原来首次见到只登记 pending 就返回，
+	// 等 cron 判完还要等【下一次】有人发消息才命中 —— 广告号顶着广告头像出现时
+	// 这一路是瞎的。现在没判过的当场调一次 clef 出结论并落库，判过的直接命中库。
+	// 退回旧行为的四道闸见 judgeAdAvatarRealtime。
+	const avatar = await judgeAdAvatarRealtime(env, avatarId, profile);
+	if (!avatar) return evaluation;
 	return applyAvatarVerdict(evaluation, avatar);
 }
 
@@ -17431,27 +17455,34 @@ async function clearAdImageOnIgnore(env, fileUniqueId) {
 // 别人转的图都可能被多人正常转发 —— 复用门槛必须更高，否则一张被 2 个人
 // 转过的普通图就会开始单独定罪。单证（本次干净）一律不定罪这条两层一致。
 const AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS = 5;
-// 实时判定的「一眼广告」线。达到它就顶到上面那个单证定罪线 —— 即主人要的
-// 「检测到了就立刻处理，没有一丝犹豫」；0.5~0.9 之间的模糊区仍按多特征走
-// （有正文词表 / 简介 / 跨用户复用 / 案底任一佐证才封，否则只进观察窗口）。
+// 【2026-10-13 口径变更】实时化刚上线时是「概率 ≥0.9 才顶到单证定罪线，
+// 0.5~0.9 的模糊区仍走多特征佐证」。主人随后拍板改成【判为广告即单证据封】
+// （含色情 / 赌博 / 诈骗等全部广告类型，见 applyImageVerdict），于是那道
+// 概率阈值不再存在 —— 删掉常量比留一个永不命中的 0.9 清楚。
 //
-// 0.9 这个数是实测定的：2026-10-13 拿 40 张真实库图跑 clef-flash，
-// 广告 0.827~0.9412、正常毛绒玩具与笑脸表情包 0.0404~0.0458，两簇之间
-// 没有重叠区，0.9 落在空档里 —— 既不放过一眼广告，也不误伤正常表情包。
-const AD_IMAGE_RT_BAN_PROB = 0.9;
+// 当时取 0.9 的实测依据留档：40 张真实库图跑 clef-flash，广告 0.827~0.9412、
+// 正常毛绒玩具与笑脸表情包 0.0404~0.0458，两簇之间无重叠区。
 function applyImageVerdict(evaluation, image) {
 	if (!evaluation || !image) return evaluation;
 	if (String(image.verdict || '') !== 'ad') return evaluation;
 	const hits = Number(image.hits) || 0;
-	const hasCorroboration = (evaluation.reasons || []).length > 0 || (Number(evaluation.score) || 0) >= 2;
 	const reason = '消息图片命中广告素材库（复用定罪 ' + hits + ' 次）';
 	const reasons = (evaluation.reasons || []).concat([reason]);
-	let verdict = evaluation.verdict;
-	if (hasCorroboration) verdict = 'ban';
-	else if (hits >= AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS) verdict = 'ban';
-	else verdict = evaluation.verdict === 'ban' ? 'ban' : 'observe';
-	// score 只作展示：图片不改评分口径，避免与历史分叠加时重复计分。
-	return Object.assign({}, evaluation, { verdict, reasons });
+	// 【2026-10-13 主人拍板：图片 / 贴纸 / 表情包单证据定罪】
+	// 原口径是「有佐证才封，或复用满 AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS 次才封」，
+	// 于是模型明明判出是广告图，只要没有第二个证据就只进观察窗口 —— 而广告贴纸
+	// 本身往往就只有一张贴纸、没有正文，等于永远等不到那个佐证。
+	// 现在：判为广告（含色情 / 赌博 / 诈骗等全部广告类型）即封，不要求第二证据。
+	//
+	// 【只改这一路，头像不动】applyAvatarVerdict 仍要求 hits≥2 或有佐证才封 ——
+	// 主人的原话是「其他多特征依旧不变，单特征只针对广告图片跟广告贴图表情包」。
+	// 头像是「一个人一张、正常人天天在用」的常驻素材，与「谁发的广告」不同性质，
+	// 混为一谈会把正常自拍头像也拉进单证封禁。
+	//
+	// 【误伤由上游闸掉】只有 verdict='ad' 才走到这里；clean 与 pending 在第一行就
+	// 原样返回。而 verdict 是 clef-flash 判的，2026-10-13 实测 40 张真实库图里
+	// 广告 0.827~0.9412、正常表情包 0.0404~0.0458，两簇无重叠。
+	return Object.assign({}, evaluation, { verdict: 'ban', reasons });
 }
 
 // 取这条消息对应的图片指纹，【一次消息只读一遍】，两道闸共用同一份结果。
@@ -18967,17 +18998,144 @@ async function judgeAdMediaRealtime(env, media, userId) {
 	// 高置信「一眼广告」：直接顶到单证定罪线，让它当场就能封，不等复用次数积累。
 	// 这是主人要的「检测到了就立刻处理」；0.5~0.9 的模糊区仍按多特征走，
 	// 有正文词表 / 简介 / 跨用户 / 案底任一佐证才封，否则只进观察窗口。
-	if (prob >= AD_IMAGE_RT_BAN_PROB) {
-		try {
-			await env.DB.prepare(
-				'UPDATE ad_images SET hits = ? WHERE file_unique_id = ? AND hits < ?')
-				.bind(AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS, key, AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS).run();
-		} catch (error) {
-			console.error('[图片实时判定] 抬升定罪强度失败:', error);
-		}
+	// 判为广告就抬到单证定罪线 —— 封禁本身已由 applyImageVerdict 无条件执行
+	// （2026-10-13 主人拍板：图片/贴纸/表情包单证据定罪），这里抬 hits
+	// 只影响展示文案里那句「复用定罪 N 次」，让它读起来是确定的广告素材。
+	try {
+		await env.DB.prepare(
+			'UPDATE ad_images SET hits = ? WHERE file_unique_id = ? AND hits < ?')
+			.bind(AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS, key, AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS).run();
+	} catch (error) {
+		console.error('[图片实时判定] 抬升定罪强度失败:', error);
 	}
 	const finalRow = await readAdImage(env, key);
 	return finalRow || { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid };
+}
+
+// ===== 实时头像判定（2026-10-13）=====
+//
+// 与 judgeAdMediaRealtime 同构，作用对象换成资料卡头像。在此之前头像同样是
+// 【建库 + 命中】：首次见到登记 pending 就返回，等 cron（一天两班）判完还要等
+// 【下一次】有人发消息才命中 —— ad_avatars 实测队列积压 988 张、日上限默认 50，
+// 20 天才轮得到一遍，等于「广告号顶着广告头像进群/发言时」这一路是瞎的。
+//
+// 主人的口径：「资料卡的头像 / bio / 昵称 / 会员标，正文的贴图 / 表情包 / 图片，
+// 全部实时杀」。bio、昵称、会员标本来就在实时链上（闸一走词表 + 指纹 + LLM，
+// 会员标查 ad_badges），缺的就是头像这一路。
+//
+// 【热路径不变量原样保住】这条链路只发 getFile + 下载 + 一次模型调用，
+// 一个 getChat 都不发 —— 既有那几条「闸一零 getChat」「闸一定罪不花 getChat」
+// 的断言照旧成立。头像信息来自调用方已有的 profile。
+//
+// 【退回旧行为的四道闸】与图片那侧一致，任一拦下都与实时化之前完全一致：
+// 没绑 AI（登记照做只是不判）、每日上限 AD_AVATAR_VISION_DAILY 跑满、
+// 连续失败熔断、超尺寸。429 不推熔断不落库。与 cron 轨共用同一个额度池。
+async function judgeAdAvatarRealtime(env, avatarId, profile) {
+	if (!env?.DB) return null;
+	const key = String(avatarId || '');
+	if (!key) return null;
+	const uid = String(profile?.userId || '');
+
+	// ① 判过的直接命中库，一个 Neurons 都不花。
+	const row = await readAdAvatar(env, key);
+	if (row) {
+		// pending 但没有可下载句柄的，退回旧行为 —— 那种当下判不了，只能先登记着。
+		if (String(row.verdict || '') !== 'pending' || !String(row.file_id || '')) return row;
+	} else {
+		// 首次见到：登记成 pending。登记本身零成本，实时判定紧接在后面。
+		await registerAdAvatar(env, profile, uid);
+	}
+
+	// 【没绑 AI 的部署】登记照做（L2 排队等 cron），只是不当场判。
+	if (!env.AI) return row || null;
+
+	// ② 额度闸与熔断闸，与 cron 轨【共用同一个池】（前缀 'avatar'）。
+	const config = loadAdDetectionConfig(env);
+	const dailyLimit = Number(config.avatarVisionDaily);
+	if (dailyLimit <= 0) return row || null;
+	const nowSeconds = Math.floor(Date.now() / 1000);
+	const quota = await readAvatarVisionQuota(env, nowSeconds, 'avatar');
+	if (dailyLimit - quota.used <= 0) return row || null;
+	if ((await readVisionBreakState(env, nowSeconds)).broken) return row || null;
+
+	// ③ 当场判。优先用库里存的句柄；失效时换成用户【当前】的头像再试一次 ——
+	// 那正是最该判的时刻（换头像往往就是为了躲）。
+	let fileId = String(row?.file_id || profile?.avatarFileId || '');
+	if (!fileId) return row || null;
+	let verdict = 'pending';
+	let prob = 0;
+	let skipBump = false;
+	try {
+		const askFile = async (id) => {
+			const resp = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ file_id: id })
+			});
+			return await resp.json();
+		};
+		let fileResult = await askFile(fileId);
+		if (!fileResult?.ok && isVisionFileMissing({ message: String(fileResult?.description || '') })) {
+			const freshFileId = await refreshAvatarFileId(env, uid || String(row?.last_user_id || ''));
+			if (freshFileId) {
+				fileId = freshFileId;
+				fileResult = await askFile(freshFileId);
+				try {
+					await upsertAdAvatar(env, key, { fileId: freshFileId });
+				} catch (writeError) {
+					console.error('[头像实时判定] 回写新 file_id 失败:', writeError);
+				}
+			}
+		}
+		if (!fileResult?.ok) throw new Error(fileResult?.description || 'getFile 失败');
+		const filePath = String(fileResult?.result?.file_path || '');
+		if (!filePath) throw new Error('file_path 为空');
+		const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
+		if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
+		const buffer = await imageResponse.arrayBuffer();
+		if (buffer.byteLength > AD_VISION_MAX_IMAGE_BYTES) return row || null;
+		const mime = sniffImageMime(new Uint8Array(buffer)) || 'image/jpeg';
+		const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
+		const judge = await runVisionJudge(env, image, CLEF_AVATAR_STATE);
+		if (!judge) throw new Error('clef 未返回判定');
+		verdict = judge.ad ? 'ad' : 'clean';
+		prob = Number(judge.prob) || 0;
+		console.log('[头像实时判定] ' + (judge.ad ? '广告' : '干净') + ' 概率=' + prob.toFixed(4)
+			+ ' 头像=' + key.slice(0, 20) + ' 归属=' + (uid || '未知')
+			+ ' 当日=' + (quota.used + 1) + '/' + dailyLimit);
+	} catch (error) {
+		if (isVisionRateLimited(error)) return row || null;
+		if (isVisionFileMissing(error)) skipBump = true;
+		logAdVisionFailure('头像·实时', 'ai.run', key, error);
+	}
+	try {
+		await upsertAdAvatar(env, key, {
+			verdict,
+			source: verdict === 'pending' ? null : 'vision',
+			fileId,
+			lastUserId: uid || null,
+			visionCheckedAt: Math.floor(Date.now() / 1000)
+		});
+	} catch (error) {
+		console.error('[头像实时判定] 写回结果失败:', error);
+	}
+	if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
+	await writeAdScanState(env, 'avatar_count', String(quota.used + 1), Math.floor(Date.now() / 1000));
+
+	if (verdict === 'pending') return row || null;
+	// 与头像既有门槛保持一致（applyAvatarVerdict：hits≥2 或有佐证才封），
+	// 这里不改门槛 —— 主人的口径是「单特征只针对广告图片跟广告贴图表情包」，
+	// 头像仍按原来的多特征走，实时化只解决「什么时候判」，不放宽「判了怎么用」。
+	try {
+		await env.DB.prepare('UPDATE ad_avatars SET hits = ? WHERE file_unique_id = ? AND hits < ?')
+			.bind(2, key, 2).run();
+	} catch (error) {
+		console.error('[头像实时判定] 抬升 hits 失败:', error);
+	}
+	const finalRow = await readAdAvatar(env, key);
+	return finalRow || (verdict === 'ad'
+		? { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid }
+		: row || null);
 }
 
 async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 1000)) {
