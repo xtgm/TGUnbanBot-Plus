@@ -881,12 +881,55 @@ section('[9] /user 按 TGID 查这个人的全部案底');
 	// 没有记录的 TGID：给出明确的「没有」而不是报错
 	resetCalls();
 	await W.handleAdUserCommand(env, '-100999', 'OWNER_1', '123456789');
-	assert('查不到时明确说没有', sentText().includes('没有这个人的判定记录'), sentText().slice(0, 200));
+	assert('查不到时明确说没有', sentText().includes('没有这个人的任何记录'), sentText().slice(0, 200));
 
 	// 非法参数：给用法提示，不抛异常
 	resetCalls();
 	await W.handleAdUserCommand(env, '-100999', 'OWNER_1', 'abc');
 	assert('非法 TGID 给用法提示', sentText().includes('用法'), sentText().slice(0, 200));
+}
+
+// ================= [9b] 任何原因进黑名单都要留案底（2026-10-13）=================
+//
+// 治的是实测缺口：投票举报封的 8958017289 用 /user 查出来是「没有这个人的判定记录」——
+// 因为快照原先【只有】 enforceAdDetection（AI 自动定罪）那一条路写，手动 /spam /ban /sban
+// 与群内 /ad 举报投票封的人一律查不到。主人原话：「自动跟手动无论任何原因进去，
+// /user 都要查到」以及「能直接定位是如何被封禁、封禁原因是什么、是谁操作的」。
+// 现在挂在 addToBlacklist 上 —— 那是所有封禁的唯一入口（10 个调用点）。
+section('[9b] 任何原因进黑名单都要留案底');
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	const sentText = () => calls.filter((c) => c.method === 'sendMessage')
+		.map((c) => String(c.body?.text || '')).join('\n');
+	// 投票举报这条路：reason='ad_vote'。用没被别的段用过的 id ——
+	// 已在黑名单的重复加黑会走 EXISTS 分支（没有新的处置），那条路刻意不写案底。
+	await W.addToBlacklist('889003', env, {
+		reason: 'ad_vote', by: '660001', note: '群内 /ad 举报投票通过：黑区交易'
+	});
+	resetCalls();
+	await W.handleAdUserCommand(env, '-100999', 'OWNER_1', '889003');
+	const voteOut = sentText();
+	assert('★ 投票封的人 /user 查得到（不再「没有记录」）', voteOut.includes('889003') && !voteOut.includes('没有这个人的任何记录'), voteOut.slice(0, 300));
+	assert('★ 能定位是如何被封禁（处置方式）', voteOut.includes('群内 /ad 举报投票通过'), voteOut.slice(0, 400));
+	assert('★ 能看到是谁操作的', voteOut.includes('660001'), voteOut.slice(0, 400));
+	assert('★ 能看到封禁原因', voteOut.includes('黑区交易'), voteOut.slice(0, 400));
+	assert('状态显示为封禁中', voteOut.includes('封禁中'), voteOut.slice(0, 200));
+
+	// 手动 /spam 这条路：reason='spam'
+	await W.addToBlacklist('889004', env, { reason: 'spam', by: '660002', note: '人工举报广告' });
+	resetCalls();
+	await W.handleAdUserCommand(env, '-100999', 'OWNER_1', '889004');
+	const spamOut = sentText();
+	assert('★ 手动封的人同样查得到', spamOut.includes('/spam 人工举报'), spamOut.slice(0, 400));
+	assert('手动那条也带操作人', spamOut.includes('660002'), spamOut.slice(0, 400));
+
+	// 已在黑名单的重复加黑：不重复留案底（没有新的处置发生）
+	const beforeCount = env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c;
+	const dup = await W.addToBlacklist('889003', env, { reason: 'spam', by: '660002', note: '重复' });
+	assert('重复加黑返回 EXISTS', dup.code === 'EXISTS', JSON.stringify(dup));
+	assert('★ 重复加黑不重复留案底', env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c === beforeCount,
+		beforeCount + '→' + env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c);
 }
 
 console.log(`\n===== 正文图片检测测试：通过 ${pass} / 失败 ${fail} =====`);

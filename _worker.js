@@ -1472,6 +1472,17 @@ async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, option
 }
 
 // 添加用户到黑名单（核心实现）
+// 处置原因的人话标签。addToBlacklist 是【所有封禁的唯一入口】（10 个调用点），
+// 把 reason 翻成人话，案底里就能一眼看出「这人是怎么进去的、谁操作的」。
+// 主人原话：「自动跟手动无论任何原因进去，/user 都要查到」以及
+// 「确保 /user 能直接定位该用户是如何被封禁、封禁原因是什么、是谁操作的」。
+const AD_BLACKLIST_REASON_LABELS = {
+	ad_auto: 'AI 自动判定（广告检测链路定罪）',
+	spam: '/spam 人工举报',
+	manual: '/ban 或 /sban 人工处置',
+	ad_vote: '群内 /ad 举报投票通过',
+};
+
 async function addToBlacklistCore(userId, env, options = {}) {
 	if (!env.DB) {
 		return { success: false, code: 'NO_DB', message: '❌ 未绑定 D1 存储空间' };
@@ -1490,9 +1501,53 @@ async function addToBlacklistCore(userId, env, options = {}) {
 			.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at, note) VALUES (?, ?, ?, ?, ?)')
 			.bind(userIdStr, reason, by, at, note)
 			.run();
-		const changed = result?.meta?.changes ?? result?.changes ?? 0;
+		// 【2026-10-13 补兼容】线上 D1 的 .run() 把影响行数放在顶层 meta.changes，
+		// 而离线测试的 D1 兼容层（node:sqlite 包装）放在 results[0].meta.changes ——
+		// 只读前两路会让【第一次加黑】在测试里就被误判成 EXISTS，案底也跟着不写。
+		// 三路都取：线上行为不变，测试与线上口径一致。
+		const changed = result?.meta?.changes ?? result?.changes
+			?? result?.results?.[0]?.meta?.changes ?? 0;
 		if (!changed) {
 			return { success: false, code: 'EXISTS', message: '⚠️ 该用户已在黑名单中' };
+		}
+
+		// 【任何原因进黑名单，/user 都要查得到】（2026-10-13 主人要求）
+		// addToBlacklist 是所有封禁的唯一入口（10 个调用点），但原先【只有】
+		// AI 自动判定那条路写了案底快照 —— 手动 /spam /ban /sban、群内 /ad 举报
+		// 投票封的人，/user 一律查不到（实测：投票封的 8958017289 查出来是
+		// 「没有这个人的判定记录」）。这里补一条处置案底：什么方式、什么原因、
+		// 谁操作的。详细的现场（消息原文、逐条判据）仍由 enforceAdDetection
+		// 那条路写完整版，两份互补 —— 这份保证「无论哪条路进来的都查得到」。
+		try {
+			const caseOwnerId = getOwnerNotifyTargets()[0] || '';
+			// 【reason='ad_auto' 不在这里写】AI 自动定罪走 enforceAdDetection，
+			// 那里写一份带完整现场的案底（名称 / 简介 / 消息原文 / 逐条判据）。
+			// 而它内部是【先加黑、后写快照】，所以下面那道「最近 5 分钟」的查重
+			// 在那一刻查不到东西、拦不住 —— 再写就成了「一起处置两条案底」，
+			// 还会把 /pending 的序号挤乱。完整案底归它，这里只补其余几条路
+			//（/spam /ban /sban /ad_vote / 批量 / 复查…）。
+			// 剩下的路再查一次最近 5 分钟，防同一处置在多步里重复记账。
+			const recentRow = await env.DB.prepare(
+				'SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE user_id = ? AND created_at > ?')
+				.bind(userIdStr, Math.floor(Date.now() / 1000) - 300).first();
+			if (caseOwnerId && String(reason || '') !== 'ad_auto' && !(Number(recentRow?.c || 0) > 0)) {
+				const caseLabel = AD_BLACKLIST_REASON_LABELS[String(reason || '')] || String(reason || '未标注原因');
+				const caseReasons = ['处置方式：' + caseLabel];
+				if (by) caseReasons.push('操作人 TGID：' + String(by));
+				if (note) caseReasons.push('原因说明：' + note);
+				await allocateAdPendingSnapshot(env, caseOwnerId, {
+					userId: userIdStr,
+					chatId: '',
+					score: 0,
+					reasons: caseReasons,
+					// 现场拿不到就不编：manual / spam / ad_vote 这几条路在加黑那一刻
+					// 只有 target id，消息原文由各自的学习链路负责，这里只把 note 带上。
+					snapshot: { name: '', username: '', bio: '', status: '', text: note || '' }
+				});
+			}
+		} catch (caseError) {
+			// 记案底绝不能影响加黑本身 —— 失败只记日志，照样返回成功。
+			console.error('[广告检测] 记录处置案底失败:', caseError);
 		}
 
 		return { success: true, code: 'ADDED', message: `✅ 已将用户 <code>${userId}</code> 添加到黑名单` };
@@ -21591,11 +21646,11 @@ async function handleAdUserCommand(env, chatId, ownerId, arg) {
 		return;
 	}
 
-	lines.push('<b>🔎 用户案底　TGID <code>' + escapeHtml(uid) + '</code></b>');
-	lines.push('当前状态：' + (blacklisted ? '<b>在黑名单中</b>' : '不在黑名单'));
+	lines.push('<b>🔎 封禁历史　TGID <code>' + escapeHtml(uid) + '</code></b>');
+	lines.push('🚫 状态：' + (blacklisted ? '<b>封禁中</b>' : '未封禁'));
 	lines.push(results.length
-		? '案底 <b>' + results.length + '</b> 条（最多显示 100 条，最新在前）'
-		: '📭 没有这个人的判定记录。');
+		? '📄 记录：共 <b>' + results.length + '</b> 条（最多显示 100 条，最新在前）'
+		: '📭 <b>没有这个人的任何记录。</b>');
 	if (!results.length) {
 		await sendTelegramMessageChunks(chatId, lines.join('\n'));
 		return;
@@ -21606,25 +21661,41 @@ async function handleAdUserCommand(env, chatId, ownerId, arg) {
 		let reasons = [];
 		try { snapshot = JSON.parse(String(row.snapshot || '{}')); } catch { snapshot = {}; }
 		try { reasons = JSON.parse(String(row.reasons || '[]')); } catch { reasons = []; }
+		const arr = Array.isArray(reasons) ? reasons : [];
+		// 处置案底那三条有固定前缀（addToBlacklist 那条路写的），先拆出来单独展示，
+		// 剩下的才是 AI 判定的逐条判据 —— 混在一起看会分不清「谁封的」和「为什么封」。
+		const take = (prefix) => arr.find((r) => String(r).startsWith(prefix));
+		const caseWay = take('处置方式：');
+		const caseBy = take('操作人');
+		const caseNote = take('原因说明：');
+		const evidences = arr.filter((r) => !String(r).startsWith('处置方式：')
+			&& !String(r).startsWith('操作人') && !String(r).startsWith('原因说明：'));
 		const when = Number(row.created_at)
 			? new Date(Number(row.created_at) * 1000).toISOString().replace('T', ' ').slice(0, 19) : '未知';
 		// expires_at = 0 表示这条已经 /ignore 复核过（回滚），行留着占序号 —— 照样列出并标注。
 		const reviewed = Number(row.expires_at) === 0;
+
 		lines.push('━━━━━━━━━━━━━━');
-		lines.push('<b>#' + Number(row.seq || 0) + '</b>　' + when
-			+ ' UTC　得分 <b>' + Number(row.score || 0) + '</b>' + (reviewed ? '　（已复核 /ignore）' : ''));
-		if (snapshot.name) lines.push('名称：' + escapeHtml(String(snapshot.name)));
-		if (snapshot.username) lines.push('用户名：' + escapeHtml(String(snapshot.username)));
+		lines.push('🕐 <b>' + when + '</b> UTC　得分 <b>' + Number(row.score || 0) + '</b>'
+			+ (reviewed ? '　（已复核 /ignore）' : ''));
+		// 【主人要的三件事】如何被封 / 封禁原因 / 谁操作的 —— 全部顶在最前面。
+		if (snapshot.name || snapshot.username) {
+			lines.push('👤 ' + escapeHtml(String(snapshot.name || ''))
+				+ (snapshot.username ? '　<code>' + escapeHtml(String(snapshot.username)) + '</code>' : ''));
+		}
+		if (caseWay) lines.push('📌 ' + escapeHtml(String(caseWay).replace('处置方式：', '')));
+		if (caseBy) lines.push('🧑‍💻 ' + escapeHtml(String(caseBy)));
+		if (caseNote) lines.push('🗒 ' + escapeHtml(String(caseNote).replace('原因说明：', '')));
 		if (snapshot.bio) lines.push('简介：' + escapeHtml(String(snapshot.bio)));
 		if (snapshot.status) lines.push('在线状态：' + escapeHtml(String(snapshot.status)));
 		// 【痕迹完整】正文与判据都不截断 —— 主人原话「痕迹必须完整」。
 		// 超长由 sendTelegramMessageChunks 按 4096 字上限分块发送，不会被吞。
-		if (snapshot.text) lines.push('正文：<code>' + escapeHtml(String(snapshot.text)) + '</code>');
-		if (Array.isArray(reasons) && reasons.length) {
-			lines.push('判据：');
-			for (const r of reasons) lines.push('　· ' + escapeHtml(String(r)));
+		if (snapshot.text) lines.push('📄 消息内容：<code>' + escapeHtml(String(snapshot.text)) + '</code>');
+		if (evidences.length) {
+			lines.push('⚖️ 判据：');
+			for (const r of evidences) lines.push('　· ' + escapeHtml(String(r)));
 		}
-		if (row.chat_id) lines.push('群：' + escapeHtml(String(row.chat_id)));
+		if (row.chat_id) lines.push('📁 群：' + escapeHtml(String(row.chat_id)));
 	}
 	await sendTelegramMessageChunks(chatId, lines.join('\n'));
 }
