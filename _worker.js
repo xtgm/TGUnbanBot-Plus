@@ -16503,7 +16503,16 @@ function applyAvatarVerdict(evaluation, avatar) {
 	if (!evaluation || !avatar) return evaluation;
 	if (String(avatar.verdict || '') !== 'ad') return evaluation;
 	const hits = Number(avatar.hits) || 0;
-	const hasCorroboration = (evaluation.reasons || []).length > 0 || (Number(evaluation.score) || 0) >= 2;
+	// 【2026-10-14 修：佐证只认【正分】判据】
+	// 原来写的是「reasons 只要非空就算有佐证」，而 reasons 里装的是【全部】判据，
+	// 连负分的也在一起 —— 于是「-1 名称无 emoji 且无 Bio」+「-3 正文命中豁免词：签到」
+	// 这种纯负分组合，只要头像命中就直接 ban。线上实测误封：8852967026，得分 0、
+	// 正文就是「签到」，头像是一张正常的哥特 MS 龙纹章 logo（被批量判定误判成广告），
+	// 就这样被封了，主人手动 /ignore 回滚。
+	// 现在：有「+N」开头的正分判据、或净分 ≥2 才算佐证；否则只进观察窗口。
+	// 这也正是主人定的口径 ——「单独特征本来就不允许封禁」。
+	const hasPositiveEvidence = (evaluation.reasons || []).some((r) => /^\+\d/.test(String(r)));
+	const hasCorroboration = hasPositiveEvidence || (Number(evaluation.score) || 0) >= 2;
 	const reason = '头像命中广告图库（复用定罪 ' + hits + ' 次）';
 	const reasons = (evaluation.reasons || []).concat([reason]);
 	let verdict = evaluation.verdict;
@@ -16516,6 +16525,46 @@ function applyAvatarVerdict(evaluation, avatar) {
 
 // 异步包装：有头像就读库叠判，没头像（闸一的 cheapProfile 恒为空、getChat 失败的号）
 // 直接原样返回 —— 于是【闸一热路径零 D1 读、零 Telegram 请求】，预算不受影响。
+// 头像命中广告图库、却没到封禁线（只进观察窗口）时，额外提醒主人一次。
+//
+// 【为什么需要】2026-10-14 修掉「负分也算佐证」那个误封之后，头像命中的
+// 无正分个案一律只进观察 —— 但观察窗口里一天几十条，主人翻不过来，等于把
+// 「这人头像和广告头像同款」这条信号埋掉了。主人原话：
+// 「负分的命中头像进观察加个额外提醒，这样我就可以手动判断是否漏广告」。
+//
+// 【只在头像命中时触发】其他原因进观察的不打扰 —— 提醒的正是「头像命中了、
+// 但证据不够封」这个矛盾状态，只有它需要人拍板。
+async function notifyAvatarHitObserve(evaluation, userId, chatId) {
+	try {
+		if (!evaluation || evaluation.verdict !== 'observe') return;
+		const reasons = Array.isArray(evaluation.reasons) ? evaluation.reasons : [];
+		if (!reasons.some((r) => String(r).includes('头像命中广告图库'))) return;
+		const ownerId = getOwnerNotifyTargets()[0] || '';
+		if (!ownerId) return;
+		const snap = (evaluation.snapshot && typeof evaluation.snapshot === 'object') ? evaluation.snapshot : {};
+		const lines = [
+			'👀 <b>头像命中广告图库，但未到封禁线 → 已转入观察</b>',
+			'',
+			'用户：<code>' + escapeHtml(String(userId)) + '</code>'
+				+ (snap.name ? '　' + escapeHtml(String(snap.name).slice(0, 40)) : '')
+				+ (snap.username ? '　<code>' + escapeHtml(String(snap.username)) + '</code>' : ''),
+			'得分：<b>' + Number(evaluation.score || 0) + '</b>（有正分佐证才会封，本次没有）',
+			'正文：' + (snap.text ? '<code>' + escapeHtml(String(snap.text).slice(0, 150)) + '</code>' : '（空）'),
+			(chatId ? '群：<code>' + escapeHtml(String(chatId)) + '</code>' : ''),
+			'',
+			'⚖️ 判据：',
+			...reasons.map((r) => '　· ' + escapeHtml(String(r))),
+			'',
+			'⚠️ 头像疑似广告素材、但本次没有正分佐证，所以没封。请人工看一眼是不是漏了广告。',
+			'　确认是广告 → /spam（引用其消息）或 /ban &lt;TGID&gt;',
+			'　观察窗口里的号还可以 /rescreen 重新筛查',
+		];
+		await sendTelegramMessageChunks(ownerId, lines.filter(Boolean).join('\n'));
+	} catch (error) {
+		console.error('[广告检测] 头像命中观察提醒失败:', error);
+	}
+}
+
 async function applyAvatarToEvaluation(env, evaluation, profile) {
 	const avatarId = String(profile?.avatarId || '');
 	if (!evaluation || !avatarId) return evaluation;
@@ -20796,6 +20845,8 @@ async function screenAdJoinMember(env, member, options = {}) {
 				snapshot: evaluation.snapshot,
 				layer: evaluation.layer
 			}, config);
+			// 头像命中却没到封禁线 → 单独提醒主人人工复核（可能漏广告）。
+			await notifyAvatarHitObserve(evaluation, userId, chatId);
 			console.log('[广告检测] 入群转入观察 user=' + userId + ' 来源=' + (options.source || 'join')
 				+ ' score=' + evaluation.score + '/' + config.scoreThreshold
 				+ ' 留存行为分=' + (evaluation.retainScore ?? 0));
@@ -21209,6 +21260,8 @@ async function detectAdOnMessage(message, env) {
 				snapshot: decision.snapshot,
 				layer: decision.layer
 			}, config);
+			// 头像命中却没到封禁线 → 单独提醒主人人工复核（可能漏广告）。
+			await notifyAvatarHitObserve(decision, userId, chat.id);
 			console.log('[广告检测] 闸一转入观察 user=' + userId + ' score=' + decision.score + '/' + config.scoreThreshold
 				+ ' 留存行为分=' + (decision.retainScore ?? 0));
 		}
@@ -21317,6 +21370,8 @@ async function detectAdOnMessage(message, env) {
 			snapshot: evaluation.snapshot,
 			layer: evaluation.layer
 		}, config);
+		// 头像命中却没到封禁线 → 单独提醒主人人工复核（可能漏广告）。
+		await notifyAvatarHitObserve(evaluation, userId, chat.id);
 		console.log('[广告检测] 闸二转入观察 user=' + userId + ' score=' + evaluation.score + '/' + config.scoreThreshold
 			+ ' 留存行为分=' + (evaluation.retainScore ?? 0));
 		// 【第2批 · 广告不进搜索库】转入观察 = 已经可疑但还没定罪，这条正文不该留在
@@ -22764,6 +22819,8 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 					snapshot: evaluation.snapshot,
 					layer: evaluation.layer
 				}, config);
+				// 头像命中却没到封禁线 → 单独提醒主人人工复核（可能漏广告）。
+				await notifyAvatarHitObserve(evaluation, userId, targetChatId);
 				kept.push(userId + '(' + evaluation.score + ')');
 			} else {
 				await deleteAdScreening(env, userId);

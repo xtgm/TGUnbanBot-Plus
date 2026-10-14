@@ -489,6 +489,68 @@ section('[6b] 干净头像当场判干净，正常自拍不受影响');
 	assert('★ 干净头像当场判成 clean（不是 pending）', clean?.verdict === 'clean', JSON.stringify(clean));
 }
 
+// ================= [7] 头像佐证只认正分（2026-10-14 修误封）=================
+//
+// 线上实测误封：8852967026 得分 0、正文就是一句「签到」，两条 reason 全是负分
+// （-1 名称无 emoji 且无 Bio、-3 正文命中豁免词：签到），只因头像命中广告图库
+//（且那张头像是批量判定误判的哥特 MS 龙纹章 logo）就被封了，主人手动 /ignore 回滚。
+// 根因：hasCorroboration 写成「reasons 只要非空就算佐证」，而负分理由也在里面。
+// 下面每条断言在改动【之前】都是红的。
+section('[7] 头像佐证只认正分（负分不再单证封）');
+{
+	const avatar = { verdict: 'ad', hits: 0 };
+	// 误封那次的原样判据
+	const negOnly = {
+		verdict: 'pass', score: 0,
+		reasons: ['-1 名称无 emoji 且无 Bio', '-3 正文命中豁免词：签到']
+	};
+	const r1 = W.applyAvatarVerdict({ ...negOnly }, avatar);
+	assert('★ 负分佐证不再单证封（8852967026 原样场景）', r1.verdict === 'observe', JSON.stringify(r1.verdict));
+	assert('原因仍写进 reasons（提醒要用）', r1.reasons.some((r) => String(r).includes('头像命中广告图库')), JSON.stringify(r1.reasons));
+
+	const withPos = {
+		verdict: 'pass', score: 7,
+		reasons: ['+7 资料卡含私有一次性邀请链接 (t.me/+ 或 joinchat)', '-1 名称无 emoji 且无 Bio']
+	};
+	assert('★ 有正分佐证才封（对照真广告 8916241973）',
+		W.applyAvatarVerdict({ ...withPos }, avatar).verdict === 'ban');
+
+	assert('净分 ≥2 同样算佐证',
+		W.applyAvatarVerdict({ verdict: 'pass', score: 5, reasons: [] }, avatar).verdict === 'ban');
+	assert('hits≥2 仍单证封（既有门槛不动）',
+		W.applyAvatarVerdict({ ...negOnly }, { verdict: 'ad', hits: 2 }).verdict === 'ban');
+	assert('头像 clean → 原样返回一个字节不改',
+		W.applyAvatarVerdict({ verdict: 'pass', score: 0, reasons: [] }, { verdict: 'clean', hits: 0 }).verdict === 'pass');
+}
+
+// ================= [7b] 头像命中进观察时给主人发提醒 =================
+//
+// 主人原话：「负分的命中头像进观察加个额外提醒，这样我就可以手动判断是否漏广告」。
+// 观察窗口一天几十条翻不过来，把「头像命中了但证据不够封」这个矛盾状态单独拎出来。
+section('[7b] 头像命中进观察时发提醒');
+{
+	const sentText = () => calls.filter((c) => c.method === 'sendMessage')
+		.map((c) => String(c.body?.text || '')).join('');
+	const evaluation = {
+		verdict: 'observe', score: 0,
+		reasons: ['-1 名称无 emoji 且无 Bio', '-3 正文命中豁免词：签到', '头像命中广告图库（复用定罪 0 次）'],
+		snapshot: { name: 'Metin', username: 'oyjukuyj', text: '签到' }
+	};
+	resetCalls();
+	await W.notifyAvatarHitObserve(evaluation, '8852967026', '-1003438950487');
+	assert('★ 头像命中进观察时发提醒', sentText().includes('头像命中广告图库'), sentText().slice(0, 200));
+	assert('提醒带用户与正文（够人工判断）',
+		sentText().includes('8852967026') && sentText().includes('签到'), sentText().slice(0, 300));
+
+	resetCalls();
+	await W.notifyAvatarHitObserve({ verdict: 'observe', score: 0, reasons: ['-1 名称无 emoji 且无 Bio'] }, '123', '-1');
+	assert('非头像原因进观察 → 不打扰', calls.filter((c) => c.method === 'sendMessage').length === 0);
+
+	resetCalls();
+	await W.notifyAvatarHitObserve({ verdict: 'ban', score: 9, reasons: ['头像命中广告图库'] }, '123', '-1');
+	assert('非 observe（已封）→ 不重复提醒', calls.filter((c) => c.method === 'sendMessage').length === 0);
+}
+
 console.log(`\n===== 头像检测测试：通过 ${pass} / 失败 ${fail} =====`);
 if (fail > 0) {
 	console.log('失败项：');
