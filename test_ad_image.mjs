@@ -270,21 +270,28 @@ section('[2] applyImageVerdict 分档（比头像严一档）');
 	const cleanBase = { verdict: 'pass', score: 0, reasons: [] };
 	const withEvidence = { verdict: 'observe', score: 3, reasons: ['+3 正文交易动词'] };
 
-	// 【2026-10-13 口径变更】这里原先是「单证不定罪、复用 4 次仍只观察」，
-	// 主人随后拍板改成【图片 / 贴纸 / 表情包判为广告即单证据封】（含色情 /
-	// 赌博 / 诈骗全部类型），断言预期跟着改 —— 不是删测试凑绿。
-	assert('图片 ad + 本次零判据 → 当场封（单证据定罪）',
-		W.applyImageVerdict({ ...cleanBase }, adRow(1)).verdict === 'ban');
-	assert('图片 ad + 复用 4 次 → 照样封',
-		W.applyImageVerdict({ ...cleanBase }, adRow(4)).verdict === 'ban',
+	// 【2026-10-14 口径再次变更】10-13 的「判为广告即单证据封」导致线上两起误封：
+	// 8913877802（Geoff Xia，2/7 分）与 6626316256（VLESS 订阅截图，0/7 分），
+	// 判据都是「复用定罪 5 次」——而那个 5 是 judgeAdMediaRealtime 里
+	// `UPDATE ad_images SET hits = 5` 写死的常量，实际 0 人复用过。
+	// 主人原话：「复用次数肯定得真实性啊。就连判定广告用户跟正常用户也得看真实性。」
+	// 现口径：真实复用满 5 次才单证封；否则图片命中只写进判据留痕，不改变结论。
+	assert('★ 图片 ad + 本次零判据 + 真实复用 1 次 → 不封（原来直接封）',
+		W.applyImageVerdict({ ...cleanBase }, adRow(1)).verdict !== 'ban',
+		W.applyImageVerdict({ ...cleanBase }, adRow(1)).verdict);
+	assert('★ 图片 ad + 真实复用 4 次 → 仍不封（未满线）',
+		W.applyImageVerdict({ ...cleanBase }, adRow(4)).verdict !== 'ban',
 		W.applyImageVerdict({ ...cleanBase }, adRow(4)).verdict);
 	assert('同一行喂给头像判据 → ban（头像仍按自己的门槛，hits≥2 即封）',
 		W.applyAvatarVerdict({ ...cleanBase }, adRow(4)).verdict === 'ban',
 		W.applyAvatarVerdict({ ...cleanBase }, adRow(4)).verdict);
-	assert('图片 ad + 复用 >= 5 次 → 单独即可封',
+	assert('图片 ad + 真实复用 >= 5 次 → 单独即可封（这条门槛保留）',
 		W.applyImageVerdict({ ...cleanBase }, adRow(5)).verdict === 'ban');
-	assert('图片 ad + 本次已有判据 → 封（互相印证）',
-		W.applyImageVerdict({ ...withEvidence }, adRow(1)).verdict === 'ban');
+	assert('★ 图片 ad + 本次已有判据 → 仍按本次判定走（图片不改结论）',
+		W.applyImageVerdict({ ...withEvidence }, adRow(1)).verdict === 'observe',
+		W.applyImageVerdict({ ...withEvidence }, adRow(1)).verdict);
+	assert('本次判定已是 ban 的，图片命中不会把它降级',
+		W.applyImageVerdict({ verdict: 'ban', score: 9, reasons: ['+7 资料卡含私有群一次性邀请链接'] }, adRow(1)).verdict === 'ban');
 	assert('clean → 原样返回，一个字节不改',
 		W.applyImageVerdict({ ...cleanBase }, { verdict: 'clean', hits: 0 }).verdict === 'pass');
 	assert('pending → 原样返回',
@@ -770,10 +777,15 @@ section('[7] 带图消息当场判定（不再等 cron）');
 	// 会把它覆盖成 learned 并把 hits +1 —— 那是既有设计，不是实时判定丢了来源。
 	assert('判定结果已落库（vision，或定罪后被学习覆盖为 learned）',
 		row[0]?.source === 'vision' || row[0]?.source === 'learned', JSON.stringify(row[0]));
-	assert('★ 当场封禁了发广告的人（这才是「检测就杀」）',
-		countCalls('banChatMember') >= 1, 'banChatMember=' + countCalls('banChatMember'));
+	// 【2026-10-14】这条原先断言「光有图就当场封」，是 10-13 单证据定罪的预期。
+	// 撤销后：图片判 ad 只写进库与判据，光凭它不封人（Geoff Xia 就是这样被误封的）。
+	assert('★ 光有图不封人：判 ad 但本次没有达线证据 → 不动用户',
+		countCalls('banChatMember') === 0, 'banChatMember=' + countCalls('banChatMember'));
 	assert('vision_checked_at 已推进（cron 不会再重判这张）', Number(row[0]?.vision_checked_at) > 0, JSON.stringify(row[0]));
-	assert('★ 判广告的图 hits 抬到定罪线（展示用；封禁已由判据无条件执行）', Number(row[0]?.hits) >= 5, JSON.stringify(row[0]));
+	// 【2026-10-14】不再把 hits 强写成 5 —— 那是常量冒充复用次数，
+	// 线上两起误封（Geoff Xia / VLESS 截图）的判据都写着假的「复用定罪 5 次」。
+	assert('★ 复用次数保持真实：首次出现就是 0，不许被强写成 5',
+		Number(row[0]?.hits) === 0, JSON.stringify(row[0]));
 	assert('调过 getFile（真的下了图去判，不是只登记）', countCalls('getFile') >= 1, 'getFile=' + countCalls('getFile'));
 }
 
@@ -787,12 +799,12 @@ section('[7b] 图片单证据封禁 + 第二次出现不重复花钱');
 	await send(barePhotoMessage({ id: 880011, first_name: '模糊广告' }, 'IMG_RT_MID_1', 'F_RT_MID_1'), env);
 	const mid = env.DB.query('SELECT verdict, hits FROM ad_images WHERE file_unique_id = ?', 'IMG_RT_MID_1')[0];
 	assert('0.7 同样当场判成广告', mid?.verdict === 'ad', JSON.stringify(mid));
-	// 【2026-10-13 口径变更】这条断言的预期本身变了：原先断言「0.5~0.9 的模糊区
-	// 不顶定罪线、仍走多特征」，主人随后拍板【图片 / 贴纸 / 表情包判为广告即
-	// 单证据封】（含色情 / 赌博 / 诈骗全部类型），于是改成断言它当场封了人。
-	// 不是删测试凑绿 —— 回退 _worker.js 之后这条同样会红（banChatMember=0）。
-	assert('★ 单证据封禁：0.7 没有第二证据也当场封了人',
-		countCalls('banChatMember') >= 1, 'banChatMember=' + countCalls('banChatMember'));
+	// 【2026-10-14 口径再改】10-13 主人拍板「判为广告即单证据封」，随后两起误封
+	//（Geoff Xia 2/7 分、VLESS 截图 0/7 分，判据都是假的「复用定罪 5 次」）让他改口：
+	// 「是广告就给我判了 不是广告就给我解了」+「复用次数肯定得真实性」。
+	// 现在 0.7 判 ad 只入库、只写判据，光凭它不封人。
+	assert('★ 单证据封禁已停用：0.7 判 ad 但没有真实复用线 → 不封',
+		countCalls('banChatMember') === 0, 'banChatMember=' + countCalls('banChatMember'));
 
 	// 同一张图第二次出现：库里已有结论，一个模型调用都不该再发。
 	resetCalls();
@@ -930,6 +942,64 @@ section('[9b] 任何原因进黑名单都要留案底');
 	assert('重复加黑返回 EXISTS', dup.code === 'EXISTS', JSON.stringify(dup));
 	assert('★ 重复加黑不重复留案底', env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c === beforeCount,
 		beforeCount + '→' + env.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c);
+}
+
+// ================= [10] 复用次数必须真实 + 判定必须看真实证据（2026-10-14）=================
+//
+// 线上实测误封：8913877802（Geoff Xia）发了一张 workers.dev 默认域名的截图，
+// 得分 2 / 阈值 7，判据写「消息图片命中广告素材库（复用定罪 5 次）」被无条件封 13 群。
+// 查库实证那个「5 次」是假的 —— ad_image_senders 0 行、因图被封的快照只有他本人 1 条、
+// 同款文本名单 0 命中。真相是 judgeAdMediaRealtime 判 ad 后执行
+// `UPDATE ad_images SET hits = 5 WHERE hits < 5`，把常量写进「复用次数」再拼成文案。
+// 下面 A 组断言复用次数的真实性，B 组断言封禁必须由真实证据 + 分数说了算。
+section('[10] 复用次数真实、封禁只认真实证据（Geoff Xia 误封）');
+{
+	// —— A. AI 判 ad 不许把 hits 强写成 5：hits 必须是真实复用次数 ——
+	const envA = makeEnv({
+		AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'ad', probabilities: { ad: 0.95, clean: 0.05 }, confidence: 0.9 } } }) }
+	});
+	await W.adDetectionReady(envA);
+	resetCalls();
+	await send(barePhotoMessage({ id: 880101, first_name: 'Geoff Xia' }, 'IMG_TRUTH_1', 'F_TRUTH_1'), envA);
+	const truth = envA.DB.query('SELECT verdict, hits FROM ad_images WHERE file_unique_id = ?', 'IMG_TRUTH_1')[0];
+	assert('★ 判据仍判成广告（图片库该记还是记）', truth?.verdict === 'ad', JSON.stringify(truth));
+	assert('★ 复用次数是真实的：没人复用过就是 0，不许被强写成 5',
+		Number(truth?.hits) === 0, JSON.stringify(truth));
+
+	// —— B. 封禁必须由真实证据决定，分数没到线就不能只凭图片封 ——
+	// Geoff 原始判据：得分 2 / 阈值 7，正分只有一条 +2 名字。
+	const geoff = {
+		verdict: 'observe', score: 2,
+		reasons: ['+2 昵称为机器生成型西方全名']
+	};
+	const r1 = W.applyImageVerdict({ ...geoff }, { verdict: 'ad', hits: 0 });
+	assert('★ 图片判 ad 但真实复用 0 次、分数 2/7 → 不封（原样进观察）',
+		r1.verdict !== 'ban', JSON.stringify(r1.verdict));
+	assert('图片命中仍写进判据（留痕供人工复核，不改判）',
+		r1.reasons.some((r) => String(r).includes('复用定罪 0 次')), JSON.stringify(r1.reasons));
+
+	// 真实复用满线：同一张图被反复用于被封的人，这时单证才成立。
+	const r2 = W.applyImageVerdict({ ...geoff }, { verdict: 'ad', hits: 5 });
+	assert('真实复用达 5 次 → 单证封（既有门槛保留）', r2.verdict === 'ban', JSON.stringify(r2.verdict));
+
+	// 强佐证 + 已达线：正常广告判据不受影响。
+	const realAd = {
+		verdict: 'ban', score: 9,
+		reasons: ['+7 资料卡含私有群一次性邀请链接（t.me/+ 或 joinchat）', '+2 昵称为机器生成型西方全名']
+	};
+	assert('真广告（+7 私有邀请、分数 9）照封不动',
+		W.applyImageVerdict({ ...realAd }, { verdict: 'ad', hits: 0 }).verdict === 'ban');
+
+	// 负分理由不算佐证（同 2026-10-14 头像通道的修法，治同一个病）。
+	const negOnly = {
+		verdict: 'observe', score: 0,
+		reasons: ['-1 名称无 emoji 且无 Bio', '-3 正文命中豁免词：签到']
+	};
+	assert('负分理由不算佐证，不因图片命中就封',
+		W.applyImageVerdict({ ...negOnly }, { verdict: 'ad', hits: 0 }).verdict !== 'ban');
+	assert('图片 clean/pending → 原样返回一个字节不改',
+		W.applyImageVerdict({ ...geoff }, { verdict: 'clean', hits: 0 }).verdict === 'observe'
+			&& W.applyImageVerdict({ ...geoff }, { verdict: 'pending', hits: 0 }).verdict === 'observe');
 }
 
 console.log(`\n===== 正文图片检测测试：通过 ${pass} / 失败 ${fail} =====`);

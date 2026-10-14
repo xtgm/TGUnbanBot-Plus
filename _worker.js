@@ -17582,21 +17582,24 @@ function applyImageVerdict(evaluation, image) {
 	const hits = Number(image.hits) || 0;
 	const reason = '消息图片命中广告素材库（复用定罪 ' + hits + ' 次）';
 	const reasons = (evaluation.reasons || []).concat([reason]);
-	// 【2026-10-13 主人拍板：图片 / 贴纸 / 表情包单证据定罪】
-	// 原口径是「有佐证才封，或复用满 AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS 次才封」，
-	// 于是模型明明判出是广告图，只要没有第二个证据就只进观察窗口 —— 而广告贴纸
-	// 本身往往就只有一张贴纸、没有正文，等于永远等不到那个佐证。
-	// 现在：判为广告（含色情 / 赌博 / 诈骗等全部广告类型）即封，不要求第二证据。
+	// 【2026-10-14 改：图片命中不再无条件封禁】
+	// 10-13 拍板的「单特征杀掉」把这里写成恒返回 verdict:'ban'，分数一概不看。
+	// 线上实测误封：8913877802（Geoff Xia）发了一张 workers.dev 默认域名截图，
+	// 得分 2 / 阈值 7，凭这一条就被封了 13 个群；而那条判据里的「复用定罪 5 次」
+	// 是代码强写的常量（见 judgeAdMediaRealtime 已删的那段），实际 0 人复用过。
+	// 主人原话：「复用次数肯定得真实性啊。就连判定广告用户跟正常用户也得看真实性。」
 	//
-	// 【只改这一路，头像不动】applyAvatarVerdict 仍要求 hits≥2 或有佐证才封 ——
-	// 主人的原话是「其他多特征依旧不变，单特征只针对广告图片跟广告贴图表情包」。
-	// 头像是「一个人一张、正常人天天在用」的常驻素材，与「谁发的广告」不同性质，
-	// 混为一谈会把正常自拍头像也拉进单证封禁。
-	//
-	// 【误伤由上游闸掉】只有 verdict='ad' 才走到这里；clean 与 pending 在第一行就
-	// 原样返回。而 verdict 是 clef-flash 判的，2026-10-13 实测 40 张真实库图里
-	// 广告 0.827~0.9412、正常表情包 0.0404~0.0458，两簇无重叠。
-	return Object.assign({}, evaluation, { verdict: 'ban', reasons });
+	// 现在的口径，两条都必须是真的：
+	//   ① 真实复用满线 —— 同一张图已被反复用于被封的人（learnAdImageOnBan 逐次累加），
+	//      这是可核验的事实，单证成立，直接封。
+	//   ② 否则图片命中【只留痕、不改变结论】：封不封由本条消息自己的分数与证据决定。
+	//      得分没到线就不封，进观察窗口等人工或后续证据 —— 与头像通道同口径
+	//      （applyAvatarVerdict 2026-10-14 也是只认正分佐证，治的是同一个病）。
+	if (hits >= AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS) {
+		return Object.assign({}, evaluation, { verdict: 'ban', reasons });
+	}
+	// score 只作展示：图片不改评分口径，避免与历史分叠加时重复计分。
+	return Object.assign({}, evaluation, { verdict: evaluation.verdict, reasons });
 }
 
 // 取这条消息对应的图片指纹，【一次消息只读一遍】，两道闸共用同一份结果。
@@ -19109,19 +19112,14 @@ async function judgeAdMediaRealtime(env, media, userId) {
 	await writeAdScanState(env, 'img_count', String(quota.used + 1), Math.floor(Date.now() / 1000));
 
 	if (verdict !== 'ad') return verdict === 'clean' ? { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid } : null;
-	// 高置信「一眼广告」：直接顶到单证定罪线，让它当场就能封，不等复用次数积累。
-	// 这是主人要的「检测到了就立刻处理」；0.5~0.9 的模糊区仍按多特征走，
-	// 有正文词表 / 简介 / 跨用户 / 案底任一佐证才封，否则只进观察窗口。
-	// 判为广告就抬到单证定罪线 —— 封禁本身已由 applyImageVerdict 无条件执行
-	// （2026-10-13 主人拍板：图片/贴纸/表情包单证据定罪），这里抬 hits
-	// 只影响展示文案里那句「复用定罪 N 次」，让它读起来是确定的广告素材。
-	try {
-		await env.DB.prepare(
-			'UPDATE ad_images SET hits = ? WHERE file_unique_id = ? AND hits < ?')
-			.bind(AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS, key, AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS).run();
-	} catch (error) {
-		console.error('[图片实时判定] 抬升定罪强度失败:', error);
-	}
+	// 【2026-10-14 删：不再把 hits 强写成 AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS】
+	// 原实现在这里执行 `UPDATE ad_images SET hits = 5 WHERE hits < 5`，然后判据拼成
+	// 「消息图片命中广告素材库（复用定罪 5 次）」。那个 5 是常量，不是复用次数。
+	// 线上误封实证（8913877802 / Geoff Xia）：ad_image_senders 0 行、因该图被封的
+	// 快照只有他本人 1 条、同款文本名单 0 命中 —— 一个人都没复用过，文案却说 5 次；
+	// 再叠上「定罪即学习」的 +1，库里实际显示 6、7 不等，没有一个是真的。
+	// 主人原话：「复用次数肯定得真实性啊」。现在 hits 只由 learnAdImageOnBan 真实累加，
+	// 展示文案与单证门槛（hits >= AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS）读到的都是真数。
 	const finalRow = await readAdImage(env, key);
 	return finalRow || { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid };
 }
