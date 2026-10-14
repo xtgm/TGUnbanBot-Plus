@@ -355,8 +355,11 @@ section('[7] 删判据的路径全部卡在第一主人门槛内');
 	// 主人的原话：「如果其他权限通过 /unban 解封并删除了指纹特征，那么我之前演练学习
 	// 的特征全部都白费。」/unban 三条执行路今天本来就不删判据（已逐条核实），
 	// 真正的口子在这一条，所以卡死的是它。
+	// 窗口 800：2026-10-14 加 ok/no 两条分支时多了一句 payloadStr 声明，
+	// isPrimaryOwner 被推到 500 之外 —— 断言要钉的是「权限卡在入口」这个位置关系，
+	// 不是精确距离，所以放宽窗口而不是挪代码（挪代码会把变量声明放到函数中段，更难读）。
 	assert('↩️ 误判按钮：入口卡 isPrimaryOwner',
-		/handleAdFixButtonCallback\([\s\S]{0,500}isPrimaryOwner\(fromId\)/.test(src));
+		/handleAdFixButtonCallback\([\s\S]{0,800}isPrimaryOwner\(fromId\)/.test(src));
 	assert('演练「不该封」按钮：入口卡 isPrimaryOwner',
 		/handleDryRunButtonCallback\([\s\S]{0,500}isPrimaryOwner\(fromId\)/.test(src));
 	assert('/ignore 等广告管理命令：整段入口卡 isPrimaryOwner',

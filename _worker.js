@@ -16681,11 +16681,22 @@ async function notifyAvatarHitObserve(evaluation, userId, chatId) {
 			'⚖️ 判据：',
 			...reasons.map((r) => '　· ' + escapeHtml(String(r))),
 			'',
-			'⚠️ 头像疑似广告素材、但本次没有正分佐证，所以没封。请人工看一眼是不是漏了广告。',
-			'　确认是广告 → /spam（引用其消息）或 /ban &lt;TGID&gt;',
+			'⚠️ 头像疑似广告素材、但本次没有正分佐证，所以没封。',
+			'　判断直接点下面的按钮 —— 【不要用引用回复发 /spam】：',
+			'　私聊里能引用的只有机器人自己的消息，那样会把机器人当成目标封掉（2026-10-14 真实事故）。',
+			'　　🔒 确认封 = 全群封禁 + 拉黑 + 学指纹',
+			'　　❌ 不该封 = 这张头像转干净，以后谁用都不再触发，本次观察记录一并清除',
 			'　观察窗口里的号还可以 /rescreen 重新筛查',
 		];
-		await sendTelegramMessageChunks(ownerId, lines.filter(Boolean).join('\n'));
+		// 按钮而不是「你去手动发 /spam」：主人 2026-10-14 照着提示里的「引用其消息发 /spam」
+		// 执行，结果 /spam 取「被引用消息的发送者」当目标 —— 私聊里能引用的只有机器人自己，
+		// 于是机器人把自己加黑、全群禁言。把判断收进按钮，这类误操作从根上没有入口。
+		await sendTelegramMessageChunks(ownerId, lines.filter(Boolean).join('\n'), {
+			inline_keyboard: [[
+				{ text: '🔒 确认封（全群封禁+拉黑）', callback_data: ADFIX_BUTTON_PREFIX + 'ok:' + String(userId) },
+				{ text: '❌ 不该封（头像转干净）', callback_data: ADFIX_BUTTON_PREFIX + 'no:' + String(userId) }
+			]]
+		});
 	} catch (error) {
 		console.error('[广告检测] 头像命中观察提醒失败:', error);
 	}
@@ -20134,13 +20145,16 @@ function buildAdNoticeKeyboard(seq, userId) {
 
 async function handleAdFixButtonCallback(callbackQuery, env) {
 	const data = String(callbackQuery?.data || '');
-	const match = data.slice(ADFIX_BUTTON_PREFIX.length).match(/^(ig|ub|wl):(\d+)$/);
+	const match = data.slice(ADFIX_BUTTON_PREFIX.length).match(/^(ig|ub|wl|ok|no):(\d+)$/);
 	if (!match) {
 		await answerAdVoteCallback(callbackQuery?.id);
 		return;
 	}
 	const action = match[1];
 	const payload = Number(match[2]);
+	// ok / no 两条分支的载荷是 TGID，要拿去 D1 主键匹配 —— TGID 可到 10 位以上，
+	// 经过 Number 有丢精度的风险，主键对不上会静默查不到记录，所以字符串形态另存一份。
+	const payloadStr = String(match[2]);
 	const fromId = String(callbackQuery?.from?.id || '');
 	if (!isPrimaryOwner(fromId)) {
 		await answerAdVoteCallback(callbackQuery?.id, '这三个按钮只有第一主人能点', true);
@@ -20157,6 +20171,71 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 		await handleAdIgnoreCommand(env, chatId, fromId, String(payload));
 		await editTelegramMessage(chatId, messageId, originText + '\n─────\n↩️ 已按误判回滚　快照 #' + payload
 			+ '\n解封 + 指纹/形状/AI 样本修正已执行，明细在上一条消息。');
+		return;
+	}
+
+	// ===== 头像观察通知上的两个按钮 =====
+	// 与演练那对（dry:ok / dry:no）同形态：判完不封，推给主人拍板。
+	// 【为什么必须有按钮】原来那条提示写着「确认是广告 → /spam（引用其消息）」，
+	// 主人 2026-10-14 照做，而 /spam 取「被引用消息的发送者」当目标 —— 私聊里能引用的
+	// 只有机器人自己，于是机器人把自己加黑、全群禁言。把判断收进按钮，这类误操作没有入口。
+	if (action === 'ok' || action === 'no') {
+		// 通知本身没带群上下文（observe 落的是 ad_user_screening），去观察表取。
+		const screening = await env.DB
+			.prepare('SELECT chat_id, snapshot FROM ad_user_screening WHERE user_id = ?')
+			.bind(payloadStr).first();
+		if (action === 'ok') {
+			const targetChatId = String(screening?.chat_id || '');
+			if (!targetChatId) {
+				await answerAdVoteCallback(callbackQuery?.id, '找不到该用户的观察记录，无法确定要封的群', true);
+				return;
+			}
+			let result = null;
+			try {
+				result = await enforceAdDetection(env, {
+					userId: payloadStr,
+					chatId: targetChatId,
+					chatTitle: '',
+					messageId: null
+				}, {
+					verdict: 'ban',
+					score: 0,
+					layer: 'avatar',
+					// 判据原样写进 note，事后 /user 查得到「这是主人看过判据后拍板封的」，
+					// 不然回滚时会以为是自动定罪、找不到是谁拍的板。
+					reasons: ['头像命中广告图库（主人点确认封）'],
+					threshold: 0,
+					snapshot: {}
+				}, { force: true });
+			} catch (error) {
+				console.error('[头像观察] 主人确认封执行失败:', error);
+			}
+			if (!result?.banned) {
+				await answerAdVoteCallback(callbackQuery?.id, '封禁未执行：' + (result?.reason || '未知原因'), true);
+				return;
+			}
+			await answerAdVoteCallback(callbackQuery?.id, '已确认封禁 ' + payloadStr);
+			await editTelegramMessage(chatId, messageId, originText + '\n─────\n🔒 已按主人确认封禁　TGID <code>'
+				+ escapeHtml(payloadStr) + '</code>\n全群封禁 + 拉黑 + 学指纹已执行，明细见上一条。');
+			return;
+		}
+		// 不该封：这张头像转干净（防连坐）+ 清观察记录。
+		// 只清观察不清头像的话，下一个用同款头像的人还会被推一遍同样的通知。
+		let avatarId = '';
+		try {
+			avatarId = String(JSON.parse(String(screening?.snapshot || '{}')).avatarId || '');
+		} catch (_) { avatarId = ''; }
+		let cleared = false;
+		if (avatarId) cleared = await clearAdAvatarOnIgnore(env, avatarId);
+		try {
+			await env.DB.prepare('DELETE FROM ad_user_screening WHERE user_id = ?').bind(payloadStr).run();
+		} catch (error) {
+			console.error('[头像观察] 清观察记录失败:', error);
+		}
+		await answerAdVoteCallback(callbackQuery?.id, cleared ? '已标记为误判，该头像已转干净' : '已清除观察记录');
+		await editTelegramMessage(chatId, messageId, originText + '\n─────\n❌ 已按误判处理　TGID <code>'
+			+ escapeHtml(payloadStr) + '</code>\n头像：' + (cleared ? '已转干净，以后谁用都不再触发' : '无对应头像记录')
+			+ '\n观察记录：已清除');
 		return;
 	}
 
