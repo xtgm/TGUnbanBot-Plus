@@ -703,7 +703,12 @@ async function handleInitialization(request) {
 				{ command: "menu", description: "群设置菜单：群统计/资料卡/运行检查 (仅第一主人)" },
 				{ command: "user", description: "按 TGID 查这个人的全部案底 (仅第一主人)" },
 				{ command: "adstats", description: "广告检测状态总览 (仅第一主人)" },
-				{ command: "dryrun", description: "本群演练开关：只判定不处置不封 (仅第一主人)" }
+				{ command: "dryrun", description: "本群演练开关：只判定不处置不封 (仅第一主人)" },
+				// ↓【2026-10-14 补】用户白名单。与 /whitelist（域名白名单，判据层）是两回事，
+				// 刻意分名：/whitelist 管「这条链接不算广告链接」，/wl 管「这个人一律不判」。
+				// 权限闸门本就在 handleAdDetectionCommands 的 isPrimaryOwner 那一段，
+				// 这里同样只是把入口摆到明面，没有放宽任何一道门。
+				{ command: "wl", description: "用户白名单：名单里的人永不检测不封，支持批量 add/del (仅第一主人)" }
 			]
 		};
 
@@ -22910,39 +22915,65 @@ async function handleAdStatsCommand(env, chatId) {
 // 一个是判据、一个是豁免，混在一条指令里迟早点错。
 // 用法：/wl 列出 ｜ /wl add 123456 ｜ /wl del 123456
 async function handleAdUserWhitelistCommand(env, chatId, ownerId, arg) {
-	const parts = arg ? arg.split(/\s+/) : [];
-	const action = (parts[0] || 'list').toLowerCase();
-	const target = (parts[1] || '').trim();
+	const trimmed = String(arg || '').trim();
+	const actionMatch = trimmed.match(/^(\S+)/);
+	const action = (actionMatch?.[1] || 'list').toLowerCase();
+	// 批量：action 之后的部分按【任意非数字】切分 —— 空格、中英文逗号、分号、制表符、
+	// 换行都能当分隔符。主人的口径是「不限大小写」：对纯数字 TGID 而言大小写本来
+	// 就不存在，真正要兼容的是分隔符五花八门；指令本身 /WL 也认得（AD_COMMAND_RE 带 i）。
+	// 用 \d+ 抓而不是按分隔符 split —— 这样「123,, 456；789」这种多余分隔符不会凭空造出空项。
+	const rest = trimmed.slice(actionMatch?.[1]?.length || 0);
+	const targets = rest.match(/\d+/g) || [];
 
 	if (action === 'add' || action === 'del') {
-		if (!target) {
-			await sendTelegramMessage(chatId, '用法：<code>/wl ' + action + ' 123456</code>（填 TGID，纯数字）');
+		if (!targets.length) {
+			// 抓不到数字却带了内容 = 分隔符或格式写错了，把原样报回去，别静默当成 list 让人一脸问号
+			await sendTelegramMessage(chatId,
+				'用法：<code>/wl ' + action + ' 123456</code>　批量：<code>/wl ' + action + ' 123 456, 789</code>'
+				+ '\n多个 TGID 用空格、逗号、分号隔开都行。'
+				+ (rest.trim() ? '\n⚠️ 没从「' + escapeHtml(rest.trim().slice(0, 40)) + '」里识别出任何纯数字' : ''));
 			return;
 		}
-		const result = action === 'add'
-			? await addAdUserWhitelist(env, target, ownerId, '/wl 手动添加')
-			: await removeAdUserWhitelist(env, target);
-		if (!result.ok) {
-			const reasonMap = { invalid: 'TGID 不合法（必须是纯数字）', unavailable: '数据表不可用', error: '写入失败' };
-			await sendTelegramMessage(chatId, '❌ 操作失败：' + (reasonMap[result.reason] || result.reason));
-			return;
+		const done = [];
+		const existed = [];
+		const bad = [];
+		for (const id of targets) {
+			const result = action === 'add'
+				? await addAdUserWhitelist(env, id, ownerId, '/wl 手动添加')
+				: await removeAdUserWhitelist(env, id);
+			if (!result.ok) { bad.push(id); continue; }
+			if (action === 'add' ? result.added : result.removed) done.push(id);
+			else existed.push(id);
 		}
-		if (action === 'add') {
-			await sendTelegramMessage(chatId, (result.added ? '✅ 已加入白名单：' : 'ℹ️ 已在白名单中：')
-				+ '<code>' + escapeHtml(result.userId) + '</code>'
-				+ '\n从现在起：入群不查、发消息不判、封禁一律拒绝。'
-				+ '\n⚠️ 白名单只挡【以后】。此人若仍在黑名单，要放出来得再执行一次解封'
-				+ '（<code>/unban ' + escapeHtml(result.userId) + '</code>）。');
-		} else {
-			await sendTelegramMessage(chatId, (result.removed ? '✅ 已从白名单移除：' : '⚠️ 白名单中没有该 TGID：')
-				+ '<code>' + escapeHtml(result.userId) + '</code>'
-				+ '\n移除后恢复检测。');
+		// 汇总一行而不是逐个列：主人常用一次加几十个，逐条会刷屏把后面的消息顶掉
+		const lines = [action === 'add'
+			? '✅ 已加入白名单 <b>' + done.length + '</b> 人'
+			: '✅ 已从白名单移除 <b>' + done.length + '</b> 人'];
+		if (done.length) {
+			lines.push('　' + done.slice(0, 20).map((id) => '<code>' + escapeHtml(id) + '</code>').join('、')
+				+ (done.length > 20 ? ' …等' : ''));
 		}
+		if (existed.length) {
+			lines.push((action === 'add' ? 'ℹ️ 本来就在白名单 ' : '⚠️ 白名单里没有 ')
+				+ existed.length + ' 个：' + escapeHtml(existed.slice(0, 10).join('、')));
+		}
+		if (bad.length) {
+			lines.push('❌ 无法处理 ' + bad.length + ' 个：' + escapeHtml(bad.slice(0, 10).join('、')));
+		}
+		if (action === 'add' && done.length) {
+			lines.push('', '从现在起：入群不查、发消息不判、封禁一律拒绝。');
+			lines.push('⚠️ 白名单只挡【以后】。已在黑名单的人要放出来得再解封一次（<code>/unban TGID</code>）。');
+		} else if (action === 'del' && done.length) {
+			lines.push('', '移除后恢复检测。');
+		}
+		await sendTelegramMessage(chatId, lines.join('\n'));
 		return;
 	}
 
 	if (action !== 'list') {
-		await sendTelegramMessage(chatId, '用法：<code>/wl</code> 列出｜<code>/wl add 123456</code>｜<code>/wl del 123456</code>');
+		await sendTelegramMessage(chatId,
+			'用法：<code>/wl</code> 列出　<code>/wl add 123456</code>　<code>/wl del 123456</code>'
+			+ '\n批量：空格、逗号、分号都行 —— <code>/wl add 123 456, 789;101</code>');
 		return;
 	}
 

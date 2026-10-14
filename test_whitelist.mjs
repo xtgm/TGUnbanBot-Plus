@@ -203,14 +203,67 @@ section('[1] ad_user_whitelist 表与 /wl add / del / list');
 	resetCalls();
 	await sendCommand('/wl add 不是数字', env);
 	text = sendTextOf('sendMessage').join('\n');
-	assert('非法 TGID 被拒且写明必须纯数字', /必须是纯数字/.test(text), text.slice(0, 200));
-	assert('非法 TGID 未写库', env.DB.query('SELECT * FROM ad_user_whitelist').length === 1);
+	assert('纯文字无数字时提示识别不出数字', /识别出任何纯数字/.test(text), text.slice(0, 300));
+	assert('提示里回显无法识别的原样', /不是数字/.test(text), text.slice(0, 300));
+	assert('非法输入未写库', env.DB.query('SELECT * FROM ad_user_whitelist').length === 1);
 
 	resetCalls();
 	await sendCommand('/wl del ' + STRANGER_ID, env);
 	assert('/wl del 删掉那一行', env.DB.query('SELECT * FROM ad_user_whitelist').length === 0);
 	text = sendTextOf('sendMessage').join('\n');
 	assert('/wl del 回执写明恢复检测', /移除后恢复检测/.test(text), text.slice(0, 200));
+}
+
+// ================= [1b] 批量 add / del =================
+section('[1b] 批量：空格 / 中英文逗号 / 分号 / 大小写');
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	const ids = () => env.DB.query('SELECT user_id FROM ad_user_whitelist ORDER BY user_id').map((r) => String(r.user_id));
+
+	resetCalls();
+	await sendCommand('/wl add 111 222 333', env);
+	assert('空格分隔一次加三个', ids().join(',') === '111,222,333', JSON.stringify(ids()));
+	let t = sendTextOf('sendMessage').join('\n');
+	assert('批量回执写明数量', /加入白名单 <b>3<\/b> 人/.test(t), t.slice(0, 200));
+	assert('批量回执逐个列出 TGID', t.includes('111') && t.includes('333'), t.slice(0, 200));
+
+	// 中文逗号、英文逗号、分号混着写
+	resetCalls();
+	await sendCommand('/wl add 444,555，666;777', env);
+	assert('中英文逗号与分号都认', ids().length === 7, JSON.stringify(ids()));
+
+	// 多余分隔符不该凭空造出空项
+	resetCalls();
+	await sendCommand('/wl add 888,, 999', env);
+	assert('多余分隔符不造出空项', ids().length === 9, JSON.stringify(ids()));
+
+	// 混入文字：能认的照加，认不出的报出来，不整批失败
+	resetCalls();
+	await sendCommand('/wl add 1010 abc1111', env);
+	const mixed = ids();
+	assert('混入文字时数字照加', mixed.includes('1010') && mixed.includes('1111'), JSON.stringify(mixed));
+	assert('文字没有被当成 TGID 写库', mixed.every((id) => /^\d+$/.test(id)), JSON.stringify(mixed));
+	t = sendTextOf('sendMessage').join('\n');
+	assert('混入时回执写明加了几个', /加入白名单 <b>2<\/b> 人/.test(t), t.slice(0, 200));
+
+	// 批量 del
+	resetCalls();
+	await sendCommand('/wl del 111,222 333', env);
+	const afterDel = ids();
+	assert('批量 del 一次删三个', !afterDel.some((id) => ['111', '222', '333'].includes(id)), JSON.stringify(afterDel));
+	assert('批量 del 不误删其他', afterDel.includes('444') && afterDel.includes('888'), JSON.stringify(afterDel));
+
+	// 指令与动作大小写混杂也认得（AD_COMMAND_RE 带 i 标志）
+	resetCalls();
+	await sendCommand('/WL ADD 1212', env);
+	assert('指令与动作大小写混杂也认得', ids().includes('1212'), JSON.stringify(ids()));
+
+	// 用法提示要提批量 —— 不然主人只会单个加
+	resetCalls();
+	await sendCommand('/wl nonsense', env);
+	t = sendTextOf('sendMessage').join('\n');
+	assert('用法提示写明批量分隔符', /空格、逗号、分号/.test(t), t.slice(0, 200));
 }
 
 // ================= [2] 三道豁免闸 =================
