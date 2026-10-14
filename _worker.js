@@ -708,7 +708,8 @@ async function handleInitialization(request) {
 				// 刻意分名：/whitelist 管「这条链接不算广告链接」，/wl 管「这个人一律不判」。
 				// 权限闸门本就在 handleAdDetectionCommands 的 isPrimaryOwner 那一段，
 				// 这里同样只是把入口摆到明面，没有放宽任何一道门。
-				{ command: "wl", description: "用户白名单：名单里的人永不检测不封，支持批量 add/del (仅第一主人)" }
+				{ command: "wl", description: "用户白名单：名单里的人永不检测不封，/wl TGID 添加 (仅第一主人)" },
+				{ command: "del", description: "从用户白名单移除，支持批量，/del 123,321 123 (仅第一主人)" }
 			]
 		};
 
@@ -21592,7 +21593,9 @@ async function detectAdOnMessage(message, env) {
 // /learnlast 放进这里是因为它与本组命令的约束完全一致：仅第一主人、强制私聊。
 // /recent 【刻意不在】这里 —— 它必须群内可用（在群里看到广告被删就顺手拉列表），
 // 而本函数对群内命令一律撤回 + 引导私聊，会把 /recent 的主用法直接堵死。
-const AD_COMMAND_RE = /^\/(pending|user|ignore|addword|delword|words|addsample|clearsamples|adstats|vision|digest|whitelist|rescreen|warmup|learnlast|wl)(?:@[^\s]+)?(?:\s|$)/i;
+// 【del 必须排在 delword 之后】alternation 是按顺序试的，把短的放前面的话
+// 「/delword xxx」会被 /del 抢走，剩下「word xxx」当成目标 —— 删词表功能当场失灵。
+const AD_COMMAND_RE = /^\/(pending|user|ignore|addword|delword|words|addsample|clearsamples|adstats|vision|digest|whitelist|rescreen|warmup|learnlast|wl|del)(?:@[^\s]+)?(?:\s|$)/i;
 
 // 快照 → 判定载荷。/ignore 标误判、删 AI 样本都要用同一份载荷，保证两边命中的集合一致。
 function adPayloadFromSnapshot(snapshot) {
@@ -21684,6 +21687,11 @@ async function handleAdDetectionCommands(message, env, ctx) {
 			case 'digest': await handleAdDigestCommand(env, chatId, arg); break;
 			case 'whitelist': await handleAdWhitelistCommand(env, chatId, ownerId, arg); break;
 			case 'wl': await handleAdUserWhitelistCommand(env, chatId, ownerId, arg); break;
+			// /del 是 /wl 的删除专用入口（主人：「添加就是 /wl tgid，删除就是 /del tgid」）。
+			// 实现上不另写一份逻辑，只在参数前面补一个 del 让它走同一条删除分支 ——
+			// 两套实现迟早会在批量、分隔符、回执文案上分叉，主人会看到两种说法。
+			// /wl …del（动作词放末尾）同样认，两种写法都通向这里。
+			case 'del': await handleAdUserWhitelistCommand(env, chatId, ownerId, ('del ' + (arg || '')).trim()); break;
 			case 'rescreen': await handleAdRescreenCommand(env, chatId, arg); break;
 			case 'warmup': await handleAdWarmupCommand(env, chatId); break;
 			case 'learnlast': await handleAdLearnLastCommand(env, chatId, ownerId, arg); break;
@@ -22916,22 +22924,34 @@ async function handleAdStatsCommand(env, chatId) {
 // 用法：/wl 列出 ｜ /wl add 123456 ｜ /wl del 123456
 async function handleAdUserWhitelistCommand(env, chatId, ownerId, arg) {
 	const trimmed = String(arg || '').trim();
-	const actionMatch = trimmed.match(/^(\S+)/);
-	const action = (actionMatch?.[1] || 'list').toLowerCase();
-	// 批量：action 之后的部分按【任意非数字】切分 —— 空格、中英文逗号、分号、制表符、
-	// 换行都能当分隔符。主人的口径是「不限大小写」：对纯数字 TGID 而言大小写本来
-	// 就不存在，真正要兼容的是分隔符五花八门；指令本身 /WL 也认得（AD_COMMAND_RE 带 i）。
-	// 用 \d+ 抓而不是按分隔符 split —— 这样「123,, 456；789」这种多余分隔符不会凭空造出空项。
-	const rest = trimmed.slice(actionMatch?.[1]?.length || 0);
-	const targets = rest.match(/\d+/g) || [];
+	// 动作词跟在 TGID 后面（主人定的格式）：
+	//   /wl                   列出
+	//   /wl 123,321 123 321    添加（三种写法都认：逗号连写 / 空格 / 逗号+空格）
+	//   /wl 123,321 123 del    删除
+	// add 不再写、也不出现在任何文案里 —— 主人的口径是「把 add 去除就行了」。
+	// 前置 del（/wl del 123）仍一并认：上一版已推过这个写法，别让人敲熟的突然失效。
+	let action = trimmed ? 'add' : 'list';
+	let payload = trimmed;
+	const tail = trimmed.match(/\s+(del|remove|rm)$/i);
+	const head = tail ? null : trimmed.match(/^(del|remove|rm)\s+/i);
+	if (tail) {
+		action = 'del';
+		payload = trimmed.slice(0, trimmed.length - tail[0].length).trim();
+	} else if (head) {
+		action = 'del';
+		payload = trimmed.slice(head[0].length).trim();
+	}
+	// 目标按【任意非数字】切分：空格、中英文逗号是主人点名要的，分号/制表符/换行也一并认。
+	// 用 \d+ 抓而不是按分隔符 split —— 这样「123,, 321，123」这种多余分隔符不会凭空造出空项。
+	const targets = payload.match(/\d+/g) || [];
 
 	if (action === 'add' || action === 'del') {
 		if (!targets.length) {
 			// 抓不到数字却带了内容 = 分隔符或格式写错了，把原样报回去，别静默当成 list 让人一脸问号
 			await sendTelegramMessage(chatId,
-				'用法：<code>/wl ' + action + ' 123456</code>　批量：<code>/wl ' + action + ' 123 456, 789</code>'
-				+ '\n多个 TGID 用空格、逗号、分号隔开都行。'
-				+ (rest.trim() ? '\n⚠️ 没从「' + escapeHtml(rest.trim().slice(0, 40)) + '」里识别出任何纯数字' : ''));
+				'用法：<code>/wl 123,321 123 321</code>　删除：<code>/wl 123,321 123 del</code>'
+				+ '\n多个 TGID 用空格或中英文逗号隔开都行。'
+				+ (payload.trim() ? '\n⚠️ 没从「' + escapeHtml(payload.trim().slice(0, 40)) + '」里识别出任何纯数字' : ''));
 			return;
 		}
 		const done = [];
@@ -22970,12 +22990,14 @@ async function handleAdUserWhitelistCommand(env, chatId, ownerId, arg) {
 		return;
 	}
 
-	if (action !== 'list') {
-		await sendTelegramMessage(chatId,
-			'用法：<code>/wl</code> 列出　<code>/wl add 123456</code>　<code>/wl del 123456</code>'
-			+ '\n批量：空格、逗号、分号都行 —— <code>/wl add 123 456, 789;101</code>');
-		return;
-	}
+	// 用法说明统一挂在 list 输出末尾，而不是单独留一支「未知动作」分支 ——
+	// 现在 action 只可能是 add / del / list（add 是默认动作，没有第四种），
+	// 再留一支 action !== 'list' 就是永远走不到的死代码。
+	const usageLines = [
+		'',
+		'用法：<code>/wl</code> 列出　<code>/wl 123,321 123 321</code> 添加　<code>/del 123,321 123</code> 删除',
+		'多个 TGID 用空格或中英文逗号隔开；<code>/wl …del</code> 结尾写 del 也算删除。'
+	];
 
 	const listed = await listAdUserWhitelist(env);
 	if (!listed.ok) {
@@ -22984,7 +23006,8 @@ async function handleAdUserWhitelistCommand(env, chatId, ownerId, arg) {
 	}
 	const rows = listed.rows || [];
 	if (!rows.length) {
-		await sendTelegramMessage(chatId, '📋 用户白名单为空。\n\n加白名单的人：入群不查、发消息不判、封禁一律拒绝。');
+		await sendTelegramMessage(chatId, '📋 用户白名单为空。\n\n加进名单的人：入群不查、发消息不判、封禁一律拒绝。'
+			+ usageLines.join('\n'));
 		return;
 	}
 	const lines = ['📋 用户白名单（' + rows.length + ' 人）', ''];
@@ -22992,7 +23015,8 @@ async function handleAdUserWhitelistCommand(env, chatId, ownerId, arg) {
 		lines.push('• <code>' + escapeHtml(row.userId) + '</code>　' + escapeHtml(row.at.slice(0, 10))
 			+ (row.note ? '　' + escapeHtml(row.note) : ''));
 	}
-	lines.push('', '用 <code>/wl del TGID</code> 移除，移除后恢复检测。');
+	lines.push(...usageLines);
+	lines.push('移除后恢复检测。');
 	await sendTelegramMessage(chatId, lines.join('\n'));
 }
 

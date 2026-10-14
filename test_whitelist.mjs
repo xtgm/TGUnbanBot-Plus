@@ -259,11 +259,61 @@ section('[1b] 批量：空格 / 中英文逗号 / 分号 / 大小写');
 	await sendCommand('/WL ADD 1212', env);
 	assert('指令与动作大小写混杂也认得', ids().includes('1212'), JSON.stringify(ids()));
 
-	// 用法提示要提批量 —— 不然主人只会单个加
+	// 抓不到数字时把原样回显报错 —— 不静默当成 list 让人一脸问号
 	resetCalls();
 	await sendCommand('/wl nonsense', env);
 	t = sendTextOf('sendMessage').join('\n');
-	assert('用法提示写明批量分隔符', /空格、逗号、分号/.test(t), t.slice(0, 200));
+	assert('无法识别时回显原样', /没从「nonsense」里识别出任何纯数字/.test(t), t.slice(0, 300));
+	assert('提示写明添加与删除的写法', /123,321 123 321/.test(t) && /del/.test(t), t.slice(0, 300));
+}
+
+// ================= [1c] 不写 add、/del 独立指令 =================
+section('[1c] 主人定的格式：/wl + TGID 添加、/del + TGID 删除');
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	const ids = () => env.DB.query('SELECT user_id FROM ad_user_whitelist ORDER BY user_id').map((r) => String(r.user_id));
+
+	// 三种分隔写法，全都不写 add
+	resetCalls();
+	await sendCommand('/wl 501,502', env);
+	assert('逗号连写 123,321', ids().join(',') === '501,502', JSON.stringify(ids()));
+	resetCalls();
+	await sendCommand('/wl 503 504', env);
+	assert('空格分隔', ids().includes('503') && ids().includes('504'), JSON.stringify(ids()));
+	resetCalls();
+	await sendCommand('/wl 505, 506', env);
+	assert('逗号+空格', ids().includes('505') && ids().includes('506'), JSON.stringify(ids()));
+
+	// 主人给的示例原文「/wl 123,321 123 321」—— 重复 ID 去重后仍应完整
+	resetCalls();
+	await sendCommand('/wl 507,508 507 508', env);
+	assert('示例原文里重复的 ID 去重后都在', ids().includes('507') && ids().includes('508'), JSON.stringify(ids()));
+	assert('重复 ID 没写成多行', env.DB.query('SELECT * FROM ad_user_whitelist WHERE user_id = ?', '507').length === 1,
+		JSON.stringify(env.DB.query('SELECT * FROM ad_user_whitelist WHERE user_id = ?', '507')));
+
+	// /del 独立指令
+	resetCalls();
+	await sendCommand('/del 501,502 503', env);
+	const afterDel = ids();
+	assert('/del 一次删三个', !afterDel.some((id) => ['501', '502', '503'].includes(id)), JSON.stringify(afterDel));
+	assert('/del 不误删其他', afterDel.includes('504') && afterDel.includes('508'), JSON.stringify(afterDel));
+
+	// 末尾 del 也认（两种写法都通向同一条分支）
+	resetCalls();
+	await sendCommand('/wl 504 del', env);
+	assert('末尾写 del 也算删除', !ids().includes('504'), JSON.stringify(ids()));
+
+	// /del 不能抢走 /delword —— alternation 顺序错了的话，删词表功能当场失灵
+	resetCalls();
+	await sendCommand('/wl 999', env);
+	await sendCommand('/delword 999', env);
+	assert('/delword 不被 /del 抢走删白名单', ids().includes('999'), JSON.stringify(ids()));
+
+	// 权限
+	resetCalls();
+	await sendCommand('/del 999', env, 777000);
+	assert('非第一主人发 /del 被拒且未删任何行', ids().includes('999'), JSON.stringify(ids()));
 }
 
 // ================= [2] 三道豁免闸 =================
