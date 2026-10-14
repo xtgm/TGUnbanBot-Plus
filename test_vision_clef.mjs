@@ -94,7 +94,12 @@ vm.runInContext(stripExportDefault(src), sandbox, { filename: '_worker.js' });
 const origFetch = sandbox.fetch;
 sandbox.fetch = async (url) => {
 	const u = String(url);
-	const ok = (p) => ({ ok: true, status: 200, async json() { return p; }, async text() { return JSON.stringify(p); }, async arrayBuffer() { return new Uint8Array(64 * 1024).buffer; } });
+	// 64KB，开头写 JPEG magic bytes（FF D8 FF E0）。
+	// 2026-10-14 起头像那条会先 sniffImageMime 认字节头再拼 data URI —— 全零字节
+	// 会被当成「不是位图」直接拒掉（那正是新行为：错格式喂模型必然失败）。
+	// 线上 Telegram 下载到的本来就是真实图片，mock 就该带真实字节头。
+	const jpegBytes = () => { const u8 = new Uint8Array(64 * 1024); u8[0] = 0xFF; u8[1] = 0xD8; u8[2] = 0xFF; u8[3] = 0xE0; return u8.buffer; };
+	const ok = (p) => ({ ok: true, status: 200, async json() { return p; }, async text() { return JSON.stringify(p); }, async arrayBuffer() { return jpegBytes(); } });
 	if (u.includes('getFile')) return ok({ ok: true, result: { file_path: 'photos/x.jpg' } });
 	if (u.includes('sendMessage')) return ok({ ok: true, result: { message_id: 1 } });
 	return ok({ ok: true, result: true });

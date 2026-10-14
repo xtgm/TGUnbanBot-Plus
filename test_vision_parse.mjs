@@ -159,7 +159,13 @@ async function main() {
 		sandbox.fetch = async (url) => {
 			const u = String(url);
 			if (u.includes('getFile')) return { ok: true, status: 200, async json() { return { ok: true, result: { file_path: 'photos/x.jpg' } }; }, async text() { return '{}'; } };
-			if (u.includes('/file/')) return { ok: true, status: 200, async json() { return {}; }, async text() { return ''; }, async arrayBuffer() { return new Uint8Array(64 * 1024).buffer; } };
+			// JPEG magic bytes —— 见 test_vision_clef.mjs 同处说明（sniffImageMime 要真实字节头，
+			// 全零字节会被当成「不是位图」拒掉，测试就走不到推理那一步）。
+			if (u.includes('/file/')) {
+				const u8 = new Uint8Array(64 * 1024);
+				u8[0] = 0xFF; u8[1] = 0xD8; u8[2] = 0xFF; u8[3] = 0xE0;
+				return { ok: true, status: 200, async json() { return {}; }, async text() { return ''; }, async arrayBuffer() { return u8.buffer; } };
+			}
 			return { ok: true, status: 200, async json() { return { ok: true, result: true }; }, async text() { return '{}'; }, async arrayBuffer() { return new ArrayBuffer(0); } };
 		};
 

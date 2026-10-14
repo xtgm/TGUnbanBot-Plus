@@ -102,7 +102,10 @@ function makeFetch(refreshWorks) {
 	return async (url, init) => {
 		const u = String(url);
 		apiCalls.push(u.includes('getUserProfilePhotos') ? 'getUserProfilePhotos' : (u.includes('getFile') ? 'getFile' : 'other'));
-		const ok = (payload) => ({ ok: true, status: 200, async json() { return payload; }, async text() { return JSON.stringify(payload); }, async arrayBuffer() { return new Uint8Array(64 * 1024).buffer; } });
+		// JPEG magic bytes —— 2026-10-14 起头像先 sniffImageMime 认字节头，
+		// 全零字节会被当成「不是位图」拒掉（见 test_vision_clef.mjs 同处说明）。
+		const jpegBytes = () => { const u8 = new Uint8Array(64 * 1024); u8[0] = 0xFF; u8[1] = 0xD8; u8[2] = 0xFF; u8[3] = 0xE0; return u8.buffer; };
+		const ok = (payload) => ({ ok: true, status: 200, async json() { return payload; }, async text() { return JSON.stringify(payload); }, async arrayBuffer() { return jpegBytes(); } });
 		// 顺序要紧：getUserProfilePhotos 必须在 getFile 之前判，
 		// 而 getFile 要按 file_id 分流 —— 旧的「一律返回 wrong file_id」分支
 		// 曾经排在最前面直接 return，把下面的 FRESH_1 分支整段变成死代码（首跑就栽这儿）。

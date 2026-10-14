@@ -12694,6 +12694,13 @@ async function ensureAdDetectionTables(env) {
 			// 名字容易看混，故不复用。主人的口径是「加入白名单的人就不会触发任何封禁」。
 			await runD1SchemaStatement(env, 'ad_user_whitelist', 'CREATE TABLE IF NOT EXISTS ad_user_whitelist (user_id TEXT PRIMARY KEY, by_user TEXT, at TEXT NOT NULL, note TEXT)');
 
+			// 视觉识别失败台账。【2026-10-14 新增】此前失败只写 console.error，
+			// Cloudflare 日志只留 7 天，过期彻底无从追溯 —— 线上 94 张图永久卡死，
+			// 排查时连「是 MIME 错、文件过期、还是模型挂了」都定不了，只能靠推测。
+			// 按 target_id 主键去重 + 累加 fail_count：同一张图反复失败不该撑爆表，
+			// 而 fail_count 本身就是要看的信号（一次是偶发，几十次是系统性）。
+			await runD1SchemaStatement(env, 'ad_vision_failures', 'CREATE TABLE IF NOT EXISTS ad_vision_failures (target_id TEXT PRIMARY KEY, kind TEXT NOT NULL, stage TEXT NOT NULL, error_name TEXT NOT NULL DEFAULT \'\', error_message TEXT NOT NULL DEFAULT \'\', fail_count INTEGER NOT NULL DEFAULT 1, first_at INTEGER NOT NULL, last_at INTEGER NOT NULL)');
+
 			await runD1SchemaStatement(env, 'ad_pending_snapshots', 'CREATE TABLE IF NOT EXISTS ad_pending_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT NOT NULL, chat_id TEXT, score INTEGER NOT NULL DEFAULT 0, reasons TEXT, snapshot TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_pending_owner_seq', 'CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_pending_owner_seq ON ad_pending_snapshots (owner_id, seq)', { optional: true });
 			await runD1SchemaStatement(env, 'idx_ad_pending_expires', 'CREATE INDEX IF NOT EXISTS idx_ad_pending_expires ON ad_pending_snapshots (expires_at)', { optional: true });
@@ -18354,6 +18361,13 @@ const AD_VISION_FAIL_BREAK = 10;
 // 每图封顶 1024 tokens（≈1024×1024），单图上限 4 MiB / 16 MP、请求体 13 MiB ——
 // 「不限尺寸自适应识别」是模型自己做的，这里只留一道兜底防止下载超大文件白跑一趟。
 const AD_VISION_MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+// 视觉识别失败后的冷却时长。【2026-10-14 新增】配合「失败不推进 vision_checked_at」
+// 一起生效 —— 单独只做前者的话，一张注定失败的图（格式不支持 / 模型挂了）会被每一轮
+// cron 都取出来重试一次，白烧额度，还可能连带触发熔断把正常图一起停掉。
+// 口径：成功判定过的图 verdict 已变成 ad/clean，被队列第一个条件挡掉，永远不会重试；
+// 只有「判过但失败」（verdict 仍是 pending）的图才会等到冷却期满再试一次。
+// 24 小时对应每天 cron 两次只重试一次：88 张失败图约 352 Neurons，占日预算 10000 的 3.5%。
+const AD_VISION_RETRY_COOLDOWN_SEC = 24 * 60 * 60;
 // 单轮 cron 最多推理多少张。取「日预算 ÷ 每天轮次」，正好让两轮吃完 300：
 // crons 是每天 2 次（03:17 / 15:17），设 100 的话日预算永远用不完，
 // 配置上限与实际消耗对不上，看板上「当日 x/300」会一直停在 200 以下。
@@ -18707,13 +18721,38 @@ async function refreshAvatarFileId(env, userId) {
 	}
 }
 
-function logAdVisionFailure(kind, stage, id, error) {
+// 记录一次视觉识别失败：console 一行 + D1 台账一条。
+// 【为什么落库】console.error 只在 Cloudflare 日志里留 7 天，还得手动展开 update 才看得到；
+// 而这类失败是【静默卡死】型 —— 不报错、不重试，只是那张图永远没有结论。
+// 2026-10-14 排查 94 张卡死时就吃了这个亏：没有台账，只能拿线上数据倒推根因，
+// 最后才定位到头像 MIME 硬编码 jpeg。失败原因落了库，下次一眼就能看出是哪一类。
+// await 不可省：Worker 请求结束即弃，不 await 的写入大概率丢失。
+// 【为什么按 target_id 去重累加】同一张图反复失败不该撑爆表，而 fail_count 本身
+// 就是信号 —— 1 次是偶发，几十次是系统性（模型挂了 / 格式不支持）。
+async function logAdVisionFailure(env, kind, stage, id, error) {
+	const name = String(error?.name || '(无)');
+	const message = String(error?.message || '(空)');
 	console.error('[广告检测·' + kind + '] 识别失败 stage=' + stage
 		+ ' id=' + String(id || '')
-		+ ' errorName=' + String(error?.name || '(无)')
-		+ ' errorMessage=' + String(error?.message || '(空)')
+		+ ' errorName=' + name
+		+ ' errorMessage=' + message
 		+ ' errorString=' + String(error).slice(0, 200)
 		+ ' stack=' + String(error?.stack || '').replace(/\s+/g, ' ').slice(0, 300));
+	const key = String(id || '').trim();
+	if (!env?.DB || !key) return;
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		await env.DB.prepare(
+			'INSERT INTO ad_vision_failures (target_id, kind, stage, error_name, error_message, fail_count, first_at, last_at) '
+			+ 'VALUES (?, ?, ?, ?, ?, 1, ?, ?) '
+			+ 'ON CONFLICT(target_id) DO UPDATE SET kind = excluded.kind, stage = excluded.stage, '
+			+ 'error_name = excluded.error_name, error_message = excluded.error_message, '
+			+ 'fail_count = ad_vision_failures.fail_count + 1, last_at = excluded.last_at'
+		).bind(key, String(kind || ''), String(stage || ''), name, message.slice(0, 300), now, now).run();
+	} catch (writeError) {
+		// 台账写失败绝不能反过来把识别主链路带崩 —— 它是可观测性，不是主流程。
+		console.error('[广告检测·视觉] 失败台账写入失败:', writeError);
+	}
 }
 
 // 视觉识别熔断状态（头像与正文图【共用一套】—— 同一个模型、同一根因，分两套只会让排查翻倍）。
@@ -18794,11 +18833,16 @@ async function runAdAvatarVision(env, options = {}) {
 
 	let rows = [];
 	try {
+		// 冷却 24 小时（AD_VISION_RETRY_COOLDOWN_SEC）：vision_checked_at = 0 是
+		// 「从没判过」，非 0 且超过冷却期的是「判过但失败」—— 后者隔天再试一次。
+		// 成功判定过的图 verdict 已变成 ad/clean，被第一个条件挡掉，永远不会重试。
+		// ORDER BY 也跟着改：0（没判过的）天然排最前，失败过的按最早失败先试。
 		rows = await env.DB.prepare(
 			'SELECT file_unique_id, file_id, last_user_id FROM ad_avatars '
-			+ 'WHERE verdict = \'pending\' AND vision_checked_at = 0 AND file_id != \'\' '
-			+ 'ORDER BY updated_at ASC LIMIT ?'
-		).bind(Math.min(remaining, Number(options.batchSize) > 0 ? Number(options.batchSize) : dailyLimit)).all();
+			+ 'WHERE verdict = \'pending\' AND (vision_checked_at = 0 OR vision_checked_at < ?) AND file_id != \'\' '
+			+ 'ORDER BY vision_checked_at ASC, updated_at ASC LIMIT ?'
+		).bind(nowSeconds - AD_VISION_RETRY_COOLDOWN_SEC,
+			Math.min(remaining, Number(options.batchSize) > 0 ? Number(options.batchSize) : dailyLimit)).all();
 		rows = (rows && rows.results) || rows || [];
 	} catch (error) {
 		console.error('[广告检测·头像] 取队列失败:', error);
@@ -18877,8 +18921,17 @@ async function runAdAvatarVision(env, options = {}) {
 				console.log('[视觉识别] 图片超过尺寸上限，跳过推理', JSON.stringify({ 字节: buffer.byteLength, 上限: AD_VISION_MAX_IMAGE_BYTES }));
 				continue;
 			}
+			// 按字节头认格式，与正文图那条同一套 sniffImageMime。
+			// 【2026-10-14 修】这里原本写死 data:image/jpeg，而 Telegram 头像大量是 WebP，
+			// 标错 MIME 必然解码失败 → clef 未返回判定 → vision_checked_at 已推进 → 永久卡死。
+			// 线上证据：头像卡死 88 条、正文图只 6 条，差别正是「硬编码 vs sniff」——
+			// 正文图那条早在 .tgs 事故（17504 注释）时就修过，这条漏了。
+			// 同理不能用「下载到什么就算什么」：kind 只说明载体，说明不了里面是什么字节。
+			stage = 'sniff';
+			const mime = sniffImageMime(new Uint8Array(buffer));
+			if (!mime) throw new Error('头像不是位图（可能是 .tgs / .webm 容器），跳过推理');
 			stage = 'encode';
-			const image = 'data:image/jpeg;base64,' + bytesToBase64(new Uint8Array(buffer));
+			const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
 			stage = 'ai.run';
 			const judge = await runVisionJudge(env, image, CLEF_AVATAR_STATE);
 			if (!judge) throw new Error('clef 未返回判定');
@@ -18898,10 +18951,10 @@ async function runAdAvatarVision(env, options = {}) {
 			if (isVisionFileMissing(error)) {
 				stats.skippedMissing += 1;
 				skipBump = true;
-				logAdVisionFailure('头像', stage, row.file_unique_id, error);
+				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error);
 			} else {
 				stats.failed += 1;
-				logAdVisionFailure('头像', stage, row.file_unique_id, error);
+				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error);
 			}
 		}
 		try {
@@ -18975,12 +19028,14 @@ async function runAdImageVision(env, options = {}) {
 	let rows = [];
 	try {
 		const kinds = AD_IMAGE_VISION_KINDS.map((k) => '\'' + k + '\'').join(', ');
+		// 冷却 24 小时，口径与头像那条一致（详见 runAdAvatarVision 同段注释）。
 		rows = await env.DB.prepare(
 			'SELECT file_unique_id, file_id, kind, last_user_id FROM ad_images '
-			+ 'WHERE verdict = \'pending\' AND vision_checked_at = 0 AND file_id != \'\' '
+			+ 'WHERE verdict = \'pending\' AND (vision_checked_at = 0 OR vision_checked_at < ?) AND file_id != \'\' '
 			+ 'AND kind IN (' + kinds + ') '
-			+ 'ORDER BY updated_at ASC LIMIT ?'
-		).bind(Math.min(remaining, Number(options.batchSize) > 0 ? Number(options.batchSize) : dailyLimit)).all();
+			+ 'ORDER BY vision_checked_at ASC, updated_at ASC LIMIT ?'
+		).bind(nowSeconds - AD_VISION_RETRY_COOLDOWN_SEC,
+			Math.min(remaining, Number(options.batchSize) > 0 ? Number(options.batchSize) : dailyLimit)).all();
 		rows = (rows && rows.results) || rows || [];
 	} catch (error) {
 		console.error('[广告检测·图片] 取队列失败:', error);
@@ -19067,10 +19122,10 @@ async function runAdImageVision(env, options = {}) {
 			if (isVisionFileMissing(error)) {
 				stats.skippedMissing += 1;
 				skipBump = true;
-				logAdVisionFailure('图片', stage, row.file_unique_id, error);
+				await logAdVisionFailure(env, '图片', stage, row.file_unique_id, error);
 			} else {
 				stats.failed += 1;
-				logAdVisionFailure('图片', stage, row.file_unique_id, error);
+				await logAdVisionFailure(env, '图片', stage, row.file_unique_id, error);
 			}
 		}
 		try {
@@ -19191,7 +19246,7 @@ async function judgeAdMediaRealtime(env, media, userId) {
 		// 429 是临时状态不是链路故障：不推熔断、不落库（理由见 runAdImageVision 同名分支）。
 		if (isVisionRateLimited(error)) return null;
 		if (isVisionFileMissing(error)) skipBump = true;
-		logAdVisionFailure('图片·实时', 'ai.run', key, error);
+		await logAdVisionFailure(env, '图片·实时', 'ai.run', key, error);
 	}
 	try {
 		await upsertAdImage(env, key, {
@@ -19314,7 +19369,7 @@ async function judgeAdAvatarRealtime(env, avatarId, profile) {
 	} catch (error) {
 		if (isVisionRateLimited(error)) return row || null;
 		if (isVisionFileMissing(error)) skipBump = true;
-		logAdVisionFailure('头像·实时', 'ai.run', key, error);
+		await logAdVisionFailure(env, '头像·实时', 'ai.run', key, error);
 	}
 	try {
 		await upsertAdAvatar(env, key, {
@@ -22606,6 +22661,8 @@ async function handleAdStatsCommand(env, chatId) {
 	let avatarRows = [];
 	let imageRows = [];
 	let badgeRows = [];
+	let visionFailRow = null;
+	let visionFailTop = [];
 	try {
 		const rows = await env.DB.batch([
 			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints'),
@@ -22621,7 +22678,11 @@ async function handleAdStatsCommand(env, chatId) {
 			// 会员标指纹库同口径分档。它没有「待识别」这一档（不做视觉识别），
 			// pending 恒为 0，但列结构与另两张对齐，所以照同一条 SQL 查，展示时
 			// 照样给出三档，主人看到 pending=0 不会以为卡住了 —— 说明行里写清原因。
-			env.DB.prepare('SELECT verdict, COUNT(*) AS c FROM ad_badges GROUP BY verdict')
+			env.DB.prepare('SELECT verdict, COUNT(*) AS c FROM ad_badges GROUP BY verdict'),
+			// 视觉识别失败台账。【只能放 batch 末尾】下标是硬编码的，插进 rows[6] 之前
+			// 会让后面全部错位 —— 这类错位不报错，只会静默显示成别人的数据。
+			env.DB.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures'),
+			env.DB.prepare('SELECT kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures ORDER BY last_at DESC LIMIT 3')
 		]);
 		fpTotal = Number(rows[0]?.results?.[0]?.c) || 0;
 		fpByType = rows[1]?.results || [];
@@ -22632,6 +22693,8 @@ async function handleAdStatsCommand(env, chatId) {
 		avatarRows = rows[6]?.results || [];
 		imageRows = rows[7]?.results || [];
 		badgeRows = rows[8]?.results || [];
+		visionFailRow = rows[9]?.results?.[0] || null;
+		visionFailTop = rows[10]?.results || [];
 	} catch (error) {
 		console.error('[广告检测] 统计查询失败:', error);
 	}
@@ -22757,6 +22820,24 @@ async function handleAdStatsCommand(env, chatId) {
 	lines.push('<b>自定义 emoji 指纹</b>　广告素材 <b>' + badgeAd + '</b>　待识别 <b>' + badgePending + '</b>　已排除 <b>' + badgeClean + '</b>');
 	lines.push('　↳ 含昵称旁会员标与正文贴纸 emoji 两类来源，共用一张表');
 	lines.push('　↳ 同款定罪 <b>' + AD_BADGE_BAN_HITS + '</b> 次起、且本次有其他佐证才参与定罪（单证永不单独定罪，防常见标连坐）');
+	// 视觉识别失败台账。这是「静默卡死」的报警器 —— 这类失败不报错、不重试，
+	// 只是那张图永远没有结论，2026-10-14 就这样积了 94 张才发现。
+	// 只报总数不够：主人要看的是【哪一类失败】，反复失败同一个 stage 才是系统性问题
+	// （格式不支持 / 模型挂了），单次失败是偶发（文件过期），两者处置完全不同。
+	if (visionFailRow && Number(visionFailRow.c) > 0) {
+		const failKinds = [...new Set((visionFailTop || []).map((r) => String(r.kind || '')).filter(Boolean))];
+		lines.push('<b>视觉识别失败台账</b>　条目 <b>' + Number(visionFailRow.c) + '</b>　累计失败 <b>'
+			+ Number(visionFailRow.total || 0) + '</b> 次');
+		for (const row of (visionFailTop || [])) {
+			lines.push('　↳ ' + escapeHtml(String(row.kind || '')) + ' @ ' + escapeHtml(String(row.stage || ''))
+				+ '　失败 ' + Number(row.fail_count || 0) + ' 次　'
+				+ escapeHtml(String(row.error_message || row.error_name || '').slice(0, 60)));
+		}
+		if (failKinds.length) {
+			lines.push('　↳ 失败集中在 ' + escapeHtml(failKinds.join('、'))
+				+ ' —— 同一类反复失败通常是系统性问题（格式 / 模型），不是偶发');
+		}
+	}
 	lines.push('<b>域名白名单</b>　生效 <b>' + whitelist.size + '</b> 条（D1 自定义 ' + whitelistRows + ' 条，内置种子 ' + AD_DOMAIN_WHITELIST_SEED.length + ' 条）');
 	// 入群检查流水。只记命中的话这一屏对绝大多数新成员是一片空白，
 	// 主人分不清「检查过、这个人正常」和「压根没看过他」—— 后者正是漏放的形态。
