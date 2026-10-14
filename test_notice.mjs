@@ -172,12 +172,36 @@ reset();
 await clickBtn(OWNER, 'notice:confirm');
 check('超 10 分钟 → 失效、不群发', answered.some((a) => a.text.includes('失效')) && copied.length === 0);
 
-console.log('\n=== 10. /notice 显示在命令菜单（无说明占位）===');
+console.log('\n=== 10. /notice 显示在命令菜单 + 主菜单补齐第一主人命令 ===');
 reset();
 await W.__h.fetch(new Request('https://x/T'), env, { waitUntil() {} });
-const noticeCmd = (callsOf('setMyCommands')[0]?.body?.commands || []).find((c) => c.command === 'notice');
+const allCmds = callsOf('setMyCommands')[0]?.body?.commands || [];
+const noticeCmd = allCmds.find((c) => c.command === 'notice');
 check('setMyCommands 注册了 /notice（在菜单明面上）', !!noticeCmd);
-check('/notice 菜单项无实质说明（占位符）', !!noticeCmd && noticeCmd.description === '·');
+// 【2026-10-14 改】主人原话：/notice「补充一下说明并写上仅第一主人使用」——
+// 占位符「·」那条旧断言跟着改成新预期，改之前它必红。
+check('★ /notice 有实质说明（不再是占位符「·」）',
+	!!noticeCmd && noticeCmd.description !== '·' && noticeCmd.description.length > 1,
+	noticeCmd?.description);
+check('★ /notice 说明写明仅第一主人',
+	!!noticeCmd && noticeCmd.description.includes('仅第一主人'), noticeCmd?.description);
+
+// 主菜单（输入 / 弹出的那排）必须把这五个第一主人命令列在明面上，
+// 每条都要注明是什么、并标明仅第一主人使用。
+const OWNER_MENU_CMDS = ['start', 'menu', 'user', 'adstats', 'dryrun'];
+for (const c of OWNER_MENU_CMDS) {
+	const hit = allCmds.find((x) => x.command === c);
+	check('★ 主菜单注册了 /' + c, !!hit, JSON.stringify(allCmds.map((x) => x.command)));
+	check('★ /' + c + ' 注明了是什么', !!hit && hit.description.length > 1 && hit.description !== '·',
+		hit?.description);
+	check('★ /' + c + ' 写明仅第一主人',
+		!!hit && hit.description.includes('仅第一主人'), hit?.description);
+}
+// 既有 11 条一条都不能被挤掉（补菜单不是重写菜单）
+for (const c of ['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist']) {
+	check('原有 /' + c + ' 仍在菜单里', allCmds.some((x) => x.command === c),
+		JSON.stringify(allCmds.map((x) => x.command)));
+}
 
 console.log('\n全体通知验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 if (fail > 0) process.exitCode = 1;

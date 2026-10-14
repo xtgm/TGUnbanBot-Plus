@@ -691,10 +691,19 @@ async function handleInitialization(request) {
 				{ command: "profile", description: "查看账号资料卡与时间线 (仅第一主人)" },
 				{ command: "stats", description: "本群发言/进退群统计 (群管理员)" },
 				{ command: "blacklist", description: "查看当前黑名单 (高级管理员)" },
-				// /notice：主人要求「只在菜单显示指令、不写说明」。Telegram 的 setMyCommands
-				// 要求 description 至少 1 个非空字符（空串会导致整批命令更新失败），
-				// 故用一个占位符「·」当作「无说明」，命令照常出现在菜单明面上。
-				{ command: "notice", description: "·" }
+				// /notice：早先主人要求「只显示指令、不写说明」，故 description 用占位符「·」
+				//（setMyCommands 要求至少 1 个非空字符，空串会让整批命令更新失败）。
+				// 【2026-10-14 改】主人改口要「补充说明并写上仅第一主人使用」，故补回真说明。
+				{ command: "notice", description: "发起全体通知，群发到所有配置群 (仅第一主人)" },
+				// ↓【2026-10-14 补】主人要求把这五条「写在菜单明面上并注明是什么、仅第一主人使用」。
+				// 它们此前只在 /help 长清单里（/start 连那里面都没有），输入 / 弹不出来。
+				// 权限闸门本就全是第一主人（/dryrun 24512、/user·/adstats 21434、/menu 24004、
+				// /start 非第一主人走原介绍语），这里只是把入口摆到明面，没有放宽任何一道门。
+				{ command: "start", description: "统计面板首页，常用指令都在这一页 (仅第一主人)" },
+				{ command: "menu", description: "群设置菜单：群统计/资料卡/运行检查 (仅第一主人)" },
+				{ command: "user", description: "按 TGID 查这个人的全部案底 (仅第一主人)" },
+				{ command: "adstats", description: "广告检测状态总览 (仅第一主人)" },
+				{ command: "dryrun", description: "本群演练开关：只判定不处置不封 (仅第一主人)" }
 			]
 		};
 

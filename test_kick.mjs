@@ -4495,15 +4495,18 @@ console.log('\n[23] 一键代发链路已移除');
 	assert('Webhook 初始化 → 订阅的都是官方合法 update 类型（无 bot_chat_join_request）',
 		!webhookCall?.body?.allowed_updates?.includes('bot_chat_join_request'));
 	assert('Webhook 初始化 → /ad 投票按钮回调已启用', webhookCall?.body?.allowed_updates?.includes('callback_query'));
-	assert('BotFather 菜单统一注册（含 /rm /profile）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice']));
-	// rm / profile 允许写说明，且必须标注权限「仅第一主人」；notice 只有占位符「·」（Telegram 不允许空说明）
+	// 【2026-10-14 补】主菜单补进 start/menu/user/adstats/dryrun 五条第一主人命令（各注明确是什么）。
+	assert('BotFather 菜单统一注册（含 /rm /profile + 新补五条）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice', 'start', 'menu', 'user', 'adstats', 'dryrun']));
+	// rm / profile 允许写说明，且必须标注权限「仅第一主人」
 	assert('rm / profile 菜单说明标注「仅第一主人」', ['rm', 'profile'].every((c) => {
 		const entry = (commandCall?.body?.commands || []).find((x) => x.command === c);
 		return Boolean(entry) && String(entry.description || '').includes('仅第一主人');
 	}));
-	// /notice 只在菜单显示指令、不带说明（Telegram 不允许空说明，用占位符「·」）
+	// 【2026-10-14 改】/notice 从占位符「·」改为真说明 + 标「仅第一主人」（主人改口要求补充）
 	const noticeMenu = (commandCall?.body?.commands || []).find((c) => c.command === 'notice');
-	assert('/notice 菜单项无实质说明（占位符 ·）', !!noticeMenu && noticeMenu.description === '·');
+	assert('/notice 菜单项有实质说明且标「仅第一主人」',
+		!!noticeMenu && noticeMenu.description !== '·'
+			&& String(noticeMenu.description || '').includes('仅第一主人'), noticeMenu?.description);
 }
 
 // ---------- [24] chat_member 手动 ban → 主人收审计 ----------
