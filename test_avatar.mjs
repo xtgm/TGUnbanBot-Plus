@@ -205,8 +205,23 @@ section('[2] applyAvatarVerdict 分档');
 		W.applyAvatarVerdict(base, adRow(1)).verdict === 'ban');
 	assert('头像 ad + 分数达 2 也算有佐证 → 封禁',
 		W.applyAvatarVerdict({ verdict: 'observe', score: 2, reasons: [] }, adRow(1)).verdict === 'ban');
-	assert('头像 ad + 复用定罪 2 次 → 单独即可封',
-		W.applyAvatarVerdict({ ...cleanBase }, adRow(2)).verdict === 'ban');
+	// 【2026-10-14 修】这条此前是【hits>=2 无条件单独封】，与「单独特征不允许封禁」的口径
+	// 矛盾 —— 上一轮修「佐证只认正分」时只改了 hasCorroboration 那条分支，漏了这里。
+	// 后果：一个广告号跨群被封几次就能把同款头像的 hits 顶到 2，之后别人盗用该头像
+	//（或撞车）一进来就被封，正文多干净都救不回来。线上 130 个头像正处在这一档。
+	// 现在 hits 只算【一份佐证】，且要达 AD_AVATAR_HITS_CORROBORATION 才算数 ——
+	// 复用次数高确实是批量马甲的强信号，但不能单独定罪。
+	assert('头像 ad + 复用 2 次 + 零判据 → 只进观察（不再单独定罪）',
+		W.applyAvatarVerdict({ ...cleanBase }, adRow(2)).verdict === 'observe',
+		JSON.stringify(W.applyAvatarVerdict({ ...cleanBase }, adRow(2))));
+	assert('头像 ad + 复用 2 次 + 有其它判据 → 封禁',
+		W.applyAvatarVerdict(base, adRow(2)).verdict === 'ban');
+	assert('头像 ad + 复用达佐证档（3 次）+ 零判据 → 封禁',
+		W.applyAvatarVerdict({ ...cleanBase }, adRow(3)).verdict === 'ban',
+		JSON.stringify(W.applyAvatarVerdict({ ...cleanBase }, adRow(3))));
+	// 佐证档常量钉住：改数字会让上面那条断言变红，逼人重新想清楚
+	assert('佐证档常量为 3', /const AD_AVATAR_HITS_CORROBORATION = 3;/.test(src),
+		(src.match(/const AD_AVATAR_HITS_CORROBORATION[^;]*/) || ['未找到'])[0]);
 	assert('封禁结果原样保留（不会被降级）',
 		W.applyAvatarVerdict({ ...base, verdict: 'ban' }, adRow(1)).verdict === 'ban');
 	assert('头像 clean → 原样返回不动判定',
@@ -242,12 +257,28 @@ section('[3] 端到端 · 干净消息 + 广告头像');
 	assert('正文干净 + 头像 ad(复用1次) → 不封禁（走观察，防头像盗用误封）', banned === 0, '封禁次数 ' + banned);
 	assert('   但确实进了观察窗口（不是完全放走）', observed > 0, '观察记录 ' + observed);
 
-	// 头像复用定罪累积到 2 次 → 单独即可封
+	// 头像复用累积到 2 次：【2026-10-14 起不再单独定罪】—— hits 降为佐证之一，
+	// 要达 AD_AVATAR_HITS_CORROBORATION(3) 才算数，否则仍只进观察。
+	// 理由见 applyAvatarVerdict：同一个人跨群被封几次就能把 hits 顶到 2，
+	// 盗用头像 / 撞车的人会被连坐。线上 130 个头像正处在这一档。
 	env.DB.query('UPDATE ad_avatars SET hits = 2 WHERE file_unique_id = ?', 'AV_ADV');
 	resetCalls();
 	setApi({ getChat: chatWithAvatar('AV_ADV', 'F_ADV') });
 	await sendUpdate({ message: groupMessage({ id: 555002, first_name: '路人乙' }, '你好') }, env);
-	assert('正文干净 + 头像 ad(复用2次) → 直接封禁', countCalls('banChatMember') === 1, '封禁次数 ' + countCalls('banChatMember'));
+	assert('正文干净 + 头像 ad(复用2次) → 仍不封（hits 降为佐证，单独不定罪）',
+		countCalls('banChatMember') === 0, '封禁次数 ' + countCalls('banChatMember'));
+
+	// 累积到佐证档 3 次 → 才参与定罪（批量马甲的强信号不能丢）
+	env.DB.query('UPDATE ad_avatars SET hits = 3 WHERE file_unique_id = ?', 'AV_ADV');
+	resetCalls();
+	setApi({ getChat: chatWithAvatar('AV_ADV', 'F_ADV') });
+	await sendUpdate({ message: groupMessage({ id: 555004, first_name: '路人丁' }, '你好') }, env);
+	// 注意：这轮实际会有 2 条 banChatMember —— 另一条是上一轮那个发「你好」的人，
+	// 被同款连带（findLinkedSpamTargets 按正文 hash 在 24 小时内连人）捎上的，
+	// 不是头像判定本身多封了一个。断言只盯本人，别被连带搅混。
+	const bannedHere = calls.filter((c) => c.method === 'banChatMember').map((c) => String(c.body?.user_id || ''));
+	assert('正文干净 + 头像 ad(复用3次) → 本人被封（达佐证档）',
+		bannedHere.includes('555004'), '封禁明细 ' + JSON.stringify(bannedHere));
 
 	// clean 头像：完全不影响判定。
 	// 【换一个全新 env】—— 前两轮封禁触发了定罪即学习，把「你好」学进了指纹库，
@@ -517,8 +548,13 @@ section('[7] 头像佐证只认正分（负分不再单证封）');
 
 	assert('净分 ≥2 同样算佐证',
 		W.applyAvatarVerdict({ verdict: 'pass', score: 5, reasons: [] }, avatar).verdict === 'ban');
-	assert('hits≥2 仍单证封（既有门槛不动）',
-		W.applyAvatarVerdict({ ...negOnly }, { verdict: 'ad', hits: 2 }).verdict === 'ban');
+	// 【2026-10-14 起】hits≥2 不再单证封 —— 否则「只有负分判据 + 命中一个头像」也能封，
+	// 与上面刚立的「单独特征不允许封禁」直接矛盾。线上 130 个头像正处在这一档。
+	assert('hits≥2 但只有负分判据 → 只进观察（不再单证封）',
+		W.applyAvatarVerdict({ ...negOnly }, { verdict: 'ad', hits: 2 }).verdict === 'observe',
+		JSON.stringify(W.applyAvatarVerdict({ ...negOnly }, { verdict: 'ad', hits: 2 })));
+	assert('hits 达佐证档 3 → 仅凭复用即可封（批量马甲的强信号不丢）',
+		W.applyAvatarVerdict({ ...negOnly }, { verdict: 'ad', hits: 3 }).verdict === 'ban');
 	assert('头像 clean → 原样返回一个字节不改',
 		W.applyAvatarVerdict({ verdict: 'pass', score: 0, reasons: [] }, { verdict: 'clean', hits: 0 }).verdict === 'pass');
 }

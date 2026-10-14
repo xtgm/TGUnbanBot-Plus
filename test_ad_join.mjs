@@ -453,13 +453,16 @@ section('[10] 入群那一刻：bio 与头像检测都真的跑了');
 	env2.DB.query(
 		'INSERT INTO ad_avatars (file_unique_id, verdict, hits, file_id, source, last_user_id, vision_checked_at, created_at, updated_at)'
 		+ ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-		'AVBAD', 'ad', 2, 'fid-bad', 'test', '', 0, now, now);
+		'AVBAD', 'ad', 3, 'fid-bad', 'test', '', 0, now, now);
 
 	resetCalls();
 	const v = await joinScreen(env2, '888042', CLEAN_BIO, { big_file_unique_id: 'AVBAD', big_file_id: 'fid-bad' });
 	// 干净 bio = 0 分（< 消息线 6）、AD_CARD_KILL=off（结构不封）、入群线=消息线 ——
-	// verdict 只可能来自头像分档（hits>=2 → ban）。
-	assert('已定罪头像（复用 2 次）入群即封，不等他发言', v === 'banned', String(v));
+	// verdict 只可能来自头像分档（hits >= AD_AVATAR_HITS_CORROBORATION(3) → ban）。
+	// 【2026-10-14 起】hits 达 2 不再单独定罪，要到 3 才算一份佐证 ——
+	// 理由见 applyAvatarVerdict：同一个人跨群被封几次就能把 hits 顶到 2，
+	// 盗用头像 / 撞车的人会被连坐。
+	assert('已定罪头像（复用 3 次）入群即封，不等他发言', v === 'banned', String(v));
 	assert('确实执行了封禁', callsOf('banChatMember').length >= 1, JSON.stringify(callsOf('banChatMember')));
 	const row2 = (await W.readAdJoinChecks(env2, { chatId: GROUP_ID, limit: 1 }))[0];
 	assert('流水判据里写明是头像命中的',
@@ -480,6 +483,22 @@ section('[10] 入群那一刻：bio 与头像检测都真的跑了');
 	const v3 = await joinScreen(env3, '888043', CLEAN_BIO, { big_file_unique_id: 'AVONCE', big_file_id: 'fid-once' });
 	assert('单证头像（复用 1 次、bio 干净）只进观察不封', v3 !== 'banned', String(v3));
 	assert('单证这次没封', callsOf('banChatMember').length === 0);
+
+	// —— ⑤ 复用 2 次（仍未达佐证档 3）同样只进观察 ——
+	// 【2026-10-14 新增】旧代码 hits>=2 就无条件封，与「单独特征不允许封禁」的口径矛盾，
+	// 与 ④ 的 1 次之间没有任何理由刚好在 2 这个数上分叉。线上 130 个头像正处在这一档，
+	// 入群即封、bio 写什么都救不回来 —— 同一个人跨群被封几次就能把 hits 顶到 2。
+	const env4 = makeEnv({ AD_SCORE_THRESHOLD: '6', AD_JOIN_SCORE_THRESHOLD: '0', AD_CARD_KILL: 'off' });
+	await W.adDetectionReady(env4);
+	await W.ensureAdJoinChecksTable(env4);
+	env4.DB.query(
+		'INSERT INTO ad_avatars (file_unique_id, verdict, hits, file_id, source, last_user_id, vision_checked_at, created_at, updated_at)'
+		+ ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+		'AVTWICE', 'ad', 2, 'fid-twice', 'test', '', 0, now, now);
+	resetCalls();
+	const v4 = await joinScreen(env4, '888044', CLEAN_BIO, { big_file_unique_id: 'AVTWICE', big_file_id: 'fid-twice' });
+	assert('复用 2 次（未达佐证档 3）→ 只进观察，入群不封', v4 === 'observed', String(v4));
+	assert('这一档确实没执行封禁', callsOf('banChatMember').length === 0, JSON.stringify(callsOf('banChatMember')));
 }
 
 console.log(`\n========== 入群专用门槛与流水：通过 ${pass} / 失败 ${fail} ==========`);

@@ -6293,7 +6293,7 @@ async function markAdDryRunVerdict(env, id, field) {
 // 两个用途：
 //   ① 主人点「✅ 确认封」时据此跳过重复学习 —— hits 是 +1 语义，确认封那一次
 //      再学一遍会让头像与资料形状各 +1，直接顶到封禁档（AD_PROFILE_SHAPE_MIN_HITS=2、
-//      头像 hits>=2），把安全阀提前拱开。同一个坑代码里已经踩过两次。
+//      头像达佐证档 3），把安全阀提前拱开。同一个坑代码里已经踩过两次。
 //   ② 主人关演练时给一份「这一轮学到什么」的汇总（summarizeDryRunLearning）。
 async function markAdDryRunLearned(env, id, tally) {
 	const rowId = Number(id) || 0;
@@ -16630,13 +16630,21 @@ function applyAvatarVerdict(evaluation, avatar) {
 	// 现在：有「+N」开头的正分判据、或净分 ≥2 才算佐证；否则只进观察窗口。
 	// 这也正是主人定的口径 ——「单独特征本来就不允许封禁」。
 	const hasPositiveEvidence = (evaluation.reasons || []).some((r) => /^\+\d/.test(String(r)));
-	const hasCorroboration = hasPositiveEvidence || (Number(evaluation.score) || 0) >= 2;
+	// 【2026-10-14 修：hits 不再单独定罪】原来这里是 `if (hits >= 2) verdict = 'ban'`，
+	// 无条件封、连佐证都不看 —— 与上面刚立的「单独特征不允许封禁」直接矛盾。
+	// 上一轮修「佐证只认正分」时只改了 hasCorroboration 那条分支，把这条漏了。
+	// 后果：一个广告号跨群被封几次就能把同款头像的 hits 顶到 2，之后别人盗用该头像
+	//（或撞车）一进来就被封，正文写什么都救不回来。线上 130 个头像正处在这一档。
+	// 现在 hits 只算【一份佐证】，且要达 AD_AVATAR_HITS_CORROBORATION 才算数 ——
+	// 复用次数高确实是批量马甲的强信号，但同样要过佐证这道闸，不能单独定罪。
+	const hasCorroboration = hasPositiveEvidence
+		|| (Number(evaluation.score) || 0) >= 2
+		|| hits >= AD_AVATAR_HITS_CORROBORATION;
 	const reason = '头像命中广告图库（复用定罪 ' + hits + ' 次）';
 	const reasons = (evaluation.reasons || []).concat([reason]);
-	let verdict = evaluation.verdict;
-	if (hits >= 2) verdict = 'ban';
-	else if (hasCorroboration) verdict = 'ban';
-	else verdict = evaluation.verdict === 'ban' ? 'ban' : 'observe';
+	// 定罪一律走 hasCorroboration：头像本身不再产生独立的定罪路径。
+	// 已经是 ban 的不降级（保留原样），免得前一层定了罪却被头像这一层压回去。
+	let verdict = hasCorroboration ? 'ban' : (evaluation.verdict === 'ban' ? 'ban' : 'observe');
 	// score 只作展示：头像不改评分口径，避免与历史分叠加时重复计分。
 	return Object.assign({}, evaluation, { verdict, reasons });
 }
@@ -16706,7 +16714,9 @@ async function applyAvatarToEvaluation(env, evaluation, profile) {
 // 【与头像层的三点不同，别照抄头像的分档】
 //   ① 没有 register / pending：这层不做视觉识别，没有队列可排队，
 //      查不到就是没入过库，直接原样返回（少一次写入，热路径更省）
-//   ② 分档【刻意比头像严】：头像是 `hits >= 2 单独即可封`，这里取消了那一档
+//   ② 分档：这里取消了「单独即可封」那一档（AD_BADGE_BAN_HITS=3 且要求佐证）。
+//      2026-10-14 起头像也取消了那一档（AD_AVATAR_HITS_CORROBORATION 同为 3），
+//      两层口径对齐 —— 不再有哪一层能凭复用次数单独定罪。
 //   ③ 命中时【只加 reasons 不改 score】，与头像层一致，避免历史分重复计分
 //
 // 【安全阀：会员标永不单独定罪】这是这个判据唯一需要小心的地方 ——
@@ -16721,6 +16731,13 @@ async function applyAvatarToEvaluation(env, evaluation, profile) {
 // 要越过 3 意味着已经有三个挂它的人各自因别的强证据被定罪 ——
 // 那时该封的本来也封了，badge 只是确认了他们同属一批。
 const AD_BADGE_BAN_HITS = 3;
+
+// 头像的「复用佐证档」：复用次数达这个数才算一份佐证，且【仍不能单独定罪】。
+// 【为什么与 AD_BADGE_BAN_HITS 同为 3】两者踩的是同一个坑：hits 由封禁时累加，
+// 同一个人跨群被封几次也能把它顶上去，盗用头像 / 撞车的人会被连坐。
+// 会员标那一层早就用 3 且要求 hasCorroboration，头像这边却一直写死 hits >= 2
+// 且【无条件封】—— 2026-10-14 对齐。线上 130 个头像正处在 hits>=2 这一档。
+const AD_AVATAR_HITS_CORROBORATION = 3;
 
 // 读一条会员标指纹。查不到返回 null（= 未入库，既不是 ad 也不是 clean）。
 async function readAdBadge(env, badgeId) {
@@ -20403,7 +20420,7 @@ async function handleDryRunButtonCallback(callbackQuery, env) {
 	const config = loadAdDetectionConfig(env);
 	const whitelist = await loadAdDomainWhitelist(env);
 	// 演练期已经学过的特征不再学第二次：hits 是 +1 语义，确认封那一次再学一遍会让
-	// 头像与资料形状各 +1，直接顶到封禁档（AD_PROFILE_SHAPE_MIN_HITS=2、头像 hits>=2），
+	// 头像与资料形状各 +1，直接顶到封禁档（AD_PROFILE_SHAPE_MIN_HITS=2、头像达佐证档 3），
 	// 等于主人点一次按钮就把安全阀拱开。记账见 markAdDryRunLearned。
 	const alreadyLearned = Number(row.learned) > 0 || Number(row.sample) === 1;
 	let result = null;
@@ -20805,7 +20822,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	//
 	// skipLearning：演练期已经学过、主人这时才点「✅ 确认封」。hits 是 +1 语义，
 	// 确认封那一次再学一遍会让头像与资料形状各 +1，直接顶到封禁档
-	// （AD_PROFILE_SHAPE_MIN_HITS=2、头像 hits>=2），把安全阀提前拱开。
+	// （AD_PROFILE_SHAPE_MIN_HITS=2、头像达佐证档 3），把安全阀提前拱开。
 	let learned = 0;
 	let sampleAdded = false;
 	if (options.skipLearning !== true) {
