@@ -7342,6 +7342,14 @@ function getAdQuotedText(message) {
 		ext?.text,
 		ext?.caption,
 		ext?.quote?.text,
+		// 【2026-10-14 补】被引用消息的内联按钮。线上漏放一条真广告：广告号引用别人的
+		// 消息发出来、自己正文为空，而按钮全挂在被引用那一条上（普通TG号卡网 /
+		// 自助TG会员机器人 / 联系客服）。这里此前一个字都没读 —— 于是 analyzeAdOutlets
+		// 的 linkCount=0、引流出口=0，形态 B 判据整条不成立，引用体通道直接判无罪，
+		// 最后只剩头像一条硬判据，头像那条又恰好被同日的降档拦住，整条链路全空。
+		// 按钮文本里带 URL，正好被 linkCount 的正则统计到，不必另开一路判据。
+		getInlineButtonPayloadText(ext || {}),
+		getInlineButtonPayloadText(reply || {}),
 		reply?.text,
 		reply?.caption,
 	].filter(Boolean).join('\n').trim();
@@ -16640,11 +16648,20 @@ function applyAvatarVerdict(evaluation, avatar) {
 	const hasCorroboration = hasPositiveEvidence
 		|| (Number(evaluation.score) || 0) >= 2
 		|| hits >= AD_AVATAR_HITS_CORROBORATION;
+	// 【2026-10-14 二次修正】hits>=2 恢复可单独定罪，但加一道否证 ——
+	// 【正文非空且干净】时不单独定罪：那说明这个人确实在说话、内容一个正分都没拿到，
+	// 头像撞车 / 被盗用的可能性大于「他就是广告号」（线上 130 个头像里正有这种）。
+	// 反过来【正文为空】（引用体形态、纯图片、纯按钮）时，头像是唯一判据源，
+	// 不封就等于整条链路对这类消息彻底失效 —— 19:53 那条真广告就是这样漏掉的：
+	// 广告号引用别人的消息发出来、自己正文为空，头像 hits=2 只进了观察，
+	// 最后是另一个 bot 删的。
+	const bodyText = String(evaluation?.snapshot?.text || '').trim();
+	const hitsAloneSufficient = hits >= 2 && !bodyText;
 	const reason = '头像命中广告图库（复用定罪 ' + hits + ' 次）';
 	const reasons = (evaluation.reasons || []).concat([reason]);
-	// 定罪一律走 hasCorroboration：头像本身不再产生独立的定罪路径。
 	// 已经是 ban 的不降级（保留原样），免得前一层定了罪却被头像这一层压回去。
-	let verdict = hasCorroboration ? 'ban' : (evaluation.verdict === 'ban' ? 'ban' : 'observe');
+	let verdict = (hasCorroboration || hitsAloneSufficient) ? 'ban'
+		: (evaluation.verdict === 'ban' ? 'ban' : 'observe');
 	// score 只作展示：头像不改评分口径，避免与历史分叠加时重复计分。
 	return Object.assign({}, evaluation, { verdict, reasons });
 }
@@ -16743,11 +16760,11 @@ async function applyAvatarToEvaluation(env, evaluation, profile) {
 // 那时该封的本来也封了，badge 只是确认了他们同属一批。
 const AD_BADGE_BAN_HITS = 3;
 
-// 头像的「复用佐证档」：复用次数达这个数才算一份佐证，且【仍不能单独定罪】。
+// 头像的「复用佐证档」：复用次数达这个数，【任何情况下】都算一份佐证（正文干净也封）。
 // 【为什么与 AD_BADGE_BAN_HITS 同为 3】两者踩的是同一个坑：hits 由封禁时累加，
 // 同一个人跨群被封几次也能把它顶上去，盗用头像 / 撞车的人会被连坐。
-// 会员标那一层早就用 3 且要求 hasCorroboration，头像这边却一直写死 hits >= 2
-// 且【无条件封】—— 2026-10-14 对齐。线上 130 个头像正处在 hits>=2 这一档。
+// 低于这个档的 hits=2【仍可单独定罪】，但有一道否证：正文非空且干净时不单独定罪
+// （详见 applyAvatarVerdict）—— 2026-10-14 二次修正，第一次降档漏掉过一条真广告。
 const AD_AVATAR_HITS_CORROBORATION = 3;
 
 // 读一条会员标指纹。查不到返回 null（= 未入库，既不是 ad 也不是 clean）。

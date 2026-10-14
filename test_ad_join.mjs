@@ -484,10 +484,11 @@ section('[10] 入群那一刻：bio 与头像检测都真的跑了');
 	assert('单证头像（复用 1 次、bio 干净）只进观察不封', v3 !== 'banned', String(v3));
 	assert('单证这次没封', callsOf('banChatMember').length === 0);
 
-	// —— ⑤ 复用 2 次（仍未达佐证档 3）同样只进观察 ——
-	// 【2026-10-14 新增】旧代码 hits>=2 就无条件封，与「单独特征不允许封禁」的口径矛盾，
-	// 与 ④ 的 1 次之间没有任何理由刚好在 2 这个数上分叉。线上 130 个头像正处在这一档，
-	// 入群即封、bio 写什么都救不回来 —— 同一个人跨群被封几次就能把 hits 顶到 2。
+	// —— ⑤ 复用 2 次 + 正文为空（入群时还没发言）→ 同样封 ——
+	// 【2026-10-14 二次修正】hits>=2 恢复可单独定罪，否证只在【正文非空且干净】时生效。
+	// 入群这一步拿不到正文，头像是唯一判据源 —— 不封等于入群筛查对这类号彻底失效。
+	// 19:53 漏掉的那条真广告正是这个形态：广告号引用别人的消息发出来、自己正文为空，
+	// 头像 hits=2 只进了观察，最后是另一个 bot 删的。
 	const env4 = makeEnv({ AD_SCORE_THRESHOLD: '6', AD_JOIN_SCORE_THRESHOLD: '0', AD_CARD_KILL: 'off' });
 	await W.adDetectionReady(env4);
 	await W.ensureAdJoinChecksTable(env4);
@@ -497,8 +498,8 @@ section('[10] 入群那一刻：bio 与头像检测都真的跑了');
 		'AVTWICE', 'ad', 2, 'fid-twice', 'test', '', 0, now, now);
 	resetCalls();
 	const v4 = await joinScreen(env4, '888044', CLEAN_BIO, { big_file_unique_id: 'AVTWICE', big_file_id: 'fid-twice' });
-	assert('复用 2 次（未达佐证档 3）→ 只进观察，入群不封', v4 === 'observed', String(v4));
-	assert('这一档确实没执行封禁', callsOf('banChatMember').length === 0, JSON.stringify(callsOf('banChatMember')));
+	assert('复用 2 次 + 正文为空 → 入群即封（头像是唯一判据源）', v4 === 'banned', String(v4));
+	assert('这一档确实执行了封禁', callsOf('banChatMember').length === 1, JSON.stringify(callsOf('banChatMember')));
 }
 
 console.log(`\n========== 入群专用门槛与流水：通过 ${pass} / 失败 ${fail} ==========`);

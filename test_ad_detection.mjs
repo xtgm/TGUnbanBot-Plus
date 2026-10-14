@@ -2351,6 +2351,24 @@ section('[15] 方案 6 · 三道闸的 bio 检测（双轨：首发查 bio + 定
 	assert('引用体提取：reply_to_message.text', W.getAdQuotedText({ reply_to_message: { text: QUOTED_AD } }) === QUOTED_AD);
 	assert('引用体提取：reply_to_message.caption', W.getAdQuotedText({ reply_to_message: { caption: QUOTED_AD } }) === QUOTED_AD);
 	assert('引用体提取：无引用时为空串', W.getAdQuotedText({ text: '普通消息' }) === '');
+	// 【2026-10-14 补】被引用消息的内联按钮也算引用体的一部分。
+	// 线上漏放一条真广告：广告号引用别人的消息发出来、自己正文为空，按钮全挂在
+	// 被引用那一条上（普通TG号卡网 / 自助TG会员机器人 / 联系客服），而这里一个字没读 ——
+	// 于是 analyzeAdOutlets 的 linkCount=0、引流出口=0，形态 B 判据整条不成立。
+	// 注意只读【被引用消息】的按钮，不读消息自己的：主人点按钮的场景不该被算成引流出口。
+	assert('引用体提取：被引用消息的内联按钮（external_reply）',
+		W.getAdQuotedText({ external_reply: { reply_markup: { inline_keyboard: [[{ text: '联系客服', url: 'https://t.me/kefu' }]] } } })
+			.includes('https://t.me/kefu'),
+		W.getAdQuotedText({ external_reply: { reply_markup: { inline_keyboard: [[{ text: '联系客服', url: 'https://t.me/kefu' }]] } } }));
+	assert('引用体提取：被引用消息的内联按钮（reply_to_message）',
+		W.getAdQuotedText({ reply_to_message: { reply_markup: { inline_keyboard: [[{ text: '自助TG会员机器人', url: 'https://t.me/memb' }]] } } })
+			.includes('自助TG会员机器人'),
+		W.getAdQuotedText({ reply_to_message: { reply_markup: { inline_keyboard: [[{ text: '自助TG会员机器人', url: 'https://t.me/memb' }]] } } }));
+	// 自己消息的按钮不进引用体 —— 那是消息自身的属性，归正文通道（getAdDetectionBodyText）管。
+	// 这条的独立价值是「即使带按钮也照样为空」，用来守住不读 message.reply_markup 这条边界。
+	assert('引用体提取：消息自己的按钮不计入',
+		W.getAdQuotedText({ text: '看看', reply_markup: { inline_keyboard: [[{ text: 'x', url: 'https://t.me/x' }]] } }) === '',
+		JSON.stringify(W.getAdQuotedText({ text: '看看', reply_markup: { inline_keyboard: [[{ text: 'x', url: 'https://t.me/x' }]] } })));
 	assert('引用体提取：多字段同时存在时全部拼接',
 		W.getAdQuotedText({ quote: { text: 'A' }, reply_to_message: { text: 'B' } }) === 'A\nB');
 

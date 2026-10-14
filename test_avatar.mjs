@@ -211,14 +211,22 @@ section('[2] applyAvatarVerdict 分档');
 	//（或撞车）一进来就被封，正文多干净都救不回来。线上 130 个头像正处在这一档。
 	// 现在 hits 只算【一份佐证】，且要达 AD_AVATAR_HITS_CORROBORATION 才算数 ——
 	// 复用次数高确实是批量马甲的强信号，但不能单独定罪。
-	assert('头像 ad + 复用 2 次 + 零判据 → 只进观察（不再单独定罪）',
-		W.applyAvatarVerdict({ ...cleanBase }, adRow(2)).verdict === 'observe',
+	// 【2026-10-14 二次修正】hits>=2 恢复可单独定罪，但有一道否证：
+	//   正文为空       → 头像是唯一判据源，单独定罪（引用体形态 / 纯图片 / 纯按钮，
+	//                    不封等于整条链路对这类消息彻底失效；19:53 那条真广告正是这样漏的）
+	//   正文非空且干净 → 只进观察（这个人确实在说话、内容没拿到正分，头像撞车 / 被盗用
+	//                    的可能性更大，线上 130 个头像里正有这种）
+	assert('头像 ad + 复用 2 次 + 正文为空 → 封（头像是唯一判据源）',
+		W.applyAvatarVerdict({ ...cleanBase }, adRow(2)).verdict === 'ban',
 		JSON.stringify(W.applyAvatarVerdict({ ...cleanBase }, adRow(2))));
+	assert('头像 ad + 复用 2 次 + 正文非空且干净 → 只进观察（防撞车连坐）',
+		W.applyAvatarVerdict({ ...cleanBase, snapshot: { text: '今天天气不错' } }, adRow(2)).verdict === 'observe',
+		JSON.stringify(W.applyAvatarVerdict({ ...cleanBase, snapshot: { text: '今天天气不错' } }, adRow(2))));
 	assert('头像 ad + 复用 2 次 + 有其它判据 → 封禁',
 		W.applyAvatarVerdict(base, adRow(2)).verdict === 'ban');
-	assert('头像 ad + 复用达佐证档（3 次）+ 零判据 → 封禁',
-		W.applyAvatarVerdict({ ...cleanBase }, adRow(3)).verdict === 'ban',
-		JSON.stringify(W.applyAvatarVerdict({ ...cleanBase }, adRow(3))));
+	assert('头像 ad + 复用达佐证档（3 次）+ 正文干净 → 仍封（否证只管 hits=2 那档）',
+		W.applyAvatarVerdict({ ...cleanBase, snapshot: { text: '今天天气不错' } }, adRow(3)).verdict === 'ban',
+		JSON.stringify(W.applyAvatarVerdict({ ...cleanBase, snapshot: { text: '今天天气不错' } }, adRow(3))));
 	// 佐证档常量钉住：改数字会让上面那条断言变红，逼人重新想清楚
 	assert('佐证档常量为 3', /const AD_AVATAR_HITS_CORROBORATION = 3;/.test(src),
 		(src.match(/const AD_AVATAR_HITS_CORROBORATION[^;]*/) || ['未找到'])[0]);
@@ -548,13 +556,18 @@ section('[7] 头像佐证只认正分（负分不再单证封）');
 
 	assert('净分 ≥2 同样算佐证',
 		W.applyAvatarVerdict({ verdict: 'pass', score: 5, reasons: [] }, avatar).verdict === 'ban');
-	// 【2026-10-14 起】hits≥2 不再单证封 —— 否则「只有负分判据 + 命中一个头像」也能封，
-	// 与上面刚立的「单独特征不允许封禁」直接矛盾。线上 130 个头像正处在这一档。
-	assert('hits≥2 但只有负分判据 → 只进观察（不再单证封）',
-		W.applyAvatarVerdict({ ...negOnly }, { verdict: 'ad', hits: 2 }).verdict === 'observe',
+	// 【2026-10-14 二次修正】hits≥2 仍可单证封，但有一道否证：【正文非空且干净】时不封。
+	// 负分判据（豁免词扣分）本身不影响这道否证 —— 否证看的是「这个人有没有在正常说话」，
+	// 不看他得了多少分。正文为空时（引用体形态 / 纯图片 / 纯按钮）头像是唯一判据源，
+	// 不封就等于整条链路对这类消息彻底失效，19:53 那条真广告就是这样漏掉的。
+	assert('hits≥2 + 只有负分判据 + 正文为空 → 封（无正文可判，头像是唯一证据）',
+		W.applyAvatarVerdict({ ...negOnly }, { verdict: 'ad', hits: 2 }).verdict === 'ban',
 		JSON.stringify(W.applyAvatarVerdict({ ...negOnly }, { verdict: 'ad', hits: 2 })));
-	assert('hits 达佐证档 3 → 仅凭复用即可封（批量马甲的强信号不丢）',
-		W.applyAvatarVerdict({ ...negOnly }, { verdict: 'ad', hits: 3 }).verdict === 'ban');
+	assert('hits≥2 + 只有负分判据 + 正文干净 → 只进观察',
+		W.applyAvatarVerdict({ ...negOnly, snapshot: { text: '签到' } }, { verdict: 'ad', hits: 2 }).verdict === 'observe',
+		JSON.stringify(W.applyAvatarVerdict({ ...negOnly, snapshot: { text: '签到' } }, { verdict: 'ad', hits: 2 })));
+	assert('hits 达佐证档 3 → 仅凭复用即可封（否证只管 hits=2 那档）',
+		W.applyAvatarVerdict({ ...negOnly, snapshot: { text: '签到' } }, { verdict: 'ad', hits: 3 }).verdict === 'ban');
 	assert('头像 clean → 原样返回一个字节不改',
 		W.applyAvatarVerdict({ verdict: 'pass', score: 0, reasons: [] }, { verdict: 'clean', hits: 0 }).verdict === 'pass');
 }
