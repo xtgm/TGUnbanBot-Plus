@@ -12576,6 +12576,7 @@ const AD_FINGERPRINT_SEED = [
 const D1_AD_DETECTION_INIT_PROMISES = new WeakMap();
 const D1_AD_DETECTION_RETRY_AT = new WeakMap();
 const AD_DOMAIN_WHITELIST_CACHE = new WeakMap();
+const AD_USER_WHITELIST_CACHE = new WeakMap();
 const AD_FINGERPRINT_CACHE = new WeakMap();
 const AD_SAMPLE_EMBEDDING_CACHE = new WeakMap();
 
@@ -12687,6 +12688,11 @@ async function ensureAdDetectionTables(env) {
 			await runD1SchemaStatement(env, 'idx_ad_sample_pending', 'CREATE INDEX IF NOT EXISTS idx_ad_sample_pending ON ad_sample_embeddings (dimension)', { optional: true });
 
 			await runD1SchemaStatement(env, 'ad_domain_whitelist', 'CREATE TABLE IF NOT EXISTS ad_domain_whitelist (domain TEXT PRIMARY KEY, added_by TEXT, source TEXT, created_at INTEGER NOT NULL)');
+
+			// 用户白名单：表里的人【永不进广告检测】—— 入群不查、发消息不判、封禁执行口直接拒绝。
+			// 语义与 ad_vote_allowlist 完全不同（那是 /ad 投票的投票人名单，跟豁免无关），
+			// 名字容易看混，故不复用。主人的口径是「加入白名单的人就不会触发任何封禁」。
+			await runD1SchemaStatement(env, 'ad_user_whitelist', 'CREATE TABLE IF NOT EXISTS ad_user_whitelist (user_id TEXT PRIMARY KEY, by_user TEXT, at TEXT NOT NULL, note TEXT)');
 
 			await runD1SchemaStatement(env, 'ad_pending_snapshots', 'CREATE TABLE IF NOT EXISTS ad_pending_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT NOT NULL, chat_id TEXT, score INTEGER NOT NULL DEFAULT 0, reasons TEXT, snapshot TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_pending_owner_seq', 'CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_pending_owner_seq ON ad_pending_snapshots (owner_id, seq)', { optional: true });
@@ -13053,6 +13059,96 @@ async function removeAdDomainWhitelist(env, rawDomain) {
 		return { ok: true, domain, removed: Number(result?.meta?.changes || 0) > 0 };
 	} catch (error) {
 		console.error('[广告检测] 删除域名白名单失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+// === 用户白名单：表里的人永不进广告检测 ===
+//
+// 【为什么必须走缓存】这是消息热路径的豁免闸，每条消息都要问一次。
+// 读域名白名单已经用了同一套 loadAdCachedValue + 60 秒 TTL，这里照抄 ——
+// 稳定态下内存命中，一条消息零额外 D1 读。
+//
+// 【为什么不并进 loadAdDomainWhitelist】两者主键类型与用途都不同（域名 vs 数字 TGID），
+// 合并会把两类数据揉进一个 Set，增删任一侧都要重建另一侧，反而更贵也更易错。
+async function loadAdUserWhitelist(env) {
+	const fallback = () => new Set();
+	if (!env?.DB) return fallback();
+	try {
+		const value = await loadAdCachedValue(AD_USER_WHITELIST_CACHE, env.DB, AD_WHITELIST_CACHE_TTL_MS, async () => {
+			if (!(await adDetectionReady(env))) return fallback();
+			const { results } = await env.DB.prepare('SELECT user_id FROM ad_user_whitelist').all();
+			const set = new Set();
+			for (const row of results || []) {
+				const id = String(row?.user_id || '');
+				// 只收纯数字 TGID —— 与 isPrimaryOwner 那套正数裸 id 口径一致，
+				// 避免脏数据（群 id、带 @ 的 handle）把闸门撑成一个假白名单。
+				if (/^\d+$/.test(id)) set.add(id);
+			}
+			return set;
+		});
+		return value instanceof Set ? value : fallback();
+	} catch (error) {
+		console.error('[广告检测] 读取用户白名单失败:', error);
+		return fallback();
+	}
+}
+
+// 判一个人是否被白名单豁免。主人 / 副主人 / 超管本来就走 isAdDetectionExemptUser，
+// 这里一并返回 true，让调用方只需问一句，不必自己再叠一次判断。
+async function isAdUserWhitelisted(env, userId) {
+	const id = String(userId || '');
+	if (!/^\d+$/.test(id)) return false;
+	if (isAdDetectionExemptUser(id)) return true;
+	const set = await loadAdUserWhitelist(env);
+	return set.has(id);
+}
+
+async function addAdUserWhitelist(env, userId, addedBy, note) {
+	const id = String(userId || '').trim();
+	if (!/^\d+$/.test(id)) return { ok: false, reason: 'invalid' };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const result = await env.DB
+			.prepare('INSERT OR IGNORE INTO ad_user_whitelist (user_id, by_user, at, note) VALUES (?, ?, ?, ?)')
+			.bind(id, String(addedBy ?? ''), new Date().toISOString(), String(note ?? '').slice(0, 120)).run();
+		// 写完立刻让缓存失效：白名单的语义是【马上生效】，
+		// 等 60 秒 TTL 自然过期的话，加完名单那条消息照样会被判，主人会以为按钮没用。
+		AD_USER_WHITELIST_CACHE.delete(env.DB);
+		return { ok: true, userId: id, added: Number(result?.meta?.changes || 0) > 0 };
+	} catch (error) {
+		console.error('[广告检测] 添加用户白名单失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+async function removeAdUserWhitelist(env, userId) {
+	const id = String(userId || '').trim();
+	if (!/^\d+$/.test(id)) return { ok: false, reason: 'invalid' };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const result = await env.DB.prepare('DELETE FROM ad_user_whitelist WHERE user_id = ?').bind(id).run();
+		AD_USER_WHITELIST_CACHE.delete(env.DB);
+		return { ok: true, userId: id, removed: Number(result?.meta?.changes || 0) > 0 };
+	} catch (error) {
+		console.error('[广告检测] 删除用户白名单失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+async function listAdUserWhitelist(env) {
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const { results } = await env.DB
+			.prepare('SELECT user_id, by_user, at, note FROM ad_user_whitelist ORDER BY at DESC').all();
+		return { ok: true, rows: (results || []).map((row) => ({
+			userId: String(row?.user_id || ''),
+			byUser: String(row?.by_user || ''),
+			at: String(row?.at || ''),
+			note: String(row?.note || '')
+		})) };
+	} catch (error) {
+		console.error('[广告检测] 列举用户白名单失败:', error);
 		return { ok: false, reason: 'error' };
 	}
 }
@@ -19948,12 +20044,19 @@ function buildAdNoticeKeyboard(seq, userId) {
 	// 挂一个点了必报「序号不存在」的按钮，比不挂更让人困惑。
 	if (seq) rows.push([{ text: '↩️ 误判（回滚全部）', callback_data: ADFIX_BUTTON_PREFIX + 'ig:' + Number(seq) }]);
 	rows.push([{ text: '🔓 解封（判定维持）', callback_data: ADFIX_BUTTON_PREFIX + 'ub:' + uid }]);
+	// 第三档：加白名单。与前两档的分工 ——
+	//   ↩️ 误判 = 这条判定错了，回滚判据库，人照封（下次同款也不封）
+	//   🔓 解封 = 判定是对的，只是这次不罚，人回到「下次再判」的状态
+	//   ➕ 白名单 = 这个人以后一律不判：入群不查、发消息不判、封禁口直接拒绝，
+	//              并且本次一并解封（点它的人说的是「这个人误封了」，只加名单不放人，
+	//              他照样出不来，还得再点一次解封，等于逼人点两下）。
+	rows.push([{ text: '➕ 加入白名单（永不检测）', callback_data: ADFIX_BUTTON_PREFIX + 'wl:' + uid }]);
 	return { inline_keyboard: rows };
 }
 
 async function handleAdFixButtonCallback(callbackQuery, env) {
 	const data = String(callbackQuery?.data || '');
-	const match = data.slice(ADFIX_BUTTON_PREFIX.length).match(/^(ig|ub):(\d+)$/);
+	const match = data.slice(ADFIX_BUTTON_PREFIX.length).match(/^(ig|ub|wl):(\d+)$/);
 	if (!match) {
 		await answerAdVoteCallback(callbackQuery?.id);
 		return;
@@ -19962,7 +20065,7 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 	const payload = Number(match[2]);
 	const fromId = String(callbackQuery?.from?.id || '');
 	if (!isPrimaryOwner(fromId)) {
-		await answerAdVoteCallback(callbackQuery?.id, '这两个按钮只有第一主人能点', true);
+		await answerAdVoteCallback(callbackQuery?.id, '这三个按钮只有第一主人能点', true);
 		return;
 	}
 	const chatId = String(callbackQuery?.message?.chat?.id || '');
@@ -19977,6 +20080,22 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 		await editTelegramMessage(chatId, messageId, originText + '\n─────\n↩️ 已按误判回滚　快照 #' + payload
 			+ '\n解封 + 指纹/形状/AI 样本修正已执行，明细在上一条消息。');
 		return;
+	}
+
+	// 加白名单。放在解封之前【且 fall through 到解封】：
+	//   先加名单 —— 名单生效后封禁口会拒绝，后面那段解封不会再被「还在黑名单里」挡下；
+	//   再放人   —— 只加名单不放人的话，他照样在群里禁言着，得逼主人再点一次解封。
+	// 不在这里 editTelegramMessage：下面解封收尾时会原地改写一次，先写必被覆盖。
+	let whitelistNote = '';
+	if (action === 'wl') {
+		const added = await addAdUserWhitelist(env, String(payload), fromId, '封禁回执上的白名单按钮');
+		if (!added.ok) {
+			await answerAdVoteCallback(callbackQuery?.id, '加白名单失败：' + (added.reason || '未知原因'), true);
+			return;
+		}
+		// 不在这里 answerCallbackQuery：Telegram 每个回调只收一次回执，
+		// 这里答了下面解封那段就答不进去，主人只会看到「已加入白名单」而看不到封禁有没有解除。
+		whitelistNote = '\n➕ 已加入白名单：入群不查、发消息不判、封禁一律拒绝（含同款连带与手动确认）。';
 	}
 
 	const uid = String(payload);
@@ -19994,10 +20113,11 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 	}
 	const okCount = (results || []).filter((item) => item.ok).length;
 	const d1Removed = (eligibility.d1Removed || []).includes(uid);
-	await answerAdVoteCallback(callbackQuery?.id, '已解封 ' + uid + '（' + okCount + ' 个群）');
+	await answerAdVoteCallback(callbackQuery?.id, (whitelistNote ? '已加入白名单　' : '')
+		+ '已解封 ' + uid + '（' + okCount + ' 个群）');
 	await editTelegramMessage(chatId, messageId, originText + '\n─────\n🔓 已解封 <code>' + escapeHtml(uid) + '</code>　'
 		+ okCount + '/' + (results || []).length + ' 个群' + (d1Removed ? '　D1 记录已移除' : '')
-		+ '\n判定维持：指纹、AI 样本、形状、快照一律未动。');
+		+ '\n判定维持：指纹、AI 样本、形状、快照一律未动。' + whitelistNote);
 	console.log('[封禁回执] 主人点解封（判定维持）user=' + uid + ' 群=' + okCount + ' d1Removed=' + d1Removed);
 }
 
@@ -20428,6 +20548,13 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	const userId = String(input?.userId ?? '');
 	const chatId = input?.chatId != null ? String(input.chatId) : '';
 	if (!userId) return { banned: false, seq: null, reason: 'no_user' };
+	// 用户白名单：封禁执行口的兜底闸。
+	// 前面两个入口挡住了自动检测，但仍有几条路会绕过它们直接走到这里 ——
+	// 同款连带（findLinkedSpamTargets 按文本 hash 连人，只看 hash 不看人）、
+	// /ad 投票确认、cron 复查轨。主人的口径是「加入白名单的人就不会触发任何封禁」，
+	// 所以这里无条件拦，【不看 options.force】：force 的语义只是「跳过阈值裁决」，
+	// 不是「跳过白名单」—— 主人手动点确认时若目标在白名单，回执会写明原因而不是静默失败。
+	if (await isAdUserWhitelisted(env, userId)) return { banned: false, seq: null, reason: 'whitelisted' };
 
 	// ===== 演练模式：命中记流水 + 学特征 + 推私聊，处置一个都不做 =====
 	//
@@ -20712,6 +20839,10 @@ async function screenAdJoinMember(env, member, options = {}) {
 	const userId = member?.id;
 	if (!userId || member?.is_bot) return 'skipped';			// bot 交给 handleNewChatMemberBots
 	if (isAdDetectionExemptUser(userId)) return 'skipped';		// 主人 / 副主人 / 超管豁免
+	// 用户白名单：入群这一步整体不查（评分、AI、头像、图片、指纹一个都不跑）。
+	// 与上面那条特权豁免并列而不是包进去：白名单是主人事后加的，随时可能增删，
+	// 必须走带 TTL 的缓存；特权名单是静态常量，两者缓存策略不同，混在一起会互相拖累。
+	if (await isAdUserWhitelisted(env, userId)) return 'whitelisted';
 	const chatId = String(options.chatId ?? '');
 	if (!chatId) return 'skipped';
 	if (!env?.DB) return 'skipped';
@@ -20912,6 +21043,10 @@ async function detectAdOnMessage(message, env) {
 	const chat = message?.chat;
 	const from = message?.from;
 	if (!chat || !from) return false;
+	// 用户白名单：整条判定链不进 —— 闸一、闸二、评分、AI、头像、图片、指纹全跳过。
+	// 放在最前面而不是各层内部：豁免要的是「一个字节都不判」，
+	// 在层里逐个加豁免条件迟早漏一处，漏的那处照样会写观察记录、照样会推通知。
+	if (await isAdUserWhitelisted(env, from.id)) return false;
 	// 【2026-09-21 bot 消息不再整体免检】原来这里是 `from.is_bot` 直接 return false，
 	// 于是【任何 bot 发的消息都不进广告检测】。线上被这样利用：
 	// 广告号艾特若干 @xxxbot 后自行删除原消息，那些 bot 并不在群里，
@@ -21397,7 +21532,7 @@ async function detectAdOnMessage(message, env) {
 // /learnlast 放进这里是因为它与本组命令的约束完全一致：仅第一主人、强制私聊。
 // /recent 【刻意不在】这里 —— 它必须群内可用（在群里看到广告被删就顺手拉列表），
 // 而本函数对群内命令一律撤回 + 引导私聊，会把 /recent 的主用法直接堵死。
-const AD_COMMAND_RE = /^\/(pending|user|ignore|addword|delword|words|addsample|clearsamples|adstats|vision|digest|whitelist|rescreen|warmup|learnlast)(?:@[^\s]+)?(?:\s|$)/i;
+const AD_COMMAND_RE = /^\/(pending|user|ignore|addword|delword|words|addsample|clearsamples|adstats|vision|digest|whitelist|rescreen|warmup|learnlast|wl)(?:@[^\s]+)?(?:\s|$)/i;
 
 // 快照 → 判定载荷。/ignore 标误判、删 AI 样本都要用同一份载荷，保证两边命中的集合一致。
 function adPayloadFromSnapshot(snapshot) {
@@ -21488,6 +21623,7 @@ async function handleAdDetectionCommands(message, env, ctx) {
 			case 'vision': await handleAdVisionCommand(env, chatId, ctx); break;
 			case 'digest': await handleAdDigestCommand(env, chatId, arg); break;
 			case 'whitelist': await handleAdWhitelistCommand(env, chatId, ownerId, arg); break;
+			case 'wl': await handleAdUserWhitelistCommand(env, chatId, ownerId, arg); break;
 			case 'rescreen': await handleAdRescreenCommand(env, chatId, arg); break;
 			case 'warmup': await handleAdWarmupCommand(env, chatId); break;
 			case 'learnlast': await handleAdLearnLastCommand(env, chatId, ownerId, arg); break;
@@ -22688,6 +22824,66 @@ async function handleAdStatsCommand(env, chatId) {
 
 // /whitelist [list|add|del] [域名]：域名白名单管理。
 // D1 表为空时自动回落到内置种子，所以「删到空」不会导致所有链接都被判广告。
+// /wl：用户白名单管理。与 /whitelist（域名白名单）是两回事，指令名刻意区分开 ——
+// 域名白名单管的是「这条链接不算广告链接」，用户白名单管的是「这个人一律不判」，
+// 一个是判据、一个是豁免，混在一条指令里迟早点错。
+// 用法：/wl 列出 ｜ /wl add 123456 ｜ /wl del 123456
+async function handleAdUserWhitelistCommand(env, chatId, ownerId, arg) {
+	const parts = arg ? arg.split(/\s+/) : [];
+	const action = (parts[0] || 'list').toLowerCase();
+	const target = (parts[1] || '').trim();
+
+	if (action === 'add' || action === 'del') {
+		if (!target) {
+			await sendTelegramMessage(chatId, '用法：<code>/wl ' + action + ' 123456</code>（填 TGID，纯数字）');
+			return;
+		}
+		const result = action === 'add'
+			? await addAdUserWhitelist(env, target, ownerId, '/wl 手动添加')
+			: await removeAdUserWhitelist(env, target);
+		if (!result.ok) {
+			const reasonMap = { invalid: 'TGID 不合法（必须是纯数字）', unavailable: '数据表不可用', error: '写入失败' };
+			await sendTelegramMessage(chatId, '❌ 操作失败：' + (reasonMap[result.reason] || result.reason));
+			return;
+		}
+		if (action === 'add') {
+			await sendTelegramMessage(chatId, (result.added ? '✅ 已加入白名单：' : 'ℹ️ 已在白名单中：')
+				+ '<code>' + escapeHtml(result.userId) + '</code>'
+				+ '\n从现在起：入群不查、发消息不判、封禁一律拒绝。'
+				+ '\n⚠️ 白名单只挡【以后】。此人若仍在黑名单，要放出来得再执行一次解封'
+				+ '（<code>/unban ' + escapeHtml(result.userId) + '</code>）。');
+		} else {
+			await sendTelegramMessage(chatId, (result.removed ? '✅ 已从白名单移除：' : '⚠️ 白名单中没有该 TGID：')
+				+ '<code>' + escapeHtml(result.userId) + '</code>'
+				+ '\n移除后恢复检测。');
+		}
+		return;
+	}
+
+	if (action !== 'list') {
+		await sendTelegramMessage(chatId, '用法：<code>/wl</code> 列出｜<code>/wl add 123456</code>｜<code>/wl del 123456</code>');
+		return;
+	}
+
+	const listed = await listAdUserWhitelist(env);
+	if (!listed.ok) {
+		await sendTelegramMessage(chatId, '❌ 白名单读取失败，请稍后重试。');
+		return;
+	}
+	const rows = listed.rows || [];
+	if (!rows.length) {
+		await sendTelegramMessage(chatId, '📋 用户白名单为空。\n\n加白名单的人：入群不查、发消息不判、封禁一律拒绝。');
+		return;
+	}
+	const lines = ['📋 用户白名单（' + rows.length + ' 人）', ''];
+	for (const row of rows) {
+		lines.push('• <code>' + escapeHtml(row.userId) + '</code>　' + escapeHtml(row.at.slice(0, 10))
+			+ (row.note ? '　' + escapeHtml(row.note) : ''));
+	}
+	lines.push('', '用 <code>/wl del TGID</code> 移除，移除后恢复检测。');
+	await sendTelegramMessage(chatId, lines.join('\n'));
+}
+
 async function handleAdWhitelistCommand(env, chatId, ownerId, arg) {
 	const parts = arg ? arg.split(/\s+/) : [];
 	const action = (parts[0] || 'list').toLowerCase();

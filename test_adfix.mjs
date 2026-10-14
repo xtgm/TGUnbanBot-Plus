@@ -183,17 +183,22 @@ section('[1] buildAdNoticeKeyboard 构造');
 {
 	const both = W.buildAdNoticeKeyboard(12, '555001');
 	const rows = both?.inline_keyboard || [];
-	assert('有 seq 时给两行两个按钮', rows.length === 2 && rows[0].length === 1 && rows[1].length === 1,
+	// 第三行是白名单按钮（2026-10-14 新增）：前两档是判后纠错，第三档是「这个人以后一律不判」。
+	assert('有 seq 时给三行三个按钮', rows.length === 3 && rows[0].length === 1 && rows[1].length === 1 && rows[2].length === 1,
 		JSON.stringify(both));
 	assert('第一行是误判回滚、第二行是解封',
 		rows[0][0].text.includes('误判') && rows[1][0].text.includes('解封'), JSON.stringify(rows));
 	assert('callback_data 形如 adfix:ig:<seq> / adfix:ub:<uid>',
 		rows[0][0].callback_data === 'adfix:ig:12' && rows[1][0].callback_data === 'adfix:ub:555001',
 		JSON.stringify(rows));
+	assert('第三行白名单按钮 callback_data 形如 adfix:wl:<uid>',
+		rows[2][0].callback_data === 'adfix:wl:555001', JSON.stringify(rows));
 
 	const noSeq = W.buildAdNoticeKeyboard(null, '555001')?.inline_keyboard || [];
-	assert('无 seq 时不挂必失败的回滚按钮', noSeq.length === 1 && noSeq[0][0].callback_data === 'adfix:ub:555001',
+	// 无 seq 时只撤掉回滚那一行：解封与白名单都拿 uid 就能用，不依赖快照序号。
+	assert('无 seq 时不挂必失败的回滚按钮', noSeq.length === 2 && noSeq[0][0].callback_data === 'adfix:ub:555001',
 		JSON.stringify(noSeq));
+	assert('无 seq 时白名单按钮照挂', noSeq[1][0].callback_data === 'adfix:wl:555001', JSON.stringify(noSeq));
 	assert('uid 非数字直接不挂按钮', W.buildAdNoticeKeyboard(12, 'abc') === null,
 		JSON.stringify(W.buildAdNoticeKeyboard(12, 'abc')));
 }
