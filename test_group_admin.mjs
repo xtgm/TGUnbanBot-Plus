@@ -468,7 +468,11 @@ section('[9] 访问初始化地址即立刻同步一次（不用等 cron）');
 	const env = makeEnv();
 	resetCalls();
 	const res = await W.__handler.fetch(new Request('https://example.workers.dev/TESTTOKEN'), env, { waitUntil() {} });
-	const body = await res.json();
+	// 先读文本再解析：万一返回的不是 JSON（比如被下面 [10] 节的 HTML 分支抢走），
+	// .json() 会抛异常把整个测试带崩，那样看到的是「崩了」而不是「哪条断言红了」。
+	const resText = await res.text();
+	let body = null;
+	try { body = JSON.parse(resText); } catch (_) { body = null; }
 	assert('★ 初始化回执里带上管理员同步结果',
 		Boolean(body) && Boolean(body.管理员同步) && typeof body.管理员同步.groups === 'number',
 		JSON.stringify(body));
@@ -485,6 +489,57 @@ section('[9] 访问初始化地址即立刻同步一次（不用等 cron）');
 	assert('★ 菜单与 Webhook 设置照旧（同步没把它们挤掉）',
 		body?.命令?.已设置 === true && body?.Webhook?.已设置 === true,
 		JSON.stringify(body));
+}
+
+// ================= [10] 初始化回执的浏览器美化页 =================
+// 浏览器打开 /{TOKEN} 时给一个排版好的页面（原先是纯 JSON，好不好看全靠浏览器扩展），
+// 程序调用（curl / fetch 默认 Accept: */*）仍然拿 JSON，另有 ?raw=1 强制回 JSON。
+section('[10] 浏览器打开给美化页，程序调用仍是 JSON');
+{
+	const env = makeEnv();
+
+	// 浏览器：Accept 里带 text/html
+	resetCalls();
+	const htmlRes = await W.__handler.fetch(new Request('https://example.workers.dev/TESTTOKEN', {
+		headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' }
+	}), env, { waitUntil() {} });
+	const htmlBody = await htmlRes.text();
+	assert('★ 浏览器头 → 返回 HTML 美化页',
+		String(htmlRes.headers.get('Content-Type') || '').startsWith('text/html') && htmlBody.startsWith('<!DOCTYPE html>'),
+		String(htmlRes.headers.get('Content-Type')) + ' | ' + htmlBody.slice(0, 60));
+	assert('★ 美化页里带上了同步结果（不是空壳）',
+		htmlBody.includes('管理员同步') && htmlBody.includes('baseline'),
+		'HTML 长度=' + htmlBody.length);
+
+	// 程序调用：不声明 text/html
+	resetCalls();
+	const jsonRes = await W.__handler.fetch(new Request('https://example.workers.dev/TESTTOKEN'), env, { waitUntil() {} });
+	// 读文本再自己解析：万一返回的不是 JSON，.json() 会抛异常把整个测试带崩，
+	// 那样看到的是「崩了」而不是「这条断言红了」，定位反而更难。
+	const jsonText = await jsonRes.text();
+	let jsonParsed = null;
+	try { jsonParsed = JSON.parse(jsonText); } catch (_) { jsonParsed = null; }
+	assert('★ 程序调用 → 仍是 JSON（机器可读没被破坏）',
+		String(jsonRes.headers.get('Content-Type') || '').startsWith('application/json') && jsonParsed?.管理员同步?.groups === 2,
+		String(jsonRes.headers.get('Content-Type')) + ' | ' + jsonText.slice(0, 80));
+
+	// ?raw=1：在浏览器里也想看原始 JSON 时的出口
+	resetCalls();
+	const rawRes = await W.__handler.fetch(new Request('https://example.workers.dev/TESTTOKEN?raw=1', {
+		headers: { Accept: 'text/html' }
+	}), env, { waitUntil() {} });
+	assert('★ ?raw=1 在浏览器里强制回 JSON',
+		String(rawRes.headers.get('Content-Type') || '').startsWith('application/json'),
+		String(rawRes.headers.get('Content-Type')));
+
+	// 逃生：JSON 里的值是 HTML 时不能穿透成标签（这个端点是公开地址，值里可能有任意文本）
+	const esc = W.renderJsonHtml({ s: '<script>alert(1)</script>', n: 1, b: true, z: null, arr: ['x'], obj: {} }, 0);
+	assert('★ JSON 值里的 HTML 被转义，不穿透',
+		!esc.includes('<script>') && esc.includes('&lt;script&gt;'),
+		esc.slice(0, 140));
+	assert('★ 四种标量各自着色（key/字符串/数字/布尔/null 都有类名）',
+		/<span class="k">/.test(esc) && /<span class="s">/.test(esc) && /<span class="n">/.test(esc) && /<span class="b">/.test(esc),
+		esc.slice(0, 200));
 }
 
 console.log(`\n========== ${pass} 通过 / ${fail} 失败 ==========`);

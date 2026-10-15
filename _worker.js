@@ -668,6 +668,80 @@ function jsonResponse(data, status = 200) {
 
 // env 是【2026-10-15】为「顺带同步配置群管理员表」加的：本函数原先不碰 env，
 // 现在末尾要调 syncAdGroupAdmins，而它需要 env.DB。
+// 【2026-10-15】浏览器打开初始化地址时给一个排版好的页面。
+// 原先返回纯 JSON —— 好不好看全看浏览器扩展（主人截图里那个「美观输出」勾选框就是扩展的），
+// 而扩展的默认状态代码控制不了。这里自己渲染：语法着色 + 固定表头 + 一个「原始 JSON」出口。
+//
+// 【为什么看 Accept 头】curl / fetch / axios 默认发 `Accept: */*`，浏览器发的是以
+// `text/html` 开头的一长串。所以同一个地址：人打开是页面，脚本调用还是 JSON，
+// 机器可读性一点没丢。另给 `?raw=1` 强制回 JSON —— 在浏览器里想复制原始数据时用。
+const JSON_PAGE_CSS = [
+	'*{box-sizing:border-box}',
+	'body{margin:0;background:#f5f6f8;color:#24292f;'
+		+ 'font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace}',
+	'header{position:sticky;top:0;z-index:1;display:flex;align-items:center;gap:8px;'
+		+ 'padding:10px 16px;background:#fff;border-bottom:1px solid #d8dee4;'
+		+ 'font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}',
+	'header .dot{color:#1a7f37;font-weight:700}',
+	'header .raw{margin-left:auto;color:#0969da;text-decoration:none}',
+	'header .raw:hover{text-decoration:underline}',
+	'pre{margin:0;padding:16px;white-space:pre;overflow:auto;tab-size:4}',
+	'.k{color:#0550ae}',
+	'.s{color:#0a3069}',
+	'.n{color:#953800}',
+	'.b{color:#8250df}'
+].join('');
+
+// 递归渲染成带类名的 HTML。刻意【不用正则去给 JSON 文本着色】——
+// 字符串里的引号、冒号、转义都会把正则带偏（值里正好含 `": "` 就会串色），
+// 遍历对象是唯一稳的做法。
+function renderJsonHtml(value, depth) {
+	if (value === null) return '<span class="b">null</span>';
+	const type = typeof value;
+	if (type === 'string') return '<span class="s">' + escapeHtml(JSON.stringify(value)) + '</span>';
+	if (type === 'number') return '<span class="n">' + escapeHtml(JSON.stringify(value)) + '</span>';
+	if (type === 'boolean') return '<span class="b">' + String(value) + '</span>';
+	const pad = '\t'.repeat(depth);
+	const inner = '\t'.repeat(depth + 1);
+	if (Array.isArray(value)) {
+		if (!value.length) return '[]';
+		return '[\n' + value.map((item) => inner + renderJsonHtml(item, depth + 1)).join(',\n') + '\n' + pad + ']';
+	}
+	if (type === 'object') {
+		const keys = Object.keys(value);
+		if (!keys.length) return '{}';
+		return '{\n' + keys
+			.map((key) => inner + '<span class="k">' + escapeHtml(JSON.stringify(key)) + '</span>: ' + renderJsonHtml(value[key], depth + 1))
+			.join(',\n') + '\n' + pad + '}';
+	}
+	// undefined / function 不会出现在 JSON 里，兜底成字符串，免得渲染出裸的 undefined
+	return escapeHtml(String(value));
+}
+
+function renderJsonPage(data, title) {
+	return '<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n<meta charset="utf-8">\n'
+		+ '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+		+ '<title>' + escapeHtml(title) + '</title>\n'
+		+ '<style>' + JSON_PAGE_CSS + '</style>\n'
+		+ '</head>\n<body>\n'
+		+ '<header><span class="dot">●</span> ' + escapeHtml(title)
+		+ '<a class="raw" href="?raw=1">原始 JSON</a>'
+		+ '</header>\n<pre>' + renderJsonHtml(data, 0) + '</pre>\n</body>\n</html>';
+}
+
+// 与 jsonResponse 同签名，多一个 request 用来判断调用方是人还是脚本。
+function beautifyJsonResponse(request, data, status = 200) {
+	const accept = String(request?.headers?.get?.('Accept') || '');
+	let raw = false;
+	try { raw = new URL(request.url).searchParams.has('raw'); } catch (_) { raw = false; }
+	if (raw || !accept.includes('text/html')) return jsonResponse(data, status);
+	const title = (data && typeof data === 'object' && data.消息) ? String(data.消息) : '运行结果';
+	return new Response(renderJsonPage(data, title), {
+		status,
+		headers: { 'Content-Type': 'text/html; charset=UTF-8' }
+	});
+}
+
 async function handleInitialization(request, env) {
 	try {
 		// 设置 Webhook
@@ -764,7 +838,7 @@ async function handleInitialization(request, env) {
 		});
 
 		if (commandsResponse.ok) {
-			return jsonResponse({
+			return beautifyJsonResponse(request, {
 				成功: true,
 				消息: 'Webhook 和命令设置成功',
 				Webhook: {
@@ -779,7 +853,7 @@ async function handleInitialization(request, env) {
 			});
 		} else {
 			const result = await commandsResponse.json();
-			return jsonResponse({
+			return beautifyJsonResponse(request, {
 				成功: false,
 				消息: '命令设置失败',
 				Webhook: {
@@ -796,7 +870,7 @@ async function handleInitialization(request, env) {
 			}, 500);
 		}
 	} catch (error) {
-		return jsonResponse({
+		return beautifyJsonResponse(request, {
 			成功: false,
 			消息: '内部服务器错误',
 			错误: error.message
