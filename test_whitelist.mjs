@@ -534,10 +534,11 @@ section('[8] /wl 列表：昵称与可点击的资料卡入口');
 		'INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at) '
 		+ 'VALUES (?, ?, ?, ?, ?, ?, ?, 0)'
 	).bind(String(uid), GROUP_ID, first, last, uname, now, now).run();
-	// 名册里两个人：A 有 username、B 只有名字；C 名册里完全没有
+	// 名册里两个人：A 有 username、B 只有名字；C 名册里没有但点名能查到；
+	// D 名册没有、点名也查不到 —— 三组各要有样本，否则「分组」断言测不到空组的行为。
 	await seedMember(5001, '张三', '', 'zhangsan_wl');
 	await seedMember(5002, '李四', '', '');
-	for (const id of ['5001', '5002', '5003']) {
+	for (const id of ['5001', '5002', '5003', '5004']) {
 		await W.addAdUserWhitelist(env, id, String(OWNER_ID), '/wl 手动添加');
 	}
 
@@ -592,6 +593,33 @@ section('[8] /wl 列表：昵称与可点击的资料卡入口');
 	const looked2 = callsOf('getChatMember').filter((c) => ['5001', '5002', '5003'].includes(String(c.body?.user_id || '')));
 	assert('★ 第二次 /wl 零 API 调用（走名册）', looked2.length === 0, JSON.stringify(looked2.map((c) => c.body?.user_id)));
 
+	// ===== 丁：去掉逐行重复的来源与日期 + 按「点得开」分三组 =====
+	// 35 行各挂一遍「2026-10-14 /wl 手动添加」是列表看着乱的主因 ——
+	// 这两个字段在整份名单里全同，收进标题说一次就够，每行重复 35 遍纯是噪音。
+	const noteTimes = (text.match(/\/wl 手动添加/g) || []).length;
+	assert('★ 来源「/wl 手动添加」不再逐行重复（全同时只说一次）',
+		noteTimes <= 1, '出现 ' + noteTimes + ' 次');
+	const dayTimes = (text.match(/\d{4}-\d{2}-\d{2}/g) || []).length;
+	assert('★ 日期不再逐行重复（全同时只说一次）',
+		dayTimes <= 1, '出现 ' + dayTimes + ' 次');
+
+	// 分组：三种形态「点得开」的可靠性完全不同（有 username 一定点得动；
+	// 只有昵称的走 tg://user，对方开了隐私就点不动），混在一起看不出差别。
+	const idxGroup1 = text.indexOf('有用户名');
+	const idxGroup2 = text.indexOf('只有昵称');
+	assert('★ 分成三组（有用户名 / 只有昵称 / 只有号码）',
+		idxGroup1 >= 0 && idxGroup2 > idxGroup1 && text.includes('只有号码'),
+		JSON.stringify({ idxGroup1, idxGroup2, has3: text.includes('只有号码') }));
+	assert('★ 有 username 的落在第一组',
+		text.indexOf('5001') > idxGroup1 && text.indexOf('5001') < idxGroup2,
+		JSON.stringify({ g1: idxGroup1, g2: idxGroup2, i5001: text.indexOf('5001') }));
+	assert('★ 只有昵称的落在第二组（排在有用户名那一组之后）',
+		text.indexOf('5002') > idxGroup2,
+		JSON.stringify({ g2: idxGroup2, i5002: text.indexOf('5002') }));
+	assert('★ 什么都查不到的落在「只有号码」组',
+		text.indexOf('5004') > text.indexOf('只有号码') && text.indexOf('5004') > text.indexOf('5002'),
+		JSON.stringify({ i5004: text.indexOf('5004'), iG3: text.indexOf('只有号码') }));
+
 	// 谁都没查到：只给 TGID，不生成点不动的死链接
 	const env2 = makeEnv();
 	await W.adDetectionReady(env2);
@@ -604,6 +632,7 @@ section('[8] /wl 列表：昵称与可点击的资料卡入口');
 	const text2 = sendTextOf('sendMessage').join('\n');
 	assert('★ 查不到时只给 TGID，不生成死链接',
 		text2.includes('6001') && !/tg:\/\/user\?id=6001/.test(text2), text2.slice(0, 300));
+	assert('★ 什么都查不到的落在「只有号码」组', text2.includes('只有号码'), text2.slice(0, 300));
 
 	// 只有壳没有名字的回包不算查到 —— getChatMember 对不存在的用户也可能回一个只有 id 的 user，
 	// 拿它写回名册等于把「没查到」记成「查到了」，还会在屏上渲染出一个点不开的空链接。

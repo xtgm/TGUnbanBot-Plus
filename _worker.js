@@ -13346,22 +13346,35 @@ async function resolveAdWhitelistNames(env, rows) {
 	return found;
 }
 
-// 一行白名单里的「人」怎么显示。三档，可靠性递减 —— 顺序不能改：
+// 一行白名单怎么渲染。三档，可靠性递减 —— 顺序不能改：
 //   ① 有 username → 纯文本 @xxx。Telegram 客户端自动识别成用户链接，一定点得动。
 //   ② 只有名字   → tg://user?id= 链接。多数点得动，但官方 ChatFullInfo.has_private_forwards
 //                  写明：对方把「隐私和安全 → 转发消息」设为非「所有人」时，该链接
 //                  只在与该用户本人的聊天里生效，别处退化成点不动的灰字。
-//   ③ 两样都没有 → 空串。调用方只显示 TGID，绝不生成点不动的死链接。
-function renderAdWhitelistUser(row) {
+//   ③ 两样都没有 → 只给 TGID，绝不生成点不动的死链接。
+//
+// 【为什么不做列对齐】Telegram 正文是比例字体，靠补空格对齐是假的 —— 真对齐只能用
+// 等宽块（<pre> / 整行 <code>），而那会把每一行都变成一条代码横条，比不对齐更难读。
+// 整齐交给「字段顺序固定 + 分组 + 去掉逐行重复的来源与日期」，不交给空格。
+// options.singleDay / singleNote 为真时该字段已收进标题，行内不再重复。
+function renderAdWhitelistRow(row, options = {}) {
+	const id = '<code>' + escapeHtml(String(row.userId)) + '</code>';
 	const fullName = [row.firstName, row.lastName].filter(Boolean).join(' ').trim();
 	const username = normalizeTelegramUsername(row.username);
+	const tail = [];
+	if (!options.singleDay) {
+		const day = String(row.at || '').slice(0, 10);
+		if (day) tail.push(escapeHtml(day));
+	}
+	if (!options.singleNote && row.note) tail.push(escapeHtml(String(row.note)));
+	const suffix = tail.length ? '　' + tail.join('　') : '';
 	if (username) {
-		return '@' + escapeHtml(username) + (fullName ? '　' + escapeHtml(fullName) : '');
+		return '@' + escapeHtml(username) + (fullName ? '　' + escapeHtml(fullName) : '') + '　' + id + suffix;
 	}
 	if (fullName) {
-		return '<a href="tg://user?id=' + escapeHtml(String(row.userId)) + '">' + escapeHtml(fullName) + '</a>';
+		return '<a href="tg://user?id=' + escapeHtml(String(row.userId)) + '">' + escapeHtml(fullName) + '</a>　' + id + suffix;
 	}
-	return '';
+	return id + suffix;
 }
 
 // === 第一层：结构化评分 ===
@@ -23541,16 +23554,39 @@ async function handleAdUserWhitelistCommand(env, chatId, ownerId, arg) {
 		console.error('[广告检测] 补全白名单昵称失败:', error);
 	}
 	const lines = ['📋 用户白名单（' + rows.length + ' 人）', ''];
+	// 来源与日期：全同时收进标题说一次，不再每行重复 —— 35 行各挂一遍
+	// 「2026-10-14 /wl 手动添加」正是这份列表看着乱的主因。不一样时才退回逐行显示。
+	const days = [...new Set(rows.map((row) => String(row.at || '').slice(0, 10)).filter(Boolean))];
+	const notes = [...new Set(rows.map((row) => String(row.note || '').trim()).filter(Boolean))];
+	const singleDay = days.length === 1;
+	const singleNote = notes.length === 1;
+	const metaParts = [];
+	if (singleDay) metaParts.push(days[0]);
+	if (singleNote) metaParts.push(notes[0]);
+	if (metaParts.length) lines.push('　' + escapeHtml(metaParts.join(' · ')), '');
+
+	// 按「点得开」的可信度分三组。这不只是好看：三种形态点进去的命中率完全不同 ——
+	// 有 username 是客户端自动识别的 mention，一定点得动；只有昵称的走 tg://user
+	// 链接，对方开了「隐私 → 转发消息」就退化成灰字。混成一片时主人分不清
+	// 「点了没反应」是自己点错还是对方的设置。
+	const groups = [
+		{ title: '✅ 有用户名 · 点得开', rows: [], note: '' },
+		{ title: '⚠️ 只有昵称 · 可能点不动', rows: [], note: '' },
+		// 这组的说明挂在组内末行，不在列表尾部再报一次人数 ——
+		// 两处都说「3 人」只是换个说法重复，看着啰嗦。
+		{ title: '❓ 只有号码', rows: [], note: '查不到昵称 · 下次 /wl 会再点一次名' }
+	];
 	for (const row of rows) {
-		const who = renderAdWhitelistUser(row);
-		lines.push('• ' + (who ? who + '　' : '') + '<code>' + escapeHtml(row.userId) + '</code>　'
-			+ escapeHtml(row.at.slice(0, 10)) + (row.note ? '　' + escapeHtml(row.note) : ''));
+		const idx = normalizeTelegramUsername(row.username) ? 0
+			: ([row.firstName, row.lastName].filter(Boolean).join(' ').trim() ? 1 : 2);
+		groups[idx].rows.push(row);
 	}
-	// 还有谁没名字，明说 —— 静默截断会让人以为「就这么几个人查不到」。
-	const nameless = rows.filter((row) => !row.firstName && !row.lastName && !row.username).length;
-	if (nameless) {
-		lines.push('　↳ 还有 <b>' + nameless + '</b> 人没查到昵称（已退群、不在配置群，或本次超出上限）'
-			+ '，下次 /wl 会接着补');
+	for (const group of groups) {
+		if (!group.rows.length) continue;
+		lines.push('<b>' + group.title + '（' + group.rows.length + ' 人）</b>');
+		for (const row of group.rows) lines.push(renderAdWhitelistRow(row, { singleDay, singleNote }));
+		if (group.note) lines.push('　↳ ' + group.note);
+		lines.push('');
 	}
 	lines.push(...usageLines);
 	lines.push('移除后恢复检测。');
