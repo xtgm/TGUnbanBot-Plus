@@ -4497,7 +4497,7 @@ console.log('\n[23] 一键代发链路已移除');
 	assert('Webhook 初始化 → /ad 投票按钮回调已启用', webhookCall?.body?.allowed_updates?.includes('callback_query'));
 	// 【2026-10-14 补】主菜单补进 start/menu/user/adstats/dryrun 五条第一主人命令（各注明确是什么），
 	// 同日再补 /wl 与 /del —— 一对用户白名单的增删入口，与 /whitelist（域名白名单，判据层）分名。
-	assert('BotFather 菜单统一注册（含 /rm /profile + 新补五条 + /wl + /del）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice', 'start', 'menu', 'user', 'adstats', 'dryrun', 'wl', 'del']));
+	assert('BotFather 菜单统一注册（含 /rm /profile + 新补五条 + /wl + /del + /listgroups）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice', 'start', 'menu', 'user', 'adstats', 'dryrun', 'wl', 'del', 'listgroups']));
 	// /wl /del 与 rm/profile 同口径：菜单说明必须标权限，否则主人看不出它只给第一主人用
 	assert('/wl 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'wl')?.description || '').includes('仅第一主人'));
 	assert('/del 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'del')?.description || '').includes('仅第一主人'));
@@ -4505,6 +4505,8 @@ console.log('\n[23] 一键代发链路已移除');
 	assert('/wl 菜单说明写明白名单语义', /白名单/.test(String((commandCall?.body?.commands || []).find((x) => x.command === 'wl')?.description || '')));
 	// /del 的说明要写明它删的是白名单 —— 光写「删除」会被当成删消息或删黑名单
 	assert('/del 菜单说明写明删的是白名单', /白名单/.test(String((commandCall?.body?.commands || []).find((x) => x.command === 'del')?.description || '')));
+	// 【2026-10-15 补】/listgroups 摆上菜单，同样必须标权限，否则主人看不出它只给第一主人用
+	assert('/listgroups 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'listgroups')?.description || '').includes('仅第一主人'));
 	// rm / profile 允许写说明，且必须标注权限「仅第一主人」
 	assert('rm / profile 菜单说明标注「仅第一主人」', ['rm', 'profile'].every((c) => {
 		const entry = (commandCall?.body?.commands || []).find((x) => x.command === c);
@@ -5936,7 +5938,7 @@ console.log('\n[96] 动态群组管理');
 		? { ok: true, status: 200, async json() { return { ok: true, result: { id: 12345678, username: 'testbot' } }; } }
 		: { ok: true, status: 200, async json() { return { ok: true, result: true }; } });
 	const CACHED_BOT_ID = String(await sandbox.getBotId() || 12345678);
-	const mkFetch = (adminIds = [OWNER, CACHED_BOT_ID]) => async (url, init) => {
+	const mkFetch = (adminIds = [OWNER, CACHED_BOT_ID], opts = {}) => async (url, init) => {
 		const u = String(url);
 		if (u.includes('api.telegram.org')) {
 			const method = u.split('/').pop();
@@ -5951,14 +5953,20 @@ console.log('\n[96] 动态群组管理');
 					},
 				};
 			}
-			if (method === 'getChat') return { ok: true, status: 200, async json() { return { ok: true, result: { id: Number(body?.chat_id), title: '新群 ' + body?.chat_id, type: 'supergroup' } }; } };
+			// opts.failChatFor：让指定群的 getChat 失败，用来测「群名拉不到时退回只显示 ID」
+			if (method === 'getChat') {
+				if (opts.failChatFor && String(body?.chat_id) === String(opts.failChatFor)) {
+					return { ok: false, status: 400, async json() { return { ok: false, error_code: 400, description: 'Bad Request: chat not found' }; } };
+				}
+				return { ok: true, status: 200, async json() { return { ok: true, result: { id: Number(body?.chat_id), title: '新群 ' + body?.chat_id, type: 'supergroup' } }; } };
+			}
 			return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1 } }; } };
 		}
 		throw new Error('Unexpected fetch: ' + u);
 	};
-	const run = async (db, text, from = { id: Number(OWNER), is_bot: false, first_name: '主人' }, chat = { id: Number(OWNER), type: 'private' }) => {
+	const run = async (db, text, from = { id: Number(OWNER), is_bot: false, first_name: '主人' }, chat = { id: Number(OWNER), type: 'private' }, opts = {}) => {
 		resetCalls();
-		sandbox.fetch = mkFetch();
+		sandbox.fetch = mkFetch(undefined, opts);
 		const env = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: OWNER, DB: db };
 		await handler.fetch(new Request('https://x.com/', {
 			method: 'POST',
@@ -6018,6 +6026,37 @@ console.log('\n[96] 动态群组管理');
 		out.includes('环境变量群') && out.includes('指令添加群') && out.includes('动态群A') && out.includes('备注A'));
 	assert('动态群组:/listgroups 标注主群且合计正确', out.includes('主群') && out.includes('合计生效群组:3 个'));
 
+	// 补群名：环境变量群原先只有纯数字 ID（十几个群排下来认不出谁是谁）。
+	// 群名走 getChat（getChatInfoFromId），外面套 10 分钟内存缓存 —— 不然每次查看
+	// 都要按群数打一遍 API。动态群优先用库里存的 title，缺失才去拉。
+	{
+		const dbT = makeFakeDB([], { dynamicGroups: { '-1003904078173': { title: '动态群A' } } });
+		const outT = await run(dbT, '/listgroups');
+		assert('动态群组:/listgroups 环境变量群显示群名（不再只有纯 ID）',
+			outT.includes('新群 -1001') && outT.includes('新群 -1002'),
+			JSON.stringify(outT.split('\n').filter((l) => l.includes('-1001') || l.includes('-1002'))));
+
+		// 缓存：连着查两次，第二次一次 getChat 都不该发
+		resetCalls();
+		await run(dbT, '/listgroups');
+		const titleChats = callsOf('getChat').filter((c) => String(c.body?.chat_id || '').startsWith('-100'));
+		assert('动态群组:/listgroups 群名走缓存，连续查看零重复 getChat',
+			titleChats.length === 0, 'getChat 次数=' + titleChats.length);
+
+		// 群名拉不到 → 退回只显示 ID，不阻断整条命令
+		const dbF = makeFakeDB([]);
+		resetCalls();
+		sandbox.fetch = mkFetch(undefined, { failChatFor: '-1004' });
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: { message_id: 1, chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false, first_name: '主人' }, text: '/listgroups' } }),
+		}), { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1003,-1004', OWNER_IDS: OWNER, DB: dbF }, fakeCtxAd);
+		const outF = callsOf('sendMessage').map((c) => c.body.text).join('\n');
+		assert('动态群组:/listgroups 群名拉不到时退回只显示 ID，且有群名的照常显示',
+			outF.includes('环境变量群') && outF.includes('新群 -1003') && outF.includes('-1004') && !outF.includes('新群 -1004'),
+			JSON.stringify(outF.split('\n').slice(0, 8)));
+	}
+
 	// 关键：动态群参与全群封禁（合并生效验证）
 	db = makeFakeDB([], { dynamicGroups: { '-1003904078173': { title: '动态群A' } } });
 	resetCalls();
@@ -6042,6 +6081,21 @@ console.log('\n[96] 动态群组管理');
 	const targets = callsOf('restrictChatMember').map((c) => String(c.body.chat_id));
 	assert('动态群组:D1 中非法 chat_id 被过滤，不参与封禁',
 		!targets.includes('not-a-group') && targets.includes('-1003904078173'), JSON.stringify(targets));
+
+	// / 主菜单（setMyCommands）：/listgroups 此前只在 /help 里，输入 / 弹不出来。
+	// 权限闸门是本就在的「动态群组管理」那段 isPrimaryOwner，这里只是把入口摆到明面。
+	assert('动态群组:/listgroups 已进 / 主菜单，且说明写明仅第一主人',
+		/command: "listgroups", description: "[^"]*仅第一主人[^"]*"/.test(src),
+		'setMyCommands 里没有 listgroups，或说明未标注权限');
+
+	// 群名标签（/listgroups 与 /admins 共用同一套口径）：有邀请链接做成超链接，
+	// 没链接就用加粗纯文本，拉不到群名返回空串让调用方只显示 ID。
+	const labelWithUrl = sandbox.renderGroupNameLabel({ title: '群A', url: 'https://t.me/grpa' });
+	const labelNoUrl = sandbox.renderGroupNameLabel({ title: '群B', url: '' });
+	const labelEmpty = sandbox.renderGroupNameLabel({ title: '', url: 'https://t.me/x' });
+	assert('动态群组:群名标签三态正确（超链接 / 加粗 / 空串）',
+		labelWithUrl === '<a href="https://t.me/grpa">群A</a> ' && labelNoUrl === '<b>群B</b> ' && labelEmpty === '',
+		JSON.stringify([labelWithUrl, labelNoUrl, labelEmpty]));
 }
 
 // ---------- [97] 服务消息不进清扫缓存（置顶不被取消） ----------

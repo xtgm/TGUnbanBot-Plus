@@ -84,7 +84,7 @@
 - `/profile TGID` —— **资料卡 + 7 项时间线**（申请/入群/退群/任命/最早发言/最后发言/总入群）+ 黑名单与 GKY
 - `/admins` —— 分节列出主人/副主人/超管的 TGID、昵称、用户名、群内身份、来源群（单次查询上限 40 次）
 - `/learnlast 序号` —— 按**冻结快照**序号学习（列表会因新消息挤动而错位），同时加黑 + 全群封禁；判错用回执的 `/unban` 回滚
-- `/addgroup` `/delgroup` `/listgroups` —— 指令增删治理群（存 D1，三道硬校验，不改环境变量）
+- `/addgroup` `/delgroup` `/listgroups` —— 指令增删治理群（存 D1，三道硬校验，不改环境变量）；`/listgroups` 用 `getChat` 拉群名并列出台账（10 分钟缓存），三条都仅第一主人私聊可用
 - `/add_ad_admin TGID` `/del_ad_admin TGID` —— 授权 / 取消某成员发起 `/ad` 投票
 - `/pending [N]` `/ignore 序号` `/rescreen [N]` `/adstats` —— 广告检测复核与状态，见 [广告检测](#广告检测)
 - `/words [页码]` `/addword` `/delword` `/addsample` `/clearsamples` `/warmup` `/whitelist` —— 指纹库、语义样本与域名白名单维护

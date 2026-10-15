@@ -735,7 +735,11 @@ async function handleInitialization(request) {
 				// 权限闸门本就在 handleAdDetectionCommands 的 isPrimaryOwner 那一段，
 				// 这里同样只是把入口摆到明面，没有放宽任何一道门。
 				{ command: "wl", description: "用户白名单：名单里的人永不检测不封，/wl TGID 添加 (仅第一主人)" },
-				{ command: "del", description: "从用户白名单移除，支持批量，/del 123,321 123 (仅第一主人)" }
+				{ command: "del", description: "从用户白名单移除，支持批量，/del 123,321 123 (仅第一主人)" },
+				// ↓【2026-10-15 补】主人要求把 /listgroups 摆到 / 菜单明面。
+				// 权限闸门本就在「动态群组管理」那段的 isPrimaryOwner（非第一主人私聊回
+				// 权限不足、群内静默），这里只是把入口摆出来，没有放宽任何一道门。
+				{ command: "listgroups", description: "列出全部生效群组与群名 (仅第一主人)" }
 			]
 		};
 
@@ -9743,10 +9747,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/add_ad_admin TGID　给该成员发起投票的权限',
 			'/del_ad_admin TGID　收回该成员的发起权限',
 			'',
-			'<b>━━ 动态群组（仅私聊）━━</b>',
+			'<b>━━ 动态群组（仅第一主人私聊）━━</b>',
 			'/addgroup -100xxx [备注]　新增治理群，免改环境变量',
 			'/delgroup -100xxx　停止治理该群，bot 仍留在群里',
-			'/listgroups　列出全部生效群组',
+			'/listgroups　列出全部生效群组与群名（含环境变量群，标出主群）',
 			'',
 			'<b>━━ 查询与退群（仅私聊）━━</b>',
 			'/admins　查看主人、副主人与超级管理员名单',
@@ -9921,13 +9925,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const rows = Array.isArray(loadedRows) ? loadedRows : [];
 			const rowsUnavailable = loadedRows === null;
 			const lines = ['🗂️ <b>当前生效的群组</b>', ''];
+			// 群名：环境变量群库里没存，实时拉一次（外面有 10 分钟缓存）。
+			// 并发发出即可，十几个请求远低于 Telegram 的限流阈值。
+			const envInfos = await Promise.all(ENV_GROUP_IDS.map((id) => resolveGroupInfoCached(id)));
 			lines.push(`<b>环境变量群（GROUP_ID，共 ${ENV_GROUP_IDS.length} 个）</b>`);
 			if (ENV_GROUP_IDS.length === 0) {
 				lines.push('  （空）');
 			} else {
 				ENV_GROUP_IDS.forEach((id, index) => {
 					const mark = index === 0 ? ' ⭐ 主群' : '';
-					lines.push(`  ${index + 1}. <code>${escapeHtml(String(id))}</code>${mark}`);
+					lines.push(`  ${index + 1}. ${renderGroupNameLabel(envInfos[index])}<code>${escapeHtml(String(id))}</code>${mark}`);
 				});
 			}
 			lines.push('', `<b>指令添加群（D1，共 ${rows.length} 个）</b>`);
@@ -9936,9 +9943,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			} else if (rows.length === 0) {
 				lines.push('  （空）', '', '用 <code>/addgroup -100xxxx 备注</code> 添加。');
 			} else {
+				// 库里有群名就直接用（/addgroup 时存下的，零 API）；只有添加时没拉到
+				// （title 为空）才当场补一次 —— 同样是「拉不到只显示 ID」，不阻断整条命令。
+				const dynInfos = await Promise.all(rows.map(async (row) => {
+					const stored = String(row.title || '').trim();
+					if (stored) return { title: stored, url: '' };
+					return await resolveGroupInfoCached(row.chatId);
+				}));
 				rows.forEach((row, index) => {
-					const title = row.title ? escapeHtml(row.title) : '未知群名';
-					lines.push(`  ${index + 1}. <b>${title}</b> <code>${escapeHtml(row.chatId)}</code>`);
+					lines.push(`  ${index + 1}. ${renderGroupNameLabel(dynInfos[index])}<code>${escapeHtml(row.chatId)}</code>`);
 					const meta = [];
 					if (row.note) meta.push(`备注:${escapeHtml(row.note)}`);
 					if (row.addedAt) meta.push(`添加于 ${escapeHtml(row.addedAt)}`);
@@ -11863,6 +11876,48 @@ async function getChatInfoFromId(chatId) {
 		console.error('获取群组信息时出错:', error);
 		return null;
 	}
+}
+
+// /listgroups 用的群信息补齐（群名 + 可点击链接）。
+// 【为什么带缓存】群名几乎不变，而配置群有十几个 —— 不缓存的话每查一次就是十几次
+// getChat；/groups 那条路径就是每次全拉一遍。这里套一层 10 分钟内存缓存。
+// 【为什么复用 fetchConfiguredGroupInfo / resolveChatInviteUrl】项目里「群 ID → 群名」
+// 已经有一套（/admins 的 resolvePermissionGroupLabels、/groups 的 renderConfiguredGroupLine），
+// 别再为同一件事造第二个 getChat 调用点。
+// 拉不到就返回空对象，交给调用方退回只显示 ID —— 群名是锦上添花，不能因为它拉不到
+// 就让整条 /listgroups 失败（那反而连 ID 都看不到了）。
+const GROUP_INFO_CACHE_TTL_MS = 600000;
+const GROUP_INFO_CACHE = new Map();
+
+async function resolveGroupInfoCached(chatId) {
+	const key = String(chatId || '');
+	if (!key) return { title: '', url: '' };
+	const hit = GROUP_INFO_CACHE.get(key);
+	if (hit && hit.expiresAt > Date.now()) return hit.value;
+	let value = { title: '', url: '' };
+	const info = await fetchConfiguredGroupInfo(key);   // 内部自带 try/catch，失败返回 {ok:false}
+	if (info?.ok) {
+		value = {
+			title: String(info.chat?.title || '').trim(),
+			// 与 /admins 同款：公开群走 t.me/username，私密群用 getChat 返回的 invite_link。
+			// 刻意不调 exportChatInviteLink —— 那会撤销并重建主邀请链接，让群内所有人
+			// 手上的旧链接失效，代价远大于「让一行字可点击」。
+			url: String(resolveChatInviteUrl(info.chat) || '').trim()
+		};
+	}
+	// 失败【不写缓存】：下次还得再试一次，不能把「这次没拉到」记成「这个群没名字」
+	if (value.title) GROUP_INFO_CACHE.set(key, { value, expiresAt: Date.now() + GROUP_INFO_CACHE_TTL_MS });
+	return value;
+}
+
+// 「群名 + 一个空格」前缀；拉不到群名就返回空串（调用方只显示 ID）。
+// 有邀请链接就把群名做成超链接，与 /admins 的群名显示同一套口径。
+function renderGroupNameLabel(info) {
+	const title = String(info?.title || '').trim();
+	if (!title) return '';
+	const safe = escapeHtml(title);
+	const url = String(info?.url || '').trim();
+	return (url ? '<a href="' + escapeHtml(url) + '">' + safe + '</a>' : '<b>' + safe + '</b>') + ' ';
 }
 
 // ============================================================================
