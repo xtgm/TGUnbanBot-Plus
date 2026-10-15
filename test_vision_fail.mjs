@@ -261,6 +261,50 @@ section('[4] /adstats 展示失败台账');
 	assert('无失败时不显示台账屏', !/视觉识别失败台账/.test(cleanText), cleanText.slice(0, 200));
 }
 
+// ================= [5] /adstats 各通道定罪 /误封对账 =================
+section('[5] /adstats 各通道定罪 /误封对账');
+{
+	// 【为什么要有这一屏】第③层向量相似度是全系统定罪量最大的主力通道
+	//（线上实测 5525 次），而它的样本库里 5834 条是 source=auto 自动学的、
+	// 没人审过。现在 0.11% 很干净，但样本库会持续增长 —— 噪声混进来之后
+	// 这条通道会【悄悄】变脏，等主人收到误封反馈时可能已经封了几百个。
+	// 有这一屏，谁的误封率抬头立刻看得见，不用靠事后反馈猜。
+	// 数据全部来自 ad_pending_snapshots（/ignore 回滚过的记 expires_at=0），
+	// 零新增表、零新增查询往返（并进 /adstats 现有的那次 batch）。
+	const envAcc = makeEnv();
+	await W.adDetectionReady(envAcc);
+	const seedSnap = (seq, userId, reasons, expiresAt) => envAcc.DB.prepare(
+		'INSERT INTO ad_pending_snapshots (owner_id, seq, user_id, chat_id, score, reasons, snapshot, created_at, expires_at) '
+		+ 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+	).bind(OWNER_ID, seq, String(userId), '-100111', 7, JSON.stringify(reasons), '{}',
+		Math.floor(Date.now() / 1000), expiresAt).run();
+	await seedSnap(1, 1001, ['+3 指纹库命中：@adexample'], 9999999999);
+	await seedSnap(2, 1002, ['+3 指纹库命中：@adexample2'], 0);   // expires_at=0 = 被 /ignore 回滚 = 误封
+	await seedSnap(3, 1003, ['AI 语义相似度 0.794 ≥ 阈值 0.78'], 9999999999);
+	calls.length = 0;
+	await post({ update_id: 7, message: { message_id: 7, date: 1, text: '/adstats', chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID, is_bot: 0, first_name: 'O' } } }, envAcc);
+	const accText = sendTextOf('sendMessage').join('\n');
+	// 数字用【剥掉 HTML 标签】后的文本匹配 —— 屏上是「定罪 <b>2</b>」，
+	// 直接拿原文匹配「定罪 2」永远匹配不到，会把格式问题误报成数据问题。
+	const accPlain = accText.replace(/<\/?b>/g, '');
+	assert('★ /adstats 报出各通道对账屏', /各通道定罪/.test(accText), accText.slice(0, 300));
+	assert('★ 指纹层：定罪 2 / 误封 1 / 50.00%',
+		/指纹库命中\s*定罪 2\s*误封 1\s*50\.00%/.test(accPlain),
+		(accPlain.match(/指纹库命中[^\n]*/) || ['(没匹配到)'])[0]);
+	assert('★ AI 向量层：定罪 1 / 误封 0',
+		/AI 向量相似度\s*定罪 1\s*误封 0/.test(accPlain),
+		(accPlain.match(/AI 向量相似度[^\n]*/) || ['(没匹配到)'])[0]);
+	assert('★ 点明误封口径是 /ignore 回滚', /ignore/.test(accText), accPlain.slice(0, 700));
+
+	// 一条封禁都没有时不显示 —— 每次 /adstats 都带一块全 0 的表只是噪音
+	const envEmpty = makeEnv();
+	await W.adDetectionReady(envEmpty);
+	calls.length = 0;
+	await post({ update_id: 8, message: { message_id: 8, date: 1, text: '/adstats', chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID, is_bot: 0, first_name: 'O' } } }, envEmpty);
+	const emptyText = sendTextOf('sendMessage').join('\n');
+	assert('★ 无定罪记录时不显示对账屏', !/各通道定罪/.test(emptyText), emptyText.slice(0, 300));
+}
+
 console.log(`\n========== ${pass} 通过 / ${fail} 失败 ==========`);
 if (failures.length) console.log('失败项：\n  - ' + failures.join('\n  - '));
 process.exit(fail ? 1 : 0);

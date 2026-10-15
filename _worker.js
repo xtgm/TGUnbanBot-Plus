@@ -22999,6 +22999,26 @@ async function handleAdDigestCommand(env, chatId, arg) {
 }
 
 
+// 各通道「定罪 / 误封」对账的行定义（2026-10-15 观测屏）。
+// total 与 fp 对应下面那条聚合 SQL 的两个别名。
+//
+// 【为什么要有它】第③层向量相似度是全系统定罪量最大的主力通道（线上 5525 次），
+// 而它的样本库里 5834 条是 source=auto 自动学的、没人审过。现在误封率 0.11% 很干净，
+// 但样本库会持续增长 —— 噪声混进来之后这条通道会【悄悄】变脏，等主人收到误封
+// 反馈时可能已经封了几百个。有这一屏，谁的抬头立刻看得见，不用靠事后反馈猜。
+//
+// 【只列五条会封人的通道】评分层不在其中：它的 reasons 是几十条判据的组合，
+// 没有单一关键词可 LIKE，硬凑会把「评分凑到 7 分」与「AI 加分」混为一谈。
+const AD_CHANNEL_ACCOUNT_ROWS = [
+	{ label: '指纹库命中', total: 'fp_total', fp: 'fp_false' },
+	{ label: 'AI 向量相似度', total: 'ai_total', fp: 'ai_false' },
+	{ label: '同款自定义 emoji', total: 'badge_total', fp: 'badge_false' },
+	{ label: '头像命中广告图', total: 'avatar_total', fp: 'avatar_false' },
+	{ label: 'AI 深度判定（第⑥层）', total: 'llm_total', fp: 'llm_false' }
+];
+// 误封率警戒线（百分比）。超过它那一行会带 ⚠️。
+const AD_CHANNEL_ACCOUNT_WARN_RATE = 1;
+
 async function handleAdStatsCommand(env, chatId) {
 	const config = loadAdDetectionConfig(env);
 	// 顺带补一批样本向量。此前 topUpAdSampleEmbeddings 的唯一调用点在 checkAdAiSimilarity 内部，
@@ -23023,6 +23043,7 @@ async function handleAdStatsCommand(env, chatId) {
 	let badgeRows = [];
 	let visionFailRow = null;
 	let visionFailTop = [];
+	let channelAccount = null;
 	try {
 		const rows = await env.DB.batch([
 			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints'),
@@ -23042,7 +23063,23 @@ async function handleAdStatsCommand(env, chatId) {
 			// 视觉识别失败台账。【只能放 batch 末尾】下标是硬编码的，插进 rows[6] 之前
 			// 会让后面全部错位 —— 这类错位不报错，只会静默显示成别人的数据。
 			env.DB.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures'),
-			env.DB.prepare('SELECT kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures ORDER BY last_at DESC LIMIT 3')
+			env.DB.prepare('SELECT kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures ORDER BY last_at DESC LIMIT 3'),
+			// 各通道定罪 / 误封对账。【下标硬编码，只能追加在 batch 末尾】同上一条。
+			// 误封 = 被主人 /ignore 回滚过的（expires_at=0），与定罪总数在同一条 SQL 里
+			// 聚合 —— 并进这次 batch 就不多付一次 D1 往返。
+			// 五条通道两两一对：*_total 是定罪数、*_false 是其中被回滚的数。
+			env.DB.prepare(`SELECT
+				SUM(CASE WHEN reasons LIKE '%指纹库命中%' THEN 1 ELSE 0 END) AS fp_total,
+				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%指纹库命中%' THEN 1 ELSE 0 END) AS fp_false,
+				SUM(CASE WHEN reasons LIKE '%AI 语义相似度%' THEN 1 ELSE 0 END) AS ai_total,
+				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%AI 语义相似度%' THEN 1 ELSE 0 END) AS ai_false,
+				SUM(CASE WHEN reasons LIKE '%同款自定义 emoji%' THEN 1 ELSE 0 END) AS badge_total,
+				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%同款自定义 emoji%' THEN 1 ELSE 0 END) AS badge_false,
+				SUM(CASE WHEN reasons LIKE '%头像命中广告图库%' THEN 1 ELSE 0 END) AS avatar_total,
+				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%头像命中广告图库%' THEN 1 ELSE 0 END) AS avatar_false,
+				SUM(CASE WHEN reasons LIKE '%AI 深度判定命中%' THEN 1 ELSE 0 END) AS llm_total,
+				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%AI 深度判定命中%' THEN 1 ELSE 0 END) AS llm_false
+			FROM ad_pending_snapshots`)
 		]);
 		fpTotal = Number(rows[0]?.results?.[0]?.c) || 0;
 		fpByType = rows[1]?.results || [];
@@ -23055,6 +23092,7 @@ async function handleAdStatsCommand(env, chatId) {
 		badgeRows = rows[8]?.results || [];
 		visionFailRow = rows[9]?.results?.[0] || null;
 		visionFailTop = rows[10]?.results || [];
+		channelAccount = rows[11]?.results?.[0] || null;
 	} catch (error) {
 		console.error('[广告检测] 统计查询失败:', error);
 	}
@@ -23197,6 +23235,33 @@ async function handleAdStatsCommand(env, chatId) {
 			lines.push('　↳ 失败集中在 ' + escapeHtml(failKinds.join('、'))
 				+ ' —— 同一类反复失败通常是系统性问题（格式 / 模型），不是偶发');
 		}
+	}
+
+	// ===== 各通道定罪 / 误封对账（2026-10-15）=====
+	// 【为什么是这五个数】判据会不会退化，光看「封了多少」看不出来 —— 封得多
+	// 可能是广告真的变多，也可能是判据在乱杀。只有把【定罪】和【被 /ignore 回滚】
+	// 摆在一起才算得清谁在变脏。数据全是既有的（ad_pending_snapshots），零新增表。
+	// 【一行都不带就整屏不显示】主人健康时看到的 /adstats 不该多出一块全 0 的表。
+	const accountLines = [];
+	if (channelAccount) {
+		for (const row of AD_CHANNEL_ACCOUNT_ROWS) {
+			const total = Number(channelAccount[row.total]) || 0;
+			if (!total) continue;
+			const falseCount = Number(channelAccount[row.fp]) || 0;
+			const rate = falseCount * 100 / total;
+			accountLines.push(row.label + '　定罪 <b>' + total + '</b>　误封 <b>' + falseCount
+				+ '</b>　' + rate.toFixed(2) + '%'
+				+ (rate >= AD_CHANNEL_ACCOUNT_WARN_RATE ? '　⚠️' : ''));
+		}
+	}
+	if (accountLines.length) {
+		lines.push('');
+		lines.push('<b>⚖️ 各通道定罪 / 误封对账</b>');
+		lines.push(...accountLines);
+		lines.push('　↳ 误封 = 主人 <code>/ignore</code> 回滚过的条数；⚠️ = 误封率 ≥ '
+			+ AD_CHANNEL_ACCOUNT_WARN_RATE + '%');
+		lines.push('　↳ 全绿说明判据还在正轨上，哪一行抬头就是那个判据在退化 —— '
+			+ '第③层的样本库是自动学的，这条最该盯');
 	}
 	lines.push('<b>域名白名单</b>　生效 <b>' + whitelist.size + '</b> 条（D1 自定义 ' + whitelistRows + ' 条，内置种子 ' + AD_DOMAIN_WHITELIST_SEED.length + ' 条）');
 	// 入群检查流水。只记命中的话这一屏对绝大多数新成员是一片空白，
