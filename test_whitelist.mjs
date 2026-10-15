@@ -516,6 +516,107 @@ section('[7] handleAdCallbackQuery 认得 wl 分支');
 	assert('未知 action 只回执不编辑消息', callsOf('editMessageText').length === 0);
 }
 
+// ================= [8] /wl 列表显示昵称与资料卡入口 =================
+section('[8] /wl 列表：昵称与可点击的资料卡入口');
+{
+	// 起因：主人 2026-10-15 截图 —— 白名单 35 人全是「• 5740566746 2026-10-14」，
+	// 一排纯数字看不出谁是谁。要的是「知道是谁」+「点得开资料卡」。
+	//
+	// 【一个必须避开的坑】不能一律套 tg://user?id= 链接：官方 ChatFullInfo.has_private_forwards
+	// 写明，对方把「隐私和安全 → 转发消息」设为非「所有人」时，该链接只在与该用户本人的聊天里
+	// 生效，别处退化成点不动的灰字。项目在 /blacklist 操作人那里已经实拍过这个问题。
+	// 所以分三档、可靠性递减：有 username 走纯文本 @xxx（客户端自动识别，不受该设置约束）；
+	// 只有名字才回落 tg://user 链接；两样都没有就只给 TGID，不生成死链接。
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	const now = Math.floor(Date.now() / 1000);
+	const seedMember = (uid, first, last, uname) => env.DB.prepare(
+		'INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at) '
+		+ 'VALUES (?, ?, ?, ?, ?, ?, ?, 0)'
+	).bind(String(uid), GROUP_ID, first, last, uname, now, now).run();
+	// 名册里两个人：A 有 username、B 只有名字；C 名册里完全没有
+	await seedMember(5001, '张三', '', 'zhangsan_wl');
+	await seedMember(5002, '李四', '', '');
+	for (const id of ['5001', '5002', '5003']) {
+		await W.addAdUserWhitelist(env, id, String(OWNER_ID), '/wl 手动添加');
+	}
+
+	// C 不在名册 → 走配置群点名。mock 成「在群里点到了他」
+	// 【setApi 必须在 resetCalls 之后】resetCalls 内部会调 setApi() 把 handler 清空，
+	// 写反了自定义 mock 会被静默丢掉，表现是「点名没生效」，与实现出错长得一样。
+	resetCalls();
+	setApi({
+		getChatMember: (body) => String(body?.user_id) === '5003'
+			? { ok: true, result: { status: 'member', user: { id: 5003, first_name: '王五', username: 'wangwu_wl' } } }
+			: { ok: true, result: { status: 'member', user: { id: body?.user_id } } }
+	});
+	await sendCommand('/wl', env);
+	const text = sendTextOf('sendMessage').join('\n');
+
+	assert('★ 有 username 的走纯文本 @username（一定点得动）',
+		text.includes('@zhangsan_wl'), text.slice(0, 400));
+	assert('★ 有 username 的不再套 tg://user 链接（那种可能点不动）',
+		!/tg:\/\/user\?id=5001/.test(text), text.slice(0, 400));
+	assert('★ 昵称与用户名并排显示（看名字认人，点用户名进资料卡）',
+		text.includes('张三') && text.includes('@zhangsan_wl'), text.slice(0, 400));
+	assert('★ 无 username 的回落 tg://user 链接且链接文字就是昵称',
+		/<a href="tg:\/\/user\?id=5002">李四<\/a>/.test(text), text.slice(0, 400));
+
+	assert('★ 名册里没有的去配置群点名补上昵称',
+		text.includes('@wangwu_wl'), text.slice(0, 400));
+	const filled = env.DB.query("SELECT first_name, username FROM ad_group_members WHERE user_id = '5003'");
+	assert('★ 点到的结果写回名册（下次零成本）',
+		filled.length === 1 && String(filled[0].username) === 'wangwu_wl', JSON.stringify(filled));
+
+	const looked = callsOf('getChatMember')
+		.map((c) => String(c.body?.user_id || ''))
+		.filter((id) => ['5001', '5002', '5003'].includes(id));
+	assert('★ 名册里已有的两个人一个 getChatMember 都不发（走零成本路径）',
+		looked.includes('5003') && !looked.includes('5001') && !looked.includes('5002'),
+		JSON.stringify(looked));
+
+	assert('★ TGID 仍逐条给出（要能复制去 /check、/unban）',
+		['5001', '5002', '5003'].every((id) => text.includes(id)), text.slice(0, 400));
+
+	// 补进名册的人按【老数据档】处理：first_seen = 0。
+	// adRescanTierSeconds 对 first_seen 为 0 的约定是「走最老一档（3 天）」——
+	// 补一个 first_seen = now 会让 cron 把这批人当成刚进群的新号，按 2 小时一次高频重扫。
+	const filledRow = env.DB.query("SELECT first_seen, bio_checked_at FROM ad_group_members WHERE user_id = '5003'");
+	assert('★ 补进名册走老数据档（first_seen=0，不当新人高频重扫）',
+		Number(filledRow[0]?.first_seen) === 0, JSON.stringify(filledRow));
+
+	// 第二次 /wl：名册已经补齐，一个 getChatMember 都不该再发。
+	// 这条同时是「写回名册」这个设计的收益断言 —— 少了它，写回名册就成了纯副作用。
+	resetCalls();
+	await sendCommand('/wl', env);
+	const looked2 = callsOf('getChatMember').filter((c) => ['5001', '5002', '5003'].includes(String(c.body?.user_id || '')));
+	assert('★ 第二次 /wl 零 API 调用（走名册）', looked2.length === 0, JSON.stringify(looked2.map((c) => c.body?.user_id)));
+
+	// 谁都没查到：只给 TGID，不生成点不动的死链接
+	const env2 = makeEnv();
+	await W.adDetectionReady(env2);
+	await W.addAdUserWhitelist(env2, '6001', String(OWNER_ID), '/wl 手动添加');
+	resetCalls();
+	setApi({
+		getChatMember: () => ({ ok: false, error_code: 400, description: 'Bad Request: user not found' })
+	});
+	await sendCommand('/wl', env2);
+	const text2 = sendTextOf('sendMessage').join('\n');
+	assert('★ 查不到时只给 TGID，不生成死链接',
+		text2.includes('6001') && !/tg:\/\/user\?id=6001/.test(text2), text2.slice(0, 300));
+
+	// 只有壳没有名字的回包不算查到 —— getChatMember 对不存在的用户也可能回一个只有 id 的 user，
+	// 拿它写回名册等于把「没查到」记成「查到了」，还会在屏上渲染出一个点不开的空链接。
+	const env3 = makeEnv();
+	await W.adDetectionReady(env3);
+	await W.addAdUserWhitelist(env3, '7001', String(OWNER_ID), '/wl 手动添加');
+	resetCalls();
+	setApi({ getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }) });
+	await sendCommand('/wl', env3);
+	const wrote = env3.DB.query("SELECT * FROM ad_group_members WHERE user_id = '7001'");
+	assert('★ 只有 id 没有名字的回包不写回名册', wrote.length === 0, JSON.stringify(wrote));
+}
+
 // ================= 汇总 =================
 console.log(`\n========== ${pass} 通过 / ${fail} 失败 ==========`);
 if (failures.length) console.log('失败项：\n  - ' + failures.join('\n  - '));

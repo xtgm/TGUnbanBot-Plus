@@ -13246,18 +13246,122 @@ async function removeAdUserWhitelist(env, userId) {
 async function listAdUserWhitelist(env) {
 	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
 	try {
+		// LEFT JOIN 名册表取昵称。名册本来就存着 first_name / last_name / username，
+		// 一次 JOIN 零额外调用；名册里没有的人那几个字段是 null，下面统一归一成空串。
 		const { results } = await env.DB
-			.prepare('SELECT user_id, by_user, at, note FROM ad_user_whitelist ORDER BY at DESC').all();
+			.prepare('SELECT w.user_id, w.by_user, w.at, w.note, m.first_name, m.last_name, m.username '
+				+ 'FROM ad_user_whitelist w LEFT JOIN ad_group_members m ON m.user_id = w.user_id '
+				+ 'ORDER BY w.at DESC').all();
 		return { ok: true, rows: (results || []).map((row) => ({
 			userId: String(row?.user_id || ''),
 			byUser: String(row?.by_user || ''),
 			at: String(row?.at || ''),
-			note: String(row?.note || '')
+			note: String(row?.note || ''),
+			firstName: String(row?.first_name || ''),
+			lastName: String(row?.last_name || ''),
+			username: String(row?.username || '')
 		})) };
 	} catch (error) {
 		console.error('[广告检测] 列举用户白名单失败:', error);
 		return { ok: false, reason: 'error' };
 	}
+}
+
+// 每次 /wl 最多点名多少人。白名单是一次加几十个的场景（线上 35 人），
+// 而每个没名册的人最坏要走遍全部配置群 —— 不设上限的话，名单涨到几百人时会把这条命令拖到超时。
+// 超出的部分下次 /wl 接着补；补到的都写回名册，所以会逐次收敛，不会永远补不完。
+const AD_WL_NAME_LOOKUP_MAX = 40;
+// 点名用的并发。与 BATCH_USER_PROFILE_CONCURRENCY 分开：那个 3 是给批量封禁回执控子请求的，
+// 这里是纯查询、无人值守，可以拉高一点。
+const AD_WL_NAME_CONCURRENCY = 6;
+
+// 只把昵称补进名册，【不动已有行的发言时序字段】。
+// 【为什么不复用 upsertAdGroupMember】那个函数会把 last_seen 覆盖成当前时间，
+// 而 last_seen 的含义是「最近一次发言」、还是 pruneAdDetectionData 那 90 天剪枝的依据 ——
+// 在 /wl 里刷新它，等于把「没说过话」记成「刚说过」，这些人从此永远不被剪枝，
+// 名册会慢慢积成一张「全员都在」的假账。
+// first_seen 传 0：走【最老一档】复查节奏（adRescanTierSeconds 对 0 的约定），
+// 不因为「我们刚知道他」就把他当新人按 2 小时一次重扫。
+// 【已知代价，如实记下】cron 待复查名单的 SQL 只排除黑名单、不排除白名单，
+// 所以补进名册的白名单用户会以 3 天一次的节奏各花一次 getChat 拉 bio ——
+// 判定本身会被白名单豁免，只是白拉。这是既有缺陷（名册里原有的白名单用户
+// 一直就在被扫），不是本次引入的。
+async function fillAdGroupMemberName(env, userId, chatId, user) {
+	const uid = String(userId || '');
+	if (!env?.DB || !uid) return false;
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at) '
+			+ 'VALUES (?, ?, ?, ?, ?, 0, ?, 0) '
+			+ 'ON CONFLICT(user_id) DO UPDATE SET '
+			+ 'first_name = excluded.first_name, last_name = excluded.last_name, username = excluded.username'
+		).bind(uid, String(chatId ?? ''), String(user?.first_name || ''), String(user?.last_name || ''),
+			String(user?.username || ''), now).run();
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 补写名册昵称失败:', error);
+		return false;
+	}
+}
+
+// 把白名单里的「一串数字」变成「知道是谁」。
+// 【为什么需要第二步】名册表 ad_group_members 存着昵称，但它是【靠发言 upsert 填充】的
+// （upsertAdGroupMember 只在消息路径被调用），没在配置群说过话的人一条记录都没有 ——
+// 线上实测 35 个白名单用户只有 23 个有名册。
+// 【为什么用 getChatMember 而不是 getChat】getChatMember 对【群成员】有效，与发没发过言无关；
+// getChat 对从未与 bot 私聊过的用户恒返回 chat not found（那条链路的注释记着实测成功率约 69%）。
+// 所以对每个没名册的人，按配置群逐个点名，命中即停。
+// 【写回名册】补到的立刻 upsert 进 ad_group_members，之后每次 /wl 只多一条 SQL、零 API 调用。
+// 返回 Map<userId, {firstName, lastName, username}>，由调用方合并进展示数据。
+async function resolveAdWhitelistNames(env, rows) {
+	const found = new Map();
+	if (!env?.DB) return found;
+	const missing = (rows || [])
+		.filter((row) => !row.firstName && !row.lastName && !row.username && isPureTgid(row.userId))
+		.slice(0, AD_WL_NAME_LOOKUP_MAX);
+	if (!missing.length) return found;
+
+	await mapWithConcurrency(missing, AD_WL_NAME_CONCURRENCY, async (row) => {
+		for (const groupId of GROUP_IDS) {
+			try {
+				const result = await checkUserStatus(row.userId, groupId);
+				const user = result?.result?.user;
+				const firstName = String(user?.first_name || '');
+				const lastName = String(user?.last_name || '');
+				const username = String(user?.username || '');
+				// 【判据是三样之一非空，不是 user.id 存在】getChatMember 对查不到的人也可能
+				// 回一个只有 id 的空壳，拿它写回名册等于把「没查到」记成「查到了」，
+				// 屏上还会渲染出一个点不开的空链接。
+				if (!firstName && !lastName && !username) continue;
+				found.set(String(row.userId), { firstName, lastName, username });
+				await fillAdGroupMemberName(env, row.userId, groupId, user);
+				return;
+			} catch (_) {
+				// 单个群查不到（已退群 / 不是该群成员）继续下一个群，
+				// 与 formatTargetByTgid 的「单群失败继续下一个」同口径。
+			}
+		}
+	});
+	return found;
+}
+
+// 一行白名单里的「人」怎么显示。三档，可靠性递减 —— 顺序不能改：
+//   ① 有 username → 纯文本 @xxx。Telegram 客户端自动识别成用户链接，一定点得动。
+//   ② 只有名字   → tg://user?id= 链接。多数点得动，但官方 ChatFullInfo.has_private_forwards
+//                  写明：对方把「隐私和安全 → 转发消息」设为非「所有人」时，该链接
+//                  只在与该用户本人的聊天里生效，别处退化成点不动的灰字。
+//   ③ 两样都没有 → 空串。调用方只显示 TGID，绝不生成点不动的死链接。
+function renderAdWhitelistUser(row) {
+	const fullName = [row.firstName, row.lastName].filter(Boolean).join(' ').trim();
+	const username = normalizeTelegramUsername(row.username);
+	if (username) {
+		return '@' + escapeHtml(username) + (fullName ? '　' + escapeHtml(fullName) : '');
+	}
+	if (fullName) {
+		return '<a href="tg://user?id=' + escapeHtml(String(row.userId)) + '">' + escapeHtml(fullName) + '</a>';
+	}
+	return '';
 }
 
 // === 第一层：结构化评分 ===
@@ -23422,10 +23526,31 @@ async function handleAdUserWhitelistCommand(env, chatId, ownerId, arg) {
 			+ usageLines.join('\n'));
 		return;
 	}
+	// 名册里没有的，当场去配置群点名补一次（补到的写回名册，之后这批人零成本）。
+	// 补名字失败绝不能让整条命令失败 —— 那几个只显示 TGID，列表主体照常输出。
+	try {
+		const filled = await resolveAdWhitelistNames(env, rows);
+		for (const row of rows) {
+			const hit = filled.get(String(row.userId));
+			if (!hit) continue;
+			row.firstName = hit.firstName;
+			row.lastName = hit.lastName;
+			row.username = hit.username;
+		}
+	} catch (error) {
+		console.error('[广告检测] 补全白名单昵称失败:', error);
+	}
 	const lines = ['📋 用户白名单（' + rows.length + ' 人）', ''];
 	for (const row of rows) {
-		lines.push('• <code>' + escapeHtml(row.userId) + '</code>　' + escapeHtml(row.at.slice(0, 10))
-			+ (row.note ? '　' + escapeHtml(row.note) : ''));
+		const who = renderAdWhitelistUser(row);
+		lines.push('• ' + (who ? who + '　' : '') + '<code>' + escapeHtml(row.userId) + '</code>　'
+			+ escapeHtml(row.at.slice(0, 10)) + (row.note ? '　' + escapeHtml(row.note) : ''));
+	}
+	// 还有谁没名字，明说 —— 静默截断会让人以为「就这么几个人查不到」。
+	const nameless = rows.filter((row) => !row.firstName && !row.lastName && !row.username).length;
+	if (nameless) {
+		lines.push('　↳ 还有 <b>' + nameless + '</b> 人没查到昵称（已退群、不在配置群，或本次超出上限）'
+			+ '，下次 /wl 会接着补');
 	}
 	lines.push(...usageLines);
 	lines.push('移除后恢复检测。');
