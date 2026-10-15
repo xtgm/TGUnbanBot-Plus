@@ -345,6 +345,27 @@ console.log('\n===== 人工判定学习 =====');
 			{ learned: 0, sampleAdded: 0, imageLearned: 0, avatars: 0, badges: 0, shapes: 0, enriched: 0 },
 			'ban').length === 0);
 
+	// ⑩ 从缓存捞正文（/spam <TGID> 不带引用时的正文来源）
+	// 【为什么需要它】/spam <id> 此前只学得到资料卡 —— 代码注释原话「正文无从得知」，
+	// text 传空串（命令消息内容是「/spam 123」，学它等于把命令文本当广告样本）。
+	// 而主人的痛点恰恰是这个：广告被别的 bot 先删了、来不及引用。
+	// 缓存改成按天保留（MSG_CACHE_RETENTION_DAYS=7）之后，moderation_messages 里
+	// 有该用户最近 7 天的发言，这是唯一还拿得到广告文案的地方。
+	const cacheD1 = env.DB;
+	await W.ensureAdDetectionTables(env);
+	cacheD1.query("INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm, is_ad) VALUES (9001,'-100111','991001','2026-10-15T02:00:00.000Z','h9001','成人短剧每日更新全网热门精品短剧 进频道 @ppduanju',1)");
+	cacheD1.query("INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm, is_ad) VALUES (9002,'-100111','991001','2026-10-15T02:01:00.000Z','h9002','女朋友的闺蜜来借住一晚 频道 @ppduanju 官方群 @PPDJ2026',1)");
+	const cachedText = await W.loadRecentUserAdText(env, '991001');
+	check('★ 缓存里捞得到该用户正文', cachedText.includes('成人短剧') && cachedText.includes('ppduanju'), JSON.stringify(cachedText));
+	check('★ 取最近 N 条而不是全部（控成本）',
+		cachedText.split('\n').length <= 5, String(cachedText.split('\n').length));
+	check('★ 捞不到时返回空串而不是抛错',
+		(await W.loadRecentUserAdText(env, '999999999')) === '',
+		JSON.stringify(await W.loadRecentUserAdText(env, '999999999')));
+	check('★ 缓存表不存在时也不抛错（降级为只学资料卡）',
+		typeof (await W.loadRecentUserAdText({ DB: null }, '991001')) === 'string');
+	cacheD1.query("DELETE FROM moderation_messages WHERE from_id='991001'");
+
 	W.fetchAdUserProfile = realFetch;
 }
 

@@ -336,6 +336,36 @@ section('[6] 形态 C 色情引流型：色情指向词 ∧ 引流出口（2026-
 		&& !/\bAD_PORN_PATTERNS[\s\S]{0,800}['"]外围['"]/.test(src)
 		&& !/\bAD_PORN_PATTERNS[\s\S]{0,800}['"]完整版['"]/.test(src),
 		'逐词核对');
+	// 【丁 · 2026-10-15】补主人发来的 6 张图里判据够不着的形态。
+	// 用户口径：「正常人是不会搞色情的，所以杀就完了」，但【单特征不能封】——
+	// 色情词仍必须配引流出口（形态 C），行业词仍必须配招揽意图（形态 A）。
+	//
+	// 色情短剧引流（图 #36-#38）：正文含色情语 + 频道 / 官方群两个提及。
+	const shortDrama = W.judgeAdStructure(
+		'🎬 AI成人短剧每日更新全网热门精品短剧 '
+		+ '🔥 女友帮我操闺蜜，失恋闺蜜住进家的第一晚…淫水把床单都打湿了… '
+		+ '频道: @ppduanju 官方群: @PPDJ2026', '', 'body');
+	assert('色情短剧引流 → 定罪', shortDrama.guilty === true, JSON.stringify(shortDrama.reasons));
+
+	// 缅甸「开火车」变体（图 #41）：正文只有一个词 + 预览卡描述里是广告语。
+	const trainSpam = W.judgeAdStructure(
+		'开车 缅甸内部群10月流出开火车视频 萝莉被卖去缅甸 刚到地方就被20几个狗推拖进酒店轮流上 '
+		+ 'https://mm-train.example.com/v/1', '', 'body');
+	assert('缅甸开火车变体 → 定罪', trainSpam.guilty === true, JSON.stringify(trainSpam.reasons));
+
+	// 词表故意【不收】的高频中性词 —— 谁手滑补进去，这条立刻变红。
+	const animeFan = W.judgeAdStructure('这个萝莉角色好可爱 https://anime.example.com/a', '', 'body');
+	assert('动漫讨论（萝莉）→ 不定罪', animeFan.guilty === false, JSON.stringify(animeFan.reasons));
+	const gameTrain = W.judgeAdStructure('我们几个开火车去 https://game.example.com/a', '', 'body');
+	assert('游戏语境（开火车）→ 不定罪', gameTrain.guilty === false, JSON.stringify(gameTrain.reasons));
+
+	// U 商 / 博彩（图 #39）：只有行业词、没有招揽意图 → 与形态 A 同一道闸，不许单类定罪。
+	const uBizOnly = W.judgeAdStructure('可进交易所钱包 冻结包赔 https://u-biz.example.com/a', '', 'body');
+	assert('只有行业词、无招揽 → 不定罪（单特征不封）', uBizOnly.guilty === false, JSON.stringify(uBizOnly.reasons));
+	// 配上招揽意图才定罪。
+	const uBizFull = W.judgeAdStructure(
+		'🚗 一手、黑、U 🔥比例1:3可进交易所钱包，🔑可撸博彩 / 可测试 冻结包赔! 🔔进了解: @c043c', '', 'body');
+	assert('行业词 + 招揽意图同现 → 定罪', uBizFull.guilty === true, JSON.stringify(uBizFull.reasons));
 }
 
 section('[5] 源码断言：三要素写在判据里');

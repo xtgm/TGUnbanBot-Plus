@@ -165,6 +165,22 @@ const DEFAULT_STAT_SEARCH_GROUPS = [];
 // 搜索群正文保留天数（按 moderation_messages.created_at 裁剪）。
 const STAT_SEARCH_RETENTION_DAYS = 180;
 
+// 非搜索群的正文保留天数（2026-10-15 新增）。
+//
+// 【为什么加】改动前这里按 autoincrement 保留最新 max(MSG_CACHE_SIZE, 200) 条 ——
+// 14 个群一天几千条消息，200 条只够几分钟。线上实测：moderation_messages 整张表
+// 总共 245 条，主人要 /spam 的那批广告【一条记录都没有】，同款直封的 text_hash
+// 同样只覆盖这几分钟 —— 而 ad_spam_texts 的 TTL 是 7 天，名义上拦一周、
+// 实际拦不到第二天。主人原话：「很多问题都是可以通过 spam 学习而解决问题的」——
+// 学习链本身是通的（语义样本 6556 条全部已算向量），缺的是原料。
+//
+// 7 天与 AD_SPAM_TEXTS_TTL_MS 对齐：/spam 学过的东西，7 天内同款都该拦得住。
+const MSG_CACHE_RETENTION_DAYS = 7;
+
+// 行数硬上限：时间窗在极端流量（某个群刷屏）下会涨到几十万行，用它兜住。
+// 50000 行 × 约 300 字节 ≈ 15 MB，D1 付费层可忽略。
+const MSG_CACHE_HARD_LIMIT = 50000;
+
 // 11) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
 //    留空 → 用 GROUP_IDS[0]（主群），与原行为一致。
 //    填了就直接用（2026-09-26 方案 A）：联系群只用来生成那颗按钮的链接，不参与封禁/检测/鉴权，
@@ -1330,28 +1346,41 @@ async function pruneAutoincrementCacheTable(env, table, keepLimit, nowMs = Date.
 	if (table !== 'moderation_messages') {
 		throw new Error(`Unsupported D1 cache table: ${table}`);
 	}
-	const safeLimit = Math.max(1, Math.floor(Number(keepLimit) || 1));
+	// 【2026-10-15 甲】keepLimit 不再控制裁剪，保留参数只为不惊动调用方。
+	// 改之前它就是 max(MSG_CACHE_SIZE, 200)，200 条对 14 个群只够几分钟，
+	// /spam 与同款直封因此双双失效 —— 详见 MSG_CACHE_RETENTION_DAYS 上方那段。
+	const cacheCutoffIso = new Date(nowMs - MSG_CACHE_RETENTION_DAYS * 86400000).toISOString();
 	// 【第2批 · 分群裁剪】搜索群按 created_at 保留 STAT_SEARCH_RETENTION_DAYS 天（/search 的历史来源），
-	// 其余群仍按 autoincrement 保留最新 keepLimit 条 —— 与改动前逐字一致。
-	// 搜索群没配时走下面的原版单条 SQL，行为一个字都不变（零影响）。
+	// 其余群按 MSG_CACHE_RETENTION_DAYS 天保留，行数只做兜底。
 	if (STAT_SEARCH_GROUPS.length) {
 		const notIn = STAT_SEARCH_GROUPS.map(() => '?').join(',');
 		// created_at 存的是 UTC ISO（new Date().toISOString()），字典序即时间序，直接比字符串。
-		const cutoffIso = new Date(nowMs - STAT_SEARCH_RETENTION_DAYS * 86400000).toISOString();
+		const searchCutoffIso = new Date(nowMs - STAT_SEARCH_RETENTION_DAYS * 86400000).toISOString();
 		await env.DB.prepare(
 			`DELETE FROM ${table} WHERE chat_id IN (${notIn}) AND created_at < ?`
-		).bind(...STAT_SEARCH_GROUPS, cutoffIso).run();
-		// 「其他群维持全局 200 条」的名额必须【只在非搜索群里算】：
-		// 子查询不排除搜索群的话，搜索群的行会占掉这 200 个名额，别的群实际保留数少于 keepLimit。
+		).bind(...STAT_SEARCH_GROUPS, searchCutoffIso).run();
+		// 非搜索群的保留窗。放在行数兜底之前，两道都过才算留下。
+		await env.DB.prepare(
+			`DELETE FROM ${table} WHERE chat_id NOT IN (${notIn}) AND created_at < ?`
+		).bind(...STAT_SEARCH_GROUPS, cacheCutoffIso).run();
+		// 行数硬上限：名额必须【只在非搜索群里算】——
+		// 子查询不排除搜索群的话，搜索群的行会占掉名额，别的群实际保留数少于上限。
 		await env.DB.prepare(
 			`DELETE FROM ${table} WHERE chat_id NOT IN (${notIn}) AND id <= COALESCE((
 				SELECT id FROM ${table} WHERE chat_id NOT IN (${notIn}) ORDER BY id DESC LIMIT 1 OFFSET ?
 			), 0)`
-		).bind(...STAT_SEARCH_GROUPS, ...STAT_SEARCH_GROUPS, safeLimit).run();
+		).bind(...STAT_SEARCH_GROUPS, ...STAT_SEARCH_GROUPS, MSG_CACHE_HARD_LIMIT).run();
+		// 搜索群自己也有硬上限：它按 180 天保留，一个高频搜索群同样能涨到几十万行。
+		await env.DB.prepare(
+			`DELETE FROM ${table} WHERE chat_id IN (${notIn}) AND id <= COALESCE((
+				SELECT id FROM ${table} WHERE chat_id IN (${notIn}) ORDER BY id DESC LIMIT 1 OFFSET ?
+			), 0)`
+		).bind(...STAT_SEARCH_GROUPS, ...STAT_SEARCH_GROUPS, MSG_CACHE_HARD_LIMIT).run();
 		return;
 	}
+	await env.DB.prepare(`DELETE FROM ${table} WHERE created_at < ?`).bind(cacheCutoffIso).run();
 	await env.DB.prepare(`DELETE FROM ${table} WHERE id <= COALESCE((SELECT id FROM ${table} ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`)
-		.bind(safeLimit)
+		.bind(MSG_CACHE_HARD_LIMIT)
 		.run();
 }
 
@@ -3388,7 +3417,9 @@ async function performBulkJobD1Mutation(job, env, ids) {
 				const r = await learnAdFromOperatorAction(env, uid, null, {
 					source: learnSource,
 					createdBy: String(job.createdBy || ''),
-					text: ''
+					// 【2026-10-15 乙】批量路径同样从缓存捞正文（与 /spam 单条同一个来源）。
+					// 改之前传空串，批量封一批广告号却只学得到资料卡。
+					text: await loadRecentUserAdText(env, uid)
 				});
 				learnedTotal += Number(r.learned || 0);
 				sampleTotal += Number(r.sampleAdded || 0);
@@ -9022,13 +9053,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					if (alreadyExists) {
 						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行全群处置</b>');
 					}
-				// /spam <id>（不带引用）此前同样不学 —— 只有「引用回复 + /spam」那条
-				// 路径有正文可学。这里能学的只有资料卡：正文无从得知，
-				// 【text 传空串】命令消息的内容是「/spam 123」，学它等于把命令文本当广告样本。
+				// /spam <id>（不带引用）此前同样不学正文 —— 只有「引用回复 + /spam」那条
+				// 路径有正文可学，这里 text 传空串（命令消息的内容是「/spam 123」，
+				// 学它等于把命令文本当广告样本）。结果是「广告被别的 bot 先删了、
+				// 来不及引用」这种最常见的场景，一个字都学不到。
+				// 【2026-10-15 乙】改成从消息缓存捞该用户最近的发言 ——
+				// 缓存保留期已改成 7 天（MSG_CACHE_RETENTION_DAYS），那里有原文。
+				const spamIdTextForLearn = await loadRecentUserAdText(env, valid[0]);
 				const spamIdLearn = await learnAdFromOperatorAction(env, valid[0], message, {
 					source: 'spam',
 					createdBy: String(operatorId ?? ''),
-					text: ''
+					text: spamIdTextForLearn
 				});
 				lines.push(...renderAdLearnLines(spamIdLearn, 'spam'));
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
@@ -13440,7 +13475,12 @@ const AD_STRUCT_MATCH = (patterns, text) => patterns.some((re) => re.test(text))
 const AD_PORN_PATTERNS = [
 	'色色', '裸聊', '约炮', '楼凤', '福利姬', '无码', '有码',
 	'激情视频', '一夜情', '深夜福利', '看片资源', '在线看片',
-	'磁力种子', '开车资源'
+	'磁力种子', '开车资源',
+	// 【2026-10-15 丁】主人发来的 6 张图里判据够不着的色情引流形态。
+	// 「成人短剧」是短剧引流的标准开头；「狗推」是园区诈骗黑话（正常语境一个字都不会出现）；
+	// 「内射」「淫水」是色情正文的硬词；「开火车视频」取【四字组合】而不是「开火车」——
+	// 后者在游戏与日常梗里高频，收进来会连坐。
+	'成人短剧', '狗推', '内射', '淫水', '开火车视频'
 ];
 
 // ===== 身份查杀（identity）：昵称 + 简介，单类命中即封 =====
@@ -15134,6 +15174,37 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 //
 // 【options.text】调用方没给正文时才回退到 message 的 text/caption。
 // 「不带引用的 /ban <id>」就走这条路：正文无从得知，只学资料卡。
+// 从消息缓存里捞该用户最近的正文，供 /spam <TGID>（不带引用）学习用。
+//
+// 【2026-10-15 乙】/spam <id> 此前只学得到资料卡 —— 代码注释原话是「正文无从得知」，
+// text 传空串（命令消息内容是「/spam 123」，学它等于把命令文本当广告样本）。
+// 而主人的痛点恰恰是这个：广告常常被别的 bot 先删掉，来不及引用就没了。
+// 缓存改成按天保留（MSG_CACHE_RETENTION_DAYS = 7）之后，moderation_messages 里
+// 有该用户最近 7 天的发言 —— 主人原话「很多问题都是可以通过 spam 学习而解决问题的」，
+// 缺的从来不是学习链，是原料。
+//
+// 【取 5 条而不是全部】一个人连发的广告通常同款，5 条足够代表他的文案风格；
+// text_norm 每条截到 200 字，拼起来最多 1000 字，不会把语义样本库撑成噪声。
+// 【失败一律返回空串】正文只是学习的一个来源，捞不到就退回「只学资料卡」，
+// 绝不能因为一次 D1 抖动让 /spam 的加黑与封禁失败。
+async function loadRecentUserAdText(env, userId) {
+	const uid = String(userId || '');
+	if (!env?.DB || !uid) return '';
+	try {
+		const rows = await env.DB.prepare(
+			"SELECT text_norm FROM moderation_messages WHERE from_id = ? "
+			+ "AND text_norm IS NOT NULL AND text_norm != '' ORDER BY id DESC LIMIT 5"
+		).bind(uid).all();
+		const texts = (rows?.results || [])
+			.map((row) => String(row?.text_norm || '').trim())
+			.filter(Boolean);
+		return texts.join('\n').slice(0, 1000);
+	} catch (error) {
+		console.error('[广告检测] 读缓存正文失败:', error);
+		return '';
+	}
+}
+
 async function learnAdFromOperatorAction(env, targetUserId, message, options = {}) {
 	const source = String(options.source || 'manual');
 	const createdBy = String(options.createdBy || '');
@@ -16553,6 +16624,20 @@ async function upsertAdScreening(env, userId, payload, config) {
 			JSON.stringify(payload?.snapshot || {}).slice(0, 2000),
 			String(payload?.layer || 'score'), now, expiresAt, now
 		).run();
+		// 【2026-10-15 丙】进了观察窗口就把头像送进视觉队列。
+		// 改之前只有【定罪】才排队（learnAdFeaturesOnVerdict 里那一处），
+		// 于是漏放的号 —— 进观察就结束了 —— 头像永远不进队列、永远不判、永远不入库，
+		// 漏一次 = 全网永远学不到。主人原话「很多问题都是可以通过 spam 学习而解决问题的」，
+		// 而这类号连等 /spam 的机会都没有：他没见过那条消息。
+		//
+		// 【零误学风险】队列只负责把图送去 vision，判成 ad 才改 verdict、判 clean 的原样留着 ——
+		// 学的是模型结论，不是「他进了观察」这个动作。
+		// 【失败不影响观察记录】排队只是附带动作，写不进去最多是这个号的头像晚一轮入库。
+		try {
+			await queueAdAvatarLearning(env, userId);
+		} catch (error) {
+			console.error('[广告检测·观察] 头像排队失败（不影响观察记录）:', error?.message || error);
+		}
 		return true;
 	} catch (error) {
 		console.error('[广告检测] 写入观察记录失败:', error);

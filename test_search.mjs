@@ -319,37 +319,54 @@ console.log('\n=== 8. 翻页回调与权限复查 ===');
 // 编号排在最后是因为这节会清空整张表 —— 放前面会把第 3 节造的数据全删掉。
 console.log('\n=== 9. 分群裁剪（放在末尾：本节清表）===');
 {
-	// 造数据：搜索群 50 条（30 新 + 20 老于 180 天），非搜索群 300 条新的。
+	// 造数据：搜索群 50 条（30 新 + 20 老于 180 天），非搜索群 300 条新的 + 20 条老于 7 天。
 	const seed = async (db) => {
 		await W.ensureD1Table(env);
 		// db.exec 是 async 的，不 await 会「DELETE 还没执行就开始 INSERT」，旧数据全留着。
 		await db.exec('DELETE FROM moderation_messages');
 		const fresh = '2026-10-01T00:00:00.000Z';
 		const old = '2025-02-01T00:00:00.000Z';   // 早于 180 天
+		const stale = '2026-08-01T00:00:00.000Z'; // 早于 7 天、晚于 180 天 —— 只有非搜索群的保留窗会剪到它
 		const add = (chatId, mid, at) =>
 			db.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm) VALUES (?,?,?,?,?,?)')
 				.bind(mid, chatId, '1', at, 'h' + mid, 'x').run();
 		for (let i = 1; i <= 30; i += 1) add(SEARCH_GROUP, i, fresh);
 		for (let i = 31; i <= 50; i += 1) add(SEARCH_GROUP, i, old);
 		for (let i = 100; i < 400; i += 1) add(PLAIN_GROUP, i, fresh);
+		for (let i = 400; i < 420; i += 1) add(PLAIN_GROUP, i, stale);
 	};
 	const count = (chatId) => env.DB.query("SELECT COUNT(*) AS c FROM moderation_messages WHERE chat_id='" + chatId + "'")[0].c;
 
-	// ① 配了搜索群：搜索群按天剪、其他群 200 条名额【独立】算
+	// ① 配了搜索群：搜索群按天剪、其他群保留窗【独立】算
 	// STAT_SEARCH_GROUPS 是 `let` 全局词法变量，`W.X = ...` 给沙箱对象加个属性是【无效】的
 	// （内部读的还是词法绑定）—— 必须走 applyRuntimeConfig 这个正规入口。
 	await seed(env.DB);
 	W.applyRuntimeConfig(W.loadRequiredConfig(env));
 	await W.pruneAutoincrementCacheTable(env, 'moderation_messages', 200, Date.parse('2026-10-02T00:00:00Z'));
 	check('搜索群：20 条超期被按天剪掉，剩 30', count(SEARCH_GROUP) === 30, String(count(SEARCH_GROUP)));
-	check('其他群：300 → 200（名额不含搜索群的 30 条）', count(PLAIN_GROUP) === 200, String(count(PLAIN_GROUP)));
 
-	// ② 未配置搜索群：行为与改动前一致（全局按 id 取最新 200 条）
+	// 【2026-10-15 甲 · 这两条正是改动点】
+	// 改动前非搜索群是「按 autoincrement 保留最新 keepLimit 条」，而 keepLimit = max(MSG_CACHE_SIZE, 200)
+	// —— 14 个群一天几千条消息，200 条只够几分钟。线上实测：moderation_messages 总共 245 条，
+	// 主人要 /spam 的那批广告一条记录都没有（发出来几分钟就被裁掉），同款直封的 text_hash
+	// 同样只覆盖这几分钟，而 ad_spam_texts 的 TTL 是 7 天 —— 名义拦一周，实际拦不到第二天。
+	check('其他群：7 天内的 300 条全留，不再被砍到 200',
+		count(PLAIN_GROUP) === 300, String(count(PLAIN_GROUP)));
+	check('其他群：超期的 20 条同样按天剪掉（保留窗对非搜索群生效）',
+		env.DB.query("SELECT COUNT(*) AS c FROM moderation_messages WHERE chat_id='" + PLAIN_GROUP + "' AND created_at < '2026-09-25T00:00:00.000Z'")[0].c === 0,
+		String(env.DB.query("SELECT COUNT(*) AS c FROM moderation_messages WHERE chat_id='" + PLAIN_GROUP + "' AND created_at < '2026-09-25T00:00:00.000Z'")[0].c));
+
+	// ② 未配置搜索群：同样按天剪，行数只做兜底
 	await seed(env.DB);
 	W.applyRuntimeConfig(W.loadRequiredConfig({ ...env, STAT_SEARCH_GROUPS: '' }));
 	await W.pruneAutoincrementCacheTable(env, 'moderation_messages', 200, Date.parse('2026-10-02T00:00:00Z'));
 	const total = env.DB.query('SELECT COUNT(*) AS c FROM moderation_messages')[0].c;
-	check('未配置搜索群 → 与改动前一致：全表只剩最新 200 条', total === 200, String(total));
+	// 30（搜索群 fresh，此时它也只是普通群）+ 300（普通群 fresh）= 330；两批超期的（20 + 20）都剪掉。
+	check('未配置搜索群 → 同样按天剪：330 条', total === 330, String(total));
+	// 行数硬上限是极端流量的兜底，常量不挂 vm 全局，从源码断言它确实在裁剪里。
+	check('行数硬上限写进裁剪（防极端流量把时间窗涨成几十万行）',
+		src.includes('MSG_CACHE_HARD_LIMIT') && src.includes('OFFSET ?'),
+		'源码里没找到硬上限');
 	// 恢复配置，别把搜索群配置泄漏到后面的断言里
 	W.applyRuntimeConfig(W.loadRequiredConfig(env));
 

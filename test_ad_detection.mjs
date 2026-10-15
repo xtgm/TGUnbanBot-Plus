@@ -2475,6 +2475,31 @@ section('[15] 方案 6 · 三道闸的 bio 检测（双轨：首发查 bio + 定
 		resetCalls();
 	}
 
+	// ===== 丙 · 进观察即排队学头像（2026-10-15）=====
+	// 改之前只有【定罪】才把头像送进视觉队列（learnAdFeaturesOnVerdict 里那一处），
+	// 于是漏放的号 —— 进观察窗口就结束了 —— 头像永远不进队列、永远不判、永远不入库。
+	// 漏一次 = 全网永远学不到，这是「漏放的号一个特征都不进库」的结构性来源。
+	// 【零误学风险】队列只负责送图去 vision，判成 ad 才改 verdict，判 clean 的原样留着 ——
+	// 学的是模型结论，不是「他进了观察」这个动作。
+	console.log('\n===== 丙：进观察即排队学头像 =====');
+	{
+		const envQueued = makeEnv();
+		await W.adDetectionReady(envQueued);
+		await W.upsertAdScreening(envQueued, '61010', {
+			chatId: '-100111', score: 3, reasons: ['+3 诱饵词'], snapshot: {}, layer: 'score'
+		}, W.loadAdDetectionConfig(envQueued));
+		const queue = envQueued.DB.query("SELECT value FROM ad_scan_state WHERE key='avatar_learn_queue'");
+		assert('★ 进观察即把头像送进视觉队列',
+			queue.length > 0 && String(queue[0].value).includes('61010'), JSON.stringify(queue));
+		await W.upsertAdScreening(envQueued, '61011', {
+			chatId: '-100111', score: 2, reasons: [], snapshot: {}, layer: 'score'
+		}, W.loadAdDetectionConfig(envQueued));
+		const queue2 = envQueued.DB.query("SELECT value FROM ad_scan_state WHERE key='avatar_learn_queue'");
+		assert('★ 队列追加而不是覆盖',
+			String(queue2[0].value).includes('61010') && String(queue2[0].value).includes('61011'),
+			JSON.stringify(queue2));
+	}
+
 	// 判定本体。第一列是本人正文，第二列是引用体，第三列期望。
 	const quotedCases = [
 		// 主人给的真实实例（昵称 Maybell Tillman、正文一个字母 c、引用块是这条广告）。
