@@ -3379,6 +3379,11 @@ async function performBulkJobD1Mutation(job, env, ids) {
 			const learnIds = [...(lastResults.success || [])].slice(0, BULK_LEARN_LIMIT);
 			let learnedTotal = 0;
 			let sampleTotal = 0;
+			// 2026-10-15：判据学习补进这条链之后，这行日志若只记指纹与语义样本，
+			// 批量封禁后就无法从日志确认头像 / 会员标 / 形状到底学没学到 —— 记录不准等于没记。
+			let avatarTotal = 0;
+			let badgeTotal = 0;
+			let shapeTotal = 0;
 			await mapWithConcurrency(learnIds, BULK_LEARN_CONCURRENCY, async (uid) => {
 				const r = await learnAdFromOperatorAction(env, uid, null, {
 					source: learnSource,
@@ -3387,11 +3392,15 @@ async function performBulkJobD1Mutation(job, env, ids) {
 				});
 				learnedTotal += Number(r.learned || 0);
 				sampleTotal += Number(r.sampleAdded || 0);
+				avatarTotal += Number(r.avatars || 0);
+				badgeTotal += Number(r.badges || 0);
+				shapeTotal += Number(r.shapes || 0);
 				return r;
 			});
 			console.log('[广告检测] 批量封禁学习完成', JSON.stringify({
 				来源: learnSource, 学习目标数: learnIds.length,
-				指纹: learnedTotal, 语义样本: sampleTotal
+				指纹: learnedTotal, 语义样本: sampleTotal,
+				头像: avatarTotal, 会员标: badgeTotal, 资料形状: shapeTotal
 			}));
 		}
 		if (!lastResults.failed.length) return lastResults;
@@ -15044,7 +15053,7 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 async function learnAdFromOperatorAction(env, targetUserId, message, options = {}) {
 	const source = String(options.source || 'manual');
 	const createdBy = String(options.createdBy || '');
-	const out = { learned: 0, sampleAdded: 0, enriched: 0, imageLearned: 0 };
+	const out = { learned: 0, sampleAdded: 0, enriched: 0, imageLearned: 0, avatars: 0, badges: 0, shapes: 0 };
 	try {
 		// checklist 是与 text/caption 互斥的第六类正文来源 —— /spam /ban /sban 引用【清单】时
 		// message.text 恒为 undefined，不接它就只学得到一张空正文的资料卡。
@@ -15061,6 +15070,39 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 		};
 		const learn = await learnAdFingerprints(env, payload, { source, createdBy });
 		out.learned = Number(learn?.learned || 0);
+
+		// =====【2026-10-15 乙：人工判定也要学全判据】=====
+		// 主人口径：「指纹特征都要学到」。此前这条链只学 name / username / bio 五样 ——
+		// 头像、会员标、资料形状一类都不学，而这三样恰恰是【跨号复用】的强判据：
+		// 广告团队批量用同一批素材，一次 /ban 学不进去，下一个号换一套词再发照样漏。
+		// 实测佐证：拿线上漏放的 8202349213 快照跑这条链，整条只学得出 1 条 username 指纹。
+		//
+		// 【零额外 Telegram 调用】头像与会员标就挂在上面那份 fetchAdUserProfile 的响应上
+		// （avatarId / badgeId），资料形状由同一份 profile.bio 现算 —— 补这三样只多 2~3 次 D1 写。
+		// 所以【不走 learnAdFeaturesOnVerdict 的补学队列】：那条队列是为「闸一压根没 getChat」
+		// 准备的，这里资料本来就是刚拉的，排队只会让判据晚一轮才生效。
+		//
+		// 【绝不影响命令本职】与上面的指纹学习同一口径：封禁已经做完了，
+		// 判据写不进去最多是少学一条，不能让回执报错，更不能影响后面的语义样本与共性提炼。
+		try {
+			const avatarId = String(profile.avatarId || '');
+			if (avatarId && await learnAdAvatarOnBan(env, avatarId, targetUserId)) out.avatars += 1;
+			// 会员标与正文自定义 emoji 共用 ad_badges、共用 hits 计数（+1 语义），
+			// 这里只学 profile 上那一个标：正文 emoji 属于消息，人工命令没有消息可取。
+			const badgeId = String(profile.badgeId || '');
+			if (badgeId && await learnAdBadgeOnBan(env, badgeId, targetUserId)) out.badges += 1;
+		} catch (error) {
+			console.error('[广告检测] 人工判定头像/会员标学习失败（' + source + '）:', error);
+		}
+		try {
+			// 形状只在【有实质内容】时才算得出来：adProfileShape 对空 bio 或核心内容不足 4 字的
+			// 一律返回空串，这里自然跳过 —— 形状层只加分不定罪，写一条没有区分度的进去纯属噪声，
+			// 反而会把同模板的正常人一起加分（那正是会员标那次连坐的同一类风险）。
+			const shapeKey = adProfileShape(profile);
+			if (shapeKey && await learnAdProfileShape(env, shapeKey, String(profile.bio || ''))) out.shapes += 1;
+		} catch (error) {
+			console.error('[广告检测] 人工判定资料形状学习失败（' + source + '）:', error);
+		}
 
 		// 【2026-10-13 补：学习链路必须也学图片】
 		// payload 只有 name / username / bio / text / domains 五样 —— 主人引用一张
@@ -15117,6 +15159,11 @@ function renderAdLearnLines(learn, source) {
 	if (!learn) return lines;
 	if (learn.learned > 0) lines.push('🧬 已学习广告指纹:' + learn.learned + ' 条(来源 /' + source + ' 人工判定)');
 	if (learn.imageLearned > 0) lines.push('🖼 已学习广告图片/贴纸: 引用消息里的那张已入库，下次任何人发同一张即命中');
+	// 三类判据的回执（2026-10-15）：与上面的指纹、图片同一口径 —— 学到了就报，
+	// 一条都没学到就一行都不发，免得每次都刷三条永远为 0 的行。
+	if (learn.avatars > 0) lines.push('🖼 已学习广告头像: 下次任何人用同款头像（含进群申请）即命中');
+	if (learn.badges > 0) lines.push('🏷 已学习会员标/自定义emoji素材: 下次挂同款即命中');
+	if (learn.shapes > 0) lines.push('🧩 已学习资料形状: 同模板的号零 AI 也能加分');
 	if (learn.sampleAdded > 0) lines.push('🧠 已加 AI 语义样本:' + learn.sampleAdded + ' 条');
 	if (learn.enriched > 0) lines.push('🧠 共性提炼:从新样本自动提炼出 ' + learn.enriched + ' 条指纹(共现 ≥2 次)');
 	return lines;

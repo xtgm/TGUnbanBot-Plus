@@ -277,6 +277,74 @@ console.log('\n===== 人工判定学习 =====');
 		src.some((r) => String(r.source) === 'sban') && src.some((r) => String(r.source) === 'manual'),
 		JSON.stringify(src));
 
+	// ⑥ 人工判定也要学头像 / 会员标 / 资料形状（2026-10-15 乙）
+	// 起因：主人要处置两个漏放的广告号，其中一个（6314776213）只有 /ban 一条路可走，
+	// 而 /ban 的学习链只学 name / bio / username 五样，三类判据一类都不学 ——
+	// 拿 8202349213 的真实快照实测，整条链只学得出 1 条 username 指纹。
+	// 头像与会员标就挂在 fetchAdUserProfile 的同一份响应上，补它们【零额外 Telegram 调用】。
+	W.fetchAdUserProfile = async () => ({
+		firstName: 'AK宣传小助手', lastName: '', username: 'akads02',
+		// 有 bio 才算得出资料形状（adProfileShape 读的是 profile.bio）
+		bio: '加我详聊 一天赚8千老号出售',
+		avatarId: 'AQADTESTAVATAR001',
+		badgeId: '5387492010000000001'
+	});
+	const r5 = await W.learnAdFromOperatorAction(env, '990005', { text: '', from: {} }, {
+		source: 'manual', createdBy: '1', text: '出售老号 日结'
+	});
+	check('★ 人工判定学头像', r5.avatars === 1, JSON.stringify(r5));
+	check('★ 人工判定学会员标', r5.badges === 1, JSON.stringify(r5));
+	check('★ 人工判定学资料形状', r5.shapes === 1, JSON.stringify(r5));
+	const avRow = env.DB.query("SELECT * FROM ad_avatars WHERE file_unique_id='AQADTESTAVATAR001'");
+	check('★ 头像落库 verdict=ad source=learned 且记下归属人',
+		avRow.length === 1 && avRow[0].verdict === 'ad' && avRow[0].source === 'learned'
+		&& avRow[0].last_user_id === '990005', JSON.stringify(avRow));
+	const bdRow = env.DB.query("SELECT * FROM ad_badges WHERE badge_id='5387492010000000001'");
+	check('★ 会员标落库 verdict=ad source=learned',
+		bdRow.length === 1 && bdRow[0].verdict === 'ad' && bdRow[0].source === 'learned',
+		JSON.stringify(bdRow));
+	const shRow = env.DB.query('SELECT shape, sample FROM ad_profile_shapes');
+	// 【不能断言总条数】前面 ①②⑤ 三段的 mock 资料卡也带 bio，改动后同样会写进形状行 ——
+	// 按 ⑥ 自己那份样本内容定位，才测得到「这一次真的写进去了」。
+	check('★ 资料形状落库且带样本',
+		shRow.some((r) => String(r.sample || '') === '加我详聊 一天赚8千老号出售'),
+		JSON.stringify(shRow));
+
+	// ⑦ 三样全空时一个都不学 —— 不写脏行、不虚增计数，计数是回执的展示依据
+	W.fetchAdUserProfile = async () => ({
+		firstName: '路人甲', lastName: '', username: 'normal01', bio: '',
+		avatarId: '', badgeId: ''
+	});
+	const r6 = await W.learnAdFromOperatorAction(env, '990006', { text: '', from: {} }, {
+		source: 'manual', createdBy: '1', text: ''
+	});
+	check('★ 三样全空 → 一个都不学（计数全 0）',
+		r6.avatars === 0 && r6.badges === 0 && r6.shapes === 0, JSON.stringify(r6));
+	check('★ 空头像不写库',
+		env.DB.query("SELECT COUNT(*) c FROM ad_avatars WHERE last_user_id='990006'")[0].c === 0);
+
+	// ⑧ 批量路径（message=null）也要学得到 —— /ban 123,456 走的正是这条路，
+	// 它没有命令消息可供提取任何东西，三样判据全靠这份 profile。
+	W.fetchAdUserProfile = async () => ({
+		firstName: '批量测试', lastName: '', username: 'bulk01', bio: '日结 出售账号 加群看',
+		avatarId: 'AQADTESTAVATAR002', badgeId: ''
+	});
+	const r7 = await W.learnAdFromOperatorAction(env, '990007', null, { source: 'manual', text: '' });
+	check('★ 批量路径（message=null）也学头像', r7.avatars === 1, JSON.stringify(r7));
+	check('★ 批量路径也学资料形状', r7.shapes === 1, JSON.stringify(r7));
+	check('★ 无会员标不虚增', r7.badges === 0, JSON.stringify(r7));
+
+	// ⑨ 回执：三样各自一行，全 0 时不刷屏
+	const learnLines = W.renderAdLearnLines(
+		{ learned: 1, sampleAdded: 0, imageLearned: 0, avatars: 1, badges: 1, shapes: 1, enriched: 0 }, 'ban');
+	check('★ 回执含头像行', learnLines.some((l) => l.includes('头像')), learnLines.join('|'));
+	check('★ 回执含会员标行', learnLines.some((l) => l.includes('会员标')), learnLines.join('|'));
+	check('★ 回执含资料形状行', learnLines.some((l) => l.includes('资料形状')), learnLines.join('|'));
+	check('★ 全 0 时回执仍为空（不刷屏）',
+		W.renderAdLearnLines(
+			{ learned: 0, sampleAdded: 0, imageLearned: 0, avatars: 0, badges: 0, shapes: 0, enriched: 0 },
+			'ban').length === 0);
+
 	W.fetchAdUserProfile = realFetch;
 }
 
