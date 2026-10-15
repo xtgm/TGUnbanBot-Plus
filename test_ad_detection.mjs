@@ -2372,6 +2372,109 @@ section('[15] 方案 6 · 三道闸的 bio 检测（双轨：首发查 bio + 定
 	assert('引用体提取：多字段同时存在时全部拼接',
 		W.getAdQuotedText({ quote: { text: 'A' }, reply_to_message: { text: 'B' } }) === 'A\nB');
 
+	// ===== 链接预览卡（web_page）通道 —— 2026-10-15 =====
+	// 线上实例（主人截图 + D1 取证）：群里每隔 8 分钟发一次「正文两个字 + 预览卡」，
+	// 广告词全在预览卡里。bot 侧 moderation_messages 落的是 text_norm='带劲' ——
+	// 四层判据一个字都没读到，5 条同款照发不误。_worker.js 此前对 web_page 字段的
+	// 引用是 0 次，这是整条链路对「发链接出预览卡」这一最常见引流手法的结构性失明。
+	console.log('\n===== 链接预览卡（web_page）通道 =====');
+	{
+		const PREVIEW = {
+			message_id: 550392,
+			text: '带劲',
+			web_page: {
+				type: 'photo',
+				url: 'https://sexxx.example.com/v/9f2',
+				title: '🚨色色影院🥵你的免费影院 女友被轮后还让我舔😳',
+				description: '🥵 情侣被骗睡 甸！女友被轮 奸！！轮 奸后，让男友舔干净，太畜生了。缅 北轮 奸完整版…',
+				photo: { file_id: 'AgADPREVIEWFILE', file_unique_id: 'uq_preview_001' }
+			}
+		};
+		const body = W.getAdDetectionBodyText(PREVIEW);
+		assert('正文取到预览卡标题', body.includes('色色影院'), JSON.stringify(body.slice(0, 90)));
+		assert('正文取到预览卡描述', body.includes('缅'), JSON.stringify(body.slice(0, 90)));
+		assert('正文取到预览卡链接', body.includes('https://sexxx.example.com/v/9f2'), JSON.stringify(body.slice(0, 90)));
+		// 链接必须真的能被出口统计认到 —— 否则色情判据要求的「引流出口」永远不成立
+		assert('预览卡链接计入引流出口',
+			W.analyzeAdOutlets(body, '').count >= 1,
+			JSON.stringify(W.analyzeAdOutlets(body, '')));
+
+		// 同款检测：5 条一模一样的预览卡必须算同一个 key，否则 /spam 过一次后面 4 条照发
+		const keyPreview = W.buildModerationTextKey(PREVIEW);
+		const keyOther = W.buildModerationTextKey({
+			text: '带劲',
+			web_page: { url: 'https://movie.example.com/a' }
+		});
+		assert('同款 key 覆盖预览卡文案',
+			Boolean(keyPreview) && keyPreview.norm.includes('色色影院'),
+			JSON.stringify(keyPreview && keyPreview.norm));
+		// 【不同预览卡必须算不同 key】否则「带劲 + 电影链接」会被当成
+		//「带劲 + 色情链接」的同款，主人 /spam 色情广告会连坐正常分享电影的人。
+		assert('不同预览卡算不同 key（不与正常分享连坐）',
+			Boolean(keyPreview) && Boolean(keyOther) && keyPreview.hash !== keyOther.hash,
+			JSON.stringify({ preview: keyPreview && keyPreview.hash, other: keyOther && keyOther.hash }));
+
+		// 图片：预览卡里的图要进图片通道，否则视觉判定与图片指纹对这类消息全瞎
+		const media = W.extractAdMedia(PREVIEW);
+		assert('预览卡图片进图片通道',
+			Boolean(media) && media.fileUniqueId === 'uq_preview_001' && media.kind === 'photo',
+			JSON.stringify(media));
+
+		// 【刻意不设长度门槛】短广告必须照旧能进同款名单 —— test_linked_spam 钉着
+		//「2 字广告也可进连带（4 字下限亦已废除，线上『5迁』被放过）」，2026-09 立的能力。
+		// 「谁说带劲谁被直封」的风险不是靠门槛挡的，而是靠【广告 key 变长】消除的：
+		// 预览卡并进来之后，那条广告的 key 是完整文案，不再是那两个字（见上面两条断言）。
+		assert('2 字广告仍可进同款名单（既有连带能力不回退）',
+			W.buildModerationTextKey({ text: '5迁' }) !== null,
+			JSON.stringify(W.buildModerationTextKey({ text: '5迁' })));
+
+		// ===== 端到端（这一段存在的理由）=====
+		// 单元层全绿【不代表】入口会封 —— getAdDetectionBodyText 全文件只有两个调用点：
+		// DEBUG 日志那一行、通知里的 messagePreview，它压根不参与判定。
+		// 真正喂给四条通道的是 detectAdOnMessage 里的局部 text。
+		// 2026-10-15 就是踩在这上面：判据层已经 guilty=true(form C)，
+		// detectAdOnMessage 照旧返回 false，991 条测试全绿也没拦住。这条钉的是真入口。
+		const previewMsg = () => groupMessage({ id: 61000, first_name: 'James', last_name: 'Tate' }, '带劲', {
+			web_page: {
+				type: 'photo',
+				url: 'https://sexxx.example.com/v/9f2',
+				title: '🚨色色影院🥵你的免费影院 女友被轮后还让我舔😳',
+				description: '🥵 情侣被骗睡 甸！女友被轮 奸！！轮 奸后，让男友舔干净，太畜生了。缅 北轮 奸完整版…',
+				photo: { file_id: 'AgADPREVIEWFILE', file_unique_id: 'uq_preview_001' }
+			}
+		});
+		const envPorn = makeEnv();
+		await W.adDetectionReady(envPorn);
+		// 【两组都必须用干净资料卡】adProfile 的 mock 昵称本身就是「💚高价收网赚号💚」+
+		// 广告 bio，用它测的话无论 web_page 写什么都会被封 —— 断言就零信息量了。
+		// 干净资料 + 色情预览卡 → 封，干净资料 + 电影预览卡 → 放行，
+		// 两组之间唯一的变量就是 web_page，这才测得到通道本身。
+		const cleanProfile = {
+			getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: 'James', last_name: 'Tate', bio: '' } }),
+			getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } })
+		};
+		resetCalls();
+		setApi(cleanProfile);
+		await sendUpdate({ message: previewMsg() }, envPorn);
+		assert('★ 端到端：预览卡色情广告被封',
+			countCalls('banChatMember') > 0, JSON.stringify(calls.map((c) => c.method)));
+
+		// 对照组：正常人分享电影链接 —— 「影院」「完整版」「女友」一个都不进词表，
+		// 端到端必须照旧放行，否则通道一开就是一片误伤面。
+		const envFan = makeEnv();
+		await W.adDetectionReady(envFan);
+		resetCalls();
+		setApi(cleanProfile);
+		await sendUpdate({
+			message: groupMessage({ id: 61001, first_name: '影迷' }, '万达影院看的完整版，女友说好看', {
+				web_page: { type: 'article', url: 'https://movie.example.com/a', title: '影评', description: '一部电影的完整评论' }
+			})
+		}, envFan);
+		assert('★ 端到端：正常分享链接不被封',
+			countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+		resetCalls();
+	}
+
 	// 判定本体。第一列是本人正文，第二列是引用体，第三列期望。
 	const quotedCases = [
 		// 主人给的真实实例（昵称 Maybell Tillman、正文一个字母 c、引用块是这条广告）。

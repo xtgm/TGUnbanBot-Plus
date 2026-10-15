@@ -6474,6 +6474,15 @@ function isTelegramServiceMessage(message) {
 // 误封风险由两层兜住，都比长度门槛可靠：
 //   ① 仅 OWNER_IDS[0] 可触发（isPrimaryOwner 闸，副主人 / 群管理员一律不连带）；
 //   ② 处置结果私聊第一主人，附一条可直接复制的 /unban 全部TGID 一键回滚。
+// 【2026-10-15 复核后维持 1，不设长度门槛】
+// 当天一度改成 4，理由是「正文只有两个字的广告进名单会让说这两个字的人被连带」。
+// 反证立刻打断：test_linked_spam 的三条既有断言全红 —— 「2 字广告也可进连带
+//（4 字下限亦已废除，线上『5迁』被放过）」，那是 2026-09 立的能力，不能因为
+// 新形态就砍掉。
+//
+// 而且这个风险本身已经不存在了：链接预览卡并进 key 之后，广告 key 由
+//【完整预览卡文案】构成，不再是那两个字。真正会被短句卡住的只剩
+//「纯两字 + 无预览卡」的广告，那种本来就由上面两层兜住，不需要代码再加一道。
 const MODERATION_TEXT_MIN_LENGTH = 1;
 
 function buildModerationTextKey(message) {
@@ -6483,7 +6492,13 @@ function buildModerationTextKey(message) {
 	//（同款直封不触发）。主人都 /spam 过了，同款照发不误。
 	// 【改这一处就够】recordSpamText（/spam 学）与 cacheModerationMessage（同款直封）
 	// 都调这个函数；extractAdChecklistText 对非清单消息返回空串，其余消息逐字节不变。
-	const raw = String(message?.text ?? message?.caption ?? extractAdChecklistText(message)).trim();
+	//
+	// 【2026-10-15 补：链接预览卡】同款 key 必须包含 web_page 的内容。否则
+	//「正文两个字 + 预览卡」这类广告的 key 恒为那两个字 —— 主人 /spam 一次之后，
+	// 群里那 5 条一模一样的预览卡照样各算各的、一条都删不掉（线上实测，
+	// moderation_messages 里 550392 / 550395 两条 key 完全相同却都不是广告 key）。
+	const ownText = String(message?.text ?? message?.caption ?? extractAdChecklistText(message)).trim();
+	const raw = [ownText, extractAdWebPageText(message)].filter(Boolean).join(' ').trim();
 	if (!raw) return null;
 	// 斜杠命令永不参与连带：命令文本是操作指令而非广告内容，
 	// 与 extractAdFingerprintCandidates 里那道过滤同源（管理员 /ban 自噬事故）。
@@ -7314,6 +7329,21 @@ function extractAdChecklistText(message) {
 	return parts.filter(Boolean).join('\n').trim();
 }
 
+// 链接预览卡（web_page）文本 —— 标题 + 描述 + 链接本身。
+//
+// 【2026-10-15 新增】线上漏放一整类广告：群里每隔 8 分钟发一次「正文两个字 + 预览卡」，
+// 广告词全在预览卡里。bot 侧 moderation_messages 落的是 text_norm='带劲'，
+// 四层判据一个字都没读到 —— 改之前 _worker.js 对 web_page 字段的引用是【0 次】，
+// 这是整条链路对「发链接出预览卡」这一最常见引流手法的结构性失明。
+//
+// 【url 必须一并并进正文】它是这条消息实际指向的地址，正是「引流出口」的来源。
+// 不并进来的话，色情判据（形态 C）要求的 outlets.count 永远为 0，等于白修。
+function extractAdWebPageText(message) {
+	const page = message?.web_page || null;
+	if (!page) return '';
+	return [page.title, page.description, page.url].filter(Boolean).join(' ').trim();
+}
+
 function getAdDetectionBodyText(message) {
 	return [
 		message?.text,
@@ -7322,7 +7352,9 @@ function getAdDetectionBodyText(message) {
 		getInlineButtonPayloadText(message || {}),
 		// checklist：与 text / caption 同级的第六类正文来源，漏了它 debug 与
 		// 依赖 bodyText 的那几处就会把 checklist 消息当空消息。
-		extractAdChecklistText(message)
+		extractAdChecklistText(message),
+		// 链接预览卡：与上面五类同级。见 extractAdWebPageText 的说明。
+		extractAdWebPageText(message)
 	].filter(Boolean).join(' ').trim();
 }
 
@@ -9124,7 +9156,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 学习逻辑已抽成 learnAdFromOperatorAction（/spam /ban /sban 三条命令共用），
 			// 这里只传【引用的那条消息】+ source='spam'，三段内容与改动前逐字一致。
 			// 清单消息的 text 是 undefined，接上 checklist 才学得到正文（同 buildModerationTextKey）。
-			const spamTextForLearn = String(repliedMsg.text || repliedMsg.caption || extractAdChecklistText(repliedMsg));
+			//
+			// 【2026-10-15 补：链接预览卡】原来是 text || caption || checklist 三选一，
+			// 而「正文两个字 + 预览卡」这种广告的 text 非空（就是那两个字）——
+			// 于是主人 /spam 之后学进 AI 样本库的样本就是「带劲」两个字，
+			// 广告语一个都没进去，下一次换个号发同款照样漏（线上实测）。
+			// 预览卡文案一并并进去，口径与 getAdDetectionBodyText / buildModerationTextKey 一致。
+			const spamOwnTextForLearn = String(repliedMsg.text || repliedMsg.caption
+				|| extractAdChecklistText(repliedMsg) || '').trim();
+			const spamWebPageForLearn = extractAdWebPageText(repliedMsg);
+			const spamTextForLearn = [spamOwnTextForLearn, spamWebPageForLearn]
+				.filter(Boolean).join(' ').trim();
 			const spamLearn = await learnAdFromOperatorAction(env, repliedUserId, repliedMsg, {
 				source: 'spam',
 				createdBy: String(operatorId ?? ''),
@@ -13380,6 +13422,27 @@ const AD_BIZ_PATTERNS = [
 
 const AD_STRUCT_MATCH = (patterns, text) => patterns.some((re) => re.test(text));
 
+// ===== 色情引流词表（2026-10-15 新增）=====
+// 起因：线上一整类广告四层判据全瞎 —— 群里每隔 8 分钟发一次「正文两个字 + 链接预览卡」，
+// 色情语全在预览卡的标题与描述里。两张既有词表（AD_TRADE_VERBS 45 条 / AD_BUSINESS_KEYWORDS 63 条）
+// 整个是【黑产交易】方向（收购 / 网赌 / USDT / 招代理），色情引流一个词都没有，
+// 于是这条广告从头到尾 0 分，5 条同款照发不误（主人截图 + D1 取证双证）。
+//
+// 【逐个词都复核过正当语义，被否掉的比留下的多】
+//   外围   —— 足球「外围球员」「外围赛」高频
+//   空降   —— 「空降兵」「空降现场」有正当用法
+//   看片   —— 「看片子」是日常口语
+//   上门服务 —— 安装 / 维修 / 家政的标配说法
+//   伴游   —— 旅游语境
+//   磁力 / 种子 / 迅雷 / 资源站 —— 影迷与技术群高频
+//   影院 / 完整版 / 女友 / 免费 —— 影迷群与日常口语
+// 留下的每一个都几乎没有正当解释空间。宁可漏，不可误伤 —— 这是主人反复强调的口径。
+const AD_PORN_PATTERNS = [
+	'色色', '裸聊', '约炮', '楼凤', '福利姬', '无码', '有码',
+	'激情视频', '一夜情', '深夜福利', '看片资源', '在线看片',
+	'磁力种子', '开车资源'
+];
+
 // ===== 身份查杀（identity）：昵称 + 简介，单类命中即封 =====
 // 2026-09-08 主人下令新增。原话三句，第三句纠正了前两句的对象：
 //   ①「关于用户的用户名，用户名只有带广告词才加分，不然这样很容易误封用户。」
@@ -13652,11 +13715,27 @@ function judgeAdStructure(text, selfUsername, channel) {
 	const formBWeak = outlets.mentions.length >= 3
 		|| outlets.repeatedDigit.length >= 2;
 
+	// ===== 形态 C 色情引流型（2026-10-15 新增）=====
+	// 【闸门：色情指向词 ∧ 引流出口同现，两个都必须有】
+	//   只有色情词 → 不封：举报、吐槽、新闻讨论都会出现「色色」「约炮」，
+	//     没有引流出口就不是广告；
+	//   只有出口   → 不封：正常人天天分享链接。
+	// 与形态 A「招揽 ∧ 行业」是同一个防误封思路 —— 主人反复强调的「多特征组合」。
+	//
+	// 【只在 body / quoted 生效】card 通道的文本是昵称 + 简介，那里没有「引流出口」可谈，
+	// 强行判只会把简介里挂链接的正常人拖进来。
+	const pornHits = countAdKeywordHits(source, AD_PORN_PATTERNS);
+	const formC = pornHits.length > 0
+		&& outlets.count >= 1
+		&& (channel === 'body' || channel === 'quoted');
+
 	const label = channel === 'card' ? '资料卡查杀' : (channel === 'quoted' ? '引用体查杀' : '正文查杀');
 
 	// 只有弱档成立：不进 hardHit、不定罪，但结论必须带出去（reasons 由上层在
 	// `!structure.guilty && structure.reasons.length` 那一支 push，weak 标记供加分用）。
-	if (!formA && !formBHard && formBWeak) {
+	// 【formC 必须进这个条件】否则形态 C 成立、又恰好只有弱档信号时，
+	// 会被这一支提前 return 成 weak，色情引流直接放行。
+	if (!formA && !formBHard && !formC && formBWeak) {
 		const weakDetail = [];
 		if (outlets.count) weakDetail.push('引流出口×' + outlets.count + (outlets.hasBot ? '(含bot)' : ''));
 		if (outlets.repeatedDigit.length) weakDetail.push('重复数字账号×' + outlets.repeatedDigit.length);
@@ -13670,12 +13749,17 @@ function judgeAdStructure(text, selfUsername, channel) {
 	}
 
 	const formB = formBHard || formBWeak;
-	const form = formA && formB ? 'A+B' : (formA ? 'A' : (formB ? 'B' : ''));
+	const formParts = [];
+	if (formA) formParts.push('A');
+	if (formB) formParts.push('B');
+	if (formC) formParts.push('C');
+	const form = formParts.join('+');
 	if (!form) return { guilty: false, channel, form: '', reasons: [] };
 
 	const detail = [];
 	if (solicit) detail.push('招揽意图');
 	if (biz) detail.push('行业指向');
+	if (pornHits.length) detail.push('色情指向词：' + pornHits.slice(0, 3).join('/'));
 	if (outlets.count) detail.push('引流出口×' + outlets.count + (outlets.hasBot ? '(含bot)' : ''));
 	if (outlets.repeatedDigit.length) detail.push('重复数字账号×' + outlets.repeatedDigit.length);
 	if (outlets.sharedPrefix) detail.push('同前缀引流矩阵');
@@ -17638,7 +17722,13 @@ function extractAdMedia(message) {
 	return pick(message.sticker, 'sticker')
 		|| pick(message.animation, 'animation')
 		|| pick(message.video, 'video')
-		|| pick(message.document, 'document');
+		|| pick(message.document, 'document')
+		// 【2026-10-15 补】链接预览卡里的图，放在最后当兜底。
+		// 广告最常见的形态就是「正文两个字 + 预览卡」，图片挂在 web_page.photo 上 ——
+		// 这里不读它，视觉判定与图片指纹对整类消息全瞎：色情图不进 ad_images、
+		// 不走识图，主人 /spam 也学不到那张图（线上实测 ad_images 零新增）。
+		// kind 记 'photo'：预览图是静态位图，AD_IMAGE_VISION_KINDS 里已有它。
+		|| pick(message?.web_page?.photo, 'photo');
 }
 
 // 按字节头猜图片 MIME。比「按 kind 猜」可靠得多 —— kind 只说明载体类型，
@@ -21323,8 +21413,20 @@ async function detectAdOnMessage(message, env) {
 	// 只有 checklist 消息才会落到 checklist 那一支。这一处改完，下面的
 	// 早退闸门、闸一/闸二/AI 补查三处 payload.text、指纹、AI 语义、四通道
 	// 【全部自动看到 checklist 的文字】，不必逐处接线。
-	const text = String(message.text ?? message.caption ?? '').trim()
+	//
+	// 【2026-10-15 补：链接预览卡（web_page）—— 同一个道理，同样只改这一处】
+	// 线上漏放一整类广告：群里每隔 8 分钟发一次「正文两个字 + 预览卡」，
+	// 色情语全在预览卡的标题与描述里，引流链接在 web_page.url 上。
+	// 【为什么必须改这里，改 getAdDetectionBodyText 没用】那个函数在这个入口里
+	// 只出现在 DEBUG 日志那一行，全文件另一个调用点是通知里的 messagePreview ——
+	// 它压根不参与判定。真正喂给下面四条通道的是这个局部 text。
+	// 端到端实测过这个坑：形态 C 判据已经 guilty=true，而 detectAdOnMessage 照旧
+	// 返回 false，就是因为判据层拿到的 payload.text 仍是那两个字。
+	// 预览卡文案并进来之后，早退闸门、闸一/闸二/AI 补查、指纹、AI 语义、四通道
+	// 与 checklist 那次一样【全部自动看到】，不必逐处接线。
+	const ownText = String(message.text ?? message.caption ?? '').trim()
 		|| extractAdChecklistText(message);
+	const text = [ownText, extractAdWebPageText(message)].filter(Boolean).join(' ').trim();
 	if (isTelegramSlashCommand(text)) return false;
 	const forwardChat = message.forward_from_chat || message.forward_origin?.chat || null;
 	// 引用体正文：这条消息引用/回复的那条【别人的】消息里的文字。

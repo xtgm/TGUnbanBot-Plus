@@ -250,16 +250,30 @@ section('[3] 清单文字并入 payload.text');
 	// 短路在 detectAdOnMessage 的 text 定义上。const 不挂 vm 全局，所以从源码里
 	// 抠出那几行【原文】编译执行 —— 测的是真代码，不是复刻的等价表达式：
 	// 谁把 || 改成 && 或删掉回退，这里立刻变红。
-	const textDef = (src.match(/const text = String\(message\.text \?\? message\.caption \?\? ''\)\.trim\(\)[\s\S]{0,120}?extractAdChecklistText\(message\);/) || [])[0];
+	//
+	// 【2026-10-15 跟着改】接入链接预览卡后，那两行拆成 ownText + text：
+	// checklist 回退仍在 || 那一支（语义不变），web_page 另外并进最终的 text。
+	// 抠的是【两行】，编译执行时才拿得到 text 这个名字 —— 只抠一行会 ReferenceError。
+	const textDef = (src.match(
+		/const ownText = String\(message\.text \?\? message\.caption \?\? ''\)\.trim\(\)[\s\S]{0,120}?extractAdChecklistText\(message\);[\s\S]{0,160}?const text = \[ownText, extractAdWebPageText\(message\)\]\.filter\(Boolean\)\.join\(' '\)\.trim\(\);/
+	) || [])[0];
 	assert('源码里抠得到 text 定义原文', !!textDef, '没匹配到');
 	if (textDef) {
-		const evalText = new Function('message', 'extractAdChecklistText', textDef + '\nreturn text;');
+		const evalText = new Function('message', 'extractAdChecklistText', 'extractAdWebPageText',
+			textDef + '\nreturn text;');
 		assert('有 text → text 优先，checklist 不参与（与改动前逐字节一致）',
-			evalText({ text: '这是普通正文', checklist: { title: '不该被读', tasks: [] } }, W.extractAdChecklistText) === '这是普通正文');
+			evalText({ text: '这是普通正文', checklist: { title: '不该被读', tasks: [] } },
+				W.extractAdChecklistText, W.extractAdWebPageText) === '这是普通正文');
 		assert('无 text → 回退到 checklist',
-			evalText(adChecklistMessage({ id: 1 }, AD_TASKS, AD_TITLE), W.extractAdChecklistText).includes(AD_TITLE));
+			evalText(adChecklistMessage({ id: 1 }, AD_TASKS, AD_TITLE),
+				W.extractAdChecklistText, W.extractAdWebPageText).includes(AD_TITLE));
 		assert('text 为空串 → 也回退（trim 后靠 || 接上）',
-			evalText({ text: '   ', checklist: { title: 'T', tasks: [] } }, W.extractAdChecklistText) === 'T');
+			evalText({ text: '   ', checklist: { title: 'T', tasks: [] } },
+				W.extractAdChecklistText, W.extractAdWebPageText) === 'T');
+		// 新增：预览卡内容必须一并进 text —— 这正是 2026-10-15 漏放的那类广告。
+		assert('预览卡标题并进 text',
+			evalText({ text: '带劲', web_page: { title: '色色影院', url: 'https://x.example.com' } },
+				W.extractAdChecklistText, W.extractAdWebPageText).includes('色色影院'));
 	}
 }
 

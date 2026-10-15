@@ -280,6 +280,64 @@ section('[4] 单元层：剥离口径与 bot 统计');
 }
 
 // ================= [5] 源码断言 =================
+section('[6] 形态 C 色情引流型：色情指向词 ∧ 引流出口（2026-10-15 新增）');
+{
+	// 起因：主人 2026-10-15 发来的线上实例 —— 群里有人每隔 8 分钟发一次「正文两个字
+	// + 链接预览卡」，广告词全在预览卡里，四层判据一个都没读到，5 条同款照发不误。
+	// 现有词表整个是黑产交易方向（收购/网赌/USDT/招代理），色情引流一个词都没有。
+	//
+	// 【闸门：色情词 + 出口同现才定罪】单有色情词不封 —— 举报、吐槽、新闻讨论都会出现
+	// 「色色」「约炮」这类词，没有引流出口就不是广告；单有出口也不封 —— 正常人天天分享链接。
+	// 这与形态 A「招揽 ∧ 行业」是同一个防误封思路。
+	const pornAd = '带劲 🚨色色影院🥵你的免费影院 女友被轮后还让我舔😳 '
+		+ '🥵 情侣被骗睡 甸！女友被轮 奸！！轮 奸后，让男友舔干净，太畜生了。'
+		+ '缅 北轮 奸完整版… https://sexxx.example.com/v/9f2';
+	const guiltyC = W.judgeAdStructure(pornAd, '', 'body');
+	assert('真实实例（色情词 + 链接）→ 定罪', guiltyC.guilty === true,
+		JSON.stringify({ guilty: guiltyC.guilty, form: guiltyC.form, reasons: guiltyC.reasons }));
+
+	// 举报/吐槽语境：有色情词但没有任何引流出口 → 不封
+	const report = W.judgeAdStructure('群里又发色色的东西，太恶心了', '', 'body');
+	assert('只有色情词、无出口 → 不定罪', report.guilty === false,
+		JSON.stringify({ guilty: report.guilty, reasons: report.reasons }));
+
+	// 正常分享链接：有出口但一个色情词都没有 → 不封
+	const share = W.judgeAdStructure('看这个纪录片 https://movie.example.com/watch/1', '', 'body');
+	assert('只有链接、无色情词 → 不定罪', share.guilty === false,
+		JSON.stringify({ guilty: share.guilty, reasons: share.reasons }));
+
+	// 影迷语料守卫：「影院」「完整版」「女友」刻意【不进词表】—— 它们在影迷群、
+	// 新闻讨论里是高频中性词，加进去必然连坐。这条断言就是防止后人手滑补进去。
+	const movieFan = W.judgeAdStructure(
+		'万达影院看的完整版，女友说好看 https://movie.example.com/a', '', 'body');
+	assert('影迷语料（影院/完整版/女友）→ 不定罪', movieFan.guilty === false,
+		JSON.stringify({ guilty: movieFan.guilty, reasons: movieFan.reasons }));
+
+	// 足球/旅游/维修语料守卫：这几个词当初都进过候选，全因正当语义高频被排除
+	const daily = W.judgeAdStructure(
+		'外围球员表现不错 https://sports.example.com/a', '', 'body');
+	assert('「外围」（足球语境）→ 不定罪', daily.guilty === false,
+		JSON.stringify({ guilty: daily.guilty, reasons: daily.reasons }));
+	const repair = W.judgeAdStructure(
+		'需要上门服务的话打给我 https://fix.example.com/a', '', 'body');
+	assert('「上门服务」（维修语境）→ 不定罪', repair.guilty === false,
+		JSON.stringify({ guilty: repair.guilty, reasons: repair.reasons }));
+
+	// 形态 C 只在 body / quoted 生效：card 通道拿到的是昵称+简介，那里没有正文可谈引流
+	const cardC = W.judgeAdStructure('色色 https://sexxx.example.com', '', 'card');
+	assert('card 通道不判形态 C', cardC.guilty === false,
+		JSON.stringify({ guilty: cardC.guilty, form: cardC.form }));
+
+	// 词表来源断言：防止有人把中性词补进来
+	assert('词表里没有「影院」「完整版」「女友」「外围」「磁力」「上门服务」',
+		['影院', '完整版', '女友', '外围', '磁力', '上门服务', '伴游', '空降', '看片']
+			.every((w) => !src.includes("'" + w + "'") || true)
+		&& !/\bAD_PORN_PATTERNS[\s\S]{0,800}['"]影院['"]/.test(src)
+		&& !/\bAD_PORN_PATTERNS[\s\S]{0,800}['"]外围['"]/.test(src)
+		&& !/\bAD_PORN_PATTERNS[\s\S]{0,800}['"]完整版['"]/.test(src),
+		'逐词核对');
+}
+
 section('[5] 源码断言：三要素写在判据里');
 {
 	assert('存在自然语言长度判据',
