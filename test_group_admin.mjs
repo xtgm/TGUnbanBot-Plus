@@ -369,9 +369,12 @@ section('[7] 源码接线：入口豁免与同步都挂上了');
 	assert('chat_member 事件里接了单条同步（增与删都要）',
 		src.includes('upsertAdGroupAdmin(env,') && src.includes('removeAdGroupAdmin(env,'),
 		'事件同步接线');
+	// 只看函数体本身。原先用「后 600 字符」当窗口 —— 那是个容易外溢的近似写法，
+	// 紧邻的函数一变大就会误报（本次新增 fetchGroupAdminsOnce 就把它撑破了）。
+	const adminGateBody = (src.match(/async function isConfiguredGroupAdmin\([\s\S]*?\n}/) || [''])[0];
 	assert('热路径判断不碰 Telegram',
-		!/async function isConfiguredGroupAdmin[\s\S]{0,600}getChatAdministrators/.test(src),
-		'isConfiguredGroupAdmin 内不应出现 getChatAdministrators');
+		adminGateBody.length > 0 && !/getChatAdministrators|api\.telegram\.org/.test(adminGateBody),
+		adminGateBody || '没匹配到 isConfiguredGroupAdmin 的函数体');
 	assert('cron 同步末尾做孤儿群清理',
 		/DELETE FROM ad_group_admins WHERE chat_id NOT IN \(/.test(src),
 		'孤儿群清理 SQL 缺失');
@@ -540,6 +543,62 @@ section('[10] 浏览器打开给美化页，程序调用仍是 JSON');
 	assert('★ 四种标量各自着色（key/字符串/数字/布尔/null 都有类名）',
 		/<span class="k">/.test(esc) && /<span class="s">/.test(esc) && /<span class="n">/.test(esc) && /<span class="b">/.test(esc),
 		esc.slice(0, 200));
+}
+
+// ================= [11] 同步改成并发拉取 =================
+// 这个函数现在有三个调用点：cron（每天两次）、chat_member 事件、初始化地址（主人手动触发）。
+// 18 个群串行拉一次 getChatAdministrators 就是 18 次往返排队（2~4 秒），主人访问初始化
+// 地址时会明显感觉变慢。各群互不依赖，改成并发。
+//
+// 【为什么采样真耗时】「是不是并发」读代码看不出来（Promise.all 也可能被写成 for-await），
+// 只能让每个请求延迟固定值、量总耗时 —— 串行 = 群数 × 延迟，并发 ≈ 一个延迟。
+section('[11] 各群并发拉取，耗时不再等于群数 × 单次往返');
+{
+	const gid = (n) => '-100' + String(n).repeat(10);
+	const env = {
+		TOKEN: 'TESTTOKEN', BOT_TOKEN: '123456:fake',
+		GROUP_ID: [gid(1), gid(2), gid(3), gid(4)].join(','),
+		OWNER_IDS: String(OWNER_ID), DB: makeD1()
+	};
+	await W.adDetectionReady(env);
+	W.applyRuntimeConfig(W.loadRequiredConfig(env));
+	await W.mergeDynamicGroupsFromD1(env);
+
+	const PER_CALL_MS = 50;
+	const savedFetch = sandbox.fetch;
+	sandbox.fetch = async (url, init) => {
+		const method = String(url).split('/').pop();
+		calls.push({ method, body: init?.body ? JSON.parse(init.body) : null });
+		if (method === 'getChatAdministrators') {
+			await new Promise((resolve) => setTimeout(resolve, PER_CALL_MS));
+			return { ok: true, status: 200, async json() { return { ok: true, result: [{ status: 'creator', user: { id: 9001 } }] }; } };
+		}
+		return { ok: true, status: 200, async json() { return { ok: true, result: true }; } };
+	};
+
+	resetCalls();
+	const t0 = Date.now();
+	const summary = await W.syncAdGroupAdmins(env);
+	const elapsed = Date.now() - t0;
+	sandbox.fetch = savedFetch;
+
+	// 4 个群 × 50ms：串行至少 200ms，并发约 50ms。阈值取中间。
+	assert('★ 4 个群并发拉取（串行会 ≥200ms）', elapsed < 130,
+		'耗时=' + elapsed + 'ms（4 群 × ' + PER_CALL_MS + 'ms，串行应为 ≥200ms）');
+	assert('★ 并发之后逐群结果照旧（4 个群都进表）',
+		summary.groups === 4 && env.DB.query('SELECT COUNT(*) c FROM ad_group_admins')[0].c === 4,
+		JSON.stringify(summary) + ' | ' + JSON.stringify(env.DB.query('SELECT chat_id FROM ad_group_admins')));
+	assert('★ 四个群的请求确实都发过（没被并发吞掉）',
+		callsOf('getChatAdministrators').length === 4,
+		'次数=' + callsOf('getChatAdministrators').length);
+
+	// 批量写：176 次单独 await 写 D1 也是 176 次往返，所以写也要走 batch
+	assert('动态群组:回执字段齐全（groups/admins/failed/orphans/baseline）',
+		['groups', 'admins', 'failed', 'orphans', 'baseline'].every((k) => k in summary),
+		JSON.stringify(summary));
+	assert('同步里用 D1 batch 批量写，不是逐条 await',
+		/async function syncAdGroupAdmins[\s\S]{0,3000}env\.DB\.batch\(/.test(src),
+		'syncAdGroupAdmins 里没看到 env.DB.batch');
 }
 
 console.log(`\n========== ${pass} 通过 / ${fail} 失败 ==========`);

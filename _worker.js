@@ -13435,15 +13435,21 @@ async function isAdUserWhitelisted(env, userId) {
 const AD_GROUP_ADMIN_CACHE_TTL_MS = 60000;
 const AD_GROUP_ADMIN_CACHE = new WeakMap();
 
+// 单条 upsert 的 SQL。单条写（chat_member 事件路径）与批量写（全量同步）共用同一份，
+// 避免两处各写一遍、改了一处忘了另一处。
+const AD_GROUP_ADMIN_UPSERT_SQL = 'INSERT INTO ad_group_admins (user_id, chat_id, status, updated_at) VALUES (?, ?, ?, ?) '
+	+ 'ON CONFLICT(user_id, chat_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at';
+
+// D1 batch 的单次条数。分片只为不撞单次 batch 的体积限制，片与片之间不需要事务关系。
+const AD_GROUP_ADMIN_SYNC_BATCH = 100;
+
 async function upsertAdGroupAdmin(env, userId, chatId, status) {
 	const uid = String(userId || '');
 	const gid = String(chatId || '');
 	if (!env?.DB || !uid || !gid) return false;
 	try {
-		await env.DB.prepare(
-			'INSERT INTO ad_group_admins (user_id, chat_id, status, updated_at) VALUES (?, ?, ?, ?) '
-			+ 'ON CONFLICT(user_id, chat_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at'
-		).bind(uid, gid, String(status || ''), Math.floor(Date.now() / 1000)).run();
+		await env.DB.prepare(AD_GROUP_ADMIN_UPSERT_SQL)
+			.bind(uid, gid, String(status || ''), Math.floor(Date.now() / 1000)).run();
 		// 写完立刻让缓存失效 —— 与白名单同一个理由：豁免的语义是【马上生效】，
 		// 等 60 秒 TTL 自然过期的话，刚被提为管理员的人下一句话仍会进检测。
 		AD_GROUP_ADMIN_CACHE.delete(env.DB);
@@ -13502,54 +13508,84 @@ async function isConfiguredGroupAdmin(env, userId) {
 	return set.has(id);
 }
 
-// cron 全量同步：逐群拉管理员列表，重建该群的行。
+// 拉一个群的管理员列表。抽出来是为了能并发调用 —— 原来这段内嵌在 for 里，只能一个个 await。
+// 返回值：数组 = 拉到了（**空数组也算拉到了**，一个群不可能没有管理员，调用方据此清该群）；
+//        null = 命令失败 / 网络异常，调用方必须跳过该群、绝不清空它的行。
+async function fetchGroupAdminsOnce(gid) {
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: gid }),
+		});
+		const result = await response.json();
+		if (response.ok && result?.ok && Array.isArray(result.result)) return result.result;
+		console.error('[广告检测] 同步配置群管理员失败 group=' + gid + ': ' + (result?.description || ('HTTP ' + response.status)));
+	} catch (error) {
+		console.error('[广告检测] 同步配置群管理员异常 group=' + gid + ':', error);
+	}
+	return null;
+}
+
+// 全量同步：逐群拉管理员列表，重建该群的行。
 // 【失败保护，这是本函数最要紧的一条】某个群拉不到时【跳过那个群】，绝不清空它的行 ——
 // 清空等于让该群全部管理员在接下来 12 小时里集体失去豁免，比留着旧数据危险得多。
 // 命令失败（429 / 网络）与「拉到了但列表是空的」必须区分：前者 skip，后者才真清。
+//
+// 【为什么是并发 + 批量写】这个函数有三个调用点：cron（每天两次）、chat_member 事件、
+// 初始化地址（主人手动触发，见 handleInitialization）。18 个群串行拉就是 18 次往返排队
+// （实测每群 50ms 延迟时 4 个群就要 250ms，即耗时 = 群数 × 单次往返），176 个管理员再
+// 逐个 await 写 D1 又是 176 次。两者都互不依赖，改成并发拉 + batch 批量写。
 async function syncAdGroupAdmins(env) {
-	if (!env?.DB || !(await adDetectionReady(env))) return { groups: 0, admins: 0, failed: 0 };
-	let groups = 0, admins = 0, failed = 0;
-	for (const groupId of GROUP_IDS) {
-		const gid = String(groupId || '');
-		if (!gid) continue;
-		let entries = null;
-		try {
-			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ chat_id: gid }),
-			});
-			const result = await response.json();
-			if (response.ok && result?.ok && Array.isArray(result.result)) entries = result.result;
-			else console.error('[广告检测] 同步配置群管理员失败 group=' + gid + ': ' + (result?.description || ('HTTP ' + response.status)));
-		} catch (error) {
-			console.error('[广告检测] 同步配置群管理员异常 group=' + gid + ':', error);
-		}
-		if (entries === null) { failed += 1; continue; }
+	if (!env?.DB || !(await adDetectionReady(env))) {
+		return { groups: 0, admins: 0, failed: 0, orphans: 0, baseline: DYNAMIC_GROUPS_READY };
+	}
 
+	// ① 并发拉取：各群的 getChatAdministrators 互不依赖，没理由排队
+	const groupIds = GROUP_IDS.map((id) => String(id || '')).filter(Boolean);
+	const fetched = await Promise.all(groupIds.map((gid) => fetchGroupAdminsOnce(gid)));
+
+	// ② 逐群算增量，攒成一批待执行的 SQL
+	let groups = 0, admins = 0, failed = 0;
+	const statements = [];
+	for (let i = 0; i < groupIds.length; i++) {
+		const gid = groupIds[i];
+		const entries = fetched[i];
+		// null = 这个群没拉到 → 跳过它，绝不清空它的行
+		if (entries === null) { failed += 1; continue; }
 		const seen = [];
 		for (const member of entries) {
 			const id = String(member?.user?.id || '');
 			if (!/^\d+$/.test(id)) continue;
-			await upsertAdGroupAdmin(env, id, gid, String(member?.status || 'administrator'));
+			statements.push(env.DB.prepare(AD_GROUP_ADMIN_UPSERT_SQL)
+				.bind(id, gid, String(member?.status || 'administrator'), Math.floor(Date.now() / 1000)));
 			seen.push(id);
 		}
 		// 该群里已卸任的人：只删这一群的行，别的群的管理员身份不受影响。
 		// seen 为空时不删任何东西（一个群不可能没有管理员，空列表更可能是接口异常）。
 		if (seen.length) {
 			const placeholders = seen.map(() => '?').join(', ');
-			try {
-				await env.DB.prepare('DELETE FROM ad_group_admins WHERE chat_id = ? AND user_id NOT IN (' + placeholders + ')')
-					.bind(gid, ...seen).run();
-				AD_GROUP_ADMIN_CACHE.delete(env.DB);
-			} catch (error) {
-				console.error('[广告检测] 清理卸任管理员失败 group=' + gid + ':', error);
-			}
+			statements.push(env.DB.prepare('DELETE FROM ad_group_admins WHERE chat_id = ? AND user_id NOT IN (' + placeholders + ')')
+				.bind(gid, ...seen));
 		}
 		groups += 1;
 		admins += seen.length;
 	}
-	// 【孤儿群清理】群从 GROUP_ID 环境变量或 /delgroup 移除后，它的管理员行不会
+	// ③ 批量写：一次 D1 往返执行多条。分片发，一片失败不影响另一片。
+	if (statements.length) {
+		try {
+			for (let i = 0; i < statements.length; i += AD_GROUP_ADMIN_SYNC_BATCH) {
+				await env.DB.batch(statements.slice(i, i + AD_GROUP_ADMIN_SYNC_BATCH));
+			}
+		} catch (error) {
+			console.error('[广告检测] 批量写入配置群管理员失败:', error);
+		}
+		// 成败都让缓存失效：成功要立刻生效，失败则让下一次读回库重新取，
+		// 反正不能继续拿旧集合当准。
+		AD_GROUP_ADMIN_CACHE.delete(env.DB);
+	}
+
+	// ④ 【孤儿群清理】群从 GROUP_ID 环境变量或 /delgroup 移除后，它的管理员行不会
 	// 自己消失 —— 那些人会在剩余全部配置群里永久免检，且 /adstats 与日志都看不出来。
 	//
 	// 【为什么必须看 DYNAMIC_GROUPS_READY】清理的基准是 GROUP_IDS，而动态群读 D1 失败时
@@ -13557,14 +13593,13 @@ async function syncAdGroupAdmins(env) {
 	// 「某个群没读出来」完全同形，照删就是把动态群的管理员集体误删，而且同样是静默的。
 	// 拿不准就不删：宁可多留一批旧行（下轮 cron 再清），也不误删活人的豁免。
 	let orphans = 0;
-	const live = GROUP_IDS.map((id) => String(id)).filter(Boolean);
 	if (!DYNAMIC_GROUPS_READY) {
 		console.error('[广告检测] 跳过孤儿群清理：动态群基线不可信');
-	} else if (live.length && groups > 0) {
-		const placeholders = live.map(() => '?').join(', ');
+	} else if (groupIds.length && groups > 0) {
+		const placeholders = groupIds.map(() => '?').join(', ');
 		try {
 			const result = await env.DB.prepare('DELETE FROM ad_group_admins WHERE chat_id NOT IN (' + placeholders + ')')
-				.bind(...live).run();
+				.bind(...groupIds).run();
 			orphans = Number(result?.meta?.changes || 0);
 			AD_GROUP_ADMIN_CACHE.delete(env.DB);
 		} catch (error) {
