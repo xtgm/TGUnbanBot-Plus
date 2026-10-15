@@ -461,6 +461,32 @@ section('[8] 群被移除后，管理员行不残留');
 		JSON.stringify(env2.DB.query("SELECT * FROM ad_group_admins WHERE chat_id='" + GROUP_A + "'")));
 }
 
+// ================= [9] 初始化地址顺带同步 =================
+section('[9] 访问初始化地址即立刻同步一次（不用等 cron）');
+{
+	// [8] 节末尾已把 PER_GROUP_ADMINS 恢复成「A 群两人 / B 群一人」，这里直接沿用。
+	const env = makeEnv();
+	resetCalls();
+	const res = await W.__handler.fetch(new Request('https://example.workers.dev/TESTTOKEN'), env, { waitUntil() {} });
+	const body = await res.json();
+	assert('★ 初始化回执里带上管理员同步结果',
+		Boolean(body) && Boolean(body.管理员同步) && typeof body.管理员同步.groups === 'number',
+		JSON.stringify(body));
+	assert('★ 初始化时真的逐群拉了管理员（不再等 cron）',
+		callsOf('getChatAdministrators').length >= 2,
+		'getChatAdministrators 次数=' + callsOf('getChatAdministrators').length);
+	const rows = env.DB.query('SELECT user_id, chat_id FROM ad_group_admins').map((r) => String(r.user_id) + '@' + String(r.chat_id));
+	assert('★ 同步结果落进 D1 表',
+		rows.includes('9001@' + GROUP_A) && rows.includes('5001@' + GROUP_B),
+		JSON.stringify(rows));
+	assert('★ 初始化触发的同步同样做孤儿清理（基线可信）',
+		body?.管理员同步?.baseline === true,
+		JSON.stringify(body?.管理员同步));
+	assert('★ 菜单与 Webhook 设置照旧（同步没把它们挤掉）',
+		body?.命令?.已设置 === true && body?.Webhook?.已设置 === true,
+		JSON.stringify(body));
+}
+
 console.log(`\n========== ${pass} 通过 / ${fail} 失败 ==========`);
 if (failures.length) console.log('失败项：\n  - ' + failures.join('\n  - '));
 process.exit(fail ? 1 : 0);

@@ -198,7 +198,7 @@
 
 | 变量 | 说明 |
 | --- | --- |
-| `TOKEN` | 初始化入口密钥。访问 `https://你的域名/{TOKEN}` 注册 Webhook 与命令；`/{TOKEN}/export` 导出黑名单；`/{TOKEN}/purge/run` 分批清扫存量黑名单。**不是** Bot Token，建议用随机长字符串 |
+| `TOKEN` | 初始化入口密钥。访问 `https://你的域名/{TOKEN}` 注册 Webhook 与命令，**并顺带同步一次配置群管理员表**（改完群配置想立刻生效就重访一次，不必等 cron）；`/{TOKEN}/export` 导出黑名单；`/{TOKEN}/purge/run` 分批清扫存量黑名单。**不是** Bot Token，建议用随机长字符串 |
 | `BOT_TOKEN` | Telegram Bot Token，从 [@BotFather](https://t.me/BotFather) 取 |
 | `GROUP_ID` | 目标群 ID，逗号分隔多群（半角 `,` 与全角 `，` 均可）。**第一个群是主群** |
 

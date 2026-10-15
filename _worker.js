@@ -392,11 +392,11 @@ export default {
 				return new Response('OK');
 			} else if (path === TOKEN) {
 				// 处理初始化命令
-				return await handleInitialization(request);
+				return await handleInitialization(request, env);
 			}
 		} else if (request.method === 'GET' && path === TOKEN) {
 			// 处理 GET 初始化请求
-			return await handleInitialization(request);
+			return await handleInitialization(request, env);
 		}
 
 		return new Response('Method Not Allowed', { status: 405 });
@@ -666,7 +666,9 @@ function jsonResponse(data, status = 200) {
 	});
 }
 
-async function handleInitialization(request) {
+// env 是【2026-10-15】为「顺带同步配置群管理员表」加的：本函数原先不碰 env，
+// 现在末尾要调 syncAdGroupAdmins，而它需要 env.DB。
+async function handleInitialization(request, env) {
 	try {
 		// 设置 Webhook
 		const webhookUrl = new URL(request.url);
@@ -743,6 +745,18 @@ async function handleInitialization(request) {
 			]
 		};
 
+		// 【2026-10-15 加】顺带把配置群管理员表全量同步一次。
+		// cron 每天只跑两次（03:17 / 15:17 UTC），改了群配置、或想立刻验证同步/清理逻辑时，
+		// 访问一次本地址即可 —— 与 cron 共用同一个 syncAdGroupAdmins，口径完全一致。
+		// 失败只写日志、不影响初始化结果：同步是附带动作，不该把 webhook / 菜单设置拖下水。
+		let adminSync = { groups: 0, admins: 0, failed: 0, orphans: 0, baseline: false };
+		try {
+			adminSync = await syncAdGroupAdmins(env);
+		} catch (error) {
+			console.error('[初始化] 配置群管理员同步失败:', error);
+			adminSync = { error: error?.message || '同步异常' };
+		}
+
 		const commandsResponse = await fetch(setCommandsUrl, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
@@ -760,7 +774,8 @@ async function handleInitialization(request) {
 				},
 				命令: {
 					已设置: true
-				}
+				},
+				管理员同步: adminSync
 			});
 		} else {
 			const result = await commandsResponse.json();
@@ -776,7 +791,8 @@ async function handleInitialization(request) {
 					已设置: false,
 					HTTP状态码: commandsResponse.status,
 					Telegram返回: result
-				}
+				},
+				管理员同步: adminSync
 			}, 500);
 		}
 	} catch (error) {
