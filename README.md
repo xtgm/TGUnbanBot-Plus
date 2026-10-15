@@ -111,6 +111,7 @@
 - **手动封禁不同步** —— 真人点 Telegram 封禁按钮**不写 D1 黑名单**，仅发审计通知；手动解封时对黑名单用户**立即封回**（无法绕过全局黑名单）
 - **通知带发起来源** —— 末尾一行 `📍 发起:私聊` 或 `📍 发起:群名 -100xxx`
 - **广告自动处置** —— 总分 ≥ `AD_SCORE_THRESHOLD` 即加黑 + 全群封禁 + 删消息 + 学指纹与 AI 样本，回执带 `/ignore` 序号与两个纠错按钮
+- **管理员自动免检** —— 在**任意一个**配置群是管理员或群主的人，在**所有**配置群都不进广告检测链（包括他只在别的配置群当管理员、在本群只是普通成员的情形），不必手动加白名单；群内提权/撤职即时同步，撤职后下一句就恢复检测。**手动 `/ban` `/spam` 不受此限制**（那是主人口径）
 - **演练模式** —— `/dryrun` 开启后上面这条一条都不执行，只写流水 + 私聊通知；**只挡处置不挡同款**（重发照删、`/spam` 连带照追，但同款直封名单不写）
 - **入群判定** —— 不等发言：进群当场拉 bio + 查头像指纹，达线即封；每次检查都写 `ad_join_checks` 流水，正常号也记
 - **资料挂载的频道/群/bot** —— **先判人再查链接**：资料卡与正文都没广告特征的正常人**一个请求都不花**；查的人按目标的简介与案底打分（简介含招揽 +2、有案底 +3，案底含**自举**），查不到/简介空/正常社群/挂个人号一律 0 分。每人最多查 5 个、按 handle 缓存 6 小时
@@ -267,7 +268,7 @@
 - **核心 5 张** —— `schema_meta` schema 版本号（当前 `8`）、`blacklist` 全局黑名单（TGID / 原因 / 操作人 / 时间 / 备注）、`moderation_messages` 群消息缓存（`/spam` `/ban` 清扫历史发言与**同款连带反查**；被判过的广告标 `is_ad=1`，`/spam` 追得到、`/search` 检索不到）、`batch_jobs` 批量任务状态与游标、`dynamic_groups` 动态治理群
 - **统计 4 张** —— `stat_speech` `stat_member` `stat_actions` 按天计数（`/stats` 数据源）、`stat_member_events` 入群/退群/申请**明细**（`/profile` 时间线，**永久不剪枝**）
 - **按需建立 4 张** —— `ad_votes` `ad_vote_allowlist`（`/ad` 投票）、`killer_mode`、`dryrun_groups`
-- **广告检测 17 张** —— 判定：`ad_fingerprints` 指纹库（keyword/domain/username/bio 四类）、`ad_user_screening` 观察窗口、`ad_sample_embeddings` AI 样本与向量、`ad_domain_whitelist` 域名白名单、`ad_profile_shapes` 资料形状库、`ad_spam_texts` 同款直封名单；**素材指纹三张**：`ad_avatars` 头像、`ad_images` 正文图片（多一列 `kind`，只有 photo/sticker 进视觉识别）、`ad_badges` 会员标 + 正文贴纸 emoji（同一 id 体系共用一张表与同一道安全阀）—— 三者 `verdict` 同为 `pending`/`ad`/`clean` 三态，`/ignore` 纠错口径一致；**流程**：`ad_group_members` 名册、`ad_scan_state` 滚动复查游标、`ad_learn_snapshots` `/recent` 冻结快照、`ad_confirm_tokens` 二次确认令牌、`ad_join_checks` 入群检查流水（含正常号，留 30 天）、`ad_dryrun_log` 演练命中流水（含整份 `evaluation` 供按钮回放，留 30 天）、`ad_pending_snapshots` 待复核快照（**100 年不过期**，`/ignore` 后置 `expires_at=0` 不再算案底）、`ad_link_cache` 资料挂载链接解析缓存（两本案底 `ad_known` 查用户黑名单、`ad_confirmed` 自举标记，按 `fetched_at` 6 小时过期）
+- **广告检测 18 张** —— 判定：`ad_fingerprints` 指纹库（keyword/domain/username/bio 四类）、`ad_user_screening` 观察窗口、`ad_sample_embeddings` AI 样本与向量、`ad_domain_whitelist` 域名白名单、`ad_profile_shapes` 资料形状库、`ad_spam_texts` 同款直封名单；**素材指纹三张**：`ad_avatars` 头像、`ad_images` 正文图片（多一列 `kind`，只有 photo/sticker 进视觉识别）、`ad_badges` 会员标 + 正文贴纸 emoji（同一 id 体系共用一张表与同一道安全阀）—— 三者 `verdict` 同为 `pending`/`ad`/`clean` 三态，`/ignore` 纠错口径一致；**流程**：`ad_group_members` 名册、`ad_scan_state` 滚动复查游标、`ad_learn_snapshots` `/recent` 冻结快照、`ad_confirm_tokens` 二次确认令牌、`ad_join_checks` 入群检查流水（含正常号，留 30 天）、`ad_dryrun_log` 演练命中流水（含整份 `evaluation` 供按钮回放，留 30 天）、`ad_pending_snapshots` 待复核快照（**100 年不过期**，`/ignore` 后置 `expires_at=0` 不再算案底）、`ad_link_cache` 资料挂载链接解析缓存（两本案底 `ad_known` 查用户黑名单、`ad_confirmed` 自举标记，按 `fetched_at` 6 小时过期）、`ad_group_admins` 配置群管理员同步（群内提权/撤职即时写、cron 全量兜底，热路径的免检读它）
 
 后两张按需建立、不进完整性复验。
 
@@ -412,7 +413,7 @@ Workers 已连 GitHub 时，`git push` 即自动部署。
 - **正常用户被误封** → `/pending` 拿序号 → `/ignore 序号`：一键解封 + 给命中指纹加误报，累计 3 次该指纹自动退役。
 - **广告号没被检测到 / 同款查杀漏了号** → 引用回复 `/spam` 最快（自动学指纹，该文案进同款直封名单后直发即删 + 封）；手工加 `/addword`；被抢先删的用 `/recent` + `/learnlast`。
 - **`/adstats` 显示「降级为评分 + 指纹两层」** → Workers AI 没绑上，`wrangler.toml` 加 `[ai]` 段，绑定名必须**正好是** `AI`。
-- **广告检测的 13 张表建失败** → **既有功能完全不受影响**，广告层静默跳过并进 60 秒冷却，用 `/adstats` 诊断。
+- **广告检测的 18 张表建失败** → **既有功能完全不受影响**，广告层静默跳过并进 60 秒冷却，用 `/adstats` 诊断。
 - **处置完广告，正文又被某个 bot 带引用贴回群里** → 已拆两条通道：**bot 发的广告 → 删 + 封**；**已处置正文的重发 → 只删不封**。
 - **管理员置顶后被 bot 删除并取消置顶** → 两种成因：服务消息被清扫缓存误删（v2 已修复，旧版升级清一次存量缓存）；频道转发帖本身被广告检测删掉（另一条路径）。
 ## License

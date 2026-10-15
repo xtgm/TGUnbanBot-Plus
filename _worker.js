@@ -463,9 +463,14 @@ export default {
 			await pruneAdDetectionData(env);
 			// 群统计明细超期剪枝（保留 STAT_RETENTION_DAYS 天），同样搭 cron 的稳定节拍。
 			await pruneStatData(env);
+			// 配置群管理员全量同步：热路径的豁免读的就是这张表。
+			// cron 每天只跑两次，所以主力是 chat_member 事件的即时同步，这里只是兜底 ——
+			// 补上 bot 掉线 / 事件丢失期间漏掉的提权与撤职。
+			const adminSummary = await syncAdGroupAdmins(env);
 			console.log('[广告检测·扫描] Cron ' + (controller?.cron || '') + ' 结果: ' + JSON.stringify(summary)
 				+ ' 头像: ' + JSON.stringify(avatarSummary)
-				+ ' 图片: ' + JSON.stringify(imageSummary));
+				+ ' 图片: ' + JSON.stringify(imageSummary)
+				+ ' 管理员: ' + JSON.stringify(adminSummary));
 		} catch (error) {
 			console.error('[广告检测·扫描] Cron 执行失败:', error);
 		}
@@ -5539,6 +5544,25 @@ async function handleChatMemberUpdate(chatMember, env) {
 		&& (oldMember.status === 'administrator' || newMember.status === 'administrator'
 			|| oldMember.status === 'creator' || newMember.status === 'creator')) {
 		invalidateAdAdminCache(chat.id);
+		// 【同步落 D1】热路径的豁免读的是 ad_group_admins 这张表，只清内存缓存不够 ——
+		// 别的人群里现查得到、热路径那一步查不到，两条口径就分叉了。
+		// 只记【配置群】的管理员：非配置群的管理员本来就不参与判定，写进去只会撑大热路径那个 Set。
+		// 这条分支只在身份真的变化时才走，一次 UPSERT，量级可忽略。
+		if (isConfiguredGroup(chat.id)) {
+			const changed = newMember.user || oldMember.user;
+			const changedId = String(changed?.id || '');
+			if (changedId) {
+				try {
+					if (newMember.status === 'administrator' || newMember.status === 'creator') {
+						await upsertAdGroupAdmin(env, changedId, chat.id, newMember.status);
+					} else {
+						await removeAdGroupAdmin(env, changedId, chat.id);
+					}
+				} catch (error) {
+					console.error('[广告检测] 同步管理员身份变更失败:', error);
+				}
+			}
+		}
 	}
 
 	// 必须是配置群组
@@ -12794,6 +12818,17 @@ async function ensureAdDetectionTables(env) {
 			// 名字容易看混，故不复用。主人的口径是「加入白名单的人就不会触发任何封禁」。
 			await runD1SchemaStatement(env, 'ad_user_whitelist', 'CREATE TABLE IF NOT EXISTS ad_user_whitelist (user_id TEXT PRIMARY KEY, by_user TEXT, at TEXT NOT NULL, note TEXT)');
 
+			// 配置群管理员：在【任意一个】配置群是管理员或群主的人，任何配置群都不进检测链。
+			// 【为什么落库而不是每次现查】热路径每条消息都要问一次，现查要遍历全部配置群
+			// （十几个请求），而且 getChatAdministrators 撞 429 时现查那条会返回 false ——
+			// 豁免静默失效，管理员反而可能被封。落库后热路径只查一次带缓存的表：
+			// 零 Telegram 请求，且不依赖运行时 API 是否成功。
+			// 【为什么是复合主键】同一个人可以在多个群都是管理员。用 user_id 单主键的话，
+			// 「在 A 群被撤职」会连带删掉「在 B 群仍是管理员」的那条记录。
+			// 由 chat_member 事件即时同步（主力）+ cron 全量兜底（补漏），见 syncAdGroupAdmins。
+			await runD1SchemaStatement(env, 'ad_group_admins', 'CREATE TABLE IF NOT EXISTS ad_group_admins (user_id TEXT NOT NULL, chat_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'\', updated_at INTEGER NOT NULL, PRIMARY KEY (user_id, chat_id))');
+			await runD1SchemaStatement(env, 'idx_ad_group_admins_chat', 'CREATE INDEX IF NOT EXISTS idx_ad_group_admins_chat ON ad_group_admins (chat_id)', { optional: true });
+
 			// 视觉识别失败台账。【2026-10-14 新增】此前失败只写 console.error，
 			// Cloudflare 日志只留 7 天，过期彻底无从追溯 —— 线上 94 张图永久卡死，
 			// 排查时连「是 MIME 错、文件过期、还是模型挂了」都定不了，只能靠推测。
@@ -13209,6 +13244,140 @@ async function isAdUserWhitelisted(env, userId) {
 	if (isAdDetectionExemptUser(id)) return true;
 	const set = await loadAdUserWhitelist(env);
 	return set.has(id);
+}
+
+// === 配置群管理员（热路径豁免读的那份）===
+//
+// 主人口径（2026-10-15）：在【任意一个】配置群是管理员或群主的人，在任何配置群里
+// 都不进广告检测链 —— 包括他在别的配置群只是普通成员的时候。这样主人不必手动把
+// 他们加进白名单，白名单只留给「配置群里非管理员的正常用户」。
+//
+// 【与 isAdminInAnyConfiguredGroup 的分工】那个函数是「定罪那一刻遍历全部群现查」，
+// 覆盖的是同一条口径，但只在判定要封时才够用：热路径用不了（每条消息十几个请求），
+// 且 429 时返回 false。这里的表补的正是热路径那一段。两者都留着，互为兜底。
+//
+// 【更新时机两条路，缺一不可】
+//   ① chat_member 事件即时同步（主力）：提权/撤职当场生效，不用等；
+//   ② cron 全量同步（兜底）：每天两次，补上 bot 掉线期间漏掉的事件。
+// 只做 ① 会漏事件，只做 ② 会滞后最多 12 小时。
+const AD_GROUP_ADMIN_CACHE_TTL_MS = 60000;
+const AD_GROUP_ADMIN_CACHE = new WeakMap();
+
+async function upsertAdGroupAdmin(env, userId, chatId, status) {
+	const uid = String(userId || '');
+	const gid = String(chatId || '');
+	if (!env?.DB || !uid || !gid) return false;
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_group_admins (user_id, chat_id, status, updated_at) VALUES (?, ?, ?, ?) '
+			+ 'ON CONFLICT(user_id, chat_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at'
+		).bind(uid, gid, String(status || ''), Math.floor(Date.now() / 1000)).run();
+		// 写完立刻让缓存失效 —— 与白名单同一个理由：豁免的语义是【马上生效】，
+		// 等 60 秒 TTL 自然过期的话，刚被提为管理员的人下一句话仍会进检测。
+		AD_GROUP_ADMIN_CACHE.delete(env.DB);
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 写入配置群管理员失败:', error);
+		return false;
+	}
+}
+
+async function removeAdGroupAdmin(env, userId, chatId) {
+	const uid = String(userId || '');
+	const gid = String(chatId || '');
+	if (!env?.DB || !uid || !gid) return false;
+	try {
+		await env.DB.prepare('DELETE FROM ad_group_admins WHERE user_id = ? AND chat_id = ?').bind(uid, gid).run();
+		AD_GROUP_ADMIN_CACHE.delete(env.DB);
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 移除配置群管理员失败:', error);
+		return false;
+	}
+}
+
+// 读「配置群管理员」集合。与用户白名单同一套 loadAdCachedValue + 60 秒 TTL，
+// 稳定态下内存命中，一条消息零额外 D1 读。
+async function loadAdGroupAdminSet(env) {
+	const fallback = () => new Set();
+	if (!env?.DB) return fallback();
+	try {
+		const value = await loadAdCachedValue(AD_GROUP_ADMIN_CACHE, env.DB, AD_GROUP_ADMIN_CACHE_TTL_MS, async () => {
+			if (!(await adDetectionReady(env))) return fallback();
+			// DISTINCT：同一个人可能在多个群都是管理员，(user_id, chat_id) 会有多行，
+			// 而这里要的只是「这个人是不是管理员」这一个布尔。
+			const { results } = await env.DB.prepare('SELECT DISTINCT user_id FROM ad_group_admins').all();
+			const set = new Set();
+			for (const row of results || []) {
+				const id = String(row?.user_id || '');
+				// 与白名单同口径：只收纯数字 TGID，脏数据不许把闸门撑成假豁免。
+				if (/^\d+$/.test(id)) set.add(id);
+			}
+			return set;
+		});
+		return value instanceof Set ? value : fallback();
+	} catch (error) {
+		console.error('[广告检测] 读取配置群管理员失败:', error);
+		return fallback();
+	}
+}
+
+// 热路径的那一句。零 Telegram 请求、零依赖运行时 API 是否成功。
+async function isConfiguredGroupAdmin(env, userId) {
+	const id = String(userId || '');
+	if (!/^\d+$/.test(id)) return false;
+	const set = await loadAdGroupAdminSet(env);
+	return set.has(id);
+}
+
+// cron 全量同步：逐群拉管理员列表，重建该群的行。
+// 【失败保护，这是本函数最要紧的一条】某个群拉不到时【跳过那个群】，绝不清空它的行 ——
+// 清空等于让该群全部管理员在接下来 12 小时里集体失去豁免，比留着旧数据危险得多。
+// 命令失败（429 / 网络）与「拉到了但列表是空的」必须区分：前者 skip，后者才真清。
+async function syncAdGroupAdmins(env) {
+	if (!env?.DB || !(await adDetectionReady(env))) return { groups: 0, admins: 0, failed: 0 };
+	let groups = 0, admins = 0, failed = 0;
+	for (const groupId of GROUP_IDS) {
+		const gid = String(groupId || '');
+		if (!gid) continue;
+		let entries = null;
+		try {
+			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ chat_id: gid }),
+			});
+			const result = await response.json();
+			if (response.ok && result?.ok && Array.isArray(result.result)) entries = result.result;
+			else console.error('[广告检测] 同步配置群管理员失败 group=' + gid + ': ' + (result?.description || ('HTTP ' + response.status)));
+		} catch (error) {
+			console.error('[广告检测] 同步配置群管理员异常 group=' + gid + ':', error);
+		}
+		if (entries === null) { failed += 1; continue; }
+
+		const seen = [];
+		for (const member of entries) {
+			const id = String(member?.user?.id || '');
+			if (!/^\d+$/.test(id)) continue;
+			await upsertAdGroupAdmin(env, id, gid, String(member?.status || 'administrator'));
+			seen.push(id);
+		}
+		// 该群里已卸任的人：只删这一群的行，别的群的管理员身份不受影响。
+		// seen 为空时不删任何东西（一个群不可能没有管理员，空列表更可能是接口异常）。
+		if (seen.length) {
+			const placeholders = seen.map(() => '?').join(', ');
+			try {
+				await env.DB.prepare('DELETE FROM ad_group_admins WHERE chat_id = ? AND user_id NOT IN (' + placeholders + ')')
+					.bind(gid, ...seen).run();
+				AD_GROUP_ADMIN_CACHE.delete(env.DB);
+			} catch (error) {
+				console.error('[广告检测] 清理卸任管理员失败 group=' + gid + ':', error);
+			}
+		}
+		groups += 1;
+		admins += seen.length;
+	}
+	return { groups, admins, failed };
 }
 
 async function addAdUserWhitelist(env, userId, addedBy, note) {
@@ -18456,6 +18625,14 @@ async function rescanAdMember(env, row, options = {}) {
 		await markAdBioChecked(env, userId, nowSeconds);
 		return { scanned: false, banned: false, reason: 'admin' };
 	}
+	// 任意配置群的管理员：cron 复查这一轨同样跳过（口径与消息路径 / 入群一致）。
+	// 走到这里的只可能是「曾以普通成员发言、后来升为管理员」的人 —— 豁免之后不再写名册，
+	// 所以新人不会进名册；但升职前留下的那行还在，靠这一句挡住。
+	// 顺带把 bio_checked_at 推到现在，免得每轮都被重新排到队首空转。
+	if (await isConfiguredGroupAdmin(env, userId)) {
+		await markAdBioChecked(env, userId, nowSeconds);
+		return { scanned: false, banned: false, reason: 'group_admin' };
+	}
 
 	const profile = await fetchAdUserProfile(userId, {
 		first_name: row?.first_name || '',
@@ -21370,6 +21547,9 @@ async function screenAdJoinMember(env, member, options = {}) {
 		// 用 isAdminForAdDetection 而不是 checkIfUserIsAdminInGroup：这里是【检测豁免】不是鉴权，
 		// 前者带 5 分钟按群缓存，一次批量入群（拉人进群常常一次十几个）同群只拉一份管理员列表。
 		if (await isAdminForAdDetection(chatId, userId)) return 'skipped';
+		// 任意配置群的管理员：入群这一步也整条不进 —— 管理员申请加入另一个配置群
+		// 不该被当成新成员筛查，口径与消息路径一致（主人 2026-10-15）。
+		if (await isConfiguredGroupAdmin(env, userId)) return 'skipped';
 
 		const nowSeconds = Math.floor(Date.now() / 1000);
 		// 先读后写：要的是【本次入群之前】的 bio_checked_at。
@@ -21681,6 +21861,11 @@ async function detectAdOnMessage(message, env) {
 	// 这里用 isAdminForAdDetection 而不是 checkIfUserIsAdminInGroup：
 	// 前者带 5 分钟按群缓存（同群所有人共用一份列表），后者是 /ban 的鉴权入口不能缓存。
 	if (await isAdminForAdDetection(chat.id, userId)) return false;
+	// 任意配置群的管理员同样整条链不进（主人 2026-10-15 口径）：在 A 群是管理员的人，
+	// 在 B 群（他也是配置群）只是普通成员时发广告，一样一个字节都不判。
+	// 与上一行分工：上一行管【本群】且走实时 API（刚被提权那一刻最及时），
+	// 这一行管【其他配置群】且读同步表（零 Telegram 请求，429 也照常生效）。两句都要。
+	if (await isConfiguredGroupAdmin(env, userId)) return false;
 
 	const nowSeconds = Math.floor(Date.now() / 1000);
 	// 先读名册再 upsert —— 顺序不能颠倒：upsert 会把 last_seen 推到现在，
