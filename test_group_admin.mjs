@@ -28,13 +28,20 @@ function stripExportDefault(source) {
 	return source.slice(0, start) + 'globalThis.__handler = ' + source.slice(start + 'export default'.length, i) + ';' + source.slice(i);
 }
 
-function makeD1() {
-	const db = new DatabaseSync(':memory:');
+// 故障注入：命中这条正则的 SQL 直接抛错，用来测「D1 读失败」这条分支。
+// 动态群基线读不到时 GROUP_IDS 会静默变短，孤儿群清理必须认出这种情况而不是照删。
+let FAIL_SQL_PATTERN = null;
+
+// shared 可选：传入一个已有的 DatabaseSync 就复用它（同一份数据、不同的包装对象）。
+// 运行期缓存是按 env.DB 对象做 key 的 WeakMap，换个包装即可绕过缓存、真的走到 loader。
+function makeD1(shared) {
+	const db = shared || new DatabaseSync(':memory:');
 	const sqlLog = [];
 	const nIn = (v) => (v === undefined ? null : typeof v === 'boolean' ? (v ? 1 : 0) : typeof v === 'bigint' ? Number(v) : v);
 	const nOut = (r) => { if (!r) return null; const o = {}; for (const k of Object.keys(r)) o[k] = typeof r[k] === 'bigint' ? Number(r[k]) : r[k]; return o; };
 	const exec = (sql, params = []) => {
 		sqlLog.push(String(sql).replace(/\s+/g, ' ').trim());
+		if (FAIL_SQL_PATTERN && FAIL_SQL_PATTERN.test(String(sql))) throw new Error('mock D1 故障: ' + String(sql).slice(0, 40));
 		const st = db.prepare(sql);
 		const bd = params.map(nIn);
 		const up = sql.trim().slice(0, 6).toUpperCase();
@@ -57,7 +64,10 @@ function makeD1() {
 		async exec(sql) { for (const p of String(sql).split(';')) { const s = p.trim(); if (s) db.exec(s); } return { count: 1 }; },
 		async batch(l) { const o = []; for (const s of l) o.push(await s.run()); return o; },
 		query(sql) { return db.prepare(sql).all().map(nOut); },
-		_sql: sqlLog
+		_sql: sqlLog,
+		// 底层 DatabaseSync。运行期缓存是按 env.DB 对象做 key 的 WeakMap，
+		// 换个包装共享同一份库就能绕过缓存、真的走到 loader（数据不受影响）。
+		__raw: db
 	};
 }
 
@@ -362,6 +372,93 @@ section('[7] 源码接线：入口豁免与同步都挂上了');
 	assert('热路径判断不碰 Telegram',
 		!/async function isConfiguredGroupAdmin[\s\S]{0,600}getChatAdministrators/.test(src),
 		'isConfiguredGroupAdmin 内不应出现 getChatAdministrators');
+	assert('cron 同步末尾做孤儿群清理',
+		/DELETE FROM ad_group_admins WHERE chat_id NOT IN \(/.test(src),
+		'孤儿群清理 SQL 缺失');
+	assert('孤儿群清理带基线可信保护',
+		/let DYNAMIC_GROUPS_READY = false/.test(src) && /if \(!?DYNAMIC_GROUPS_READY/.test(src),
+		'缺少 DYNAMIC_GROUPS_READY 的声明或判断');
+	assert('动态群读失败与「真的没有动态群」必须区分',
+		/function loadDynamicGroupsCachedFromD1[\s\S]{0,400}return null;/.test(src),
+		'loadDynamicGroupsCachedFromD1 未把读失败暴露成 null');
+}
+
+// ================= [8] 孤儿群清理 =================
+section('[8] 群被移除后，管理员行不残留');
+{
+	// [2] 节把 PER_GROUP_ADMINS 改成空名单、测完「API 失败不清空」后没有还原，
+	// 这里先恢复，否则 [8] 拿到的是空管理员名单，表永远建不起来。
+	PER_GROUP_ADMINS = {
+		[GROUP_A]: [
+			{ status: 'creator', user: { id: 9001, first_name: 'A群主' } },
+			{ status: 'administrator', user: { id: 9002, first_name: 'A管理' } }
+		],
+		[GROUP_B]: [{ status: 'administrator', user: { id: 5001, first_name: 'B管理' } }]
+	};
+
+	// DYNAMIC_GROUPS_READY 由 mergeDynamicGroupsFromD1 置位。真实 cron 里它一定先跑
+	// （scheduled 中 mergeDynamicGroupsFromD1 排在 syncAdGroupAdmins 之前），
+	// 离线下要显式补上，否则读到的是上一次请求留下的残留值。
+	async function bootCron(env) {
+		W.applyRuntimeConfig(W.loadRequiredConfig(env));
+		await W.mergeDynamicGroupsFromD1(env);
+	}
+
+	// --- 8a 两个配置群都同步进表 ---
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	await bootCron(env);
+	await W.syncAdGroupAdmins(env);
+	let ids = env.DB.query('SELECT user_id, chat_id FROM ad_group_admins').map((r) => String(r.user_id) + '@' + String(r.chat_id));
+	assert('同步后两群管理员都进表',
+		ids.includes('9001@' + GROUP_A) && ids.includes('5001@' + GROUP_B), JSON.stringify(ids));
+
+	// --- 8b 把 GROUP_B 从配置里移除（等价于改 GROUP_ID 环境变量，或 /delgroup）---
+	env.GROUP_ID = GROUP_A;
+	await bootCron(env);
+	await W.syncAdGroupAdmins(env);
+	const left = env.DB.query('SELECT user_id, chat_id FROM ad_group_admins').map((r) => String(r.user_id) + '@' + String(r.chat_id));
+	assert('★ 被移除群的管理员行被清掉（否则那些人永久免检）',
+		!left.some((x) => x.endsWith('@' + GROUP_B)), JSON.stringify(left));
+	assert('★ 仍在配置里的群一个没动',
+		left.includes('9001@' + GROUP_A) && left.includes('9002@' + GROUP_A), JSON.stringify(left));
+
+	// --- 8c 端到端：清理后该管理员在剩余群恢复检测 ---
+	resetCalls();
+	await send(groupMessage({ id: 5001, first_name: '前B群管理' }, AD_TEXT, GROUP_A), env);
+	const back = callsOf('banChatMember').length > 0
+		|| env.DB.query("SELECT * FROM ad_group_members WHERE user_id='5001'").length > 0;
+	assert('★ 清理后该管理员在别的群恢复检测', back,
+		JSON.stringify({ ban: callsOf('banChatMember').length, member: env.DB.query("SELECT * FROM ad_group_members WHERE user_id='5001'").length }));
+
+	// --- 8d 【关键保护】动态群基线读失败时，GROUP_IDS 会静默变短 ---
+	// 场景：B 群是 /addgroup 加进来的动态群，某轮 cron 读 dynamic_groups 失败。
+	// 那一刻 GROUP_IDS 只剩环境变量群，「B 不在配置里」与「B 没读出来」长得一模一样 ——
+	// 照 GROUP_IDS 清理就会把动态群的管理员全部误删（同样是静默的）。
+	const env2 = makeEnv();
+	await W.adDetectionReady(env2);
+	env2.GROUP_ID = GROUP_A;                     // 环境变量里只有 A 群，B 群只在动态群表里
+	W.applyRuntimeConfig(W.loadRequiredConfig(env2));
+	// B 群的管理员是此前某轮同步写进来的，现在表里有一条它的行
+	await W.upsertAdGroupAdmin(env2, '5001', GROUP_B, 'administrator');
+	assert('前置：B 群的管理员行已在表里',
+		env2.DB.query("SELECT * FROM ad_group_admins WHERE chat_id='" + GROUP_B + "'").length === 1,
+		JSON.stringify(env2.DB.query('SELECT chat_id FROM ad_group_admins')));
+
+	// 换一个包装共享同一份 SQLite：绕过按 env.DB 做的缓存，才会真的走到 loader
+	env2.DB = makeD1(env2.DB.__raw);
+	await W.adDetectionReady(env2);
+	FAIL_SQL_PATTERN = /FROM dynamic_groups/;
+	await W.mergeDynamicGroupsFromD1(env2);      // 读失败 → GROUP_IDS 只剩 A 群
+	FAIL_SQL_PATTERN = null;
+	const diag = await W.syncAdGroupAdmins(env2);
+	assert('★ 读失败被认出来（baseline 记为 false）', diag.baseline === false, 'baseline=' + diag.baseline);
+	assert('★ 动态群基线不可信时不清孤儿行（宁可留旧数据也不误删）',
+		env2.DB.query("SELECT * FROM ad_group_admins WHERE chat_id='" + GROUP_B + "'").length === 1,
+		JSON.stringify(env2.DB.query('SELECT chat_id FROM ad_group_admins')) + ' baseline=' + diag.baseline);
+	assert('★ 读失败没连累配置里的群（A 群照常同步）',
+		env2.DB.query("SELECT * FROM ad_group_admins WHERE chat_id='" + GROUP_A + "'").length === 2,
+		JSON.stringify(env2.DB.query("SELECT * FROM ad_group_admins WHERE chat_id='" + GROUP_A + "'")));
 }
 
 console.log(`\n========== ${pass} 通过 / ${fail} 失败 ==========`);

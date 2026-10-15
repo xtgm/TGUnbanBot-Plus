@@ -243,6 +243,10 @@ let GROUP_IDS = [];
 let ENV_GROUP_IDS = [];
 // D1 dynamic_groups 里合并进来的群（每请求由 mergeDynamicGroupsFromD1 重建）
 let DYNAMIC_GROUP_IDS = [];
+// 动态群基线本次是否可信（读 D1 失败时为 false）。GROUP_IDS 的可信度依赖它：
+// 读失败时 GROUP_IDS 会静默停在环境变量群上，那是「短」不是「少」，任何以它为准的
+// 清理都可能误删动态群的数据 —— 见 syncAdGroupAdmins 末尾的孤儿群清理。
+let DYNAMIC_GROUPS_READY = false;
 // 主人 TGID 列表:第一个是主人,后续是副主人。空数组 = 未配置,禁用通知
 let OWNER_IDS = [];
 // 超级管理员 TGID 列表：等同 Telegram 群管理员的全部权限（免实际管理员身份），
@@ -291,6 +295,7 @@ function applyRuntimeConfig(config) {
 	// 随后 mergeDynamicGroupsFromD1 再按 D1 内容追加，避免 isolate 复用时残留上次的群。
 	ENV_GROUP_IDS = [...effectiveGroupIds];
 	DYNAMIC_GROUP_IDS = [];
+	DYNAMIC_GROUPS_READY = false;
 	GROUP_ID = config.GROUP_ID;
 	OWNER_IDS = config.OWNER_IDS;
 	SUPER_ADMIN_IDS = config.SUPER_ADMIN_IDS || [];
@@ -1197,10 +1202,14 @@ async function ensureAdVoteTables(env) {
 // 合并顺序固定为「环境变量群在前、动态群在后」，动态群永远不会顶替 GROUP_IDS[0] 主群。
 // 合并进 GROUP_IDS 之后，isConfiguredGroup 的全部调用点（封禁/踢人/广告检测/purge/
 // 批量任务/投票）自动生效，无需逐处改动。
+// 返回值：数组 = 读到了（空数组表示真的没有动态群）；null = 读失败。
+// 【为什么必须区分】读失败时 mergeDynamicGroupsFromD1 会保留环境变量群不动，
+// GROUP_IDS 于是停在「只有环境变量群」的形态 —— 这与「动态群被全部删除」完全同形，
+// 而 syncAdGroupAdmins 末尾的孤儿群清理正是以 GROUP_IDS 为基准的。
 async function loadDynamicGroupsFromD1(env) {
 	if (!env.DB) return [];
 	try {
-		if (!(await ensureD1Table(env))) return [];
+		if (!(await ensureD1Table(env))) return null;
 		const { results } = await env.DB
 			.prepare('SELECT chat_id, title, added_by, added_at, note FROM dynamic_groups ORDER BY added_at ASC, chat_id ASC')
 			.all();
@@ -1218,13 +1227,16 @@ async function loadDynamicGroupsFromD1(env) {
 			}));
 	} catch (error) {
 		console.error('[动态群组] 读 D1 失败:', error);
-		return [];
+		return null;
 	}
 }
 
+// 返回值同上：数组 = 读到了；null = 读失败。不能把 null 折成 []，否则读失败会被下游
+// 当成「真的没有动态群」，GROUP_IDS 静默变短而没有任何人察觉。
 async function loadDynamicGroupsCachedFromD1(env) {
 	const value = await loadD1RuntimeCachedValue(env, D1_DYNAMIC_GROUPS_CACHE, loadDynamicGroupsFromD1);
-	return Array.isArray(value) ? value : [];
+	if (Array.isArray(value)) return value;
+	return null;
 }
 
 // 把 D1 动态群并入运行期 GROUP_IDS。必须在路由分发之前调用（fetch 与 queue 两个入口都要），
@@ -1236,8 +1248,16 @@ async function mergeDynamicGroupsFromD1(env) {
 	ENV_GROUP_IDS = [...GROUP_IDS];
 	try {
 		const rows = await loadDynamicGroupsCachedFromD1(env);
+		// 读失败（null）与「真的没有动态群」（空数组）在这里必须分开：前者 GROUP_IDS
+		// 会停在环境变量群上，那是「短」不是「少」，不能当成「动态群被删光了」。
+		if (rows === null) {
+			DYNAMIC_GROUP_IDS = [];
+			DYNAMIC_GROUPS_READY = false;
+			return;
+		}
 		if (rows.length === 0) {
 			DYNAMIC_GROUP_IDS = [];
+			DYNAMIC_GROUPS_READY = true;
 			return;
 		}
 		const envSet = new Set(GROUP_IDS.map((id) => String(id)));
@@ -1250,10 +1270,12 @@ async function mergeDynamicGroupsFromD1(env) {
 		}
 		DYNAMIC_GROUP_IDS = extra;
 		if (extra.length > 0) GROUP_IDS = [...GROUP_IDS, ...extra];
+		DYNAMIC_GROUPS_READY = true;
 	} catch (error) {
 		// 读失败时保持环境变量群不变，绝不因此丢群
 		console.error('[动态群组] 合并失败，仅使用 GROUP_ID 环境变量:', error);
 		DYNAMIC_GROUP_IDS = [];
+		DYNAMIC_GROUPS_READY = false;
 	}
 }
 
@@ -9894,7 +9916,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const { head, rest } = parseTelegramCommand(text);
 
 		if (head === '/listgroups') {
-			const rows = await loadDynamicGroupsFromD1(env);
+			// 读失败（null）不能显示成「一个动态群都没有」—— 那会让主人以为配置丢了
+			const loadedRows = await loadDynamicGroupsFromD1(env);
+			const rows = Array.isArray(loadedRows) ? loadedRows : [];
+			const rowsUnavailable = loadedRows === null;
 			const lines = ['🗂️ <b>当前生效的群组</b>', ''];
 			lines.push(`<b>环境变量群（GROUP_ID，共 ${ENV_GROUP_IDS.length} 个）</b>`);
 			if (ENV_GROUP_IDS.length === 0) {
@@ -9906,7 +9931,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				});
 			}
 			lines.push('', `<b>指令添加群（D1，共 ${rows.length} 个）</b>`);
-			if (rows.length === 0) {
+			if (rowsUnavailable) {
+				lines.push('  ⚠️ 读取失败，请稍后重试。');
+			} else if (rows.length === 0) {
 				lines.push('  （空）', '', '用 <code>/addgroup -100xxxx 备注</code> 添加。');
 			} else {
 				rows.forEach((row, index) => {
@@ -13377,7 +13404,30 @@ async function syncAdGroupAdmins(env) {
 		groups += 1;
 		admins += seen.length;
 	}
-	return { groups, admins, failed };
+	// 【孤儿群清理】群从 GROUP_ID 环境变量或 /delgroup 移除后，它的管理员行不会
+	// 自己消失 —— 那些人会在剩余全部配置群里永久免检，且 /adstats 与日志都看不出来。
+	//
+	// 【为什么必须看 DYNAMIC_GROUPS_READY】清理的基准是 GROUP_IDS，而动态群读 D1 失败时
+	// GROUP_IDS 会静默停在「只有环境变量群」的形态上 —— 那一刻「某个群已被移除」与
+	// 「某个群没读出来」完全同形，照删就是把动态群的管理员集体误删，而且同样是静默的。
+	// 拿不准就不删：宁可多留一批旧行（下轮 cron 再清），也不误删活人的豁免。
+	let orphans = 0;
+	const live = GROUP_IDS.map((id) => String(id)).filter(Boolean);
+	if (!DYNAMIC_GROUPS_READY) {
+		console.error('[广告检测] 跳过孤儿群清理：动态群基线不可信');
+	} else if (live.length && groups > 0) {
+		const placeholders = live.map(() => '?').join(', ');
+		try {
+			const result = await env.DB.prepare('DELETE FROM ad_group_admins WHERE chat_id NOT IN (' + placeholders + ')')
+				.bind(...live).run();
+			orphans = Number(result?.meta?.changes || 0);
+			AD_GROUP_ADMIN_CACHE.delete(env.DB);
+		} catch (error) {
+			console.error('[广告检测] 清理孤儿群管理员失败:', error);
+		}
+	}
+	// baseline 一并回报：cron 汇总日志里能直接看出这轮为什么没清理孤儿行
+	return { groups, admins, failed, orphans, baseline: DYNAMIC_GROUPS_READY };
 }
 
 async function addAdUserWhitelist(env, userId, addedBy, note) {
