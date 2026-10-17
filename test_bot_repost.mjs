@@ -173,7 +173,9 @@ console.log('\n=== 4. 环形上限与过期淘汰 ===');
 {
 	const env = { ...baseEnv, DB: makeD1() };
 	await bootEnv(env);
-	for (let i = 0; i < 510; i += 1) await W.recordHandledAdText(env, '广告文案编号第' + i + '号请联系我详谈');
+	// 2026-10-17 模板资格闸：文案必须【自身带广告证据】才能进名单，
+	// 所以这里的占位文案带一个业务词「跑分」——否则它压根不会被记录，本组测的就是空气。
+	for (let i = 0; i < 510; i += 1) await W.recordHandledAdText(env, '广告文案编号第' + i + '号来跑分有意联系');
 	const list = JSON.parse(env.DB.query("SELECT value FROM ad_scan_state WHERE key='ad_handled_texts'")[0].value);
 	check('超过上限后截断到 500 条', list.length === 500, '实际 ' + list.length);
 	check('最新的留在最前（第 509 号）', String(list[0].t).includes('第509号'), String(list[0].t));
@@ -181,13 +183,15 @@ console.log('\n=== 4. 环形上限与过期淘汰 ===');
 		!list.some((x) => /第[0-9]号/.test(String(x.t))),
 		list.filter((x) => /第[0-9]号/.test(String(x.t))).length + ' 条残留');
 	check('挤出的旧文案不再命中',
-		!(await W.matchHandledAdText(env, { text: '广告文案编号第0号请联系我详谈' })));
+		!(await W.matchHandledAdText(env, { text: '广告文案编号第0号来跑分有意联系' })));
 
 	// 过期项：手动塞一条 25 小时前的记录，应读不到。
-	const stale = JSON.stringify([{ t: W.normalizeAdFingerprintValue('过期的旧广告文案内容在此'), at: Date.now() - 8 * 24 * 60 * 60 * 1000 }]);
+	// 文案同样要带广告证据（「跑分」），否则会被模板资格闸先挡下 ——
+	// 那样这条断言测的就是闸门而不是 TTL 了，会失去它本来的意义。
+	const stale = JSON.stringify([{ t: W.normalizeAdFingerprintValue('过期的旧广告来跑分内容在此'), at: Date.now() - 8 * 24 * 60 * 60 * 1000 }]);
 	await W.writeAdScanState(env, 'ad_handled_texts', stale);
 	W.primeHandledAdTexts(env, JSON.parse(stale));
-	check('超过一周的记录不再命中', !(await W.matchHandledAdText(env, { text: '过期的旧广告文案内容在此' })));
+	check('超过一周的记录不再命中', !(await W.matchHandledAdText(env, { text: '过期的旧广告来跑分内容在此' })));
 }
 
 console.log('\n=== 5. 运行期缓存：热路径不重复读 D1 ===');
@@ -206,7 +210,8 @@ console.log('\n=== 5. 运行期缓存：热路径不重复读 D1 ===');
 	check('5 次比对全部命中（缓存不能把结果吃掉）', hits.every((h) => Boolean(h)), JSON.stringify(hits));
 
 	// 写入端必须主动刷缓存：重发常在封禁后几秒内到达，等 TTL 自然过期就会漏删第一条。
-	const FRESH = '崭新的另一条广告文案需要立刻生效不能等缓存过期';
+	// 同样带广告证据（「跑分」）才能进名单。
+	const FRESH = '崭新的另一条广告来跑分需要立刻生效不能等缓存过期';
 	await W.recordHandledAdText(env, FRESH);
 	check('新记录立即可命中（写入端主动刷新缓存）', Boolean(await W.matchHandledAdText(env, { text: FRESH })));
 }
@@ -429,7 +434,15 @@ console.log('\n=== 11. 热路径 D1 预算：稳定态不因重发通道多读�
 console.log('\n=== 11b. 同款直封（2026-09-26 方案 A）：第一主人 /spam 过的文案，广告号直发 → 删除 + 封禁 ===');
 {
 	// 中性文案：广告检测本身判不出来，这样下面出现的封禁只可能来自同款直封，而不是检测。
-	const SPAM_TEXT = '今天下午三点在老地方见面记得带上资料';
+	// 2026-10-17 模板资格闸：/spam 记录进直封名单的文案必须【自身带广告证据】。
+	// 本组原本用的是一句正常对话（「今天下午三点在老地方见面记得带上资料」）——
+	// 那恰好复现了线上误封事故本身（正常话被当同款模板去连坐别人）。
+	//
+	// 换成「来跑分 一天1万」的理由：它 score=0（只有业务词、无交易动词），
+	// 所以【正文自动检测判不出广告】——本组要测的正是「只靠同款名单封人」这条通道。
+	// 若换成带交易动词的文案（如「急招跑分…」score=5），正文自己就被自动检测封了，
+	// 根本轮不到同款通道，本组的四条断言会全部失去意义。
+	const SPAM_TEXT = '来跑分 一天1万';
 	const QUIET_ADMINS = () => ({ ok: true, result: [] });
 	const originalFetch = sandbox.fetch;
 	let adminList = QUIET_ADMINS;

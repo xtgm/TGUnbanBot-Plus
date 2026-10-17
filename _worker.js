@@ -6723,6 +6723,10 @@ async function recordSpamText(env, repliedMsg) {
 	const key = buildModerationTextKey(repliedMsg);
 	// 与已处置名单同一道短文案门槛：不到 6 个字不记，防止「你好」「在吗」误伤。
 	if (!key || String(key.norm).length < 6) return;
+	// 模板资格闸（2026-10-17）：正文自身没有广告证据 → 不进同款直封名单。
+	// 名单就是模板，口径与 findLinkedSpamTargets 完全一致：不查词表，只看正文分。
+	// 挡的是「节点订阅链接」这类长技术词（能过 6 字门槛，但正文自身 0 分）。
+	if (!isAdBearingText(key.norm)) return;
 	if (!(await ensureAdSpamTextsTable(env))) return;
 	const now = Date.now();
 	try {
@@ -6849,10 +6853,42 @@ function shouldRunLinkedSpamSync(targetCount) {
 	return !budget.useQueue;
 }
 
+// 这段正文自身够不够格当同款模板 —— 判据是「它自己有没有广告证据」。
+//
+// 【2026-10-17 主人口径】正常词（签到 / 打卡 / 收到 / 在吗 / 冒泡）本来就不该是广告证据，
+// 而这【不需要查任何词表】：正文里一个广告词都没有，就是没证据。
+//
+// 【为什么不用 scoreAdMessageText().score > 0】那条分要求「交易动词 ∧ 业务关键词同现」
+// 才给分（防误封的老设计）。线上主人亲手 /spam 过的真广告「来跑分 一天1万」「来洗钱 挣8千」
+// 都只有业务词、没有交易动词，纯分是 0 —— 用它当判据会把真广告一起误挡。
+// 所以判据放宽到：**分 > 0（组合分 / 结构分 / 引流链接等）或任一广告词表命中**。
+// 单类词命中在【评分】里不足定罪，但用来回答「这段文本是不是在讲广告」已经够了。
+//
+// 【为什么不查 AD_EXEMPT_KEYWORDS】那张表只有主人手工攒的一百来个词，
+// 表外的高频日常词照样漏（线上「打卡」就不在表里）——「有没有广告词/广告分」才是根本判据。
+function isAdBearingText(text) {
+	const source = String(text ?? '').trim();
+	if (!source) return false;
+	const r = scoreAdMessageText(source);
+	if (Number(r?.score) > 0) return true;
+	return Array.isArray(r?.tradeHits) && r.tradeHits.length > 0
+		|| Array.isArray(r?.businessHits) && r.businessHits.length > 0;
+}
+
 // 按正文哈希跨【全部配置群】反查 24 小时内发过同款文案的其他账号。
 // 返回去重后的 { userId, chatIds, messageIds } 列表，不含被 /spam 的当事人。
 async function findLinkedSpamTargets(env, textKey, excludeUserId) {
 	if (!env?.DB || !textKey?.hash) return { targets: [], truncated: 0 };
+	// ===== 模板资格闸（2026-10-17）：正文自身没有广告证据 → 不能当同款模板 =====
+	// 【线上误封回归】广告号资料卡是广告、正文却只发了「签到」，连带拿这句「签到」
+	// 反查 24 小时，把全群发打卡词的正常人一锅端（TGID 1335910695 就是这么死的）。
+	// 【只挡模板，不挡处置本人】触发者该封还封 —— 这里管的只是「别拿他的正文去连坐别人」。
+	// 返回结构照抄正常返回：/spam 那侧读的是 found.targets.length，没有可选链，返回 null 会崩。
+	if (!isAdBearingText(textKey?.norm)) {
+		console.log('[同款连带] 模板正文自身无广告证据（' + String(textKey?.norm || '').slice(0, 40)
+			+ '），不作同款模板、跳过反查');
+		return { targets: [], truncated: 0, overflowIds: [] };
+	}
 	const sinceIso = new Date(Date.now() - LINKED_SPAM_LOOKBACK_MS).toISOString();
 	try {
 		await ensureD1Table(env);
@@ -7122,6 +7158,9 @@ async function recordHandledAdText(env, rawText) {
 	const norm = normalizeAdFingerprintValue(rawText);
 	// 过短的不记：那种文案撞正常发言概率高，而这条通道是【无条件删消息】，宁缺毋滥。
 	if (norm.length < 6) return;
+	// 模板资格闸（2026-10-17）：正文自身没有广告证据 → 不进重发名单（名单同样是模板）。
+	// 这条通道是【无条件删消息】，误伤代价不比封禁低，口径与 findLinkedSpamTargets 一致。
+	if (!isAdBearingText(norm)) return;
 	try {
 		const now = Date.now();
 		const list = await loadHandledAdTexts(env);
@@ -7152,13 +7191,19 @@ async function matchHandledAdText(env, message) {
 		String(message?.reply_to_message?.text ?? message?.reply_to_message?.caption
 			?? extractAdChecklistText(message?.reply_to_message))
 	].map((t) => normalizeAdFingerprintValue(t)).filter((t) => t.length >= 6);
-	if (!candidates.length) return false;
+	// 模板资格闸（2026-10-17）：拿不出「自身有广告证据」的正文，一律不参与比对 ——
+	// 这条通道是【只删消息】，误删正常发言（「签到」）的代价不比误封低。
+	// 名单侧还多一层意义：改造【之前】写进 ad_handled_texts 的脏数据（「签到」这类）
+	// 也一并失效，不必干等 7 天 TTL 自然过期。
+	// 口径与 findLinkedSpamTargets / enforceHandledRepeatBan 的闸门完全一致：不看词表，只看正文自身证据。
+	const adBearingCandidates = candidates.filter((t) => isAdBearingText(t));
+	if (!adBearingCandidates.length) return false;
 	try {
 		const list = await loadHandledAdTexts(env);
 		if (!Array.isArray(list) || !list.length) return false;
 		const now = Date.now();
 		const fresh = list.filter((x) => x && typeof x.t === 'string' && now - Number(x.at) < AD_HANDLED_TEXTS_TTL_MS);
-		return fresh.some((x) => candidates.includes(x.t));
+		return fresh.some((x) => adBearingCandidates.includes(x.t));
 	} catch (error) {
 		console.error('[重发删除] 比对已处置文案失败:', error);
 		return false;
@@ -7170,6 +7215,12 @@ async function matchHandledAdText(env, message) {
 async function enforceHandledRepeatBan(env, message, hit) {
 	const userId = String(message?.from?.id || '');
 	if (!userId) return;
+	// 兜底闸（2026-10-17）：名单里可能已有本次改造【之前】写进去的无广告证据文案
+	//（「签到」这类）。写入端已加闸，读侧再拦一次 —— 否则历史脏数据照样会直封。
+	if (!isAdBearingText(String(hit?.norm || ''))) {
+		console.log('[同款直封] 文案自身无广告证据，跳过直封');
+		return;
+	}
 	let blacklistCode = 'ERROR';
 	try {
 		const added = await addToBlacklist(userId, env, {

@@ -347,6 +347,81 @@ console.log('     3 群 2 号 → ' + b3.estimate.total + ' 子请求，useQueue
 console.log('     15 群 2 号 → ' + b15.estimate.total + ' 子请求，useQueue=' + b15.useQueue);
 check('同一目标数在群多时自动改走批量（不写死号数是必要的）', b3.useQueue === false && b15.useQueue === true);
 
+console.log('\n=== 13. 正文无广告证据 → 不能当同款模板（2026-10-17 线上误封回归）===');
+// 线上事故：广告号资料卡是广告、正文只发了一句「签到」，连带拿这句当模板反查 24h，
+// 把全群发打卡词的正常人一锅端（TGID 1335910695 就是这么死的）。
+// 判据不是「在不在豁免词表」—— 表外的高频日常词（打卡/冒泡）照样漏；
+// 判据是【这段正文自己有没有广告分】：正文自身 0 分就是没证据，根本不配当模板。
+{
+	const tplEnv = { TOKEN: 'T', BOT_TOKEN: '1:x', GROUP_ID: GROUPS.join(','), OWNER_IDS: '10001', DB: makeD1() };
+	await W.__h.fetch(new Request('https://x/T/export'), tplEnv, { waitUntil() {} });
+
+	// —— 判据函数本体：正常词 false、真广告 true ——
+	const hasFn = typeof W.isAdBearingText === 'function';
+	check('isAdBearingText 已定义', hasFn);
+	if (hasFn) {
+		check('「签到」自身无广告证据', W.isAdBearingText('签到') === false);
+		check('「打卡」自身无广告证据（表外词，查表方案治不了这个）', W.isAdBearingText('打卡') === false);
+		check('「在吗」自身无广告证据', W.isAdBearingText('在吗') === false);
+		check('「节点订阅链接」自身无广告证据（长豁免词，过了 6 字门槛）', W.isAdBearingText('节点订阅链接') === false);
+		check('「来跑分 一天1万」自身有广告证据', W.isAdBearingText('来跑分 一天1万') === true);
+		check('「来洗钱 挣8千」自身有广告证据', W.isAdBearingText('来洗钱 挣8千') === true);
+	}
+
+	// —— 端到端：正常词当模板，反查不出人 ——
+	let m2 = 20000;
+	for (const u of ['401', '402', '403']) {
+		m2 += 1;
+		await W.cacheModerationMessage(tplEnv, { message_id: m2, chat: { id: GROUPS[0] }, from: { id: u }, text: '签到' });
+	}
+	const kSignin = W.buildModerationTextKey({ text: '签到' });
+	const fSignin = await W.findLinkedSpamTargets(tplEnv, kSignin, '401');
+	check('「签到」作模板 → 连带 0 人（3 个同款号全被挡下）',
+		fSignin.targets.length === 0, '实际 ' + fSignin.targets.length + ' 人');
+
+	// —— 真广告模板照常连带（召回不许受损）——
+	const kAd2 = W.buildModerationTextKey({ text: '来跑分 一天1万' });
+	for (const u of ['501', '502']) {
+		m2 += 1;
+		await W.cacheModerationMessage(tplEnv, { message_id: m2, chat: { id: GROUPS[0] }, from: { id: u }, text: '来跑分 一天1万' });
+	}
+	const fAd = await W.findLinkedSpamTargets(tplEnv, kAd2, '501');
+	check('真广告模板照常连带（召回未受损）', fAd.targets.length === 1, '实际 ' + fAd.targets.length + ' 人');
+
+	// —— 名单侧：写入端与读取端同口径 ——
+	await W.recordSpamText(tplEnv, { text: '节点订阅链接' });
+	check('长豁免词不进同款直封名单', tplEnv.DB.query('SELECT COUNT(*) c FROM ad_spam_texts')[0].c === 0);
+	await W.recordHandledAdText(tplEnv, '节点订阅链接');
+	check('长豁免词不进重发删除名单',
+		(await W.matchHandledAdText(tplEnv, { text: '节点订阅链接' })) === false);
+	// 写入端不能一刀切：真广告照常进名单
+	await W.recordSpamText(tplEnv, { text: '来跑分 一天1万' });
+	check('真广告照常进同款直封名单', tplEnv.DB.query('SELECT COUNT(*) c FROM ad_spam_texts')[0].c === 1);
+
+	// —— 读取端兜底：名单里已有的历史脏数据也要拦住 ——
+	banned.length = 0;
+	await W.enforceHandledRepeatBan(tplEnv, {
+		from: { id: '601' }, chat: { id: GROUPS[0], title: '测试群' }
+	}, { norm: '签到' });
+	check('「签到」即便命中名单也不直封（读侧兜底历史数据）', banned.length === 0, banned.join(' '));
+
+	// —— 读取端兜底（重发删除通道 matchHandledAdText）：名单里的历史脏数据同样不能匹上 ——
+	// 这一条【绕过写入端闸门】手工把文案塞进名单，专门考 matchHandledAdText 内部的闸门。
+	// 为什么必须绕过：写入端已经挡住了，读侧闸门根本没机会表现，改前改后都是绿 = 零信息量。
+	// 为什么不用「签到」：它只有 2 字，会先被「不足 6 字」门槛挡下，根本测不到本闸门。
+	const dirtyList = JSON.stringify([{ t: W.normalizeAdFingerprintValue('节点订阅链接'), at: Date.now() }]);
+	await W.writeAdScanState(tplEnv, 'ad_handled_texts', dirtyList);
+	W.primeHandledAdTexts(tplEnv, JSON.parse(dirtyList));
+	check('名单里的历史脏数据「节点订阅链接」不匹配重发通道（读侧兜底）',
+		(await W.matchHandledAdText(tplEnv, { text: '节点订阅链接' })) === false);
+	// 对照：真广告在名单里照常命中 —— 读侧闸门只剔正常话，不许把名单本身废掉。
+	const goodList = JSON.stringify([{ t: W.normalizeAdFingerprintValue('来跑分 一天1万'), at: Date.now() }]);
+	await W.writeAdScanState(tplEnv, 'ad_handled_texts', goodList);
+	W.primeHandledAdTexts(tplEnv, JSON.parse(goodList));
+	check('真广告在名单里照常匹配重发通道（读侧闸门未误伤召回）',
+		(await W.matchHandledAdText(tplEnv, { text: '来跑分 一天1万' })) === true);
+}
+
 console.log('\n' + '='.repeat(52));
 console.log('连带查杀验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 process.exit(fail > 0 ? 1 : 0);
