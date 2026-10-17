@@ -7706,8 +7706,10 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 		`🔧 加黑操作人:${operator}`,
 		`🕐 加黑时间:${addedAt}`,
 	];
+	// 【2026-10-17】文案从「踢人结果」改中性：拦截处置现在跟随 /ban /spam 口径，
+	// 普通配置群禁言、杀手模式 ON 的群才踢出，不再只有踢人一种可能。
 	if (banResult && !banResult.ok) {
-		lines.push(`⚠️ 踢人结果:失败 - ${escapeHtml(banResult.error || '未知')}`);
+		lines.push(`⚠️ 处置结果:失败 - ${escapeHtml(banResult.error || '未知')}`);
 	}
 
 	await notifyAllOwners(lines.join('\n'), null);
@@ -8921,10 +8923,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// checkIfUserIsAdmin 已含主人/副主人/任意配置群管理员；再补超管。
 			const isProtected = isSuperAdmin(userId) || await checkIfUserIsAdmin(userId);
 			if (!isProtected) {
-				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+踢人`);
+				// 【2026-10-17】处置口径与 /ban /spam 对齐（原来硬编码 banUserFromGroup 踢人）。
+				// 普通配置群的 /ban /spam 早已是【禁言】，这里却还在硬踢 —— 群里管理员一旦
+				// 收走 bot 的「封禁用户」权限，踢人必然 400 not enough rights 且不重试，
+				// 人踢不走、留在群里继续发 → 每条消息再拦一次、再发一条通知 → 刷屏。
+				// 改走 applyGroupModeration(..., 'human')：普通配置群禁言（人发不出话，拦截自然停止）、
+				// 杀手模式 ON 的群仍踢出。处置结果真实回传，失败时通知写明原因，不再静默。
+				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+按人工命令口径处置`);
 				await deleteMessage(chatId, message.message_id);
-				await banUserFromGroup(chatId, userId);
-				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, null);
+				const moderation = await applyGroupModeration(chatId, userId, 'human');
+				await recordDisposalsFromBanResults(env, [{ groupId: chatId, ok: moderation?.ok === true }]);
+				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, moderation);
 				return;
 			}
 		}

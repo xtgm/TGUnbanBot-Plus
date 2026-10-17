@@ -1072,13 +1072,20 @@ console.log('\n[3] /ban 100,200,300（批量）');
 }
 
 // ---------- [4] 群消息黑名单拦截 ----------
-console.log('\n[4] 黑名单用户在群里发言 → 删消息 + 踢人');
+// 【2026-10-17】拦截口径与 /ban /spam 对齐。原本这里硬编码 banUserFromGroup（踢人），
+// 而普通配置群的 /ban /spam 早就是【禁言】—— 口径打架。更糟的是群里管理员一旦收走
+// bot 的「封禁用户」(Ban users) 权限，踢人必然 400 not enough rights 且不重试，
+// 人踢不走、留在群里继续发 → 每条消息再拦一次、再发一条通知 → 刷屏。
+// 现在改走 applyGroupModeration(..., 'human')：普通配置群禁言、杀手模式 ON 的群仍踢出。
+console.log('\n[4] 黑名单用户在群里发言 → 删消息 + 禁言（与 /ban /spam 同口径）');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
 		// 黑名单用户不是管理员，让 getChatMember 返回 member
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 1 }, status: 'creator' }] }),
+		// banChatMember 路由留着：为了能断言「改后一次都不再调它」
 		banChatMember: () => ({ ok: true, result: true }),
+		restrictChatMember: () => ({ ok: true, result: true }),
 		deleteMessage: () => ({ ok: true, result: true }),
 	});
 
@@ -1095,9 +1102,13 @@ console.log('\n[4] 黑名单用户在群里发言 → 删消息 + 踢人');
 
 	const delCalls = callsOf('deleteMessage');
 	const banCalls = callsOf('banChatMember');
+	const muteCalls = callsOf('restrictChatMember');
 	assert('deleteMessage 调用 1 次', delCalls.length === 1);
-	assert('banChatMember 调用 1 次（仅当前群）', banCalls.length === 1);
-	assert('踢的是 8888', String(banCalls[0].body.user_id) === '8888');
+	assert('不再调用 banChatMember（普通配置群不再硬踢）', banCalls.length === 0);
+	assert('restrictChatMember 调用 1 次（改走禁言）', muteCalls.length === 1);
+	assert('禁言的是 8888', String(muteCalls[0]?.body?.user_id) === '8888');
+	assert('禁言发生在 -1001', muteCalls[0]?.body?.chat_id === -1001);
+	assert('禁言置 can_send_messages=false', muteCalls[0]?.body?.permissions?.can_send_messages === false);
 	assert('删除发生在 -1001', delCalls[0].body.chat_id === -1001);
 	assert('删除的是 msgId 500', delCalls[0].body.message_id === 500);
 	const normalizedD1Sql = env.DB._sql.map((sql) => sql.replace(/\s+/g, ' ').trim());
@@ -1105,6 +1116,38 @@ console.log('\n[4] 黑名单用户在群里发言 → 删消息 + 踢人');
 	assert('黑名单发言不再读取完整黑名单', !normalizedD1Sql.some((sql) => (
 		sql.startsWith('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at ASC')
 	)));
+}
+
+// ---------- [4b] 黑名单发言拦截：处置失败必须可见（不再静默） ----------
+// 【2026-10-17】改前 banResult 写死传 null，notifyOwnerBlacklistIntercept 里唯一的失败提示分支
+// （banResult && !banResult.ok）永远进不去 → 通知与成功时逐字节相同，主人以为拦住了，
+// 实际人还在群里一条条发。改后真实传入处置结果，失败必须写明原因。
+console.log('\n[4b] 黑名单发言拦截处置失败 → 通知写明失败原因');
+{
+	resetCalls();
+	sandbox.fetch = makeFetchMock({
+		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 1 }, status: 'creator' }] }),
+		// 禁言失败：模拟群管理员连「限制成员」权限也一并收走
+		restrictChatMember: () => ({ ok: false, error_code: 400, description: 'Bad Request: not enough rights to restrict chat member' }),
+		deleteMessage: () => ({ ok: true, result: true }),
+		sendMessage: () => ({ ok: true, result: { message_id: 1 } }),
+	});
+
+	const update = {
+		message: {
+			message_id: 501,
+			chat: { id: -1001, type: 'supergroup' },
+			from: { id: 8888, is_bot: false },
+			text: '我又来了',
+		},
+	};
+	const env = { ...baseEnv, DB: makeFakeDB([{ id: '8888', reason: 'sa', by: '999', at: '2026-05-01T00:00:00Z' }]) };
+	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env);
+
+	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
+	assert('处置失败时主人收到拦截通知', !!ownerDm);
+	assert('通知含「处置结果:失败」', !!ownerDm && ownerDm.body.text.includes('处置结果:失败'));
+	assert('通知带 Telegram 原始报错（看得出是权限不足）', !!ownerDm && ownerDm.body.text.includes('not enough rights'));
 }
 
 // ---------- [4a] D1 高频路径固定上限 ----------
@@ -4986,17 +5029,23 @@ console.log('\n[67a2] 群聊 /start 仅第一主人；私聊不变');
 	}), groupSilentEnv(), fakeCtxAd);
 	assert('群聊匿名管理员发 /start 也零 Telegram 请求', apiCalls.length === 0, apiCalls.map((c) => c.method).join('/'));
 
-	// 黑名单用户在群里发 /start：由【黑名单兜底拦截】先行处理（删消息 + 踢人 + 通知主人），
-	// 在 /start 分支之前就 return，因此绝不会弹出欢迎语。这是既有安全行为，本次改动不触碰。
+	// 黑名单用户在群里发 /start：由【黑名单兜底拦截】先行处理（删消息 + 处置 + 通知主人），
+	// 在 /start 分支之前就 return，因此绝不会弹出欢迎语。拦截的【位置】本次未动。
+	// 【2026-10-17】处置方式改了：从硬编码踢人改为与 /ban /spam 同口径（普通配置群禁言），
+	// 断言随之从 banChatMember 换成 restrictChatMember —— 拦截仍在，只是不再硬踢。
 	resetCalls();
-	sandbox.fetch = makeFetchMock({ ...silentRoutes, banChatMember: () => ({ ok: true, result: true }) });
+	sandbox.fetch = makeFetchMock({
+		...silentRoutes,
+		banChatMember: () => ({ ok: true, result: true }),
+		restrictChatMember: () => ({ ok: true, result: true }),
+	});
 	const blacklistedEnv = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', DB: makeFakeDB([{ id: '5558', reason: 'manual', by: '999', at: '2026-07-21T00:00:00Z' }]) };
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
 		body: JSON.stringify({ message: { message_id: 3200, chat: { id: -1001, type: 'supergroup' }, from: { id: 5558, is_bot: false, first_name: '黑名单用户' }, text: '/start' } }),
 	}), blacklistedEnv, fakeCtxAd);
 	assert('群聊黑名单用户发 /start 不弹欢迎语', !callsOf('sendMessage').some((c) => String(c.body.text || '').includes('自助解封机器人')));
-	assert('群聊黑名单用户发 /start 仍被兜底拦截删消息并踢出', callsOf('deleteMessage').some((c) => c.body.message_id === 3200) && callsOf('banChatMember').some((c) => String(c.body.user_id) === '5558'));
+	assert('群聊黑名单用户发 /start 仍被兜底拦截（删消息 + 禁言）', callsOf('deleteMessage').some((c) => c.body.message_id === 3200) && callsOf('restrictChatMember').some((c) => String(c.body.user_id) === '5558'));
 
 	// 第一主人群内保持原行为
 	resetCalls();
