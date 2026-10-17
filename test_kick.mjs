@@ -4519,8 +4519,12 @@ console.log('\n[23] 一键代发链路已移除');
 			&& String(noticeMenu.description || '').includes('仅第一主人'), noticeMenu?.description);
 }
 
-// ---------- [24] chat_member 手动 ban → 主人收审计 ----------
-console.log('\n[24] chat_member 手动 ban:主人收审计');
+// ---------- [24] chat_member 手动 ban → 不再通知主人 ----------
+// 【2026-10-17 主人拍板】凡「Telegram 原生操作」（管理员在客户端直接点的封禁/解封，
+// 不经 bot 命令）产生的通知一律去掉。判据=通知里带「📋 状态变更:」这一行，全项目只有
+// notifyOwnerChatMemberAction 会发。本组断言随之反向：从「主人收到审计」改为「主人不再收到」；
+// 行为类断言（不写入 D1 黑名单）原样保留 —— 通知可以不要，防护语义一个不丢。
+console.log('\n[24] chat_member 手动 ban:不再通知主人');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
@@ -4540,16 +4544,9 @@ console.log('\n[24] chat_member 手动 ban:主人收审计');
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cmUpdate) }), env);
 
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('主人 999 收到 chat_member 审计', !!ownerDm);
-	assert('审计含"群管理员操作通知"', ownerDm.body.text.includes('群管理员操作通知'));
-	assert('审计含"群内手动 封禁"（不再加黑）', ownerDm.body.text.includes('群内手动 封禁'));
-	assert('审计标注"未加入全局黑名单"', ownerDm.body.text.includes('未加入全局黑名单'));
-	assert('真人群内手动封禁不写入 D1 黑名单（唯一来源=/ban /spam）', !env.DB._rows.has('5555'));
-	assert('审计含操作人"台风"', ownerDm.body.text.includes('台风'));
-	assert('审计含目标"广告号"', ownerDm.body.text.includes('广告号'));
-	// 状态变更已翻译为中文
-	assert('审计含中文状态"普通成员"', ownerDm.body.text.includes('普通成员'));
-	assert('审计含中文状态"已踢出"', ownerDm.body.text.includes('已踢出'));
+	assert('主人 999 不再收到 chat_member 原生操作通知', !ownerDm,
+		ownerDm ? ownerDm.body.text.slice(0, 120) : '');
+	assert('真人群内手动封禁仍不写入 D1 黑名单（唯一来源=/ban /spam）', !env.DB._rows.has('5555'));
 }
 
 // ---------- [24a] 普通管理员原生解封 D1 用户:黑名单保留并立即封回 ----------
@@ -4702,8 +4699,10 @@ console.log('\n[26] 机器人(其它bot)手动操作:不通知主人');
 	assert('机器人封禁不写入 D1 黑名单（核心:作为管理员的 bot 封禁绝不进黑名单）', !env.DB._rows.has('5555'));
 }
 
-// ---------- [27] 匿名管理员(GroupAnonymousBot)操作 → 仍通知主人 ----------
-console.log('\n[27] 匿名管理员操作:仍通知主人');
+// ---------- [27] 匿名管理员(GroupAnonymousBot)原生操作 → 同样不再通知主人 ----------
+// 【2026-10-17】匿名管理员的操作也是「Telegram 原生操作」（真人开了匿名身份在客户端点的），
+// 走的同一个 notifyOwnerChatMemberAction，故与 [24] 一并不再通知；行为类断言保留。
+console.log('\n[27] 匿名管理员原生操作:同样不再通知主人');
 {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
@@ -4724,9 +4723,9 @@ console.log('\n[27] 匿名管理员操作:仍通知主人');
 	await handler.fetch(new Request(`https://x.com/`, { method: 'POST', body: JSON.stringify(cmUpdate) }), env);
 
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('匿名管理员操作 → 主人仍收通知', !!ownerDm);
-	assert('通知含目标"广告"', ownerDm.body.text.includes('广告'));
-	assert('匿名管理员群内手动封禁不写入 D1 黑名单', !env.DB._rows.has('6666'));
+	assert('匿名管理员原生操作 → 主人不再收通知', !ownerDm,
+		ownerDm ? ownerDm.body.text.slice(0, 120) : '');
+	assert('匿名管理员群内手动封禁仍不写入 D1 黑名单', !env.DB._rows.has('6666'));
 }
 
 // ===== 广告自动检测专项测试([28]-[37]) =====

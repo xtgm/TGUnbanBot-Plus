@@ -5807,9 +5807,9 @@ async function handleChatMemberUpdate(chatMember, env) {
 	if (newStatus === 'kicked') {
 		// 群内手动封禁（真人点 Telegram 封禁按钮 / 任何作为管理员的机器人执行封禁）一律【不再】同步进 D1 黑名单。
 		// D1 全局黑名单的唯一来源 = 真人管理员的 /ban、/spam 指令（含 /ban 123、/spam 123、引用消息 /spam）。
-		// 这里仅发审计通知告知主人群里发生了手动封禁；notifyOwnerChatMemberAction 内部已自动过滤机器人操作，机器人封禁不会打扰主人。
-		console.log('[chat_member] 群内手动封禁，按规则不同步加黑:', JSON.stringify(logCommon));
-		await notifyOwnerChatMemberAction(chatMember, '封禁（未加入全局黑名单）', oldStatus, newStatus);
+		// 【2026-10-17 主人拍板】这类「Telegram 原生操作」不再向主人发通知（曾把主人通知频道刷出 900+ 条）。
+		// 判据：凡正文带「📋 状态变更:」行的审计通知（仅 notifyOwnerChatMemberAction 会发）一律取消，只留 console.log。
+		console.log('[chat_member] 群内手动封禁，按规则不同步加黑（不再通知主人）:', JSON.stringify(logCommon));
 	} else if (oldStatus === 'kicked') {
 		// 群内原生手动解封：D1 黑名单是权威封禁，禁止普通管理员经此绕过或清除。
 		// 管理层必须通过 /unban TGID 先移除 D1 再解封；该命令路径不会进入这里的封回逻辑。
@@ -5817,9 +5817,8 @@ async function handleChatMemberUpdate(chatMember, env) {
 		const blacklistCheck = await checkBlacklist(targetIdStr, env);
 		if (blacklistCheck.isBlacklisted) {
 			if (isGroupMuteMode(chat.id)) {
-				// 禁言模式群：不封回（主人要求：只禁言不踢出）。仅审计通知。
-				console.log('[chat_member] 禁言模式群，黑名单用户被手动解封，不封回:', JSON.stringify(logCommon));
-				await notifyOwnerChatMemberAction(chatMember, '解封用户（禁言模式群，未封回）', oldStatus, newStatus);
+				// 禁言模式群：不封回（主人要求：只禁言不踢出）。仅记日志，不再通知主人（原生操作通知已取消）。
+				console.log('[chat_member] 禁言模式群，黑名单用户被手动解封，不封回（不再通知主人）:', JSON.stringify(logCommon));
 			} else {
 				// 仍在 D1 黑名单 → 撤销本次群内手动解封，立即封回，绝不删除黑名单记录
 				const banResult = await banUserFromGroup(chat.id, targetIdStr);
@@ -5829,71 +5828,17 @@ async function handleChatMemberUpdate(chatMember, env) {
 				await notifyOwnerBlacklistIntercept(targetUser, chat, '群内手动解封拦截', blacklistCheck, banResult);
 			}
 		} else {
-			// 不在 D1 黑名单：无黑名单变化，仅发审计通知告知主人群内发生了解封动作
-			await notifyOwnerChatMemberAction(chatMember, '解封用户（非黑名单）', oldStatus, newStatus);
+			// 不在 D1 黑名单：无黑名单变化，仅记日志，不再通知主人（原生操作通知已取消）。
+			console.log('[chat_member] 群内原生解封（非黑名单用户），不再通知主人:', JSON.stringify(logCommon));
 		}
 	}
 }
 
-// 把 Telegram 的成员状态(英文)翻译成中文标签,带 emoji 直观显示
-// 参考: https://core.telegram.org/bots/api#chatmember
-function translateMemberStatus(status) {
-	const map = {
-		creator: '👑 群主',
-		administrator: '🛡️ 管理员',
-		member: '👤 普通成员',
-		restricted: '🔇 被限制(禁言/限权)',
-		left: '🚪 已离群',
-		kicked: '🚫 已踢出/已封禁',
-	};
-	return map[status] || `❔ ${status || '未知'}`;
-}
-
-// 主人审计通知:群内管理员手动 ban/unban 时,事件只发给主人
-// 已豁免:OWNER_IDS 为空 / 操作人是主人本人(不通知自己) / 操作人是机器人(其它 bot 的操作不通知)
-async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newStatus) {
-	if (!OWNER_IDS.length) return;
-	const fromIdStr = String(chatMember.from?.id || '');
-	if (isOwner(fromIdStr)) return;
-
-	// 过滤机器人操作:只通知真人管理员的操作
-	// 例外:GroupAnonymousBot(1087968824)是"匿名管理员"——真人开了匿名,仍需通知
-	const ANON_ADMIN_BOT = '1087968824';
-	if (chatMember.from?.is_bot && fromIdStr !== ANON_ADMIN_BOT) {
-		console.log(`[审计通知] 跳过机器人操作:${fromIdStr}（${chatMember.from?.first_name || ''}）`);
-		return;
-	}
-
-	const operator = chatMember.from
-		? formatUserMention(chatMember.from)
-		: `<code>${escapeHtml(fromIdStr || '未知')}</code>`;
-	const role = classifyOperatorRole(fromIdStr, '群管理员');
-	const targetUser = chatMember.new_chat_member?.user;
-	const target = targetUser
-		? formatUserMention(targetUser)
-		: `<code>${escapeHtml(String(targetUser?.id || '未知'))}</code>`;
-
-	// 拉群名(失败时退回 ID 显示)
-	let groupLabel = `<code>${escapeHtml(String(chatMember.chat.id))}</code>`;
-	try {
-		const info = await getChatInfoFromId(chatMember.chat.id);
-		if (info?.title) {
-			groupLabel = `<b>${escapeHtml(info.title)}</b> <code>${escapeHtml(String(chatMember.chat.id))}</code>`;
-		}
-	} catch (_) {
-		// 拉群名失败不影响通知主流程
-	}
-
-	const auditText =
-		`🔔 <b>${escapeHtml(role)}操作通知</b>\n` +
-		`🎬 操作:群内手动 ${escapeHtml(action)}\n` +
-		`👤 操作人:${operator}（${escapeHtml(role)}）\n` +
-		`🎯 目标用户:${target}\n` +
-		`📍 群:${groupLabel}\n` +
-		`📋 状态变更:${translateMemberStatus(oldStatus)} → ${translateMemberStatus(newStatus)}`;
-
-	await notifyAllOwners(auditText, null);
-}
+// 【2026-10-17 已删除】translateMemberStatus / notifyOwnerChatMemberAction 两个函数整体移除。
+// 主人拍板：一切「Telegram 原生操作」（管理员/群主在客户端直接点的封禁/解封，不经 bot 命令）
+// 触发的通知全部取消 —— 这类通知曾把主人通知频道刷出 900+ 条。
+// 该通知的唯一判据是正文里的「📋 状态变更:」行，全项目仅 notifyOwnerChatMemberAction 会发。
+// 防护语义（D1 黑名单同步规则、群内原生解封的封回拦截 notifyOwnerBlacklistIntercept）全部保留，只去掉通知。
 
 // ===== 广告自动检测 =====
 
