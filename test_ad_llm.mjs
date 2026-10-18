@@ -985,6 +985,43 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 	}
 }
 
+// ================= [11] 计数原子性 =================
+section('[11] 计数原子性：并发自增不丢更新');
+{
+	// 【为什么要这一节】原实现是「readAdScanState 读出来 → writeAdScanState 写回 +1」
+	// 两条 SQL，中间隔着 await。三条 bump* 全在判定链上，而模型调用要几百毫秒到几秒，
+	// 并发窗口极大：N 个并发会全部读到同一个旧值、写回同一个新值，只加 1。
+	//   · llm_count 是额度计数，少记就等于当天可能超出设定额度（付费版照单计费）；
+	//   · 观测计数少记则让 /adstats 与真实值对不上，而那几个数正是判断本层
+	//     有没有真在跑的唯一依据。
+	// 【这条断言在改前是红的】换成改前实现再跑，第一条 hits 只有 1（不是 10）——
+	// 它测的是并发下的原子性，不是「函数能跑通」。
+	const env = await makeReadyEnv();
+	env.DB.prepare("DELETE FROM ad_scan_state WHERE key IN ('llm_hits','llm_bans')").run();
+	await Promise.all(Array.from({ length: 10 }, () => W.bumpAdLLMOutcome(env, false)));
+	const hits = Number(env.DB.query("SELECT value FROM ad_scan_state WHERE key = 'llm_hits'")[0]?.value) || 0;
+	assert('★ 10 次并发自增后 llm_hits 恰好 10（原子，不丢更新）', hits === 10, '实际=' + hits);
+
+	await Promise.all(Array.from({ length: 6 }, () => W.bumpAdLLMOutcome(env, true)));
+	const bans = Number(env.DB.query("SELECT value FROM ad_scan_state WHERE key = 'llm_bans'")[0]?.value) || 0;
+	assert('★ 并发自增 llm_bans 恰好 6', bans === 6, '实际=' + bans);
+
+	// 额度计数（llm_count 与分池）走同一个原子 helper，两边的增量都不能丢。
+	env.DB.prepare("DELETE FROM ad_scan_state WHERE key IN ('llm_count','llm_pool_message')").run();
+	await Promise.all(Array.from({ length: 8 }, () => W.bumpAdLLMQuota(env, 'message', Math.floor(Date.now() / 1000))));
+	const total = Number(env.DB.query("SELECT value FROM ad_scan_state WHERE key = 'llm_count'")[0]?.value) || 0;
+	const pool = Number(env.DB.query("SELECT value FROM ad_scan_state WHERE key = 'llm_pool_message'")[0]?.value) || 0;
+	assert('★ 并发占额：llm_count 与分池各 8（互不丢）', total === 8 && pool === 8,
+		'total=' + total + ' pool=' + pool);
+
+	// 冷启动：键不存在时第一次自增必须写出 '1'，不能是 NaN ——
+	// UPSERT 分支读 ad_scan_state.value 时行还没有，CAST 结果一旦是 NULL 就会写进 'NaN'。
+	env.DB.prepare("DELETE FROM ad_scan_state WHERE key = 'llm_parse_fail'").run();
+	await W.bumpAdLLMParseFail(env);
+	const pf = String(env.DB.query("SELECT value FROM ad_scan_state WHERE key = 'llm_parse_fail'")[0]?.value || '');
+	assert('★ 冷启动首次自增写入 "1"（不是 NaN）', pf === '1', 'value=' + pf);
+}
+
 // ================= 汇总 =================
 // ===== [11] 误判反例池（/ignore 的「不白判」那一半）=====
 // 【2026-10-12】此前 /ignore 只做【删除】—— 删完之后模型下次看到同类内容还会再判一次，

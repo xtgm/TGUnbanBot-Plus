@@ -17894,14 +17894,8 @@ function adLLMPoolLimit(config, pool) {
 // 调用异常（日志空白），这一层到底有没有真跑过，没有任何手段能证明。
 // 加这个计数之后：命中 0 但解析失败也 0 = 模型确实判 false；解析失败一大片 = 输出格式跑偏。
 async function bumpAdLLMParseFail(env) {
-	if (!env?.DB) return;
-	try {
-		const now = Math.floor(Date.now() / 1000);
-		await writeAdScanState(env, 'llm_parse_fail',
-			String((await readAdScanState(env, 'llm_parse_fail', '0')) * 1 + 1), now);
-	} catch (error) {
-		console.error('[广告检测·深度判定] 记录解析失败计数失败:', error);
-	}
+	// 原子自增（原先是读-改-写两条 SQL），理由见 bumpAdScanCounter。
+	await bumpAdScanCounter(env, 'llm_parse_fail', 1, Math.floor(Date.now() / 1000));
 }
 
 // ===== 形态摘要：把积累的判据压缩成一段话，注入每一条判定 =====
@@ -18105,7 +18099,7 @@ async function judgeAdByLLM(env, config, input, options) {
 	// 无论判没判出来都记额度与去重键：解析失败同样花了 Neurons，
 	// 不记的话同一条解析不出来的载荷会被反复重试，把当天预算烧在同一个坑上。
 	adLLMSeen.add(key);
-	await bumpAdLLMQuota(env, quota.used + 1, pool, poolUsed + 1, nowSeconds);
+	await bumpAdLLMQuota(env, pool, nowSeconds);
 	if (!answer) {
 		// 解析不出来要能被看见 —— 理由见 bumpAdLLMParseFail。
 		// 【这行日志是排查这一层的唯一抓手】命中计数只在 answer 非空时才写，
@@ -19140,6 +19134,35 @@ async function writeAdScanState(env, key, value, nowSeconds = Math.floor(Date.no
 	}
 }
 
+// 【2026-10-19】计数的原子自增：把「读出来 +1 再写回」两条 SQL 换成一条 UPSERT。
+// 【为什么必须原子】原先 bumpAdLLMQuota / bumpAdLLMOutcome / bumpAdLLMParseFail 都是
+// 「readAdScanState 读出来 → writeAdScanState 写回 value+1」，中间隔着 await。这三条
+// 路径都在判定链上，而模型调用要几百毫秒到几秒 —— 并发窗口极大：两个请求都读到 99、
+// 都写回 100，实际发生了 101 次却只记 100。
+//   · llm_count 是【额度计数】，少记就等于当天可能超出设定额度；付费版超出不报错，
+//     但会照单计费。
+//   · 观测计数（hits / bans / parse_fail）少记则让 /adstats 与真实值对不上，
+//     而那几个数正是判断「这一层有没有真在跑」的唯一依据。
+// 【CAST 兜底】ad_scan_state.value 是 TEXT 列，先 CAST 成 INTEGER 再加，避免 '10'+1
+// 变成 '101' 这种字符串拼接。
+// 【不用 RETURNING】自增本身是单条语句、原子；需要读回新值的地方（judgeAdByLLM 那道
+// 超额闸）再单独读一次 —— 读到的值只会被并发抬得更高，用于「是否超额」判断时偏保守，
+// 是安全方向。
+async function bumpAdScanCounter(env, key, delta = 1, nowSeconds = 0) {
+	if (!env?.DB) return;
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_scan_state (key, value, updated_at) VALUES (?, ?, ?) '
+			+ 'ON CONFLICT(key) DO UPDATE SET '
+			+ 'value = CAST(CAST(ad_scan_state.value AS INTEGER) + ? AS TEXT), '
+			+ 'updated_at = excluded.updated_at'
+		).bind(String(key), String(delta), Number(nowSeconds) || Math.floor(Date.now() / 1000), Number(delta) || 0).run();
+	} catch (error) {
+		// 计数失败不能把判定链带崩 —— 与 writeAdScanState 同一口径，只记日志。
+		console.error('[广告检测] 计数自增失败 key=' + key + ':', error);
+	}
+}
+
 // 取下一批待复查的人。排序键是 bio_checked_at ASC —— 「最久没查过的排最前」。
 // 【这就是游标本身，不需要另存偏移量】：查完就把 bio_checked_at 推到现在，
 // 他自动落到队尾，下一批自然取到别人。这个自平衡的性质意味着增删行、
@@ -19714,10 +19737,12 @@ const AD_LLM_POOLS = ['message', 'join', 'cron'];
 // 一次消耗同时写总计数与分池计数。两笔必须在同一个函数里写完 ——
 // 拆成两个调用点的话，中间任何一步失败都会留下「总池扣了、分池没扣」的账，
 // 分池从此虚高、永远够不着上限，白分。
-async function bumpAdLLMQuota(env, nextTotal, pool, nextPoolUsed, nowSeconds) {
-	await writeAdScanState(env, 'llm_count', String(nextTotal), nowSeconds);
+// 【2026-10-19 改签名】原先接「算好的新值」，调用方自己读-改-写两条 SQL，并发会丢更新。
+// 现在只接池名，自增在 SQL 里原子完成（理由见 bumpAdScanCounter）。
+async function bumpAdLLMQuota(env, pool, nowSeconds) {
+	await bumpAdScanCounter(env, 'llm_count', 1, nowSeconds);
 	if (AD_LLM_POOLS.includes(String(pool))) {
-		await writeAdScanState(env, 'llm_pool_' + pool, String(nextPoolUsed), nowSeconds);
+		await bumpAdScanCounter(env, 'llm_pool_' + pool, 1, nowSeconds);
 	}
 }
 
@@ -19725,26 +19750,40 @@ async function readAdLLMQuota(env, nowSeconds) {
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
 	const savedDay = await readAdScanState(env, 'llm_day', '');
 	if (savedDay !== today) {
-		await writeAdScanState(env, 'llm_day', today, nowSeconds);
-		await writeAdScanState(env, 'llm_count', '0', nowSeconds);
-		// 观测计数一并归零：它们与额度同处一天窗口，只在这里清就永远是当天值
-		//（bumpAdLLMOutcome 写入时也判一次跨天，两头都兜住才不会残留）。
-		await writeAdScanState(env, 'llm_hits', '0', nowSeconds);
-		await writeAdScanState(env, 'llm_bans', '0', nowSeconds);
-		await writeAdScanState(env, 'llm_parse_fail', '0', nowSeconds);
-		// 分池计数同样必须在这里清 —— 只清总计数不清池，第二天第一轮会把
-		// 昨天各池的消耗当成今天的，池额度在凌晨直接就是满的，等于白分。
-		for (const pool of AD_LLM_POOLS) {
-			await writeAdScanState(env, 'llm_pool_' + pool, '0', nowSeconds);
+		// 【2026-10-19 改一次 batch 原子写】原先是 13 条独立的 await writeAdScanState 串行 ——
+		// 它们不是一组事务：中途任何一次失败或 Worker 重启，都会留下「day 已是今天、
+		// count 还是昨天的值」的中间态。而跨天清零【当天不会再触发第二次】（savedDay 已经
+		// 等于 today 了），这个残留会挂一整天：额度一开始就是满的、甚至直接判超额，整层白停。
+		// D1 的 batch 是一组原子写，要么全成、要么全不成，不会留下中间态。
+		const resets = [
+			['llm_day', today],
+			['llm_count', '0'],
+			// 观测计数一并归零：它们与额度同处一天窗口，只在这里清就永远是当天值
+			//（bumpAdLLMOutcome 写入时也判一次跨天，两头都兜住才不会残留）。
+			['llm_hits', '0'],
+			['llm_bans', '0'],
+			['llm_parse_fail', '0'],
+			// 分池计数同样必须在这里清 —— 只清总计数不清池，第二天第一轮会把
+			// 昨天各池的消耗当成今天的，池额度在凌晨直接就是满的，等于白分。
+			...AD_LLM_POOLS.map((pool) => ['llm_pool_' + pool, '0']),
+			// 熔断状态也只在跨天清 —— 昨天链路坏了不等于今天也坏；不清的话
+			// 第二天第一次调用仍读到「已熔断」，第⑥层会被永久关掉，比不加熔断更糟。
+			['llm_consec_fail', '0'],
+			['llm_broken_day', ''],
+			['llm_last_shape', ''],
+			// 解析成功 / 失败的时间戳也一并清 —— 它们只对「当天链路现在健不健康」有意义。
+			['llm_last_fail_seq', '0'],
+			['llm_last_success_seq', '0']
+		];
+		try {
+			await env.DB.batch(resets.map(([key, value]) => env.DB.prepare(
+				'INSERT INTO ad_scan_state (key, value, updated_at) VALUES (?, ?, ?) '
+				+ 'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
+			).bind(key, String(value), Number(nowSeconds) || 0)));
+		} catch (error) {
+			// 清零失败不能把判定链带崩 —— 与 writeAdScanState 同一口径，只记日志。
+			console.error('[广告检测] 跨天清零额度失败:', error);
 		}
-		// 熔断状态也只在跨天清 —— 昨天链路坏了不等于今天也坏；不清的话
-		// 第二天第一次调用仍读到「已熔断」，第⑥层会被永久关掉，比不加熔断更糟。
-		await writeAdScanState(env, 'llm_consec_fail', '0', nowSeconds);
-		await writeAdScanState(env, 'llm_broken_day', '', nowSeconds);
-		await writeAdScanState(env, 'llm_last_shape', '', nowSeconds);
-		// 解析成功 / 失败的时间戳也一并清 —— 它们只对「当天链路现在健不健康」有意义。
-		await writeAdScanState(env, 'llm_last_fail_seq', '0', nowSeconds);
-		await writeAdScanState(env, 'llm_last_success_seq', '0', nowSeconds);
 		return { today, used: 0, pools: { message: 0, join: 0, cron: 0 }, broken: false, consecFail: 0, lastShape: '' };
 	}
 	const used = Number(await readAdScanState(env, 'llm_count', '0')) || 0;
@@ -19772,19 +19811,10 @@ async function readAdLLMQuota(env, nowSeconds) {
 // 【开销】只在模型真给出 ad 结论时写（低频），也只有 /adstats 读它 —— 热路径不为
 // 它多付 SQL：judgeAdByLLM 那条路上一个字段都不读。
 async function bumpAdLLMOutcome(env, reachedLine) {
-	if (!env?.DB) return;
-	try {
-		const now = Math.floor(Date.now() / 1000);
-		await writeAdScanState(env, 'llm_hits',
-			String((await readAdScanState(env, 'llm_hits', '0')) * 1 + 1), now);
-		if (reachedLine) {
-			await writeAdScanState(env, 'llm_bans',
-				String((await readAdScanState(env, 'llm_bans', '0')) * 1 + 1), now);
-		}
-	} catch (error) {
-		// 观测计数失败不影响判定 —— 宁可少记一次也不能把这条路径弄崩。
-		console.error('[广告检测·深度判定] 记录观测计数失败:', error);
-	}
+	// 两次原子自增（原先是两对读-改-写），理由见 bumpAdScanCounter。
+	const now = Math.floor(Date.now() / 1000);
+	await bumpAdScanCounter(env, 'llm_hits', 1, now);
+	if (reachedLine) await bumpAdScanCounter(env, 'llm_bans', 1, now);
 }
 
 // 读第 ⑥ 层的今日观测计数。只给 /adstats 用，不在任何判定路径上。
