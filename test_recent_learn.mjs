@@ -408,6 +408,82 @@ console.log('\n===== 人工判定学习 =====');
 	W.fetchAdUserProfile = realFetch;
 }
 
+console.log('\n=== 13. /ban <id>（不带引用）的正文取自消息缓存 ===');
+{
+	// 【2026-10-19 修】/spam <id> 与「/recent + /learnlast 批量」两条路径
+	// 2026-10-15 起就已经从 moderation_messages 捞该用户最近的发言当正文
+	//（见 loadRecentUserAdText），唯独 /ban <id> /sban <id> 漏了 —— 那两处 text 传的是空串。
+	// 后果与 /spam <id> 当初完全一样：广告被别的 bot 先删、来不及引用时，
+	// /ban <id> 学得到的只有一张资料卡，正文一个字都进不了库。
+	//
+	// 【为什么必须走完整命令链路】只调 learnAdFromOperatorAction 并手动传 text，
+	// 测的是「函数拿到 text 会不会学」；而漏改点在【调用方传什么】——
+	// 手动传 text 的写法永远测不出这个点（上面段 ⑪/⑫ 就是手动传的，它们照旧全绿）。
+	// 所以这条断言从 handler.fetch 发真实的 /ban 命令，只断言落库结果。
+	const BAN_UID = '990010';
+	const BAN_AD = '进直播间当托一轮给500 详情加 @tuoguan01';
+
+	env.DB.query('DELETE FROM ad_fingerprints');
+	env.DB.query("DELETE FROM moderation_messages WHERE from_id='" + BAN_UID + "'");
+	await W.cacheModerationMessage(env, {
+		message_id: 7101, chat: { id: GROUPS[0] }, from: { id: BAN_UID }, text: BAN_AD
+	});
+	check('前置：缓存里确实有该用户的正文',
+		(await W.loadRecentUserAdText(env, BAN_UID)).includes('当托'));
+
+	// 资料卡刻意留空 —— 否则 name / username / bio 本身就能学出指纹，
+	// 改前也会「有新增」，这条断言就失去区分力（红绿失效）。
+	const realFetchForBan = W.fetchAdUserProfile;
+	W.fetchAdUserProfile = async () => ({ firstName: '', lastName: '', username: '', bio: '', avatarId: '', badgeId: '' });
+
+	// /ban 走的是完整命令链路（权限校验 → 加黑 → 全群处置 → 清扫 → 学习），
+	// 沿途会调一串 Bot API，这里按方法给最小可用响应。
+	sandbox.fetch = async (url, init) => {
+		const m = String(url).split('/').pop();
+		let b = null;
+		try { b = init?.body ? JSON.parse(init.body) : null; } catch (_) { b = null; }
+		let result = true;
+		if (m === 'sendMessage') {
+			sent.push({ chatId: String(b?.chat_id ?? ''), text: String(b?.text || '') });
+			result = { message_id: 8000 + sent.length };
+		} else if (m === 'getChat') result = { id: Number(b?.chat_id), type: 'supergroup', title: '测试群' };
+		else if (m === 'getChatMember') result = { status: 'member', user: { id: Number(b?.user_id) } };
+		else if (m === 'getChatAdministrators') result = [{ user: { id: Number(OWNER), status: 'creator' } }];
+		return { ok: true, status: 200, json: async () => ({ ok: true, result }), text: async () => JSON.stringify({ ok: true, result }) };
+	};
+
+	sent.length = 0;
+	await W.__h.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			update_id: 9001,
+			message: {
+				message_id: 7102, date: 1, text: '/ban ' + BAN_UID,
+				chat: { id: Number(GROUPS[0]), type: 'supergroup', title: '测试群' },
+				from: { id: Number(OWNER), is_bot: false, first_name: 'Owner' }
+			}
+		})
+	}), env, { waitUntil() {} });
+
+	// 先证明链路真跑到了学习那一步 —— 否则「指纹库为空」可能是因为命令压根没被执行，
+	// 那种红是假红，指向不到本问题。
+	check('前置：/ban 真的执行了（目标已入黑名单）',
+		env.DB.query("SELECT id FROM blacklist WHERE id='" + BAN_UID + "'").length === 1);
+
+	// 断在【库里】而不是回执文案上：回执的行数会随渲染口径变，
+	// 而「该 uid 的正文进了指纹库」才是这次修的行为本体。
+	const fpRows = env.DB.query("SELECT fingerprint, type, value FROM ad_fingerprints WHERE source='manual'");
+	check('★ /ban <id> 把缓存里的正文学成了指纹（改前 source=manual 一条都没有）',
+		fpRows.length > 0, JSON.stringify(fpRows));
+	check('★ 学到的是正文里的词，不是命令文本「/ban <id>」',
+		fpRows.some((r) => String(r.value).includes('当托') || String(r.value).includes('tuoguan'))
+			&& !fpRows.some((r) => String(r.value).includes('/ban')),
+		JSON.stringify(fpRows.map((r) => r.type + ':' + r.value)));
+
+	W.fetchAdUserProfile = realFetchForBan;
+}
+
 
 console.log('/recent + /learnlast 验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 process.exit(fail > 0 ? 1 : 0);

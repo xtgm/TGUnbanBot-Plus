@@ -10272,6 +10272,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				// 这里补一层兜底：从 moderation_messages 捞出该 TGID 在【当前群】缓存的消息 ID
 				// 逐条 deleteMessage。仅群内执行时做 —— 私聊没有"当前群"的概念；
 				// 批量路径也不做，N 个目标 × 最多 200 条会直接撞 Cloudflare 子请求上限。
+				// 【正文必须在清扫之前读走】下面那次清扫会执行
+				// `DELETE FROM moderation_messages WHERE chat_id = ? AND from_id = ?`
+				//（cleanupCurrentChatUserMessages 内），而 moderation_messages
+				// 正是 loadRecentUserAdText 唯一的正文来源 —— 晚读一步就是空串。
+				// 私聊路径不清扫，所以只有群内 /ban 会踩到这一点。
+				// 读出来的正文在下面交给 learnAdFromOperatorAction。
+				const banIdTextForLearn = await loadRecentUserAdText(env, valid[0]);
 				const cleanupResult = isInGroup
 					? await cleanupCurrentChatUserMessages(env, chatId, valid[0])
 					: null;
@@ -10284,12 +10291,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 								// /ban 与 /sban 的学习（这段两者共用，只差 source）——
 				// 此前这两条命令一个特征都不学：封得越多、漏得越多，因为封掉的那些
 				//【判定链压根没命中过】，特征一条都没进库。详见 learnAdFromOperatorAction。
-				// 【text 传空串】命令消息的内容是「/ban 123」，学它等于把命令文本当广告样本。
+				// 【text 不能传命令消息】命令消息的内容是「/ban 123」，学它等于把命令文本当广告样本。
 				// 引用块兜底仍在生效 —— 命令如果是引用回复发的，广告就在那个引用块里。
+				// 【2026-10-19 补】但「不带引用」才是主人的常态：广告被别的 bot 先删了、来不及引用。
+				// 此前这里固定传空串 → 学得到的只有一张资料卡，正文一个字都进不了库。
+				// 改从消息缓存捞该用户最近的发言（MSG_CACHE_RETENTION_DAYS=7），
+				// 与 /spam <id> 和「/recent + /learnlast 批量」两条路径同一口径。
+				// 值在上面的清扫之前取好（清扫会删掉来源行）。
 				const manualLearn = await learnAdFromOperatorAction(env, valid[0], message, {
 					source: isSban ? 'sban' : 'manual',
 					createdBy: String(operatorId ?? ''),
-					text: ''
+					text: banIdTextForLearn
 				});
 				lines.push(...renderAdLearnLines(manualLearn, isSban ? 'sban' : 'ban'));
 				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: commandName }));
