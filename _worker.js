@@ -13388,7 +13388,7 @@ async function loadAdDomainWhitelist(env) {
 			const set = new Set();
 			for (const row of results || []) {
 				const domain = normalizeAdDomain(row?.domain);
-				if (domain) set.add(domain.startsWith('*.') ? domain : domain);
+				if (domain) set.add(domain);
 			}
 			return set.size ? set : fallback();
 		});
@@ -24028,7 +24028,7 @@ async function handleAdStatsCommand(env, chatId) {
 			// 视觉识别失败台账。【只能放 batch 末尾】下标是硬编码的，插进 rows[6] 之前
 			// 会让后面全部错位 —— 这类错位不报错，只会静默显示成别人的数据。
 			env.DB.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures'),
-			env.DB.prepare('SELECT kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures ORDER BY last_at DESC LIMIT 3'),
+			env.DB.prepare('SELECT target_id, kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures ORDER BY last_at DESC LIMIT 3'),
 			// 各通道定罪 / 误封对账。【下标硬编码，只能追加在 batch 末尾】同上一条。
 			// 误封 = 被主人 /ignore 回滚过的（expires_at=0），与定罪总数在同一条 SQL 里
 			// 聚合 —— 并进这次 batch 就不多付一次 D1 往返。
@@ -24210,9 +24210,13 @@ async function handleAdStatsCommand(env, chatId) {
 		lines.push('<b>视觉识别失败台账</b>　条目 <b>' + Number(visionFailRow.c) + '</b>　累计失败 <b>'
 			+ Number(visionFailRow.total || 0) + '</b> 次');
 		for (const row of (visionFailTop || [])) {
+			// 带上 target_id（= file_unique_id，表主键）：它是【唯一能定位是哪张图】的字段。
+			// 此前这条 SQL 没 SELECT 它，主人只能看到「头像 @ sniff 失败 3 次」，
+			// 却不知道是哪一张，拿去重试或进一步排查都无从下手。
 			lines.push('　↳ ' + escapeHtml(String(row.kind || '')) + ' @ ' + escapeHtml(String(row.stage || ''))
 				+ '　失败 ' + Number(row.fail_count || 0) + ' 次　'
-				+ escapeHtml(String(row.error_message || row.error_name || '').slice(0, 60)));
+				+ escapeHtml(String(row.error_message || row.error_name || '').slice(0, 60))
+				+ '　id <code>' + escapeHtml(String(row.target_id || '')) + '</code>');
 		}
 		if (failKinds.length) {
 			lines.push('　↳ 失败集中在 ' + escapeHtml(failKinds.join('、'))
@@ -24503,7 +24507,7 @@ async function handleAdWhitelistCommand(env, chatId, ownerId, arg) {
 	const effective = await loadAdDomainWhitelist(env);
 	const lines = [
 		'<b>🛡 域名白名单</b>',
-		'生效 <b>' + effective.size + '</b> 条（白名单内的域名不计入链接可疑分）',
+		'生效 <b>' + effective.size + '</b> 条（白名单域名的两重作用：不计链接可疑分 + 永不学入指纹库）',
 		''
 	];
 	if (customRows.length) {
@@ -24515,6 +24519,8 @@ async function handleAdWhitelistCommand(env, chatId, ownerId, arg) {
 	}
 	lines.push('');
 	lines.push('支持 <code>*.example.com</code> 形式的泛域名；子域名自动向上匹配父域。');
+	lines.push('　↳ 第二重（永不学入指纹库）比第一重更关键：domain 指纹【命中即单独定罪】。'
+		+ '某域名一旦被学进去，此后任何人贴它都会被秒封 —— 白名单正是阻断这条链的入口。');
 	await sendTelegramMessageChunks(chatId, lines.join('\n'));
 }
 
@@ -26275,11 +26281,6 @@ function isDryRunCommand(text) {
 // 不回任何话 —— 群里不暴露这条命令的存在。
 // 群内：/dryrun 翻转本群；/dryrun on|off 显式设置；/dryrun status 只看不改。
 // 私聊：列出已开演练的群与命中数（只读）。
-// /dryrun 演练模式切换。仅第一主人（与 /killer 同一道门：敏感开关不放开给群管理员）。
-// 返回 true = 本条已处理，调用方短路；非第一主人同样返回 true 但只静默吞掉，
-// 不回任何话 —— 群里不暴露这条命令的存在。
-// 群内：/dryrun 翻转本群；/dryrun on|off 显式设置；/dryrun status 只看不改。
-// 私聊：列出已开演练的群与命中数（只读）。
 // 群内回执发完立即撤回。它只为了让发送者看到「命令收到了」，下一毫秒就撤 ——
 // 主人的口径是群里不留痕（命令与回执都清掉），完整信息另行推私聊。
 async function sendAndRecall(chatId, text) {
@@ -26306,7 +26307,7 @@ async function handleDryRunCommand(message, env) {
 	if (!isPrimaryOwner(userId)) return true;
 	const chatId = String(message.chat?.id || '');
 	const isInGroup = message.chat?.type !== 'private';
-	const arg = String(message.text || '').replace(/^\/dryrun(?:@\[^\s]+)?\s*/i, '').trim().toLowerCase();
+	const arg = String(message.text || '').replace(/^\/dryrun(?:@[^\s]+)?\s*/i, '').trim().toLowerCase();
 
 	if (!isInGroup) {
 		const stateMap = await readDryRunStateMap(env);

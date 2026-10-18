@@ -607,6 +607,32 @@ section('[9] /adstats 展示正文图片指纹 + 计数守卫');
 	assert('域名白名单计数读得到（非 0）', /生效 <b>[1-9]\d*<\/b> 条/.test(lineOf('域名白名单')), lineOf('域名白名单'));
 	assert('头像指纹广告图计数读得到（非 0）', /广告图 <b>[1-9]\d*<\/b>/.test(lineOf('头像指纹')), lineOf('头像指纹'));
 	assert('头像三档分列，pending 那张也数得出来', /待识别 <b>1<\/b>/.test(lineOf('头像指纹')), lineOf('头像指纹'));
+
+	// 【2026-10-19 修】视觉失败台账那条 SQL 没 SELECT target_id（表主键）——
+	// 主人只能看到「头像 @ sniff 失败 3 次」，不知道是【哪张图】，重试与排查都无从下手。
+	// 这里走真实写入函数（logAdVisionFailure）造一条台账，再断言屏上能读出那个 id。
+	const envFail = makeEnv();
+	await W.adDetectionReady(envFail);
+	const failErr = new Error('头像不是位图');
+	failErr.name = 'VisionUnsupportedFormat';
+	await W.logAdVisionFailure(envFail, '头像', 'sniff', 'FAILDET_1', failErr);
+	resetCalls();
+	await send(privateMessage(OWNER_ID, '/adstats'), envFail);
+	const sentFail = calls.filter((c) => c.method === 'sendMessage')
+		.map((c) => c.body?.text || '').join('\n');
+	assert('视觉失败台账显示条目数', /视觉识别失败台账<\/b>　条目 <b>1<\/b>/.test(sentFail), sentFail.slice(-700));
+	assert('★ 失败台账带上 target_id（唯一能定位是哪张图的字段）',
+		sentFail.includes('FAILDET_1'), sentFail.slice(-700));
+
+	// 【2026-10-19】/whitelist 的文案此前只说了一半作用（不计链接可疑分），漏掉了
+	// 更关键的「永不学入指纹库」—— 白名单域名在 extractAdFingerprintCandidates 里被
+	// 直接跳过，而 domain 指纹命中即单独定罪，那才是加白名单的主要意义。
+	resetCalls();
+	await send(privateMessage(OWNER_ID, '/whitelist'), env);
+	const sentWl = calls.filter((c) => c.method === 'sendMessage')
+		.map((c) => c.body?.text || '').join('\n');
+	assert('★ 白名单文案点明「永不学入指纹库」这重作用',
+		sentWl.includes('永不学入指纹库'), sentWl.slice(0, 500));
 }
 
 // ================= 汇总 =================

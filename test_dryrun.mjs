@@ -228,6 +228,24 @@ section('[2] /dryrun 命令');
 	assert('status 回执标出开启', texts.some((t) => t.includes('演练模式【开启】')), JSON.stringify(texts));
 	assert('status 不改开关', (await W.isDryRunGroup(env, GROUP_ID)) === true);
 
+	// 【2026-10-19 修】群里 Telegram 客户端会把命令补成 /dryrun@机器人名。
+	// 此前剥参数的正则写的是 /^\/dryrun(?:@\[^\s]+)?\s*/i —— `\[` 在正则里是【转义的字面 [】，
+	// 所以它只认 /dryrun@[xxx 这种，永远匹配不上 /dryrun@MyBot；arg 于是变成 "@mybot status"，
+	// status 判定失败 → 落进「裸命令 = 翻转」分支，一条只读命令把演练开关翻开了。
+	// 对照组：/check 与 /ban 用的是正确的 @[^\s]+（同文件其它 replace 可查）。
+	// 【为什么用 status 断言而不是 on/off】翻转是二态取反，on/off 写错时有 50% 概率
+	// 碰巧落在期望值上、测不出问题；status 是幂等的只读命令，任何误判都会取反开关，必红。
+	await W.setDryRun(env, GROUP_ID, true, OWNER_ID);
+	texts = await sendGroupCommand(env, '/dryrun@MyTestBot status');
+	assert('★ /dryrun@机器人名 status：回执按 status 走（标出开启）',
+		texts.some((t) => t.includes('演练模式【开启】')), JSON.stringify(texts));
+	assert('★ /dryrun@机器人名 status 不翻转开关（开 → 仍开）',
+		(await W.isDryRunGroup(env, GROUP_ID)) === true, JSON.stringify(texts));
+	await W.setDryRun(env, GROUP_ID, false, OWNER_ID);
+	texts = await sendGroupCommand(env, '/dryrun@MyTestBot status');
+	assert('★ /dryrun@机器人名 status 不翻转开关（关 → 仍关）',
+		(await W.isDryRunGroup(env, GROUP_ID)) === false, JSON.stringify(texts));
+
 	// 显式 off
 	texts = await sendGroupCommand(env, '/dryrun off');
 	assert('off 回执确认关闭', texts.some((t) => t.includes('演练模式已关闭')), JSON.stringify(texts));
