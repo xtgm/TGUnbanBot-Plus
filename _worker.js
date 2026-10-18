@@ -12356,7 +12356,19 @@ const AD_LLM_PROMPT = '你是 Telegram 群组的反广告审核员。给你一�
 	+ '没有用户名、没有简介、名字是随机字符、message 为空都不构成怀疑理由 —— 大量正常人就是这样。'
 	+ '拿不准就判 false，这一步会直接影响封禁，宁可放过也不要误伤。\n'
 	+ '只输出 JSON，不要任何其它文字，格式：{"ad":true 或 false,'
-	+ '"confidence":0.0到1.0 的小数,"reason":"一句话中文理由，指出具体是哪个字段的什么内容"}';
+	+ '"confidence":0.0到1.0 的小数,"reason":"一句话中文理由，指出具体是哪个字段的什么内容",'
+	+ '"features":[{"type":"keyword","value":"原文里逐字出现过的片段"}]}\n'
+	+ '\n'
+	+ '【features 怎么写】判为广告时，把这次用到的广告特征逐条抽出来（不是广告就给空数组 []）。\n'
+	+ 'value 必须是上面那份资料或消息里【逐字出现过】的片段：不许改写、不许概括、不许自己造句、'
+	+ '不许翻译 —— 代码会拿它回原文逐字核对，对不上就作废。\n'
+	+ 'type 只能取这三种：\n'
+	+ '  keyword —— 广告话术短语（如「一天稳定5万」「包教包会」「大量收网赌博彩账户」）\n'
+	+ '  domain  —— 域名（如 xxx.com，不含 https:// 这类协议头）\n'
+	+ '  phone   —— 电话号码\n'
+	+ '【只抽广告特征，不抽通用词】「找我」「联系」「加我」「看这里」「私聊」「详聊」这类'
+	+ '单独出现说明不了任何问题的词【不要抽】；带 @用户名 的联系话术整段算 keyword。\n'
+	+ '最多 6 条。';
 // 筛查记录保留期（秒）：14 天后剪枝，防止 D1 无限增长
 const AD_SCREENING_RETENTION_SECONDS = 14 * 24 * 3600;
 // /pending 快照【长期保留】；/clearsamples 二次确认 60 秒
@@ -15729,7 +15741,7 @@ async function loadRecentUserAdText(env, userId) {
 async function learnAdFromOperatorAction(env, targetUserId, message, options = {}) {
 	const source = String(options.source || 'manual');
 	const createdBy = String(options.createdBy || '');
-	const out = { learned: 0, sampleAdded: 0, enriched: 0, imageLearned: 0, avatars: 0, badges: 0, shapes: 0 };
+	const out = { learned: 0, sampleAdded: 0, enriched: 0, imageLearned: 0, avatars: 0, badges: 0, shapes: 0, aiPromoted: 0 };
 	try {
 		// checklist 是与 text/caption 互斥的第六类正文来源 —— /spam /ban /sban 引用【清单】时
 		// message.text 恒为 undefined，不接它就只学得到一张空正文的资料卡。
@@ -15746,6 +15758,17 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 		};
 		const learn = await learnAdFingerprints(env, payload, { source, createdBy });
 		out.learned = Number(learn?.learned || 0);
+
+		// 【人工指令 = 参与学习（2026-10-18 乙方案）】把第⑥层候选池里与这次载荷命中的候选
+		// 立即转正为真指纹（weight 0.5，只计分不定罪）。
+		// 【为什么与上面并列而不是塞进 learnAdFingerprints】那条是从【本次载荷现抽】特征，
+		// 这条是把【AI 之前自己攒下的】特征转正 —— 来源不同，账分开记才好排查。
+		// 失败只记日志：封禁已经做完了，少转正一条不该让回执报错。
+		try {
+			out.aiPromoted = await promoteAdLLMCandidatesFromPayload(env, payload);
+		} catch (error) {
+			console.error('[广告检测·AI特征学] 人工转正调用失败（' + source + '）:', error?.message || error);
+		}
 
 		// =====【2026-10-15 乙：人工判定也要学全判据】=====
 		// 主人口径：「指纹特征都要学到」。此前这条链只学 name / username / bio 五样 ——
@@ -17695,8 +17718,36 @@ function parseAdLLMAnswerLoose(text) {
 	return {
 		ad,
 		confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : (ad ? 1 : 0),
-		reason: String((reasonMatch && reasonMatch[1]) || '').slice(0, 200)
+		reason: String((reasonMatch && reasonMatch[1]) || '').slice(0, 200),
+		// 兜底分支也要抠 features —— 否则「JSON 被截断」的那些调用答案有了、特征丢了，
+		// 而截断恰恰是最常见的情况（thinking 吃满额度）。抠不全不影响 ad 结论。
+		features: extractLooseAdLLMFeatures(text)
 	};
+}
+
+// 从残缺输出里尽力抠 features。两段式：先试完整数组，失败退化成逐对象抠。
+// 【不追求抠全】抠到几条算几条 —— features 只是自我学习的原料，
+// 少一条最多是少学一条，绝不该因为它影响 ad / confidence 这些【判定结论】。
+function extractLooseAdLLMFeatures(text) {
+	const src = String(text || '');
+	const keyIdx = src.indexOf('"features"');
+	if (keyIdx === -1) return [];
+	const start = src.indexOf('[', keyIdx);
+	if (start === -1) return [];
+	const end = src.lastIndexOf(']');
+	const slice = end > start ? src.slice(start, end + 1) : src.slice(start) + ']';
+	try {
+		const parsed = JSON.parse(slice);
+		return normalizeAdLLMFeatureList(parsed);
+	} catch (_) {
+		// 被截断 / 有杂物：退回逐个对象抠。模型输出的键序稳定（type 在前 value 在后），
+		// 这条正则就是照那个形状写的；形状一变它只会抠到更少，不会抠错。
+		const items = [];
+		const re = /\{\s*"type"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"value"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
+		let m;
+		while ((m = re.exec(slice)) !== null) items.push({ type: m[1], value: m[2] });
+		return normalizeAdLLMFeatureList(items);
+	}
 }
 
 // 统一组装：两个分支共用同一套字段归一化，避免 JSON 分支与兜底分支各写一遍、
@@ -17709,8 +17760,33 @@ function buildAdLLMAnswer(parsed) {
 		// 模型没给 confidence 时：判了广告就按满置信、判了正常就按 0 ——
 		// 缺字段不该把一次有效结论丢掉。
 		confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : (ad ? 1 : 0),
-		reason: String(parsed?.reason || '').slice(0, 200)
+		reason: String(parsed?.reason || '').slice(0, 200),
+		// 模型抽出的广告特征（第⑥层自我学习的原料）。这里只做【结构归一化】：
+		// 去空、去重、限条数、限长度。【真正的形态闸是 sanitizeAdLLMFeatures】——
+		// 那一层要做「逐字回原文核对」，需要原始输入，这里拿不到。
+		features: normalizeAdLLMFeatureList(parsed?.features)
 	};
+}
+
+// 第⑥层 features 的结构归一化（不含形态闸，见 sanitizeAdLLMFeatures）。
+const AD_LLM_FEATURE_MAX = 6;
+const AD_LLM_FEATURE_MAX_LEN = 120;
+function normalizeAdLLMFeatureList(raw) {
+	if (!Array.isArray(raw)) return [];
+	const out = [];
+	const seen = new Set();
+	for (const item of raw) {
+		if (!item || typeof item !== 'object') continue;
+		const type = String(item.type || '').trim().toLowerCase();
+		const value = String(item.value || '').trim();
+		if (!type || !value) continue;
+		const key = type + '\u0000' + value;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push({ type, value: value.slice(0, AD_LLM_FEATURE_MAX_LEN) });
+		if (out.length >= AD_LLM_FEATURE_MAX) break;
+	}
+	return out;
 }
 
 // 同载荷内存去重：同一条文案在一个 Worker 实例内只判一次。
@@ -17840,10 +17916,10 @@ async function buildAdDigest(env, config) {
 			+ '只输出 JSON：{"digest":"形态摘要"}\r\n\r\n' + sampleLines;
 		const aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
 			messages: [{ role: 'user', content: prompt }],
-			// 【400 → 1000】qwen3-30b 是 reasoning 模型，thinking 会先吃掉 max_tokens；
-			// 400 是全文件最小值（第⑥层 1000、视觉 512 都正常），thinking 耗光后正文为空
-			// → 解析不出 {"digest":...} → 空摘要，回执却显示成「没有可总结的样本」。
-			max_tokens: 1000,
+			// 【1000 → 4000，2026-10-18】同一个模型、同一种坑：thinking 先吃掉 max_tokens，
+			// 摘要正文还没开始写额度就没了 —— 表现是「空摘要」而不是报错（上一轮 400→1000
+			// 只解决了一半，离线实测 thinking 普遍 1500~2200 字，1000 照样会被截）。
+			max_tokens: 4000,
 			temperature: 0.2
 		});
 		const raw = extractAdLLMResponseText(aiResult);
@@ -17937,7 +18013,13 @@ async function judgeAdByLLM(env, config, input, options) {
 			// 主人拍板买断这一类故障：1000 次调用 ≈ 22,000 Neurons，
 			// 超免费额度 12,000 ≈ $4/月，换来的是「解析失败」不再是随时会放大的坑。
 			// 真实输出只有 100~200 token（一条 JSON 判据），多给的是思考空间不是正文空间。
-			max_tokens: 1000,
+			// 【1000 → 4000，2026-10-18】离线实测（30 条真广告 bio × 多轮）：
+			// qwen3-30b-a3b 的 thinking 平均写 1513~2206 字【中文】，1000 token 上限下
+			// 三成调用在思考阶段就把额度用光，正文一个字都没输出 → 解析失败。
+			// 曾经以为「1000 够了，真实输出只有 100~200 token」——那句注释只说对了正文，
+			// 漏算了它前面那一大段思考。4000 下实测解析 30/30、100% 可核验。
+			// 【代价只是上限】Neurons 按实际生成量计费，不按上限；上限抬高只是不再被截断。
+			max_tokens: 4000,
 			temperature: 0.1
 		});
 		// Workers AI 对 chat 模型返回 OpenAI 兼容结构，正文在 choices[0].message.content，
@@ -18028,6 +18110,213 @@ function collectAdLLMHardEvidence(input) {
 		hits.push('引流出口与招揽同现');
 	}
 	return hits;
+}
+
+// ===== 第⑥层自我学习：AI 抽出的特征 → 候选池（2026-10-18 乙方案）=====
+//
+// 【它接的是哪条链路】第⑥层此前【一个特征都不学】—— 模型判完 ad=true 只把结论写进
+// evaluation，抽出来的形态信息全丢了，下一次换个号发同款还得重新调 AI。
+// 主人的口径：「自我学习 = AI 自己有自我意识去判断这个用户是不是广告、有什么特征，
+// 自动判断、全程 AI 自动化操作；AI 自动化学习的特征指纹也会自动学进去特征指纹类型。」
+//
+// 【为什么必须用单独的候选池，不直接写 ad_fingerprints】后者是【真指纹库】：
+// matchAdFingerprints 对 keyword / domain 的判据是 `haystack.includes(值)`，命中即算 hits、
+// 按 weight 参与封禁权重判定。AI 抽出来的特征里实测混着「找我」「联系」这类通用词
+//（离线 30 条样本：过泛特征 7 条，其中 t.me 那一条让 20 条正常简介里的 2 条被命中）。
+// 直接进真指纹库 = 正常人在群里说一句「找我」就加分。所以分成两段：
+//   · AI 自动学到的 → 只进【候选池】，不参与任何判定；
+//   · 候选池只在【人工指令】（/ban /spam /sban）或【达自动转正门槛】时才转正。
+//     人工转正 = 主人定义的「参与学习」（只有真人用指令才算）；达门槛自动转正 = 同一条
+//     特征在多个不同广告上反复出现，已经不是偶然。
+//
+// 【转正之后也单条不定罪】写入 ad_fingerprints 时 weight 固定 0.5 ——
+// 低于 AD_FINGERPRINT_BAN_WEIGHT（0.8），所以它【只计分、永不单条定罪】，
+// 与既有的「按词截取的 24 字短语」同一档。这是主人永久规则「单特征不作为任何判定」的落点。
+const AD_LLM_FEATURE_TYPES = ['keyword', 'domain', 'phone'];
+// 长度下限 4：实测「找我」(2)、「看这里」(3)、「0风险」(3)、「招代理」(3) 全在这一档 ——
+// 它们是【词】不是【话术短语】，单独出现说明不了任何问题。
+const AD_LLM_FEATURE_MIN_LEN = 4;
+// 通用词黑名单：实测模型确实会抽这些（30 条样本里出现过「找我」「联系」「看这里」）。
+// prompt 里已经明令不要抽，这里再挡一道 ——【prompt 是概率，代码是确定性】。
+const AD_LLM_FEATURE_STOPWORDS = new Set([
+	'找我', '联系', '私聊', '详聊', '加我', '加v', '加微', '看这里', '看主页', '私信',
+	'点击', '进群', '了解详情', '有意者', '备注', '非诚勿扰', '欢迎咨询', '咨询', '滴滴我'
+]);
+// 自动转正门槛：同一条特征被【至少 3 次 AI 判定】抽到，且本身够长（≥6 字才可能是话术短语）。
+// 门槛看的是 hits 不看时间 —— hits 只在第⑥层判为广告时 +1，含金量天然高。
+const AD_LLM_FEATURE_PROMOTE_HITS = 3;
+const AD_LLM_FEATURE_PROMOTE_LEN = 6;
+// 转正写入真指纹库时的权重（只计分、不单条定罪，见上面说明）。
+const AD_LLM_FEATURE_PROMOTE_WEIGHT = 0.5;
+
+// 形态闸：模型抽的特征必须过这一关才允许进候选池。
+// 逐字复核 + 类型 + 长度 + 域名形态 + 通用词，五道。
+// 【为什么逐字复核是硬闸】模型是生成式的，会「顺手」补出没出现过的内容
+//（离线实测：t.me 邀请链接被标成 domain 共 9 条）。value 必须在原始输入里逐字出现，
+// 否则整条丢掉 —— 与 collectAdLLMHardEvidence 同一取向：能代码验的才认。
+function sanitizeAdLLMFeatures(features, input) {
+	if (!Array.isArray(features) || !features.length) return [];
+	const profile = input?.profile || {};
+	const raw = [profile.firstName, profile.lastName, profile.bio, input?.text]
+		.filter(Boolean).join(' ');
+	if (!raw) return [];
+	const out = [];
+	const seen = new Set();
+	for (const item of features) {
+		const type = String(item?.type || '').trim().toLowerCase();
+		const value = String(item?.value || '').trim();
+		if (!AD_LLM_FEATURE_TYPES.includes(type)) continue;
+		if (value.length < AD_LLM_FEATURE_MIN_LEN) continue;
+		// 逐字回原文核对：先原样、再小写（模型可能改了 handle 的大小写，其余必须原样）。
+		if (!raw.includes(value) && !raw.toLowerCase().includes(value.toLowerCase())) continue;
+		if (type === 'domain') {
+			// 域名必须有真域名形态（含点，且不是 t.me / telegram.me 本身）。
+			// 【为什么单独拦 t.me】离线实测 9 条邀请链接被标成 domain；t.me 在本项目是
+			// 豁免词，私有邀请链接另有 confirmAdLinkOnBan 通道 —— 让它进特征库只会污染。
+			const host = value.replace(/^https?:\/\//i, '').split('/')[0].split('[')[0].toLowerCase();
+			if (!host.includes('.')) continue;
+			if (host === 't.me' || host === 'telegram.me'
+				|| host.endsWith('.t.me') || host.endsWith('.telegram.me')) continue;
+		}
+		if (type === 'keyword' && AD_LLM_FEATURE_STOPWORDS.has(value.toLowerCase())) continue;
+		const normalized = normalizeAdFingerprintValue(value);
+		if (!normalized || normalized.length < AD_LLM_FEATURE_MIN_LEN) continue;
+		const key = type + '\u0000' + normalized;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push({ type, value: value.slice(0, AD_LLM_FEATURE_MAX_LEN), normalized });
+		if (out.length >= AD_LLM_FEATURE_MAX) break;
+	}
+	return out;
+}
+
+// 候选池表（懒建表，不动 D1_SCHEMA_VERSION —— 与 ad_spam_texts / ad_false_positives 同一取向：
+// 这是第⑥层的附属能力，不该因为它的 schema 变更去触发整套核心迁移）。
+const D1_AD_LLM_CANDIDATES_INIT = new WeakMap();
+async function ensureAdLLMCandidatesTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_AD_LLM_CANDIDATES_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			await runD1SchemaStatement(env, 'ad_llm_candidates',
+				'CREATE TABLE IF NOT EXISTS ad_llm_candidates (fingerprint TEXT PRIMARY KEY, type TEXT NOT NULL, value TEXT NOT NULL, hits INTEGER NOT NULL DEFAULT 0, promoted INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
+			return true;
+		} catch (error) {
+			console.error('[广告检测·AI特征学] 建表失败:', error?.message || error);
+			return false;
+		}
+	})();
+	D1_AD_LLM_CANDIDATES_INIT.set(env.DB, init);
+	const ok = await init;
+	if (!ok) D1_AD_LLM_CANDIDATES_INIT.delete(env.DB);   // 失败不缓存，下次再试
+	return ok;
+}
+
+// 把这一轮 AI 抽到的特征写进候选池，并顺手做一次自动转正。
+// 【调用时机】只在第⑥层判为广告（ad=true）时 —— 判 false 的占绝大多数，一个 SQL 都不发。
+// 【失败绝不影响判定】整段 try 包住、只记日志：候选写不进去最多是少学一条，
+// 不能让一次已经做完的判定因为附属学习而报错。
+async function recordAdLLMCandidates(env, features, input) {
+	if (!env?.DB || !features.length) return 0;
+	const cleaned = sanitizeAdLLMFeatures(features, input);
+	if (!cleaned.length) return 0;
+	try {
+		if (!(await ensureAdLLMCandidatesTable(env))) return 0;
+		const now = Math.floor(Date.now() / 1000);
+		const stmts = cleaned.map((f) => env.DB.prepare(
+			'INSERT INTO ad_llm_candidates (fingerprint, type, value, hits, promoted, created_at, updated_at) '
+			+ 'VALUES (?, ?, ?, 1, 0, ?, ?) '
+			+ 'ON CONFLICT(fingerprint) DO UPDATE SET hits = hits + 1, value = excluded.value, updated_at = excluded.updated_at')
+			.bind(adFingerprintKey(f.type, f.value), f.type, f.value, now, now));
+		await env.DB.batch(stmts);
+		await promoteAdLLMCandidates(env);
+		return cleaned.length;
+	} catch (error) {
+		console.error('[广告检测·AI特征学] 写候选池失败:', error?.message || error);
+		return 0;
+	}
+}
+
+// 自动转正：把达门槛的候选搬进真指纹库（weight 0.5 → 只计分不定罪），并标记 promoted。
+// 【为什么是 INSERT OR IGNORE】ad_fingerprints.fingerprint 是 UNIQUE —— 人工早先学过的
+// 同一条值在这里会被忽略，不会重复写、也不会覆盖人工学到的更高权重。
+async function promoteAdLLMCandidates(env) {
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		const res = await env.DB.prepare(
+			'INSERT OR IGNORE INTO ad_fingerprints '
+			+ '(fingerprint, type, value, weight, confidence, source, created_at, updated_at) '
+			+ "SELECT fingerprint, type, value, ?, 1, 'llm-candidate', ?, ? FROM ad_llm_candidates "
+			+ 'WHERE promoted = 0 AND hits >= ? AND LENGTH(value) >= ?')
+			.bind(AD_LLM_FEATURE_PROMOTE_WEIGHT, now, now,
+				AD_LLM_FEATURE_PROMOTE_HITS, AD_LLM_FEATURE_PROMOTE_LEN).run();
+		const moved = Number(res?.meta?.changes || res?.changes || 0);
+		await env.DB.prepare(
+			'UPDATE ad_llm_candidates SET promoted = 1 '
+			+ 'WHERE promoted = 0 AND hits >= ? AND LENGTH(value) >= ?')
+			.bind(AD_LLM_FEATURE_PROMOTE_HITS, AD_LLM_FEATURE_PROMOTE_LEN).run();
+		if (moved > 0) AD_FINGERPRINT_CACHE.delete(env.DB);
+		return moved;
+	} catch (error) {
+		console.error('[广告检测·AI特征学] 自动转正失败:', error?.message || error);
+		return 0;
+	}
+}
+
+// 人工指令（/ban /spam /sban）时调用：把候选池里与这次载荷命中的候选【立即转正】。
+// 【它与自动转正的区别就是主人定义的两种学习】人工用的指令 = 参与学习，不设 hits 门槛 ——
+// 人看过判据拍板了，那就是最强的确认信号，不该再等它凑够 3 次。
+// 【只提权不降权】INSERT OR IGNORE：已经被人工以更高权重学过的同值指纹不受影响。
+async function promoteAdLLMCandidatesFromPayload(env, payload) {
+	if (!env?.DB) return 0;
+	try {
+		if (!(await ensureAdLLMCandidatesTable(env))) return 0;
+		const haystack = normalizeAdFingerprintValue(
+			[payload?.name, payload?.bio, payload?.text].filter(Boolean).join(' '));
+		if (!haystack) return 0;
+		const rows = await env.DB.prepare(
+			'SELECT fingerprint, type, value FROM ad_llm_candidates WHERE promoted = 0 LIMIT 500').all();
+		const list = (rows && rows.results) || rows || [];
+		const matched = list.filter((row) => {
+			const norm = normalizeAdFingerprintValue(row.value);
+			if (!norm || norm.length < AD_LLM_FEATURE_MIN_LEN) return false;
+			if (row.type === 'phone') return false;   // 号码型不做正文子串匹配（与 matchAdFingerprints 同口径）
+			return haystack.includes(norm);
+		});
+		if (!matched.length) return 0;
+		const now = Math.floor(Date.now() / 1000);
+		await env.DB.batch(matched.map((row) => env.DB.prepare(
+			'INSERT OR IGNORE INTO ad_fingerprints '
+			+ '(fingerprint, type, value, weight, confidence, source, created_at, updated_at) '
+			+ 'VALUES (?, ?, ?, ?, 1, ?, ?, ?)')
+			.bind(row.fingerprint, row.type, row.value, AD_LLM_FEATURE_PROMOTE_WEIGHT,
+				'llm-candidate', now, now)));
+		await env.DB.batch(matched.map((row) => env.DB.prepare(
+			'UPDATE ad_llm_candidates SET promoted = 1, updated_at = ? WHERE fingerprint = ?')
+			.bind(now, row.fingerprint)));
+		AD_FINGERPRINT_CACHE.delete(env.DB);
+		return matched.length;
+	} catch (error) {
+		console.error('[广告检测·AI特征学] 人工转正失败:', error?.message || error);
+		return 0;
+	}
+}
+
+// 候选池统计（只给 /adstats 看）。
+async function readAdLLMCandidateStats(env) {
+	if (!env?.DB) return { total: 0, promoted: 0 };
+	try {
+		if (!(await ensureAdLLMCandidatesTable(env))) return { total: 0, promoted: 0 };
+		const row = await env.DB.prepare(
+			'SELECT COUNT(*) AS total, COALESCE(SUM(promoted), 0) AS promoted FROM ad_llm_candidates').first();
+		return {
+			total: Number(row?.total || 0),
+			promoted: Number(row?.promoted || 0)
+		};
+	} catch (error) {
+		return { total: 0, promoted: 0 };
+	}
 }
 
 // ===== 误判反例池（/ignore 的「不白判」那一半）=====
@@ -18135,6 +18424,11 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	// 否则「调了但从没命中」与「压根没跑」在线上完全无法区分（上线首日就是这个状态）。
 	// 只在模型真给出 ad 结论时写（低频），也只有 /adstats 读它，热路径不为它多付 SQL。
 	await bumpAdLLMOutcome(env, answer.confidence >= line);
+	// 第⑥层自我学习（2026-10-18 乙方案）：把模型抽到的特征写进候选池，并做一次自动转正。
+	// 【为什么放在这里】answer.ad 为 true 才会走到这行 —— 判 false 的调用（绝大多数）
+	// 一个 SQL 都不发；且同一载荷有 adLLMSeen 内存去重，不会对同一条文案重复写。
+	// 【失败绝不影响判定】recordAdLLMCandidates 内部整段 try，只记日志。
+	await recordAdLLMCandidates(env, answer.features || [], input);
 	const reason = 'AI 深度判定命中（置信度 ' + answer.confidence.toFixed(2) + '）：' + answer.reason;
 	const reasons = (current.reasons || []).concat([reason]);
 	if (answer.confidence >= line) {
@@ -23637,6 +23931,10 @@ async function handleAdStatsCommand(env, chatId) {
 	// 第 ⑥ 层的今日观测：调了几次、模型判了几次广告、其中几次真到采信线。
 	// 没有这三个数时，「调了但 0 命中」与「压根没跑」在线上完全无法区分。
 	const llmStat = await readAdLLMOutcome(env, Math.floor(Date.now() / 1000));
+	// AI 特征自我学习（2026-10-18 乙）：候选池攒了多少、转正了多少。
+	// 单独一次查询而不是塞进上面那个 batch —— 那个 batch 的下标是硬编码的，
+	// 插进中间会让后面全部静默错位；/adstats 是低频命令，多一次 D1 往返无所谓。
+	const candidateStat = await readAdLLMCandidateStats(env);
 
 	const lines = [
 		'<b>📊 广告检测状态</b>',
@@ -23693,6 +23991,11 @@ async function handleAdStatsCommand(env, chatId) {
 			// 上次解析失败时返回对象的【字段名】—— 直接回答「正文到底在哪个字段」。
 			// 只有字段名不含内容：返回体里带着别人的 bio 与消息片段，摆出来是隐私泄露面。
 			+ (llmStat.lastShape ? '　↳ 上次返回字段：' + escapeHtml(llmStat.lastShape) : ''),
+		// AI 特征自我学习（2026-10-18 乙方案）：候选池条数与转正条数。
+		// 【与真指纹库分开报】候选【不参与任何判定】，混进指纹库那条数字里会让人
+		// 误以为它们已经在起作用；只有「已转正」那部分才是生效的。
+		'　↳ AI 特征自我学习：候选池 <b>' + candidateStat.total + '</b> 条，已转正 <b>'
+			+ candidateStat.promoted + '</b> 条（转正后按 0.5 权重只计分、不单条定罪）',
 		'',
 		'<b>指纹库</b>　共 <b>' + fpTotal + '</b> 条'
 	];
