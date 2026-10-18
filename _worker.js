@@ -19818,6 +19818,22 @@ function isVisionFileMissing(error) {
 	return /wrong file_id|file is temporarily unavailable|file not found|file .* expired/i.test(msg);
 }
 
+// 下载到的字节不是模型能吃的位图（.tgs 动图贴纸 / .webm 视频贴纸，或存量行存的
+// 是本体而不是缩略图）。与 isVisionFileMissing 同一性质：不可恢复、且在 ai.run
+// 【之前】就抛，一个 Neurons 都没花。
+//
+// 【为什么必须单独识别】此前它落进 else 分支，被当成链路故障 —— 计一次 failed、
+// 还累加熔断连续失败数。而头像与正文图【共用同一套熔断状态】（AD_VISION_FAIL_BREAK=10），
+// 所以连着 10 张这类贴纸就把当天【正常图片】的识别一起停掉。/adstats 失败台账里那几行
+// 「图片 @ sniff」正是这条路径：stage 相同、错误信息一字不差。
+//
+// 判据用 error.name 而不是匹配错误原文 —— 原文是给日志看的，改一个字判据就哑；
+// 名字由抛错点显式设置，两处（头像/正文图）共用同一个常量。
+const AD_VISION_UNSUPPORTED_FORMAT = 'VisionUnsupportedFormat';
+function isVisionUnsupportedFormat(error) {
+	return String(error?.name || '') === AD_VISION_UNSUPPORTED_FORMAT;
+}
+
 // 失效后重新取该用户【当前】头像的 file_id。
 // 头像 file_id 原本来自 getChat（fetchAdUserProfile 采的），但 getChat 对
 // 【从未与 bot 私聊过】的用户恒返回 chat not found —— 那批人一个都取不到。
@@ -19930,7 +19946,7 @@ async function bumpVisionBreakState(env, ok, nowSeconds) {
 }
 
 async function runAdAvatarVision(env, options = {}) {
-	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0, skippedMissing: 0 };
+	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0, skippedMissing: 0, skippedUnsupported: 0 };
 	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
 	if (!(await adDetectionReady(env))) { stats.skipped = 'not_ready'; return stats; }
 
@@ -20052,7 +20068,12 @@ async function runAdAvatarVision(env, options = {}) {
 			// 同理不能用「下载到什么就算什么」：kind 只说明载体，说明不了里面是什么字节。
 			stage = 'sniff';
 			const mime = sniffImageMime(new Uint8Array(buffer));
-			if (!mime) throw new Error('头像不是位图（可能是 .tgs / .webm 容器），跳过推理');
+			if (!mime) {
+				// 名字必须设：catch 靠它认出「不是位图」并跳过熔断（见 isVisionUnsupportedFormat）。
+				const e = new Error('头像不是位图（可能是 .tgs / .webm 容器），跳过推理');
+				e.name = AD_VISION_UNSUPPORTED_FORMAT;
+				throw e;
+			}
 			stage = 'encode';
 			const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
 			stage = 'ai.run';
@@ -20073,6 +20094,14 @@ async function runAdAvatarVision(env, options = {}) {
 			// （下方 upsert 照跑），所以不会下一轮又取出来反复失败。
 			if (isVisionFileMissing(error)) {
 				stats.skippedMissing += 1;
+				skipBump = true;
+				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error);
+			} else if (isVisionUnsupportedFormat(error)) {
+				// 【不是位图】与「文件失效」同款处置：失败发生在 ai.run【之前】（sniff 那一步），
+				// 一个 Neurons 都没花，重判一百次结果还是一样 —— 它证明不了链路坏了，
+				// 绝不能参与熔断。但【仍推进 vision_checked_at】（下方 upsert 照跑），
+				// 免得下一轮 cron 又把它取出来白跑一趟。
+				stats.skippedUnsupported += 1;
 				skipBump = true;
 				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error);
 			} else {
@@ -20130,7 +20159,7 @@ async function readImageVisionQuota(env, nowSeconds, prefix = 'img') {
 // 模型调用，挂在消息上会拖慢每一次回复，且撞子请求配额；付费层解决的是
 // 「超限报错」，解决不了「每条消息慢半秒」。
 async function runAdImageVision(env, options = {}) {
-	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0, skippedMissing: 0 };
+	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0, skippedMissing: 0, skippedUnsupported: 0 };
 	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
 	if (!(await adDetectionReady(env))) { stats.skipped = 'not_ready'; return stats; }
 	// 未绑 Workers AI：与广告检测整体的降级口径一致 —— 跳过而不是报错。
@@ -20217,7 +20246,12 @@ async function runAdImageVision(env, options = {}) {
 			// （喂错格式 = 模型抛错 = 计 failed，那正是这个 bug 的原貌）。
 			stage = 'sniff';
 			const mime = sniffImageMime(new Uint8Array(buffer));
-			if (!mime) throw new Error('下载到的不是位图（可能是 .tgs / .webm 容器），跳过推理');
+			if (!mime) {
+				// 名字必须设：catch 靠它认出「不是位图」并跳过熔断（见 isVisionUnsupportedFormat）。
+				const e = new Error('下载到的不是位图（可能是 .tgs / .webm 容器），跳过推理');
+				e.name = AD_VISION_UNSUPPORTED_FORMAT;
+				throw e;
+			}
 			stage = 'encode';
 			const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
 			stage = 'ai.run';
@@ -20244,6 +20278,14 @@ async function runAdImageVision(env, options = {}) {
 			}
 			if (isVisionFileMissing(error)) {
 				stats.skippedMissing += 1;
+				skipBump = true;
+				await logAdVisionFailure(env, '图片', stage, row.file_unique_id, error);
+			} else if (isVisionUnsupportedFormat(error)) {
+				// 【不是位图】与「文件失效」同款处置：失败发生在 ai.run【之前】（sniff 那一步），
+				// 一个 Neurons 都没花，重判一百次结果还是一样 —— 它证明不了链路坏了，
+				// 绝不能参与熔断。但【仍推进 vision_checked_at】（下方 upsert 照跑），
+				// 免得下一轮 cron 又把它取出来白跑一趟。
+				stats.skippedUnsupported += 1;
 				skipBump = true;
 				await logAdVisionFailure(env, '图片', stage, row.file_unique_id, error);
 			} else {
@@ -23774,6 +23816,7 @@ async function handleAdVisionCommand(env, chatId, ctx) {
 			+ (Number(s.skippedLarge) > 0 ? '　超限跳过 ' + Number(s.skippedLarge) : '')
 			+ (Number(s.rateLimited) > 0 ? '　限流跳过 ' + Number(s.rateLimited) : '')
 			+ (Number(s.skippedMissing) > 0 ? '　📁 失效跳过 ' + Number(s.skippedMissing) + '（文件没了，不计熔断）' : '')
+			+ (Number(s.skippedUnsupported) > 0 ? '　🚫 非位图跳过 ' + Number(s.skippedUnsupported) + '（.tgs/.webm 等，不计熔断）' : '')
 			+ (s.skipped ? '　⏸️ 跳过：' + escapeHtml(String(s.skipped)) : '');
 		const parts = [
 			'<b>🖼 视觉识别 · 结果</b>',

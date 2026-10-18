@@ -305,6 +305,65 @@ section('[5] /adstats 各通道定罪 /误封对账');
 	assert('★ 无定罪记录时不显示对账屏', !/各通道定罪/.test(emptyText), emptyText.slice(0, 300));
 }
 
+// ================= [6] 不是位图（.tgs/.webm）不计熔断 =================
+section('[6] 非位图失败不计入 failed、不推熔断');
+{
+	// 【为什么要有这一条】头像与正文图【共用同一套熔断状态】（AD_VISION_FAIL_BREAK=10）。
+	// 改前「不是位图」（.tgs 动图贴纸 / .webm 视频贴纸，或存量行存的是本体不是缩略图）
+	// 落进 catch 的 else 分支，被当成链路故障：计一次 failed、还累加熔断连续失败数 ——
+	// 连着 10 张这类贴纸就把【当天正常图片】的识别一起停掉（它们本属同一条弃用镜头）。
+	// 这类失败发生在 ai.run【之前】（sniff 那一步），一个 Neurons 都没花，
+	// 重判一百次结果一样，它证明不了链路坏了。
+	const env = makeEnv({
+		AI: { run: async () => ({ answers: { ad: { type: 'choice', choice: 'clean', probabilities: { ad: 0.05, clean: 0.95 }, confidence: 0.9 } } }) }
+	});
+	await W.adDetectionReady(env);
+	const now = Math.floor(Date.now() / 1000);
+	// 15 行而不是 3 行：熔断阈值是 10，行数必须【超过】阈值才能让「改前实现」真的熔断 ——
+	// 少于阈值时两种实现的 consec_fail 都停在行数上，断言成假绿（test_avatar_missing 同款教训）。
+	for (let i = 0; i < 15; i++) {
+		await env.DB.prepare('INSERT INTO ad_avatars (file_unique_id, verdict, hits, file_id, source, last_user_id, vision_checked_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)')
+			.bind('NV' + i, 'pending', 0, 'FID_' + i, null, '8000' + i, 0, now, now).run();
+	}
+
+	const origFetch = sandbox.fetch;
+	// getFile 一律成功（失败会先落进 isVisionFileMissing 那条路），下载返回【全零字节】——
+	// sniffImageMime 认不出任何格式 → 正是「不是位图」这条路径。
+	sandbox.fetch = async (url) => {
+		const u = String(url);
+		if (u.includes('getFile')) {
+			return { ok: true, status: 200, async json() { return { ok: true, result: { file_path: 'photos/x.jpg' } }; }, async text() { return '{}'; } };
+		}
+		return { ok: true, status: 200, async arrayBuffer() { return new Uint8Array(64 * 1024).buffer; }, async json() { return {}; }, async text() { return '{}'; } };
+	};
+	let stats = null, err = null;
+	try { stats = await W.runAdAvatarVision(env, { dailyLimit: 50, batchSize: 10 }); } catch (e) { err = e; }
+	sandbox.fetch = origFetch;
+
+	assert('[6-0] 未抛异常', err === null, err && String(err.message).slice(0, 200));
+	if (stats) {
+		console.log('   stats = ' + JSON.stringify(stats));
+		// ★ 核心：不是位图【不】计入 failed —— 改前会 failed=10 → 红
+		assert('★ 非位图不计入 failed', Number(stats.failed || 0) === 0, `failed=${stats.failed}`);
+		// ★ 有专属计数 —— 改前无此字段、catch 里也无此分支 → 红
+		assert('★ 非位图计入 skippedUnsupported', Number(stats.skippedUnsupported || 0) > 0, `skippedUnsupported=${stats.skippedUnsupported}`);
+		// ★ 熔断连续失败数未被推高 —— 改前连着 10 张会推到 10 → 红
+		const consec = env.DB.query("SELECT value FROM ad_scan_state WHERE key = 'vision_consec_fail'");
+		assert('★ 熔断连续失败数未被推高', Number(consec[0]?.value || 0) === 0, JSON.stringify(consec));
+		// ★ 未写熔断标记 —— 改前会写下当天日期 → 红
+		const broken = env.DB.query("SELECT value FROM ad_scan_state WHERE key = 'vision_broken_day'");
+		assert('★ 未写熔断标记（当天正常图不受影响）', !broken.length || !String(broken[0].value || ''), JSON.stringify(broken));
+		// 反证：仍推进 vision_checked_at（不无限重试）—— 这条改前改后都应绿。
+		// 只断言【本批取走的】—— batchSize=10，剩下 5 行本批根本没被取到，checked_at 仍是 0。
+		const bumped = env.DB.query('SELECT COUNT(*) c FROM ad_avatars WHERE vision_checked_at > 0');
+		assert('★ 本批取走的 10 行都推进了 vision_checked_at（不无限重试）', Number(bumped[0]?.c || 0) === 10, JSON.stringify(bumped));
+		// 台账照记（可诊断）
+		assert('★ 非位图仍写失败台账', env.DB.query('SELECT * FROM ad_vision_failures').length > 0);
+		// 一个都没进 ai.run：零 Neurons 消耗
+		assert('★ 一个都没进入 ai.run（零 Neurons）', Number(stats.done || 0) === 0, JSON.stringify({ done: stats.done, ad: stats.ad, clean: stats.clean }));
+	}
+}
+
 console.log(`\n========== ${pass} 通过 / ${fail} 失败 ==========`);
 if (failures.length) console.log('失败项：\n  - ' + failures.join('\n  - '));
 process.exit(fail ? 1 : 0);
