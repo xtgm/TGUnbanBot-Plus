@@ -7395,6 +7395,39 @@ function looksLikePersonName(name) {
 	return /^[A-Z][a-z'’-]+(?:\s[A-Z][a-z'’-]+){0,2}$/.test(value);
 }
 
+// ===== 定罪层专属标记（2026-10-19 乙方案 B）=====
+//
+// 【它治的是什么】/adstats 的「各通道定罪 / 误封对账」原先统计的是
+// `reasons LIKE '%指纹库命中%'` —— 那只能证明「这条快照的判据里出现过指纹库的
+// 加分项」，与「它是不是被指纹库定罪的」完全是两回事：一条快照可以同时含指纹加分、
+// AI 加分、头像加分，最后靠评分线定罪，照样被三行各计一次。于是屏上的「定罪 N」
+// 实为「参与 N」，而误封率的分母被大量【根本没定罪的】样本稀释 —— 线上那个看着
+// 很干净的比率就是这么来的。
+//
+// 【口径】只在【真正把 verdict 提成 ban 的那一层】写一条 【定罪层】X；
+// 已经有层定过罪时后来者不抢标（归属唯一）。于是「各行之和 = 总定罪数」，
+// 误封率的分母就是该通道实打实的定罪数。
+//
+// 【为什么走 reasons 而不是加列】不动表结构、不动判定链 —— 标记只是往既有的
+// reasons 数组里多写一行文本，对 verdict / score 零影响。ad_pending_snapshots
+// 的 snapshot 是文本，加列要改建表语句并等 D1 迁移，收益一样。
+//
+// 【格式是契约】对账 SQL 按 `%【定罪层】<层名>%` 匹配，层名一律取自
+// AD_LAYER_LABELS（找不到就回退成 layer 的原值），改格式必须同时改 SQL。
+const AD_CONVICT_MARK = '【定罪层】';
+// 追加一条专属标记并返回新数组（不改原数组）。
+// 【必须插到最前面】快照落库时 reasons 会被 JSON.stringify(...).slice(0, 2000) 截断
+// （见 allocateAdPendingSnapshot），而 /pending 复核也只渲染前 10 条 —— 排在末尾的
+// 标记一旦被截掉，对账 SQL 就永远查不到它，这一屏会【静默显示成 0】，比报错更难查。
+// 同一层名只写一次：叠放链上同一层可能被调用两遍（会员标与正文 emoji 共用
+// applyBadgeVerdict、闸一闸二各叠一次图片），重复写虽不影响行级计数，
+// 但会让 /pending 复核的判据列表里出现两行一模一样的「【定罪层】头像」。
+function markAdConvictLayer(reasons, label) {
+	const list = Array.isArray(reasons) ? reasons : [];
+	const line = AD_CONVICT_MARK + String(label || '');
+	return list.includes(line) ? list : [line].concat(list);
+}
+
 // ===== 名片广告专用定罪通道（2026-10-11）=====
 //
 // 【补的是哪个洞】两条线上名片广告离线实测（群 -1001883549197）：
@@ -7439,11 +7472,13 @@ function applyContactCardVerdict(evaluation, message) {
 	return Object.assign({}, evaluation, {
 		verdict: 'ban',
 		layer: 'contact',
-		reasons: (evaluation?.reasons || []).concat([
+		// 上面那道 `verdict === 'ban' 直接返回` 的守卫保证走到这里必定是【本层定的罪】，
+		// 所以标记无条件写 —— 与 avatar / badge / image 那三处「本层提成 ban 才写」等价。
+		reasons: markAdConvictLayer((evaluation?.reasons || []).concat([
 			'名片广告定罪：显示名「' + displayName.slice(0, 40) + '」不像人名且命中 '
 				+ hits.slice(0, 3).join('/')
 				+ '（名片是本人主动分发的联系方式，同词在正文里是谈资、在名片上是招揽）'
-		])
+		]), '名片')
 	});
 }
 
@@ -17449,8 +17484,13 @@ function applyAvatarVerdict(evaluation, avatar) {
 	// 已经是 ban 的不降级（保留原样），免得前一层定了罪却被头像这一层压回去。
 	let verdict = (hasCorroboration || hitsAloneSufficient) ? 'ban'
 		: (evaluation.verdict === 'ban' ? 'ban' : 'observe');
+	// 【定罪归属】只有本层把 verdict 从非 ban 提成 ban 时才写专属标记 ——
+	// 前面已定罪的保留它自己的归属，/pending 复核不会看到「明明是指纹封的、
+	// 却显示成头像封的」（与 applyContactCardVerdict 同口径）。
+	const convictedByAvatar = Boolean(hasCorroboration || hitsAloneSufficient)
+		&& String(evaluation.verdict) !== 'ban';
 	// score 只作展示：头像不改评分口径，避免与历史分叠加时重复计分。
-	return Object.assign({}, evaluation, { verdict, reasons });
+	return Object.assign({}, evaluation, { verdict, reasons: convictedByAvatar ? markAdConvictLayer(reasons, '头像') : reasons });
 }
 
 // 异步包装：有头像就读库叠判，没头像（闸一的 cheapProfile 恒为空、getChat 失败的号）
@@ -17619,10 +17659,15 @@ function applyBadgeVerdict(evaluation, badge) {
 	]);
 	let verdict = evaluation.verdict;
 	if (hits >= AD_BADGE_BAN_HITS && hasCorroboration) verdict = 'ban';
+	// 【定罪归属】与头像同口径：只有本层把 verdict 从非 ban 提成 ban 才写标记。
+	// 「同款自定义 emoji」这一行在 /adstats 对账屏上，标记名必须与 SQL 里那个
+	// LIKE 片段逐字一致。
+	const convictedByBadge = hits >= AD_BADGE_BAN_HITS && hasCorroboration
+		&& String(evaluation.verdict) !== 'ban';
 	// 其余情形 verdict 保持原样：不把 pass 提成 observe（那会让每一个撞上
 	// 常见标的人被记一笔、在观察窗口里叠历史分），也不降级。
 	// score 同样不改 —— 会员标不是评分口径的一部分，改了会与历史分重复计。
-	return Object.assign({}, evaluation, { verdict, reasons });
+	return Object.assign({}, evaluation, { verdict, reasons: convictedByBadge ? markAdConvictLayer(reasons, '同款emoji') : reasons });
 }
 
 // 叠判入口：一次处理【昵称旁的会员标】与【正文里的自定义贴纸 emoji】两件事。
@@ -18486,9 +18531,12 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 		// 【不能给 reasons 重新赋值】它是 const —— 直接 `reasons = reasons.concat(...)`
 		// 会抛 Assignment to constant variable，整条检测链在 try 里炸掉、返回 result: error。
 		if (hardEvidence.length) {
+			// 【定罪归属】函数入口那道 `verdict === 'ban' 直接返回` 保证走到这里
+			// 必定是本层定的罪，所以标记无条件写。
 			return Object.assign({}, current, {
 				verdict: 'ban',
-				reasons: reasons.concat(['（代码验证：' + hardEvidence.join('、') + '）'])
+				reasons: markAdConvictLayer(
+					reasons.concat(['（代码验证：' + hardEvidence.join('、') + '）']), 'LLM')
 			});
 		}
 		return Object.assign({}, current, {
@@ -18814,7 +18862,10 @@ function applyImageVerdict(evaluation, image) {
 	//      得分没到线就不封，进观察窗口等人工或后续证据 —— 与头像通道同口径
 	//      （applyAvatarVerdict 2026-10-14 也是只认正分佐证，治的是同一个病）。
 	if (hits >= AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS) {
-		return Object.assign({}, evaluation, { verdict: 'ban', reasons });
+		// 【定罪归属】同头像 / 会员标：前面定过罪的保留原归属，本层不抢标。
+		const convictedByImage = String(evaluation.verdict) !== 'ban';
+		return Object.assign({}, evaluation, { verdict: 'ban',
+			reasons: convictedByImage ? markAdConvictLayer(reasons, '正文图片') : reasons });
 	}
 	// score 只作展示：图片不改评分口径，避免与历史分叠加时重复计分。
 	return Object.assign({}, evaluation, { verdict: evaluation.verdict, reasons });
@@ -21109,14 +21160,27 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		// 否则这个模式就只是「静默放过」，起不到看误伤面的作用。
 		: ((structure.guilty || score >= config.observationScore) ? 'observe' : 'pass');
 
+	// 本次判定的归属层。提取成常量是因为下面 return 的 layer 字段与定罪层专属标记
+	// 必须读【同一个值】—— 两处各写一遍迟早会分叉（本项目注释失真已出现过多次）。
+	const convictLayer = structureBan ? structure.channel
+		// 用 aiHardHit 而非裸 ai.isMatch：被豁免词否证时这次判定并非 AI 定罪，
+		// 标成 'ai' 会让复盘时误以为是 AI 层封的。
+		: (hardHit ? (aiHardHit ? 'ai' : 'fingerprint')
+			: (structure.guilty ? structure.channel : layer));
+	// 【定罪层专属标记】到这一步才写 —— 必须与上面的 verdict 判定同源，否则
+	// 「reasons 说它被指纹定罪、verdict 却是 observe」这类自相矛盾会写进快照。
+	// 这是【评分层 / 指纹 / AI / 结构查杀】四条路径共用的唯一落点（它们全部经
+	// hardHit 或分数线在这里定案），叠加族（名片/头像/emoji/图片/LLM）各有自己的落点。
+	// 【unshift 而不是 push】快照落库时 reasons 会被 JSON.stringify(...).slice(0, 2000)
+	// 截断、/pending 也只渲染前 10 条 —— 排在末尾的标记会被截掉，对账那一屏静默变 0。
+	if (verdict === 'ban') {
+		reasons.unshift(AD_CONVICT_MARK + (AD_LAYER_LABELS[convictLayer] || convictLayer));
+	}
+
 	return {
 		verdict,
 		score,
-		layer: structureBan ? structure.channel
-			// 用 aiHardHit 而非裸 ai.isMatch：被豁免词否证时这次判定并非 AI 定罪，
-			// 标成 'ai' 会让复盘时误以为是 AI 层封的。
-			: (hardHit ? (aiHardHit ? 'ai' : 'fingerprint')
-				: (structure.guilty ? structure.channel : layer)),
+		layer: convictLayer,
 		reasons,
 		threshold: config.scoreThreshold,
 		fingerprintHits: fingerprint.hits,
@@ -23969,17 +24033,26 @@ async function handleAdStatsCommand(env, chatId) {
 			// 误封 = 被主人 /ignore 回滚过的（expires_at=0），与定罪总数在同一条 SQL 里
 			// 聚合 —— 并进这次 batch 就不多付一次 D1 往返。
 			// 五条通道两两一对：*_total 是定罪数、*_false 是其中被回滚的数。
+			//
+			// 【2026-10-19 乙方案 B：判据从「参与」改成「定罪」】
+			// 原先匹配的是各通道的加分项文本（'%指纹库命中%' 等）—— 那只能证明这条快照
+			// 的判据里【出现过】该通道的加分，跟它是不是被该通道定罪的无关：一条快照可以
+			// 同时含指纹、AI、头像三家的加分，最后靠评分线定罪，照样被三行各计一次，
+			// 于是「定罪 N」实为「参与 N」、误封率被大量没定罪的样本稀释。
+			// 现在只匹配 markAdConvictLayer 写的专属标记，那道标记只由【真正把 verdict
+			// 提成 ban 的那一层】写入且归属唯一 —— 一行一条，各行之和 = 总定罪数。
+			// 历史快照（标记上线前写的）没有任何标记，所以这五行从上线当天【从 0 起算】。
 			env.DB.prepare(`SELECT
-				SUM(CASE WHEN reasons LIKE '%指纹库命中%' THEN 1 ELSE 0 END) AS fp_total,
-				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%指纹库命中%' THEN 1 ELSE 0 END) AS fp_false,
-				SUM(CASE WHEN reasons LIKE '%AI 语义相似度%' THEN 1 ELSE 0 END) AS ai_total,
-				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%AI 语义相似度%' THEN 1 ELSE 0 END) AS ai_false,
-				SUM(CASE WHEN reasons LIKE '%同款自定义 emoji%' THEN 1 ELSE 0 END) AS badge_total,
-				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%同款自定义 emoji%' THEN 1 ELSE 0 END) AS badge_false,
-				SUM(CASE WHEN reasons LIKE '%头像命中广告图库%' THEN 1 ELSE 0 END) AS avatar_total,
-				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%头像命中广告图库%' THEN 1 ELSE 0 END) AS avatar_false,
-				SUM(CASE WHEN reasons LIKE '%AI 深度判定命中%' THEN 1 ELSE 0 END) AS llm_total,
-				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%AI 深度判定命中%' THEN 1 ELSE 0 END) AS llm_false
+				SUM(CASE WHEN reasons LIKE '%【定罪层】指纹库%' THEN 1 ELSE 0 END) AS fp_total,
+				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%【定罪层】指纹库%' THEN 1 ELSE 0 END) AS fp_false,
+				SUM(CASE WHEN reasons LIKE '%【定罪层】AI 语义%' THEN 1 ELSE 0 END) AS ai_total,
+				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%【定罪层】AI 语义%' THEN 1 ELSE 0 END) AS ai_false,
+				SUM(CASE WHEN reasons LIKE '%【定罪层】同款emoji%' THEN 1 ELSE 0 END) AS badge_total,
+				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%【定罪层】同款emoji%' THEN 1 ELSE 0 END) AS badge_false,
+				SUM(CASE WHEN reasons LIKE '%【定罪层】头像%' THEN 1 ELSE 0 END) AS avatar_total,
+				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%【定罪层】头像%' THEN 1 ELSE 0 END) AS avatar_false,
+				SUM(CASE WHEN reasons LIKE '%【定罪层】LLM%' THEN 1 ELSE 0 END) AS llm_total,
+				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%【定罪层】LLM%' THEN 1 ELSE 0 END) AS llm_false
 			FROM ad_pending_snapshots`)
 		]);
 		fpTotal = Number(rows[0]?.results?.[0]?.c) || 0;
@@ -24170,6 +24243,9 @@ async function handleAdStatsCommand(env, chatId) {
 		lines.push(...accountLines);
 		lines.push('　↳ 误封 = 主人 <code>/ignore</code> 回滚过的条数；⚠️ = 误封率 ≥ '
 			+ AD_CHANNEL_ACCOUNT_WARN_RATE + '%');
+		lines.push('　↳ 定罪 = 该通道【实际把号判成封禁】的次数（一条快照只归定它罪的那一层，'
+			+ '不重复计）—— 不是「判据里出现过该通道加分」的次数');
+		lines.push('　↳ 计数从本功能上线当天起算：此前的历史快照没有归属标记');
 		lines.push('　↳ 全绿说明判据还在正轨上，哪一行抬头就是那个判据在退化 —— '
 			+ '第③层的样本库是自动学的，这条最该盯');
 	}

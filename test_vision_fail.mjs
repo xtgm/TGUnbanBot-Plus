@@ -278,9 +278,19 @@ section('[5] /adstats 各通道定罪 /误封对账');
 		+ 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
 	).bind(OWNER_ID, seq, String(userId), '-100111', 7, JSON.stringify(reasons), '{}',
 		Math.floor(Date.now() / 1000), expiresAt).run();
-	await seedSnap(1, 1001, ['+3 指纹库命中：@adexample'], 9999999999);
-	await seedSnap(2, 1002, ['+3 指纹库命中：@adexample2'], 0);   // expires_at=0 = 被 /ignore 回滚 = 误封
-	await seedSnap(3, 1003, ['AI 语义相似度 0.794 ≥ 阈值 0.78'], 9999999999);
+	// 【2026-10-19 乙方案 B 起：只有带【定罪层】归属标记的才算「定罪」】
+	// 指纹层：2 条定罪，其中 1 条被 /ignore 回滚 = 误封
+	await seedSnap(1, 1001, ['+3 指纹库命中：@adexample', '【定罪层】指纹库'], 9999999999);
+	await seedSnap(2, 1002, ['+3 指纹库命中：@adexample2', '【定罪层】指纹库'], 0);   // expires_at=0 = 被 /ignore 回滚 = 误封
+	// AI 层：1 条定罪
+	await seedSnap(3, 1003, ['AI 语义相似度 0.794 ≥ 阈值 0.78', '【定罪层】AI 语义'], 9999999999);
+	// ★ 旧口径的样本：只有加分项、没有任何归属标记 → 改前计入、改后不计。
+	// 这正是被修掉的假计数 ——「判据里出现过指纹加分」不等于「被指纹定罪」。
+	await seedSnap(4, 1004, ['+3 指纹库命中：@adexample3'], 9999999999);
+	// ★ 一条被 AI 定罪、判据里同时含指纹加分 → 改前指纹与 AI 各计一次，改后只归 AI。
+	await seedSnap(5, 1005, ['+3 指纹库命中：@adexample4', 'AI 语义相似度 0.80 ≥ 阈值 0.78', '【定罪层】AI 语义'], 9999999999);
+	// ★ 同上：只有 AI 加分、没有归属标记 → 改前计入、改后不计。
+	await seedSnap(6, 1006, ['AI 语义相似度 0.79 ≥ 阈值 0.78'], 9999999999);
 	calls.length = 0;
 	await post({ update_id: 7, message: { message_id: 7, date: 1, text: '/adstats', chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID, is_bot: 0, first_name: 'O' } } }, envAcc);
 	const accText = sendTextOf('sendMessage').join('\n');
@@ -288,13 +298,17 @@ section('[5] /adstats 各通道定罪 /误封对账');
 	// 直接拿原文匹配「定罪 2」永远匹配不到，会把格式问题误报成数据问题。
 	const accPlain = accText.replace(/<\/?b>/g, '');
 	assert('★ /adstats 报出各通道对账屏', /各通道定罪/.test(accText), accText.slice(0, 300));
-	assert('★ 指纹层：定罪 2 / 误封 1 / 50.00%',
+	// 改前这两行的数是「指纹 4 / 误封 1 / 25.00%」「AI 3 / 误封 0」——
+	// seed 4 与 seed 6 那两条「只有加分项」的被算了进去，seed 5 还让指纹多计一次。
+	assert('★ 指纹层：定罪 2 / 误封 1 / 50.00%（只算归属标记）',
 		/指纹库命中\s*定罪 2\s*误封 1\s*50\.00%/.test(accPlain),
 		(accPlain.match(/指纹库命中[^\n]*/) || ['(没匹配到)'])[0]);
-	assert('★ AI 向量层：定罪 1 / 误封 0',
-		/AI 向量相似度\s*定罪 1\s*误封 0/.test(accPlain),
+	assert('★ AI 向量层：定罪 2 / 误封 0（只算归属标记）',
+		/AI 向量相似度\s*定罪 2\s*误封 0/.test(accPlain),
 		(accPlain.match(/AI 向量相似度[^\n]*/) || ['(没匹配到)'])[0]);
 	assert('★ 点明误封口径是 /ignore 回滚', /ignore/.test(accText), accPlain.slice(0, 700));
+	assert('★ 点明「一条快照只归定它罪的那一层」的归属口径',
+		/一条快照只归定它罪的那一层/.test(accPlain), accPlain.slice(0, 900));
 
 	// 一条封禁都没有时不显示 —— 每次 /adstats 都带一块全 0 的表只是噪音
 	const envEmpty = makeEnv();
@@ -362,6 +376,63 @@ section('[6] 非位图失败不计入 failed、不推熔断');
 		// 一个都没进 ai.run：零 Neurons 消耗
 		assert('★ 一个都没进入 ai.run（零 Neurons）', Number(stats.done || 0) === 0, JSON.stringify({ done: stats.done, ad: stats.ad, clean: stats.clean }));
 	}
+}
+
+// ================= [7] 定罪层标记的写入端 =================
+section('[7] 定罪层专属标记由判定链写入');
+{
+	// 先验纯函数契约 —— 别只靠端到端一条断言兜，这一层是新增的。
+	assert('★ markAdConvictLayer 插到最前面并返回新数组',
+		JSON.stringify(W.markAdConvictLayer(['a'], '头像')) === JSON.stringify(['【定罪层】头像', 'a']),
+		JSON.stringify(W.markAdConvictLayer(['a'], '头像')));
+	assert('★ 同层名不重复写（叠放链上同一层会被调用两遍）',
+		JSON.stringify(W.markAdConvictLayer(['a', '【定罪层】头像'], '头像')) === JSON.stringify(['a', '【定罪层】头像']));
+	assert('★ 非数组输入不炸（调用方可能传 undefined）',
+		Array.isArray(W.markAdConvictLayer(undefined, 'x')));
+
+	// 端到端：用【种子指纹】让这条消息必定被判成封禁 —— 种子 weight 1.0 > 封禁权重 0.8，
+	// 走的是「指纹硬命中」，与评分阈值无关，所以不必构造一串凑分的文本。
+	// 【为什么必须端到端】纯函数对不代表判定链真的调了它 —— 本项目踩过
+	// 「函数写对了、调用点没接上、断言却仍然在过」的坑。
+	const envBan = makeEnv();
+	await W.adDetectionReady(envBan);
+	const configBan = W.loadAdDetectionConfig(envBan);
+	const ev = await W.evaluateAdSuspect(envBan,
+		{ profile: { firstName: '测试号', lastName: '', username: 'testuser', bio: '' }, text: '收网赚号 长期收购各类账号' },
+		{ config: configBan, whitelist: new Set(), skipMissingBioPenalty: true });
+	const marks = (ev.reasons || []).filter((r) => String(r).startsWith('【定罪层】'));
+	console.log('   verdict=' + ev.verdict + ' layer=' + ev.layer + ' marks=' + JSON.stringify(marks));
+	assert('★ 前置：这条消息确实被判成封禁（否则后面的断言没意义）',
+		ev.verdict === 'ban', JSON.stringify({ verdict: ev.verdict, score: ev.score }));
+	assert('★ 定罪时写入且只写入【一条】归属标记',
+		marks.length === 1, JSON.stringify(ev.reasons));
+	// 层名表要从源码里取 —— vm 里顶层 const 不挂 globalThis（与 [3] 段取冷却常量同理）。
+	// 【为什么不在这里抄一份期望表】抄一份等于把同一张表维护两遍：源码里改了层名，
+	// 标记跟着变、测试里那份没变，断言照样绿 —— 那就成了「只验证能解析」。
+	const layerLabels = {};
+	{
+		const block = (src.match(/const AD_LAYER_LABELS = \{[\s\S]*?\n\};/) || [''])[0];
+		for (const m of block.matchAll(/(\w+):\s*'([^']*)'/g)) layerLabels[m[1]] = m[2];
+	}
+	assert('★ 前置：源码里的层名表解析出来了', Object.keys(layerLabels).length >= 5, JSON.stringify(layerLabels));
+	assert('★ 归属标记的层名与 evaluation.layer 一致',
+		marks[0] === '【定罪层】' + (layerLabels[ev.layer] || ev.layer),
+		String(marks[0]) + ' layer=' + String(ev.layer) + ' table=' + JSON.stringify(layerLabels));
+	// 【快照落库会截断】allocateAdPendingSnapshot 写库时是
+	// JSON.stringify(reasons).slice(0, 2000)，/pending 复核也只渲染前 10 条 ——
+	// 归属标记必须排在最前面，否则被截掉之后对账那一屏会【静默显示成 0】，
+	// 比抛错更难查（本项目对「静默」的教训已经栽过好几次）。
+	assert('★ 归属标记在 reasons 最前面（否则会被 2000 字符截断掉）',
+		ev.reasons[0] === marks[0], JSON.stringify({ first: ev.reasons[0], mark: marks[0] }));
+	console.log('   reasons 序列化长度 = ' + JSON.stringify(ev.reasons).length + '（落库上限 2000）');
+	// 反证：没定罪的消息不该有任何归属标记
+	const evPass = await W.evaluateAdSuspect(envBan,
+		{ profile: { firstName: '路人甲', lastName: '', username: 'normalguy', bio: '' }, text: '今天天气不错 大家下午好' },
+		{ config: configBan, whitelist: new Set(), skipMissingBioPenalty: true });
+	const passMarks = (evPass.reasons || []).filter((r) => String(r).startsWith('【定罪层】'));
+	assert('★ 未定罪的消息不写归属标记',
+		evPass.verdict !== 'ban' && passMarks.length === 0,
+		JSON.stringify({ verdict: evPass.verdict, marks: passMarks }));
 }
 
 console.log(`\n========== ${pass} 通过 / ${fail} 失败 ==========`);
