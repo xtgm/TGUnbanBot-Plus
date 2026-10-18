@@ -15749,12 +15749,26 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 			?? extractAdChecklistText(message));
 		const profile = await fetchAdUserProfile(targetUserId, message?.from || {});
 		const name = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
+		// 【媒体源】/ban <id>、/spam <id>、/sban 传进来的 message 是【命令消息本身】，
+		// 被引用的那条广告躺在 message.reply_to_message 里 —— 命令消息上没有 photo /
+		// sticker / entities，直接吃 message 会让「引用一张广告图或贴纸去 /ban」的媒体
+		// 与正文 emoji 一个字节都进不了库。
+		// 【只在命令消息上回退】/spam 引用回复式传进来的本就是被引用的那条消息（不是命令），
+		// 若一律回退到 reply_to_message，会把「引用的引用」的图当成广告素材误学 ——
+		// 所以先用 isTelegramSlashCommand 认出命令消息，只对它回退。
+		// 只让 mediaSource 服务【媒体与 emoji 两处】；message 本身原样留给 getAdQuotedText
+		// （引用体兜底读的正是 message.reply_to_message 的文本，直接换掉会让它变成读「引用的引用」）。
+		const mediaSource = (message && isTelegramSlashCommand(String(message.text || '').trim()))
+			? (message.reply_to_message || message) : message;
 		const payload = {
 			name,
 			username: profile.username ? '@' + String(profile.username).replace(/^@/, '') : '',
 			bio: profile.bio || '',
 			text,
-			domains: extractAdDomains([name, profile.bio, text].filter(Boolean).join('\n'))
+			domains: extractAdDomains([name, profile.bio, text].filter(Boolean).join('\n')),
+			// 正文里的自定义 emoji（点⚔️查 这类贴纸 emoji）id 就在被引用消息的 entities 里，
+			// 与资料无关，必须从媒体源现取 —— fetchAdUserProfile 的响应里没有它。
+			customEmojiIds: extractCustomEmojiIds(mediaSource)
 		};
 		const learn = await learnAdFingerprints(env, payload, { source, createdBy });
 		out.learned = Number(learn?.learned || 0);
@@ -15790,6 +15804,15 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 			// 这里只学 profile 上那一个标：正文 emoji 属于消息，人工命令没有消息可取。
 			const badgeId = String(profile.badgeId || '');
 			if (badgeId && await learnAdBadgeOnBan(env, badgeId, targetUserId)) out.badges += 1;
+			// 正文自定义 emoji 与会员标共用 ad_badges、共用 hits 计数（+1 语义）。
+			// 2026-10-19 补：此前手动路径只学 profile 上那个会员标，正文里的贴纸 emoji
+			// 一个都不学 —— 管理员引用「正文只有 点⚔️查 这类 emoji」的广告发 /spam，
+			// 那个 emoji id 进不了库，同款素材复用等于零成本漏放。id 现已随 payload 带上。
+			// 跳过与会员标重复的那个 id —— 重复学会把 AD_BADGE_BAN_HITS 的安全阀提前拱开。
+			for (const emojiId of payload.customEmojiIds) {
+				if (!emojiId || emojiId === badgeId) continue;
+				if (await learnAdBadgeOnBan(env, emojiId, targetUserId)) out.badges += 1;
+			}
 		} catch (error) {
 			console.error('[广告检测] 人工判定头像/会员标学习失败（' + source + '）:', error);
 		}
@@ -15814,7 +15837,11 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 		// 引用消息里的媒体直接标成广告素材：verdict='ad'，source 记 /spam /ban /sban
 		// 里的哪一个，归属记被处置的那个 user id。下次【任何人】发同一张就命中。
 		// 没有引用消息（如 /ban 12345 直接给 id）时 message 为空，自然跳过。
-		const learnMedia = message ? extractAdMedia(message) : null;
+		// 2026-10-19 修：媒体一律从 mediaSource 取 —— 它已把「命令消息」回退到被引用的
+		// 那条广告（见上方 mediaSource 的说明）。此前吃的是 message 本身，于是
+		// 「/ban 123 引用一张广告图」学不到图，只有「/spam 引用回复」那条路径学得到。
+		// 裸 /ban 12345（无引用）时 reply_to_message 为空、回退成命令消息，仍自然跳过。
+		const learnMedia = mediaSource ? extractAdMedia(mediaSource) : null;
 		if (learnMedia?.fileUniqueId) {
 			const wrote = await upsertAdImage(env, learnMedia.fileUniqueId, {
 				verdict: 'ad',

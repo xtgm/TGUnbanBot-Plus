@@ -366,6 +366,45 @@ console.log('\n===== 人工判定学习 =====');
 		typeof (await W.loadRecentUserAdText({ DB: null }, '991001')) === 'string');
 	cacheD1.query("DELETE FROM moderation_messages WHERE from_id='991001'");
 
+	// ⑪ 命令消息引用广告 → 媒体与正文 emoji 从 reply_to_message 学（2026-10-19）
+	// 起因：/ban <id>、/spam <id>、/sban 传进来的是【命令消息】本身，被引用的那条广告
+	// 躺在 reply_to_message 里。此前 extractAdMedia 吃的是命令消息 → 命令上没有 photo /
+	// entities，「引用一张广告图或贴纸去 /ban」的媒体与 emoji 一个字节都学不到
+	//（只有 /spam 引用回复那条路径恰好传的是被引用消息、才学得到）。
+	W.fetchAdUserProfile = async () => ({ firstName: '引用测试', lastName: '', username: 'ref01', bio: '' });
+	const quotedAd = {
+		message_id: 5001,
+		text: '点⚔️查',
+		photo: [{ file_id: 'PHOTO_FID_1', file_unique_id: 'PHOTO_UNIQ_1', width: 90, height: 90 }],
+		entities: [{ type: 'custom_emoji', custom_emoji_id: '5368746000000000001', offset: 0, length: 2 }]
+	};
+	const r8 = await W.learnAdFromOperatorAction(env, '990008',
+		{ text: '/ban 990008', from: {}, reply_to_message: quotedAd },
+		{ source: 'manual', createdBy: '1', text: '' });
+	check('★ 命令消息引用的图片被学进去', r8.imageLearned === 1, JSON.stringify(r8));
+	check('★ 命令消息引用的正文 emoji 被学进去', r8.badges === 1, JSON.stringify(r8));
+	const imgRow = env.DB.query("SELECT * FROM ad_images WHERE file_unique_id='PHOTO_UNIQ_1'");
+	check('★ 图片落库 verdict=ad 且归属正确',
+		imgRow.length === 1 && imgRow[0].verdict === 'ad' && imgRow[0].last_user_id === '990008',
+		JSON.stringify(imgRow));
+	const emojiRow = env.DB.query("SELECT * FROM ad_badges WHERE badge_id='5368746000000000001'");
+	check('★ emoji 落库 verdict=ad',
+		emojiRow.length === 1 && emojiRow[0].verdict === 'ad', JSON.stringify(emojiRow));
+
+	// ⑫ 非命令消息【不】回退（防误学「引用的引用」）
+	// /spam 引用回复式传进来的本就是被引用的那条消息，它自己可能还带 reply_to_message；
+	// 若一律回退，会把「引用的引用」的图当成广告素材 —— 误学一张不相干的图。
+	const quotedAd2 = {
+		message_id: 5002,
+		photo: [{ file_id: 'PHOTO_FID_2', file_unique_id: 'PHOTO_UNIQ_2', width: 90, height: 90 }]
+	};
+	const r9 = await W.learnAdFromOperatorAction(env, '990009',
+		{ text: '随便说句话', from: {}, reply_to_message: quotedAd2 },
+		{ source: 'manual', createdBy: '1', text: '' });
+	check('★ 非命令消息不回退（不误学引用的图）', r9.imageLearned === 0, JSON.stringify(r9));
+	check('★ 该图确实没入库',
+		env.DB.query("SELECT COUNT(*) c FROM ad_images WHERE file_unique_id='PHOTO_UNIQ_2'")[0].c === 0);
+
 	W.fetchAdUserProfile = realFetch;
 }
 
