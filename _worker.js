@@ -24047,6 +24047,45 @@ const AD_CHANNEL_ACCOUNT_ROWS = [
 // 误封率警戒线（百分比）。超过它那一行会带 ⚠️。
 const AD_CHANNEL_ACCOUNT_WARN_RATE = 1;
 
+// 对账查询。【2026-10-19 二次改：SQL 只负责把带归属标记的行捞回来】
+// 上一版把十二类归类全压在 SQL 里（24 个 SUM(CASE WHEN reasons LIKE ? …)），
+// 线上实测直接打崩 D1 会话 —— 返回 {"D1_RESET_DO":true}。
+// 而 batch 是一个事务，一条崩则这次 /adstats 的【全部十二条统计】一起失败，
+// 屏上一半数字静默变成 0（「D1 自定义 0 条」与「生效 51 条」自相矛盾，
+// 就是最先露出来的马脚）。逐条实测：1 个 LIKE 扫 8600 行 10ms、
+// 旧版 10 个 LIKE 33ms 都正常，24 个就不行了 —— 不是绑定参数的问题，
+// 是把 24 次全表 LIKE 求值压在 D1 一侧太重。
+// 现在 SQL 只做一件事：一次 LIKE 捞回带标记的行。归类改在 JS 里做 ——
+// 带标记的行本来就很少（线上 8598 行快照里只有 36 行），
+// 回传几十行远比让 D1 对每行求值 24 次便宜。
+// 【将来若标记行数涨到上万】这里的全量回传会变重，改成按 id 分页取。
+const AD_CHANNEL_ACCOUNT_SQL =
+	'SELECT reasons, expires_at FROM ad_pending_snapshots WHERE reasons LIKE ?';
+const AD_CHANNEL_ACCOUNT_PARAM = '%' + AD_CONVICT_MARK + '%';
+
+// 按归属标记归类。【与原先那条 SQL 逐字等价】：
+// t_i = SUM(CASE WHEN reasons LIKE '%【定罪层】tag%' THEN 1 ELSE 0 END)，
+// f_i 多一个 AND expires_at = 0 —— 这里 reasons.includes(mark + tag) 与
+// LIKE '%【定罪层】tag%' 同义（都是字面量子串匹配），expires_at === 0 就是
+// 被 /ignore 回滚过。一条快照若含多个标记则各计一次，与原 SQL 同形
+//（归属标记本应唯一，这里不假定，保持与旧口径一致）。
+function buildAdChannelAccount(rows) {
+	const stats = new Map();
+	for (const row of rows || []) {
+		const reasons = String(row?.reasons ?? '');
+		if (!reasons) continue;
+		const rolledBack = Number(row?.expires_at) === 0;
+		for (const item of AD_CHANNEL_ACCOUNT_ROWS) {
+			if (!reasons.includes(AD_CONVICT_MARK + item.tag)) continue;
+			let slot = stats.get(item.tag);
+			if (!slot) { slot = { total: 0, falseCount: 0 }; stats.set(item.tag, slot); }
+			slot.total += 1;
+			if (rolledBack) slot.falseCount += 1;
+		}
+	}
+	return stats;
+}
+
 async function handleAdStatsCommand(env, chatId) {
 	const config = loadAdDetectionConfig(env);
 	// 顺带补一批样本向量。此前 topUpAdSampleEmbeddings 的唯一调用点在 checkAdAiSimilarity 内部，
@@ -24105,17 +24144,9 @@ async function handleAdStatsCommand(env, chatId) {
 			// 现在只匹配 markAdConvictLayer 写的专属标记，那道标记只由【真正把 verdict
 			// 提成 ban 的那一层】写入且归属唯一 —— 一行一条，各行之和 = 总定罪数。
 			// 历史快照（标记上线前写的）没有任何标记，所以这些行从上线当天【从 0 起算】。
-			// 【十二行由 AD_CHANNEL_ACCOUNT_ROWS 派生】列名用下标 t0/f0…，
-			// tag 走参数绑定（中文与【】不进 SQL 文本）；顺序必须与渲染端一致。
-			env.DB.prepare(
-				'SELECT ' + AD_CHANNEL_ACCOUNT_ROWS.map((row, i) =>
-					'SUM(CASE WHEN reasons LIKE ? THEN 1 ELSE 0 END) AS t' + i + ', '
-					+ 'SUM(CASE WHEN expires_at = 0 AND reasons LIKE ? THEN 1 ELSE 0 END) AS f' + i
-				).join(', ') + ' FROM ad_pending_snapshots'
-			).bind(...AD_CHANNEL_ACCOUNT_ROWS.flatMap((row) => {
-				const pattern = '%' + AD_CONVICT_MARK + row.tag + '%';
-				return [pattern, pattern];
-			}))
+			// 【2026-10-19 二次改：归类搬到应用层】这里只捞出「带归属标记」的行，
+			// 十二类拆分交给 buildAdChannelAccount —— 缘由见该函数上方那段说明。
+			env.DB.prepare(AD_CHANNEL_ACCOUNT_SQL).bind(AD_CHANNEL_ACCOUNT_PARAM)
 		]);
 		fpTotal = Number(rows[0]?.results?.[0]?.c) || 0;
 		fpByType = rows[1]?.results || [];
@@ -24128,7 +24159,7 @@ async function handleAdStatsCommand(env, chatId) {
 		badgeRows = rows[8]?.results || [];
 		visionFailRow = rows[9]?.results?.[0] || null;
 		visionFailTop = rows[10]?.results || [];
-		channelAccount = rows[11]?.results?.[0] || null;
+		channelAccount = buildAdChannelAccount(rows[11]?.results);
 	} catch (error) {
 		console.error('[广告检测] 统计查询失败:', error);
 	}
@@ -24295,16 +24326,17 @@ async function handleAdStatsCommand(env, chatId) {
 	// 补上之后「各行之和 = 总定罪数」这句话才真的成立（原屏的七类标记是无处归账的）。
 	// 【一行都不带就整屏不显示】主人健康时看到的 /adstats 不该多出一块全 0 的表。
 	const accountLines = [];
-	if (channelAccount) {
-		AD_CHANNEL_ACCOUNT_ROWS.forEach((row, i) => {
-			const total = Number(channelAccount['t' + i]) || 0;
-			if (!total) return;
-			const falseCount = Number(channelAccount['f' + i]) || 0;
+	if (channelAccount && typeof channelAccount.get === 'function') {
+		for (const row of AD_CHANNEL_ACCOUNT_ROWS) {
+			const slot = channelAccount.get(row.tag);
+			const total = slot ? slot.total : 0;
+			if (!total) continue;
+			const falseCount = slot.falseCount;
 			const rate = falseCount * 100 / total;
 			accountLines.push(row.label + '　定罪 <b>' + total + '</b>　误封 <b>' + falseCount
 				+ '</b>　' + rate.toFixed(2) + '%'
 				+ (rate >= AD_CHANNEL_ACCOUNT_WARN_RATE ? '　⚠️' : ''));
-		});
+		}
 	}
 	if (accountLines.length) {
 		lines.push('');

@@ -347,6 +347,22 @@ section('[5] /adstats 各通道定罪 /误封对账');
 			&& !/结构查杀·正文（简介\+正文）\s*定罪 [2-9]/.test(accPlain),
 		accPlain.slice(0, 900));
 
+	// 【2026-10-19 二次改的回归钉子】这条对账 SQL 上一版是「十二类归类全压在 SQL 里」
+	// —— 24 个 SUM(CASE WHEN reasons LIKE ? …)。线上实测直接把 D1 底层会话打死，
+	// 返回 {"D1_RESET_DO":true}；而 batch 是【一个事务】，一条崩则这次 /adstats 的
+	// 十二条统计【整批失败】，屏上一半数字静默变 0 ——「D1 自定义 0 条」与
+	// 「生效 51 条」自相矛盾就是这么冒出来的（catch 里只 console.error，屏上不留痕）。
+	// 逐条实测把范围卡死了：1 个 LIKE 扫 8600 行 10.62ms、旧版 10 个 LIKE 33.28ms 都正常，
+	// 24 个就不行 —— 不是绑定参数超限（内联无参版照样崩），是把 24 次全表 LIKE 求值
+	// 压在 D1 一侧太重。现在 SQL 只做一件事：一次 LIKE 把带标记的行捞回来，归类搬进 JS
+	// （标记行本来就极少：线上 8598 行快照里只有 36 行）。
+	// 下面两条钉的是【形态】而不是数字 —— 数字对了但 SQL 又长回 24 个 LIKE 也算重演。
+	const accSql = (envAcc.DB._sql || []).find((s) => s.includes('ad_pending_snapshots') && s.includes('reasons LIKE'));
+	assert('★ 对账 SQL 只带 1 个 LIKE 参数（曾 24 个把 D1 会话打死，不许重演）',
+		!!accSql && (accSql.match(/\?/g) || []).length === 1, accSql || '(没找到该 SQL)');
+	assert('★ 对账 SQL 不再堆 SUM(CASE…) 聚合（求值搬到应用层）',
+		!!accSql && !/SUM\s*\(/i.test(accSql), accSql || '(没找到该 SQL)');
+
 	// 一条封禁都没有时不显示 —— 每次 /adstats 都带一块全 0 的表只是噪音
 	const envEmpty = makeEnv();
 	await W.adDetectionReady(envEmpty);
