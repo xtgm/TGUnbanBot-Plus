@@ -20865,9 +20865,17 @@ const AD_MONEY_SOLICIT_SCORE = 5;
 const AD_MONEY_AMOUNT_RE = new RegExp(
 	'(?:¥|￥)'
 	+ '|(?:\\d[\\d,\\.\\s]{0,6}\\s*(?:万|千|百|[kKwW]|元|块|rmb|usdt))'
-	+ '|(?:[一二三四五六七八九十两]\\s*[万亿])'
-	+ '|(?:[一两\\d]+\\s*(?:天|日|单|笔)\\s*\\d{2,6})'	// 一天8000 / 一单800 / 两单5000
+	// 【2026-10-19 线上漏放补】「千/百」原先不在这个字符类里 —— 只认「八万 / 一亿」，
+	// 「一天八千」「两千」这类最普通的写法直接漏掉。而金额是形态 E 的入口
+	//（`if (!amount) return null`），认不出金额就等于整条形态不成立，
+	// 后面有没有「收款」都不会再看一眼。
+	+ '|(?:[一二三四五六七八九十两]\\s*[千百万亿])'
+	// 时薪写法原先只认阿拉伯数字，「一天八千」里的中文数额同样漏（线上漏放原文）。
+	+ '|(?:[一两\\d]+\\s*(?:天|日|单|笔)\\s*(?:\\d{2,6}|[一二三四五六七八九十百千万两]+))'
 	+ '|(?:\\b\\d{3,6}\\b(?=\\s*(?:[个张单笔天]|/天)))'
+	// 【2026-10-19】用字母 o/O 冒充 0 的写法（线上原文「一天7ooo」）：
+	// 要求数字后跟两个以上 o/O —— 「OK」「photo」只有一个 o、且前面不是数字，不会误命中。
+	+ '|(?:\\d\\s*[oO]{2,})'
 	, 'i');
 // 收益动作：承诺赚钱、回报、赌博类。
 const AD_MONEY_GAIN_RE = /赚|收益|利润|稳赚|日赚|日结|月结|躺赚|月入|回本|分红|上分|回血|包赢|带单|跟单|带你/;
@@ -20886,6 +20894,34 @@ function scoreAdMoneySolicit(text) {
 	if (!gain && !solicit) return null;
 	const labels = [gain ? '收益动作' : '', solicit ? '招人/收钱动作' : ''].filter(Boolean).join(' × ');
 	return { score: AD_MONEY_SOLICIT_SCORE, reason: '金额与' + labels + '同现（形态 E 金额招揽，达观察线不定罪）' };
+}
+
+// 【2026-10-19 线上漏放补】第⑥层（生成式深度判定）的触发闸门 —— 从 evaluateAdSuspect
+// 里抽成纯函数，因为它是「词表外话术能不能得救」的唯一开关，必须能被单独断言。
+//
+// 【它治的是什么】第⑥层存在的理由就是「词表抓不住的新话术」（见上方那段说明），
+// 但它得先被【触发】才跑得起来。原触发条件是【业务词/交易动词命中】∪【reasons 里有正分行】
+// —— 线上实测两条漏放广告在这两条上都拿 0：
+//   · 「能稳定收米的来洗米 一天八千 @hxdalao」：收米 / 洗米 / 八千 在四张表里逐词零命中；
+//   · 「支付宝微信帮我收款一天7ooo」：「收款」只活在 AD_MONEY_SOLICIT_RE（形态 E 内部），
+//     不在 AD_TRADE_VERBS / AD_BUSINESS_KEYWORDS 这两张触发表里。
+// 两条都是 0 分放行、人手动 /spam 才处置 —— 越是词表抓不住的越需要第⑥层，它偏偏够不着。
+//
+// 【第三条路径：形态 E 的单边命中】金额 与（收钱/招揽动作 或 @提及）同现即触发。
+// 不要求形态 E 达分（它要 +5 才进观察线），这里只要「值得让模型看一眼」。
+// 为什么不是「见到金额就送」：技术群里报数字太常见（「延迟200ms」「预算 5000 元」），
+// 它们没有动作词也没有 @handle，一条都不会被拉起来 —— 稳态零额外开销的口径不变。
+function isAdSuspectSignal(text, reasons) {
+	const source = String(text || '');
+	const solicitHits = countAdKeywordHits(source, AD_TRADE_VERBS).length
+		+ countAdKeywordHits(source, AD_BUSINESS_KEYWORDS).length;
+	if (solicitHits > 0) return true;
+	if (AD_MONEY_AMOUNT_RE.test(source)
+		&& (AD_MONEY_GAIN_RE.test(source) || AD_MONEY_SOLICIT_RE.test(source)
+			|| /[@＠][A-Za-z0-9_]{4,}/.test(source))) {
+		return true;
+	}
+	return Array.isArray(reasons) && reasons.some((line) => AD_POSITIVE_SIGNAL_RE.test(line));
 }
 
 // ===== 自定义 emoji 的贴纸包名判据（批次 B-2）=====
@@ -22716,11 +22752,14 @@ async function detectAdOnMessage(message, env) {
 	// 技术群里天天说的「代理 / 订阅 / 节点 / 教程」全是豁免词，不在下面这两张表里，
 	// 普通技术讨论一条都不会被它拉起来 —— 这两行的命中者，本来就已经在 reasons 里
 	// 留下了「仅业务关键词」「仅交易动词」的记录，它们只是此前没资格往下走而已。
-	const solicitHits = countAdKeywordHits(text || contactName, AD_TRADE_VERBS).length
-		+ countAdKeywordHits(text || contactName, AD_BUSINESS_KEYWORDS).length;
-	const suspectSignal = solicitHits > 0
-		|| (Array.isArray(cheap.reasons)
-			&& cheap.reasons.some((line) => AD_POSITIVE_SIGNAL_RE.test(line)));
+	//
+	// ===== 2026-10-19：再加第三条路径（形态 E 单边命中）=====
+	// 上面那两条补完之后仍有两类漏放（主人截图实证，离线沙箱实跑确认两条都是 0 分放行）：
+	// 「能稳定收米的来洗米 一天八千 @hxdalao」与「支付宝微信帮我收款一天7ooo」——
+	// 前者「收米 / 洗米 / 八千」四张表零命中，后者「收款」只活在形态 E 的正则里、
+	// 不在上面那两张触发表中。同一轮也补了形态 E 自己的判据（AD_MONEY_AMOUNT_RE
+	// 现在认中文数额与 `7ooo` 这类字母冒充）。三条路径的合并与边界见 isAdSuspectSignal。
+	const suspectSignal = isAdSuspectSignal(text || contactName, cheap.reasons);
 	const bioCheckedAt = Number(member?.bio_checked_at) || 0;
 	const needBio = suspectSignal
 		? (bioCheckedAt <= 0 || nowSeconds - bioCheckedAt >= AD_SUSPECT_BIO_COOLDOWN_SECONDS)

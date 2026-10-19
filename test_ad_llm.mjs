@@ -607,6 +607,64 @@ section('[8] 可疑信号把 bio 冷却期压到 10 分钟');
 		assert('★ 豁免词复读不触发新路径（技术讨论仍零 AI 调用）',
 			ai.llmCalls === 0, 'llmCalls=' + ai.llmCalls);
 	}
+	// ②d 【2026-10-19 主人截图实证的两条漏放】金额招揽形态落在四张词表之外
+	//     → 第⑥层必须够得着（够不着就是 0 分放行、只能等人手动 /spam）。
+	{
+		// 线上原文。离线沙箱实跑确认两条都是 0 分：形态 E 的金额入口认不出
+		// 「一天八千」（中文数额）与「一天7ooo」（字母冒充 0）→ 整条形态 return null；
+		// 而「收米 / 洗米」在四张表里逐词零命中、「收款」只活在形态 E 的正则里
+		// （不在 AD_TRADE_VERBS / AD_BUSINESS_KEYWORDS 这两张触发表里）。
+		const LEAKS = [
+			'能稳定收米的来洗米 一天八千 @hxdalao',
+			'支付宝微信帮我收款一天7ooo'
+		];
+		for (let i = 0; i < LEAKS.length; i++) {
+			const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });
+			const ai = env.AI;
+			const uid = 771120 + i;
+			setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+				id: body?.chat_id, first_name: '漏放用户', username: '', bio: ''
+			} } }) });
+			await primeBioChecked(env, uid, 60);   // 冷却期内：原逻辑进不去，只有新触发路径救得了
+			await send(groupMessage({ id: uid, first_name: '漏放用户' }, LEAKS[i]), env);
+			assert('★ 金额招揽漏放「' + LEAKS[i].slice(0, 14) + '…」→ 第⑥层被调到（曾 0 分放行）',
+				ai.llmCalls >= 1, 'llmCalls=' + ai.llmCalls);
+		}
+	}
+	// ②e 反向：报数字的普通技术讨论不许被拉起来（稳态零额外开销的口径不变）
+	{
+		const PLAINS = ['这个节点延迟200ms', '预算 5000 元', '一共 300 天免费'];
+		for (let i = 0; i < PLAINS.length; i++) {
+			const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });
+			const ai = env.AI;
+			const uid = 771130 + i;
+			setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+				id: body?.chat_id, first_name: '技术用户2', username: '', bio: ''
+			} } }) });
+			await primeBioChecked(env, uid, 60);
+			await send(groupMessage({ id: uid, first_name: '技术用户2' }, PLAINS[i]), env);
+			assert('★ 普通报数的技术讨论不触发第⑥层（' + PLAINS[i] + '）',
+				ai.llmCalls === 0, 'llmCalls=' + ai.llmCalls);
+		}
+	}
+	// ②f 触发闸门本身（纯函数直测 —— 上面测的是「接线」，这里测「判据」）
+	{
+		assert('触发闸门：「收米…一天八千 @xxx」→ true',
+			W.isAdSuspectSignal('能稳定收米的来洗米 一天八千 @hxdalao', []) === true);
+		assert('触发闸门：「微信帮我收款一天7ooo」→ true',
+			W.isAdSuspectSignal('支付宝微信帮我收款一天7ooo', []) === true);
+		assert('触发闸门：交易动词命中照旧 true（原路径不退化）',
+			W.isAdSuspectSignal('高价收购账号', []) === true);
+		assert('触发闸门：正分行照旧 true（原路径不退化）',
+			W.isAdSuspectSignal('随便聊聊', ['+2 交易动词']) === true);
+		assert('触发闸门：普通报数 → false（有金额但没动作词也没 @）',
+			W.isAdSuspectSignal('预算 5000 元', []) === false);
+		assert('触发闸门：字母分支不过宽 —— OK / photo 不算金额，配 @ 也不触发',
+			W.isAdSuspectSignal('OK @abcdef', []) === false
+				&& W.isAdSuspectSignal('photo @abcdef', []) === false);
+		assert('触发闸门：+0 不算正分（0 分不构成「有特征」）',
+			W.isAdSuspectSignal('随便聊聊', ['+0 来源频道名为随机字母串']) === false);
+	}
 	// ③ 冷却期外 + 0 正分 → 照旧进闸二（原有行为不变）
 	{
 		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });
