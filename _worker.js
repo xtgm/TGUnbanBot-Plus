@@ -24016,12 +24016,33 @@ async function handleAdDigestCommand(env, chatId, arg) {
 //
 // 【只列五条会封人的通道】评分层不在其中：它的 reasons 是几十条判据的组合，
 // 没有单一关键词可 LIKE，硬凑会把「评分凑到 7 分」与「AI 加分」混为一谈。
+// 【2026-10-19 补：从五个标签扩到十二个】
+// 方案 B 上线时屏上只摆了五个标签，而 markAdConvictLayer 实际会写出【十二种】——
+// 结构查杀四条通道（card / body / identity / quoted）、名片、正文图片、结构化评分
+// 这七类的标记【写了库却没处看】。后果不是报错而是更糟：主人看到的是
+// 「结构查杀一条都没定过罪」，真实情况却可能是它在频繁定罪、只是没有行显示，
+// 于是某条判据在退化时完全看不见 —— 与这一屏的设立初衷正好相反。
+//
+// 【tag 是契约】必须与 markAdConvictLayer 的实参【逐字一致】：
+// 层名取自 AD_LAYER_LABELS 的值（score/card/body 三条），或
+// applyXxxVerdict 里写死的字面量（'头像' / '同款emoji' / '正文图片' / 'LLM' / '名片'），
+// 或 judgeAdStructure 的 channel 原值（'identity' / 'quoted'，表里没有对应键所以原样写库）。
+// SQL 与屏上渲染都从这一张表派生，避免「加了行忘了加 SQL」这种两处分叉。
+// 【identity / quoted 保持英文】它们已是写进库的标记文本，这里改成中文会让
+// 同一通道的新老标记分裂成两条、各自计数。
 const AD_CHANNEL_ACCOUNT_ROWS = [
-	{ label: '指纹库命中', total: 'fp_total', fp: 'fp_false' },
-	{ label: 'AI 向量相似度', total: 'ai_total', fp: 'ai_false' },
-	{ label: '同款自定义 emoji', total: 'badge_total', fp: 'badge_false' },
-	{ label: '头像命中广告图', total: 'avatar_total', fp: 'avatar_false' },
-	{ label: 'AI 深度判定（第⑥层）', total: 'llm_total', fp: 'llm_false' }
+	{ tag: '指纹库', label: '指纹库命中' },
+	{ tag: 'AI 语义', label: 'AI 向量相似度' },
+	{ tag: '同款emoji', label: '同款自定义 emoji' },
+	{ tag: '头像', label: '头像命中广告图' },
+	{ tag: '正文图片', label: '正文图片命中' },
+	{ tag: '资料卡查杀（用户名+简介）', label: '结构查杀·资料卡（用户名+简介）' },
+	{ tag: '正文查杀（简介+正文）', label: '结构查杀·正文（简介+正文）' },
+	{ tag: 'identity', label: '结构查杀·身份类（昵称+简介）' },
+	{ tag: 'quoted', label: '结构查杀·引用体' },
+	{ tag: '名片', label: '名片广告' },
+	{ tag: '结构化评分', label: '结构化评分定罪' },
+	{ tag: 'LLM', label: 'AI 深度判定（第⑥层）' }
 ];
 // 误封率警戒线（百分比）。超过它那一行会带 ⚠️。
 const AD_CHANNEL_ACCOUNT_WARN_RATE = 1;
@@ -24083,19 +24104,18 @@ async function handleAdStatsCommand(env, chatId) {
 			// 于是「定罪 N」实为「参与 N」、误封率被大量没定罪的样本稀释。
 			// 现在只匹配 markAdConvictLayer 写的专属标记，那道标记只由【真正把 verdict
 			// 提成 ban 的那一层】写入且归属唯一 —— 一行一条，各行之和 = 总定罪数。
-			// 历史快照（标记上线前写的）没有任何标记，所以这五行从上线当天【从 0 起算】。
-			env.DB.prepare(`SELECT
-				SUM(CASE WHEN reasons LIKE '%【定罪层】指纹库%' THEN 1 ELSE 0 END) AS fp_total,
-				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%【定罪层】指纹库%' THEN 1 ELSE 0 END) AS fp_false,
-				SUM(CASE WHEN reasons LIKE '%【定罪层】AI 语义%' THEN 1 ELSE 0 END) AS ai_total,
-				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%【定罪层】AI 语义%' THEN 1 ELSE 0 END) AS ai_false,
-				SUM(CASE WHEN reasons LIKE '%【定罪层】同款emoji%' THEN 1 ELSE 0 END) AS badge_total,
-				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%【定罪层】同款emoji%' THEN 1 ELSE 0 END) AS badge_false,
-				SUM(CASE WHEN reasons LIKE '%【定罪层】头像%' THEN 1 ELSE 0 END) AS avatar_total,
-				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%【定罪层】头像%' THEN 1 ELSE 0 END) AS avatar_false,
-				SUM(CASE WHEN reasons LIKE '%【定罪层】LLM%' THEN 1 ELSE 0 END) AS llm_total,
-				SUM(CASE WHEN expires_at = 0 AND reasons LIKE '%【定罪层】LLM%' THEN 1 ELSE 0 END) AS llm_false
-			FROM ad_pending_snapshots`)
+			// 历史快照（标记上线前写的）没有任何标记，所以这些行从上线当天【从 0 起算】。
+			// 【十二行由 AD_CHANNEL_ACCOUNT_ROWS 派生】列名用下标 t0/f0…，
+			// tag 走参数绑定（中文与【】不进 SQL 文本）；顺序必须与渲染端一致。
+			env.DB.prepare(
+				'SELECT ' + AD_CHANNEL_ACCOUNT_ROWS.map((row, i) =>
+					'SUM(CASE WHEN reasons LIKE ? THEN 1 ELSE 0 END) AS t' + i + ', '
+					+ 'SUM(CASE WHEN expires_at = 0 AND reasons LIKE ? THEN 1 ELSE 0 END) AS f' + i
+				).join(', ') + ' FROM ad_pending_snapshots'
+			).bind(...AD_CHANNEL_ACCOUNT_ROWS.flatMap((row) => {
+				const pattern = '%' + AD_CONVICT_MARK + row.tag + '%';
+				return [pattern, pattern];
+			}))
 		]);
 		fpTotal = Number(rows[0]?.results?.[0]?.c) || 0;
 		fpByType = rows[1]?.results || [];
@@ -24267,21 +24287,24 @@ async function handleAdStatsCommand(env, chatId) {
 	}
 
 	// ===== 各通道定罪 / 误封对账（2026-10-15）=====
-	// 【为什么是这五个数】判据会不会退化，光看「封了多少」看不出来 —— 封得多
+	// 【为什么是这些数】判据会不会退化，光看「封了多少」看不出来 —— 封得多
 	// 可能是广告真的变多，也可能是判据在乱杀。只有把【定罪】和【被 /ignore 回滚】
 	// 摆在一起才算得清谁在变脏。数据全是既有的（ad_pending_snapshots），零新增表。
+	// 【2026-10-19 从五行补到十二行】原屏只列五类，而实际会写进 reasons 的归属标记
+	// 有十二种 —— 结构查杀四条通道、名片、正文图片、结构化评分这七类此前一条都看不到。
+	// 补上之后「各行之和 = 总定罪数」这句话才真的成立（原屏的七类标记是无处归账的）。
 	// 【一行都不带就整屏不显示】主人健康时看到的 /adstats 不该多出一块全 0 的表。
 	const accountLines = [];
 	if (channelAccount) {
-		for (const row of AD_CHANNEL_ACCOUNT_ROWS) {
-			const total = Number(channelAccount[row.total]) || 0;
-			if (!total) continue;
-			const falseCount = Number(channelAccount[row.fp]) || 0;
+		AD_CHANNEL_ACCOUNT_ROWS.forEach((row, i) => {
+			const total = Number(channelAccount['t' + i]) || 0;
+			if (!total) return;
+			const falseCount = Number(channelAccount['f' + i]) || 0;
 			const rate = falseCount * 100 / total;
 			accountLines.push(row.label + '　定罪 <b>' + total + '</b>　误封 <b>' + falseCount
 				+ '</b>　' + rate.toFixed(2) + '%'
 				+ (rate >= AD_CHANNEL_ACCOUNT_WARN_RATE ? '　⚠️' : ''));
-		}
+		});
 	}
 	if (accountLines.length) {
 		lines.push('');

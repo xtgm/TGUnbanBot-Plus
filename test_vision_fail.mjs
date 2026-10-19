@@ -291,6 +291,18 @@ section('[5] /adstats 各通道定罪 /误封对账');
 	await seedSnap(5, 1005, ['+3 指纹库命中：@adexample4', 'AI 语义相似度 0.80 ≥ 阈值 0.78', '【定罪层】AI 语义'], 9999999999);
 	// ★ 同上：只有 AI 加分、没有归属标记 → 改前计入、改后不计。
 	await seedSnap(6, 1006, ['AI 语义相似度 0.79 ≥ 阈值 0.78'], 9999999999);
+	// 【2026-10-19 补：屏上原来只列五类，另七类标记写了库却没处看】
+	// 结构查杀四条通道（judgeAdStructure 的 channel：card / body / identity / quoted）、
+	// 名片、正文图片、结构化评分 —— 这七种标签此前一律不在屏上出现。
+	// 后果不是报错而是更糟：主人看到的是「结构查杀一条都没定过罪」，
+	// 真实情况却可能是它在频繁定罪、只是没有行显示。
+	await seedSnap(7, 1007, ['资料卡查杀定罪：…', '【定罪层】资料卡查杀（用户名+简介）'], 9999999999);
+	await seedSnap(8, 1008, ['正文查杀定罪：…', '【定罪层】正文查杀（简介+正文）'], 0);   // 误封 1
+	await seedSnap(9, 1009, ['身份查杀定罪：…', '【定罪层】identity'], 9999999999);
+	await seedSnap(10, 1010, ['引用体查杀定罪：…', '【定罪层】quoted'], 9999999999);
+	await seedSnap(11, 1011, ['名片广告定罪：…', '【定罪层】名片'], 9999999999);
+	await seedSnap(12, 1012, ['正文图片命中：…', '【定罪层】正文图片'], 9999999999);
+	await seedSnap(13, 1013, ['结构化评分 7 ≥ 阈值 6', '【定罪层】结构化评分'], 9999999999);
 	calls.length = 0;
 	await post({ update_id: 7, message: { message_id: 7, date: 1, text: '/adstats', chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID, is_bot: 0, first_name: 'O' } } }, envAcc);
 	const accText = sendTextOf('sendMessage').join('\n');
@@ -309,6 +321,31 @@ section('[5] /adstats 各通道定罪 /误封对账');
 	assert('★ 点明误封口径是 /ignore 回滚', /ignore/.test(accText), accPlain.slice(0, 700));
 	assert('★ 点明「一条快照只归定它罪的那一层」的归属口径',
 		/一条快照只归定它罪的那一层/.test(accPlain), accPlain.slice(0, 900));
+
+	// 【2026-10-19 新增七行的红绿断言：改前这七条一条都不出现】
+	// 屏上文案与 tag 不同（tag 是写库的契约、label 是给人看的），逐行核对映射。
+	// 正则里「（用户名+简介）」的 `+` 必须转义，否则变成量词、匹配到别的行。
+	const rowOf = (label) => (accPlain.match(new RegExp(label + '[^\\n]*')) || ['(没匹配到)'])[0];
+	assert('★ 结构查杀·资料卡行出现（定罪 1 / 误封 0）',
+		/结构查杀·资料卡（用户名\+简介）\s*定罪 1\s*误封 0/.test(accPlain), rowOf('结构查杀·资料卡'));
+	assert('★ 结构查杀·正文行出现（定罪 1 / 误封 1 / 100.00%）',
+		/结构查杀·正文（简介\+正文）\s*定罪 1\s*误封 1\s*100\.00%/.test(accPlain), rowOf('结构查杀·正文'));
+	// 这两行的 tag 是英文（judgeAdStructure 的 channel 原值，AD_LAYER_LABELS 里没有对应键）。
+	// 断言写的是【屏上中文 label】—— 若把 tag 也改成中文，库里已有的标记会分裂成两条，此处必红。
+	assert('★ 结构查杀·身份类行出现（tag 是英文 identity）',
+		/结构查杀·身份类（昵称\+简介）\s*定罪 1/.test(accPlain), rowOf('结构查杀·身份类'));
+	assert('★ 结构查杀·引用体行出现（tag 是英文 quoted）',
+		/结构查杀·引用体\s*定罪 1/.test(accPlain), rowOf('结构查杀·引用体'));
+	assert('★ 名片广告行出现', /名片广告\s*定罪 1/.test(accPlain), rowOf('名片广告'));
+	assert('★ 正文图片行出现', /正文图片命中\s*定罪 1/.test(accPlain), rowOf('正文图片命中'));
+	assert('★ 结构化评分行出现', /结构化评分定罪\s*定罪 1/.test(accPlain), rowOf('结构化评分定罪'));
+	// 【前缀串扰】'名片' 是「名片广告查杀（显示名+手机号）」的前缀 —— 后者是
+	// AD_LAYER_LABELS.contact 的值，只用于 layer 显示、从不写进 reasons，
+	// 所以两行不会互相吞。这里钉死：各行只能计到自己的那一条，不能被抬成 2。
+	assert('★ 行间无前缀串扰（每类各计一次、互不吞并）',
+		!/名片广告\s*定罪 [2-9]/.test(accPlain) && !/正文图片命中\s*定罪 [2-9]/.test(accPlain)
+			&& !/结构查杀·正文（简介\+正文）\s*定罪 [2-9]/.test(accPlain),
+		accPlain.slice(0, 900));
 
 	// 一条封禁都没有时不显示 —— 每次 /adstats 都带一块全 0 的表只是噪音
 	const envEmpty = makeEnv();
