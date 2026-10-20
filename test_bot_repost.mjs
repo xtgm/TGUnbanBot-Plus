@@ -675,6 +675,19 @@ console.log('\n=== 12. 引用已处置广告的四条管理命令先鉴权撤回
 			check(command + ' 鉴权后撤回命令一次', deletedCommand === 1);
 			check(command + ' 先完成管理员鉴权再撤回', commandDeleteIndex > adminIndex);
 			check(command + ' 群内简洁结果，同时私聊第一主人', groupSent && ownerSent);
+			// 【2026-10-20】主人要求：/unban 回执必须写明「要彻底纠正请用 /ignore」。
+			// 线上 383555435 反复被封的直接原因就是「我明明解开过」——/unban 只解封、
+			// 删黑名单，头像 / 指纹 / 会员标的判定痕迹全留着，下一条消息照样封。
+			const unbanGroupText = requests
+				.filter((r) => r.method === 'sendMessage' && String(r.body.chat_id) === String(GROUPS[0]))
+				.map((r) => String(r.body.text || '')).join('\n');
+			const unbanOwnerText = requests
+				.filter((r) => r.method === 'sendMessage' && String(r.body.chat_id) === '10001')
+				.map((r) => String(r.body.text || '')).join('\n');
+			check(command + ' 群内回执提示「要彻底纠正请用 /ignore」',
+				unbanGroupText.includes('要彻底纠正请用 /ignore'), unbanGroupText.slice(0, 300));
+			check(command + ' 私聊回执同样提示「要彻底纠正请用 /ignore」',
+				unbanOwnerText.includes('要彻底纠正请用 /ignore'), unbanOwnerText.slice(0, 300));
 		} else {
 			// /ban·/spam 群聊撤回命令 + 群内简洁回执（含目标可点击 + 可复制 TGID）+ 私聊第一主人完整。
 			check(command + ' 鉴权后撤回命令一次', deletedCommand === 1);

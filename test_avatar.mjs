@@ -392,6 +392,55 @@ section('[6] /ignore 误封纠错同步清头像');
 	assert('纠错后复用计数清零', Number(after[0]?.hits) === 0, JSON.stringify(after));
 }
 
+// ================= [6b] 自动学习的两道自增强闸（2026-10-20）=================
+//
+// 线上 383555435（@TbagM）四次封禁全部由头像层定罪，头像 hits 1→2→3→4：
+//   ① 每封一次就把同一张普通表情包重新学一遍 → hits 自己 +1，下次更容易够到佐证档；
+//   ② /ignore 已经转成 manual/clean 的头像，下一次封禁又被无条件改回 ad。
+// 两道闸都是【改动之前跑必红】的断言。
+section('[6b] 自动学习不覆盖人工 clean、头像层自定罪不回头学');
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+
+	// ① 人工 clean 是安全阀：自动学习必须一个字节都不改它
+	await W.learnAdAvatarOnBan(env, 'AV_MANUAL', '600001');
+	let row = env.DB.query('SELECT verdict, hits, source FROM ad_avatars WHERE file_unique_id = ?', 'AV_MANUAL');
+	assert('首次学习写入 ad/1', row[0]?.verdict === 'ad' && Number(row[0]?.hits) === 1, JSON.stringify(row));
+	await W.clearAdAvatarOnIgnore(env, 'AV_MANUAL');
+	await W.learnAdAvatarOnBan(env, 'AV_MANUAL', '600002');
+	row = env.DB.query('SELECT verdict, hits, source FROM ad_avatars WHERE file_unique_id = ?', 'AV_MANUAL');
+	assert('★ 人工 clean 不被自动学习覆盖（383555435 反复被学回 ad 的根因）',
+		row[0]?.verdict === 'clean' && Number(row[0]?.hits) === 0 && row[0]?.source === 'manual',
+		JSON.stringify(row));
+
+	// ② 头像层自己定的罪不回头再学同一张头像（那张图本来就必须是 ad 才会命中）
+	await W.upsertAdAvatar(env, 'AV_SELF', { verdict: 'ad', source: 'vision' });
+	env.DB.query('UPDATE ad_avatars SET hits = 2 WHERE file_unique_id = ?', 'AV_SELF');
+	const viaAvatar = await W.learnAdFeaturesOnVerdict(env, {
+		verdict: 'ban',
+		reasons: ['【定罪层】头像', '头像命中广告图库（复用定罪 2 次）'],
+		payload: { avatarId: 'AV_SELF' },
+		snapshot: {}
+	}, { userId: '600003' });
+	row = env.DB.query('SELECT hits FROM ad_avatars WHERE file_unique_id = ?', 'AV_SELF');
+	assert('★ 头像层自定罪时不再学头像（断掉 hits 自增循环）',
+		Number(row[0]?.hits) === 2 && viaAvatar.avatars === 0,
+		JSON.stringify({ row, avatars: viaAvatar.avatars }));
+
+	// 对照组：别的层定罪时头像照学 —— 只断自增强，不是把学习停了
+	const viaFingerprint = await W.learnAdFeaturesOnVerdict(env, {
+		verdict: 'ban',
+		reasons: ['【定罪层】指纹', '指纹库命中'],
+		payload: { avatarId: 'AV_SELF' },
+		snapshot: {}
+	}, { userId: '600004' });
+	row = env.DB.query('SELECT hits FROM ad_avatars WHERE file_unique_id = ?', 'AV_SELF');
+	assert('非头像层定罪时头像照常学习（+1）',
+		Number(row[0]?.hits) === 3 && viaFingerprint.avatars === 1,
+		JSON.stringify({ row, avatars: viaFingerprint.avatars }));
+}
+
 // ================= [7] L2 视觉识别 =================
 section('[7] runAdAvatarVision · 队列 / 熔断 / 解析');
 {
@@ -556,6 +605,23 @@ section('[7] 头像佐证只认正分（负分不再单证封）');
 
 	assert('净分 ≥2 同样算佐证',
 		W.applyAvatarVerdict({ verdict: 'pass', score: 5, reasons: [] }, avatar).verdict === 'ban');
+
+	// 【2026-10-20 再修】上一轮只修到「reasons 里必须有 +N」，但仍不看这条加分是否
+	// 已被豁免词抵成负数。线上 383555435（@TbagM）连续四次误封的形态就是：
+	// bio 里的 +2 被「双向 / bot」的 -3 抵成净 -1，头像层却仍把「reasons 里有 +2」
+	// 当佐证。下面两条在改动【之前】都是红的（旧逻辑会 ban）。
+	const exempted = {
+		verdict: 'pass', score: -1,
+		reasons: ['+2 资料卡含非白名单引流链接', '-3 正文命中豁免词：双向']
+	};
+	assert('★ 原始 +2 被豁免词抵成净负 → 只进观察（383555435 原样场景）',
+		W.applyAvatarVerdict({ ...exempted }, avatar).verdict === 'observe',
+		JSON.stringify(W.applyAvatarVerdict({ ...exempted }, avatar)));
+	assert('净分只有 1 → 仍不够佐证（阈值是净分 ≥2，不是「只要有正分」）',
+		W.applyAvatarVerdict({
+			verdict: 'pass', score: 1,
+			reasons: ['+2 资料卡含非白名单引流链接', '-1 名称无 emoji 且无 Bio']
+		}, avatar).verdict === 'observe');
 	// 【2026-10-14 二次修正】hits≥2 仍可单证封，但有一道否证：【正文非空且干净】时不封。
 	// 负分判据（豁免词扣分）本身不影响这道否证 —— 否证看的是「这个人有没有在正常说话」，
 	// 不看他得了多少分。正文为空时（引用体形态 / 纯图片 / 纯按钮）头像是唯一判据源，

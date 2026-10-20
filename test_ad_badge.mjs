@@ -423,8 +423,13 @@ section('[7] 五个叠判接入点 + 定罪即学习');
 	// 写法从 `if (immediateBadge) await learnAdBadgeOnBan(...)` 改成了
 	// `if (immediateBadge && await learnAdBadgeOnBan(...)) badges += 1`，
 	// 是为了给关演练时的汇总记账 —— 嵌套语义与先后顺序一字未变。
-	const nestOk = /if \(immediateAvatar\) \{[\s\S]{0,400}?if \(immediateBadge && await learnAdBadgeOnBan/.test(src);
-	assert('immediateBadge 嵌在 avatar 分支内（杜绝重复学习虚高 hits）', nestOk, '');
+	// 【2026-10-20】判据从「400 字符以内」改成「截取整段分支再找」：
+	// 头像层自定罪跳过学习的注释插进了这个分支，字符数已经超了 400，
+	// 但嵌套语义没有任何变化。原来那种限长正则一加注释就误报，
+	// 现在直接把 if (immediateAvatar) { … } else if (队列) 这一整段切出来判断。
+	const avatarBranch = (src.match(/if \(immediateAvatar\) \{[\s\S]*?\} else if \(await queueAdAvatarLearning/) || [''])[0];
+	const nestOk = avatarBranch.includes('if (immediateBadge && await learnAdBadgeOnBan');
+	assert('immediateBadge 嵌在 avatar 分支内（杜绝重复学习虚高 hits）', nestOk, avatarBranch.slice(0, 200));
 
 	// 队列条件仍是原来的「avatar 拿不到才排队」，没被我改坏
 	assert('排队条件保持 !immediateAvatar 语义',

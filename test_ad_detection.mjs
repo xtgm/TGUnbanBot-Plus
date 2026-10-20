@@ -1265,6 +1265,24 @@ section('[8] 命令层端到端（权限、快照闭环、指纹与样本维护�
 	assert('/ignore 不存在的序号给出提示', (await cmd(env, '/ignore 88')).includes('不存在或已复核过'), lastSent());
 	assert('/ignore 已复核过的序号不重复执行', (await cmd(env, '/ignore ' + seq70002)).includes('不存在或已复核过'), lastSent());
 
+	// 【2026-10-20】/ignore 记反例：正文在 snapshot.snapshot.text，不是 snapshot.text。
+	// 旧代码取错层级 → 传入空串 → addAdFalsePositive 因长度不足直接返回 0，
+	// 线上 ad_false_positives 一直是空表就是证据。这条断言在修之前必红。
+	{
+		const nowIg = Math.floor(Date.now() / 1000);
+		env.DB.query(
+			'INSERT INTO ad_pending_snapshots (owner_id, seq, user_id, chat_id, score, reasons, snapshot, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+			String(OWNER_ID), 90001, '70009', GROUP_ID, 7, '测试',
+			JSON.stringify({ name: '误封样本', username: '', bio: '', text: '这是一条被误判的正常技术讨论内容' }),
+			nowIg, nowIg + 3600
+		);
+		await cmd(env, '/ignore 90001');
+		const fpRows = env.DB.query('SELECT value FROM ad_false_positives');
+		assert('★ /ignore 把正文写进反例池（字段层级修正）',
+			fpRows.some((r) => String(r.value).includes('正常技术讨论')),
+			JSON.stringify(fpRows));
+	}
+
 	// 批量回滚（项 10A）：空格分隔、区间、非法参数
 	assert('/ignore 无参给出批量与区间用法', (await cmd(env, '/ignore')).includes('区间'), lastSent());
 	assert('/ignore 非法参数给出用法', (await cmd(env, '/ignore abc')).includes('用法'), lastSent());

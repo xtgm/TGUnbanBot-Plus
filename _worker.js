@@ -10530,11 +10530,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 						: 'ℹ️ 本次未修改任何 D1 记录。',
 					'',
 					'<b>Telegram 群解封结果</b>:',
-					await renderUnbanResultsDetail(unbanResults, null, { userId: targetId, retryCommand: '/unban' })
+					await renderUnbanResultsDetail(unbanResults, null, { userId: targetId, retryCommand: '/unban' }),
+					'',
+					'💡 <b>要彻底纠正请用 /ignore</b> —— /unban 只解封并移出黑名单，不撤销头像 / 指纹 / 会员标等判定痕迹；痕迹还在的话下一条消息可能又被封。'
 				);
 				await replyToModerationAdmin(message, ctx, {
 					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封\n${renderUnbanResults(unbanResults)}`,
-					groupText: `🔓 已解封\n🎯 ${targetMention}\n${renderUnbanResults(unbanResults)}`,
+					groupText: `🔓 已解封\n🎯 ${targetMention}\n${renderUnbanResults(unbanResults)}\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）`,
 					detailText: lines.join('\n'),
 					isInGroup
 				});
@@ -10579,10 +10581,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				}
 				detailText += `\n\n${unbanHeaderLines.join('\n')}\n\n${perUserBlocks.join('\n\n')}`;
 			}
+			detailText += '\n\n💡 <b>要彻底纠正请用 /ignore</b> —— /unban 只解封并移出黑名单，不撤销头像 / 指纹 / 会员标等判定痕迹；痕迹还在的话下一条消息可能又被封。';
 			await replyToModerationAdmin(message, ctx, {
 				flashText,
 				groupText: `🔓 批量解封完成\n✅ 解封 ${results.eligible.length}　⛔ D1拒绝 ${results.blacklisted.length}　❌ 失败 ${failedCount}`
-					+ (idsToUnban.length ? '\n' + idsToUnban.map((id) => `· ${formatBatchUserTarget(id, userProfiles)}`).join('\n') : ''),
+					+ (idsToUnban.length ? '\n' + idsToUnban.map((id) => `· ${formatBatchUserTarget(id, userProfiles)}`).join('\n') : '')
+					+ '\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）',
 				detailText,
 				isInGroup
 			});
@@ -17541,11 +17545,21 @@ async function learnAdAvatarOnBan(env, fileUniqueId, userId) {
 	if (!env?.DB || !key) return false;
 	const now = Math.floor(Date.now() / 1000);
 	try {
+		// 【2026-10-20 修：人工 clean 不许被自动学习覆盖】
+		// 原来的 ON CONFLICT 无条件把 verdict 改回 'ad' 并 hits +1 —— 主人用 /ignore
+		// 纠错过的头像，只要再有一个人顶着它被封（哪怕正是被头像层自己连坐封的），
+		// 就又被学回 ad。线上 383555435（@TbagM）的普通黑白表情包头像就是这样被
+		// 「学」到 hits=4 的：越封越像广告，越像广告越封，四次封禁全由头像层定罪。
+		// WHERE 让 source='manual' 的行一个字节都不动（verdict / hits / 时间戳都不改），
+		// 人工判定是安全阀，自动学习的正反馈只能作用在从没被人拍过板的行上。
+		// source 可为 NULL（建表未设默认值），所以用 IFNULL 兜一下，
+		// 否则 NULL <> 'manual' 得到 NULL、条件不成立，自动学习的行会永远学不动。
 		await env.DB.prepare(
 			'INSERT INTO ad_avatars (file_unique_id, verdict, hits, source, last_user_id, vision_checked_at, created_at, updated_at) '
 			+ 'VALUES (?, \'ad\', 1, \'learned\', ?, 0, ?, ?) '
 			+ 'ON CONFLICT(file_unique_id) DO UPDATE SET verdict = \'ad\', hits = ad_avatars.hits + 1, '
-			+ 'source = \'learned\', last_user_id = excluded.last_user_id, updated_at = excluded.updated_at'
+			+ 'source = \'learned\', last_user_id = excluded.last_user_id, updated_at = excluded.updated_at '
+			+ 'WHERE IFNULL(ad_avatars.source, \'\') <> \'manual\''
 		).bind(key, String(userId || ''), now, now).run();
 		return true;
 	} catch (error) {
@@ -17589,9 +17603,20 @@ function applyAvatarVerdict(evaluation, avatar) {
 	// 这种纯负分组合，只要头像命中就直接 ban。线上实测误封：8852967026，得分 0、
 	// 正文就是「签到」，头像是一张正常的哥特 MS 龙纹章 logo（被批量判定误判成广告），
 	// 就这样被封了，主人手动 /ignore 回滚。
-	// 现在：有「+N」开头的正分判据、或净分 ≥2 才算佐证；否则只进观察窗口。
-	// 这也正是主人定的口径 ——「单独特征本来就不允许封禁」。
-	const hasPositiveEvidence = (evaluation.reasons || []).some((r) => /^\+\d/.test(String(r)));
+	//
+	// 【2026-10-20 再修：连「有 +N」也不够，只认【净分】】
+	// 上一轮改成「reasons 里有以 + 开头的判据就算佐证」，仍然不看这条加分是否已被
+	// 豁免词减成负数 —— 某一层又一次绕过了另一层的否证。线上实测 383555435（@TbagM）
+	// 连续四次误封，每次的判据链一模一样：
+	//   bio「🟢 请通过 @tbag2026bot 双向聊天bot与我联系！」
+	//     +2 含非白名单引流链接（命中 bot 提及）
+	//     -3 命中豁免词：双向 / bot        → 净分 -1
+	//   头像层看到 reasons 里有「+2」→ 认定有佐证 → 封。正文四次全是「一千零一夜」
+	//   「感谢天诚大佬」这类正常闲聊，一个正分都没有。
+	// 豁免词已经把这条 bio 判定成正常的联系方式说明，头像层不能再拿被它抵掉的
+	// 原始加分当证据。所以现在只认【净分 ≥2】或复用达佐证档；净负 / 净 0 / 净 1
+	// 一律只进观察。这也正是主人定的口径 ——「单独特征本来就不允许封禁」，
+	// 以及「某一层不能绕过其他层的否证」。
 	// 【2026-10-14 修：hits 不再单独定罪】原来这里是 `if (hits >= 2) verdict = 'ban'`，
 	// 无条件封、连佐证都不看 —— 与上面刚立的「单独特征不允许封禁」直接矛盾。
 	// 上一轮修「佐证只认正分」时只改了 hasCorroboration 那条分支，把这条漏了。
@@ -17599,8 +17624,7 @@ function applyAvatarVerdict(evaluation, avatar) {
 	//（或撞车）一进来就被封，正文写什么都救不回来。线上 130 个头像正处在这一档。
 	// 现在 hits 只算【一份佐证】，且要达 AD_AVATAR_HITS_CORROBORATION 才算数 ——
 	// 复用次数高确实是批量马甲的强信号，但同样要过佐证这道闸，不能单独定罪。
-	const hasCorroboration = hasPositiveEvidence
-		|| (Number(evaluation.score) || 0) >= 2
+	const hasCorroboration = (Number(evaluation.score) || 0) >= 2
 		|| hits >= AD_AVATAR_HITS_CORROBORATION;
 	// 【2026-10-14 二次修正】hits>=2 恢复可单独定罪，但加一道否证 ——
 	// 【正文非空且干净】时不单独定罪：那说明这个人确实在说话、内容一个正分都没拿到，
@@ -22022,7 +22046,17 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 			if (await learnAdBadgeOnBan(env, emojiId, userId)) badges += 1;
 		}
 		if (immediateAvatar) {
-			if (await learnAdAvatarOnBan(env, immediateAvatar, userId)) avatars += 1;
+			// 【2026-10-20 修：头像层自己定的罪，不回头再学这张头像】
+			// 头像层只有在库里 verdict='ad' 时才会定罪（applyAvatarVerdict 的入口就
+			// 挡掉了 clean / pending），所以「头像层定罪 → 再把同一张头像学一遍」
+			// 不带来任何新信息，只会把它的 hits 自己 +1，下次更容易够到佐证档 ——
+			// 这是纯粹的自增强循环。线上 383555435 的四次封禁就是 hits 1→2→3→4
+			// 一路被自己拱上去的。定罪层标记由 applyAvatarVerdict 写入（只在本层
+			// 把 verdict 从非 ban 提成 ban 时才写），这里只认这个标记，不重算判据。
+			// 会员标不跟着跳过：它与头像同源但独立计分，头像自定罪不代表标也该停学。
+			const convictedByAvatarLayer = (evaluation?.reasons || [])
+				.some((r) => String(r) === AD_CONVICT_MARK + '头像');
+			if (!convictedByAvatarLayer && await learnAdAvatarOnBan(env, immediateAvatar, userId)) avatars += 1;
 			// 会员标跟着同一条路径学：两者都来自同一份 getChat 响应，
 			// 要么一起有（闸二 / 入群 / cron 定罪）要么一起空（闸一定罪）。
 			// 【刻意嵌在 if 里】否则「avatar 空 + badge 有」会既立即学一次、
@@ -23675,9 +23709,16 @@ async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
 			// 回滚只是【删掉特征】—— 删完之后模型下次看到同类内容还会再判一次，
 			// 因为没有任何东西告诉它「这段话主人已经确认过是正常的」。
 			// 记下这次的正文片段，下次达线时先问反例池，命中就降级不封。
+			// 【2026-10-20 修：取错字段层级，反例池一直是空的】
+			// readAdPendingSnapshot 返回的是 { seq, userId, snapshot: <解析后的快照> }，
+			// 正文在 snapshot.snapshot.text，不在这里的顶层。原写法 snapshot?.text
+			// 恒为 undefined → 传进去空串 → addAdFalsePositive 因长度不足直接返回 0，
+			// 反例一条都没落库（线上 ad_false_positives 表为空就是证据）。
+			// 兜底那一层留着给直接传扁平快照的调用方，正常路径走第一层。
 			// 【绝不影响 /ignore 本职】失败只记日志，回滚照常完成。
 			try {
-				await addAdFalsePositive(env, String(snapshot?.text || ''));
+				const ignoreText = String(snapshot?.snapshot?.text || snapshot?.text || '');
+				await addAdFalsePositive(env, ignoreText);
 			} catch (error) {
 				console.error('[广告检测] /ignore 记反例失败:', error);
 			}
