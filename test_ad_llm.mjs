@@ -1273,6 +1273,23 @@ console.log('\n===== [10] 第⑥层达线后的代码证据闸 =====');
 	const gotC = await W.applyAdLLMToEvaluation(envC, { verdict: 'pass', score: 0, reasons: [] }, cfgC,
 		{ profile: { firstName: 'x', bio: '' }, text: '普通讨论' });
 	assert('★ 置信度 0.7（低于采信线）→ 仍是观察，证据闸不介入', gotC.verdict === 'observe', JSON.stringify(gotC));
+
+	// ⑤ 【2026-10-20 名片形态】名片 + 号码 + 显示名不像人名 = 结构硬证据。
+	//    判的是形态不是词：同一句显示名放在人名名片里不算，带号码才算。
+	assert('名片形态（显示名不像人名 + 带号码）算硬证据',
+		W.collectAdLLMHardEvidence({ profile: {}, text: '注册领取1688彩金1倍可休', contactCardName: '注册领取1688彩金1倍可休', contactPhone: '+989136229902' })
+			.some((h) => h.includes('名片形态')));
+	assert('反向：显示名像人名（张三）→ 不算（反向白名单仍生效）',
+		W.collectAdLLMHardEvidence({ profile: {}, text: '张三', contactCardName: '张三', contactPhone: '+8613800138000' }).length === 0);
+	assert('反向：名片不带号码 → 不算（名片形态要求三项同现）',
+		W.collectAdLLMHardEvidence({ profile: {}, text: '注册领取1688彩金', contactCardName: '注册领取1688彩金', contactPhone: '' }).length === 0);
+	{
+		const envD = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.95, '名片显示名是博彩领取话术') }) });
+		const cfgD = W.loadAdDetectionConfig({ AD_LLM_DAILY: '50' });
+		const gotD = await W.applyAdLLMToEvaluation(envD, { verdict: 'pass', score: 0, reasons: [] }, cfgD,
+			{ profile: { firstName: '名片复验者', bio: '' }, text: '注册领取1688彩金1倍可休', contactCardName: '注册领取1688彩金1倍可休', contactPhone: '+989136229902' });
+		assert('★ 达线 + 名片形态 → 封（不再降级观察）', gotD.verdict === 'ban', JSON.stringify(gotD.reasons).slice(0, 300));
+	}
 }
 
 

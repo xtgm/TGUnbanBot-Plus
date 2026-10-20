@@ -18315,6 +18315,13 @@ async function judgeAdByLLM(env, config, input, options) {
 // 【只认能被代码验证的】不放任何「模型说像」的东西进来：
 //   ① 真私有群邀请链接 —— 形态写死在 AD_PRIVATE_INVITE_RE，一次都骗不过
 //   ② 引流出口 ∧ 招揽动作 —— 两类同现，与结构查杀同口径
+//   ③ 名片形态 —— 名片 ∧ 手机号 ∧ 显示名不像人名（2026-10-20 补）
+//
+// ③ 为什么是形态而不是词：线上漏放的名片显示名「注册领取1688彩金1倍可休」在四张词表
+// 与金额正则里逐词零命中，②永远不成立，模型判到 0.95 也只能降级观察。补词只治
+// 已知的那个词；名片广告的结构约束是「必须把话术塞进显示名」，而正常人分享联系人
+// 的显示名基本都是人名（looksLikePersonName 为真，被摘出去）—— 三项同现才是判据。
+// 三个字段都由调用处从 message.contact 取出，这里再验一遍形态，不信任模型输出。
 function collectAdLLMHardEvidence(input) {
 	const profile = input?.profile || {};
 	const text = [profile.firstName, profile.lastName, profile.bio, input?.text]
@@ -18330,6 +18337,15 @@ function collectAdLLMHardEvidence(input) {
 			|| AD_MONEY_GAIN_RE.test(text)
 			|| AD_MONEY_SOLICIT_RE.test(text))) {
 		hits.push('引流出口与招揽同现');
+	}
+	// ③ 名片形态：联系人名片 ∧ 带手机号 ∧ 显示名不像人名。
+	// contactCardName 由调用处从 message.contact 拼出（闸一、闸二两处），空串 = 不是名片。
+	// 这里再做一次 looksLikePersonName 复验 —— 调用处已经过滤过，但硬证据闸的原则是
+	// 「能代码验的才认」，不能只信上游传进来的标记。
+	const cardName = String(input?.contactCardName || '').trim();
+	const cardPhone = String(input?.contactPhone || '').trim();
+	if (cardName && cardPhone && !looksLikePersonName(cardName)) {
+		hits.push('名片形态（显示名不像人名且带号码）');
 	}
 	return hits;
 }
@@ -22996,7 +23012,12 @@ async function detectAdOnMessage(message, env) {
 	// 闸一本就有同步的 bge-m3 嵌入调用，这一层不改变它的性质，只是更慢一点。
 	// cheapProfile 没有 bio（闸一是零 getChat 路径），所以这一层判的是昵称 + 正文。
 	let decision = suspectSignal
-		? await applyAdLLMToEvaluation(env, cheap, config, { profile: cheapProfile, text: text || contactName }, { pool: 'message' })
+		? await applyAdLLMToEvaluation(env, cheap, config, {
+			profile: cheapProfile, text: text || contactName,
+			// 名片形态进硬证据闸：这两个字段只在名片消息里非空，普通消息一个字节都不多传。
+			contactCardName: contactName,
+			contactPhone: String(message?.contact?.phone_number || '')
+		}, { pool: 'message' })
 		: cheap;
 	let bioVerified = false;
 	if (cheap.verdict === 'ban' && cheap.layer === 'ai' && cheap.score < config.scoreThreshold) {
@@ -23139,7 +23160,10 @@ async function detectAdOnMessage(message, env) {
 	// 没有近似的正文，在这里由模型直接判。载荷口径与上面 evaluateAdSuspect 一致
 	// （text || contactName），两层看到的是同一份内容。
 	evaluation = await applyAdLLMToEvaluation(env, evaluation, config, {
-		profile, text: text || contactName
+		profile, text: text || contactName,
+		// 与闸一同口径：名片形态要能作为硬证据，否则闸二判到 0.95 也只能观察。
+		contactCardName: contactName,
+		contactPhone: String(message?.contact?.phone_number || '')
 	}, { pool: 'message' });
 
 	if (evaluation.verdict === 'ban') {
