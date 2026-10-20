@@ -4267,7 +4267,9 @@ console.log('\n[19a] 群管理员私聊 /ban /spam');
 	}
 	assert('群管理员私聊 /ban /spam 写入 D1', env.DB._rows.has('601') && env.DB._rows.has('602'));
 	assert('群管理员私聊 /ban /spam 执行全群禁言', callsOf('restrictChatMember').length === 4 && callsOf('banChatMember').length === 0);
-	assert('群管理员私聊通过配置群管理员鉴权', callsOf('getChatAdministrators').length === 2);
+	// 60 秒缓存：两条私聊命令由同一用户连续发出，只应查一次管理员列表。
+	// 改动前这里是 2（每次命令都查）；缓存的收益就体现在这个数字上。
+	assert('群管理员私聊通过配置群管理员鉴权（60 秒缓存只查一次）', callsOf('getChatAdministrators').length === 1);
 	const replies = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '6666');
 	assert('群管理员私聊 /ban /spam 收到完整结果', replies.length === 2 && replies.every((c) => c.body.text.includes('已永久禁言')));
 }
@@ -6329,6 +6331,10 @@ console.log('\n[98] 四条管理命令权限与回执矩阵');
 	];
 	for (const command of ['unban', 'ban', 'spam', 'check']) {
 		for (const scenario of scenarios) {
+			// 每个场景模拟「独立请求 / 身份刚变化」：清掉上一个场景留下的管理员判定缓存，
+			// 否则「私聊鉴权接口失败」这类场景会命中前面场景的 true 缓存，根本走不到失败分支。
+			// 真实世界里对应的失效点是 chat_member 事件（代码里已接线）。
+			sandbox.invalidateAdminCheckCache();
 			resetCalls();
 			const target = '9876543210';
 			const seed = command === 'unban' || command === 'check'

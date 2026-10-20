@@ -5717,6 +5717,9 @@ async function handleChatMemberUpdate(chatMember, env) {
 			const changed = newMember.user || oldMember.user;
 			const changedId = String(changed?.id || '');
 			if (changedId) {
+				// 管理员身份变更立即失效跨群鉴权缓存：撤职后不必等 60 秒 TTL，
+				// 提权后也能马上使用管理命令。与上面的广告豁免缓存同时清，口径一致。
+				invalidateAdminCheckCache(changedId);
 				try {
 					if (newMember.status === 'administrator' || newMember.status === 'creator') {
 						await upsertAdGroupAdmin(env, changedId, chat.id, newMember.status);
@@ -11750,6 +11753,44 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 	return result;
 }
 
+// === 管理员判定缓存（仅供 checkIfUserIsAdmin 使用）===
+// 【为什么这里能缓存，而 checkIfUserIsAdminInGroup 不能】：
+// 后者是 /ban、/spam 的鉴权入口，缓存会制造提权窗口（撤职后仍能封人），必须每次现查。
+// 本函数只用于「私聊命令 / 保护判定」这类跨群鉴权，一次调用要遍历全部配置群
+// （最多 14 次 getChatAdministrators），黑名单用户每条私聊消息都会触发一次，是 429 放大面。
+// 60 秒缓存把稳定态请求降到 0；chat_member 事件到达时主动失效，
+// 撤职/提权不必等 TTL 过期。事件丢失的最坏情况也只有 60 秒，方向仍可接受。
+const ADMIN_CHECK_CACHE = new Map();
+const ADMIN_CHECK_CACHE_TTL_MS = 60 * 1000;
+
+// 缓存键必须带上「当前群集合」：GROUP_IDS 每请求重建，/addgroup 合并动态群后
+// 可能比上一次多出几个群。只按 userId 缓存，会让「刚加入的动态群里的管理员」
+// 在 60 秒内一直命中旧结果（false），私聊命令被误拒。
+// 排序后拼接，避免 D1 返回顺序波动导致无谓的 miss。
+function adminCacheKeyFor(userIdStr) {
+	return `${userIdStr}|${[...GROUP_IDS].sort().join(',')}`;
+}
+
+// 过期项不会主动消失；用户量大时做一次轻量清理，避免 Map 无限增长。
+function pruneAdminCheckCache(now) {
+	if (ADMIN_CHECK_CACHE.size < 500) return;
+	for (const [key, value] of ADMIN_CHECK_CACHE) {
+		if (!value || now > value.expiresAt) ADMIN_CHECK_CACHE.delete(key);
+	}
+}
+
+// 传 userId 只清单个（含该用户所有群集合组合）；不传清全部（测试隔离用）。
+function invalidateAdminCheckCache(userId = null) {
+	if (userId == null || userId === '') {
+		ADMIN_CHECK_CACHE.clear();
+		return;
+	}
+	const prefix = `${String(userId)}|`;
+	for (const key of ADMIN_CHECK_CACHE.keys()) {
+		if (key.startsWith(prefix)) ADMIN_CHECK_CACHE.delete(key);
+	}
+}
+
 // 检查用户是否是任一配置群组的管理员
 // 用 getChatAdministrators 拉群管理员列表本地匹配，比 getChatMember 更稳:
 // - 不要求 bot 是该群管理员（仅要求 bot 在群里）
@@ -11765,7 +11806,15 @@ async function checkIfUserIsAdmin(userId) {
 		return true;
 	}
 
+	const cacheKey = adminCacheKeyFor(userIdStr);
+	const cached = ADMIN_CHECK_CACHE.get(cacheKey);
+	if (cached && Date.now() <= cached.expiresAt) {
+		return cached.isAdmin;
+	}
+
 	const summary = [];
+	let failedCount = 0;
+	let checkedCount = 0;
 
 	for (const groupId of GROUP_IDS) {
 		try {
@@ -11778,22 +11827,38 @@ async function checkIfUserIsAdmin(userId) {
 			const result = await response.json();
 
 			if (!response.ok || !result.ok || !Array.isArray(result.result)) {
+				failedCount += 1;
 				summary.push(`群${groupId}:查询失败(${result.description || `HTTP ${response.status}`})`);
 				continue;
 			}
+			checkedCount += 1;
 
 			const adminCount = result.result.length;
 			const hit = result.result.find((m) => m.user && String(m.user.id) === userIdStr);
 			if (hit) {
 				console.log(`[管理员鉴权] 用户 ${userId} 在群 ${groupId} 是 ${hit.status} ✅`);
 				console.log(`[管理员鉴权] 总结: ${[...summary, `群${groupId}:命中(${hit.status})`].join('; ')}`);
+				const now = Date.now();
+				ADMIN_CHECK_CACHE.set(cacheKey, { isAdmin: true, expiresAt: now + ADMIN_CHECK_CACHE_TTL_MS });
+				pruneAdminCheckCache(now);
 				return true;
 			}
 			summary.push(`群${groupId}:不在 ${adminCount} 个 admin 中`);
 		} catch (error) {
+			failedCount += 1;
 			summary.push(`群${groupId}:异常(${error.message})`);
 			console.error(`[管理员鉴权] 群 ${groupId} 异常:`, error);
 		}
+	}
+
+	// 【只缓存「全部群都查成功且未命中」的 false】：
+	// 任何一个群查失败都不能断定「他不是管理员」——那个群可能正是他任管理员的群。
+	// 此时缓存 false 会让合法管理员在 60 秒内被拒；不缓存则下次重试，代价只是多一次查询。
+	// 鉴权路径方向必须是 fail-closed：宁可多查，不可误判。
+	if (failedCount === 0 && checkedCount > 0) {
+		const now = Date.now();
+		ADMIN_CHECK_CACHE.set(cacheKey, { isAdmin: false, expiresAt: now + ADMIN_CHECK_CACHE_TTL_MS });
+		pruneAdminCheckCache(now);
 	}
 
 	console.log(`[管理员鉴权] 用户 ${userId} 未命中。总结: ${summary.join('; ')}`);
