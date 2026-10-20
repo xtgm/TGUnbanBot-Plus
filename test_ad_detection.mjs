@@ -523,6 +523,9 @@ section('[3] D1 建表、种子与降级');
 	const whitelist = await W.loadAdDomainWhitelist(env);
 	assert('白名单命中裸域', W.isAdDomainWhitelisted('github.com', whitelist) === true);
 	assert('白名单命中子域', W.isAdDomainWhitelisted('gist.github.com', whitelist) === true);
+	// 2026-10-20：优选域名 seeck.cn 入表，深层子域也必须被父域覆盖，
+	// 否则 cucc.cloudflare.seeck.cn 仍会按「非白名单引流链接」+2。
+	assert('白名单命中 seeck.cn 的深层子域', W.isAdDomainWhitelisted('cucc.cloudflare.seeck.cn', whitelist) === true);
 	assert('白名单不误命中广告域', W.isAdDomainWhitelisted('evil-shop.top', whitelist) === false);
 }
 
