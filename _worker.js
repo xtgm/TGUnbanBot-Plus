@@ -12939,7 +12939,7 @@ const AD_DOMAIN_WHITELIST_SEED = [
 	'github.com', 'gitlab.com', 'gitee.com', 'npmjs.com', 'pypi.org', 'stackoverflow.com',
 	'anthropic.com', 'claude.ai', 'openai.com', 'chatgpt.com', 'gemini.google.com',
 	'huggingface.co', 'deepseek.com', 'moonshot.cn', 'bigmodel.cn', 'aliyun.com',
-	'cloudflare.com', 'workers.dev', 'google.com', 'microsoft.com', 'apple.com',
+	'cloudflare.com', 'workers.dev', 'seeck.cn', 'google.com', 'microsoft.com', 'apple.com',
 	'amazon.com', 'mozilla.org', 'baidu.com', 'qq.com', 'taobao.com', 'jd.com',
 	'163.com', 'sina.com.cn', 'zhihu.com', 'juejin.cn', 'csdn.net', 'cnblogs.com',
 	'youtube.com', 'youtu.be', 'bilibili.com', 'b23.tv', 'douyin.com', 'vimeo.com',
@@ -13972,11 +13972,17 @@ function renderAdWhitelistRow(row, options = {}) {
 // 顿号与逗号是中文列举的正规标点：「苹果、香蕉、橘子、西瓜」「上海、北京、广州、深圳」
 // 天然就是「2 字 + 分隔符」重复三次以上，离线实测这类正常句子会被整片误伤。
 // 所以两级拆开：
-//   STRICT —— 点号、间隔号、下划线、星号、破折号、波浪号、空白。中文写作【不用】它们
+//   STRICT —— 点号、间隔号、下划线、星号、破折号、波浪号。中文写作【不用】它们
 //             逐字断句，出现即是混淆信号，允许 1~2 字分组。
 //   LOOSE  —— 顿号、逗号。正规列举标点，只在【严格逐字】（每组恰好 1 字）时才算混淆，
 //             「联、系、我、们」这种一个字一个顿号确实反常，但「苹果、香蕉」完全正常。
-const AD_CHAR_SPLIT_SEP_STRICT = '.·・･｡‧∙⋅•_\\-—–~～*\\s';
+//   【空白刻意不进任何一档】（2026-10-20）：中文输入法下用空格分隔列举极其普遍
+//   （「云南 北京 天津 广东 新疆」「苹果 香蕉 橘子 西瓜」），而本签名允许从任意字
+//   起算「1~2 字 + 分隔符」，两个字的词会被切成「词尾 + 空格」，整段变成连续
+//   「单字 + 空白」链 —— 线上实测一条十几个省份的空格列举被误判 +4，叠上观察窗口
+//   历史分把一个正常用户封了。用空白逐字切字的广告会漏检，这个取舍比大面积误封划算；
+//   真广告的同一句话通常还带点号切字或招揽语境，仍会被其它判据抓到。
+const AD_CHAR_SPLIT_SEP_STRICT = '.·・･｡‧∙⋅•_\\-—–~～*';
 const AD_CHAR_SPLIT_SEP_LOOSE = '。､、,，';
 // 两条签名，任一命中即算混淆。都要求【≥3 组连续】—— 偶发一两处不算。
 // 用 CJK 限定字符类，避免英文缩写（「U.S.A」「a.m.」）与版本号（「1.2.3.4」）被当成混淆。

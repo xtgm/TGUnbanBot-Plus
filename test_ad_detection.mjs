@@ -1565,12 +1565,13 @@ section('[10] 状态、白名单与观察窗口复判（adstats / whitelist / re
 	const warmEmpty = await cmdAll(envEmptySample, '/warmup');
 	assert('/warmup 样本库为空时引导 addsample', warmEmpty.includes('/addsample'), warmEmpty);
 
-	// /whitelist：建表时就把 50 条内置种子写进 D1，所以默认列出的是「D1 自定义 50 条」；
+	// /whitelist：建表时就把 51 条内置种子写进 D1，所以默认列出的是「D1 自定义 51 条」；
+	// 列表查询固定 LIMIT 50，所以标题只显示 50 条，总量看「生效」那一行。
 	// 只有把表清空后才回落到内存里的种子集合。
 	const wlList = await cmdAll(env, '/whitelist');
 	assert('/whitelist 缺省子命令等于 list', wlList.includes('域名白名单'), wlList);
-	assert('/whitelist 建表即写入 50 条种子', wlList.includes('D1 自定义（50 条）'), wlList);
-	assert('/whitelist 生效集合与 D1 表一致', wlList.includes('生效 <b>50</b> 条'), wlList);
+	assert('/whitelist 建表即写入 51 条种子（列表 LIMIT 50 截断）', wlList.includes('D1 自定义（50 条）'), wlList);
+	assert('/whitelist 生效集合与 D1 表一致', wlList.includes('生效 <b>51</b> 条'), wlList);
 	assert('/whitelist 展示种子域名', wlList.includes('github.com'), wlList);
 	assert('/whitelist add 无参给出用法', (await cmd(env, '/whitelist add')).includes('用法'), lastSent());
 	assert('/whitelist del 无参给出用法', (await cmd(env, '/whitelist del')).includes('用法'), lastSent());
@@ -1578,14 +1579,14 @@ section('[10] 状态、白名单与观察窗口复判（adstats / whitelist / re
 	assert('/whitelist add 成功', (await cmd(env, '/whitelist add My-Shop.Example')).includes('已加入白名单'), lastSent());
 	assert('/whitelist add 落库并归一化为小写', env.DB.query("SELECT COUNT(*) AS c FROM ad_domain_whitelist WHERE domain = 'my-shop.example'")[0].c === 1, JSON.stringify(env.DB.query("SELECT domain FROM ad_domain_whitelist WHERE domain LIKE '%shop%'")));
 	assert('/whitelist add 重复提示已在白名单', (await cmd(env, '/whitelist add my-shop.example')).includes('已在白名单中'), lastSent());
-	assert('/whitelist add 重复不产生第二行', env.DB.query('SELECT COUNT(*) AS c FROM ad_domain_whitelist')[0].c === 51);
+	assert('/whitelist add 重复不产生第二行', env.DB.query('SELECT COUNT(*) AS c FROM ad_domain_whitelist')[0].c === 52);
 	const wlAfterAdd = await cmdAll(env, '/whitelist list');
-	// 列表查询固定 LIMIT 50，51 条时只能列出 50 条；总量看「生效」那一行，不看列表标题里的数字。
-	assert('/whitelist list 生效数反映真实总量', wlAfterAdd.includes('生效 <b>51</b> 条'), wlAfterAdd);
+	// 列表查询固定 LIMIT 50，52 条时只能列出 50 条；总量看「生效」那一行，不看列表标题里的数字。
+	assert('/whitelist list 生效数反映真实总量', wlAfterAdd.includes('生效 <b>52</b> 条'), wlAfterAdd);
 	assert('/whitelist list 列表截断在 50 条', wlAfterAdd.includes('D1 自定义（50 条）'), wlAfterAdd);
 	assert('/whitelist add 非法域名被拒', (await cmd(env, '/whitelist add 不是域名')).includes('域名不合法'), lastSent());
 	assert('/whitelist del 移除成功', (await cmd(env, '/whitelist del my-shop.example')).includes('已从白名单移除'), lastSent());
-	assert('/whitelist del 后只剩种子', env.DB.query('SELECT COUNT(*) AS c FROM ad_domain_whitelist')[0].c === 50);
+	assert('/whitelist del 后只剩种子', env.DB.query('SELECT COUNT(*) AS c FROM ad_domain_whitelist')[0].c === 51);
 	assert('/whitelist del 不存在的域名有提示', (await cmd(env, '/whitelist del never-added.example')).includes('白名单中没有该域名'), lastSent());
 	// 把表清空，验证「删到空不会导致所有链接都判广告」的回落分支。
 	env.DB.__sqlite.exec('DELETE FROM ad_domain_whitelist');
@@ -1834,6 +1835,10 @@ section('[12] 修复项专项：manual 提权 / 自身 username / 回复学习�
 	}
 	// 顿号逐字切仍要抓到（每组恰好一个汉字，正常人不这样写）。
 	assert('混淆检测：顿号逐字切命中', W.hasAdCharSplitObfuscation('联、系、我、们、私聊') === true);
+	// 取舍边界：空白不再参与混淆签名。中文输入法下用空格分隔列举极其普遍，
+	// 线上实测一条省份列举被误判 +4 并叠历史分封了正常用户（详见常量注释）。
+	assert('混淆检测：空格切字不再计为混淆（已接受的漏检边界）',
+		W.hasAdCharSplitObfuscation('低 價 出 正 品 水 果 機') === false);
 	assert('混淆检测：顿号逐字切可还原',
 		W.deobfuscateAdCharSplit('联、系、我、们、私聊') === '联系我们私聊');
 	// 正常文本零误伤 —— 每一条都是放宽分组后真实踩到过的坑。
@@ -1848,7 +1853,9 @@ section('[12] 修复项专项：manual 提权 / 自身 username / 回复学习�
 		'苹果、香蕉、橘子、西瓜都买了',
 		'张三、李四、王五、赵六来了',
 		'上海、北京、广州、深圳',
-		'第一步、第二步、第三步、第四步'
+		'第一步、第二步、第三步、第四步',
+		// 空格列举：线上误封样本原文（2026-10-20），省份之间用空格是日常写法。
+		'云南 北京 天津 广东 新疆 南京 浙江 海南 湖南 湖北 甘肃 贵州 辽宁 黑龙江 以上 移动用戶 可以用 sub://cmin2.cc.cd'
 	]) {
 		assert('混淆检测：正常文本放行 [' + safe.slice(0, 12) + ']',
 			W.hasAdCharSplitObfuscation(safe) === false);
