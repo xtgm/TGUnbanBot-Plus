@@ -277,6 +277,40 @@ let BOT_ID = null;
 let GROUP_TITLE = null;
 let GROUP_USERNAME = null;
 
+// ===== Webhook 来源校验（2026-10-20）=====
+//
+// 【为什么必须堵】webhook 挂在根路径 `/`，不需要 TOKEN；而 fetch 完全信任 update 里的
+// from.id / chat.id。任何人只要知道 Worker 域名，就能 POST 一条自造的 update，把 from.id
+// 伪造成主人，执行 /ban、/notice、adfix 解封、dryrun 确认等第一主人专属操作。
+// Telegram 官方给 webhook 的验签手段只有 secret_token：setWebhook 时下发，
+// 之后每条更新都带 X-Telegram-Bot-Api-Secret-Token 头。
+//
+// 【为什么做成可选】存量部署的 webhook 是在没有 secret 的情况下注册的。新代码上线瞬间
+// 如果强制校验，Telegram 推来的每条更新都会被 401，机器人直接停摆，直到有人访问
+// `/{TOKEN}` 重新注册。为了不把「修漏洞」变成「停机事故」，这里按环境变量显式启用：
+//   · 配了 WEBHOOK_SECRET（只允许 A-Za-z0-9_-，1~256 位）→ setWebhook 带 secret_token，
+//     fetch 拒绝所有不带匹配头的 POST；
+//   · 没配 → 行为与改动前逐字节一致（离线测试也不受影响）。
+// 启用步骤：Dashboard 加 WEBHOOK_SECRET → 访问一次 `/{TOKEN}` 重新注册 → 再部署/生效。
+// 只配变量不重新注册，Telegram 不会带新头，等于没启用。
+let WEBHOOK_SECRET_WARNED = false;
+function getConfiguredWebhookSecret(env) {
+	const raw = String(env?.WEBHOOK_SECRET || '').trim();
+	if (!raw) return '';
+	if (!/^[A-Za-z0-9_-]{1,256}$/.test(raw)) {
+		if (!WEBHOOK_SECRET_WARNED) {
+			WEBHOOK_SECRET_WARNED = true;
+			console.warn('[Webhook] WEBHOOK_SECRET 含非法字符（只允许 A-Za-z0-9_-，1~256 位），已忽略；本次仍未启用来源校验');
+		}
+		return '';
+	}
+	return raw;
+}
+function webhookSecretFields(env) {
+	const secret = getConfiguredWebhookSecret(env);
+	return secret ? { secret_token: secret } : {};
+}
+
 function applyRuntimeConfig(config) {
 	TOKEN = config.TOKEN;
 	BOT_TOKEN = config.BOT_TOKEN;
@@ -331,6 +365,18 @@ export default {
 				error: error.message
 			}, 500);
 		}
+		// ===== Webhook 来源校验（放在任何 D1 读写之前）=====
+		// 校验不通过就不碰数据库：伪造请求连一次 D1 查询都不该消耗。
+		// 只拦 POST 根路径（Telegram 更新入口）；GET/POST `/{TOKEN}` 初始化走 TOKEN 鉴权，不受影响。
+		const configuredWebhookSecret = getConfiguredWebhookSecret(env);
+		if (request.method === 'POST' && path === '' && configuredWebhookSecret) {
+			const receivedSecret = String(request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '');
+			if (receivedSecret !== configuredWebhookSecret) {
+				console.warn('[Webhook] 拒绝来源不明的更新：secret token 不匹配');
+				return new Response('Unauthorized', { status: 401 });
+			}
+		}
+
 		// 必须在任何路由分发之前合并 /addgroup 动态群：isConfiguredGroup 及其 26 个调用点
 		// 都依赖 GROUP_IDS，晚于分发会导致动态群被当成"非配置群"直接忽略。
 		await mergeDynamicGroupsFromD1(env);
@@ -757,7 +803,10 @@ async function handleInitialization(request, env) {
 			// ⚠️ 只能用官方 Update 对象里的 27 个类型之一；这里曾误写成 bot_chat_join_request
 			//    （该名在整份官方文档中出现 0 次），导致 Telegram 根本不推送、申请时间永远收不到。
 			// ⚠️ 该 update 还要求 bot 在群里有 can_invite_users 权限（官方文档明写）。
-			allowed_updates: ['message', 'chat_member', 'callback_query', 'chat_join_request']
+			allowed_updates: ['message', 'chat_member', 'callback_query', 'chat_join_request'],
+			// 配了 WEBHOOK_SECRET 才下发 secret_token；未配置时展开为空对象，
+			// 请求体与改动前完全一致（存量部署重新访问初始化地址不会被意外改成强制校验）。
+			...webhookSecretFields(env)
 		};
 
 		const response = await fetch(setWebhookUrl, {
