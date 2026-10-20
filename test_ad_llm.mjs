@@ -664,6 +664,44 @@ section('[8] 可疑信号把 bio 冷却期压到 10 分钟');
 				&& W.isAdSuspectSignal('photo @abcdef', []) === false);
 		assert('触发闸门：+0 不算正分（0 分不构成「有特征」）',
 			W.isAdSuspectSignal('随便聊聊', ['+0 来源频道名为随机字母串']) === false);
+		// 【2026-10-20 名片形态】判的是形态不是词：同一句话不在名片里仍是 false，
+		// 进了名片（extras.contactCard）就成立 —— 证明它不是「又补了一个词」。
+		assert('触发闸门：名片形态单独成立 → true（显示名是词表外话术）',
+			W.isAdSuspectSignal('注册领取1688彩金1倍可休', [], { contactCard: true }) === true);
+		assert('触发闸门：同一段文本不是名片 → false（四张词表零命中）',
+			W.isAdSuspectSignal('注册领取1688彩金1倍可休', []) === false);
+	}
+	// ②g 【2026-10-20 名片漏放】名片显示名是词表外话术
+	//     → 名片形态本身触发第⑥层，不依赖任何词表命中。
+	//     线上样本：显示名「注册领取1688彩金1倍可休」+ 电话 +98 913 622 9902，
+	//     四张词表零命中、金额正则也认不出「1688」「1倍」→ 旧逻辑 0 分放行。
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '名片发送者', username: '', bio: ''
+		} } }) });
+		await primeBioChecked(env, 771140, 60);   // 冷却期内：旧逻辑进不去，只有名片形态救得了
+		await send(groupMessage({ id: 771140, first_name: '名片发送者' }, '', {
+			contact: { user_id: 555001, first_name: '注册领取1688彩金1倍可休', phone_number: '+989136229902' }
+		}), env);
+		assert('★ 名片显示名是词表外话术 → 第⑥层被调到（曾 0 分放行）',
+			ai.llmCalls >= 1, 'llmCalls=' + ai.llmCalls);
+	}
+	// ②h 反向：显示名像人名（≤5 汉字）的正常名片 → 一个 AI 调用都没有。
+	//     名片形态触发的前提是「显示名不像人名」，这道反向白名单不能被绕过。
+	{
+		const env = await makeReadyEnv({ AI: makeAI({ llmAnswer: NO_ADB }) });
+		const ai = env.AI;
+		setApi({ getChat: (body) => ({ payload: { ok: true, result: {
+			id: body?.chat_id, first_name: '名片发送者2', username: '', bio: ''
+		} } }) });
+		await primeBioChecked(env, 771141, 60);
+		await send(groupMessage({ id: 771141, first_name: '名片发送者2' }, '', {
+			contact: { user_id: 555002, first_name: '张三', phone_number: '+8613800138000' }
+		}), env);
+		assert('★ 正常人名名片不触发第⑥层（稳态零开销）',
+			ai.llmCalls === 0, 'llmCalls=' + ai.llmCalls);
 	}
 	// ③ 冷却期外 + 0 正分 → 照旧进闸二（原有行为不变）
 	{

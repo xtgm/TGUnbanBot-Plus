@@ -21083,8 +21083,25 @@ function scoreAdMoneySolicit(text) {
 // 不要求形态 E 达分（它要 +5 才进观察线），这里只要「值得让模型看一眼」。
 // 为什么不是「见到金额就送」：技术群里报数字太常见（「延迟200ms」「预算 5000 元」），
 // 它们没有动作词也没有 @handle，一条都不会被拉起来 —— 稳态零额外开销的口径不变。
-function isAdSuspectSignal(text, reasons) {
+// ===== 2026-10-20：第四条路径（名片形态本身）=====
+// 线上样本：名片显示名「注册领取1688彩金1倍可休」+ 电话 +98 913 622 9902，
+// 四张词表逐词零命中（「注册」「领取」不在交易动词表，「彩金」不在业务关键词表），
+// 形态 E 的金额正则也认不出「1688」「1倍」—— 三条路径全不成立，第⑥层没被调到，
+// 0 分放行、nmBot 已经删了而我们把广告留在了群里。
+//
+// 【为什么这次不再补词】补词只治「我已经知道的那个词」，换个词照样漏 —— 这条样本
+// 自己就绕开了词表里已有的「博彩 / 彩票 / 六合彩 / 注册即送」。名片广告的判据应当是
+// 【形态】：名片消息 + 显示名不像人名（looksLikePersonName 为 false）+ 正文恒空。
+// 正常人分享联系人，显示名基本都是人名；广告必须把话术塞进显示名，塞了就一定不像人名。
+// 这个形态与显示名里写「彩金」还是明天换个新词无关。
+//
+// 【边界】contactCard 由调用处传 Boolean(contactName)，而 contactName 只在
+// 「message.contact 存在且显示名不像人名」时才非空（见 :22762）—— 人名名片在进这里
+// 之前就被摘掉了，一个调用都不会发生。触发之后仍然只做两件事：bio 冷却压到 10 分钟、
+// 送一次 LLM；封不封由原有评分阈值与 LLM 的 0.85 采信线说了算，这一行不改任何裁决。
+function isAdSuspectSignal(text, reasons, extras = {}) {
 	const source = String(text || '');
+	if (extras.contactCard === true) return true;
 	const solicitHits = countAdKeywordHits(source, AD_TRADE_VERBS).length
 		+ countAdKeywordHits(source, AD_BUSINESS_KEYWORDS).length;
 	if (solicitHits > 0) return true;
@@ -22941,7 +22958,8 @@ async function detectAdOnMessage(message, env) {
 	// 前者「收米 / 洗米 / 八千」四张表零命中，后者「收款」只活在形态 E 的正则里、
 	// 不在上面那两张触发表中。同一轮也补了形态 E 自己的判据（AD_MONEY_AMOUNT_RE
 	// 现在认中文数额与 `7ooo` 这类字母冒充）。三条路径的合并与边界见 isAdSuspectSignal。
-	const suspectSignal = isAdSuspectSignal(text || contactName, cheap.reasons);
+	const suspectSignal = isAdSuspectSignal(text || contactName, cheap.reasons,
+		{ contactCard: Boolean(contactName) });
 	const bioCheckedAt = Number(member?.bio_checked_at) || 0;
 	const needBio = suspectSignal
 		? (bioCheckedAt <= 0 || nowSeconds - bioCheckedAt >= AD_SUSPECT_BIO_COOLDOWN_SECONDS)
