@@ -243,14 +243,18 @@ section('[4] /adstats 展示失败台账');
 	const env = makeEnv();
 	await W.adDetectionReady(env);
 	calls.length = 0;
-	await W.logAdVisionFailure(env, '头像', 'sniff', 'AV_S', new Error('头像不是位图（可能是 .tgs / .webm 容器），跳过推理'));
+	// 跳过类：文件失效（预期内，不计熔断）→ 展示在「跳过」栏，不叫失败。
+	await W.logAdVisionFailure(env, '头像', 'getFile', 'AV_SKIP', new Error('wrong file_id or the file is temporary'), true);
+	// 真故障：链路失败 → 展示在「故障」栏，保留系统性问题提示。
+	await W.logAdVisionFailure(env, '图片', 'ai.run', 'IMG_FAIL', new Error('clef 未返回判定'));
 	calls.length = 0;
 	await post({ update_id: 5, message: { message_id: 5, date: 1, text: '/adstats', chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID, is_bot: 0, first_name: 'O' } } }, env);
 	const text = sendTextOf('sendMessage').join('\n');
-	assert('/adstats 报出台账条目数', /视觉识别失败台账/.test(text), text.slice(0, 200));
-	assert('展示失败所在 kind 与 stage', /头像 @ sniff/.test(text), text.slice(0, 400));
-	assert('展示失败次数', /失败 1 次/.test(text), text.slice(0, 400));
-	assert('点明同类反复失败是系统性问题', /系统性问题/.test(text), text.slice(0, 400));
+	assert('跳过与故障分成两栏', /视觉识别跳过/.test(text) && /视觉识别故障/.test(text), text.slice(0, 400));
+	assert('跳过栏展示目标 id 与跳过字样', text.includes('AV_SKIP') && /跳过 1 次/.test(text), text.slice(0, 600));
+	assert('故障栏展示目标 id 与失败字样', text.includes('IMG_FAIL') && /失败 1 次/.test(text), text.slice(0, 600));
+	assert('跳过项不串进故障栏', text.indexOf('AV_SKIP') < text.indexOf('视觉识别故障'), text.slice(0, 600));
+	assert('真故障仍提示系统性问题', /系统性问题/.test(text), text.slice(0, 600));
 
 	// 没有失败记录时不该出现这一屏（健康状态不添废话）
 	const envClean = makeEnv();
@@ -258,7 +262,7 @@ section('[4] /adstats 展示失败台账');
 	calls.length = 0;
 	await post({ update_id: 6, message: { message_id: 6, date: 1, text: '/adstats', chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID, is_bot: 0, first_name: 'O' } } }, envClean);
 	const cleanText = sendTextOf('sendMessage').join('\n');
-	assert('无失败时不显示台账屏', !/视觉识别失败台账/.test(cleanText), cleanText.slice(0, 200));
+	assert('无记录时两栏都不显示', !/视觉识别跳过/.test(cleanText) && !/视觉识别故障/.test(cleanText), cleanText.slice(0, 200));
 }
 
 // ================= [5] /adstats 各通道定罪 /误封对账 =================

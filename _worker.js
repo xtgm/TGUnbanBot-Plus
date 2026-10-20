@@ -20075,12 +20075,20 @@ async function refreshAvatarFileId(env, userId) {
 // await 不可省：Worker 请求结束即弃，不 await 的写入大概率丢失。
 // 【为什么按 target_id 去重累加】同一张图反复失败不该撑爆表，而 fail_count 本身
 // 就是信号 —— 1 次是偶发，几十次是系统性（模型挂了 / 格式不支持）。
-async function logAdVisionFailure(env, kind, stage, id, error) {
-	const name = String(error?.name || '(无)');
+// skipped=true：文件失效（头像被换 / file_id 过期）或非位图（.tgs / .webm 贴纸）
+// 这类【预期内跳过】，不是链路故障 —— 用 console.warn（Dashboard 黄色）而不是
+// error（红色），并在台账 error_name 前加 'VisionSkipped:' 前缀。
+// /adstats 据此把「跳过」与「真故障」分两栏显示，不再把预期跳过叫成失败。
+// 前缀只用于分类，日志与展示都剥掉，原始错误名照常可见。
+const AD_VISION_SKIPPED_PREFIX = 'VisionSkipped:';
+async function logAdVisionFailure(env, kind, stage, id, error, skipped = false) {
+	const rawName = String(error?.name || '(无)');
+	const name = skipped ? AD_VISION_SKIPPED_PREFIX + rawName : rawName;
 	const message = String(error?.message || '(空)');
-	console.error('[广告检测·' + kind + '] 识别失败 stage=' + stage
+	const log = skipped ? console.warn : console.error;
+	log('[广告检测·' + kind + '] ' + (skipped ? '跳过识别（不计熔断）' : '识别失败') + ' stage=' + stage
 		+ ' id=' + String(id || '')
-		+ ' errorName=' + name
+		+ ' errorName=' + rawName
 		+ ' errorMessage=' + message
 		+ ' errorString=' + String(error).slice(0, 200)
 		+ ' stack=' + String(error?.stack || '').replace(/\s+/g, ' ').slice(0, 300));
@@ -20302,7 +20310,7 @@ async function runAdAvatarVision(env, options = {}) {
 			if (isVisionFileMissing(error)) {
 				stats.skippedMissing += 1;
 				skipBump = true;
-				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error);
+				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error, true);
 			} else if (isVisionUnsupportedFormat(error)) {
 				// 【不是位图】与「文件失效」同款处置：失败发生在 ai.run【之前】（sniff 那一步），
 				// 一个 Neurons 都没花，重判一百次结果还是一样 —— 它证明不了链路坏了，
@@ -20310,7 +20318,7 @@ async function runAdAvatarVision(env, options = {}) {
 				// 免得下一轮 cron 又把它取出来白跑一趟。
 				stats.skippedUnsupported += 1;
 				skipBump = true;
-				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error);
+				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error, true);
 			} else {
 				stats.failed += 1;
 				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error);
@@ -20486,7 +20494,7 @@ async function runAdImageVision(env, options = {}) {
 			if (isVisionFileMissing(error)) {
 				stats.skippedMissing += 1;
 				skipBump = true;
-				await logAdVisionFailure(env, '图片', stage, row.file_unique_id, error);
+				await logAdVisionFailure(env, '图片', stage, row.file_unique_id, error, true);
 			} else if (isVisionUnsupportedFormat(error)) {
 				// 【不是位图】与「文件失效」同款处置：失败发生在 ai.run【之前】（sniff 那一步），
 				// 一个 Neurons 都没花，重判一百次结果还是一样 —— 它证明不了链路坏了，
@@ -20494,7 +20502,7 @@ async function runAdImageVision(env, options = {}) {
 				// 免得下一轮 cron 又把它取出来白跑一趟。
 				stats.skippedUnsupported += 1;
 				skipBump = true;
-				await logAdVisionFailure(env, '图片', stage, row.file_unique_id, error);
+				await logAdVisionFailure(env, '图片', stage, row.file_unique_id, error, true);
 			} else {
 				stats.failed += 1;
 				await logAdVisionFailure(env, '图片', stage, row.file_unique_id, error);
@@ -24261,6 +24269,8 @@ async function handleAdStatsCommand(env, chatId) {
 	let avatarRows = [];
 	let imageRows = [];
 	let badgeRows = [];
+	let visionSkipRow = null;
+	let visionSkipTop = [];
 	let visionFailRow = null;
 	let visionFailTop = [];
 	let channelAccount = null;
@@ -24282,8 +24292,14 @@ async function handleAdStatsCommand(env, chatId) {
 			env.DB.prepare('SELECT verdict, COUNT(*) AS c FROM ad_badges GROUP BY verdict'),
 			// 视觉识别失败台账。【只能放 batch 末尾】下标是硬编码的，插进 rows[6] 之前
 			// 会让后面全部错位 —— 这类错位不报错，只会静默显示成别人的数据。
-			env.DB.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures'),
-			env.DB.prepare('SELECT target_id, kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures ORDER BY last_at DESC LIMIT 3'),
+			// 【跳过 / 真故障分开统计】error_name 带 VisionSkipped: 前缀的是文件失效、
+			// 非位图这类预期跳过，不计熔断、不影响判定；不能和链路故障混在一个「失败台账」里。
+			// 四条查询顺序固定：跳过统计、故障统计、跳过 TOP3、故障 TOP3。
+			// 【下标硬编码，只能追加在 batch 末尾】。
+			env.DB.prepare("SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures WHERE error_name LIKE 'VisionSkipped:%'"),
+			env.DB.prepare("SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures WHERE error_name NOT LIKE 'VisionSkipped:%'"),
+			env.DB.prepare("SELECT target_id, kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures WHERE error_name LIKE 'VisionSkipped:%' ORDER BY last_at DESC LIMIT 3"),
+			env.DB.prepare("SELECT target_id, kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures WHERE error_name NOT LIKE 'VisionSkipped:%' ORDER BY last_at DESC LIMIT 3"),
 			// 各通道定罪 / 误封对账。【下标硬编码，只能追加在 batch 末尾】同上一条。
 			// 误封 = 被主人 /ignore 回滚过的（expires_at=0），与定罪总数在同一条 SQL 里
 			// 聚合 —— 并进这次 batch 就不多付一次 D1 往返。
@@ -24310,9 +24326,11 @@ async function handleAdStatsCommand(env, chatId) {
 		avatarRows = rows[6]?.results || [];
 		imageRows = rows[7]?.results || [];
 		badgeRows = rows[8]?.results || [];
-		visionFailRow = rows[9]?.results?.[0] || null;
-		visionFailTop = rows[10]?.results || [];
-		channelAccount = buildAdChannelAccount(rows[11]?.results);
+		visionSkipRow = rows[9]?.results?.[0] || null;
+		visionFailRow = rows[10]?.results?.[0] || null;
+		visionSkipTop = rows[11]?.results || [];
+		visionFailTop = rows[12]?.results || [];
+		channelAccount = buildAdChannelAccount(rows[13]?.results);
 	} catch (error) {
 		console.error('[广告检测] 统计查询失败:', error);
 	}
@@ -24447,13 +24465,26 @@ async function handleAdStatsCommand(env, chatId) {
 	lines.push('<b>自定义 emoji 指纹</b>　广告素材 <b>' + badgeAd + '</b>　待识别 <b>' + badgePending + '</b>　已排除 <b>' + badgeClean + '</b>');
 	lines.push('　↳ 含昵称旁会员标与正文贴纸 emoji 两类来源，共用一张表');
 	lines.push('　↳ 同款定罪 <b>' + AD_BADGE_BAN_HITS + '</b> 次起、且本次有其他佐证才参与定罪（单证永不单独定罪，防常见标连坐）');
-	// 视觉识别失败台账。这是「静默卡死」的报警器 —— 这类失败不报错、不重试，
-	// 只是那张图永远没有结论，2026-10-14 就这样积了 94 张才发现。
-	// 只报总数不够：主人要看的是【哪一类失败】，反复失败同一个 stage 才是系统性问题
-	// （格式不支持 / 模型挂了），单次失败是偶发（文件过期），两者处置完全不同。
+	// 视觉识别台账分两栏：
+	//   「跳过」= 文件失效 / 非位图，预期内、不计熔断、不影响判定 —— 不叫失败；
+	//   「故障」= 真正的链路失败，保留原来的报警口径。
+	// 2026-10-14 的教训是「不报出来会静默积压」；但把预期跳过也报成「失败」，
+	// 主人每天看到一片红，真正的故障反而被淹没。
+	const stripSkipPrefix = (name) => String(name || '').replace(/^VisionSkipped:/, '');
+	if (visionSkipRow && Number(visionSkipRow.c) > 0) {
+		lines.push('<b>视觉识别跳过</b>　条目 <b>' + Number(visionSkipRow.c) + '</b>　累计 <b>'
+			+ Number(visionSkipRow.total || 0) + '</b> 次');
+		lines.push('　↳ 文件失效 / 非位图（.tgs / .webm 等），不计熔断，不影响判定');
+		for (const row of (visionSkipTop || [])) {
+			lines.push('　↳ ' + escapeHtml(String(row.kind || '')) + ' @ ' + escapeHtml(String(row.stage || ''))
+				+ '　跳过 ' + Number(row.fail_count || 0) + ' 次　'
+				+ escapeHtml(String(row.error_message || stripSkipPrefix(row.error_name) || '').slice(0, 60))
+				+ '　id <code>' + escapeHtml(String(row.target_id || '')) + '</code>');
+		}
+	}
 	if (visionFailRow && Number(visionFailRow.c) > 0) {
 		const failKinds = [...new Set((visionFailTop || []).map((r) => String(r.kind || '')).filter(Boolean))];
-		lines.push('<b>视觉识别失败台账</b>　条目 <b>' + Number(visionFailRow.c) + '</b>　累计失败 <b>'
+		lines.push('<b>视觉识别故障</b>　条目 <b>' + Number(visionFailRow.c) + '</b>　累计失败 <b>'
 			+ Number(visionFailRow.total || 0) + '</b> 次');
 		for (const row of (visionFailTop || [])) {
 			// 带上 target_id（= file_unique_id，表主键）：它是【唯一能定位是哪张图】的字段。

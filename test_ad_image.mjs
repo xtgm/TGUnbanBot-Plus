@@ -615,13 +615,14 @@ section('[9] /adstats 展示正文图片指纹 + 计数守卫');
 	await W.adDetectionReady(envFail);
 	const failErr = new Error('头像不是位图');
 	failErr.name = 'VisionUnsupportedFormat';
-	await W.logAdVisionFailure(envFail, '头像', 'sniff', 'FAILDET_1', failErr);
+	await W.logAdVisionFailure(envFail, '头像', 'sniff', 'FAILDET_1', failErr, true);
 	resetCalls();
 	await send(privateMessage(OWNER_ID, '/adstats'), envFail);
 	const sentFail = calls.filter((c) => c.method === 'sendMessage')
 		.map((c) => c.body?.text || '').join('\n');
-	assert('视觉失败台账显示条目数', /视觉识别失败台账<\/b>　条目 <b>1<\/b>/.test(sentFail), sentFail.slice(-700));
-	assert('★ 失败台账带上 target_id（唯一能定位是哪张图的字段）',
+	// 非位图属【预期跳过】，归「视觉识别跳过」栏，不再叫失败。
+	assert('视觉跳过台账显示条目数', /视觉识别跳过<\/b>　条目 <b>1<\/b>/.test(sentFail), sentFail.slice(-700));
+	assert('★ 跳过台账带上 target_id（唯一能定位是哪张图的字段）',
 		sentFail.includes('FAILDET_1'), sentFail.slice(-700));
 
 	// 【2026-10-19】/whitelist 的文案此前只说了一半作用（不计链接可疑分），漏掉了
