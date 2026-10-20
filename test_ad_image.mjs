@@ -611,17 +611,24 @@ section('[9] /adstats 展示正文图片指纹 + 计数守卫');
 	// 【2026-10-19 修】视觉失败台账那条 SQL 没 SELECT target_id（表主键）——
 	// 主人只能看到「头像 @ sniff 失败 3 次」，不知道是【哪张图】，重试与排查都无从下手。
 	// 这里走真实写入函数（logAdVisionFailure）造一条台账，再断言屏上能读出那个 id。
+	// 【2026-10-20 方案 A】跳过栏平时隐藏，只有 24 小时内新增 ≥ 20 条才报警；
+	// 所以这里凑满 20 条再查屏，否则那一栏根本不出现，id 也没地方读。
 	const envFail = makeEnv();
 	await W.adDetectionReady(envFail);
 	const failErr = new Error('头像不是位图');
 	failErr.name = 'VisionUnsupportedFormat';
+	for (let i = 1; i < 20; i += 1) {
+		await W.logAdVisionFailure(envFail, '头像', 'sniff', 'BULKFILL_' + i, failErr, true);
+	}
 	await W.logAdVisionFailure(envFail, '头像', 'sniff', 'FAILDET_1', failErr, true);
+	// TOP3 按 last_at 取，同秒写入顺序不保证 —— 显式把目标项压成最新。
+	await envFail.DB.prepare('UPDATE ad_vision_failures SET last_at = last_at - 100 WHERE target_id != ?').bind('FAILDET_1').run();
 	resetCalls();
 	await send(privateMessage(OWNER_ID, '/adstats'), envFail);
 	const sentFail = calls.filter((c) => c.method === 'sendMessage')
 		.map((c) => c.body?.text || '').join('\n');
-	// 非位图属【预期跳过】，归「视觉识别跳过」栏，不再叫失败。
-	assert('视觉跳过台账显示条目数', /视觉识别跳过<\/b>　条目 <b>1<\/b>/.test(sentFail), sentFail.slice(-700));
+	// 非位图属【预期跳过】，归「视觉识别跳过」栏；20 条触发报警后才显示。
+	assert('视觉跳过台账达到 20 条时报警', /视觉识别跳过（近 24 小时）<\/b>　新增 <b>20<\/b> 条/.test(sentFail), sentFail.slice(-700));
 	assert('★ 跳过台账带上 target_id（唯一能定位是哪张图的字段）',
 		sentFail.includes('FAILDET_1'), sentFail.slice(-700));
 

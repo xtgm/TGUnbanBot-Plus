@@ -20121,6 +20121,14 @@ const AD_VISION_SKIP_CONDITION =
 	+ " OR error_message LIKE '%file not found%'"
 	+ " OR error_message LIKE '%expired%')";
 
+// 跳过栏默认【不显示】。文件失效 / 非位图（.tgs / .webm）本来就是预期内的噪声，
+// 历史台账会一直留着它们 —— 天天挂在 /adstats 上，主人看到的就是「又有报错」，
+// 而真正的链路故障反而被这堆预期项淹没。
+// 只有【最近 24 小时新增条目】达到阈值才显示一行提醒：短时间集中出现说明某一类图
+// 集体失效或下载链路变了，那才是需要看的信号。历史条目仍保留在表里，不删、不清零。
+const AD_VISION_SKIP_ALERT_MIN = 20;
+const AD_VISION_SKIP_ALERT_WINDOW_SEC = 24 * 60 * 60;
+
 // 视觉识别熔断状态（头像与正文图【共用一套】—— 同一个模型、同一根因，分两套只会让排查翻倍）。
 // 跨天自动恢复：熔断标记存的是「触发当天的日期」，过期即失效。
 // 把视觉识别的熔断状态渲染成一行后缀。健康时返回空串 —— 看板上不添废话。
@@ -24286,6 +24294,10 @@ async function handleAdStatsCommand(env, chatId) {
 	let visionFailRow = null;
 	let visionFailTop = [];
 	let channelAccount = null;
+	// 跳过项只统计【最近 24 小时仍在出现】的条目：last_at 会被每次重复跳过刷新，
+	// 所以它等价于「这个跳过类型现在是否还活着」。故障栏不过滤时间 —— 故障是报警器，
+	// 历史故障在修好之前必须一直看得见。
+	const visionSkipCutoff = now - AD_VISION_SKIP_ALERT_WINDOW_SEC;
 	try {
 		const rows = await env.DB.batch([
 			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints'),
@@ -24308,9 +24320,10 @@ async function handleAdStatsCommand(env, chatId) {
 			// 非位图这类预期跳过，不计熔断、不影响判定；不能和链路故障混在一个「失败台账」里。
 			// 四条查询顺序固定：跳过统计、故障统计、跳过 TOP3、故障 TOP3。
 			// 【下标硬编码，只能追加在 batch 末尾】。
-			env.DB.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures WHERE ' + AD_VISION_SKIP_CONDITION),
+			// 跳过两条查询带 24 小时窗口（? = visionSkipCutoff）；故障两条不带，保留全历史。
+			env.DB.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures WHERE ' + AD_VISION_SKIP_CONDITION + ' AND last_at >= ?').bind(visionSkipCutoff),
 			env.DB.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures WHERE NOT ' + AD_VISION_SKIP_CONDITION),
-			env.DB.prepare('SELECT target_id, kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures WHERE ' + AD_VISION_SKIP_CONDITION + ' ORDER BY last_at DESC LIMIT 3'),
+			env.DB.prepare('SELECT target_id, kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures WHERE ' + AD_VISION_SKIP_CONDITION + ' AND last_at >= ? ORDER BY last_at DESC LIMIT 3').bind(visionSkipCutoff),
 			env.DB.prepare('SELECT target_id, kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures WHERE NOT ' + AD_VISION_SKIP_CONDITION + ' ORDER BY last_at DESC LIMIT 3'),
 			// 各通道定罪 / 误封对账。【下标硬编码，只能追加在 batch 末尾】同上一条。
 			// 误封 = 被主人 /ignore 回滚过的（expires_at=0），与定罪总数在同一条 SQL 里
@@ -24482,11 +24495,15 @@ async function handleAdStatsCommand(env, chatId) {
 	//   「故障」= 真正的链路失败，保留原来的报警口径。
 	// 2026-10-14 的教训是「不报出来会静默积压」；但把预期跳过也报成「失败」，
 	// 主人每天看到一片红，真正的故障反而被淹没。
+	// 【2026-10-20 方案 A】跳过栏平时完全不显示。只有最近 24 小时新增条目达到
+	// AD_VISION_SKIP_ALERT_MIN 才出现 —— 那说明某类图在集中失效，才值得看一眼。
+	// 健康状态下 /adstats 的出错数就是 0。
 	const stripSkipPrefix = (name) => String(name || '').replace(/^VisionSkipped:/, '');
-	if (visionSkipRow && Number(visionSkipRow.c) > 0) {
-		lines.push('<b>视觉识别跳过</b>　条目 <b>' + Number(visionSkipRow.c) + '</b>　累计 <b>'
+	if (visionSkipRow && Number(visionSkipRow.c) >= AD_VISION_SKIP_ALERT_MIN) {
+		lines.push('<b>视觉识别跳过（近 24 小时）</b>　新增 <b>' + Number(visionSkipRow.c) + '</b> 条　累计 <b>'
 			+ Number(visionSkipRow.total || 0) + '</b> 次');
 		lines.push('　↳ 文件失效 / 非位图（.tgs / .webm 等），不计熔断，不影响判定');
+		lines.push('　↳ 24 小时内新增偏多 —— 某一类图集中失效或下载链路有变化，核对下面条目即可');
 		for (const row of (visionSkipTop || [])) {
 			lines.push('　↳ ' + escapeHtml(String(row.kind || '')) + ' @ ' + escapeHtml(String(row.stage || ''))
 				+ '　跳过 ' + Number(row.fail_count || 0) + ' 次　'

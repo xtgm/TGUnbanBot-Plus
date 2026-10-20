@@ -237,20 +237,34 @@ section('[3] 队列冷却：失败的图隔天再试，没判过的照取');
 	assert('队列条件里不再有「只认 0」的写法', strict.length === 0, JSON.stringify(strict));
 }
 
-// ================= [4] /adstats 展示台账 =================
+// ================= [4] /adstats 展示台账（跳过栏按阈值报警） =================
 section('[4] /adstats 展示失败台账');
 {
 	const env = makeEnv();
 	await W.adDetectionReady(env);
-	calls.length = 0;
-	// 跳过类：文件失效（预期内，不计熔断）→ 展示在「跳过」栏，不叫失败。
+	// 单条跳过属预期噪声，低于报警阈值 → 平时完全不显示。
+	// 健康状态下 /adstats 不该出现「错误」二字，这条断言就是那个口径。
 	await W.logAdVisionFailure(env, '头像', 'getFile', 'AV_SKIP', new Error('wrong file_id or the file is temporary'), true);
+	calls.length = 0;
+	await post({ update_id: 5, message: { message_id: 5, date: 1, text: '/adstats', chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID, is_bot: 0, first_name: 'O' } } }, env);
+	const quietText = sendTextOf('sendMessage').join('\n');
+	assert('单条跳过默认不显示（平时 0 出错）', !/视觉识别跳过/.test(quietText), quietText.slice(0, 400));
+
+	// 近 24 小时新增达到阈值 20 条 → 才出现报警行。
+	// 19 条填充 + AV_SKIP 共 20 条；填充项统一压到更早的 last_at，
+	// 保证 AV_SKIP 在 TOP3 里（同秒写入顺序不保证）。
+	for (let i = 1; i < 20; i += 1) {
+		await W.logAdVisionFailure(env, '图片', 'sniff', 'BULK_' + i, new Error('头像不是位图'), true);
+	}
+	await env.DB.prepare('UPDATE ad_vision_failures SET last_at = last_at - 100 WHERE target_id != ?').bind('AV_SKIP').run();
 	// 真故障：链路失败 → 展示在「故障」栏，保留系统性问题提示。
 	await W.logAdVisionFailure(env, '图片', 'ai.run', 'IMG_FAIL', new Error('clef 未返回判定'));
 	calls.length = 0;
-	await post({ update_id: 5, message: { message_id: 5, date: 1, text: '/adstats', chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID, is_bot: 0, first_name: 'O' } } }, env);
+	await post({ update_id: 55, message: { message_id: 55, date: 1, text: '/adstats', chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID, is_bot: 0, first_name: 'O' } } }, env);
 	const text = sendTextOf('sendMessage').join('\n');
 	assert('跳过与故障分成两栏', /视觉识别跳过/.test(text) && /视觉识别故障/.test(text), text.slice(0, 400));
+	assert('跳过栏在 20 条时报警并标明近 24 小时',
+		/视觉识别跳过（近 24 小时）<\/b>　新增 <b>20<\/b> 条/.test(text), text.slice(0, 600));
 	assert('跳过栏展示目标 id 与跳过字样', text.includes('AV_SKIP') && /跳过 1 次/.test(text), text.slice(0, 600));
 	assert('故障栏展示目标 id 与失败字样', text.includes('IMG_FAIL') && /失败 1 次/.test(text), text.slice(0, 600));
 	assert('跳过项不串进故障栏', text.indexOf('AV_SKIP') < text.indexOf('视觉识别故障'), text.slice(0, 600));
