@@ -20109,6 +20109,18 @@ async function logAdVisionFailure(env, kind, stage, id, error, skipped = false) 
 	}
 }
 
+// /adstats 把台账分成「跳过」与「故障」的 SQL 判据。
+// 新记录靠 VisionSkipped: 前缀；上线前的历史记录没有前缀，必须按 error_name /
+// error_message 兼容识别，否则那 90 多条历史「跳过」会整批显示成「故障」。
+// LIKE 条件与 isVisionFileMissing 的正则一一对应，改一处必须同步另一处。
+const AD_VISION_SKIP_CONDITION =
+	"(error_name LIKE 'VisionSkipped:%'"
+	+ " OR error_name = 'VisionUnsupportedFormat'"
+	+ " OR error_message LIKE '%wrong file_id%'"
+	+ " OR error_message LIKE '%file is temporarily unavailable%'"
+	+ " OR error_message LIKE '%file not found%'"
+	+ " OR error_message LIKE '%expired%')";
+
 // 视觉识别熔断状态（头像与正文图【共用一套】—— 同一个模型、同一根因，分两套只会让排查翻倍）。
 // 跨天自动恢复：熔断标记存的是「触发当天的日期」，过期即失效。
 // 把视觉识别的熔断状态渲染成一行后缀。健康时返回空串 —— 看板上不添废话。
@@ -24296,10 +24308,10 @@ async function handleAdStatsCommand(env, chatId) {
 			// 非位图这类预期跳过，不计熔断、不影响判定；不能和链路故障混在一个「失败台账」里。
 			// 四条查询顺序固定：跳过统计、故障统计、跳过 TOP3、故障 TOP3。
 			// 【下标硬编码，只能追加在 batch 末尾】。
-			env.DB.prepare("SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures WHERE error_name LIKE 'VisionSkipped:%'"),
-			env.DB.prepare("SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures WHERE error_name NOT LIKE 'VisionSkipped:%'"),
-			env.DB.prepare("SELECT target_id, kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures WHERE error_name LIKE 'VisionSkipped:%' ORDER BY last_at DESC LIMIT 3"),
-			env.DB.prepare("SELECT target_id, kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures WHERE error_name NOT LIKE 'VisionSkipped:%' ORDER BY last_at DESC LIMIT 3"),
+			env.DB.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures WHERE ' + AD_VISION_SKIP_CONDITION),
+			env.DB.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(fail_count), 0) AS total FROM ad_vision_failures WHERE NOT ' + AD_VISION_SKIP_CONDITION),
+			env.DB.prepare('SELECT target_id, kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures WHERE ' + AD_VISION_SKIP_CONDITION + ' ORDER BY last_at DESC LIMIT 3'),
+			env.DB.prepare('SELECT target_id, kind, stage, error_name, error_message, fail_count, last_at FROM ad_vision_failures WHERE NOT ' + AD_VISION_SKIP_CONDITION + ' ORDER BY last_at DESC LIMIT 3'),
 			// 各通道定罪 / 误封对账。【下标硬编码，只能追加在 batch 末尾】同上一条。
 			// 误封 = 被主人 /ignore 回滚过的（expires_at=0），与定罪总数在同一条 SQL 里
 			// 聚合 —— 并进这次 batch 就不多付一次 D1 往返。
