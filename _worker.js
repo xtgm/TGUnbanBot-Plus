@@ -18441,6 +18441,36 @@ function sanitizeAdLLMFeatures(features, input) {
 	return out;
 }
 
+// ===== 模型引文 = 判定依据（2026-10-22，menshen 同款）=====
+//
+// 【与硬证据闸是「或」关系】代码算得出的硬证据（私有邀请链接 / 引流出口∧招揽 /
+// 名片形态）成立就封；算不出来时，模型自己给出的引文只要能在【原文里逐字找到】，
+// 同样落地。主人的原话：「AI 达线 + evidence 逐字核对 → 直接落地，跟 menshen 一样。」
+//
+// 【为什么这不是「模型说一句就封」】prompt 已明令 features[].value 必须逐字引用，
+// 这里再拿回原文核对一遍 —— 编造的、概括的、翻译过的引文一律作废。
+// 封禁依据始终是【原文里确实存在的那一段】，不是模型的结论本身。
+//
+// 【复用 sanitizeAdLLMFeatures 而不是另写一套】学习路径与判定路径的判据必须完全一致，
+// 否则会出现「学到的特征」和「能定罪的引文」不是一回事。那套五道闸（逐字核对 /
+// 类型 / 长度 / 域名形态 / 通用词）就是 menshen evidence gate 在这里的落点。
+function collectAdLLMEvidenceCitations(input, features) {
+	const profile = input?.profile || {};
+	// 【username 也要在核对范围内】模型看到的载荷里有 username（buildAdLLMPayload），
+	// 它引用「这个用户名本身就是招揽」时，原实现会因为 raw 只拼了姓名/bio/正文
+	// 而把真引文判成编造。这里只给【判定路径】补上 username —— 学习路径故意不补：
+	// username 一旦进候选池、转正后按 includes 匹配，会在正文里连坐同名片段。
+	const username = String(profile.username || '').trim();
+	const widened = username
+		? Object.assign({}, input, {
+			profile: Object.assign({}, profile, {
+				bio: [profile.bio, username].filter(Boolean).join(' ')
+			})
+		})
+		: input;
+	return sanitizeAdLLMFeatures(features, widened).map((f) => f.type + ':' + f.value);
+}
+
 // 候选池表（懒建表，不动 D1_SCHEMA_VERSION —— 与 ad_spam_texts / ad_false_positives 同一取向：
 // 这是第⑥层的附属能力，不该因为它的 schema 变更去触发整套核心迁移）。
 const D1_AD_LLM_CANDIDATES_INIT = new WeakMap();
@@ -18756,21 +18786,31 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 			});
 		}
 		const hardEvidence = collectAdLLMHardEvidence(input);
+		// 模型自己给出的引文，回原文逐字核对 —— 对得上就说明【那段文字真实存在于原文】，
+		// 与代码硬证据同权，任一成立即落地（2026-10-22，主人定「跟 menshen 一样」）。
+		const citations = collectAdLLMEvidenceCitations(input, answer.features);
 		// 【不能给 reasons 重新赋值】它是 const —— 直接 `reasons = reasons.concat(...)`
 		// 会抛 Assignment to constant variable，整条检测链在 try 里炸掉、返回 result: error。
-		if (hardEvidence.length) {
+		if (hardEvidence.length || citations.length) {
 			// 【定罪归属】函数入口那道 `verdict === 'ban' 直接返回` 保证走到这里
 			// 必定是本层定的罪，所以标记无条件写。
 			return Object.assign({}, current, {
 				verdict: 'ban',
 				reasons: markAdConvictLayer(
-					reasons.concat(['（代码验证：' + hardEvidence.join('、') + '）']), 'LLM')
+					reasons.concat(
+						hardEvidence.length ? ['（代码验证：' + hardEvidence.join('、') + '）'] : [],
+						citations.length
+							? ['（模型引文逐字核对通过：' + citations.slice(0, 3).join('、')
+								+ (citations.length > 3 ? ' 等 ' + citations.length + ' 条' : '') + '）']
+							: []
+					), 'LLM')
 			});
 		}
 		return Object.assign({}, current, {
 			verdict: 'observe',
-			reasons: reasons.concat(['（已拦下：模型判为广告且够采信线，但【代码算不出任何硬证据】'
-				+ '—— 没有私有群邀请链接，也没有引流出口与招揽同现。降级为观察，不封禁）'])
+			reasons: reasons.concat(['（已拦下：模型判为广告且够采信线，但【引文逐字核对没通过、'
+				+ '代码也算不出硬证据】—— 它说的内容要么原文里找不到，要么只是「找我」这类通用词。'
+				+ '降级为观察，不封禁）'])
 		});
 	}
 	if (answer.confidence >= AD_LLM_OBSERVE_CONF) {
@@ -24561,7 +24601,7 @@ async function handleAdStatsCommand(env, chatId) {
 			// 【不写「达线处置」】2026-10-12 起达线不等于处置：还要看代码能核验的硬证据
 			//（真私有邀请链接 / 出口∧招揽同现），没有就降级观察窗口、不封禁。
 			// 写「处置」会让人以为第⑥层在自动封人，而它现在多数是「达线但降级」。
-			+ '（达线后还要看代码证据，有硬证据才封，否则进观察窗口）'
+			+ '（达线后还要看证据：模型引文逐字核对通过、或代码验出硬证据才封，否则进观察窗口）'
 			+ '　解析失败 <b>' + llmStat.parseFail + '</b> 次'
 			+ (llmStat.used > 0 && llmStat.hits === 0 && llmStat.parseFail === 0
 				? '　⚠️ 调用有、0 命中且 0 解析失败 —— 模型确实判了「不是广告」，问题在送进去的载荷内容，不在输出格式'

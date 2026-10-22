@@ -923,7 +923,7 @@ section('[10] 观测计数：调用 / 判广告 / 达线三个数');
 		const text = lastSent();
 		assert('/adstats 显示今日调用数', text.includes('今日调用'), text.slice(0, 600));
 		assert('/adstats 显示「模型判为广告」', text.includes('模型判为广告'), text.slice(0, 600));
-		assert('/adstats 显示「其中达线」并说明达线不等于处置', text.includes('其中达线') && text.includes('有硬证据才封'), text.slice(0, 600));
+		assert('/adstats 显示「其中达线」并说明达线不等于处置', text.includes('其中达线') && text.includes('引文逐字核对'), text.slice(0, 600));
 	}
 	// ⑦ 调用 >0 且 0 命中时给出提示，且必须与「解析失败」区分开
 	{
@@ -1263,7 +1263,7 @@ console.log('\n===== [10] 第⑥层达线后的代码证据闸 =====');
 	const gotA = await W.applyAdLLMToEvaluation(envA, { verdict: 'pass', score: -2, reasons: [] }, cfgA,
 		{ profile: { firstName: '初照', lastName: '', username: 'chuzhaoxi_bot', bio: '私聊请 @chuzhaoxi_bot 或 t.me/jphrcjy' }, text: '签到' });
 	assert('★ #6269 线上样本 → 不封（模型说的私有邀请链接是假的）', gotA.verdict === 'observe', JSON.stringify(gotA.reasons).slice(0, 300));
-	assert('★ 理由写明为什么没封', gotA.reasons.some((r) => r.includes('代码算不出任何硬证据')), JSON.stringify(gotA.reasons).slice(0, 300));
+	assert('★ 理由写明为什么没封', gotA.reasons.some((r) => r.includes('引文逐字核对没通过')), JSON.stringify(gotA.reasons).slice(0, 300));
 
 	// ③ 达线 + 有硬证据 → 封，且理由带上代码验证
 	const envB = await makeReadyEnv({ AI: makeAI({ llmAnswer: adAnswer(0.95, '引流广告') }) });
