@@ -11902,26 +11902,31 @@ async function getBotUsername() {
 		return BOT_USERNAME;
 	}
 
-	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getMe`;
-		const response = await fetch(url);
-		const result = await response.json();
+	// 【绝不能返回占位名】旧实现在 getMe 失败时返回 'unknown_bot'，首页拿它拼出
+	// https://t.me/unknown_bot?startgroup=true —— 这个账号不存在，点下去 Telegram
+	// 只会弹「无法添加用户。请稍后再试。」（2026-10-22 主人实测）。频道按钮同源同病。
+	// 现在：重试一次，仍拿不到就返回空串，由调用方决定【不渲染】添加按钮 ——
+	// 宁可少一个按钮，也不能给一个必然失败的。
+	for (let attempt = 1; attempt <= 2; attempt += 1) {
+		try {
+			const url = `https://api.telegram.org/bot${BOT_TOKEN}/getMe`;
+			const response = await fetch(url);
+			const result = await response.json();
 
-		if (response.ok && result.result && result.result.username) {
-			if (result.result.id) {
-				BOT_ID = result.result.id;
+			if (response.ok && result.result && result.result.username) {
+				if (result.result.id) {
+					BOT_ID = result.result.id;
+				}
+				BOT_USERNAME = result.result.username;
+				console.log(`机器人用户名: ${BOT_USERNAME}`);
+				return BOT_USERNAME;
 			}
-			BOT_USERNAME = result.result.username;
-			console.log(`机器人用户名: ${BOT_USERNAME}`);
-			return BOT_USERNAME;
-		} else {
-			console.error('获取机器人信息失败:', result);
-			return 'unknown_bot'; // 失败时返回中性占位
+			console.error('获取机器人信息失败（第 ' + attempt + ' 次）:', result);
+		} catch (error) {
+			console.error('获取机器人用户名时出错（第 ' + attempt + ' 次）:', error);
 		}
-	} catch (error) {
-		console.error('获取机器人用户名时出错:', error);
-		return 'unknown_bot'; // 失败时返回中性占位
 	}
+	return '';
 }
 
 // 获取群组信息
@@ -26137,6 +26142,9 @@ async function renderOwnerHome(env) {
 	}
 
 	const lines = ['👋 <b>统计面板</b>', '', '👇 选择群组进行管理'];
+	// getBotUsername 失败时返回空串 —— 这时【宁可不给按钮】也不能给一个指向
+	// 不存在账号的链接（点了 Telegram 必报「无法添加用户」）。重新 /start 即可再试。
+	if (!botName) lines.push('', '⚠️ 暂时拿不到机器人用户名，添加群组/频道按钮先不显示；稍后重新 /start 即可。');
 	if (!targets.length) lines.push('', '⚠️ 当前没有配置群。');
 	return {
 		text: lines.join('\n'),
