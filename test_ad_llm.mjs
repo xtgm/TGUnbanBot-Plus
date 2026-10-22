@@ -1169,10 +1169,16 @@ console.log('\n===== [11] 误判反例池 =====');
 		got.reasons.some((r) => r.includes('误判')), JSON.stringify(got.reasons).slice(0, 300));
 
 	// ⑦ LRU 上限
+	// 【2026-10-22 上限 20 → 200】20 条在几个群、几十个广告号的量级下一周就转一圈，
+	// 等于把早期判过的形态忘掉。断言改成【按实现的上限】判，不写死数字 ——
+	// 写死 20 会让这条断言变成「改了参数就得改测试」，失去它本该守的语义
+	//（语义是「有上限且确实淘汰最旧的」，具体数字不是契约）。
+	// 上限本身另有 test_ad_false_positive.mjs 的 [7] 段守着「≥ 20」这条下限。
+	const fpCap = Number((src.match(/const AD_FALSE_POSITIVE_MAX = (\d+)/) || [])[1]);
 	const envLRU = await makeReadyEnv();
-	for (let i = 0; i < 25; i++) await W.addAdFalsePositive(envLRU, '反例样本片段编号' + i);
+	for (let i = 0; i < fpCap + 5; i++) await W.addAdFalsePositive(envLRU, '反例样本片段编号' + i);
 	const total = envLRU.DB.query('SELECT COUNT(*) AS c FROM ad_false_positives')[0].c;
-	assert('★ 上限 20 条（LRU 淘汰最旧的）', total === 20, 'count=' + total);
+	assert('★ 有上限且按 LRU 淘汰最旧的', total === fpCap, 'count=' + total + ' cap=' + fpCap);
 }
 // ===== [12] 形态摘要 =====
 // 【2026-10-12】把积累的人工判据压缩成一段话注入每一条判定，治「换几个字就认不出」。

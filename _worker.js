@@ -18578,21 +18578,68 @@ async function readAdLLMCandidateStats(env) {
 // 本项目改为【代码侧比对】：每次调用不膨胀 prompt（那会让 1000 次/天的调用每条多
 // 花 2 Neurons，且 prompt 越长模型越容易跑偏），代价只是达线时多一次 D1 查询。
 //
-// 【存片段不存整句】整句会因为空格、标点、emoji 差异匹配不上；存 30 字片段做
-// 【子串比对】，既能覆盖「同款改写」（换几个字、加个表情），又不会因为一个词就
-// 放行整类 —— 主人确认的是【这一段话】不是【这一个词】。
-const AD_FALSE_POSITIVE_MAX = 20;
-const AD_FALSE_POSITIVE_CLIP = 30;
+// 【存片段不存整句】整句会因为空格、标点、emoji 差异匹配不上；存一段可辨识
+// 内容做【子串比对】，既能覆盖「同款改写」（换几个字、加个表情），又不会因为
+// 一个词就放行整类 —— 主人确认的是【这一段话】不是【这一个词】。
+//
+// 【2026-10-22 修三处线上失效】这套机制此前对入群线是死代码，三处叠在一起：
+//   ① 写入只取正文 —— 入群 / 入群申请那一刻人还没发言，text 恒为空串，
+//      addAdFalsePositive('') 因长度 < 4 直接返回 0，反例一条都落不了库
+//      （线上 ad_false_positives 长期为空就是证据）。
+//   ② 读写口径不对称 —— 写只存正文，读拼「昵称+用户名+bio+正文」，各自再截
+//      30 字。bio 超过 30 字时读侧前 30 字全是 bio，永远匹配不到写侧的正文片段。
+//      而这批广告号的 bio 普遍长于 30 字。
+//   ③ 片段被截到 30 字后再做【对称子串】匹配，原文只要 30 字之后还有内容就
+//      匹配不上 —— 内容越长越匹配不到，正好与「越像越该放过」相反。
+//
+// 现在：写与读都用同一份「可辨识文本」（昵称不进 —— 昵称是低熵文本，
+// 一次 /ignore 不该把所有叫「清风」的人一起放进白名单），且不截断。
+// 库里的片段逐条【完整出现在】读侧文本里才算命中，长短两侧都不吃亏。
+//
+// 容量 20 → 200：误判本来低频，但 20 条在几个群、几十个广告号的量级下
+// 一周就转一圈，等于把早期判过的形态忘掉。200 条每行平均约 150 字 ≈ 30 KB，
+// 只在达线时全表拉一次，D1 代价可忽略。
+const AD_FALSE_POSITIVE_MAX = 200;
+// 【不再截断】保留常量只为兼容旧测试与旧调用点，值等于库表列的实际用途上限。
+// 取值理由：bio 在评估快照里本来就截到 200 字，正文截到 300 字，
+// 两者拼起来超过 200 的部分对「同一条内容回来」已无区分度。
+const AD_FALSE_POSITIVE_CLIP = 200;
 
-// 判定载荷里用于比对的正文（与 payload.text 同源，不带引用体 —— 那不是本人写的）。
-function adFalsePositiveSource(input) {
+// 反例池用于比对的【可辨识文本】：简介 + 正文 + 用户名，三者都空时才退回昵称。
+//
+// 【昵称为什么排在最后】昵称是低熵文本（同名者众），只要它参与比对，一次
+// /ignore 就会把所有叫「清风」「大卫」的人一起放进放行名单 —— 放行面被无谓放大。
+// 但昵称也不能整体丢掉：资料型广告（图24「【简介】 3个月✈️会员10U」）的载荷
+// 有一半在昵称里，bio 若为空就只剩它能辨识。所以做成【退路】而不是【并列项】：
+// 有简介或正文时只看它们，两者皆空才拿昵称兜底。
+function adFalsePositiveText(input, clip) {
 	const profile = input?.profile || {};
-	const text = [profile.firstName, profile.lastName, profile.bio, input?.text]
-		.filter(Boolean).join(' ');
-	return normalizeAdFingerprintValue(text).slice(0, AD_FALSE_POSITIVE_CLIP);
+	const name = normalizeAdFingerprintValue(
+		[profile.firstName, profile.lastName].filter(Boolean).join(' ')
+	);
+	const body = normalizeAdFingerprintValue(
+		[profile.bio, input?.text, profile.username].filter(Boolean).join(' ')
+	);
+	// normalizeAdFingerprintValue 本身就把值压到 200 字，这里不再叠加第二道截断 ——
+	// 截断只发生在【入库】那一侧，读侧保留完整文本，否则长内容会被截在
+	// 片段边界之外，表现出来就是「同一条内容回来仍然不命中」。
+	const value = body || name;
+	return clip ? value.slice(0, clip) : value;
 }
 
-// 主人 /ignore 时调用：把这次的正文片段记进反例池。
+// 反例池的比对载荷。读写两侧【必须】调同一个函数 —— 口径一旦分叉，
+// 长 bio 就会退化成「前 N 字永远匹配不上」（2026-10-22 修的就是这个）。
+// 只有写入侧传 clip；读取侧不截断，让库内片段能在完整文本里被找到。
+function adFalsePositiveSource(input) {
+	return adFalsePositiveText(input);
+}
+
+// 主人 /ignore 时调用：把这次的可辨识内容记进反例池。
+//
+// 【三个入参】rawText 是正文（老签名，保留兼容）；profile 是这次的资料卡；
+// 两者都空时不写。入群 / 入群申请线正文恒为空串，载荷全在 profile 里 ——
+// 旧实现只取 rawText，于是那条线上反例一条都落不了库（2026-10-22 修）。
+//
 // 【幂等】同值重复写只刷新时间，不新增行；超出上限丢最旧的，表永远很小。
 // 【绝不影响 /ignore 本职】失败只记日志，回滚照常完成。
 // 【懒建表】首次读写时自动建，不动 D1_SCHEMA_VERSION —— 与 ad_spam_texts 同一取向：
@@ -18620,10 +18667,12 @@ async function ensureAdFalsePositivesTable(env) {
 }
 
 
-async function addAdFalsePositive(env, rawText) {
+async function addAdFalsePositive(env, rawText, profile) {
 	if (!env?.DB) return 0;
 	if (!(await ensureAdFalsePositivesTable(env))) return 0;
-	const value = normalizeAdFingerprintValue(rawText).slice(0, AD_FALSE_POSITIVE_CLIP);
+	// 【走与读取完全同一份口径】不在这里另拼字段 —— 读写两侧一旦分叉，
+	// 长 bio 就会退化成「前 N 字永远匹配不上」，这正是修之前的状态。
+	const value = adFalsePositiveText({ profile: profile || {}, text: rawText }, AD_FALSE_POSITIVE_CLIP);
 	// 短于 4 字的片段比对价值为零（「签到」「你好」会把太多东西放进放行名单）
 	if (value.length < 4) return 0;
 	try {
@@ -23778,14 +23827,23 @@ async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
 			// 记下这次的正文片段，下次达线时先问反例池，命中就降级不封。
 			// 【2026-10-20 修：取错字段层级，反例池一直是空的】
 			// readAdPendingSnapshot 返回的是 { seq, userId, snapshot: <解析后的快照> }，
-			// 正文在 snapshot.snapshot.text，不在这里的顶层。原写法 snapshot?.text
-			// 恒为 undefined → 传进去空串 → addAdFalsePositive 因长度不足直接返回 0，
-			// 反例一条都没落库（线上 ad_false_positives 表为空就是证据）。
-			// 兜底那一层留着给直接传扁平快照的调用方，正常路径走第一层。
+			// 正文在 snapshot.snapshot.text，不在这里的顶层。
+			// 【2026-10-22 再修：入群线正文恒为空】只取 text 时，入群 / 入群申请
+			// 那一线的记录（人还没发言）永远是空串，长度不足直接返回 0 —— 反例池
+			// 对入群线是死代码。现在把整份资料卡一起传进去：昵称、用户名、bio
+			// 都在快照里现成带着，零额外读取。
 			// 【绝不影响 /ignore 本职】失败只记日志，回滚照常完成。
 			try {
-				const ignoreText = String(snapshot?.snapshot?.text || snapshot?.text || '');
-				await addAdFalsePositive(env, ignoreText);
+				const snap = snapshot?.snapshot || snapshot || {};
+				await addAdFalsePositive(env,
+					String(snap.text || ''),
+					{
+						// 快照里 name 是拼好的显示名，没有 firstName/lastName 之分。
+						firstName: String(snap.name || ''),
+						lastName: '',
+						username: String(snap.username || ''),
+						bio: String(snap.bio || '')
+					});
 			} catch (error) {
 				console.error('[广告检测] /ignore 记反例失败:', error);
 			}
