@@ -17691,10 +17691,23 @@ async function notifyAvatarHitObserve(evaluation, userId, chatId) {
 		// 按钮而不是「你去手动发 /spam」：主人 2026-10-14 照着提示里的「引用其消息发 /spam」
 		// 执行，结果 /spam 取「被引用消息的发送者」当目标 —— 私聊里能引用的只有机器人自己，
 		// 于是机器人把自己加黑、全群禁言。把判断收进按钮，这类误操作从根上没有入口。
+		//
+		// 【2026-10-21：按钮必须自带定位信息】观察记录 24 小时后会被 pruneAdDetectionData
+		// 物理删除，旧按钮只带 userId，点下去要反查 ad_user_screening 才拿得到 chatId ——
+		// 过期后必然报「找不到观察记录」。现在把 chatId（确认封）与 chatId + avatarId
+		// （不该封）直接编进 callback_data，与观察记录的生命周期解耦：通知留多久按钮就能用多久。
+		// callback_data 上限 64 字节；这里只有 ASCII 数字/字母/下划线，length 即字节数。
+		// avatarId 放进去超限时就不带，回退查观察记录（记录还在时照样能用）。
+		const btnUid = String(userId);
+		const btnChat = String(chatId || '');
+		const btnAvatar = String(snap.avatarId || '');
+		const okData = ADFIX_BUTTON_PREFIX + 'ok:' + btnUid + (btnChat ? ':' + btnChat : '');
+		let noData = ADFIX_BUTTON_PREFIX + 'no:' + btnUid + (btnChat ? ':' + btnChat : '');
+		if (btnAvatar && (noData + ':' + btnAvatar).length <= 64) noData += ':' + btnAvatar;
 		await sendTelegramMessageChunks(ownerId, lines.filter(Boolean).join('\n'), {
 			inline_keyboard: [[
-				{ text: '🔒 确认封（全群封禁+拉黑）', callback_data: ADFIX_BUTTON_PREFIX + 'ok:' + String(userId) },
-				{ text: '❌ 不该封（头像转干净）', callback_data: ADFIX_BUTTON_PREFIX + 'no:' + String(userId) }
+				{ text: '🔒 确认封（全群封禁+拉黑）', callback_data: okData },
+				{ text: '❌ 不该封（头像转干净）', callback_data: noData }
 			]]
 		});
 	} catch (error) {
@@ -21623,7 +21636,11 @@ function buildAdNoticeKeyboard(seq, userId) {
 
 async function handleAdFixButtonCallback(callbackQuery, env) {
 	const data = String(callbackQuery?.data || '');
-	const match = data.slice(ADFIX_BUTTON_PREFIX.length).match(/^(ig|ub|wl|ok|no):(\d+)$/);
+	const body = data.slice(ADFIX_BUTTON_PREFIX.length);
+	// ig/ub/wl 只有载荷本身；ok/no 自 2026-10-21 起携带 userId[:chatId[:avatarId]] ——
+	// 观察记录 24 小时过期被 prune 删除后，按钮仍能靠自带信息执行。
+	const match = body.match(/^(ig|ub|wl):(\d+)$/)
+		|| body.match(/^(ok|no):(\d+)(?::(-?\d+))?(?::([^:]+))?$/);
 	if (!match) {
 		await answerAdVoteCallback(callbackQuery?.id);
 		return;
@@ -21633,6 +21650,9 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 	// ok / no 两条分支的载荷是 TGID，要拿去 D1 主键匹配 —— TGID 可到 10 位以上，
 	// 经过 Number 有丢精度的风险，主键对不上会静默查不到记录，所以字符串形态另存一份。
 	const payloadStr = String(match[2]);
+	// 按钮自带的目标群与头像（旧通知这两个为空，回退查观察记录）。
+	const buttonChatId = String(match[3] || '');
+	const buttonAvatarId = String(match[4] || '');
 	const fromId = String(callbackQuery?.from?.id || '');
 	if (!isPrimaryOwner(fromId)) {
 		await answerAdVoteCallback(callbackQuery?.id, '这三个按钮只有第一主人能点', true);
@@ -21658,14 +21678,16 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 	// 主人 2026-10-14 照做，而 /spam 取「被引用消息的发送者」当目标 —— 私聊里能引用的
 	// 只有机器人自己，于是机器人把自己加黑、全群禁言。把判断收进按钮，这类误操作没有入口。
 	if (action === 'ok' || action === 'no') {
-		// 通知本身没带群上下文（observe 落的是 ad_user_screening），去观察表取。
+		// 新通知把目标群直接编进按钮；旧通知（只带 userId）才需要查观察记录。
+		// 注意：记录可能在 24 小时后已被 prune 删除 —— 那是旧通知失效的原因，
+		// 新通知不依赖它，所以这里的查询只作为回退。
 		const screening = await env.DB
 			.prepare('SELECT chat_id, snapshot FROM ad_user_screening WHERE user_id = ?')
 			.bind(payloadStr).first();
 		if (action === 'ok') {
-			const targetChatId = String(screening?.chat_id || '');
+			const targetChatId = buttonChatId || String(screening?.chat_id || '');
 			if (!targetChatId) {
-				await answerAdVoteCallback(callbackQuery?.id, '找不到该用户的观察记录，无法确定要封的群', true);
+				await answerAdVoteCallback(callbackQuery?.id, '找不到该用户的观察记录，无法确定要封的群（这条通知是旧格式，重新触发一次即可）', true);
 				return;
 			}
 			let result = null;
@@ -21699,10 +21721,13 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 		}
 		// 不该封：这张头像转干净（防连坐）+ 清观察记录。
 		// 只清观察不清头像的话，下一个用同款头像的人还会被推一遍同样的通知。
-		let avatarId = '';
-		try {
-			avatarId = String(JSON.parse(String(screening?.snapshot || '{}')).avatarId || '');
-		} catch (_) { avatarId = ''; }
+		// avatarId 优先取按钮自带的（观察记录过期后仍能转干净），旧通知才回退解析快照。
+		let avatarId = buttonAvatarId;
+		if (!avatarId) {
+			try {
+				avatarId = String(JSON.parse(String(screening?.snapshot || '{}')).avatarId || '');
+			} catch (_) { avatarId = ''; }
+		}
 		let cleared = false;
 		if (avatarId) cleared = await clearAdAvatarOnIgnore(env, avatarId);
 		try {

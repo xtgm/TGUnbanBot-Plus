@@ -649,13 +649,24 @@ section('[7b] 头像命中进观察时发提醒');
 	const evaluation = {
 		verdict: 'observe', score: 0,
 		reasons: ['-1 名称无 emoji 且无 Bio', '-3 正文命中豁免词：签到', '头像命中广告图库（复用定罪 0 次）'],
-		snapshot: { name: 'Metin', username: 'oyjukuyj', text: '签到' }
+		snapshot: { name: 'Metin', username: 'oyjukuyj', text: '签到', avatarId: 'AgADtestAvatarId' }
 	};
 	resetCalls();
 	await W.notifyAvatarHitObserve(evaluation, '8852967026', '-1003438950487');
 	assert('★ 头像命中进观察时发提醒', sentText().includes('头像命中广告图库'), sentText().slice(0, 200));
 	assert('提醒带用户与正文（够人工判断）',
 		sentText().includes('8852967026') && sentText().includes('签到'), sentText().slice(0, 300));
+	// 【2026-10-21】按钮必须自带 userId + chatId（+ avatarId），不能只存 userId ——
+	// 观察记录 24 小时后被 prune 物理删除，只靠 userId 反查会「找不到观察记录」。
+	const noticeMarkup = calls.filter((c) => c.method === 'sendMessage')
+		.map((c) => c.body?.reply_markup).filter(Boolean)[0];
+	const noticeRows = noticeMarkup?.inline_keyboard || [];
+	assert('★ 确认封按钮自带 chatId（adfix:ok:<uid>:<chatId>）',
+		String(noticeRows?.[0]?.[0]?.callback_data) === 'adfix:ok:8852967026:-1003438950487',
+		JSON.stringify(noticeRows));
+	assert('★ 不该封按钮自带 chatId + avatarId（adfix:no:<uid>:<chatId>:<avatarId>）',
+		String(noticeRows?.[0]?.[1]?.callback_data) === 'adfix:no:8852967026:-1003438950487:AgADtestAvatarId',
+		JSON.stringify(noticeRows));
 
 	resetCalls();
 	await W.notifyAvatarHitObserve({ verdict: 'observe', score: 0, reasons: ['-1 名称无 emoji 且无 Bio'] }, '123', '-1');

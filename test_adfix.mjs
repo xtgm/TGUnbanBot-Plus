@@ -254,6 +254,36 @@ section('[3] 回调鉴权与非法 data');
 	assert('seq 可用', Boolean(seq));
 }
 
+// ================= [3b] 头像观察按钮：观察记录已被清理也能执行 =================
+// 【线上事故 2026-10-21】周一推的「头像命中 → 已转入观察」通知，周三点「确认封」
+// 报「找不到该用户的观察记录，无法确定要封的群」—— 观察记录 24 小时过期后
+// 被 prune 物理删除，而旧按钮只带 userId、靠反查这张临时表拿 chatId。
+// 修法：按钮自己携带 chatId（确认封）与 chatId + avatarId（不该封），
+// 与观察记录的生命周期解耦。本段断言「记录不存在时两个按钮仍然能干活」。
+section('[3b] 头像观察按钮不依赖观察记录是否还在');
+{
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+	// 故意不写 ad_user_screening —— 模拟 24 小时过期已被 prune 删除
+	assert('先确认观察记录不存在', Number(env.DB.query('SELECT COUNT(*) AS c FROM ad_user_screening')[0].c) === 0);
+
+	resetCalls();
+	await W.handleAdFixButtonCallback(cbOf(String(OWNER_ID), 'adfix:ok:666040:-1001111111111'), env);
+	const bans = callsOf('banChatMember');
+	assert('★ 无观察记录时「确认封」仍执行封禁（chatId 来自按钮）',
+		bans.length >= 1 && String(bans[0].body?.user_id) === '666040', JSON.stringify(bans.map((c) => c.body)));
+	assert('黑名单已写入', Number(env.DB.query('SELECT COUNT(*) AS c FROM blacklist WHERE id = ?', '666040')[0].c) === 1,
+		JSON.stringify(env.DB.query('SELECT id FROM blacklist')));
+
+	const env2 = makeEnv();
+	await W.adDetectionReady(env2);
+	resetCalls();
+	await W.handleAdFixButtonCallback(cbOf(String(OWNER_ID), 'adfix:no:666041:-1001111111111:AgADavatarX'), env2);
+	const avatarRow = env2.DB.query('SELECT verdict, source FROM ad_avatars WHERE file_unique_id = ?', 'AgADavatarX')[0];
+	assert('★ 无观察记录时「不该封」仍把头像转干净（avatarId 来自按钮）',
+		avatarRow?.verdict === 'clean' && avatarRow?.source === 'manual', JSON.stringify(avatarRow));
+}
+
 // ================= [4] ↩️ 误判：完整回滚 =================
 section('[4] ↩️ 误判（回滚全部）');
 {
@@ -355,11 +385,11 @@ section('[7] 删判据的路径全部卡在第一主人门槛内');
 	// 主人的原话：「如果其他权限通过 /unban 解封并删除了指纹特征，那么我之前演练学习
 	// 的特征全部都白费。」/unban 三条执行路今天本来就不删判据（已逐条核实），
 	// 真正的口子在这一条，所以卡死的是它。
-	// 窗口 800：2026-10-14 加 ok/no 两条分支时多了一句 payloadStr 声明，
-	// isPrimaryOwner 被推到 500 之外 —— 断言要钉的是「权限卡在入口」这个位置关系，
-	// 不是精确距离，所以放宽窗口而不是挪代码（挪代码会把变量声明放到函数中段，更难读）。
+	// 窗口 1200：2026-10-21 给 ok/no 按钮加「自带 chatId / avatarId」的解析与说明后，
+	// isPrimaryOwner 又被推远了一段。断言要钉的是「权限卡在入口」这个位置关系，
+	// 不是精确距离，所以继续放宽窗口而不是挪代码（挪代码会把变量声明放到函数中段）。
 	assert('↩️ 误判按钮：入口卡 isPrimaryOwner',
-		/handleAdFixButtonCallback\([\s\S]{0,800}isPrimaryOwner\(fromId\)/.test(src));
+		/handleAdFixButtonCallback\([\s\S]{0,1200}isPrimaryOwner\(fromId\)/.test(src));
 	assert('演练「不该封」按钮：入口卡 isPrimaryOwner',
 		/handleDryRunButtonCallback\([\s\S]{0,500}isPrimaryOwner\(fromId\)/.test(src));
 	assert('/ignore 等广告管理命令：整段入口卡 isPrimaryOwner',
