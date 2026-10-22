@@ -4536,7 +4536,9 @@ console.log('\n[23] 一键代发链路已移除');
 	// 第2批新增 chat_join_request（入群审批请求）—— 申请时间的唯一来源；群未开审批时永不推送
 	// 官方 Update 对象 27 个合法类型里只有 chat_join_request，bot_chat_join_request 出现 0 次
 	//（2026-10-02 实抓 core.telegram.org/bots/api 交叉验证后纠正）。
-	assert('Webhook 初始化 → 订阅 message/chat_member/chat_join_request/callback_query', JSON.stringify(webhookCall?.body?.allowed_updates) === JSON.stringify(['message', 'chat_member', 'callback_query', 'chat_join_request']));
+	// 2026-10-22 新增 my_chat_member：机器人自己被加进群/频道时，只有这一种
+	// update 能覆盖频道（频道不推 chat_member），自动纳入动态群组靠它。
+	assert('Webhook 初始化 → 订阅 message/chat_member/my_chat_member/chat_join_request/callback_query', JSON.stringify(webhookCall?.body?.allowed_updates) === JSON.stringify(['message', 'chat_member', 'my_chat_member', 'callback_query', 'chat_join_request']));
 	assert('Webhook 初始化 → 订阅的都是官方合法 update 类型（无 bot_chat_join_request）',
 		!webhookCall?.body?.allowed_updates?.includes('bot_chat_join_request'));
 	assert('Webhook 初始化 → /ad 投票按钮回调已启用', webhookCall?.body?.allowed_updates?.includes('callback_query'));

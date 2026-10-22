@@ -421,6 +421,12 @@ export default {
 					有按钮回调: Boolean(update.callback_query)
 				}));
 
+				// bot 自己被拉进群 / 频道 → 第一主人操作时自动登记为动态群组。
+				// 必须放在下面所有分支【之前】：handleMessage 里的 handleNewChatMemberBots
+				// 对未配置群一律 return true 把整条进群消息吃掉，落在后面就永远轮不到登记
+				// ——这正是「用 /start 的添加按钮拉进来、机器人毫无反应」的根因。
+				await handleBotSelfJoin(update, env);
+
 				// 分发：普通消息 / 群成员状态变更
 				if (update.message) {
 					await handleMessage(update.message, env, ctx, request.url);
@@ -431,8 +437,10 @@ export default {
 				} else if (update.chat_join_request) {
 					// 入群审批请求 → 记「申请时间」。群未开审批时此分支永不触发。
 					await handleChatJoinRequest(update.chat_join_request, env);
+				} else if (update.my_chat_member) {
+					// 机器人自身的成员变更已在上面 handleBotSelfJoin 处理完，这里不再重复动作。
 				} else {
-					console.log('[Telegram更新] 跳过：当前代码仅处理 message/chat_member/chat_join_request/callback_query。');
+					console.log('[Telegram更新] 跳过：当前代码仅处理 message/chat_member/my_chat_member/chat_join_request/callback_query。');
 				}
 
 				return new Response('OK');
@@ -803,7 +811,11 @@ async function handleInitialization(request, env) {
 			// ⚠️ 只能用官方 Update 对象里的 27 个类型之一；这里曾误写成 bot_chat_join_request
 			//    （该名在整份官方文档中出现 0 次），导致 Telegram 根本不推送、申请时间永远收不到。
 			// ⚠️ 该 update 还要求 bot 在群里有 can_invite_users 权限（官方文档明写）。
-			allowed_updates: ['message', 'chat_member', 'callback_query', 'chat_join_request'],
+			// my_chat_member：机器人自己的成员身份变化。频道【只走这一种】，
+			// 群里的「被提为管理员」也走它 —— 自动纳入动态群组要靠它补全路径。
+			// ⚠️ setWebhook 的 allowed_updates 是整体覆盖而不是追加：加了这一项之后
+			//    必须重新访问一次初始化地址，否则线上仍是旧列表、频道那条路永远不触发。
+			allowed_updates: ['message', 'chat_member', 'my_chat_member', 'callback_query', 'chat_join_request'],
 			// 配了 WEBHOOK_SECRET 才下发 secret_token；未配置时展开为空对象，
 			// 请求体与改动前完全一致（存量部署重新访问初始化地址不会被意外改成强制校验）。
 			...webhookSecretFields(env)
@@ -5598,6 +5610,117 @@ function getNewMemberLogInfo(message, member) {
 		新成员昵称: member?.first_name,
 		新成员是否机器人: member?.is_bot
 	};
+}
+
+// 【自动纳入动态群组】第一主人通过 /start 的「添加到群组 / 添加到频道」按钮把机器人
+// 加进去之后，不必再手动 /addgroup，这里直接登记进 dynamic_groups。
+//
+// 为什么必须核对操作人：Telegram 深链 https://t.me/<bot>?startgroup=true 本身没有
+// 任何鉴权 —— 地址被谁复制走，谁就能点、就能把机器人拉进任意群。按钮只长在主人专属
+// 面板里（renderOwnerHome 仅 isOwner 可达）并不等于深链也专属。所以登记前必须核对
+// 三种事件里的 from 字段：它就是【动手的那一个】，Telegram 保证不可伪造。
+// 不是第一主人拉进来的一律不登记 —— 拉进去也没用，机器人不会在那个群做任何治理。
+//
+// 三个来源都要认，缺一就会在真实操作顺序里漏掉：
+//   ① message.new_chat_members —— 被拉进群时 Telegram 发的 service message
+//   ② chat_member              —— 机器人自身的成员状态变化（被提为管理员也走这里）
+//   ③ my_chat_member           —— 频道【唯一】通道，群里同样会推
+// 只认 ① 会漏掉「先拉进群、事后才给管理员权限」这条实际路径：那个时刻 from 才是主人，
+// 而 ① 那次 from 同样是主人、其实能覆盖；但频道完全只有 ③，所以 ③ 不能省。
+async function handleBotSelfJoin(update, env) {
+	if (!update || !env?.DB) return false;
+
+	const isJoinEvent = Boolean(update.my_chat_member)
+		|| Boolean(update.chat_member)
+		|| (Array.isArray(update.message?.new_chat_members) && update.message.new_chat_members.length > 0);
+	if (!isJoinEvent) return false;
+
+	let chat = null;
+	let actor = null;
+	let member = null;
+	// 同一条进群消息里可能同时有多个 bot 被拉进来，必须按 botId 精确挑出自己，
+	// 不能「取第一个 is_bot」—— 那会把别人的入群当成自己的、把真正的自己漏掉。
+	let candidateMembers = null;
+
+	if (update.message) {
+		chat = update.message.chat || null;
+		actor = update.message.from || null;
+		candidateMembers = (update.message.new_chat_members || []).filter((m) => m?.is_bot);
+	} else {
+		const cm = update.my_chat_member || update.chat_member;
+		chat = cm?.chat || null;
+		actor = cm?.from || null;
+		member = cm?.new_chat_member?.user || null;
+		// 已经离开 / 被踢时不登记
+		const status = cm?.new_chat_member?.status;
+		if (status && !['member', 'administrator', 'creator', 'restricted'].includes(status)) {
+			return false;
+		}
+	}
+
+	if (!chat || !actor) return false;
+	if (candidateMembers && candidateMembers.length === 0) return false;
+	// 只处理超级群组与频道：普通群的 ID 不是 -100 开头，与 /addgroup 的口径保持一致。
+	if (chat.type !== 'supergroup' && chat.type !== 'channel') return false;
+	if (!isSupergroupChatId(chat.id)) return false;
+
+	const botId = await getBotId();
+	if (!botId) return false;
+	if (candidateMembers) {
+		member = candidateMembers.find((m) => String(m.id) === String(botId)) || null;
+	}
+	if (!member || String(member.id) !== String(botId)) return false;
+
+	if (!isPrimaryOwner(actor.id)) {
+		console.log('[动态群组] 非第一主人将机器人加入，未自动登记:', JSON.stringify({
+			群ID: chat.id, 群名: chat.title, 操作人ID: actor.id, 机器人ID: botId
+		}));
+		return false;
+	}
+
+	const isChannel = chat.type === 'channel';
+	const result = await addDynamicGroup(env, chat.id, {
+		title: chat.title || null,
+		addedBy: 'auto:owner',
+		note: isChannel
+			? '第一主人通过 /start 添加频道自动登记（频道无成员可封，仅登记展示）'
+			: '第一主人通过 /start 添加群组自动登记'
+	});
+
+	if (!result?.ok) {
+		// EXISTS / ENV_DUPLICATE 是同一件事的重复事件（入群与提权各来一次），静默即可，
+		// 否则主人每加一个群都会收到两条一样的通知。
+		if (result?.code !== 'EXISTS' && result?.code !== 'ENV_DUPLICATE') {
+			console.error('[动态群组] 自动登记失败:', JSON.stringify({ 群ID: chat.id, 结果: result }));
+		}
+		return false;
+	}
+
+	// 只在【首次登记成功】时通知一次。权限预检不阻断登记 —— 主人的实际操作顺序是
+	// 「先添加、后授权」，此刻没权限是正常状态，提示他补权限即可。
+	let accessLine = '';
+	if (isChannel) {
+		accessLine = '⚠️ 频道没有成员可封，治理动作不会发生，这里只做登记与展示。';
+	} else {
+		const access = await checkPurgeGroupAccess(chat.id, botId);
+		accessLine = access.ok
+			? '✅ 已具备管理员权限与封禁用户权限。'
+			: '⚠️ 还差权限：' + (access.reason || '未知')
+				+ '。把机器人设为管理员并勾选「封禁用户」后才会真正处置。';
+	}
+
+	try {
+		await sendTelegramMessage(OWNER_IDS[0],
+			'🆕 <b>已自动纳入动态群组</b>\n\n'
+			+ '名称：' + escapeHtml(chat.title || String(chat.id)) + '\n'
+			+ 'ID：<code>' + escapeHtml(String(chat.id)) + '</code>\n'
+			+ '类型：' + (isChannel ? '频道' : '超级群组') + '\n\n'
+			+ accessLine);
+	} catch (error) {
+		console.error('[动态群组] 通知主人失败:', error);
+	}
+
+	return true;
 }
 
 async function handleNewChatMemberBots(message) {
