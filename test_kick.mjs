@@ -4544,7 +4544,7 @@ console.log('\n[23] 一键代发链路已移除');
 	assert('Webhook 初始化 → /ad 投票按钮回调已启用', webhookCall?.body?.allowed_updates?.includes('callback_query'));
 	// 【2026-10-14 补】主菜单补进 start/menu/user/adstats/dryrun 五条第一主人命令（各注明确是什么），
 	// 同日再补 /wl 与 /del —— 一对用户白名单的增删入口，与 /whitelist（域名白名单，判据层）分名。
-	assert('BotFather 菜单统一注册（含 /rm /profile + 新补五条 + /wl + /del + /listgroups）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice', 'start', 'menu', 'user', 'adstats', 'dryrun', 'wl', 'del', 'listgroups']));
+	assert('BotFather 菜单统一注册（含 /rm /profile + 新补五条 + /wl + /del + /listgroups + /addgroup /delgroup /leavegroup）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice', 'start', 'menu', 'user', 'adstats', 'dryrun', 'wl', 'del', 'listgroups', 'addgroup', 'delgroup', 'leavegroup']));
 	// /wl /del 与 rm/profile 同口径：菜单说明必须标权限，否则主人看不出它只给第一主人用
 	assert('/wl 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'wl')?.description || '').includes('仅第一主人'));
 	assert('/del 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'del')?.description || '').includes('仅第一主人'));
@@ -4554,6 +4554,16 @@ console.log('\n[23] 一键代发链路已移除');
 	assert('/del 菜单说明写明删的是白名单', /白名单/.test(String((commandCall?.body?.commands || []).find((x) => x.command === 'del')?.description || '')));
 	// 【2026-10-15 补】/listgroups 摆上菜单，同样必须标权限，否则主人看不出它只给第一主人用
 	assert('/listgroups 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'listgroups')?.description || '').includes('仅第一主人'));
+	// 【2026-10-22 补】动态群组三条摆上菜单，与 /listgroups 同口径：
+	// 必须标「仅第一主人」，且必须标「私聊」——这两条在群里发只会静默丢弃，
+	// 说明里不写清，看起来就像命令坏了。
+	for (const cmd of ['addgroup', 'delgroup', 'leavegroup']) {
+		const desc = String((commandCall?.body?.commands || []).find((x) => x.command === cmd)?.description || '');
+		assert(`/${cmd} 菜单说明标注「仅第一主人」`, desc.includes('仅第一主人'), desc);
+		assert(`/${cmd} 菜单说明标注「私聊」`, desc.includes('私聊'), desc);
+		// 说明里要给出 ID 形态，否则用户不知道该传什么参数
+		assert(`/${cmd} 菜单说明含 -100xxx 参数示例`, desc.includes('-100xxx'), desc);
+	}
 	// rm / profile 允许写说明，且必须标注权限「仅第一主人」
 	assert('rm / profile 菜单说明标注「仅第一主人」', ['rm', 'profile'].every((c) => {
 		const entry = (commandCall?.body?.commands || []).find((x) => x.command === c);

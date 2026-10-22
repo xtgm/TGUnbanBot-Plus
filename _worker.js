@@ -876,7 +876,19 @@ async function handleInitialization(request, env) {
 				// ↓【2026-10-15 补】主人要求把 /listgroups 摆到 / 菜单明面。
 				// 权限闸门本就在「动态群组管理」那段的 isPrimaryOwner（非第一主人私聊回
 				// 权限不足、群内静默），这里只是把入口摆出来，没有放宽任何一道门。
-				{ command: "listgroups", description: "列出全部生效群组与群名 (仅第一主人)" }
+				{ command: "listgroups", description: "列出全部生效群组与群名 (仅第一主人)" },
+				// ↓【2026-10-22 补】主人要求把动态群组三条摆到 / 菜单明面上并附说明。
+				// 这三条此前只在 /help 长清单里（/start 里也没提），输入 / 弹不出来。
+				// 权限闸门本就全是第一主人：
+				//   /addgroup /delgroup —— 「动态群组管理」段 isPrimaryOwner，群内静默、
+				//                          非第一主人私聊回「权限不足」；
+				//   /leavegroup        —— 单独一段 isPrimaryOwner，且强制私聊。
+				// 这里只是把入口摆到明面，没有放宽任何一道门。
+				// 说明里必须写明「仅第一主人」与「私聊」，否则在群里输入会被静默丢弃，
+				// 看起来就像命令坏了。
+				{ command: "addgroup", description: "新增治理群，免改环境变量；参数 -100xxx [备注] (仅第一主人私聊)" },
+				{ command: "delgroup", description: "停止治理该群，bot 仍留在群里；参数 -100xxx (仅第一主人私聊)" },
+				{ command: "leavegroup", description: "让 bot 退出指定群；参数 -100xxx (仅第一主人私聊)" }
 			]
 		};
 
