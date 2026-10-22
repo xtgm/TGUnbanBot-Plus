@@ -10224,10 +10224,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 		if (isInGroup) {
-			// 群组管理是全局配置，强制私聊执行，避免群内误操作与信息外泄
-			await deleteAuthorizedGroupCommandMessage(message, '/groups');
-			await sendTelegramMessage(userId, 'ℹ️ 动态群组管理命令请在私聊中使用。');
-			return;
+			// 【2026-10-22 放开】/delgroup 允许在群内执行 —— 主人要求「通过当前群组发送
+			// /delgroup 停止治理该群并且自动退出 bot」，这是撤走某个群全部权限的唯一
+			// 顺手入口（人在群里、命令就在手里，不用先查 ID 再去私聊）。
+			// 其余两条仍然强制私聊：/addgroup 要传目标群 ID（群内发没有意义，还容易
+			// 把当前群当成参数误加）、/listgroups 输出十几行会刷屏。
+			const inGroupHead = parseTelegramCommand(text).head;
+			if (inGroupHead !== '/delgroup') {
+				await deleteAuthorizedGroupCommandMessage(message, '/groups');
+				await sendTelegramMessage(userId, 'ℹ️ 该命令请在私聊中使用；/delgroup 可在群内直接发。');
+				return;
+			}
 		}
 		if (!env.DB) {
 			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间，无法管理动态群组。');
@@ -10286,21 +10293,112 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const targetGroupId = String(rawId || '').trim();
 
 		if (head === '/delgroup') {
-			if (!targetGroupId) {
+			// 【2026-10-22】群内 /delgroup = 停止治理【并且】退出机器人（主人要求）。
+			// 私聊 /delgroup 保持原语义，只停治理、bot 留在群里 —— 私聊里一次失误不该
+			// 顺手把机器人也退了；想退群就在群里发，或再用 /leavegroup 点名。
+			const inGroup = message.chat.type !== 'private';
+			const targetId = inGroup ? String(chatId) : targetGroupId;
+
+			if (inGroup && targetGroupId && String(targetGroupId) !== String(chatId)) {
+				// 群内带参数时必须是本群：/delgroup 在群内会真的退出机器人，
+				// 参数写错等于把别的群的治理和机器人一起停掉。
+				await deleteAuthorizedGroupCommandMessage(message, '/delgroup');
+				await sendTelegramMessage(userId,
+					'❌ <b>群内 /delgroup 只能作用于当前群</b>\n\n'
+					+ '当前群:<code>' + escapeHtml(String(chatId)) + '</code>\n'
+					+ '你写的是:<code>' + escapeHtml(targetGroupId) + '</code>\n\n'
+					+ '要停别的群请到私聊执行。');
+				return;
+			}
+			if (!targetId) {
 				await sendTelegramMessage(chatId, '用法:<code>/delgroup -100xxxx</code>');
 				return;
 			}
-			if (ENV_GROUP_IDS.some((g) => String(g) === targetGroupId)) {
-				await sendTelegramMessage(chatId, `⚠️ <code>${escapeHtml(targetGroupId)}</code> 来自 GROUP_ID 环境变量，无法用指令移除。\n请到 Cloudflare 后台修改 GROUP_ID。`);
+			if (ENV_GROUP_IDS.some((g) => String(g) === targetId)) {
+				// 环境变量群（含杀手模式群、搜索群）不能用指令停 —— 尤其是群内这条，
+				// 退出后没有任何入口能把它加回来（Worker 写不了自己的环境变量），
+				// 主群一旦这样退掉，整台机器人就与所有群失联了。
+				const hint = inGroup
+					? '该群来自 GROUP_ID 环境变量，不能在群内停止治理。\n请到 Cloudflare 后台修改 GROUP_ID。'
+					: '该群来自 GROUP_ID 环境变量，无法用指令移除。\n请到 Cloudflare 后台修改 GROUP_ID。';
+				if (inGroup) await deleteAuthorizedGroupCommandMessage(message, '/delgroup');
+				await sendTelegramMessage(inGroup ? userId : chatId,
+					`⚠️ <code>${escapeHtml(targetId)}</code> ` + hint);
 				return;
 			}
-			const removed = await removeDynamicGroup(env, targetGroupId);
-			await sendTelegramMessage(
-				chatId,
-				removed.ok
-					? `✅ 已移除动态群组 <code>${escapeHtml(targetGroupId)}</code>\nℹ️ bot 仍在该群内，如需退群请用 <code>/leavegroup ${escapeHtml(targetGroupId)}</code>。`
-					: `❌ 移除失败:${escapeHtml(removed.message || '未知错误')}`,
-			);
+
+			const removed = await removeDynamicGroup(env, targetId);
+			if (!removed.ok) {
+				if (inGroup) await deleteAuthorizedGroupCommandMessage(message, '/delgroup');
+				await sendTelegramMessage(inGroup ? userId : chatId,
+					`❌ 移除失败:${escapeHtml(removed.message || '未知错误')}`);
+				return;
+			}
+
+			if (!inGroup) {
+				await sendTelegramMessage(
+					chatId,
+					`✅ 已移除动态群组 <code>${escapeHtml(targetId)}</code>\n`
+					+ `ℹ️ bot 仍在该群内。要让 bot 也退出，在<b>该群里</b>直接发 <code>/delgroup</code>，`
+					+ `或用 <code>/leavegroup ${escapeHtml(targetId)}</code>。`,
+				);
+				return;
+			}
+
+			// ── 群内：停止治理后立即退群 ──
+			// 顺序是死的，不能换：上面已经先把 dynamic_groups 删掉，这里才退群。
+			// 反过来的话，「退群成功 + 删库失败」会让该群留在动态列表里但 bot 已不在，
+			// 之后每次全群操作都要为它吃一次 chat not found，而且群里再没人能发 /delgroup 补救。
+			const groupTitle = String(message.chat.title || targetId);
+			await deleteAuthorizedGroupCommandMessage(message, '/delgroup');
+
+			// 私聊回执必须先发 —— 退群之后这个群发不出任何消息，回执只能落在私聊。
+			await sendTelegramMessage(OWNER_IDS[0],
+				'✅ <b>已停止治理并退出该群</b>\n\n'
+				+ '🏷️ 群名:' + escapeHtml(groupTitle) + '\n'
+				+ '🆔 群 ID:<code>' + escapeHtml(targetId) + '</code>\n\n'
+				+ '已从动态群组列表移除，正在退出该群。\n'
+				+ '该群不再受任何治理：黑名单拦截、广告检测、全群封禁、/stats 全部停止。\n\n'
+				+ 'ℹ️ 要恢复:把机器人重新拉进群即可（第一主人操作会自动纳入），'
+				+ '或在私聊用 <code>/addgroup ' + escapeHtml(targetId) + '</code>。');
+
+			// 群里尽力留一句，让其他管理员知道机器人为什么走。发送失败不影响退出。
+			try {
+				await sendTelegramMessage(chatId, '👋 已停止本群治理，机器人正在退出。');
+			} catch (_) { /* 通知失败不阻断退群 */ }
+
+			const beforeLeave = await getBotChatMembership(chatId);
+			if (beforeLeave.ok && !beforeLeave.inChat) {
+				await sendTelegramMessage(OWNER_IDS[0],
+					'ℹ️ bot 本就不在该群，无需退出\n群 ID:<code>' + escapeHtml(targetId) + '</code>');
+				return;
+			}
+
+			const leaveResult = await leaveTelegramChat(chatId);
+			if (!leaveResult.ok) {
+				await sendTelegramMessage(OWNER_IDS[0],
+					'⚠️ <b>治理已停，但退群失败</b>\n\n'
+					+ '群:<b>' + escapeHtml(groupTitle) + '</b> <code>' + escapeHtml(targetId) + '</code>\n'
+					+ '原因:' + escapeHtml(translateLeaveChatError(leaveResult.error)) + '\n\n'
+					+ '治理配置已经删掉了，bot 留在群里也不会做任何处置。'
+					+ '如仍需退群，请在私聊用 <code>/leavegroup ' + escapeHtml(targetId) + '</code>。');
+				return;
+			}
+
+			const afterLeave = await getBotChatMembership(chatId);
+			if (afterLeave.ok && !afterLeave.inChat) {
+				await sendTelegramMessage(OWNER_IDS[0],
+					'✅ 已确认退出 <b>' + escapeHtml(groupTitle) + '</b> <code>' + escapeHtml(targetId) + '</code>');
+			} else if (afterLeave.ok && afterLeave.inChat) {
+				await sendTelegramMessage(OWNER_IDS[0],
+					'⚠️ Telegram 返回退出成功，但复查显示 bot 仍在群内（状态:'
+					+ escapeHtml(formatBotChatMembershipStatus(afterLeave)) + '）。\n'
+					+ '治理配置已删除，请稍后手动确认。');
+			} else {
+				await sendTelegramMessage(OWNER_IDS[0],
+					'⚠️ 退出请求已发送，但无法确认最终状态:'
+					+ escapeHtml(translateLeaveChatError(afterLeave.error)) + '\n治理配置已删除。');
+			}
 			return;
 		}
 
