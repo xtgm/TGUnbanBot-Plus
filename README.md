@@ -96,7 +96,7 @@
 - `/health` —— 运行检查两层：状态自检（bot 身份 / D1 / 统计活性 / AI 绑定）+ 逐群体检（在不在群、是否管理员、三权限），成本约 `1+2N` 次请求
 - `/menu` —— **群设置菜单页**，三入口（群统计 / 资料卡 / 运行检查），点入口原地切换；返回键只在第一主人打开时挂
 - `/search 关键词` `TGID` `@用户名` —— 关键词搜索带分页，大小写不敏感、`LIKE` 走 `ESCAPE` 转义；**普通管理员 / 副主人 / 超管不可用**
-- `/killer [on|off|status]` —— 杀手模式：**ON = 全群封禁踢出**（含自动处置）、**OFF = 仅永久禁言**（默认，需群在 `KILLER_MODE_GROUPS`）；非杀手群的 `/ban` `/spam` 恒为禁言，要踢人用 `/sban`
+- 杀手群（`KILLER_MODE_GROUPS`，规则固定无开关）—— **自动检测永久禁言**（退群再进重新禁言）、**`/ban` `/spam` `/sban` 踢出**（复入群踢回）；同款直封 / 同款连带 / `/ad` 投票与杀手群**完全隔离**。非杀手群的 `/ban` `/spam` 恒为禁言，要踢人用 `/sban`
 - `/dryrun [on|off|status]` —— **演练模式**：判定照跑但不删不封不加黑不学习，命中写流水 + 私聊通知**带两个按钮当场拍板**（✅确认封 / ❌不该封）。群内回执发完即撤；**只挡处置不挡同款**（重发照删、`/spam` 连带照追）。⚠️ 演练期间该群完全不设防
 - `/recent [N]` —— 捞回已被删的广告：按广告特征强度取最近 48 小时，冻结成快照私聊
 
@@ -211,7 +211,7 @@
 | --- | --- | --- |
 | `OWNER_IDS` | 空数组 | 主人 / 副主人 TGID。**第一个是主人**（收全部通知），其余副主人（收加黑踢出通知） |
 | `SUPER_ADMIN_IDS` | 空数组 | 超管 TGID，**等同群管理员全部权限但免挂管理员身份**；不含主人高级命令、不参与 `/stats`、本人豁免广告自动检测 |
-| `KILLER_MODE_GROUPS` | 空数组 | 杀手模式可用群，**自动并入 GROUP_IDS**（仅执行方式不同：禁言不踢） |
+| `KILLER_MODE_GROUPS` | 空数组 | 杀手群，**自动并入 GROUP_IDS**（自动检测禁言、人工命令踢出；不参与同款 / 连带 / 投票） |
 | `STAT_SEARCH_GROUPS` | 空数组 | 关键词搜索的**正文保留群**（这些群按 `created_at` 保留 180 天，其余群只留全局最新 200 条）；**自动并入 GROUP_IDS**，不并入则不写缓存、配了也搜不到 |
 | `PROFILE_LOOKUP_GROUPS` | 空 | **只读资料群**，仅供 `/admins` 查昵称，**完全不参与治理** |
 | `STATIC_USER_PROFILES` | 空 | `/admins` 静态资料兜底（JSON），查到实时资料后自动覆盖 |
@@ -270,7 +270,7 @@
 
 - **核心 5 张** —— `schema_meta` schema 版本号（当前 `8`）、`blacklist` 全局黑名单（TGID / 原因 / 操作人 / 时间 / 备注）、`moderation_messages` 群消息缓存（`/spam` `/ban` 清扫历史发言与**同款连带反查**；被判过的广告标 `is_ad=1`，`/spam` 追得到、`/search` 检索不到）、`batch_jobs` 批量任务状态与游标、`dynamic_groups` 动态治理群
 - **统计 4 张** —— `stat_speech` `stat_member` `stat_actions` 按天计数（`/stats` 数据源）、`stat_member_events` 入群/退群/申请**明细**（`/profile` 时间线，**永久不剪枝**）
-- **按需建立 4 张** —— `ad_votes` `ad_vote_allowlist`（`/ad` 投票）、`killer_mode`、`dryrun_groups`
+- **按需建立 3 张** —— `ad_votes` `ad_vote_allowlist`（`/ad` 投票）、`dryrun_groups`（旧版 `killer_mode` 表已停用，线上残留无害）
 - **广告检测 18 张** —— 判定：`ad_fingerprints` 指纹库（keyword/domain/username/bio 四类）、`ad_user_screening` 观察窗口、`ad_sample_embeddings` AI 样本与向量、`ad_domain_whitelist` 域名白名单、`ad_profile_shapes` 资料形状库、`ad_spam_texts` 同款直封名单；**素材指纹三张**：`ad_avatars` 头像、`ad_images` 正文图片（多一列 `kind`，只有 photo/sticker 进视觉识别）、`ad_badges` 会员标 + 正文贴纸 emoji（同一 id 体系共用一张表与同一道安全阀）—— 三者 `verdict` 同为 `pending`/`ad`/`clean` 三态，`/ignore` 纠错口径一致；**流程**：`ad_group_members` 名册、`ad_scan_state` 滚动复查游标、`ad_learn_snapshots` `/recent` 冻结快照、`ad_confirm_tokens` 二次确认令牌、`ad_join_checks` 入群检查流水（含正常号，留 30 天）、`ad_dryrun_log` 演练命中流水（含整份 `evaluation` 供按钮回放，留 30 天）、`ad_pending_snapshots` 待复核快照（**100 年不过期**，`/ignore` 后置 `expires_at=0` 不再算案底）、`ad_link_cache` 资料挂载链接解析缓存（两本案底 `ad_known` 查用户黑名单、`ad_confirmed` 自举标记，按 `fetched_at` 6 小时过期）、`ad_group_admins` 配置群管理员同步（群内提权/撤职即时写、cron 全量兜底，热路径的免检读它）
 
 后两张按需建立、不进完整性复验。

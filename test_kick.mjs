@@ -4879,8 +4879,12 @@ console.log('\n[67] /help OWNER_IDS 专属');
 		!!dm && dm.body.text.includes('/stats today　') && dm.body.text.includes('/stats week　') && dm.body.text.includes('/stats month　'));
 	assert('主人 /help → /stats 指定群写法也逐行列出',
 		!!dm && dm.body.text.includes('/stats -100群ID today　') && dm.body.text.includes('/stats -100群ID month　'));
-	assert('主人 /help → 杀手模式 on / off / status 各自独立成行',
-		!!dm && dm.body.text.includes('/killer on　') && dm.body.text.includes('/killer off　') && dm.body.text.includes('/killer status　'));
+	// 2026-10-23 杀手群重构：/killer 开关已删除，/help 改写成固定规则说明。
+	assert('主人 /help → 杀手群固定规则说明（自动禁言 / 人工踢 / 三功能隔离），不再列 /killer',
+		!!dm && dm.body.text.includes('杀手群（环境变量 KILLER_MODE_GROUPS')
+		&& dm.body.text.includes('自动检测命中广告　永久禁言')
+		&& dm.body.text.includes('/ban /spam /sban　踢出')
+		&& !dm.body.text.includes('/killer'));
 	// 曾漏列的三条：代码里实现了却查不到，主人无从知道它们存在。
 	assert('主人 /help → 含 /blacklist 与批量任务两条',
 		!!dm && dm.body.text.includes('/blacklist　') && dm.body.text.includes('/job 任务ID') && dm.body.text.includes('/jobrun 任务ID'));

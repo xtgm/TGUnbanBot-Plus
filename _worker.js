@@ -144,16 +144,13 @@ const DEFAULT_OWNER_IDS = [];
 //    空数组 = 未配置该角色。
 const DEFAULT_SUPER_ADMIN_IDS = [];
 
-// 10.6) 杀手模式可用群（环境变量 KILLER_MODE_GROUPS，逗号分隔超级群 ID，中英文逗号均可）。
-//    只有列进来的群才启用「杀手模式」特别功能，其余群永远按现状（封禁踢出）。
-//    每群 ON/OFF 由第一主人用 /killer 在群内切换，状态存 D1（killer_mode 表）：
-//      · 杀手模式 ON  = 触发即全群封禁 + 踢出（现状）。
-//      · 杀手模式 OFF = 仅永久禁言、不踢出（人留在群里）；仍写入全局黑名单。
-//    默认 OFF（= 禁言），与 GKY 一致（默认永久静音）。改默认改 KILLER_MODE_DEFAULT_ON。
+// 10.6) 杀手群（环境变量 KILLER_MODE_GROUPS，逗号分隔超级群 ID，中英文逗号均可）。
+//    为杀手权限持有者定制，处置口径固定（2026-10-23 重构，原 /killer ON/OFF 开关已删除）：
+//      · 自动检测命中广告 → 永久禁言、人留群
+//      · 人工 /ban /spam /sban、发言拦截、复入群 → 踢出
+//      · 同款直封 / 同款连带 / /ad 投票与杀手群完全隔离：杀手群里不触发，别的群触发也不波及杀手群
 //    空数组 = 该功能完全不启用（零开销）。
 const DEFAULT_KILLER_MODE_GROUPS = [];
-// 杀手模式默认状态：false = 默认 OFF（禁言，同 GKY）；true = 默认 ON（封禁踢出）。
-const KILLER_MODE_DEFAULT_ON = false;
 
 // 10.7) 关键词搜索的保留群（环境变量 STAT_SEARCH_GROUPS，逗号分隔超级群 ID，中英文逗号均可）。
 //    moderation_messages 全局只留 200 条（按 autoincrement 取最新），别的群照旧；
@@ -252,13 +249,11 @@ let OWNER_IDS = [];
 // 超级管理员 TGID 列表：等同 Telegram 群管理员的全部权限（免实际管理员身份），
 // 可用 /ban /spam /unban /check；不含主人/副主人高级权限，也不参与 /stats。空数组 = 未配置。
 let SUPER_ADMIN_IDS = [];
-// 杀手模式可用群 ID 列表（环境变量 KILLER_MODE_GROUPS）。每群 ON/OFF 存 D1，第一主人用 /killer 切换。
+// 杀手群 ID 列表（环境变量 KILLER_MODE_GROUPS）。处置口径固定，见顶部 10.6。
 let KILLER_MODE_GROUPS = [];
 // 关键词搜索的保留群 ID 列表（环境变量 STAT_SEARCH_GROUPS）。这些群的正文按天保留 180 天，
 // 其余群维持全局 200 条。空数组 = 不启用，裁剪行为与改动前完全一致。
 let STAT_SEARCH_GROUPS = [];
-// 每请求解析出的「当前处于禁言模式（杀手 OFF）」的群集合。KILLER_MODE_GROUPS 为空时恒为空集、零开销。
-let MUTE_MODE_GROUP_SET = new Set();
 // 静态用户资料表：bot 不在其所在群时作为 /admins 权限名单的兜底显示
 // 格式：TGID 字符串 → { id, first_name, last_name, username }
 // 环境变量 STATIC_USER_PROFILES（JSON 字符串）优先，留空则为空表
@@ -316,11 +311,8 @@ function applyRuntimeConfig(config) {
 	BOT_TOKEN = config.BOT_TOKEN;
 	KILLER_MODE_GROUPS = config.KILLER_MODE_GROUPS || [];
 	STAT_SEARCH_GROUPS = config.STAT_SEARCH_GROUPS || [];
-	// 杀手模式群并入有效 GROUP_IDS：它们即使不在 GROUP_ID 环境变量里，也享受完整全群治理
-	// （/stats、/ban、/spam、/check、/ad、广告检测、发言/进退群统计），但执行走禁言不踢
-	// —— 因为杀手模式 OFF 时 isGroupMuteMode 命中，banUserFromAllGroups / 拦截 / 批量 / purge
-	// 都会把这些群改成 restrictChatMember 禁言。等价于「加进 GROUP_ID + 杀手 OFF」，只是可用
-	// KILLER_MODE_GROUPS 单独管理。
+	// 杀手群并入有效 GROUP_IDS：它们即使不在 GROUP_ID 环境变量里，也享受全群治理
+	// （/stats、/ban、/spam、/check、广告检测、发言/进退群统计），处置口径按顶部 10.6 固定。
 	// 搜索群同样并入：不并入就不算配置群，isConfiguredGroup 为 false，消息一条都不写缓存，
 	// STAT_SEARCH_GROUPS 配了也搜不到东西。语义上它也确实是「我们要治理并留下记录的群」。
 	const effectiveGroupIds = [...new Set([...(config.GROUP_IDS || []), ...KILLER_MODE_GROUPS, ...STAT_SEARCH_GROUPS])];
@@ -333,8 +325,6 @@ function applyRuntimeConfig(config) {
 	GROUP_ID = config.GROUP_ID;
 	OWNER_IDS = config.OWNER_IDS;
 	SUPER_ADMIN_IDS = config.SUPER_ADMIN_IDS || [];
-	// 每请求先清空禁言模式集合；enabled 时由 refreshMuteModeGroups(env) 按 D1 状态重建。
-	MUTE_MODE_GROUP_SET = new Set();
 	STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
 	PROFILE_LOOKUP_GROUPS = config.PROFILE_LOOKUP_GROUPS || [];
 	AD_PROTECTED_USERNAMES = config.AD_PROTECTED_USERNAMES || [];
@@ -389,8 +379,6 @@ export default {
 		// 必须在任何路由分发之前合并 /addgroup 动态群：isConfiguredGroup 及其 26 个调用点
 		// 都依赖 GROUP_IDS，晚于分发会导致动态群被当成"非配置群"直接忽略。
 		await mergeDynamicGroupsFromD1(env);
-		// 重建禁言模式群集合（KILLER_MODE_GROUPS 为空时零开销）；必须在任何封禁/拦截分发之前。
-		await refreshMuteModeGroups(env);
 
 		if (url.pathname === "/banlist" && url.searchParams.has('tgid') && url.searchParams.get('tgid') != '') {
 			const tgid = url.searchParams.get('tgid');
@@ -476,7 +464,6 @@ export default {
 		// 重新校验任务里存的 groupIds，此处不合并会把动态群静默丢弃 ——
 		// 任务回执显示成功，但那些群实际没有执行封禁。
 		await mergeDynamicGroupsFromD1(env);
-		await refreshMuteModeGroups(env);
 
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
@@ -512,7 +499,6 @@ export default {
 		}
 		try {
 			await mergeDynamicGroupsFromD1(env);
-			await refreshMuteModeGroups(env);
 			const summary = await runAdBioRescan(env);
 			// 头像视觉识别独立一轨：与 bio 复查共用 cron 节拍，但各自有日预算，
 			// 互不挤占（bio 扫描看 ad_scan_state 的 scan_*，这里看 avatar_*）。
@@ -2565,7 +2551,6 @@ const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
 const D1_AD_VOTE_INIT_PROMISES = new WeakMap();
-const D1_KILLER_MODE_INIT_PROMISES = new WeakMap();
 const D1_DYNAMIC_GROUPS_CACHE = new WeakMap();
 
 function cloneD1RuntimeValue(value) {
@@ -3325,26 +3310,37 @@ async function removeFromBlacklist(userId, env) {
 // 对目标用户执行所有配置群的 Telegram 封禁/预封，逐群结果数组返回。
 // 用户在群内时 banChatMember 会把人移出并封禁；用户不在群内但 Telegram 可识别时，会加入群封禁列表（预封）。
 // bot 不在群 / 没权限 / Telegram 无法识别用户时，单群失败不影响其它群；串行避免 Telegram API 限流。
-// 杀手模式 OFF 的群（isGroupMuteMode）【略过封禁踢出，改为仅永久禁言】——人留在群里。
 // 返回 [{ groupId, userId, ok, error, memberProbe, muted }]
-// 人工命令（/ban /spam /sban）的踢/禁言口径：杀手模式 ON 的群保持【踢出】（现状不变），
-// 其余一律【禁言】。这样 /ban /spam 默认不再踢人，而 KILLER_MODE_GROUPS 里那个开关为 ON 的群
-// 仍按老行为踢出 —— 杀手模式自身的全部功能零改动。
+//
+// 【杀手群口径（2026-10-23 重构）】杀手群（KILLER_MODE_GROUPS）是为杀手权限持有者定制的，
+// 原先的 /killer ON/OFF 开关让「自动检测」与「人工命令」永远走同一种处置，满足不了他的口径。
+// 现在固定为：自动检测命中（缺省 mode）→ 永久禁言、人留群；其余一切（人工命令、拦截、复入群）→ 踢出。
+// 普通配置群的口径一个字节不变：人工命令禁言、自动路径踢出。
 function resolveHumanCommandMode(groupId) {
-	return isKillerModeGroup(groupId) && !isGroupMuteMode(groupId) ? 'kick' : 'mute';
+	return isKillerModeGroup(groupId) ? 'kick' : 'mute';
+}
+
+// 杀手群里一条黑名单记录该用哪种处置：自动检测（reason=ad_auto）的永久禁言，其余踢出。
+// 拦截、复入群、原生解封封回、/purge 都按这一条分流 —— 封的时候怎么处置，之后就怎么维持，
+// 不会出现「封的时候禁言、复入群时又被踢」的矛盾。
+function isKillerMuteReason(reason) {
+	return String(reason || '') === 'ad_auto';
 }
 
 // 单群执行处置，按 mode 分派。mode 值域：
 //   'kick'  → 恒踢出（/sban，含预封与撤回历史发言）
-//   'human' → 人工命令口径（resolveHumanCommandMode：杀手 ON 踢、其余禁言）
-//   缺省    → 现状口径：杀手模式 OFF 的群禁言、其余踢出（自动路径与 /purge 一直这么走，不传即不变）
+//   'human' → 人工命令口径（resolveHumanCommandMode：杀手群踢、普通群禁言）
+//   'mute'  → 恒禁言（杀手群里按黑名单 reason 分流到禁言的那一支）
+//   缺省    → 自动路径口径：杀手群禁言、普通群踢出（自动检测与 /purge 默认走这里）
 // 返回 { groupId, userId, ok, error, muted, mutedBy, memberProbe, retried }
 async function applyGroupModeration(groupId, userId, mode, options = {}) {
 	const effective = mode === 'kick'
 		? 'kick'
-		: mode === 'human'
-			? resolveHumanCommandMode(groupId)
-			: (isGroupMuteMode(groupId) ? 'mute' : 'kick');
+		: mode === 'mute'
+			? 'mute'
+			: mode === 'human'
+				? resolveHumanCommandMode(groupId)
+				: (isKillerModeGroup(groupId) ? 'mute' : 'kick');
 	if (effective === 'mute') {
 		// 禁言：不踢、不预封，只对【已在群里】的人永久禁言（restrictChatMember）。
 		//
@@ -3387,6 +3383,7 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 						+ '该用户若后续进群/发言仍会按 D1 黑名单拦截',
 				retried: false,
 				muted: true,
+				// 'human' 只有普通配置群会走到（杀手群的人工命令是踢）；其余禁言都是杀手群口径。
 				mutedBy: mode === 'human' ? 'human' : 'killer',
 				memberProbe,
 				// skipped 让回执能分辨「探测后主动跳过」与「真的调用失败」——
@@ -3433,9 +3430,12 @@ const BAN_ALL_GROUPS_CONCURRENCY = 5;
 // options.primaryGroupId：事发群（人从这里进来的那个群）。给了它就【先同步封这一个】，
 // 其余群并发补上 —— 入群封禁要的是「进群那一刻」被请出去，不该先在别的群上排队。
 // 不给时行为与改动前一致（全部群一起并发），只是从串行变成并发。
+// options.groupIds：只封这批群（不给 = 全部配置群）。同款 / 连带 / 投票传 nonKillerGroupIds()，
+// 让杀手群不被这三个功能波及。
 async function banUserFromAllGroups(userId, options = {}) {
+	const scope = Array.isArray(options.groupIds) ? options.groupIds : GROUP_IDS;
 	const primary = String(options.primaryGroupId || '');
-	const rest = GROUP_IDS.filter((groupId) => String(groupId) !== primary);
+	const rest = scope.filter((groupId) => String(groupId) !== primary);
 	const results = [];
 	if (primary) {
 		results.push(await applyGroupModeration(primary, userId, options.mode, options));
@@ -3729,7 +3729,7 @@ function getBanResultStats(banResults) {
 }
 
 function formatBanSuccessResult(r) {
-	// mutedBy：'human' = 人工命令口径（/ban /spam 默认禁言）；'killer' = 杀手模式关闭状态。
+	// mutedBy：'human' = 人工命令口径（/ban /spam 默认禁言）；'killer' = 杀手群自动检测口径。
 	//
 	// 【探测后主动跳过要排在最前】这一支【压根没调接口】，说成「已永久禁言」是假的 ——
 	// 2026-10-12 主人就是在 /ban 一个已在黑名单的人时，看到 14 个群全写「已永久禁言」
@@ -3739,7 +3739,7 @@ function formatBanSuccessResult(r) {
 	// 【不能说「预封」】禁言接口【没有预封能力】—— 那是既有断言明确守住的语义。
 	// 这个用户只是被 D1 黑名单记着，进群时由复入群拦截兜底，不是被 Telegram 预封。
 	if (r?.skipped === 'not_in_group') return '目标当前不在群内，已跳过禁言（不把已离群的人拉回来）；D1 黑名单已生效，后续进群/发言仍会按 D1 黑名单拦截';
-	if (r?.muted) return r?.mutedBy === 'human' ? '已永久禁言（未踢出）' : '已永久禁言（杀手模式关闭，未踢出）';
+	if (r?.muted) return r?.mutedBy === 'human' ? '已永久禁言（未踢出）' : '已永久禁言（杀手群自动检测口径，未踢出）';
 	const state = r?.memberProbe?.state;
 	if (state === 'in_group') return '已封禁并移出群聊';
 	if (state === 'not_in_group') return '已加入群封禁列表（预封，禁止后续进群）';
@@ -3811,10 +3811,10 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${total}</b>（${failCount} 个失败）`);
 	}
 	if (mutedCount > 0 && mutedCount < total) {
-		// 混合口径：/ban /spam 在杀手模式 ON 的群仍踢出、其余禁言 —— 两种都要说清，不能只提杀手模式。
+		// 混合口径：/ban /spam 在杀手群踢出、普通群禁言；自动检测在杀手群禁言、普通群踢出 —— 两种都要说清。
 		const mutedParts = [];
 		if (humanMutedCount > 0) mutedParts.push(`${humanMutedCount} 个群仅永久禁言、未踢出`);
-		if (killerMutedCount > 0) mutedParts.push(`${killerMutedCount} 个群命中杀手模式关闭状态，仅永久禁言`);
+		if (killerMutedCount > 0) mutedParts.push(`${killerMutedCount} 个杀手群按自动检测口径仅永久禁言`);
 		lines.push(`🔇 其中 ${mutedParts.join('；')}。`);
 	}
 	if (banResults.some((r) => r.ok && r.memberProbe?.state === 'not_in_group')) {
@@ -3880,7 +3880,7 @@ function renderBanResults(banResults) {
 			: `🔇 杀手模式：已永久禁言 ${okCount}/${total} 个群（未踢出）`;
 	}
 	if (mutedCount > 0 && humanMutedCount > 0) {
-		// /ban /spam 混合口径：杀手模式 ON 的群踢出、其余禁言。
+		// /ban /spam 混合口径：杀手群踢出、普通群禁言。
 		return `✅ Telegram 处置成功 ${okCount}/${total} 个配置群（禁言 ${humanMutedCount}、踢出 ${total - mutedCount}）`;
 	}
 	if (okCount === total) return `✅ Telegram封禁/预封成功 ${okCount}/${total} 个配置群`;
@@ -4747,7 +4747,8 @@ function estimateBulkAuthorizationRequests(message) {
 function createBulkJobPayload(action, ids, invalid, note, message, options = {}) {
 	const now = new Date().toISOString();
 	const operator = formatMessageActorMention(message);
-	const groupIds = GROUP_IDS.map((id) => String(id));
+	// options.groupIds：只处置这批群（同款连带的批量任务传 nonKillerGroupIds()，不波及杀手群）。
+	const groupIds = (Array.isArray(options.groupIds) ? options.groupIds : GROUP_IDS).map((id) => String(id));
 	const normalizedAction = normalizeBulkJobAction(action);
 	const isUnban = normalizedAction === 'unban';
 	const budget = shouldUseBulkQueue(ids.length, groupIds.length, {
@@ -4760,7 +4761,7 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		action: normalizedAction,
 		reason: normalizedAction === 'spam' ? 'spam' : (isUnban ? null : 'manual'),
 		// 处置方式（执行时传给 applyGroupModeration）：'kick' = /sban 恒踢出；
-		// 'human' = /ban /spam 口径（杀手 ON 踢、其余禁言）；null = 现状（老任务与自动路径）。
+		// 'human' = /ban /spam 口径（杀手群踢、普通群禁言）；null = 自动路径口径（杀手群禁言、普通群踢）。
 		mode: options.mode || null,
 		command: getBulkJobCommand(normalizedAction),
 		status: 'queued',
@@ -5248,8 +5249,8 @@ async function processBulkJobOperationSlice(job, env) {
 
 		// 按任务携带的 mode 分派单群处置：
 		//   'kick'  → /sban 恒踢出（含撤回历史发言）
-		//   'human' → /ban /spam 口径：杀手模式 ON 的群踢出、其余禁言
-		//   缺省    → 现状：杀手模式 OFF 的群禁言、其余踢出（老任务的 payload 没有该字段，行为不变）
+		//   'human' → /ban /spam 口径：杀手群踢出、普通群禁言
+		//   缺省    → 自动路径口径：杀手群禁言、普通群踢出（老任务的 payload 没有该字段）
 		const result = await applyGroupModeration(task.groupId, task.userId, job.mode);
 		if (result.ok) {
 			incrementBulkJobStat(job, 'kickOk');
@@ -6209,8 +6210,8 @@ async function handlePurge(env, url) {
 		if (status === 'kicked' || status === 'left' || status === null) {
 			return { type: 'left' };
 		}
-		// 禁言模式群：/purge 也只禁言不踢出（与杀手模式一致）；其余群照常踢出。
-		const purgeMute = isGroupMuteMode(groupId);
+		// 杀手群按黑名单 reason 分流：自动检测的只禁言，其余踢出；普通群照常踢出。
+		const purgeMute = isKillerModeGroup(groupId) && isKillerMuteReason(entry.reason);
 		const r = purgeMute ? await muteUserInGroup(groupId, entry.id) : await banUserFromGroup(groupId, entry.id);
 		if (r.ok) {
 			return {
@@ -7426,9 +7427,13 @@ async function handleChatMemberUpdate(chatMember, env) {
 				console.log('[chat_member] 受保护角色复入，不踢回:', JSON.stringify({ 群ID: chat.id, 用户ID: targetIdStr }));
 				return;
 			}
-			if (isGroupMuteMode(chat.id)) {
-				// 禁言模式群：黑名单用户复入【不踢回】（主人要求：只禁言不踢出）。
-				console.log('[chat_member] 禁言模式群，黑名单用户复入不踢回:', JSON.stringify({ 群ID: chat.id, 用户ID: targetIdStr }));
+			if (isKillerModeGroup(chat.id) && isKillerMuteReason(blacklistCheck.entry?.reason)) {
+				// 杀手群里被自动检测禁言的人复入【不踢回】，而是重新禁言：封的时候是禁言，之后就维持禁言。
+				// 必须重新禁言 —— Telegram 里退群再进会丢掉原来的禁言限制，不补上他就能直接发言。
+				const muteResult = await muteUserInGroup(chat.id, targetIdStr);
+				console.log('[chat_member] 杀手群自动检测禁言的用户复入，重新禁言不踢回:', JSON.stringify({
+					群ID: chat.id, 用户ID: targetIdStr, 禁言结果: muteResult.ok ? '成功' : `失败:${muteResult.error}`
+				}));
 				return;
 			}
 			const banResult = await banUserFromGroup(chat.id, targetIdStr);
@@ -7494,9 +7499,9 @@ async function handleChatMemberUpdate(chatMember, env) {
 		// 普通管理员直接使用 Telegram 原生解封时，D1 仍在，因此继续由独立保护链封回。
 		const blacklistCheck = await checkBlacklist(targetIdStr, env);
 		if (blacklistCheck.isBlacklisted) {
-			if (isGroupMuteMode(chat.id)) {
-				// 禁言模式群：不封回（主人要求：只禁言不踢出）。仅记日志，不再通知主人（原生操作通知已取消）。
-				console.log('[chat_member] 禁言模式群，黑名单用户被手动解封，不封回（不再通知主人）:', JSON.stringify(logCommon));
+			if (isKillerModeGroup(chat.id) && isKillerMuteReason(blacklistCheck.entry?.reason)) {
+				// 杀手群里自动检测禁言的人本来就没被踢过，原生解封对他无意义：不封回，仅记日志。
+				console.log('[chat_member] 杀手群自动检测禁言的用户被手动解封，不封回（不再通知主人）:', JSON.stringify(logCommon));
 			} else {
 				// 仍在 D1 黑名单 → 撤销本次群内手动解封，立即封回，绝不删除黑名单记录
 				const banResult = await banUserFromGroup(chat.id, targetIdStr);
@@ -7730,88 +7735,17 @@ async function setAdVoteAllowlist(env, userId, enabled, byUser) {
 	}
 }
 
-// ===== 杀手模式（KILLER_MODE_GROUPS + /killer 每群切换，状态存 D1）=====
-// ON = 封禁踢出（现状）；OFF = 仅永久禁言、不踢出（人留群）。无记录走 KILLER_MODE_DEFAULT_ON。
-async function ensureKillerModeTable(env) {
-	if (!env.DB) return false;
-	const cached = D1_KILLER_MODE_INIT_PROMISES.get(env.DB);
-	if (cached) return cached;
-	const initPromise = (async () => {
-		try {
-			if (!(await ensureD1Table(env))) throw new Error('D1 核心结构不可用');
-			await runD1SchemaStatement(
-				env,
-				'killer_mode',
-				'CREATE TABLE IF NOT EXISTS killer_mode (chat_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, by_user TEXT, at TEXT NOT NULL);',
-			);
-			return true;
-		} catch (error) {
-			console.error('D1 杀手模式表初始化失败: ' + formatD1SchemaError(error));
-			return false;
-		}
-	})();
-	D1_KILLER_MODE_INIT_PROMISES.set(env.DB, initPromise);
-	const initialized = await initPromise;
-	if (!initialized) D1_KILLER_MODE_INIT_PROMISES.delete(env.DB);
-	return initialized;
-}
-
+// ===== 杀手群（KILLER_MODE_GROUPS）=====
+// 处置口径固定（见顶部 10.6）。原 /killer 开关、killer_mode 表、禁言模式集合已于 2026-10-23 删除；
+// 线上若残留 killer_mode 表，代码不再读写它，留着无害。
 function isKillerModeGroup(chatId) {
 	return KILLER_MODE_GROUPS.length > 0 && KILLER_MODE_GROUPS.includes(String(chatId || ''));
 }
 
-// 读取全部群的杀手开关记录 → Map(chat_id → 1/0)。无记录的群由调用方走 KILLER_MODE_DEFAULT_ON。
-async function readKillerStateMap(env) {
-	const map = new Map();
-	if (!env.DB || !KILLER_MODE_GROUPS.length) return map;
-	if (!(await ensureKillerModeTable(env))) return map;
-	try {
-		const { results } = await env.DB.prepare('SELECT chat_id, enabled FROM killer_mode').all();
-		for (const r of (results || [])) map.set(String(r.chat_id), Number(r.enabled) ? 1 : 0);
-	} catch (error) {
-		console.error('[杀手模式] 读取状态失败:', error);
-	}
-	return map;
-}
-// __KILLER_MORE__
-
-// 每请求重建禁言模式群集合：KILLER_MODE_GROUPS 里、当前杀手 OFF 的群 = 禁言模式。
-async function refreshMuteModeGroups(env) {
-	MUTE_MODE_GROUP_SET = new Set();
-	if (!KILLER_MODE_GROUPS.length) return;
-	const stateMap = await readKillerStateMap(env);
-	for (const g of KILLER_MODE_GROUPS) {
-		const id = String(g);
-		const on = stateMap.has(id) ? stateMap.get(id) === 1 : KILLER_MODE_DEFAULT_ON;
-		if (!on) MUTE_MODE_GROUP_SET.add(id);
-	}
-}
-
-// 该群此刻是否禁言模式（杀手 OFF）。读模块级集合、不需 env —— 供逐群封禁/拦截判定。
-function isGroupMuteMode(chatId) {
-	return MUTE_MODE_GROUP_SET.has(String(chatId || ''));
-}
-
-// 单群杀手当前是否 ON（封禁踢出）。供 /killer 显示与切换。
-async function isKillerOn(env, chatId) {
-	const stateMap = await readKillerStateMap(env);
-	const id = String(chatId || '');
-	return stateMap.has(id) ? stateMap.get(id) === 1 : KILLER_MODE_DEFAULT_ON;
-}
-
-// 设置单群杀手开关。on=true → 封禁踢出；on=false → 禁言。
-async function setKillerMode(env, chatId, on, byUser) {
-	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
-	if (!(await ensureKillerModeTable(env))) return { ok: false, error: 'D1 杀手模式表初始化失败' };
-	try {
-		await env.DB.prepare('INSERT OR REPLACE INTO killer_mode (chat_id, enabled, by_user, at) VALUES (?, ?, ?, ?)')
-			.bind(String(chatId), on ? 1 : 0, String(byUser || ''), new Date().toISOString())
-			.run();
-		return { ok: true, on: !!on };
-	} catch (error) {
-		console.error('[杀手模式] 写入状态失败:', error);
-		return { ok: false, error: error.message || String(error) };
-	}
+// 同款直封 / 同款连带 / /ad 投票的作用范围：全部配置群减去杀手群。
+// 杀手群与这三个功能完全隔离 —— 杀手群里不触发，别的群触发时封禁也不波及杀手群。
+function nonKillerGroupIds() {
+	return GROUP_IDS.filter((groupId) => !isKillerModeGroup(groupId));
 }
 
 // ===== 演练模式（dryrun）=====
@@ -7823,8 +7757,8 @@ async function setKillerMode(env, chatId, on, byUser) {
 // 【代价，必须一直写明】演练开着 = 本群完全不设防，广告照发、不删不封。这是演练的
 // 本质不是缺陷，但回执与 /adstats 都要显眼提示，别让人开了忘记关。
 //
-// 【为什么开关不进 fetch 入口的刷新】killer_mode 走 refreshMuteModeGroups 在每个请求
-// 开头读一次；演练若照抄，每条普通消息都会多一条 D1 查询，直接把
+// 【为什么开关不进 fetch 入口的刷新】若在每个请求开头读一次开关，
+// 每条普通消息都会多一条 D1 查询，直接把
 // 「稳定态核心 SQL ≤ 3 条」那条断言撞红。演练只在【定罪时】才走到读开关这一步，
 // 热路径永远到不了它，所以这里刻意不做运行期缓存、也不挂进 fetch 入口。
 const D1_DRYRUN_INIT_PROMISES = new WeakMap();
@@ -8383,7 +8317,9 @@ async function cacheModerationMessage(env, message, options = {}) {
 		const nowIso = new Date().toISOString();
 		// 只有够长的正文才可能命中名单（写入端同一道 6 字门槛）；建表一次后按 DB 实例缓存，不逐条重复。
 		// 广告消息不查同款直封名单：调用方已经走过完整判定链（封禁 / 演练），再查一次只会重复处置。
+		// 杀手群与同款直封完全隔离：杀手群的消息不查名单（照常写缓存，供 /spam 当前群清扫用）。
 		const canMatchSpam = !isAd
+			&& !isKillerModeGroup(message.chat.id)
 			&& Boolean(textKey && String(textKey.norm).length >= 6)
 			&& await ensureAdSpamTextsTable(env);
 		// 带新列写入；若库里还没有 text_hash / text_norm（迁移未跑或跑失败），
@@ -8526,6 +8462,8 @@ async function findLinkedSpamTargets(env, textKey, excludeUserId) {
 		for (const row of results || []) {
 			const uid = String(row.from_id || '');
 			if (!uid || uid === String(excludeUserId)) continue;
+			// 杀手群与同款连带隔离：杀手群里发过同款的号不进连带名单（应用层过滤，SQL 不变）。
+			if (isKillerModeGroup(row.chat_id)) continue;
 			// 二次比对兜住哈希碰撞：FNV-1a 是 32 位，碰撞概率虽低但连带是批量不可逆操作，
 			// 代价不对称 —— 有 text_norm 就没有理由只信哈希。
 			if (String(row.text_norm || '') !== textKey.norm) continue;
@@ -8562,7 +8500,7 @@ async function enforceLinkedSpamTargets(env, targets, options = {}) {
 			by: String(options.operatorId ?? 'system'),
 			note: options.note || '同款广告连带查杀'
 		});
-		const banResults = await banUserFromAllGroups(target.userId, { probeMembership: false });
+		const banResults = await banUserFromAllGroups(target.userId, { probeMembership: false, groupIds: nonKillerGroupIds() });
 		// 风控·处置：同款连带查杀按实际封成功的群逐群 +1。
 		await recordDisposalsFromBanResults(env, banResults);
 		const okCount = banResults.filter((r) => r?.ok).length;
@@ -8857,7 +8795,7 @@ async function enforceHandledRepeatBan(env, message, hit) {
 	}
 	let banResults = [];
 	try {
-		banResults = await banUserFromAllGroups(userId, { probeMembership: false, revokeMessages: true });
+		banResults = await banUserFromAllGroups(userId, { probeMembership: false, revokeMessages: true, groupIds: nonKillerGroupIds() });
 	} catch (error) {
 		console.error('[同款直封] 全群封禁失败:', error);
 	}
@@ -9420,7 +9358,7 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 		`🕐 加黑时间:${addedAt}`,
 	];
 	// 【2026-10-17】文案从「踢人结果」改中性：拦截处置现在跟随 /ban /spam 口径，
-	// 普通配置群禁言、杀手模式 ON 的群才踢出，不再只有踢人一种可能。
+	// 普通配置群禁言、杀手群踢出，不再只有踢人一种可能。
 	if (banResult && !banResult.ok) {
 		lines.push(`⚠️ 处置结果:失败 - ${escapeHtml(banResult.error || '未知')}`);
 	}
@@ -9907,6 +9845,8 @@ async function sendAdVoteCommandFeedback(message, ctx, text) {
 
 async function handleAdCommand(message, env, ctx) {
 	if (!isConfiguredGroup(message?.chat?.id) || message?.chat?.type === 'private') return true;
+	// 杀手群与 /ad 投票隔离：不发起投票，命令静默吞掉（不回话，与其它无权场景一致）。
+	if (isKillerModeGroup(message.chat.id)) return true;
 	const now = Math.floor(Date.now() / 1000);
 	const staleReason = getAdVoteCommandIgnoreReason(message, now);
 	if (staleReason) {
@@ -10153,7 +10093,7 @@ async function enforceApprovedAdVote(env, state) {
 		by: state.creatorUserId,
 		note: ('群内 /ad 举报投票通过' + (state.reason ? '：' + state.reason : '')).slice(0, 500),
 	});
-	const banResults = await banUserFromAllGroups(state.targetUserId, { probeMembership: true, revokeMessages: true });
+	const banResults = await banUserFromAllGroups(state.targetUserId, { probeMembership: true, revokeMessages: true, groupIds: nonKillerGroupIds() });
 	// 风控·处置：群内 /ad 举报投票通过后的定罪封禁，按实际封成功的群逐群 +1。
 	await recordDisposalsFromBanResults(env, banResults);
 	const historyFallback = state.reportedMessageId
@@ -10619,14 +10559,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		} catch (_) {}
 	}
 
-	// 黑名单兜底：已黑用户在配置群里发言 → 删消息 + 立即踢出
+	// 黑名单兜底：已黑用户在配置群里发言 → 删消息 + 按口径处置
 	// 必须先于消息缓存执行，避免已黑用户刷消息继续产生 D1 写入。
 	// 排除 bot 自身 / 私聊 / 群管理员（避免误伤误加黑的管理员）
-	// 杀手模式 OFF 的群【略过拦截】：人只是被禁言、没被踢出，无需再删踢（主人明确要求）。
+	// 杀手群按黑名单 reason 分流：自动检测禁言的人重新禁言（禁言能发出话 = 限制丢了，补上），
+	// 其余踢出。普通配置群照旧走人工命令口径。
 	// 命令命中后 return，不进入后续命令分发
 	if (
 		isConfiguredGroup(chatId) &&
-		!isGroupMuteMode(chatId) &&
 		message.from &&
 		!message.from.is_bot
 	) {
@@ -10641,10 +10581,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				// 收走 bot 的「封禁用户」权限，踢人必然 400 not enough rights 且不重试，
 				// 人踢不走、留在群里继续发 → 每条消息再拦一次、再发一条通知 → 刷屏。
 				// 改走 applyGroupModeration(..., 'human')：普通配置群禁言（人发不出话，拦截自然停止）、
-				// 杀手模式 ON 的群仍踢出。处置结果真实回传，失败时通知写明原因，不再静默。
+				// 杀手群按 reason 分流（见上）。处置结果真实回传，失败时通知写明原因，不再静默。
 				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+按人工命令口径处置`);
 				await deleteMessage(chatId, message.message_id);
-				const moderation = await applyGroupModeration(chatId, userId, 'human');
+				const interceptMode = isKillerModeGroup(chatId) && isKillerMuteReason(blacklistCheck.entry?.reason)
+					? 'mute'
+					: 'human';
+				const moderation = await applyGroupModeration(chatId, userId, interceptMode);
 				await recordDisposalsFromBanResults(env, [{ groupId: chatId, ok: moderation?.ok === true }]);
 				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, moderation);
 				return;
@@ -10815,7 +10758,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		//   不带引用（群友回复广告只删不封，那条由重发通道处理）+ 发送者不是主人/副主人/超管。
 		// 其余消息照旧放后台写，不阻塞热路径。群管理员放到命中之后再查（罕见路径才花这一次请求）。
 		const senderIdStr = String(message.from.id);
-		const spamEligible = !message.reply_to_message && !isOwner(senderIdStr) && !isSuperAdmin(senderIdStr);
+		// 杀手群与同款直封隔离：在杀手群里发同款不触发直封（消息照常写缓存，只是不查名单）。
+		const spamEligible = !message.reply_to_message && !isOwner(senderIdStr) && !isSuperAdmin(senderIdStr)
+			&& !isKillerModeGroup(chatId);
 		if (spamEligible) {
 			const cached = await cacheModerationMessage(env, message, { isAd: adObserved });
 			// senderIdStr 已排除主人/副主人/超管；这里再补「任意配置群的群主/管理员」豁免。
@@ -10901,7 +10846,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				const lines = [`🎬 操作:举报加黑(/spam)`];
 				let flashText;
 				if (result.success || alreadyExists) {
-					// mode:'human' = /spam 与 /ban 同口径：杀手模式 ON 的群踢出、其余群禁言不踢。
+					// mode:'human' = /spam 与 /ban 同口径：杀手群踢出、其余群禁言不踢。
 					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true, mode: 'human' });
 					// 风控·处置：/spam 单条按实际处置成功的群逐群 +1。
 					await recordDisposalsFromBanResults(env, banResults);
@@ -11143,7 +11088,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 								if (Object.keys(byChat).length) deleteTargets[String(t.userId)] = byChat;
 							}
 							const job = await createBulkJob(env, 'spam', linkedIds, [], noteText, message, {
-								deleteTargets: Object.keys(deleteTargets).length ? deleteTargets : null
+								deleteTargets: Object.keys(deleteTargets).length ? deleteTargets : null,
+								groupIds: nonKillerGroupIds()
 							});
 							const queueAvailable = Boolean(getBulkQueue(env));
 							if (!queueAvailable) { job.autoContinue = false; await saveBulkJob(env, job); }
@@ -11278,11 +11224,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 主人/副主人随时可查（普通成员静默）；私聊仅主人/副主人查指定配置群。只汇总当前群。
 	if (isStatsCommand(text)) {
 		if (await handleStatsCommand(message, env, ctx)) return;
-	}
-
-	// /killer 杀手模式切换（仅第一主人；仅 KILLER_MODE_GROUPS 群内有效）。其他人一律静默。
-	if (isKillerCommand(text)) {
-		if (await handleKillerCommand(message, env)) return;
 	}
 
 	// /dryrun 演练模式切换（仅第一主人；任意配置群内有效）。其他人一律静默。
@@ -11532,11 +11473,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/stats -100群ID week　私聊查指定群的本周统计',
 			'/stats -100群ID month　私聊查指定群的本月统计',
 			'',
-			'<b>━━ 杀手模式（仅第一主人 · 需 KILLER_MODE_GROUPS）━━</b>',
-			'/killer　翻转本群开关；私聊发送则列出全部杀手模式群及状态',
-			'/killer on　开启：命中即全群封禁并踢出',
-			'/killer off　关闭：仅永久禁言不踢出（仍加黑）',
-			'/killer status　查看本群当前处于哪种模式',
+			'<b>━━ 杀手群（环境变量 KILLER_MODE_GROUPS · 规则固定，无开关）━━</b>',
+			'自动检测命中广告　永久禁言，人留群；退群再进会重新禁言',
+			'/ban /spam /sban　踢出；之后复入群会被踢回',
+			'同款直封 / 同款连带 / /ad 投票　与杀手群完全隔离，杀手群里不触发，别的群触发也不波及杀手群',
 			'',
 			'<b>━━ 演练模式（仅第一主人 · 任意配置群）━━</b>',
 			'/dryrun　翻转本群开关；私聊发送则列出已开演练的群与命中数',
@@ -11961,7 +11901,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 
 	// 处理 /ban 与 /sban 命令 - 添加用户到黑名单（支持批量、群内/私聊双场景；兼容 @机器人名）
-	//   /ban  → 加黑 + 全群【禁言】（杀手模式 ON 的群仍踢出，见 resolveHumanCommandMode）
+	//   /ban  → 加黑 + 全群【禁言】（杀手群踢出，见 resolveHumanCommandMode）
 	//   /sban → 加黑 + 全群【踢出】并撤回历史发言（主人定的「指定人全群踢出」专用指令）
 	// 两者共用这一条分支：解析、批量、渲染、回执逻辑完全一致，只在权限与处置方式上分叉。
 	if (isBanCommand(text) || isSbanCommand(text)) {
@@ -27416,7 +27356,7 @@ async function recordMemberEvent(env, chatId, kind, nowMs = Date.now()) {
 // ===== 入群 / 退群 / 申请 事件明细（第2批 · 2026-10-02）=====
 // 与 stat_member 的分工：那张表只存「哪天有几人进出」（计数），这张存
 // 「谁、什么时候、被谁操作、走了哪条邀请链接」—— /profile 的时间线读它（readMemberEvents）。
-// 表由代码懒建，不动 D1_SCHEMA_VERSION（与 killer_mode、ad_spam_texts 同一套做法）。
+// 表由代码懒建，不动 D1_SCHEMA_VERSION（与 ad_spam_texts 同一套做法）。
 const D1_STAT_MEMBER_EVENTS_INIT = new WeakMap();
 
 async function ensureStatMemberEventsTable(env) {
@@ -28497,66 +28437,11 @@ function isStatsCommand(text) {
 	return typeof text === 'string' && /^\/stats(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
 }
 
-function isKillerCommand(text) {
-	return typeof text === 'string' && /^\/killer(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
-}
-
-// /killer 杀手模式切换。仅第一主人；仅对 KILLER_MODE_GROUPS 里的群生效。返回 true 表示已处理。
-// 群内：/killer 翻转当前群 ON/OFF；/killer on|off 显式设置；/killer status 只看不改。
-// 私聊：列出所有杀手模式群的当前状态（不改）。非第一主人一律静默（不暴露命令存在）。
-async function handleKillerCommand(message, env) {
-	const userId = getMessageActorId(message);
-	if (!isPrimaryOwner(userId)) return true; // 非第一主人：静默吞掉（群内不暴露、私聊不回）
-	const chatId = String(message.chat?.id || '');
-	const isInGroup = message.chat?.type !== 'private';
-	const arg = String(message.text || '').replace(/^\/killer(?:@[^\s]+)?\s*/i, '').trim().toLowerCase();
-
-	if (!isInGroup) {
-		if (!KILLER_MODE_GROUPS.length) {
-			await sendTelegramMessage(chatId, 'ℹ️ 未配置 <code>KILLER_MODE_GROUPS</code>，杀手模式功能未启用。');
-			return true;
-		}
-		const stateMap = await readKillerStateMap(env);
-		const lines = ['☠️ <b>杀手模式 · 各群状态</b>（在目标群内发 <code>/killer</code> 切换）'];
-		for (const g of KILLER_MODE_GROUPS) {
-			const on = stateMap.has(String(g)) ? stateMap.get(String(g)) === 1 : KILLER_MODE_DEFAULT_ON;
-			// 额外显示群名（getChat 实时取；取不到就只显示 ID）。
-			let title = '';
-			try { const gi = await getChatInfoFromId(String(g)); title = String(gi?.title || ''); } catch (_) {}
-			const label = title ? '<b>' + escapeHtml(title) + '</b> <code>' + escapeHtml(String(g)) + '</code>' : '<code>' + escapeHtml(String(g)) + '</code>';
-			lines.push('• ' + label + '：' + (on ? '☠️ 开启（封禁踢出）' : '🔇 关闭（仅禁言）'));
-		}
-		await sendTelegramMessage(chatId, lines.join('\n'));
-		return true;
-	}
-
-	if (!isKillerModeGroup(chatId)) {
-		await sendTelegramMessage(chatId, '⚠️ 本群未启用杀手模式功能：请把本群 ID <code>' + escapeHtml(chatId) + '</code> 加进 <code>KILLER_MODE_GROUPS</code> 环境变量后重新初始化。');
-		return true;
-	}
-
-	const currentlyOn = await isKillerOn(env, chatId);
-	if (/^(status|状态)$/.test(arg)) {
-		await sendTelegramMessage(chatId, currentlyOn ? '☠️ 当前：杀手模式【开启】（封禁踢出）' : '🔇 当前：杀手模式【关闭】（仅禁言不踢出）');
-		return true;
-	}
-	let target;
-	if (/^(on|开|开启|启用|封禁)$/.test(arg)) target = true;
-	else if (/^(off|关|关闭|禁言|静音)$/.test(arg)) target = false;
-	else target = !currentlyOn; // 裸 /killer = 翻转
-
-	const r = await setKillerMode(env, chatId, target, userId);
-	if (!r.ok) { await sendTelegramMessage(chatId, '❌ 切换失败：' + escapeHtml(toChineseErrorText(r.error || '未知错误'))); return true; }
-	await sendTelegramMessage(chatId, target
-		? '☠️ <b>杀手模式已开启</b>\n本群此后触发处置的用户将【全群封禁 + 踢出】。'
-		: '🔇 <b>杀手模式已关闭</b>\n本群此后触发处置的用户【仅永久禁言、不踢出】，仍写入全局黑名单。');
-	return true;
-}
 function isDryRunCommand(text) {
 	return typeof text === 'string' && /^\/dryrun(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
 }
 
-// /dryrun 演练模式切换。仅第一主人（与 /killer 同一道门：敏感开关不放开给群管理员）。
+// /dryrun 演练模式切换。仅第一主人（敏感开关不放开给群管理员）。
 // 返回 true = 本条已处理，调用方短路；非第一主人同样返回 true 但只静默吞掉，
 // 不回任何话 —— 群里不暴露这条命令的存在。
 // 群内：/dryrun 翻转本群；/dryrun on|off 显式设置；/dryrun status 只看不改。
