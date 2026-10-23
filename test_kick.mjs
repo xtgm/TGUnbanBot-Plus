@@ -5272,7 +5272,7 @@ console.log('\n[67b2] /admins 超级管理员与请求预算');
 	}), env, fakeCtxAd);
 	const lookupCalls = callsOf('getChatAdministrators').length + callsOf('getChat').length + callsOf('getChatMember').length;
 	text = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').map((c) => c.body.text).join('\n');
-	assert('/admins 名单查询请求数不超过预算 40（免费版 50 子请求上限内）', lookupCalls <= 40, '实际 ' + lookupCalls + ' 次');
+	assert('/admins 名单查询请求数不超过预算 100（付费版 1000 子请求上限内）', lookupCalls <= 100, '实际 ' + lookupCalls + ' 次');
 	assert('/admins 优先保证各群管理员列表（30 个群全部查到）', callsOf('getChatAdministrators').length === 30);
 	assert('/admins 达到上限时名单仍完整输出三类人员与超管 TGID', text.includes('👑 <b>主人</b>') && text.includes('TGID:<code>6001</code>') && text.includes('TGID:<code>6003</code>'));
 	assert('/admins 达到上限时附说明', text.includes('本次查询已达请求上限'));

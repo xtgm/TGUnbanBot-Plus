@@ -2154,7 +2154,10 @@ async function miniAppAdmins(env) {
 		secondary: secondary.map(person),
 		superAdmins: superAdmins.map(person),
 		groupLabels: labels,
-		truncated: budget.skipped > 0
+		// 只有「预算真的跳过过查询」且「确实有人一份资料都没拿到」时才提示。
+		// 原来只判 budget.skipped > 0，会把「全都查到了」也报成请求上限；
+		// 反过来若预算够用、某人只是不在任何群里查不到，那也不是请求上限的问题，同样不该提示。
+		truncated: budget.skipped > 0 && allIds.some((id) => !profiles.get(id)?.user)
 	};
 }
 
@@ -6624,10 +6627,12 @@ async function formatTargetByTgid(tgid) {
 	return `<code>${escapeHtml(idStr)}</code>`;
 }
 
-// /admins 单次命令的 Telegram 外部请求预算。Cloudflare 免费版每次请求最多 50 个子请求，
-// 名单查询只用 40 个，余量留给回执发送等开销；付费版也按同一预算走 —— /admins 是低频查询，
-// 不值得为它多花资源。超出预算的查询直接跳过，对应位置回落成纯 TGID / 群 ID，名单主体照常输出。
-const ADMINS_LOOKUP_BUDGET = 40;
+// /admins 单次命令的 Telegram 外部请求预算。原按免费版 50 子请求上限留余量取 40；
+// 本账号是 Workers Paid（单次请求子请求上限 1000），40 反而经常不够 ——
+// 退群的超管要逐个群试 getChatMember 且永远查不到，一个人就能吃掉「群数」次请求，
+// 少量超管即可撞线。放宽到 100，付费版余量充足。若将来改回免费版，这里必须调回 40。
+// 超出预算的查询直接跳过，对应位置回落成纯 TGID / 群 ID，名单主体照常输出。
+const ADMINS_LOOKUP_BUDGET = 100;
 
 function createLookupBudget(limit) {
 	return {

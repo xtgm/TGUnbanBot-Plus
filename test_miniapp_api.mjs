@@ -576,6 +576,86 @@ section('[14] admins/list 返回主人 / 副主人 / 超管三段');
 	}
 }
 
+// ================= [14b] 请求上限提示的判据 =================
+section('[14b] 请求上限提示只在真有人缺资料时出现');
+{
+	// 群数超过预算（100）时第一轮就会撞线，但主人与副主人都已在管理员列表里查到完整资料。
+	// 旧判据只看 budget.skipped > 0，会把这种「全都查到了」也报成请求上限。
+	const env = await freshEnv();
+	env.GROUP_ID = [ENV_MAIN, ENV_SECOND]
+		.concat(Array.from({ length: 110 }, (_, i) => '-10088000' + String(10000 + i)))
+		.join(',');
+	const baseFetch = sandbox.fetch;
+	let groupCalls = 0;
+	sandbox.fetch = async (url, init) => {
+		const method = String(url).split('/').pop();
+		let body = null;
+		try { body = init?.body ? JSON.parse(init.body) : null; } catch (_) { body = null; }
+		if (method === 'getChatAdministrators') {
+			groupCalls += 1;
+			const id = String(body?.chat_id ?? '');
+			const list = [{ user: { id: BOT_ID }, status: 'administrator', can_restrict_members: true }];
+			if (id === ENV_MAIN) list.push({ user: { id: Number(OWNER), first_name: '主人', username: 'owner' }, status: 'creator' });
+			if (id === ENV_SECOND) list.push({ user: { id: 10002, first_name: '副主人', username: 'second' }, status: 'administrator' });
+			return { ok: true, status: 200, async json() { return { ok: true, result: list }; }, async text() { return ''; } };
+		}
+		if (method === 'getChat') {
+			return { ok: true, status: 200, async json() { return { ok: true, result: { id: body?.chat_id, title: '群 ' + body?.chat_id } }; }, async text() { return ''; } };
+		}
+		return baseFetch(url, init);
+	};
+	try {
+		W.applyRuntimeConfig(W.loadRequiredConfig(Object.assign({}, env, { OWNER_IDS: OWNER + ',10002' })));
+		const data = await call(env, 'admins/list');
+		assert('★ 群数超过预算时名单仍完整',
+			data.primary.length === 1 && data.primary[0].name === '主人' && data.secondary[0].name === '副主人',
+			JSON.stringify([data.primary, data.secondary]));
+		assert('★ 预算 100 已被用满', groupCalls === 100, String(groupCalls));
+		assert('★ 人人都有资料时不报请求上限', data.truncated === false, String(data.truncated));
+	} finally {
+		sandbox.fetch = baseFetch;
+		W.applyRuntimeConfig(W.loadRequiredConfig(env));
+	}
+}
+
+// 反向：预算真的不够、也确实有人一份资料都没拿到时，提示必须出现。
+section('[14c] 预算不够且有人缺资料时提示出现');
+{
+	const env = await freshEnv();
+	const supers = Array.from({ length: 60 }, (_, i) => String(20000 + i)).join(',');
+	const baseFetch = sandbox.fetch;
+	let memberCalls = 0;
+	sandbox.fetch = async (url, init) => {
+		const method = String(url).split('/').pop();
+		let body = null;
+		try { body = init?.body ? JSON.parse(init.body) : null; } catch (_) { body = null; }
+		if (method === 'getChatAdministrators') {
+			const id = String(body?.chat_id ?? '');
+			const list = [{ user: { id: BOT_ID }, status: 'administrator', can_restrict_members: true }];
+			if (id === ENV_MAIN) list.push({ user: { id: Number(OWNER), first_name: '主人', username: 'owner' }, status: 'creator' });
+			return { ok: true, status: 200, async json() { return { ok: true, result: list }; }, async text() { return ''; } };
+		}
+		if (method === 'getChatMember') {
+			memberCalls += 1;
+			return { ok: true, status: 200, async json() { return { ok: false, description: 'Bad Request: user not found' }; }, async text() { return ''; } };
+		}
+		return baseFetch(url, init);
+	};
+	try {
+		W.applyRuntimeConfig(W.loadRequiredConfig(Object.assign({}, env, { SUPER_ADMIN_IDS: supers })));
+		const data = await call(env, 'admins/list');
+		assert('★ 60 个超管全部列出', data.superAdmins.length === 60, String(data.superAdmins.length));
+		assert('★ 预算耗尽后补查停止', memberCalls > 0 && memberCalls < 60 * 2, String(memberCalls));
+		assert('★ 有人缺资料时提示出现', data.truncated === true, String(data.truncated));
+		assert('★ 缺资料的人回落为「未获取」',
+			data.superAdmins.filter((p) => p.name === '未获取').length > 0,
+			String(data.superAdmins.filter((p) => p.name === '未获取').length));
+	} finally {
+		sandbox.fetch = baseFetch;
+		W.applyRuntimeConfig(W.loadRequiredConfig(env));
+	}
+}
+
 // ================= [15] search：三种查询类型 + 分页 + 排除广告 =================
 section('[15] search 三种查询类型与分页');
 {
