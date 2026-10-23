@@ -813,7 +813,7 @@ class MiniAppError extends Error {
 	}
 }
 
-const MINI_APP_ACTIONS = new Set(['bootstrap', 'groups/list', 'groups/add', 'groups/remove', 'groups/leave', 'blacklist/list', 'blacklist/unban', 'ads/summary', 'ads/pending', 'ads/ignore', 'users/query']);
+const MINI_APP_ACTIONS = new Set(['bootstrap', 'groups/list', 'groups/add', 'groups/remove', 'groups/leave', 'blacklist/list', 'blacklist/unban', 'ads/summary', 'ads/pending', 'ads/ignore', 'users/query', 'health', 'admins/list', 'search', 'notice/send']);
 const MINI_APP_BODY_LIMIT = 32768;
 
 function miniAppJson(data, status = 200) {
@@ -1064,7 +1064,7 @@ function renderMiniAppHtml() {
 
     /* 底部导航 */
     .bottom-nav{position:fixed;z-index:20;bottom:0;left:0;right:0;background:var(--surface);border-top:1px solid var(--line);padding:6px 10px calc(6px + env(safe-area-inset-bottom,0px));box-shadow:0 -6px 24px -20px #0006}
-    .nav-inner{max-width:1120px;margin:auto;display:grid;grid-template-columns:repeat(4,1fr);gap:4px}
+    .nav-inner{max-width:1120px;margin:auto;display:grid;grid-template-columns:repeat(5,1fr);gap:2px}
     .nav-item{border:0;background:transparent;color:var(--muted);display:flex;align-items:center;flex-direction:column;gap:3px;min-height:50px;padding:7px 4px 4px;border-radius:10px;font-size:10px;font-weight:600;position:relative;transition:color .15s,background .15s}
     .nav-item[aria-selected="true"]{color:var(--accent);background:var(--soft)}
     .nav-item[aria-selected="true"]:before{content:"";position:absolute;top:2px;width:14px;height:2px;background:var(--accent);border-radius:2px}
@@ -1096,6 +1096,68 @@ function renderMiniAppHtml() {
     .muted{color:var(--muted)}
     .mono{font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}
     .subtle{font-size:12px;color:var(--muted)}
+
+    /* 运行检查：状态点 + 逐群权限徽章 */
+    .status-line{display:flex;align-items:flex-start;gap:9px;padding:9px 0;border-bottom:1px solid var(--line-soft);font-size:12px;line-height:1.55}
+    .status-line:last-child{border-bottom:0;padding-bottom:0}
+    .status-line>span:last-child{min-width:0;overflow-wrap:anywhere;white-space:pre-wrap}
+    .dot{flex:none;width:8px;height:8px;border-radius:50%;margin-top:5px;background:var(--muted)}
+    .dot.ok{background:var(--success)}
+    .dot.warn{background:var(--warning)}
+    .dot.bad{background:var(--danger)}
+    .perm-chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}
+    .perm-chip{font-size:10px;font-weight:600;padding:3px 8px;border-radius:6px;background:var(--soft);color:var(--muted)}
+    .perm-chip.yes{color:var(--success);background:color-mix(in srgb,var(--success) 11%,var(--surface))}
+    .perm-chip.no{color:var(--danger);background:color-mix(in srgb,var(--danger) 9%,var(--surface))}
+    .group-health{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;margin-top:12px}
+    .group-health .card{margin:0;padding:12px 13px}
+
+    /* 封禁结论横幅：把 /check 的判定摆到用户页最上面 */
+    .verdict{display:flex;gap:11px;align-items:flex-start;padding:13px 15px;border-radius:var(--radius);border:1px solid var(--line-soft);background:var(--surface);margin:0 0 var(--gap)}
+    .verdict-mark{flex:none;width:30px;height:30px;border-radius:9px;display:grid;place-items:center;font-size:15px;font-weight:700;background:var(--soft);color:var(--muted)}
+    .verdict-body{min-width:0}
+    .verdict-title{font-size:14px;font-weight:700;margin:0 0 3px}
+    .verdict-text{font-size:12px;color:var(--muted);overflow-wrap:anywhere;white-space:pre-wrap;margin:0;line-height:1.55}
+    .verdict[data-tone="danger"]{border-color:color-mix(in srgb,var(--danger) 34%,var(--line-soft));background:color-mix(in srgb,var(--danger) 6%,var(--surface))}
+    .verdict[data-tone="danger"] .verdict-mark{background:color-mix(in srgb,var(--danger) 16%,var(--surface));color:var(--danger)}
+    .verdict[data-tone="danger"] .verdict-title{color:var(--danger)}
+    .verdict[data-tone="warning"]{border-color:color-mix(in srgb,var(--warning) 34%,var(--line-soft));background:color-mix(in srgb,var(--warning) 7%,var(--surface))}
+    .verdict[data-tone="warning"] .verdict-mark{background:color-mix(in srgb,var(--warning) 16%,var(--surface));color:var(--warning)}
+    .verdict[data-tone="warning"] .verdict-title{color:var(--warning)}
+    .verdict[data-tone="success"]{border-color:color-mix(in srgb,var(--success) 30%,var(--line-soft));background:color-mix(in srgb,var(--success) 6%,var(--surface))}
+    .verdict[data-tone="success"] .verdict-mark{background:color-mix(in srgb,var(--success) 15%,var(--surface));color:var(--success)}
+    .verdict[data-tone="success"] .verdict-title{color:var(--success)}
+
+    /* 权限名单 */
+    .people-group{margin-top:14px}
+    .people-group h3{font-size:12px;font-weight:650;margin:0 0 4px;display:flex;align-items:center;gap:7px}
+    .people-group h3 .counter{font:10px var(--mono);color:var(--muted)}
+    .person{display:flex;gap:9px;align-items:flex-start;padding:9px 0;border-top:1px solid var(--line-soft)}
+    .people-group h3+.person{border-top:0;padding-top:2px}
+    .person-avatar{flex:none;width:28px;height:28px;border-radius:9px;background:var(--soft);color:var(--accent);display:grid;place-items:center;font-size:13px;font-weight:700}
+    .person-body{min-width:0;flex:1}
+    .person-name{font-size:12px;font-weight:650;overflow-wrap:anywhere}
+    .person-meta{font:10px var(--mono);color:var(--muted);margin-top:3px;overflow-wrap:anywhere;line-height:1.6}
+
+    /* 发言检索结果 */
+    .result-list{display:flex;flex-direction:column;margin-top:10px}
+    .result-item{padding:10px 0;border-top:1px solid var(--line-soft)}
+    .result-item:first-child{border-top:0;padding-top:0}
+    .result-head{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+    .result-who{font:11px var(--mono);overflow-wrap:anywhere;min-width:0}
+    .result-when{font:10px var(--mono);color:var(--muted);flex:none}
+    .result-text{font-size:12px;color:var(--muted);margin-top:4px;overflow-wrap:anywhere;white-space:pre-wrap;max-height:88px;overflow:hidden}
+    .result-chat{font:10px var(--mono);color:var(--muted);margin-top:4px}
+
+    /* 通知：输入区 */
+    .compose{display:flex;flex-direction:column;gap:10px}
+    .textarea{width:100%;min-height:116px;resize:vertical;padding:11px 13px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface);color:var(--text);font:13px/1.65 var(--body);outline:none;transition:border-color .15s}
+    .textarea:focus{border-color:var(--accent)}
+    .select{width:100%;min-height:44px;padding:9px 12px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface);color:var(--text);font:13px var(--body);outline:none;transition:border-color .15s}
+    .select:focus{border-color:var(--accent)}
+    .compose-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+    .char-count{font:11px var(--mono);color:var(--muted)}
+    .char-count.over{color:var(--danger)}
 
     /* 分页 */
     .pager{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 0 14px}
@@ -1142,6 +1204,18 @@ function renderMiniAppHtml() {
           <p id="group-permission" class="notice" hidden>群组变更由第一主人操作。</p>
           <div class="toolbar"><h2 class="section-label">治理中的群组</h2><span id="groups-count" class="counter"></span></div>
           <div id="groups-content" class="group-list"></div>
+          <div class="toolbar"><h2 class="section-label">运行检查</h2><span id="health-count" class="counter"></span></div>
+          <article class="card">
+            <div class="card-heading"><div><h3 class="card-title">机器人状态与群权限</h3><div class="card-subtitle">检查 Bot 身份、D1、统计活性，以及每个群的管理权限是否齐备。</div></div></div>
+            <div id="health-content"><p class="subtle">点「运行检查」读取最新状态。</p></div>
+            <div class="card-actions"><button id="health-run" class="button small primary" type="button">运行检查</button></div>
+          </article>
+          <div class="toolbar"><h2 class="section-label">权限名单</h2><span id="admins-count" class="counter"></span></div>
+          <article class="card">
+            <div class="card-heading"><div><h3 class="card-title">主人 / 副主人 / 超级管理员</h3><div class="card-subtitle">昵称与用户名来自 Telegram 当前可读取的群成员资料。</div></div></div>
+            <div id="admins-content"><p class="subtle">点「读取名单」获取最新资料。</p></div>
+            <div class="card-actions"><button id="admins-run" class="button small" type="button">读取名单</button></div>
+          </article>
         </section>
         <section id="page-blacklist" class="page" role="tabpanel" aria-labelledby="tab-blacklist" hidden>
           <div class="page-head"><div class="page-head-text"><div class="eyebrow">02 / BLACKLIST</div><h1 class="page-title" tabindex="-1">黑名单</h1><p class="description">查找封禁记录，按需解除跨群封禁。</p></div></div>
@@ -1160,6 +1234,30 @@ function renderMiniAppHtml() {
           <div class="page-head"><div class="page-head-text"><div class="eyebrow">04 / USER LOOKUP</div><h1 class="page-title" tabindex="-1">用户查询</h1><p class="description">通过 Telegram 用户 ID 查看资料与处理记录。</p></div></div>
           <label class="sr-only" for="user-query">Telegram 用户 ID</label><form id="user-search" class="search-form"><input id="user-query" class="input mono" type="text" inputmode="numeric" pattern="[0-9]{1,20}" maxlength="20" placeholder="Telegram 用户 ID" autocomplete="off" required><button class="button primary" type="submit">查询</button></form>
           <p class="form-hint">请输入数字 ID，例如 123456789。</p><div id="users-content"></div>
+          <div class="toolbar"><h2 class="section-label">发言检索</h2><span id="search-count" class="counter"></span></div>
+          <article class="card">
+            <label class="sr-only" for="search-query">搜索发言记录</label>
+            <form id="search-form" class="search-form"><input id="search-query" class="input" type="search" placeholder="用户 ID、@用户名 或 关键词" maxlength="160" autocomplete="off"><button class="button primary" type="submit">搜索</button></form>
+            <p class="form-hint">纯数字按用户 ID 查，@ 开头按用户名查，其余按关键词查；范围是全部治理群组。</p>
+            <div id="search-content"><p class="subtle">输入内容后点「搜索」。</p></div>
+            <div id="search-pager"></div>
+          </article>
+        </section>
+        <section id="page-notice" class="page" role="tabpanel" aria-labelledby="tab-notice" hidden>
+          <div class="page-head"><div class="page-head-text"><div class="eyebrow">05 / BROADCAST</div><h1 class="page-title" tabindex="-1">通知</h1><p class="description">以机器人身份向治理群组发送公告。</p></div></div>
+          <article class="card">
+            <div class="card-heading"><div><h3 class="card-title">发送通知</h3><div class="card-subtitle" id="notice-scope">正在读取群组…</div></div><span id="notice-target-badge" class="badge accent" hidden></span></div>
+            <div class="compose" style="margin-top:12px">
+              <label class="sr-only" for="notice-target">发送目标</label>
+              <select id="notice-target" class="select"><option value="">全部治理群组</option></select>
+              <label class="sr-only" for="notice-text">通知内容</label>
+              <textarea id="notice-text" class="textarea" maxlength="4096" placeholder="输入要发送的通知内容（纯文本，链接会自动识别）"></textarea>
+              <div class="compose-foot"><span id="notice-char" class="char-count">0 / 4096</span><label class="subtle" style="display:flex;align-items:center;gap:6px"><input id="notice-silent" type="checkbox">静默发送（不响铃）</label></div>
+              <button id="notice-send" class="button primary" type="button">发送通知</button>
+            </div>
+            <p class="form-hint">发送前会弹出确认框，显示目标与内容摘要。纯文本发送，不解析 Markdown 或 HTML。</p>
+          </article>
+          <div id="notice-result"></div>
         </section>
       </main>
     </div>
@@ -1169,6 +1267,7 @@ function renderMiniAppHtml() {
     <button id="tab-blacklist" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="page-blacklist" data-tab="blacklist" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 4.4-3.5 7.4-8 9-4.5-1.6-8-4.6-8-9V6zM9 9l6 6M15 9l-6 6"/></svg><span>黑名单</span></button>
     <button id="tab-ads" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="page-ads" data-tab="ads" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9l13-4v14L4 15zM4 9H2v6h2M6 16l2 5h3l-2-4M21 9v6"/></svg><span>广告</span></button>
     <button id="tab-users" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="page-users" data-tab="users" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="8" r="4"/><path d="M3 21v-2a7 7 0 0 1 10-6"/><circle cx="17" cy="17" r="4"/><path d="M20 20l2 2"/></svg><span>用户</span></button>
+    <button id="tab-notice" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="page-notice" data-tab="notice" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10v4h3l5 4V6l-5 4z"/><path d="M16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12"/></svg><span>通知</span></button>
   </div></nav>
   <dialog id="confirm-dialog" aria-labelledby="confirm-title"><h2 id="confirm-title"></h2><p id="confirm-description"></p><span id="confirm-object" class="dialog-object" hidden></span><p id="confirm-warning" class="dialog-warning" hidden></p><div class="dialog-actions"><button id="confirm-cancel" class="button" type="button">取消</button><button id="confirm-submit" class="button primary" type="button">确认</button></div></dialog>
   <dialog id="add-dialog" aria-labelledby="add-title"><form id="add-form"><h2 id="add-title">添加治理群组</h2><p>将机器人已加入的群组纳入治理范围。</p><label class="field" for="add-chat-id">群组 ID</label><input id="add-chat-id" class="input mono" type="text" pattern="-[0-9]{5,20}" maxlength="21" placeholder="-1001234567890" autocomplete="off" required><p class="form-hint" style="margin-top:8px">请输入以负号开头的数字群组 ID。</p><div class="dialog-actions"><button id="add-cancel" class="button" type="button">取消</button><button id="add-submit" class="button primary" type="submit">添加群组</button></div></form></dialog>
@@ -1177,7 +1276,7 @@ function renderMiniAppHtml() {
   (function () {
     'use strict';
     var tg = window.Telegram && window.Telegram.WebApp;
-    var state = { active: 'groups', primaryOwner: false, authenticated: false, loaded: {}, busy: new Set(), generation: {}, groups: [], blacklistPage: 1, blacklistQuery: '', adsPage: 1, queriedUser: '', toastTimer: null };
+    var state = { active: 'groups', primaryOwner: false, authenticated: false, loaded: {}, busy: new Set(), generation: {}, groups: [], blacklistPage: 1, blacklistQuery: '', adsPage: 1, queriedUser: '', searchPage: 1, searchQuery: '', autoFull: false, toastTimer: null };
     var $ = function (id) { return document.getElementById(id); };
     function element(tag, className, content) { var el = document.createElement(tag); if (className) el.className = className; if (content !== undefined && content !== null) el.textContent = String(content); return el; }
     function text(value, fallback) { return value === undefined || value === null || value === '' ? (fallback || '—') : String(value); }
@@ -1198,6 +1297,9 @@ function renderMiniAppHtml() {
     function fullscreenAvailable() { return !!(tg && typeof tg.requestFullscreen === 'function' && typeof tg.exitFullscreen === 'function'); }
     function updateFullscreenButton() { var button = $('fullscreen'); if (!button) return; if (!fullscreenAvailable() || !state.authenticated) { button.hidden = true; return; } var full = tg.isFullscreen === true; button.hidden = false; button.dataset.full = full ? '1' : '0'; button.setAttribute('aria-label', full ? '退出全屏' : '全屏显示'); button.title = full ? '退出全屏' : '全屏显示'; }
     function toggleFullscreen() { if (!fullscreenAvailable()) { if (tg && tg.expand) tg.expand(); return; } if (tg.isFullscreen === true) tg.exitFullscreen(); else tg.requestFullscreen(); }
+    // 打开即最大化：Telegram 8.0+ 才支持 requestFullscreen。失败一律静默降级 ——
+    // 自动尝试不是主人的显式操作，弹「无法进入全屏」只会让人莫名其妙。
+    function autoFullscreen() { if (!fullscreenAvailable() || tg.isFullscreen === true) return; state.autoFull = true; try { var pending = tg.requestFullscreen(); if (pending && typeof pending.catch === 'function') pending.catch(function () { state.autoFull = false; }); } catch (_) { state.autoFull = false; } setTimeout(function () { state.autoFull = false; }, 2000); }
     function updateBackButton() { if (!tg || !tg.BackButton) return; if (state.active !== 'groups' || document.querySelector('dialog[open]')) tg.BackButton.show(); else tg.BackButton.hide(); }
     function authMessage(title, message, retry) { $('auth-title').textContent = title; $('auth-text').textContent = message; $('auth-spinner').hidden = true; $('auth-retry').hidden = !retry; $('auth').hidden = false; $('app').hidden = true; $('nav').hidden = true; $('refresh').hidden = true; $('fullscreen').hidden = true; }
     function expireSession(message) { state.authenticated = false; document.querySelectorAll('dialog[open]').forEach(closeDialog); authMessage('连接已失效', message || '请从机器人的菜单重新打开群务台。', false); }
@@ -1243,6 +1345,56 @@ function renderMiniAppHtml() {
       var leaving = action === 'leave'; var confirmed = await confirmAction({ title: leaving ? '退出这个群组？' : '停止治理这个群组？', description: leaving ? '机器人将退出该群组，并将其移出治理范围。' : '该群组将移出治理范围，机器人继续留在群内。', object: text(group.title, '群组') + '\n' + text(group.chatId), warning: leaving ? '重新启用时，需要将机器人重新加入群组。' : '该群组后续将不参与统一治理。', label: leaving ? '确认退群' : '停止治理', danger: true });
       if (!confirmed) return; await actionButton(button, 'group:' + group.chatId, async function () { var result = await api('groups/' + action, { chatId: String(group.chatId) }); toast(result && result.message ? result.message : (leaving ? '机器人已退出群组。' : '已停止治理该群组。'), result && result.complete === false ? 'error' : 'success'); await loadGroups(); });
     }
+    // 运行检查（/health）：第一层是 bot 自身状态，第二层是逐群管理权限。
+    // 只读、可重复执行；不缓存结果 —— 每次点都读最新状态。
+    async function loadHealth() { var seq = begin('health'); loading($('health-content'), '正在检查运行状态…'); $('health-count').textContent = ''; try { var data = await api('health'); if (!current('health', seq)) return; renderHealth(data || {}); } catch (err) { if (err.auth || !current('health', seq)) return; empty($('health-content'), '运行检查失败', err.message, loadHealth); } }
+    function renderHealth(data) {
+      var container = $('health-content'); container.replaceChildren(); var layer1 = Array.isArray(data.layer1) ? data.layer1 : []; var layer2 = Array.isArray(data.layer2) ? data.layer2 : [];
+      var okCount = layer1.filter(function (row) { return row.ok === true; }).length; var badCount = layer1.filter(function (row) { return row.ok === false; }).length; var warnCount = layer1.length - okCount - badCount;
+      $('health-count').textContent = okCount + ' 正常 · ' + warnCount + ' 警告 · ' + badCount + ' 异常';
+      var grid = element('div', 'stat-grid');
+      [[okCount, '正常', ''], [warnCount, '警告', ''], [badCount, '异常', '']].forEach(function (row) { var stat = element('div', 'stat'); stat.append(element('div', 'stat-value', count(row[0])), element('div', 'stat-label', row[1])); grid.append(stat); });
+      container.append(grid);
+      layer1.forEach(function (item) { var line = element('div', 'status-line'); line.append(element('span', 'dot ' + (item.ok === true ? 'ok' : item.ok === false ? 'bad' : 'warn')), element('span', '', text(item.text))); container.append(line); });
+      if (!layer2.length) return;
+      var head = element('div', 'toolbar'); head.append(element('h3', 'section-label', '逐群权限'), element('span', 'counter', layer2.length + ' 个群'));
+      container.append(head);
+      var list = element('div', 'group-health');
+      layer2.forEach(function (row) {
+        var card = element('article', 'card'); card.append(element('div', 'card-title', text(row.title, '未命名群组')), element('div', 'card-subtitle mono', text(row.groupId)));
+        var chips = element('div', 'perm-chips');
+        [['在群', row.present], ['管理员', row.isAdmin], ['删消息', row.canDelete], ['封禁', row.canRestrict], ['邀请', row.canInvite]].forEach(function (pair) { chips.append(element('span', 'perm-chip ' + (pair[1] ? 'yes' : 'no'), pair[0])); });
+        card.append(chips);
+        if (row.error) card.append(element('div', 'subtle', '读取失败：' + text(row.error)));
+        list.append(card);
+      });
+      container.append(list);
+    }
+    // 权限名单（/admins）：三段固定分组，资料来自 Telegram 可读到的群成员信息。
+    async function loadAdmins() { var seq = begin('admins'); loading($('admins-content'), '正在读取权限名单…'); $('admins-count').textContent = ''; try { var data = await api('admins/list'); if (!current('admins', seq)) return; renderAdmins(data || {}); } catch (err) { if (err.auth || !current('admins', seq)) return; empty($('admins-content'), '权限名单读取失败', err.message, loadAdmins); } }
+    function renderAdmins(data) {
+      var container = $('admins-content'); container.replaceChildren(); var labels = data.groupLabels || {};
+      var statusMap = { creator: '群主', administrator: '管理员', member: '成员', restricted: '受限成员', left: '已离群', kicked: '已踢出' };
+      var total = 0;
+      [['👑 主人', data.primary], ['👤 副主人', data.secondary], ['⭐ 超级管理员', data.superAdmins]].forEach(function (pair) {
+        var people = Array.isArray(pair[1]) ? pair[1] : []; total += people.length;
+        var box = element('div', 'people-group'); var heading = element('h3', '', pair[0]); heading.append(element('span', 'counter', people.length + ' 人')); box.append(heading);
+        if (!people.length) { box.append(element('p', 'subtle', '无')); container.append(box); return; }
+        people.forEach(function (person) {
+          var row = element('div', 'person'); row.append(element('span', 'person-avatar', Array.from(person.name || '?')[0]));
+          var body = element('div', 'person-body'); body.append(element('div', 'person-name', text(person.name, '未获取')));
+          var meta = [person.username ? '@' + person.username : '未设置用户名', 'TGID ' + text(person.id)];
+          if (person.status) meta.push(statusMap[person.status] || person.status);
+          var groupLabel = labels[person.groupId];
+          if (groupLabel && groupLabel.title) meta.push('来自 ' + groupLabel.title);
+          body.append(element('div', 'person-meta', meta.join(' · ')));
+          row.append(body); box.append(row);
+        });
+        container.append(box);
+      });
+      $('admins-count').textContent = total + ' 人';
+      if (data.truncated) container.append(element('p', 'subtle', '本次查询已达请求上限，部分资料只显示 TGID。'));
+    }
     async function loadBlacklist(page, query) {
       state.blacklistPage = Math.max(1, Number(page) || 1); if (query !== undefined) state.blacklistQuery = String(query).trim(); var seq = begin('blacklist'); setFormBusy($('blacklist-search'), true); loading($('blacklist-content'), '正在读取黑名单…'); $('blacklist-pager').replaceChildren(); $('blacklist-count').textContent = ''; $('blacklist-label').textContent = state.blacklistQuery ? '搜索结果' : '全部记录';
       try { var data = await api('blacklist/list', { page: state.blacklistPage, query: state.blacklistQuery }); if (!current('blacklist', seq)) return; data = data || {}; state.blacklistPage = Number(data.page) || state.blacklistPage; if (state.blacklistPage > Math.max(1, Number(data.totalPages) || 1)) return loadBlacklist(Math.max(1, Number(data.totalPages) || 1)); renderBlacklist(data); state.loaded.blacklist = true; } catch (err) { if (err.auth || !current('blacklist', seq)) return; empty($('blacklist-content'), '黑名单加载失败', err.message, function () { return loadBlacklist(state.blacklistPage); }); } finally { if (state.generation.blacklist === seq) setFormBusy($('blacklist-search'), false); }
@@ -1266,10 +1418,90 @@ function renderMiniAppHtml() {
     async function ignoreAd(button, record) { var confirmed = await confirmAction({ title: '将这条记录标为误报？', description: '撤销这次广告判定及其相关学习与处罚，具体结果会在处理后显示。', object: '记录 #' + text(record.seq) + '\n用户 ID ' + text(record.userId), label: '确认误报' }); if (!confirmed) return; await actionButton(button, 'ignore:' + record.seq, async function () { var result = await api('ads/ignore', { seq: record.seq }); var message = result && result.message ? result.message : '已标为误报，并完成相关记录处理。'; toast(message, result && result.complete === false ? 'error' : 'success'); var rollback = result && (result.rollback || result.results || result); if (rollback) await showResult({ title: '误报处理结果', description: formatRollback(rollback), object: '记录 #' + text(record.seq) }); state.loaded.blacklist = false; state.loaded.users = false; await loadAds(); }); }
     function formatRollback(result) { if (Array.isArray(result)) return result.map(function (row) { var label = row.label || row.groupId || row.chatId || '处理项目'; var ok = row.ok === true || row.complete === true; var status = ok ? '已完成' : text(row.error || row.message, '未完成'); if (row.unmuted !== undefined || row.unbanned !== undefined) status += '（解除禁言' + (row.unmuted ? '成功' : '未完成') + '，解封' + (row.unbanned ? '成功' : '未完成') + '）'; if (row.affected !== undefined || row.removed !== undefined) status += ' · 已处理 ' + count(row.affected === undefined ? row.removed : row.affected) + ' 条'; return label + '：' + status; }).join('\n'); var labels = { removed: '已移除', blacklistRemoved: '移除黑名单', samplesRemoved: '移除样本', fingerprintsRemoved: '移除指纹', unbanned: '解除封禁', unbanResults: '群组解封', profileReset: '重置判定', learningRemoved: '撤销学习', error: '未完成原因', snapshotProcessed: '关闭复核记录', corrections: '撤销学习', falsePositiveRecorded: '记录误报' }; return Object.keys(labels).filter(function (key) { return result && result[key] !== undefined; }).map(function (key) { var v = result[key]; return labels[key] + '：' + (typeof v === 'boolean' ? (v ? '已完成' : '未完成') : Array.isArray(v) ? '\n' + formatRollback(v) : displayValue(v)); }).join('\n') || text(result && result.message, '处理结果已更新。'); }
     function userEmpty() { empty($('users-content'), '按 ID 查看一个用户', '可查看已保存的资料、黑名单状态和处理时间线。'); }
+    // 发言检索（/search）：跨全部治理群组。三种查询类型由后端 classifySearchQuery 判定，
+    // 前端不做二次猜测 —— 纯数字 / 带 @ / 其余关键词，两条入口同一套规则。
+    async function loadSearch(page, query) {
+      state.searchPage = Math.max(1, Number(page) || 1); if (query !== undefined) state.searchQuery = String(query).trim();
+      if (!state.searchQuery) { toast('请输入要搜索的内容。', 'error'); $('search-query').focus(); return; }
+      var seq = begin('search'); setFormBusy($('search-form'), true); loading($('search-content'), '正在检索发言记录…'); $('search-pager').replaceChildren(); $('search-count').textContent = '';
+      try { var data = await api('search', { query: state.searchQuery, page: state.searchPage }); if (!current('search', seq)) return; data = data || {}; state.searchPage = Number(data.page) || state.searchPage; renderSearch(data); } catch (err) { if (err.auth || !current('search', seq)) return; empty($('search-content'), '检索失败', err.message, function () { return loadSearch(state.searchPage); }); } finally { if (state.generation.search === seq) setFormBusy($('search-form'), false); }
+    }
+    function renderSearch(data) {
+      var container = $('search-content'); container.replaceChildren(); var rows = Array.isArray(data.rows) ? data.rows : []; var total = Number(data.total) || 0;
+      $('search-count').textContent = count(total) + ' 条记录';
+      if (!total) { empty(container, '没有匹配的记录', '换个关键词，或确认这个用户是否在治理群组里发过言。'); return; }
+      var pages = Math.max(1, Number(data.totalPages) || 1);
+      var note = '共 ' + count(total) + ' 条'; if (data.resolvedUserId) note += ' · @' + text(data.value) + ' 对应 TGID ' + data.resolvedUserId; if (pages > 1) note += '　第 ' + data.page + '/' + pages + ' 页';
+      container.append(element('p', 'form-hint', note));
+      var list = element('div', 'result-list');
+      rows.forEach(function (row) { var item = element('div', 'result-item'); var head = element('div', 'result-head'); head.append(element('span', 'result-who', 'ID ' + text(row.from_id)), element('span', 'result-when', date(row.created_at))); item.append(head, element('div', 'result-text', text(row.text_norm, '（无正文）')), element('div', 'result-chat', '群组 ' + text(row.chat_id) + ' · 消息 ' + text(row.mid))); list.append(item); });
+      container.append(list);
+      pager($('search-pager'), data, function (page) { return loadSearch(page); });
+    }
+    // 通知（/notice 的后台版）：全部治理群组或指定单个群，纯文本 sendMessage。
+    // 目标下拉每次进入都重建 —— 群组可能在别的设备上增删过，用旧列表会发错范围。
+    async function loadNotice() {
+      var seq = begin('notice'); $('notice-scope').textContent = '正在读取群组…';
+      try { await loadGroups(); } catch (_) { /* 群组读取失败时下面按空列表处理，按钮保持禁用 */ }
+      if (!current('notice', seq)) return;
+      var groups = Array.isArray(state.groups) ? state.groups : [];
+      var select = $('notice-target'); var previous = select.value; select.replaceChildren();
+      var all = element('option', '', '全部治理群组（' + groups.length + ' 个）'); all.value = ''; select.append(all);
+      groups.forEach(function (group) { var option = element('option', '', text(group.title, '未命名群组') + ' · ' + text(group.chatId)); option.value = String(group.chatId); select.append(option); });
+      if (previous && groups.some(function (group) { return String(group.chatId) === previous; })) select.value = previous;
+      $('notice-scope').textContent = groups.length ? '当前治理范围共 ' + groups.length + ' 个群组，可选择全部或指定一个。' : '还没有配置治理群组，暂时无法发送通知。';
+      var badge = $('notice-target-badge'); badge.textContent = groups.length + ' 个群'; badge.hidden = !groups.length;
+      $('notice-send').disabled = !groups.length;
+    }
+    async function prepareNotice() {
+      var content = $('notice-text').value.trim();
+      if (!content) { toast('请输入通知内容。', 'error'); $('notice-text').focus(); return null; }
+      if (content.length > 4096) { toast('通知内容不能超过 4096 字。', 'error'); return null; }
+      var chatId = $('notice-target').value; var groups = Array.isArray(state.groups) ? state.groups : [];
+      var targetName = '全部治理群组（' + groups.length + ' 个）';
+      if (chatId) { var found = groups.find(function (group) { return String(group.chatId) === chatId; }); targetName = found ? text(found.title, '未命名群组') + ' · ' + chatId : chatId; }
+      var silent = $('notice-silent').checked;
+      var approved = await confirmAction({ title: '确认发送这条通知？', description: '将发送到：' + targetName + '\n\n' + content.slice(0, 200) + (content.length > 200 ? '…' : ''), object: silent ? '静默发送（不响铃）' : '', warning: chatId ? '' : '这会发往全部治理群组，发出后无法撤回。', label: '确认发送' });
+      if (!approved) return null;
+      return { content: content, chatId: chatId, silent: silent, targetName: targetName };
+    }
+    async function deliverNotice(job) {
+      var result = await api('notice/send', { text: job.content, chatId: job.chatId || undefined, silent: job.silent });
+      var failures = result && Array.isArray(result.failures) ? result.failures : [];
+      var message = result && result.complete === false ? '已发送 ' + result.sent + '/' + result.total + ' 个群组，' + failures.length + ' 个失败。' : '已发送到 ' + (result && result.sent !== undefined ? result.sent : 0) + ' 个群组。';
+      toast(message, failures.length ? 'error' : 'success');
+      var container = $('notice-result'); container.replaceChildren();
+      var card = element('article', 'card'); card.append(element('h3', 'card-title', '最近一次发送'), element('div', 'card-subtitle', job.targetName + ' · ' + date(Date.now())));
+      var grid = element('div', 'stat-grid');
+      [['已送达', result && result.sent], ['失败', failures.length], ['目标群组', result && result.total]].forEach(function (pair) { var stat = element('div', 'stat'); stat.append(element('div', 'stat-value', count(pair[1])), element('div', 'stat-label', pair[0])); grid.append(stat); });
+      card.append(grid);
+      if (failures.length) { var list = element('div', 'result-list'); failures.forEach(function (row) { var item = element('div', 'result-item'); item.append(element('div', 'result-who', text(row.groupId)), element('div', 'result-text', text(row.error, '未送达'))); list.append(item); }); card.append(list); }
+      container.append(card);
+    }
     async function openUser(id) { $('user-query').value = String(id); state.queriedUser = String(id); await navigate('users', false); return queryUser(id); }
     async function queryUser(userId) { var id = String(userId || $('user-query').value).trim(); if (!/^\d{1,20}$/.test(id)) { toast('请输入有效的数字用户 ID。', 'error'); $('user-query').focus(); return; } state.queriedUser = id; var seq = begin('users'); setFormBusy($('user-search'), true); loading($('users-content'), '正在查询用户资料与记录…'); try { var data = await api('users/query', { userId: id }); if (!current('users', seq)) return; renderUser(data || {}, id); state.loaded.users = true; } catch (err) { if (err.auth || !current('users', seq)) return; empty($('users-content'), '用户查询失败', err.message, function () { return queryUser(id); }); } finally { if (state.generation.users === seq) setFormBusy($('user-search'), false); } }
+    // 封禁结论横幅：把 /check 的判定结论摆到用户页最上面。
+    // 数据全部来自 users/query 已有的两个来源（本地黑名单 + 外部风险库），不额外请求。
+    function renderVerdict(data, id) {
+      var gky = data.gky && typeof data.gky === 'object' ? data.gky : null; var black = data.blacklist || null;
+      var gkyBanned = !!(gky && gky.banned === true); var gkyFailed = !!data.gkyError || !!(gky && gky.success === false);
+      var tone; var mark; var title;
+      if (black && gkyBanned) { tone = 'danger'; mark = '⛔'; title = '双重封禁：本地黑名单 + 外部记录'; }
+      else if (black) { tone = 'danger'; mark = '🚫'; title = '在本地黑名单中'; }
+      else if (gkyBanned) { tone = 'warning'; mark = '⚠️'; title = '有外部封禁记录'; }
+      else if (gkyFailed) { tone = 'warning'; mark = '❔'; title = '本地未封禁，外部记录查询失败'; }
+      else { tone = 'success'; mark = '✅'; title = '无封禁记录'; }
+      var lines = [];
+      if (black) lines.push('本地原因：' + text(black.reason, '未填写') + '　操作人 ' + text(black.by));
+      if (gkyBanned) { var parts = []; if (gky.chatId) parts.push('来源群 ' + gky.chatId); if (gky.reason) parts.push('原因 ' + gky.reason); if (gky.recordedDate) parts.push('时间 ' + gky.recordedDate); lines.push('外部记录：' + (parts.length ? parts.join('　') : '已命中封禁')); }
+      if (gkyFailed && !gkyBanned) lines.push('外部记录：' + text(data.gkyError, '暂时无法查询'));
+      if (!lines.length) lines.push('本地黑名单与外部风险库都没有该用户的记录。');
+      var box = element('div', 'verdict'); box.dataset.tone = tone; box.append(element('span', 'verdict-mark', mark));
+      var body = element('div', 'verdict-body'); body.append(element('div', 'verdict-title', title), element('p', 'verdict-text', lines.join('\n'))); box.append(body);
+      return box;
+    }
     function renderUser(data, requestedId) {
-      var container = $('users-content'); container.replaceChildren(); var id = text(data.userId, requestedId); var profile = data.profile || {}; var card = element('article', 'card'); var head = element('div', 'profile-top'); var name = text(profile.name || [profile.first_name, profile.last_name].filter(Boolean).join(' '), '用户 ' + id); var info = element('div', 'profile-info'); info.append(element('h2', '', name), element('div', 'mono muted', 'ID ' + id)); if (profile.username) info.append(element('div', 'card-subtitle', (String(profile.username).startsWith('@') ? '' : '@') + profile.username)); head.append(element('div', 'avatar', Array.from(name)[0]), info); card.append(head); var badges = element('div', 'profile-badges'); badges.append(element('span', 'badge ' + (data.blacklist ? 'danger' : 'accent'), data.blacklist ? '黑名单中' : '未列入黑名单')); if (!data.profile) badges.append(element('span', 'badge', '暂无保存的资料')); card.append(badges); var speech = data.speech || {}; var stats = element('div', 'speech-stats'); [['发言记录', count(speech.count)], ['首次发言', date(speech.first, true)], ['最近发言', date(speech.last, true)]].forEach(function (pair) { var cell = element('div'); cell.append(element('span', '', pair[0]), element('strong', '', pair[1])); stats.append(cell); }); card.append(stats); container.append(card);
+      var container = $('users-content'); container.replaceChildren(); var id = text(data.userId, requestedId); container.append(renderVerdict(data, id)); var profile = data.profile || {}; var card = element('article', 'card'); var head = element('div', 'profile-top'); var name = text(profile.name || [profile.first_name, profile.last_name].filter(Boolean).join(' '), '用户 ' + id); var info = element('div', 'profile-info'); info.append(element('h2', '', name), element('div', 'mono muted', 'ID ' + id)); if (profile.username) info.append(element('div', 'card-subtitle', (String(profile.username).startsWith('@') ? '' : '@') + profile.username)); head.append(element('div', 'avatar', Array.from(name)[0]), info); card.append(head); var badges = element('div', 'profile-badges'); badges.append(element('span', 'badge ' + (data.blacklist ? 'danger' : 'accent'), data.blacklist ? '黑名单中' : '未列入黑名单')); if (!data.profile) badges.append(element('span', 'badge', '暂无保存的资料')); card.append(badges); var speech = data.speech || {}; var stats = element('div', 'speech-stats'); [['发言记录', count(speech.count)], ['首次发言', date(speech.first, true)], ['最近发言', date(speech.last, true)]].forEach(function (pair) { var cell = element('div'); cell.append(element('span', '', pair[0]), element('strong', '', pair[1])); stats.append(cell); }); card.append(stats); container.append(card);
       var errors = data.errors || {}; if (Object.keys(errors).length) { var labels = { profile: '用户资料', blacklist: '黑名单状态', events: '处理时间线', cases: '处罚记录', speech: '发言统计' }; var notice = element('div', 'notice'); notice.append(element('div', '', '部分记录暂时无法读取')); Object.keys(errors).forEach(function (key) { if (errors[key]) notice.append(element('div', '', (labels[key] || '记录') + '：' + text(errors[key]))); }); notice.append(makeButton('重新查询', 'small quiet', function () { return queryUser(id); })); container.append(notice); if (errors.blacklist) badges.firstChild.textContent = '黑名单状态暂时未知'; }
       if (data.blacklist) { var black = data.blacklist; var blackCard = element('article', 'card'); blackCard.append(element('h2', 'section-label', '黑名单记录'), detailList([['原因', text(black.reason)], ['备注', text(black.note)], ['操作人', text(black.by), true], ['记录时间', date(black.at || black.created_at)]])); var actions = element('div', 'card-actions'); actions.append(makeButton('解除封禁', 'small danger', async function (button) { var completed = await unban(button, Object.assign({}, black, { id: id })); if (completed && state.active === 'users' && state.queriedUser === id) await queryUser(id); })); blackCard.append(actions); container.append(blackCard); }
       var cases = Array.isArray(data.cases) ? data.cases : []; var events = Array.isArray(data.events) ? data.events : []; renderTimeline(container, '处罚记录', cases, true); renderTimeline(container, '处理时间线', events, false);
@@ -1281,23 +1513,28 @@ function renderMiniAppHtml() {
       var timeline = element('ol', 'timeline'); var labels = { ban: '封禁', unban: '解封', kick: '移出群组', mute: '禁言', unmute: '解除禁言', warn: '警告', ad: '广告判定', ad_ignore: '撤销广告判定', ignored: '已撤销', auto: '自动处理', manual: '人工处理', leave: '离开群组', join: '加入群组' };
       entries.forEach(function (row) { if (!row || typeof row !== 'object') { var simple = element('li', 'timeline-item'); simple.append(element('div', 'timeline-title', displayValue(row))); timeline.append(simple); return; } var rawTitle = valueFrom(row, ['title', 'action', 'type', 'event', 'kind', 'event_type', 'status']); var titleText = labels[rawTitle] || text(rawTitle, isCase ? '广告判定' : '处理记录'); var seq = valueFrom(row, ['seq', 'caseId', 'case_id', 'id']); var item = element('li', 'timeline-item'); item.append(element('div', 'timeline-title', titleText + (seq !== null ? ' · #' + seq : '')), element('div', 'timeline-time', date(valueFrom(row, ['at', 'createdAt', 'created_at', 'timestamp', 'time', 'date'])))); var pieces = []; var reason = valueFrom(row, ['reasons', 'reason', 'description', 'message', 'text', 'note', 'detail']); var group = valueFrom(row, ['chatId', 'groupId', 'chat_id', 'group_id']); var by = valueFrom(row, ['by', 'operatorId', 'operator_id', 'actor_id']); if (reason && (!Array.isArray(reason) || reason.length)) pieces.push(displayValue(reason)); if (isCase && row.score !== null && row.score !== undefined) pieces.push('广告评分 ' + text(row.score)); if (group) pieces.push('群组 ' + displayValue(group)); if (by) pieces.push('操作人 ' + displayValue(by)); if (row.revoked || row.ignored || row.reverted) pieces.push('此记录已撤销'); else if (isCase && row.processed) pieces.push('处理状态：' + ({ ignored: '已标为误报', done: '已完成', banned: '已封禁', pending: '待处理', true: '已处理' }[String(row.processed)] || text(row.processed))); if (pieces.length) item.append(element('div', 'timeline-detail', pieces.join('\n'))); if (isCase && row.snapshot) { var snapshot = row.snapshot; var evidence = element('details', 'evidence'); evidence.append(element('summary', '', '查看判定时的资料与内容')); var content = []; [['姓名', snapshot.name], ['用户名', snapshot.username], ['简介', snapshot.bio], ['内容', snapshot.text]].forEach(function (pair) { if (pair[1]) content.push(pair[0] + '：' + displayValue(pair[1])); }); evidence.append(element('div', 'evidence-text', content.length ? content.join('\n\n') : '暂无文字快照。')); item.append(evidence); } timeline.append(item); }); card.append(timeline); container.append(card);
     }
-    async function navigate(tab, load) { if (!state.authenticated) return; state.active = tab; document.querySelectorAll('[data-tab]').forEach(function (button) { var active = button.dataset.tab === tab; button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1; $('page-' + button.dataset.tab).hidden = !active; }); updateBackButton(); var heading = $('page-' + tab).querySelector('h1'); heading.focus({ preventScroll: true }); window.scrollTo({ top: 0, behavior: 'instant' }); if (load === false || state.loaded[tab]) return; if (tab === 'groups') await loadGroups(); else if (tab === 'blacklist') await loadBlacklist(state.blacklistPage); else if (tab === 'ads') await loadAds(); else if (state.queriedUser) await queryUser(state.queriedUser); else userEmpty(); }
+    async function navigate(tab, load) { if (!state.authenticated) return; state.active = tab; document.querySelectorAll('[data-tab]').forEach(function (button) { var active = button.dataset.tab === tab; button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1; $('page-' + button.dataset.tab).hidden = !active; }); updateBackButton(); var heading = $('page-' + tab).querySelector('h1'); heading.focus({ preventScroll: true }); window.scrollTo({ top: 0, behavior: 'instant' }); if (load === false) return; if (tab === 'notice') { await loadNotice(); return; } if (state.loaded[tab]) return; if (tab === 'groups') await loadGroups(); else if (tab === 'blacklist') await loadBlacklist(state.blacklistPage); else if (tab === 'ads') await loadAds(); else if (state.queriedUser) await queryUser(state.queriedUser); else userEmpty(); }
     async function bootstrap() {
       if (!tg || !tg.initData) { authMessage('请从 Telegram 打开', '在机器人私聊中打开菜单，点击「群务台」即可进入。', false); return; }
       $('auth-retry').disabled = true; $('auth-spinner').hidden = false; $('auth-title').textContent = '正在连接群务台'; $('auth-text').textContent = '正在确认管理权限…';
-      try { var data = await api('bootstrap'); data = data || {}; state.primaryOwner = data.primaryOwner === true; state.authenticated = true; var user = data.user || {}; $('identity-name').textContent = text(user.name, '用户 ' + text(user.id)); $('identity-role').textContent = state.primaryOwner ? '第一主人' : '管理员'; permissionNotice(); renderGroups(data.groups); state.loaded.groups = true; $('auth').hidden = true; $('app').hidden = false; $('nav').hidden = false; $('refresh').hidden = false; updateFullscreenButton(); userEmpty(); await navigate(state.active); } catch (err) { if (!err.auth) authMessage('暂时无法连接', err.message, true); } finally { $('auth-retry').disabled = false; $('auth-spinner').hidden = true; }
+      try { var data = await api('bootstrap'); data = data || {}; state.primaryOwner = data.primaryOwner === true; state.authenticated = true; var user = data.user || {}; $('identity-name').textContent = text(user.name, '用户 ' + text(user.id)); $('identity-role').textContent = state.primaryOwner ? '第一主人' : '管理员'; permissionNotice(); renderGroups(data.groups); state.loaded.groups = true; $('auth').hidden = true; $('app').hidden = false; $('nav').hidden = false; $('refresh').hidden = false; updateFullscreenButton(); autoFullscreen(); userEmpty(); await navigate(state.active); } catch (err) { if (!err.auth) authMessage('暂时无法连接', err.message, true); } finally { $('auth-retry').disabled = false; $('auth-spinner').hidden = true; }
     }
     $('auth-retry').addEventListener('click', bootstrap);
     document.querySelectorAll('[data-tab]').forEach(function (button) { button.addEventListener('click', function () { navigate(button.dataset.tab).catch(function (err) { toast(err.message, 'error'); }); }); button.addEventListener('keydown', function (event) { var keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End']; if (!keys.includes(event.key)) return; event.preventDefault(); var tabs = Array.from(document.querySelectorAll('[data-tab]')); var index = tabs.indexOf(button); index = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length; tabs[index].focus(); navigate(tabs[index].dataset.tab).catch(function (err) { toast(err.message, 'error'); }); }); });
-    $('refresh').addEventListener('click', function () { actionButton($('refresh'), 'refresh', async function () { if (state.active === 'groups') await loadGroups(); else if (state.active === 'blacklist') await loadBlacklist(state.blacklistPage); else if (state.active === 'ads') await loadAds(); else if (state.queriedUser) await queryUser(state.queriedUser); else userEmpty(); }).catch(function (err) { toast(err.message, 'error'); }); });
+    $('refresh').addEventListener('click', function () { actionButton($('refresh'), 'refresh', async function () { if (state.active === 'groups') await loadGroups(); else if (state.active === 'blacklist') await loadBlacklist(state.blacklistPage); else if (state.active === 'ads') await loadAds(); else if (state.active === 'notice') await loadNotice(); else if (state.queriedUser) await queryUser(state.queriedUser); else userEmpty(); }).catch(function (err) { toast(err.message, 'error'); }); });
     $('blacklist-search').addEventListener('submit', function (event) { event.preventDefault(); loadBlacklist(1, $('blacklist-query').value).catch(function (err) { toast(err.message, 'error'); }); });
     $('user-search').addEventListener('submit', function (event) { event.preventDefault(); queryUser($('user-query').value).catch(function (err) { toast(err.message, 'error'); }); });
+    $('search-form').addEventListener('submit', function (event) { event.preventDefault(); loadSearch(1, $('search-query').value).catch(function (err) { toast(err.message, 'error'); }); });
+    $('health-run').addEventListener('click', function () { actionButton($('health-run'), 'health', loadHealth).catch(function (err) { toast(err.message, 'error'); }); });
+    $('admins-run').addEventListener('click', function () { actionButton($('admins-run'), 'admins', loadAdmins).catch(function (err) { toast(err.message, 'error'); }); });
+    $('notice-text').addEventListener('input', function () { var length = $('notice-text').value.length; var label = $('notice-char'); label.textContent = length + ' / 4096'; label.className = 'char-count' + (length > 4096 ? ' over' : ''); });
+    $('notice-send').addEventListener('click', async function () { try { var job = await prepareNotice(); if (!job) return; await actionButton($('notice-send'), 'notice-send', function () { return deliverNotice(job); }); } catch (err) { toast(err.message || '发送失败，请稍后重试。', 'error'); } });
     $('add-group').addEventListener('click', function () { if (!state.primaryOwner) return; $('add-form').reset(); showDialog($('add-dialog')); $('add-chat-id').focus(); });
     $('add-cancel').addEventListener('click', function () { if (!state.busy.has('add-group')) closeDialog($('add-dialog')); });
     $('add-form').addEventListener('submit', async function (event) { event.preventDefault(); if (!state.primaryOwner || state.busy.has('add-group')) return; var id = $('add-chat-id').value.trim(); if (!/^-\d{5,20}$/.test(id)) { toast('请输入以负号开头的有效群组 ID。', 'error'); return; } await actionButton($('add-submit'), 'add-group', async function () { setFormBusy($('add-form'), true); try { var result = await api('groups/add', { chatId: id }); closeDialog($('add-dialog')); toast(result && result.message ? result.message : '群组已纳入治理。', result && result.complete === false ? 'error' : 'success'); await loadGroups(); } catch (err) { if (!err.auth) toast(err.message, 'error'); } finally { setFormBusy($('add-form'), false); } }); });
     document.querySelectorAll('dialog').forEach(function (dialog) { dialog.addEventListener('cancel', function (event) { if (dialog.id === 'add-dialog' && state.busy.has('add-group')) { event.preventDefault(); return; } event.preventDefault(); closeDialog(dialog); }); dialog.addEventListener('close', function () { if (!document.querySelector('dialog[open]')) document.body.classList.remove('dialog-open'); updateBackButton(); }); dialog.addEventListener('click', function (event) { if (event.target !== dialog) return; var rect = dialog.getBoundingClientRect(); if (event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom) return; if (dialog.id === 'add-dialog' && state.busy.has('add-group')) return; closeDialog(dialog); }); });
     $('fullscreen').addEventListener('click', function () { actionButton($('fullscreen'), 'fullscreen', async function () { toggleFullscreen(); }).catch(function (err) { toast(err.message || '无法切换全屏显示。', 'error'); }); });
-    theme(); if (tg) { try { tg.ready(); tg.expand(); tg.onEvent('themeChanged', theme); if (tg.onEvent) { tg.onEvent('fullscreenChanged', updateFullscreenButton); tg.onEvent('viewportChanged', updateFullscreenButton); tg.onEvent('fullscreenFailed', function (event) { var reasons = { UNSUPPORTED: '当前客户端不支持全屏显示', ALREADY_FULLSCREEN: '已经处于全屏状态' }; var raw = event && event.error ? String(event.error) : ''; toast('无法进入全屏：' + (reasons[raw] || raw || '当前客户端不支持'), 'error'); updateFullscreenButton(); }); } if (tg.BackButton) tg.BackButton.onClick(function () { var dialog = document.querySelector('dialog[open]'); if (dialog) { if (dialog.id !== 'add-dialog' || !state.busy.has('add-group')) closeDialog(dialog); } else navigate('groups').catch(function (err) { toast(err.message, 'error'); }); }); } catch (_) {} }
+    theme(); if (tg) { try { tg.ready(); tg.expand(); tg.onEvent('themeChanged', theme); if (tg.onEvent) { tg.onEvent('fullscreenChanged', updateFullscreenButton); tg.onEvent('viewportChanged', updateFullscreenButton); tg.onEvent('fullscreenFailed', function (event) { if (state.autoFull) { state.autoFull = false; updateFullscreenButton(); return; } var reasons = { UNSUPPORTED: '当前客户端不支持全屏显示', ALREADY_FULLSCREEN: '已经处于全屏状态' }; var raw = event && event.error ? String(event.error) : ''; toast('无法进入全屏：' + (reasons[raw] || raw || '当前客户端不支持'), 'error'); updateFullscreenButton(); }); } if (tg.BackButton) tg.BackButton.onClick(function () { var dialog = document.querySelector('dialog[open]'); if (dialog) { if (dialog.id !== 'add-dialog' || !state.busy.has('add-group')) closeDialog(dialog); } else navigate('groups').catch(function (err) { toast(err.message, 'error'); }); }); } catch (_) {} }
     bootstrap();
   })();
   </script>
@@ -1842,6 +2079,166 @@ async function miniAppUserQuery(env, payload) {
 	return data;
 }
 
+// ===== Mini App 第 3 批接口：health / admins / search / notice =====
+// 这四条全部对应已有的 / 命令，判定逻辑一律复用命令路径的函数，
+// 后台只是换一种呈现方式，绝不另写一套口径。
+
+// layer1 的文案是给 Telegram 消息用的 HTML 片段（含 <code>、<b>）。
+// Mini App 前端不用 innerHTML（静态检查脚本禁止），这里统一剥成纯文本再返回。
+// 实体解码必须【最后】处理 &amp;：先解它会令 "&amp;lt;" 变成 "<"，把原文里的标签字符解出来。
+function miniAppPlainText(value) {
+	return String(value === undefined || value === null ? '' : value)
+		.replace(/<[^>]*>/g, '')
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/&amp;/g, '&')
+		.trim();
+}
+
+// /health 的后台版：复用 runHealthCheck，只把 layer1 的 HTML 剥成纯文本。
+// 不合并、不改写任何判定 —— 线上 /health 显示什么，这里就显示什么。
+async function miniAppHealth(env) {
+	const report = await runHealthCheck(env);
+	const layer1 = (Array.isArray(report?.layer1) ? report.layer1 : []).map((item) => ({
+		ok: item?.ok === true ? true : item?.ok === false ? false : null,
+		text: miniAppPlainText(item?.text)
+	}));
+	const layer2 = (Array.isArray(report?.layer2) ? report.layer2 : []).map((row) => ({
+		groupId: String(row?.groupId || ''),
+		title: String(row?.title || ''),
+		present: row?.present === true,
+		isAdmin: row?.isAdmin === true,
+		canDelete: row?.canDelete === true,
+		canRestrict: row?.canRestrict === true,
+		canInvite: row?.canInvite === true,
+		error: String(row?.error || '')
+	}));
+	return { layer1, layer2, total: Number(report?.total) || layer2.length };
+}
+
+// /admins 的后台版：不调 renderPermissionAdminsList（它只产出拼好的 HTML 文本），
+// 直接用它底下的 resolvePermissionUserProfiles + resolvePermissionGroupLabels 组装结构化数据。
+// 两处共用同一份预算常量，请求消耗与 /admins 完全一致。
+async function miniAppAdmins(env) {
+	const owners = Array.isArray(OWNER_IDS) ? OWNER_IDS.map(String) : [];
+	const primary = owners.length ? [owners[0]] : [];
+	const secondary = owners.slice(1);
+	const superAdmins = [...new Set((SUPER_ADMIN_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
+	const allIds = [...primary, ...secondary, ...superAdmins];
+	const budget = createLookupBudget(ADMINS_LOOKUP_BUDGET);
+	const profiles = await resolvePermissionUserProfiles(allIds, { budget });
+	const groupLabels = await resolvePermissionGroupLabels(
+		[...profiles.values()].map((p) => p?.groupId).filter(Boolean),
+		{ budget }
+	);
+	const labels = {};
+	for (const [groupId, label] of groupLabels) {
+		labels[groupId] = { title: String(label?.title || ''), url: String(label?.url || '') };
+	}
+	const person = (id) => {
+		const row = profiles.get(id);
+		const user = row?.user || null;
+		return {
+			id,
+			name: user ? ([user.first_name, user.last_name].filter(Boolean).join(' ') || '未设置') : '未获取',
+			username: String(user?.username || ''),
+			status: String(row?.status || ''),
+			groupId: String(row?.groupId || ''),
+			source: String(row?.source || '')
+		};
+	};
+	return {
+		primary: primary.map(person),
+		secondary: secondary.map(person),
+		superAdmins: superAdmins.map(person),
+		groupLabels: labels,
+		truncated: budget.skipped > 0
+	};
+}
+
+// /search 的后台版：跨全部配置群（Mini App 只有第一主人能进，等价于私聊查询的权限）。
+// 查询分类与用户名反查都复用命令路径的函数，两条入口的口径不会分叉。
+async function miniAppSearch(env, payload) {
+	const raw = String(payload?.query || '').trim();
+	if (!raw) throw new MiniAppError(400, '请输入要搜索的内容');
+	if (raw.length > 160) throw new MiniAppError(400, '搜索内容不能超过 160 字');
+	const q = classifySearchQuery(raw);
+	if (!q) throw new MiniAppError(400, '请输入要搜索的内容');
+	const page = Math.max(1, Number(payload?.page) || 1);
+	let userIdFilter = null;
+	let keywordFilter = null;
+	let resolvedUserId = '';
+	if (q.kind === 'user') {
+		userIdFilter = q.value;
+	} else if (q.kind === 'username') {
+		resolvedUserId = await resolveUsernameToUserId(env, q.value);
+		if (!resolvedUserId) throw new MiniAppError(404, '没找到用户名 @' + q.value + ' 的记录');
+		userIdFilter = resolvedUserId;
+	} else {
+		keywordFilter = q.value;
+	}
+	const chatIds = [...new Set((GROUP_IDS || []).map(String).filter(Boolean))];
+	const result = await runSearchMessages(env, {
+		chatIds, userId: userIdFilter, keyword: keywordFilter, page
+	});
+	return {
+		kind: q.kind,
+		value: q.value,
+		resolvedUserId,
+		page,
+		rows: Array.isArray(result?.rows) ? result.rows : [],
+		total: Number(result?.total) || 0,
+		totalPages: Number(result?.totalPages) || 1
+	};
+}
+
+// /notice 的后台版：原命令用 copyMessage 搬运主人那条消息（保留任意媒体与排版）；
+// Mini App 里没有「原消息」可搬，改成 sendMessage 纯文本群发。
+// 刻意不带 parse_mode：主人随手写的 <、& 不会被当成标签，也就不会整批失败。
+// chatId 为空 = 发往全部配置群；指定群必须先在治理范围内，杜绝往任意 chat 发公告。
+async function miniAppNoticeSend(env, payload) {
+	const text = String(payload?.text || '').trim();
+	if (!text) throw new MiniAppError(400, '请输入通知内容');
+	if (text.length > 4096) throw new MiniAppError(400, '通知内容不能超过 4096 字');
+	const configured = [...new Set((GROUP_IDS || []).map(String).filter(Boolean))];
+	if (!configured.length) throw new MiniAppError(400, '还没有配置治理群组');
+	const target = String(payload?.chatId || '').trim();
+	if (target && !configured.includes(target)) throw new MiniAppError(400, '该群组不在治理范围内');
+	const groups = target ? [target] : configured;
+	const silent = payload?.silent === true;
+	const results = await mapWithConcurrency(groups, 5, async (groupId) => {
+		try {
+			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					chat_id: groupId,
+					text,
+					disable_notification: silent,
+					disable_web_page_preview: true
+				})
+			});
+			const result = await response.json();
+			if (!response.ok || result?.ok !== true) {
+				const { 中文 } = translateTelegramError(result?.description || `HTTP ${response.status}`);
+				return { groupId, ok: false, error: 中文 };
+			}
+			return { groupId, ok: true, error: '' };
+		} catch (error) {
+			return { groupId, ok: false, error: '网络错误，未送达' };
+		}
+	});
+	const failures = results.filter((row) => !row.ok);
+	return {
+		total: groups.length,
+		sent: groups.length - failures.length,
+		complete: failures.length === 0,
+		failures
+	};
+}
+
 async function dispatchMiniAppAction(action, body, env, auth, ctx) {
 	// Mini App 在 mergeDynamicGroupsFromD1 之前就鉴权返回，运行期的群组变量可能还是
 	// 上一个请求留下的快照。这里按当前请求重建一次，与 / 命令路径吃的是同一份数据。
@@ -1859,6 +2256,10 @@ async function dispatchMiniAppAction(action, body, env, auth, ctx) {
 		case 'ads/pending': return miniAppAdPending(env, payload);
 		case 'ads/ignore': return miniAppAdIgnore(env, payload);
 		case 'users/query': return miniAppUserQuery(env, payload);
+		case 'health': return miniAppHealth(env);
+		case 'admins/list': return miniAppAdmins(env);
+		case 'search': return miniAppSearch(env, payload);
+		case 'notice/send': return miniAppNoticeSend(env, payload);
 		default: throw new MiniAppError(404, '接口不存在');
 	}
 }

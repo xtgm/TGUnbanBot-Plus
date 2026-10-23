@@ -22,6 +22,7 @@ let blacklistFails = 0;
 let unbanDelay = 0;
 let denyRefresh = false;
 let userErrors = false;
+let noticeFail = false;
 function userData(id) { return {userId:id,profile:{name:id==='123456789'?'林海':'另一位用户',username:'member_'+id},blacklist:blacklist.find(row=>row.id===id)||null,events:[{kind:'join',at:1780000000,chatId:'-1001111111111'}],cases:id==='123456789'?[{seq:42,chatId:'-1001111111111',score:92,reasons:['联系方式命中'],snapshot:{name:'林海',bio:'判定时简介',text:'判定时内容'},createdAt:1780000000,processed:'banned'}]:[],speech:{count:23,first:1780000000,last:1780000010},gky:{success:true,banned:false,tgid:id,message:'无封禁记录'},gkyError:null,...(userErrors?{errors:{speech:'发言记录读取失败'}}:{})}; }
 async function fixture(route) {
   const url = route.request().url();
@@ -53,6 +54,21 @@ async function fixture(route) {
     case 'ads/pending': data={items:pending,page:1,total:pending.length,totalPages:1};break;
     case 'ads/ignore': pending=[];data={complete:false,message:'已标为误报，部分撤销未完成',rollback:{blacklistRemoved:true,unbanResults:[{groupId:'-1002222222222',ok:false,error:'权限不足'}]}};break;
     case 'users/query': data=userData(body.userId);break;
+    case 'health': data={layer1:[
+      {ok:true,text:'Bot 身份　@MiniAppTestBot（42）'},
+      {ok:true,text:'D1 存储　✅ 已连接（统计表就绪）'},
+      {ok:null,text:'统计活性　⚠️ 还没有任何发言记录'},
+      {ok:null,text:'Workers AI　⚠️ 未绑定 —— 广告检测降级为两层'},
+      {ok:true,text:'配置规模　📋 配置群 '+groups.length+' 个　杀手模式 0 个'}],
+      layer2:groups.map((group,index)=>({groupId:group.chatId,title:group.title,present:true,isAdmin:index===0,canDelete:index===0,canRestrict:index===0,canInvite:false,error:''})),
+      total:groups.length};break;
+    case 'admins/list': data={primary:[{id:'10001',name:'管理员 · 阿林',username:'owner',status:'creator',groupId:'-1001111111111',source:'getChatAdministrators'}],secondary:[{id:'10002',name:'副主人 · 小周',username:'second',status:'administrator',groupId:'-1001111111111',source:'getChatAdministrators'}],superAdmins:[{id:'10003',name:'未获取',username:'',status:'',groupId:'',source:''}],groupLabels:{'-1001111111111':{title:'读书会 · 南岸',url:''}},truncated:false};break;
+    case 'search': {
+      const rows=[{mid:501,chat_id:'-1001111111111',from_id:'123456789',created_at:1780000000,text_norm:'<img src=x onerror="window.injected=true"> 广告文案样本'},{mid:502,chat_id:'-1001111111111',from_id:'987654321',created_at:1780000010,text_norm:'正常发言记录'}];
+      data={kind:'keyword',value:body.query,resolvedUserId:'',page:Number(body.page)||1,total:rows.length,totalPages:1,rows};
+      break;
+    }
+    case 'notice/send': data=noticeFail?{total:1,sent:0,complete:false,failures:[{groupId:body.chatId||'-1001111111111',error:'bot 必须是群管理员'}]}:{total:body.chatId?1:groups.length,sent:body.chatId?1:groups.length,complete:true,failures:[]};break;
     default: throw new Error('Unexpected action '+action);
   }
   await route.fulfill({status:200,json:{success:true,data}});
@@ -70,16 +86,30 @@ async function run() {
     await page.waitForSelector('#app:not([hidden])');
     assert.equal(await page.locator('#groups-content .card').count(),2);
     assert.equal(await page.locator('#groups-content img').count(),0);
+    // 运行检查：点按钮才发请求，第一层 5 行状态 + 第二层逐群权限卡
+    await page.locator('#health-run').click();
+    await waitText(page,'health-count','正常');
+    assert.equal(await page.locator('#health-content .status-line').count(),5,'Health should show 5 layer-1 lines');
+    assert.equal(await page.locator('#health-content .group-health .card').count(),2,'Health should show one card per group');
+    assert.equal(await page.locator('#health-content .dot.warn').count(),2,'Two warnings expected');
+    assert.equal(await page.locator('#health-content .dot.bad').count(),0,'No failures expected');
+    // 权限名单：主人 / 副主人 / 超管三段，各人一行
+    await page.locator('#admins-run').click();
+    await waitText(page,'admins-count','3 人');
+    assert.equal(await page.locator('#admins-content .person').count(),3,'Admins list should show 3 people');
+    await waitText(page,'admins-content','副主人 · 小周');
     await page.screenshot({path:'miniapp_groups_light.png',fullPage:true});
-    // 全屏按钮：点一次进全屏、再点一次退出，图标随状态切换（data-full 由事件驱动）
+    // 全屏按钮：打开后台就自动最大化（bootstrap 成功后静默 requestFullscreen），
+    // 之后按钮再点一次退出、点一次进入，图标随状态切换（data-full 由事件驱动）。
     assert.equal(await page.locator('#fullscreen').isVisible(),true,'Fullscreen button should be visible');
-    assert.equal(await page.locator('#fullscreen').getAttribute('data-full'),'0');
-    await page.locator('#fullscreen').click();
     await page.waitForFunction(()=>document.getElementById('fullscreen').dataset.full==='1');
-    assert.equal(await page.evaluate(()=>window.Telegram.WebApp.isFullscreen),true,'Click should enter fullscreen');
+    assert.equal(await page.evaluate(()=>window.Telegram.WebApp.isFullscreen),true,'Should auto-enter fullscreen on open');
     await page.locator('#fullscreen').click();
     await page.waitForFunction(()=>document.getElementById('fullscreen').dataset.full==='0');
-    assert.equal(await page.evaluate(()=>window.Telegram.WebApp.isFullscreen),false,'Second click should exit fullscreen');
+    assert.equal(await page.evaluate(()=>window.Telegram.WebApp.isFullscreen),false,'Click should exit fullscreen');
+    await page.locator('#fullscreen').click();
+    await page.waitForFunction(()=>document.getElementById('fullscreen').dataset.full==='1');
+    assert.equal(await page.evaluate(()=>window.Telegram.WebApp.isFullscreen),true,'Second click should enter fullscreen again');
     await page.locator('#refresh').click();
     await page.waitForSelector('#refresh:not([disabled])');
     assert.equal(await page.locator('#refresh svg').count(),1,'Refresh icon lost');
@@ -104,6 +134,15 @@ async function run() {
     await page.locator('#blacklist-content').getByRole('button',{name:'查询用户'}).click();
     await waitText(page,'users-content','广告评分 92');
     await waitText(page,'users-content','联系方式命中');
+    // 封禁结论横幅：本地黑名单命中 → danger
+    assert.equal(await page.locator('#users-content .verdict').getAttribute('data-tone'),'danger','Blacklisted user should get danger verdict');
+    await waitText(page,'users-content','在本地黑名单中');
+    // 发言检索：跨群关键词，XSS 文本必须保持文本
+    await page.locator('#search-query').fill('广告');
+    await page.locator('#search-form').getByRole('button',{name:'搜索',exact:true}).click();
+    await waitText(page,'search-content','广告文案样本');
+    assert.equal(await page.locator('#search-content .result-item').count(),2,'Search should render 2 rows');
+    assert.equal(await page.locator('#search-content img').count(),0,'Search text must stay text');
     await page.locator('#users-content details').getByText('查看判定时的资料与内容').click();
     await page.screenshot({path:'miniapp_user_light.png',fullPage:true});
     userErrors=true;
@@ -142,6 +181,28 @@ async function run() {
     await page.locator('#groups-content .card').first().getByRole('button',{name:'退出群组'}).click();
     await page.locator('#confirm-submit').click();
     await waitText(page,'groups-count','2 个群组');
+    // 通知：目标下拉 = 全部群 + 每个治理群；发送前弹确认，结果卡给送达/失败计数
+    await page.locator('#tab-notice').click();
+    await waitText(page,'notice-scope','个群组');
+    assert.equal(await page.locator('#notice-target option').count(),3,'Notice target should be all-groups + 2 groups');
+    await page.locator('#notice-text').fill('今晚 22:00 维护，请提前保存内容。');
+    await waitText(page,'notice-char','20 / 4096');
+    await page.locator('#notice-send').click();
+    await page.locator('#confirm-submit').click();
+    await waitText(page,'notice-result','已送达');
+    assert.equal((await page.locator('#notice-result .stat-value').first().textContent()).trim(),'2','All-groups notice should reach 2 groups');
+    // 部分失败：失败群与中文原因都要显示出来
+    noticeFail=true;
+    await page.locator('#notice-send').click();
+    await page.locator('#confirm-submit').click();
+    await waitText(page,'notice-result','bot 必须是群管理员');
+    assert.equal(await page.locator('#toast').getAttribute('data-kind'),'error');
+    noticeFail=false;
+    // 320px 窄屏下 5 个标签页不横向溢出
+    await page.setViewportSize({width:320,height:640});
+    await page.waitForTimeout(150);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth),false,'Overflow on 320px with 5 tabs');
+    await page.setViewportSize({width:390,height:844});
     denyRefresh=true;
     await page.locator('#refresh').click();
     await waitText(page,'auth-title','连接已失效');
@@ -157,6 +218,8 @@ async function run() {
     assert.equal(await noAuthPage.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth),false,'Overflow on 320px');
     await noAuth.close();
     // 宽屏自适应：1280px 下群组铺成三列，且不横向溢出
+    denyRefresh=false;
+    groups=[{chatId:'-1001111111111',title:'读书会 · 南岸',source:'dynamic'},{chatId:'-1002222222222',title:'<img src=x onerror="window.injected=true">',source:'static'},{chatId:'-1003333333333',title:'周末徒步群',source:'dynamic'}];
     const wide = await browser.newContext({viewport:{width:1280,height:900}});
     await wide.route('**/*',fixture);
     await wide.addInitScript(()=>{window.Telegram={WebApp:{initData:'mock-telegram-signed-data',colorScheme:'light',isFullscreen:false,handlers:{},ready(){},expand(){},onEvent(type,cb){this.handlers[type]=cb;},requestFullscreen(){this.isFullscreen=true;if(this.handlers.fullscreenChanged)this.handlers.fullscreenChanged();},exitFullscreen(){this.isFullscreen=false;if(this.handlers.fullscreenChanged)this.handlers.fullscreenChanged();},BackButton:{show(){},hide(){},onClick(){}}}};});

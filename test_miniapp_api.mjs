@@ -505,6 +505,165 @@ section('[12] 未知 action 直接拒绝');
 	assert('★ 未知 action 返回 404', err && err.status === 404, err && err.message);
 }
 
+// ================= [13] health：复用 /health 的两层检查 =================
+section('[13] health 返回两层结果，文案已剥成纯文本');
+{
+	const env = await freshEnv();
+	const data = await call(env, 'health');
+	assert('★ layer1 五项齐全', Array.isArray(data.layer1) && data.layer1.length === 5, JSON.stringify(data.layer1));
+	assert('★ layer2 逐群 2 个且 total 对齐', data.layer2.length === 2 && data.total === 2, JSON.stringify(data.layer2));
+	// Mini App 前端禁止 innerHTML，后端必须把 <code>/<b> 剥掉再返回。
+	assert('★ 文案不含 HTML 标签', data.layer1.every((row) => !/[<>]/.test(row.text)), JSON.stringify(data.layer1.map((r) => r.text)));
+	assert('★ Bot 身份判为正常', data.layer1[0].ok === true, JSON.stringify(data.layer1[0]));
+	assert('★ D1 判为正常', data.layer1[1].ok === true, JSON.stringify(data.layer1[1]));
+	// 没有发言记录是「警告」不是「故障」—— null 与 false 必须区分开。
+	assert('★ 无发言记录时统计活性是 null（警告）', data.layer1[2].ok === null, JSON.stringify(data.layer1[2]));
+	assert('★ 未绑 Workers AI 是 null（降级不是故障）', data.layer1[3].ok === null, JSON.stringify(data.layer1[3]));
+	assert('★ 群权限如实反映 Telegram 返回值',
+		data.layer2.every((row) => row.present === true && row.isAdmin === true && row.canRestrict === true && row.canDelete === false && row.canInvite === false),
+		JSON.stringify(data.layer2));
+
+	adminNoRights = new Set([ENV_SECOND]);
+	const data2 = await call(env, 'health');
+	const second = data2.layer2.find((row) => row.groupId === ENV_SECOND);
+	assert('★ 缺封禁权限的群标 canRestrict=false', second && second.canRestrict === false, JSON.stringify(second));
+	adminNoRights = new Set();
+}
+
+// ================= [14] admins/list：三段名单结构化 =================
+section('[14] admins/list 返回主人 / 副主人 / 超管三段');
+{
+	const env = await freshEnv();
+	// OWNER_IDS / SUPER_ADMIN_IDS 是模块级 let（词法绑定，不是 sandbox 属性），
+	// 只能通过 applyRuntimeConfig 改 —— 直接赋值 sandbox.SUPER_ADMIN_IDS 不会生效。
+	W.applyRuntimeConfig(W.loadRequiredConfig(Object.assign({}, env, {
+		OWNER_IDS: OWNER + ',10002',
+		SUPER_ADMIN_IDS: '10003'
+	})));
+	const baseFetch = sandbox.fetch;
+	sandbox.fetch = async (url, init) => {
+		const method = String(url).split('/').pop();
+		let body = null;
+		try { body = init?.body ? JSON.parse(init.body) : null; } catch (_) { body = null; }
+		if (method === 'getChatAdministrators') {
+			const id = String(body?.chat_id ?? '');
+			const list = [{ user: { id: BOT_ID }, status: 'administrator', can_restrict_members: true }];
+			if (id === ENV_MAIN) list.push({ user: { id: Number(OWNER), first_name: '主人', last_name: '阿林', username: 'owner' }, status: 'creator' });
+			if (id === ENV_SECOND) list.push({ user: { id: 10002, first_name: '副主人', username: 'second' }, status: 'administrator' });
+			return { ok: true, status: 200, async json() { return { ok: true, result: list }; }, async text() { return ''; } };
+		}
+		if (method === 'getChatMember') {
+			// 超管不在任何群的管理员列表里，只能靠这一轨补查；这里返回空表示查不到，
+			// 用来验证「未获取」这条回落路径。
+			return { ok: true, status: 200, async json() { return { ok: false, description: 'Bad Request: user not found' }; }, async text() { return ''; } };
+		}
+		return baseFetch(url, init);
+	};
+	try {
+		const data = await call(env, 'admins/list');
+		assert('★ 主人只有一位', data.primary.length === 1 && data.primary[0].id === OWNER, JSON.stringify(data.primary));
+		assert('★ 主人昵称由姓 + 名拼成', data.primary[0].name === '主人 阿林', data.primary[0].name);
+		assert('★ 主人用户名与来源群齐备',
+			data.primary[0].username === 'owner' && data.primary[0].groupId === ENV_MAIN, JSON.stringify(data.primary[0]));
+		assert('★ 副主人一段独立', data.secondary.length === 1 && data.secondary[0].id === '10002', JSON.stringify(data.secondary));
+		assert('★ 超管一段独立', data.superAdmins.length === 1 && data.superAdmins[0].id === '10003', JSON.stringify(data.superAdmins));
+		assert('★ 超管查不到资料时回落「未获取」', data.superAdmins[0].name === '未获取', JSON.stringify(data.superAdmins[0]));
+		assert('★ 来源群名已解析', data.groupLabels[ENV_MAIN] && data.groupLabels[ENV_MAIN].title === '群 ' + ENV_MAIN, JSON.stringify(data.groupLabels));
+		assert('★ 未触发预算截断', data.truncated === false, String(data.truncated));
+	} finally {
+		sandbox.fetch = baseFetch;
+		W.applyRuntimeConfig(W.loadRequiredConfig(env));
+	}
+}
+
+// ================= [15] search：三种查询类型 + 分页 + 排除广告 =================
+section('[15] search 三种查询类型与分页');
+{
+	const env = await freshEnv();
+	await W.statReady(env);
+	const insert = (mid, chatId, fromId, text, isAd) => env.DB.prepare(
+		'INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm, is_ad) VALUES (?, ?, ?, ?, ?, ?, ?)'
+	).bind(mid, chatId, fromId, '2026-10-01T00:00:00Z', 'h' + mid, text, isAd).run();
+	for (let i = 1; i <= 11; i++) insert(i, ENV_MAIN, '123456789', '第 ' + i + ' 条 广告测试', 0);
+	insert(99, ENV_SECOND, '987654321', '另一个群的正常发言', 0);
+	// is_ad=1 是被判成广告的消息，只服务同款连带与清扫，绝不进检索源。
+	insert(100, ENV_MAIN, '123456789', '被判成广告的那条内容', 1);
+	env.DB.prepare(
+		'INSERT INTO stat_speech (chat_id, user_id, day, msg_count, display_name, username, updated_at, last_msg_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+	).bind(ENV_SECOND, '987654321', '2026-10-02', 1, '另一位', 'second', 1780000000, 99).run();
+
+	const byKeyword = await call(env, 'search', { query: '广告' });
+	assert('★ 关键词查询命中 11 条（广告记录被排除）', byKeyword.total === 11, JSON.stringify({ total: byKeyword.total }));
+	assert('★ 关键词类型判定正确', byKeyword.kind === 'keyword', byKeyword.kind);
+	assert('★ 首页 10 条、共 2 页', byKeyword.rows.length === 10 && byKeyword.totalPages === 2, JSON.stringify({ rows: byKeyword.rows.length, pages: byKeyword.totalPages }));
+	const page2 = await call(env, 'search', { query: '广告', page: 2 });
+	assert('★ 第二页剩 1 条', page2.rows.length === 1 && page2.page === 2, JSON.stringify({ rows: page2.rows.length, page: page2.page }));
+
+	const byId = await call(env, 'search', { query: '987654321' });
+	assert('★ 纯数字按用户 ID 查', byId.kind === 'user' && byId.total === 1, JSON.stringify({ kind: byId.kind, total: byId.total }));
+	assert('★ 命中行带回群组与消息号', byId.rows[0].chat_id === ENV_SECOND && Number(byId.rows[0].mid) === 99, JSON.stringify(byId.rows[0]));
+
+	const byName = await call(env, 'search', { query: '@second' });
+	assert('★ @ 开头按用户名反查', byName.kind === 'username' && byName.resolvedUserId === '987654321', JSON.stringify({ kind: byName.kind, id: byName.resolvedUserId }));
+	assert('★ 反查后命中该用户的发言', byName.total === 1, String(byName.total));
+
+	const missing = await callError(env, 'search', { query: '@nobodyhere' });
+	assert('★ 用户名查不到时明确报错，不退化成搜全部', missing && missing.status === 404, missing && missing.message);
+
+	const empty = await callError(env, 'search', { query: '   ' });
+	assert('★ 空查询被拒（400）', empty && empty.status === 400, empty && empty.message);
+
+	const tooLong = await callError(env, 'search', { query: 'x'.repeat(161) });
+	assert('★ 超长查询被拒（400）', tooLong && tooLong.status === 400, tooLong && tooLong.message);
+}
+
+// ================= [16] notice/send：全部群 / 指定群 / 参数校验 =================
+section('[16] notice/send 群发与指定群');
+{
+	const env = await freshEnv();
+	const sent = [];
+	const failing = new Set([ENV_SECOND]);
+	const baseFetch = sandbox.fetch;
+	sandbox.fetch = async (url, init) => {
+		const method = String(url).split('/').pop();
+		if (method !== 'sendMessage') return baseFetch(url, init);
+		let body = null;
+		try { body = init?.body ? JSON.parse(init.body) : null; } catch (_) { body = null; }
+		sent.push(body || {});
+		const id = String(body?.chat_id ?? '');
+		if (failing.has(id)) {
+			return { ok: true, status: 200, async json() { return { ok: false, description: 'Bad Request: chat not found' }; }, async text() { return ''; } };
+		}
+		return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 9001 } }; }, async text() { return ''; } };
+	};
+	try {
+		const all = await call(env, 'notice/send', { text: '今晚维护，请提前保存内容。' });
+		assert('★ 全部群：目标数 = 配置群数', all.total === 2, JSON.stringify(all));
+		assert('★ 全部群：一个成功一个失败', all.sent === 1 && all.complete === false, JSON.stringify(all));
+		assert('★ 失败项带群号与中文原因',
+			all.failures.length === 1 && all.failures[0].groupId === ENV_SECOND && Boolean(all.failures[0].error), JSON.stringify(all.failures));
+		assert('★ 正文按纯文本发送（不带 parse_mode）', sent.every((body) => body.parse_mode === undefined), JSON.stringify(sent));
+		assert('★ 正文原样送达', sent.every((body) => body.text === '今晚维护，请提前保存内容。'), JSON.stringify(sent.map((b) => b.text)));
+
+		sent.length = 0; failing.clear();
+		const one = await call(env, 'notice/send', { text: '只发这个群', chatId: ENV_MAIN, silent: true });
+		assert('★ 指定群只发一个目标', one.total === 1 && one.sent === 1 && one.complete === true, JSON.stringify(one));
+		assert('★ 指定群参数原样落到请求里',
+			sent.length === 1 && String(sent[0].chat_id) === ENV_MAIN && sent[0].disable_notification === true, JSON.stringify(sent));
+
+		const outside = await callError(env, 'notice/send', { text: '越界群', chatId: '-1009999999999' });
+		assert('★ 治理范围外的群被拒（400）', outside && outside.status === 400, outside && outside.message);
+
+		const blank = await callError(env, 'notice/send', { text: '   ' });
+		assert('★ 空内容被拒（400）', blank && blank.status === 400, blank && blank.message);
+
+		const huge = await callError(env, 'notice/send', { text: 'x'.repeat(4097) });
+		assert('★ 超过 4096 字被拒（400）', huge && huge.status === 400, huge && huge.message);
+	} finally {
+		sandbox.fetch = baseFetch;
+	}
+}
+
 console.log(`\n========== Mini App 接口：通过 ${pass} / 失败 ${fail} ==========`);
 if (fail > 0) {
 	console.log('失败项：');
