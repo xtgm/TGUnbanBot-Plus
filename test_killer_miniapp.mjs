@@ -116,6 +116,10 @@ log('\n=== 1. 静态外壳 ===');
 	check('POST /app/killer 405', post.status === 405, post.status);
 	const main = await (await handler.fetch(new Request('https://bot.example/app'), env, ctx)).text();
 	check('主后台 bootstrap 遇到杀手身份会跳转', main.includes("data.role === 'killer' && data.redirect"));
+	check('杀手后台有全屏按钮', html.includes('id="fullscreen"'), '');
+	const mainHtml = W.renderMiniAppHtml();
+	check('两个后台都不再自动全屏（改为按钮触发）', !/autoFullscreen/.test(html) && !/autoFullscreen/.test(mainHtml));
+	check('主后台保留全屏按钮', mainHtml.includes('id="fullscreen"'));
 }
 
 log('\n=== 2. 身份分流 ===');
