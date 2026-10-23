@@ -152,6 +152,16 @@ const DEFAULT_SUPER_ADMIN_IDS = [];
 //    空数组 = 该功能完全不启用（零开销）。
 const DEFAULT_KILLER_MODE_GROUPS = [];
 
+// 10.6b) 杀手权限 TGID 列表（环境变量 KILLER_ADMIN_IDS，逗号分隔，中英文逗号均可；只放 Dashboard）。
+//    独立在所有权限之外，没有高低之分；与超管分开管，两份可同时拥有：
+//      · 只作用于 KILLER_MODE_GROUPS，不能影响 GROUP_ID 的群
+//      · 按群分身份：杀手群里发命令 = 杀手身份；GROUP_ID 群里按他的其他身份算（只有杀手权限 = 无权、静默）；
+//        私聊时超管本来就有的 /ban /spam /unban /check 走超管身份，其余走杀手身份
+//      · 独立黑名单 killer_blacklist，只在杀手群拦截；手动封禁一律踢出、不学习特征
+//      · 封禁 / 解封 / 通知 / 删消息都抄送第一主人；发言豁免广告自动检测
+//    空数组 = 未配置该角色。
+const DEFAULT_KILLER_ADMIN_IDS = [];
+
 // 10.7) 关键词搜索的保留群（环境变量 STAT_SEARCH_GROUPS，逗号分隔超级群 ID，中英文逗号均可）。
 //    moderation_messages 全局只留 200 条（按 autoincrement 取最新），别的群照旧；
 //    只有列进来的群改按【创建时间】保留 STAT_SEARCH_RETENTION_DAYS 天，这样 /search 才查得到历史。
@@ -251,6 +261,8 @@ let OWNER_IDS = [];
 let SUPER_ADMIN_IDS = [];
 // 杀手群 ID 列表（环境变量 KILLER_MODE_GROUPS）。处置口径固定，见顶部 10.6。
 let KILLER_MODE_GROUPS = [];
+// 杀手权限 TGID 列表（环境变量 KILLER_ADMIN_IDS），见顶部 10.6b。
+let KILLER_ADMIN_IDS = [];
 // 关键词搜索的保留群 ID 列表（环境变量 STAT_SEARCH_GROUPS）。这些群的正文按天保留 180 天，
 // 其余群维持全局 200 条。空数组 = 不启用，裁剪行为与改动前完全一致。
 let STAT_SEARCH_GROUPS = [];
@@ -310,6 +322,7 @@ function applyRuntimeConfig(config) {
 	TOKEN = config.TOKEN;
 	BOT_TOKEN = config.BOT_TOKEN;
 	KILLER_MODE_GROUPS = config.KILLER_MODE_GROUPS || [];
+	KILLER_ADMIN_IDS = config.KILLER_ADMIN_IDS || [];
 	STAT_SEARCH_GROUPS = config.STAT_SEARCH_GROUPS || [];
 	// 杀手群并入有效 GROUP_IDS：它们即使不在 GROUP_ID 环境变量里，也享受全群治理
 	// （/stats、/ban、/spam、/check、广告检测、发言/进退群统计），处置口径按顶部 10.6 固定。
@@ -586,6 +599,17 @@ function loadRequiredConfig(env) {
 		);
 	}
 
+	// KILLER_ADMIN_IDS 可选：杀手权限 TGID，与 SUPER_ADMIN_IDS 同款解析（纯数字、去重去空）。
+	let killerAdminIds = [];
+	const rawKillerAdminEnv = env.KILLER_ADMIN_IDS;
+	if (rawKillerAdminEnv !== undefined && rawKillerAdminEnv !== null && String(rawKillerAdminEnv).trim() !== '') {
+		killerAdminIds = sanitizeAdmins(String(rawKillerAdminEnv).split(/[,，]/));
+	} else {
+		killerAdminIds = sanitizeAdmins(
+			Array.isArray(DEFAULT_KILLER_ADMIN_IDS) ? DEFAULT_KILLER_ADMIN_IDS : [DEFAULT_KILLER_ADMIN_IDS].filter(Boolean)
+		);
+	}
+
 	// KILLER_MODE_GROUPS 可选：逗号分隔超级群 ID（中英文逗号均可）。列进来的群启用杀手模式功能。
 	// 群 ID 形如 -100...，不能用 sanitizeAdmins（那只收纯数字），按 GROUP_ID 同款切分去空去重。
 	const sanitizeGroups = (raw) => [...new Set(
@@ -686,6 +710,7 @@ function loadRequiredConfig(env) {
 		OWNER_IDS: ownerIds,
 		SUPER_ADMIN_IDS: superAdminIds,
 		KILLER_MODE_GROUPS: killerModeGroups,
+		KILLER_ADMIN_IDS: killerAdminIds,
 		STAT_SEARCH_GROUPS: statSearchGroups,
 		AD_PROTECTED_USERNAMES: parseAdProtectedUsernames(env.AD_PROTECTED_USERNAMES),
 		MSG_CACHE_SIZE: msgCacheSize,
@@ -4075,9 +4100,10 @@ function isPrivilegedManager(userId) {
 // 广告【自动】检测的身份豁免：主人、副主人、超级管理员发任何内容都不判定。
 // 只用于自动检测四个入口（发言 / 入群 / 定时复扫 / /rescreen），不参与命令鉴权，
 // /ban /spam 对这些人的执行口径保持原样。
+// 杀手权限持有者同样豁免（主人定：无论杀手身份还是超管身份都豁免）。
 function isAdDetectionExemptUser(userId) {
 	const idStr = String(userId || '');
-	return isPrivilegedManager(idStr) || isSuperAdmin(idStr);
+	return isPrivilegedManager(idStr) || isSuperAdmin(idStr) || isKillerAdmin(idStr);
 }
 
 // 只检查用户是否为“指定当前群”的 Telegram 管理员。
@@ -4769,14 +4795,21 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		invalid: (invalid || []).map((id) => String(id)),
 		note: normalizeActionNote(note),
 		groupIds,
+		// 杀手权限建的任务：写杀手黑名单（killer_blacklist）、只处置 groupIds（杀手群）、不学习特征。
+		killer: options.killer === true,
 		createdBy: getMessageActorId(message),
 		unbanAllowD1Removal: isUnban && (options.allowD1Removal === true || isPrivilegedManager(getMessageActorId(message))),
 		operator,
-		operatorRole: classifyMessageOperatorRole(message, message.chat?.type === 'private' ? '管理员' : '群管理员'),
+		operatorRole: options.killer === true
+			? '杀手权限'
+			: classifyMessageOperatorRole(message, message.chat?.type === 'private' ? '管理员' : '群管理员'),
 		sourceChatId: String(message.chat?.id ?? ''),
 		sourceChatTitle: message.chat?.title || message.chat?.username || (message.chat?.type === 'private' ? '私聊' : '当前群组'),
 		sourceChatType: message.chat?.type || 'unknown',
-		notifyTargets: getBulkJobNotifyTargets(message),
+		// 杀手任务：完成通知给发起人本人 + 抄送第一主人（副主人不收）。
+		notifyTargets: options.killer === true
+			? [...new Set([getMessageActorId(message), ...getOwnerNotifyTargets(false)].map(String).filter(Boolean))]
+			: getBulkJobNotifyTargets(message),
 		// 仅公开管理命令显式开启来源群回执，隐藏连带任务沿用原通知范围。
 		notifySourceChat: options.notifySourceChat === true,
 		userBatchSize: BULK_TASK_USER_BATCH_SIZE,
@@ -4899,7 +4932,7 @@ function formatStoredBulkJobContext(job) {
 		lines.push('📍 命令来源:私聊');
 	} else {
 		lines.push(`📍 命令来源:${escapeHtml(job.sourceChatTitle || '当前群组')} <code>${escapeHtml(job.sourceChatId || '未知')}</code>`);
-		lines.push(`🧹 作用范围:全部 ${job.totals?.groups ?? job.groupIds?.length ?? 0} 个配置群`);
+		lines.push(`🧹 作用范围:全部 ${job.totals?.groups ?? job.groupIds?.length ?? 0} 个${job.killer === true ? '杀手群' : '配置群'}`);
 	}
 	lines.push(`📝 执行原因:${formatActionNote(job.note)}`);
 	return lines;
@@ -5074,6 +5107,19 @@ async function performBulkJobD1Mutation(job, env, ids) {
 	const allowD1Removal = job.unbanAllowD1Removal === true
 		|| (job.unbanAllowD1Removal == null && isPrivilegedManager(job.createdBy));
 	for (let attempt = 0; attempt <= BULK_TASK_D1_RETRY_LIMIT; attempt += 1) {
+		if (job.killer === true) {
+			// 杀手权限的批量：只动杀手黑名单，主黑名单里的人解不了；不学习特征（主人定）。
+			lastResults = job.action === 'unban'
+				? await checkKillerUnbanEligibility(env, ids)
+				: await addToKillerBlacklist(env, ids, {
+					reason: killerReasonForCommand(job.action),
+					by: job.createdBy,
+					note: job.note
+				});
+			if (!lastResults.failed.length) return lastResults;
+			if (attempt < BULK_TASK_D1_RETRY_LIMIT) await new Promise((resolve) => setTimeout(resolve, BULK_TASK_D1_RETRY_DELAY_MS));
+			continue;
+		}
 		lastResults = job.action === 'unban'
 			? await checkManyUnbanEligibility(ids, env, { allowD1Removal })
 			: await addManyToBlacklist(ids, env, {
@@ -7449,6 +7495,19 @@ async function handleChatMemberUpdate(chatMember, env) {
 			await notifyOwnerBlacklistIntercept(targetUser, chat, '复入群拦截', blacklistCheck, banResult);
 			return; // 已处理，不再走后面"管理员操作同步"分支
 		}
+		// 杀手黑名单：只在杀手群拦截，复入即踢回。
+		if (isKillerModeGroup(chat.id)) {
+			const killerEntry = await readKillerBlacklistEntrySafe(env, targetIdStr);
+			if (killerEntry && !(await isProtectedFromAutoModeration(targetIdStr, String(chat.id)))) {
+				const banResult = await banUserFromGroup(chat.id, targetIdStr);
+				console.log('[chat_member] 杀手黑名单用户复入杀手群，立即踢回:', JSON.stringify({
+					群ID: chat.id, 用户ID: targetIdStr, 踢人结果: banResult.ok ? '成功' : `失败:${banResult.error}`
+				}));
+				await recordDisposalsFromBanResults(env, [{ groupId: chat.id, ok: banResult?.ok === true }]);
+				await notifyOwnerBlacklistIntercept(targetUser, chat, '复入群拦截（杀手黑名单）', { entry: killerEntry }, banResult);
+				return;
+			}
+		}
 
 		// 【方案 C 的第一个修复】不在黑名单，就当场做广告筛查（查 bio / 用户名 / 昵称）。
 		// 这是本次补的核心缺口：自己点邀请链接进群、加入请求被批准、unban 后自加回，
@@ -7511,8 +7570,17 @@ async function handleChatMemberUpdate(chatMember, env) {
 				await notifyOwnerBlacklistIntercept(targetUser, chat, '群内手动解封拦截', blacklistCheck, banResult);
 			}
 		} else {
-			// 不在 D1 黑名单：无黑名单变化，仅记日志，不再通知主人（原生操作通知已取消）。
-			console.log('[chat_member] 群内原生解封（非黑名单用户），不再通知主人:', JSON.stringify(logCommon));
+			// 杀手黑名单同理：杀手群里被原生解封 → 封回（只看杀手群，GROUP_ID 群不读这张表）。
+			const killerEntry = isKillerModeGroup(chat.id) ? await readKillerBlacklistEntrySafe(env, targetIdStr) : null;
+			if (killerEntry) {
+				const banResult = await banUserFromGroup(chat.id, targetIdStr);
+				console.log('[chat_member] 拦截杀手群内手动解封(杀手黑名单保护):', JSON.stringify({ ...logCommon, 封回结果: banResult.ok ? '成功' : `失败:${banResult.error}` }));
+				await recordDisposalsFromBanResults(env, [{ groupId: chat.id, ok: banResult?.ok === true }]);
+				await notifyOwnerBlacklistIntercept(targetUser, chat, '群内手动解封拦截（杀手黑名单）', { entry: killerEntry }, banResult);
+			} else {
+				// 不在 D1 黑名单：无黑名单变化，仅记日志，不再通知主人（原生操作通知已取消）。
+				console.log('[chat_member] 群内原生解封（非黑名单用户），不再通知主人:', JSON.stringify(logCommon));
+			}
 		}
 	}
 }
@@ -7746,6 +7814,733 @@ function isKillerModeGroup(chatId) {
 // 杀手群与这三个功能完全隔离 —— 杀手群里不触发，别的群触发时封禁也不波及杀手群。
 function nonKillerGroupIds() {
 	return GROUP_IDS.filter((groupId) => !isKillerModeGroup(groupId));
+}
+
+// ===== 杀手权限（KILLER_ADMIN_IDS）=====
+// 口径见顶部 10.6b。一句话：只作用于杀手群，一根头发都不碰 GROUP_ID 的群。
+function isKillerAdmin(id) {
+	return KILLER_ADMIN_IDS.length > 0 && KILLER_ADMIN_IDS.includes(String(id || ''));
+}
+
+// 杀手权限的作用范围：全部杀手群。所有杀手身份的处置、查询、通知都只用这一份名单。
+function killerScopeGroupIds() {
+	return [...new Set(KILLER_MODE_GROUPS.map((id) => String(id || '').trim()).filter(Boolean))];
+}
+
+// 杀手身份能用的命令。不在这里的（/addgroup /dryrun /admins /ad 维护类…）一律落回原有分发，按他的其他身份鉴权。
+const KILLER_COMMANDS = new Set(['/ban', '/sban', '/spam', '/unban', '/rm', '/check', '/profile', '/search', '/stats', '/notice', '/health', '/job', '/jobrun', '/help']);
+// 私聊里这四条超管本来就有：两份权限都有的人私聊发，走超管身份（行为与改动前逐字节一致）。
+const KILLER_SHARED_SUPER_COMMANDS = new Set(['/ban', '/spam', '/unban', '/check']);
+
+// 这条命令走不走杀手身份（按群分）：
+//   杀手群里 → 杀手身份；GROUP_ID 群里 → 否（落回原分发，只有杀手权限的人自然无权、静默）；
+//   私聊 → 超管共有的四条且他也是超管时走超管，其余走杀手。
+// 主人永远不走杀手身份 —— 主人的权限一个字节都不变。
+function resolveKillerCommandIdentity(message, head) {
+	const actorId = getMessageActorId(message);
+	if (!isKillerAdmin(actorId) || isOwner(actorId)) return false;
+	if (!KILLER_COMMANDS.has(head)) return false;
+	if (message?.chat?.type === 'private') {
+		return !(KILLER_SHARED_SUPER_COMMANDS.has(head) && isSuperAdmin(actorId));
+	}
+	return isKillerModeGroup(message?.chat?.id);
+}
+
+// 杀手身份封不了的人：主人与其他杀手权限持有者。
+function isKillerProtectedTarget(id) {
+	const idStr = String(id || '');
+	return isOwner(idStr) || isKillerAdmin(idStr);
+}
+
+// --- 独立黑名单 killer_blacklist：只在杀手群拦截，与主黑名单互不读写 ---
+const D1_KILLER_BLACKLIST_INIT = new WeakMap();
+async function ensureKillerBlacklistTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_KILLER_BLACKLIST_INIT.get(env.DB);
+	if (cached) return cached;
+	const initPromise = (async () => {
+		await env.DB.prepare('CREATE TABLE IF NOT EXISTS killer_blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT)').run();
+		return true;
+	})().catch((error) => {
+		// 建表失败不缓存，下次请求重试
+		D1_KILLER_BLACKLIST_INIT.delete(env.DB);
+		throw error;
+	});
+	D1_KILLER_BLACKLIST_INIT.set(env.DB, initPromise);
+	return initPromise;
+}
+
+async function readKillerBlacklistEntry(env, userId) {
+	if (!env?.DB) return null;
+	const id = String(userId ?? '').trim();
+	if (!id) return null;
+	await ensureKillerBlacklistTable(env);
+	const row = await env.DB.prepare('SELECT id, reason, by_user, at, note FROM killer_blacklist WHERE id = ? LIMIT 1').bind(id).first();
+	return row ? { id: String(row.id), reason: row.reason || 'killer', by: row.by_user || null, at: row.at || null, note: row.note || null } : null;
+}
+
+// 拦截链路用：读失败当作不在名单（与主黑名单非严格模式同口径，不因 D1 抖动误封）。
+async function readKillerBlacklistEntrySafe(env, userId) {
+	try {
+		return await readKillerBlacklistEntry(env, userId);
+	} catch (error) {
+		console.error('[杀手黑名单] 读取失败:', error);
+		return null;
+	}
+}
+
+// 批量加入杀手黑名单，返回形状与 addManyToBlacklist 一致：{ success, exists, failed }。
+async function addToKillerBlacklist(env, ids, options = {}) {
+	const results = { success: [], exists: [], failed: [] };
+	const uniqueIds = normalizeBatchMutationIds(ids);
+	if (!env?.DB) {
+		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间' })));
+		return results;
+	}
+	if (!uniqueIds.length) return results;
+	await ensureKillerBlacklistTable(env);
+	const reason = options.reason || 'killer';
+	const by = options.by != null ? String(options.by) : null;
+	const note = normalizeActionNote(options.note) || null;
+	const at = new Date().toISOString();
+	for (const chunk of chunkBatchItems(uniqueIds)) {
+		try {
+			const valuesSql = chunk.map(() => '(?, ?, ?, ?, ?)').join(', ');
+			const params = chunk.flatMap((id) => [id, reason, by, at, note]);
+			const response = await env.DB
+				.prepare(`INSERT OR IGNORE INTO killer_blacklist (id, reason, by_user, at, note) VALUES ${valuesSql} RETURNING id`)
+				.bind(...params)
+				.all();
+			const inserted = new Set((response?.results || []).map((row) => String(row.id)));
+			for (const id of chunk) {
+				if (inserted.has(id)) results.success.push(id);
+				else results.exists.push(id);
+			}
+		} catch (error) {
+			console.error('[杀手黑名单] 批量写入失败:', error);
+			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 加入杀手黑名单失败: ${toChineseErrorText(error?.message || error)}` })));
+		}
+	}
+	return results;
+}
+
+async function removeFromKillerBlacklist(env, ids) {
+	const results = { removed: [], notFound: [], failed: [] };
+	const uniqueIds = normalizeBatchMutationIds(ids);
+	if (!env?.DB || !uniqueIds.length) return results;
+	await ensureKillerBlacklistTable(env);
+	for (const chunk of chunkBatchItems(uniqueIds)) {
+		try {
+			const placeholders = chunk.map(() => '?').join(', ');
+			const response = await env.DB
+				.prepare(`DELETE FROM killer_blacklist WHERE id IN (${placeholders}) RETURNING id`)
+				.bind(...chunk)
+				.all();
+			const removed = new Set((response?.results || []).map((row) => String(row.id)));
+			for (const id of chunk) {
+				if (removed.has(id)) results.removed.push(id);
+				else results.notFound.push(id);
+			}
+		} catch (error) {
+			console.error('[杀手黑名单] 批量移除失败:', error);
+			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 移出杀手黑名单失败: ${toChineseErrorText(error?.message || error)}` })));
+		}
+	}
+	return results;
+}
+
+// 杀手身份的解封资格：在【主黑名单】里的人归主人管，杀手权限一律不放（不调 Telegram）；
+// 其余移出杀手黑名单后允许在杀手群解封。返回形状与 checkManyUnbanEligibility 一致。
+async function checkKillerUnbanEligibility(env, ids) {
+	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [] };
+	const uniqueIds = normalizeBatchMutationIds(ids);
+	if (!env?.DB) {
+		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间，无法确认解封资格' })));
+		return results;
+	}
+	if (!uniqueIds.length) return results;
+	const candidates = [];
+	try {
+		await ensureD1Table(env);
+		for (const chunk of chunkBatchItems(uniqueIds)) {
+			const placeholders = chunk.map(() => '?').join(', ');
+			const response = await env.DB.prepare(`SELECT id FROM blacklist WHERE id IN (${placeholders})`).bind(...chunk).all();
+			const blocked = new Set((response?.results || []).map((row) => String(row.id)));
+			for (const id of chunk) {
+				if (blocked.has(id)) results.blacklisted.push(id);
+				else candidates.push(id);
+			}
+		}
+	} catch (error) {
+		results.failed.push(...uniqueIds.map((id) => ({ id, msg: `❌ 无法确认主黑名单状态: ${toChineseErrorText(error?.message || error)}` })));
+		results.blacklisted = [];
+		return results;
+	}
+	const removal = await removeFromKillerBlacklist(env, candidates);
+	const failedIds = new Set(removal.failed.map((item) => item.id));
+	results.failed.push(...removal.failed);
+	results.d1Removed = [...removal.removed];
+	results.eligible = candidates.filter((id) => !failedIds.has(id));
+	return results;
+}
+
+// /check /profile 里的「杀手黑名单」一节。未配置杀手群时不出这一节（零开销）。
+async function renderKillerBlacklistLines(env, userId) {
+	if (!KILLER_MODE_GROUPS.length || !env?.DB) return [];
+	const lines = ['<b>━━ 杀手黑名单 ━━</b>'];
+	try {
+		const entry = await readKillerBlacklistEntry(env, userId);
+		if (!entry) {
+			lines.push('状态　　✅ 不在杀手黑名单');
+		} else {
+			lines.push('状态　　🚫 在杀手黑名单中（只在杀手群生效）');
+			lines.push('加黑方式　' + translateBlacklistReason(entry.reason));
+			if (entry.note) lines.push('执行原因　' + escapeHtml(entry.note));
+			lines.push('操作人　　' + (entry.by ? '<code>' + escapeHtml(entry.by) + '</code>' : '未知'));
+			lines.push('加黑时间　' + escapeHtml(entry.at || '未知'));
+		}
+	} catch (error) {
+		lines.push('状态　　❌ 查询失败（' + escapeHtml(toChineseErrorText(error?.message || '未知错误')) + '）');
+	}
+	return lines;
+}
+// 统计按钮回调的放行：杀手权限 + 杀手群。
+function canKillerViewStats(userId, chatId) {
+	return isKillerAdmin(userId) && isKillerModeGroup(chatId);
+}
+
+// 杀手黑名单的 reason：killer_ban / killer_sban / killer_spam（与主黑名单的 manual / spam 分开，/check 一眼分得清）。
+function killerReasonForCommand(commandName) {
+	const head = String(commandName || '').replace(/^\//, '').toLowerCase();
+	return 'killer_' + (head === 'spam' ? 'spam' : head === 'sban' ? 'sban' : 'ban');
+}
+
+// 每次封禁 / 解封 / 通知 / 删消息都抄送第一主人（主人定）。只发第一主人，副主人不收。
+async function notifyPrimaryOwnerOfKillerAction(message, detailText, operatorMention = '') {
+	const ownerId = getOwnerNotifyTargets(false)[0];
+	if (!ownerId) return;
+	const chat = message?.chat;
+	const source = !chat || chat.type === 'private'
+		? '私聊'
+		: (chat.title ? `${chat.title}（${chat.id}）` : String(chat.id));
+	const operator = operatorMention || formatMessageActorMention(message);
+	const result = await sendTelegramMessageChunks(ownerId, renderAuditNotification(operator, detailText, source, '杀手权限'));
+	if (!result?.ok) console.error(`[杀手权限] 抄送第一主人失败:${result?.description || result?.error || '未知'}`);
+}
+
+// 杀手身份的回执：私聊直接回本人；群内按 groupText 发简洁结果（silentInGroup 时群里不留痕），
+// 完整结果私聊本人。notifyOwner 为真时抄送第一主人。
+async function replyKillerResult(message, { groupText = '', detailText, silentInGroup = false, notifyOwner = false, replyMarkup = null }) {
+	const isInGroup = message.chat.type !== 'private';
+	if (isInGroup) {
+		if (!silentInGroup && groupText) await sendTelegramMessageChunks(message.chat.id, groupText);
+		const r = await sendTelegramMessageChunks(getMessageActorId(message), detailText, replyMarkup);
+		if (!r?.ok) console.error(`[杀手权限] 私聊本人失败（多半没和 bot 私聊过）:${r?.description || r?.error || '未知'}`);
+	} else {
+		await sendTelegramMessageChunks(message.chat.id, detailText, replyMarkup);
+	}
+	if (notifyOwner) await notifyPrimaryOwnerOfKillerAction(message, detailText);
+}
+
+// 杀手身份的命令入口。返回 true = 已处理（调用方 return）；false = 不是杀手身份，落回原分发。
+async function handleKillerAdminCommand(message, env, ctx, requestUrl = '') {
+	const { head, rest } = parseTelegramCommand(message?.text);
+	if (!head || !resolveKillerCommandIdentity(message, head)) return false;
+	switch (head) {
+		case '/ban':
+		case '/sban':
+			return handleKillerBan(message, env, ctx, { commandName: head, rest, requestUrl });
+		case '/spam':
+			return handleKillerSpam(message, env, ctx, { rest, requestUrl });
+		case '/unban':
+			// 不带参数是自助解封入口，与身份无关，落回原分发。
+			if (!rest) return false;
+			return handleKillerUnban(message, env, ctx, { rest, requestUrl });
+		case '/check':
+			return handleKillerCheck(message, env, rest);
+		case '/profile':
+			return handleKillerProfile(message, env, rest);
+		case '/stats':
+			return handleKillerStats(message, env, rest);
+		case '/search':
+			return handleKillerSearch(message, env, rest);
+		case '/notice':
+			return handleKillerNotice(message, env, rest);
+		case '/health':
+			return handleKillerHealth(message, env);
+		case '/rm':
+			return handleKillerRm(message, env, ctx);
+		case '/job':
+		case '/jobrun':
+			return handleKillerJob(message, env, ctx, { head, rest, requestUrl });
+		case '/help':
+			return handleKillerHelp(message, ctx);
+		default:
+			return false;
+	}
+}
+
+// /ban /sban /spam TGID：加杀手黑名单 + 全部杀手群踢出。不学习特征、不进同款名单。
+async function handleKillerBan(message, env, ctx, { commandName, rest, requestUrl }) {
+	await deleteAuthorizedGroupCommandMessage(message, commandName);
+	const { valid, invalid, note } = parseTargetIdsAndNote(rest);
+	if (valid.length === 0 && invalid.length === 0) {
+		await replyKillerResult(message, { detailText: `❌ 使用方法：<code>${commandName} 用户ID [原因]</code> 或 <code>${commandName} 123,456,789</code>（最多 ${BATCH_LIMIT} 个）` });
+		return true;
+	}
+	if (valid.length > BATCH_LIMIT) {
+		await replyKillerResult(message, { detailText: `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）` });
+		return true;
+	}
+	return killerBanIds(message, env, ctx, { ids: valid, invalid, note, commandName, requestUrl });
+}
+
+// /spam：带 TGID 同 /ban；在杀手群里回复某条消息 = 删掉那条 + 封发送者。
+async function handleKillerSpam(message, env, ctx, { rest, requestUrl }) {
+	if (rest) return handleKillerBan(message, env, ctx, { commandName: '/spam', rest, requestUrl });
+	await deleteAuthorizedGroupCommandMessage(message, '/spam');
+	const target = message.reply_to_message;
+	if (message.chat.type === 'private' || !target?.from?.id) {
+		await replyKillerResult(message, { detailText: '❌ 使用方法：在杀手群里<b>回复</b>广告发 <code>/spam</code>，或 <code>/spam 用户ID</code>' });
+		return true;
+	}
+	const del = await deleteMessage(message.chat.id, target.message_id);
+	if (!del?.ok) console.error('[杀手权限] /spam 删除被回复消息失败:', del?.error || '未知');
+	if (target.from.is_bot) {
+		await replyKillerResult(message, { detailText: '⚠️ 目标是机器人，只删了那条消息，不加黑。' });
+		return true;
+	}
+	return killerBanIds(message, env, ctx, { ids: [String(target.from.id)], invalid: [], note: '', commandName: '/spam', requestUrl, targetUser: target.from });
+}
+
+async function killerBanIds(message, env, ctx, { ids, invalid, note, commandName, requestUrl, targetUser = null }) {
+	const isInGroup = message.chat.type !== 'private';
+	const actorId = getMessageActorId(message);
+	const protectedIds = ids.filter(isKillerProtectedTarget);
+	const targets = ids.filter((id) => !isKillerProtectedTarget(id));
+	if (!targets.length) {
+		await replyKillerResult(message, { detailText: '⚠️ 目标是主人或杀手权限持有者，已忽略。' });
+		return true;
+	}
+	const scope = killerScopeGroupIds();
+	const reason = killerReasonForCommand(commandName);
+	const budget = shouldUseBulkQueue(targets.length, scope.length, { probeMembership: targets.length === 1 });
+	if (budget.useQueue) {
+		return startKillerBulkJob(message, env, ctx, { action: commandName === '/spam' ? 'spam' : commandName === '/sban' ? 'sban' : 'ban', ids: targets, invalid, note, requestUrl });
+	}
+	const added = await addToKillerBlacklist(env, targets, { reason, by: actorId, note });
+	const okIds = [...added.success, ...added.exists];
+	const perUser = await mapWithConcurrency(okIds, BULK_TASK_CONCURRENCY, async (id) => {
+		const banResults = await banUserFromAllGroups(id, { groupIds: scope, mode: 'kick', probeMembership: okIds.length === 1 });
+		await recordDisposalsFromBanResults(env, banResults);
+		return { userId: id, banResults };
+	});
+	// 群内单条：补删当前群缓存的历史发言（revoke 对已退群的人无效，这条兜底）。只在杀手群里发生。
+	const cleanup = isInGroup && okIds.length === 1 ? await cleanupCurrentChatUserMessages(env, message.chat.id, okIds[0]) : null;
+
+	const lines = [`🎬 操作:杀手权限 ${escapeHtml(commandName)}（加杀手黑名单 + 全部杀手群踢出）`, `🧹 作用范围:${scope.length} 个杀手群`, ''];
+	const chatInfoCache = new Map();
+	for (const { userId, banResults } of perUser) {
+		const mention = targetUser && String(targetUser.id) === userId
+			? `${formatUserMention(targetUser)} <code>${escapeHtml(userId)}</code>`
+			: formatTargetFromBanResults(userId, banResults);
+		lines.push(`🎯 目标用户:${mention}${added.exists.includes(userId) ? '（已在杀手黑名单，本次继续踢出）' : ''}`);
+		lines.push(await renderBanResultsDetail(banResults, chatInfoCache, { userId, retryCommand: commandName, compactSpacing: true }));
+		lines.push('');
+	}
+	if (cleanup) lines.push(renderCurrentChatCleanupResult(cleanup));
+	for (const item of added.failed) lines.push(escapeHtml(item.msg) + '　<code>' + escapeHtml(item.id) + '</code>');
+	if (protectedIds.length) lines.push('⚠️ 已跳过主人 / 杀手权限持有者:' + protectedIds.map((id) => '<code>' + escapeHtml(id) + '</code>').join(' '));
+	if (invalid.length) lines.push('⚠️ 格式不对已忽略:' + invalid.map((id) => '<code>' + escapeHtml(id) + '</code>').join(' '));
+	lines.push('📝 执行原因:' + formatActionNote(note));
+	const summary = perUser.length === 1
+		? `✅ 已加入杀手黑名单并踢出 <code>${escapeHtml(perUser[0].userId)}</code>\n` + renderBanResults(perUser[0].banResults)
+		: `✅ 已加入杀手黑名单并踢出 ${perUser.length} 人`;
+	await replyKillerResult(message, {
+		groupText: summary,
+		detailText: lines.join('\n').trim(),
+		silentInGroup: commandName === '/sban',
+		notifyOwner: true
+	});
+	return true;
+}
+
+// 大批量走批量任务：任务带 killer 标记 → 写杀手黑名单、只踢杀手群、不学习（见 performBulkJobD1Mutation）。
+async function startKillerBulkJob(message, env, ctx, { action, ids, invalid, note, requestUrl }) {
+	if (!env.DB) {
+		await replyKillerResult(message, { detailText: '❌ 批量任务需要绑定 D1 存储空间' });
+		return true;
+	}
+	const job = await createBulkJob(env, action, ids, invalid, note, message, {
+		mode: action === 'unban' ? null : 'kick',
+		groupIds: killerScopeGroupIds(),
+		killer: true,
+		notifySourceChat: false,
+	});
+	const autoQueueAvailable = Boolean(getBulkQueue(env));
+	if (!autoQueueAvailable) {
+		job.autoContinue = false;
+		await saveBulkJob(env, job);
+	}
+	await replyKillerResult(message, {
+		groupText: `📦 批量任务已创建 <code>${escapeHtml(job.id)}</code>\n目标 ${job.totals.users} 个`,
+		detailText: formatBulkJobDetail(job, '📦 <b>批量任务已创建</b>（杀手权限）'),
+		notifyOwner: true
+	});
+	const scheduled = autoQueueAvailable ? scheduleBulkJobAutoContinue(job, ctx, requestUrl, env) : false;
+	if (scheduled && typeof scheduled.then === 'function') await scheduled;
+	return true;
+}
+
+// /unban TGID：移出杀手黑名单 + 全部杀手群解封。主黑名单里的人归主人管，一律不放。
+async function handleKillerUnban(message, env, ctx, { rest, requestUrl }) {
+	await deleteAuthorizedGroupCommandMessage(message, '/unban');
+	const { valid, invalid } = parseBatchTgids(rest);
+	if (valid.length === 0) {
+		await replyKillerResult(message, { detailText: `❌ 使用方法：<code>/unban 用户ID</code> 或 <code>/unban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）` });
+		return true;
+	}
+	if (valid.length > BATCH_LIMIT) {
+		await replyKillerResult(message, { detailText: `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）` });
+		return true;
+	}
+	const scope = killerScopeGroupIds();
+	if (shouldUseBulkQueue(valid.length, scope.length, {}).useQueue) {
+		return startKillerBulkJob(message, env, ctx, { action: 'unban', ids: valid, invalid, note: '', requestUrl });
+	}
+	const eligibility = await checkKillerUnbanEligibility(env, valid);
+	const lines = ['🎬 操作:杀手权限 /unban（移出杀手黑名单 + 全部杀手群解封）', ''];
+	const chatInfoCache = new Map();
+	let unbanned = 0;
+	for (const id of eligibility.eligible) {
+		const results = await unbanUserFromAllGroups(id, scope);
+		unbanned += 1;
+		lines.push(`🎯 <code>${escapeHtml(id)}</code>${eligibility.d1Removed.includes(id) ? '　已移出杀手黑名单' : '　原本不在杀手黑名单'}`);
+		lines.push(await renderUnbanResultsDetail(results, chatInfoCache, { userId: id, retryCommand: '/unban' }));
+		lines.push('');
+	}
+	for (const id of eligibility.blacklisted) {
+		lines.push(`⛔ <code>${escapeHtml(id)}</code> 在主黑名单（由主人管理），杀手权限不能解封；未调用 Telegram。`);
+	}
+	for (const item of eligibility.failed) lines.push(escapeHtml(item.msg) + '　<code>' + escapeHtml(item.id) + '</code>');
+	if (invalid.length) lines.push('⚠️ 格式不对已忽略:' + invalid.map((id) => '<code>' + escapeHtml(id) + '</code>').join(' '));
+	await replyKillerResult(message, {
+		groupText: unbanned ? `✅ 已解封 ${unbanned} 人（杀手群）` : '⛔ 未解封任何人',
+		detailText: lines.join('\n').trim(),
+		notifyOwner: true
+	});
+	return true;
+}
+
+// /check：主黑名单与 GKY 只读展示，外加杀手黑名单一节。
+async function handleKillerCheck(message, env, rest) {
+	const isInGroup = message.chat.type !== 'private';
+	const repliedUser = isInGroup && !/^\d+$/.test(rest) ? message.reply_to_message?.from : null;
+	const tgid = /^\d+$/.test(rest) ? rest : String(repliedUser?.id || '');
+	if (!tgid) {
+		await sendTelegramMessage(message.chat.id, '❌ 使用方法：<code>/check 用户ID</code>，或在杀手群里回复消息发 <code>/check</code>');
+		return true;
+	}
+	const response = await buildBanlistCheckResponse(tgid, { includeReviewAction: true, env, targetUser: repliedUser || undefined });
+	const killerLines = await renderKillerBlacklistLines(env, tgid);
+	await sendTelegramMessageChunks(message.chat.id, [response.text, '', ...killerLines].join('\n').trim(), response.replyMarkup || null);
+	return true;
+}
+
+// /profile：时间线只看杀手群的记录。
+async function handleKillerProfile(message, env, rest) {
+	const isGroupChat = message.chat.type !== 'private';
+	let tgid = /^\d+$/.test(rest) ? rest : '';
+	if (!tgid && message.reply_to_message?.from?.id) tgid = String(message.reply_to_message.from.id);
+	if (!tgid) {
+		await sendTelegramMessage(message.chat.id, '👤 <b>资料卡</b> · 用法\n\n• <code>/profile TGID</code> — 查指定账号\n• 在杀手群里回复某条消息发 <code>/profile</code> — 查发信人');
+		return true;
+	}
+	const groupId = isGroupChat ? String(message.chat.id) : '';
+	const profileLines = await buildProfileBlock(env, groupId, tgid, isGroupChat, { scopeChatIds: killerScopeGroupIds() });
+	const response = await buildBanlistCheckResponse(tgid, { includeReviewAction: true, env });
+	const killerLines = await renderKillerBlacklistLines(env, tgid);
+	await sendTelegramMessageChunks(message.chat.id, [...profileLines, '', response.text, '', ...killerLines].join('\n').trim(), response.replyMarkup || null);
+	return true;
+}
+
+function buildKillerStatsUsage() {
+	return [
+		'📊 <b>群发言统计</b> · 用法（杀手权限，只能查杀手群）',
+		'',
+		'• 在杀手群里发 <code>/stats</code>　出今日 / 本周 / 本月按钮',
+		'• 私聊 <code>/stats -100群ID</code>　查指定杀手群今日　后面可加 <code>week</code> / <code>month</code> / <code>近7天</code> / <code>2026-09-10</code>',
+		'',
+		'可查的杀手群：' + (killerScopeGroupIds().map((id) => '<code>' + escapeHtml(id) + '</code>').join(' ') || '（未配置）')
+	].join('\n');
+}
+
+async function handleKillerStats(message, env, rest) {
+	const chat = message.chat;
+	if (chat.type !== 'private') {
+		await deleteAuthorizedGroupCommandMessage(message, '/stats');
+		const range = parseStatsRange(rest);
+		if (range === null) {
+			await sendTelegramMessage(chat.id, buildGroupStatsUsage(), buildStatsPanelKeyboard(chat.id));
+			return true;
+		}
+		const rendered = await renderStatPage(env, String(chat.id), range, 1, chat.title || '', undefined, false);
+		await sendAdPagedMessage(chat.id, rendered.text, rendered.keyboard, rendered.fallbackLine);
+		return true;
+	}
+	const parts = rest.split(/\s+/).filter(Boolean);
+	const targetGroup = parts.find((p) => /^-\d+$/.test(p)) || '';
+	const range = parseStatsRange(parts.filter((p) => !/^-\d+$/.test(p)).join(' ')) || 'day';
+	if (!targetGroup) {
+		await sendTelegramMessage(chat.id, buildKillerStatsUsage());
+		return true;
+	}
+	if (!isKillerModeGroup(targetGroup)) {
+		await sendTelegramMessage(chat.id, '⚠️ <code>' + escapeHtml(targetGroup) + '</code> 不是杀手群，杀手权限只能查杀手群的统计。');
+		return true;
+	}
+	let title = '';
+	try { const gi = await getChatInfoFromId(targetGroup); title = String(gi?.title || ''); } catch (_) {}
+	const rendered = await renderStatPage(env, targetGroup, range, 1, title, undefined, false);
+	await sendAdPagedMessage(chat.id, rendered.text, rendered.keyboard, rendered.fallbackLine);
+	return true;
+}
+
+// /search：群内只查本杀手群，私聊查全部杀手群（翻页 token 的范围写 'killer'）。
+async function handleKillerSearch(message, env, rest) {
+	const isInGroup = message.chat.type !== 'private';
+	const chatId = String(message.chat.id);
+	if (!rest) {
+		await sendTelegramMessage(chatId, [
+			'🔍 <b>搜索</b> · 用法（杀手权限，只查杀手群）',
+			'',
+			'• <code>/search 关键词</code>　按正文搜',
+			'• <code>/search 709xxxxx</code>　按 TGID 查',
+			'• <code>/search @用户名</code>　按用户名查',
+			'',
+			'群内发 = 只查本群；私聊发 = 查全部杀手群。'
+		].join('\n'));
+		return true;
+	}
+	await runSearchQueryAndReply(env, chatId, rest, {
+		scopeChatIds: isInGroup ? [chatId] : killerScopeGroupIds(),
+		scopeToken: isInGroup ? chatId : 'killer',
+		scopeLabel: isInGroup ? (String(message.chat.title || '') || '群 <code>' + escapeHtml(chatId) + '</code>') : '全部杀手群',
+		showChatId: !isInGroup
+	});
+	return true;
+}
+
+// --- /notice：全部杀手群，或指定某个杀手群。状态按人存，与主人的通知互不干扰 ---
+const KILLER_NOTICE_PENDING_PREFIX = 'killer_notice_pending:';
+const KILLER_NOTICE_CONFIRM_DATA = 'knotice:confirm';
+const KILLER_NOTICE_CANCEL_DATA = 'knotice:cancel';
+
+async function readKillerNoticeState(env, userId) {
+	const raw = await readAdScanState(env, KILLER_NOTICE_PENDING_PREFIX + String(userId), '');
+	let st = null;
+	try { st = raw ? JSON.parse(raw) : null; } catch (_) { st = null; }
+	if (!st || (Date.now() - Number(st.at || 0)) > NOTICE_PENDING_TTL_MS) return null;
+	return st;
+}
+async function writeKillerNoticeState(env, userId, state) {
+	await writeAdScanState(env, KILLER_NOTICE_PENDING_PREFIX + String(userId), state ? JSON.stringify(state) : '');
+}
+
+async function handleKillerNotice(message, env, rest) {
+	if (message.chat.type !== 'private') return true;   // 群内静默，与主人的 /notice 同口径
+	const chatId = message.chat.id;
+	const userId = getMessageActorId(message);
+	if (rest.toLowerCase() === 'cancel') {
+		await writeKillerNoticeState(env, userId, null);
+		await sendTelegramMessage(chatId, '🚫 已取消通知。');
+		return true;
+	}
+	let targets = killerScopeGroupIds();
+	if (rest) {
+		if (!/^-\d+$/.test(rest) || !isKillerModeGroup(rest)) {
+			await sendTelegramMessage(chatId, '⚠️ <code>' + escapeHtml(rest) + '</code> 不是杀手群。\n\n杀手权限只能通知杀手群：<code>/notice</code> 发全部杀手群，<code>/notice -100群ID</code> 发指定杀手群。');
+			return true;
+		}
+		targets = [rest];
+	}
+	if (!targets.length) {
+		await sendTelegramMessage(chatId, '⚠️ 未配置杀手群，没有可通知的群。');
+		return true;
+	}
+	if (!(await adDetectionReady(env))) {
+		await sendTelegramMessage(chatId, '❌ 存储未就绪，暂时无法发通知，请稍后重试。');
+		return true;
+	}
+	await writeKillerNoticeState(env, userId, { stage: 'awaiting', targets, at: Date.now() });
+	await sendTelegramMessage(chatId, [
+		'📢 <b>杀手群通知</b>（将发往 <b>' + targets.length + '</b> 个杀手群）',
+		'',
+		'请把要发的内容<b>作为下一条消息发给我</b>（文本、图片、视频、文件都行），',
+		'我会以机器人身份原样发出。发完给你预览和「✅ 确认发送」按钮，点了才真正发送。',
+		'取消请发 /notice cancel（10 分钟未操作自动失效）。'
+	].join('\n'));
+	return true;
+}
+
+async function maybeCaptureKillerNoticeContent(message, env) {
+	const userId = getMessageActorId(message);
+	if (message?.chat?.type !== 'private' || !isKillerAdmin(userId) || isOwner(userId)) return false;
+	const st = await readKillerNoticeState(env, userId);
+	if (!st || st.stage !== 'awaiting') return false;
+	const msgId = Number(message.message_id);
+	if (!msgId) return false;
+	await writeKillerNoticeState(env, userId, { stage: 'confirm', targets: st.targets, srcChatId: String(message.chat.id), srcMsgId: msgId, at: Date.now() });
+	const snippet = String(message.text || message.caption || '').trim();
+	await sendTelegramMessage(message.chat.id, [
+		'📢 <b>杀手群通知 · 确认</b>',
+		'将发往 <b>' + (st.targets || []).length + '</b> 个杀手群，以机器人身份发送。',
+		'',
+		'<b>内容预览：</b>',
+		snippet ? escapeHtml(snippet.slice(0, 300)) : '（非文本消息：图片/视频/文件等，将按原样发送）',
+	].join('\n'), { inline_keyboard: [[
+		{ text: '✅ 确认发送', callback_data: KILLER_NOTICE_CONFIRM_DATA },
+		{ text: '🚫 取消', callback_data: KILLER_NOTICE_CANCEL_DATA }
+	]] });
+	return true;
+}
+
+async function handleKillerNoticeCallback(callbackQuery, env) {
+	const clickerId = String(callbackQuery?.from?.id || '');
+	const chatId = String(callbackQuery?.message?.chat?.id || clickerId);
+	if (!isKillerAdmin(clickerId)) { await answerAdVoteCallback(callbackQuery?.id, '仅杀手权限可操作', true); return; }
+	if (String(callbackQuery?.data || '') === KILLER_NOTICE_CANCEL_DATA) {
+		await writeKillerNoticeState(env, clickerId, null);
+		await answerAdVoteCallback(callbackQuery?.id, '已取消');
+		await sendTelegramMessage(chatId, '🚫 已取消通知。');
+		return;
+	}
+	const st = await readKillerNoticeState(env, clickerId);
+	if (!st || st.stage !== 'confirm') {
+		await answerAdVoteCallback(callbackQuery?.id, '通知已失效，请重新 /notice', true);
+		return;
+	}
+	await answerAdVoteCallback(callbackQuery?.id, '开始发送…');
+	// 发送前再按杀手群名单过滤一遍：存进去之后环境变量可能改过。
+	const groups = [...new Set((st.targets || []).map(String))].filter((g) => isKillerModeGroup(g));
+	const results = await mapWithConcurrency(groups, 5, async (groupId) => {
+		const r = await copyMessageToChat(groupId, st.srcChatId, st.srcMsgId);
+		return { groupId, ok: r?.ok === true, error: r?.error || '' };
+	});
+	await writeKillerNoticeState(env, clickerId, null);
+	const failures = results.filter((x) => !x.ok);
+	const lines = ['<b>📢 杀手群通知已发送</b>', '成功 <b>' + (results.length - failures.length) + '</b> / ' + results.length + ' 个杀手群'];
+	for (const f of failures.slice(0, 10)) {
+		lines.push('· <code>' + escapeHtml(f.groupId) + '</code>（' + escapeHtml(toChineseErrorText(f.error || '未知')) + '）');
+	}
+	await sendTelegramMessage(chatId, lines.join('\n'));
+	await notifyPrimaryOwnerOfKillerAction({ chat: { type: 'private' } }, lines.join('\n'), formatUserReference(clickerId, callbackQuery?.from));
+}
+
+async function handleKillerHealth(message, env) {
+	const chatId = String(message.chat.id);
+	try {
+		const report = await runHealthCheck(env, { groupIds: killerScopeGroupIds() });
+		await sendTelegramMessageChunks(chatId, renderHealthReport(report));
+	} catch (error) {
+		console.error('[运行检查] 杀手权限执行失败:', error);
+		await sendTelegramMessage(chatId, '❌ 运行检查失败：' + escapeHtml(toChineseErrorText(error.message || '未知错误')));
+	}
+	return true;
+}
+
+// /rm：在杀手群里回复某条消息 → 删掉它。抄送第一主人。
+async function handleKillerRm(message, env, ctx) {
+	const chatId = message.chat.id;
+	if (message.chat.type === 'private') {
+		await sendTelegramMessage(chatId, '❌ <b>请在杀手群里使用 /rm</b>\n\n回复要删除的那条消息，再发送 <code>/rm</code>。');
+		return true;
+	}
+	await deleteAuthorizedGroupCommandMessage(message, '/rm');
+	const target = message.reply_to_message;
+	if (!target?.message_id) {
+		await sendFlashMessage(chatId, '❌ 请<b>回复</b>要删除的那条消息，再发 /rm', ctx);
+		return true;
+	}
+	const del = await deleteMessage(chatId, target.message_id);
+	const content = String(target.text || target.caption || '').trim();
+	const detail = [
+		'🗑 <b>群内消息删除</b>（杀手权限）',
+		'',
+		'目标发送者　' + formatUserReference(target.from?.id, target.from),
+		'目标内容　' + (content ? escapeHtml(content.slice(0, 200)) : '（非文本消息，无文字内容）'),
+		'结果　　' + (del?.ok ? '✅ 已删除' : '❌ 删除失败 —— ' + escapeHtml(toChineseErrorText(del?.error || '未知错误')))
+	].join('\n');
+	await sendFlashMessage(chatId, del?.ok ? '✅ 已删除目标消息' : '❌ 删除失败', ctx);
+	await notifyPrimaryOwnerOfKillerAction(message, detail);
+	return true;
+}
+
+// /job /jobrun：只看得到、只续跑得了杀手身份建的批量任务。
+async function handleKillerJob(message, env, ctx, { head, rest, requestUrl }) {
+	await deleteAuthorizedGroupCommandMessage(message, head);
+	const isRun = head === '/jobrun';
+	const jobId = rest.split(/\s+/).filter(Boolean)[0] || '';
+	if (!jobId) {
+		await replyKillerResult(message, { detailText: '❌ 使用方法：<code>/job 任务ID</code> 或 <code>/jobrun 任务ID</code>' });
+		return true;
+	}
+	const job = env.DB ? await loadBulkJob(env, jobId) : null;
+	if (!job || job.killer !== true) {
+		await replyKillerResult(message, { detailText: `❌ 未找到任务:<code>${escapeHtml(jobId)}</code>` });
+		return true;
+	}
+	if (isRun && job.status !== 'done') {
+		const runner = runBulkModerationJob(env, job.id, { notifyOnDone: true, autoContinue: true, ctx, requestUrl, source: 'manual' })
+			.catch((error) => console.error(`[批量任务] 续跑失败 ${job.id}:`, error));
+		if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(runner);
+		else await runner;
+	}
+	const latest = await loadBulkJob(env, job.id) || job;
+	await replyKillerResult(message, { detailText: formatBulkJobDetail(latest, isRun ? '▶️ <b>批量任务已继续执行</b>' : '📦 <b>批量任务状态</b>') });
+	return true;
+}
+
+async function handleKillerHelp(message, ctx) {
+	if (message.chat.type !== 'private') {
+		await deleteAuthorizedGroupCommandMessage(message, '/help');
+		await sendFlashMessage(message.chat.id, 'ℹ️ 请私聊我发送 /help 查看杀手权限指令。', ctx, 6000);
+		return true;
+	}
+	const groups = killerScopeGroupIds();
+	await sendTelegramMessageChunks(message.chat.id, [
+		'🗡 <b>杀手权限 · 帮助</b>',
+		'所有命令只作用于杀手群（共 ' + groups.length + ' 个），碰不到其他群。',
+		'',
+		'<b>━━ 封禁与解封 ━━</b>',
+		'/ban TGID [原因]　加杀手黑名单 + 全部杀手群踢出',
+		'/sban TGID [原因]　同上，群里不留回执',
+		'/spam　在杀手群里回复广告：删消息 + 加杀手黑名单 + 踢出（也可 /spam TGID）',
+		'/unban TGID　移出杀手黑名单 + 全部杀手群解封',
+		'　　批量：TGID 用逗号隔开，一次最多 ' + BATCH_LIMIT + ' 个；超过 20 个转成批量任务',
+		'/job 任务ID　查批量任务进度　/jobrun 任务ID　手动续跑',
+		'',
+		'<b>━━ 查询 ━━</b>',
+		'/check TGID　查 GKY、主黑名单、杀手黑名单（群里可回复消息使用）',
+		'/profile TGID　资料卡 + 杀手群里的进退群时间线',
+		'/search 关键词|TGID|@用户名　查谁在杀手群发过什么',
+		'/stats　杀手群里发出统计面板；私聊 /stats -100群ID 查指定杀手群',
+		'/health　运行检查：bot 在每个杀手群的状态与权限',
+		'',
+		'<b>━━ 通知与删除 ━━</b>',
+		'/notice　私聊发起，通知全部杀手群；/notice -100群ID 只发这一个杀手群',
+		'/notice cancel　取消',
+		'/rm　在杀手群里回复某条消息发送 → 删掉它',
+		'',
+		'<b>━━ 说明 ━━</b>',
+		'自动检测命中广告　永久禁言，人留群；手动封禁一律踢出',
+		'杀手黑名单　只在杀手群拦截发言、复入群',
+		'手动封禁　不学习广告特征',
+		'主黑名单里的人　由主人管理，/unban 解不了',
+		'抄送　封禁、解封、通知、删消息都会抄送第一主人',
+		'检测豁免　你发任何内容都不会被广告自动检测'
+	].join('\n'));
+	return true;
 }
 
 // ===== 演练模式（dryrun）=====
@@ -9239,6 +10034,9 @@ function translateBlacklistReason(reason) {
 		ad_auto: '广告自动检测加黑（历史记录）',
 		ad_vote: '群内 /ad 举报投票加黑',
 		ad_learn: '上报学习加黑（历史记录）',
+		killer_ban: '杀手权限 /ban 加黑',
+		killer_sban: '杀手权限 /sban 加黑',
+		killer_spam: '杀手权限 /spam 加黑',
 	};
 	return map[reason] || reason || '未知';
 }
@@ -10310,6 +11108,10 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 		await handleNoticeCallback(callbackQuery, env);
 		return;
 	}
+	if (data === KILLER_NOTICE_CONFIRM_DATA || data === KILLER_NOTICE_CANCEL_DATA) {
+		await handleKillerNoticeCallback(callbackQuery, env);
+		return;
+	}
 	if (data.startsWith(STAT_GO_PREFIX)) {
 		await handleStatsGoCallback(callbackQuery, env);
 		return;
@@ -10592,6 +11394,32 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, moderation);
 				return;
 			}
+		}
+		// 杀手黑名单：只在杀手群拦截，一律踢出（杀手权限的手动封禁口径）。
+		// GROUP_ID 群走不进这个分支，热路径一条 SQL 都不多查。
+		if (isKillerModeGroup(chatId)) {
+			const killerEntry = await readKillerBlacklistEntrySafe(env, userId);
+			if (killerEntry && !(await isProtectedFromAutoModeration(userId))) {
+				console.log(`[杀手黑名单拦截] 用户 ${userId} 在杀手群 ${chatId} 发言，删消息+踢出`);
+				await deleteMessage(chatId, message.message_id);
+				const moderation = await applyGroupModeration(chatId, userId, 'kick');
+				await recordDisposalsFromBanResults(env, [{ groupId: chatId, ok: moderation?.ok === true }]);
+				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截（杀手黑名单）', { entry: killerEntry }, moderation);
+				return;
+			}
+		}
+	}
+
+	// ===== 杀手权限（KILLER_ADMIN_IDS）=====
+	// 按群分身份：判成杀手身份的命令在这里处理完就 return，不进原有分发；
+	// 没判成的（GROUP_ID 群、杀手身份没有的命令、私聊里超管共有的四条）原样落回下面，鉴权一个字节不变。
+	// 通知内容可以是图片 / 视频（没有 text），所以捕获那一支不能要求 text 是字符串。
+	if (KILLER_ADMIN_IDS.length && message.from && !message.from.is_bot) {
+		if (message.chat.type === 'private' && !isTelegramSlashCommand(text)) {
+			if (await maybeCaptureKillerNoticeContent(message, env)) return;
+		} else if (typeof text === 'string' && await handleKillerAdminCommand(message, env, ctx, requestUrl)) {
+			if (message.chat.type !== 'private') await tryRecordSpeechStat(message, env, chatId, ctx);
+			return;
 		}
 	}
 
@@ -11528,6 +12356,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/whitelist [list|add|del] [域名]　维护域名白名单，命中即豁免',
 			'',
 			'<b>━━ 说明 ━━</b>',
+			'杀手权限　环境变量 KILLER_ADMIN_IDS 里的人，只管杀手群：封的人进独立的杀手黑名单、一律踢出、不学特征，',
+			'　　　　　每次操作抄送你；在 GROUP_ID 群里按他的其他身份算（只有杀手权限 = 无权），私聊发 /help 看他的命令',
 			'超管名单　环境变量 SUPER_ADMIN_IDS 里的人',
 			'超管可用　/ban /spam /unban /check，无需群管理员身份',
 			'超管限制　不能用 /stats，本人仍受黑名单拦截',
@@ -12358,8 +13188,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		await sendTelegramMessage(chatId, approvedReply.text, approvedReply.replyMarkup);
 
 		// 遍历所有配置群组，按用户在每个群的状态分别尝试解封/解禁
+		// 杀手黑名单里的人：杀手群跳过（那张表只管杀手群，其余群照常自助解封）。
+		const killerHit = KILLER_MODE_GROUPS.length ? await readKillerBlacklistEntrySafe(env, userId) : null;
 		const perGroupResults = [];
 		for (const groupId of GROUP_IDS) {
+			if (killerHit && isKillerModeGroup(groupId)) {
+				perGroupResults.push(`⛔ <code>${escapeHtml(groupId)}</code>：在杀手黑名单中，不能自助解封。`);
+				continue;
+			}
 			let groupLabel = `<code>${escapeHtml(groupId)}</code>`;
 			try {
 				const chatInfo = await getChatInfoFromId(groupId);
@@ -12704,7 +13540,13 @@ async function readMemberEvents(env, userId, filterChatId) {
 }
 
 // 资料卡 + 时间线：/profile 的主体输出。
-async function buildProfileBlock(env, groupId, tgid, isGroupChat = false) {
+// options.scopeChatIds：只看这批群的进退群记录（杀手权限传杀手群，看不到别的群的时间线）。
+async function buildProfileBlock(env, groupId, tgid, isGroupChat = false, options = {}) {
+	const scopeSet = Array.isArray(options.scopeChatIds) ? new Set(options.scopeChatIds.map(String)) : null;
+	const readEvents = async (filterChatId) => {
+		const rows = await readMemberEvents(env, tgid, filterChatId);
+		return scopeSet ? rows.filter((x) => scopeSet.has(String(x?.chat_id || ''))) : rows;
+	};
 	const lines = ['👤 <b>资料卡</b>　TGID <code>' + escapeHtml(String(tgid)) + '</code>', ''];
 
 	// ── 基本资料（fetchAdUserProfile 自带 5 分钟缓存，不额外烧请求）──
@@ -12740,7 +13582,7 @@ async function buildProfileBlock(env, groupId, tgid, isGroupChat = false) {
 
 	// ── 时间线 ──
 	// 群内发命令 → 围绕当前配置群；私聊 → 无群上下文，原样返回跨群记录。
-	const evts = await readMemberEvents(env, tgid, isGroupChat ? groupId : undefined);
+	const evts = await readEvents(isGroupChat ? groupId : undefined);
 	const latest = (kind) => {
 		const e = evts.find((x) => x?.kind === kind && Number(x.at) > 0);
 		return e ? formatBeijingTime(e.at) : '未记录';
@@ -12755,7 +13597,7 @@ async function buildProfileBlock(env, groupId, tgid, isGroupChat = false) {
 	let crossJoin = null;
 	let crossCount = 0;
 	if (isGroupChat && !joinEv) {
-		const allEvts = await readMemberEvents(env, tgid, undefined);
+		const allEvts = await readEvents(undefined);
 		const crossJoins = (Array.isArray(allEvts) ? allEvts : []).filter((x) => x?.kind === 'join' && Number(x.at) > 0);
 		if (crossJoins.length) {
 			// readMemberEvents 已 ORDER BY at DESC，第一条就是最近一次入群。
@@ -27710,12 +28552,13 @@ async function runHealthLayerOne(env) {
 }
 
 // 整份报告：第一层自检 + 第二层逐群（并发 4，避免一次打满 Telegram 限流）。
-async function runHealthCheck(env) {
+// options.groupIds：只体检这批群（杀手权限传杀手群）；不给 = 全部配置群。
+async function runHealthCheck(env, options = {}) {
 	const layer1 = await runHealthLayerOne(env);
 	let botId = '';
 	try { botId = String(await getBotId() || ''); } catch (_) {}
 
-	const targets = GROUP_IDS.filter(Boolean).map(String);
+	const targets = (Array.isArray(options.groupIds) ? options.groupIds : GROUP_IDS).filter(Boolean).map(String);
 	let layer2 = [];
 	if (botId && targets.length) {
 		layer2 = await mapWithConcurrency(targets, HEALTH_GROUP_CONCURRENCY, async (g) => {
@@ -28214,8 +29057,23 @@ async function handleSearchCommand(message, env) {
 		return true;
 	}
 
+	// 群内只查本群；私聊（已确认是第一主人）跨全部配置群。
+	await runSearchQueryAndReply(env, chatId, raw, {
+		scopeChatIds: isInGroup ? [String(chatId)] : GROUP_IDS.map(String),
+		scopeToken: isInGroup ? String(chatId) : 'all',
+		scopeLabel: isInGroup
+			? (String(message.chat?.title || '') || '群 <code>' + escapeHtml(String(chatId)) + '</code>')
+			: '全部配置群',
+		showChatId: !isInGroup
+	});
+	return true;
+}
+
+// 解析查询词 → 查第一页 → 发结果（带翻页键）。/search 与杀手权限的 /search 共用；
+// 范围由调用方定（scopeChatIds / scopeToken），本函数不做鉴权。
+async function runSearchQueryAndReply(env, chatId, raw, { scopeChatIds, scopeToken, scopeLabel, showChatId }) {
 	const q = classifySearchQuery(raw);
-	if (!q) { await sendTelegramMessage(chatId, buildSearchUsage()); return true; }
+	if (!q) { await sendTelegramMessage(chatId, buildSearchUsage()); return; }
 
 	let userIdFilter = null;
 	let keywordFilter = null;
@@ -28229,7 +29087,7 @@ async function handleSearchCommand(message, env) {
 			// 查不到就明说查不到 —— 不能退回成「搜全部关键词」，那是完全不同的结果集。
 			await sendTelegramMessage(chatId, '⚠️ 没找到用户名 <code>@' + escapeHtml(q.value)
 				+ '</code> 的记录。\n\n该用户可能没在发言统计里出现过，或用户名拼写有误。');
-			return true;
+			return;
 		}
 		queryLabel = '@' + escapeHtml(q.value) + '（<code>' + escapeHtml(userIdFilter) + '</code>）';
 	} else {
@@ -28237,16 +29095,11 @@ async function handleSearchCommand(message, env) {
 		queryLabel = '关键词「' + escapeHtml(q.value) + '」';
 	}
 
-	// 群内只查本群；私聊（已确认是第一主人）跨全部配置群。
-	const scopeChatIds = isInGroup ? [String(chatId)] : GROUP_IDS.map(String);
 	const result = await runSearchMessages(env, {
 		chatIds: scopeChatIds, userId: userIdFilter, keyword: keywordFilter, page: 1
 	});
 	// token 只存查询的三个要素（类型|值|范围），翻页回调据此原样重跑。
-	const token = [q.kind, q.value, isInGroup ? String(chatId) : 'all'].join('|');
-	const scopeLabel = isInGroup
-		? (String(message.chat?.title || '') || '群 <code>' + escapeHtml(String(chatId)) + '</code>')
-		: '全部配置群';
+	const token = [q.kind, q.value, scopeToken].join('|');
 	const text = renderSearchResult({
 		scopeLabel,
 		queryLabel,
@@ -28254,12 +29107,11 @@ async function handleSearchCommand(message, env) {
 		total: result.total,
 		page: 1,
 		totalPages: result.totalPages,
-		showChatId: !isInGroup,
+		showChatId,
 		historyNote: searchHistoryNote(scopeChatIds)
 	});
 	const keyboard = buildAdPaginationKeyboard(SEARCH_PREFIX, 1, result.totalPages, encodeAdCallbackToken(token));
 	await sendAdPagedMessage(chatId, text, keyboard, '（记录较多，用下方按钮翻页）');
-	return true;
 }
 
 // chat_join_request 处理：申请人「发起申请」的那一刻（还不是群成员）。
@@ -28864,7 +29716,8 @@ async function handleStatsPaginationCallback(callbackQuery, env) {
 	const statChatId = sep >= 0 ? token.slice(sep + 1) : '';
 	if (!statChatId) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
 	// 权限复查（与 /stats 命令一致）：主人/副主人，或该统计群的管理员/群主。
-	const allowed = isPrivilegedManager(clickerId) || await checkIfUserIsAdminInGroup(clickerId, statChatId);
+	// 杀手权限只认杀手群的统计按钮（canKillerViewStats），别的群照旧。
+	const allowed = isPrivilegedManager(clickerId) || canKillerViewStats(clickerId, statChatId) || await checkIfUserIsAdminInGroup(clickerId, statChatId);
 	if (!allowed) { await answerAdVoteCallback(callbackQuery?.id, '仅限该群管理员或主人操作', true); return; }
 	const msgChatId = String(callbackQuery?.message?.chat?.id || '');
 	const messageId = Number(callbackQuery?.message?.message_id) || 0;
@@ -28886,7 +29739,8 @@ async function handleStatsGoCallback(callbackQuery, env) {
 	const statChatId = sep >= 0 ? token.slice(sep + 1) : '';
 	if (!statChatId) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
 	// 权限复查（与 /stats 命令一致）：主人/副主人，或该群管理员/群主。
-	const allowed = isPrivilegedManager(clickerId) || await checkIfUserIsAdminInGroup(clickerId, statChatId);
+	// 杀手权限只认杀手群的统计按钮（canKillerViewStats），别的群照旧。
+	const allowed = isPrivilegedManager(clickerId) || canKillerViewStats(clickerId, statChatId) || await checkIfUserIsAdminInGroup(clickerId, statChatId);
 	if (!allowed) { await answerAdVoteCallback(callbackQuery?.id, '仅限该群管理员或主人操作', true); return; }
 	let title = '';
 	try { const gi = await getChatInfoFromId(statChatId); title = String(gi?.title || ''); } catch (_) {}
@@ -28914,7 +29768,8 @@ async function handleStatsTrendCallback(callbackQuery, env) {
 	const statChatId = sep >= 0 ? token.slice(sep + 1) : '';
 	if (!statChatId) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
 	// 权限复查（与 /stats 命令一致）：主人/副主人，或该统计群的管理员/群主。
-	const allowed = isPrivilegedManager(clickerId) || await checkIfUserIsAdminInGroup(clickerId, statChatId);
+	// 杀手权限只认杀手群的统计按钮（canKillerViewStats），别的群照旧。
+	const allowed = isPrivilegedManager(clickerId) || canKillerViewStats(clickerId, statChatId) || await checkIfUserIsAdminInGroup(clickerId, statChatId);
 	if (!allowed) { await answerAdVoteCallback(callbackQuery?.id, '仅限该群管理员或主人操作', true); return; }
 	const msgChatId = String(callbackQuery?.message?.chat?.id || '');
 	const messageId = Number(callbackQuery?.message?.message_id) || 0;
@@ -29002,15 +29857,18 @@ async function handleSearchPaginationCallback(callbackQuery, env) {
 	const scope = parts[2] || 'all';
 	if (!value) { await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true); return; }
 
-	// 权限复查：'all' 表示私聊发起的跨群搜索（只有第一主人），否则按群判群主。
+	// 权限复查：'all' 表示私聊发起的跨群搜索（只有第一主人）；'killer' 是杀手权限私聊发起的
+	// 全部杀手群搜索（只有杀手权限）；否则按群判群主，杀手群里杀手权限也放行。
 	if (scope === 'all') {
 		if (!isPrimaryOwner(clickerId)) { await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人或该群群主', true); return; }
-	} else if (!(await canUseSearch(clickerId, scope))) {
+	} else if (scope === 'killer') {
+		if (!isKillerAdmin(clickerId)) { await answerAdVoteCallback(callbackQuery?.id, '仅限杀手权限', true); return; }
+	} else if (!(isKillerAdmin(clickerId) && isKillerModeGroup(scope)) && !(await canUseSearch(clickerId, scope))) {
 		await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人或该群群主', true);
 		return;
 	}
 
-	const scopeChatIds = scope === 'all' ? GROUP_IDS.map(String) : [String(scope)];
+	const scopeChatIds = scope === 'all' ? GROUP_IDS.map(String) : scope === 'killer' ? killerScopeGroupIds() : [String(scope)];
 	let userIdFilter = null;
 	let keywordFilter = null;
 	let queryLabel = '';
@@ -29026,14 +29884,14 @@ async function handleSearchPaginationCallback(callbackQuery, env) {
 	});
 	const msgChatId = String(callbackQuery?.message?.chat?.id || '');
 	const messageId = Number(callbackQuery?.message?.message_id) || 0;
-	let scopeLabel = scope === 'all' ? '全部配置群' : '';
-	if (scope !== 'all') {
+	let scopeLabel = scope === 'all' ? '全部配置群' : scope === 'killer' ? '全部杀手群' : '';
+	if (scope !== 'all' && scope !== 'killer') {
 		try { const gi = await getChatInfoFromId(scope); scopeLabel = String(gi?.title || '') || ('群 <code>' + escapeHtml(scope) + '</code>'); }
 		catch (_) { scopeLabel = '群 <code>' + escapeHtml(scope) + '</code>'; }
 	}
 	const text = renderSearchResult({
 		scopeLabel, queryLabel, rows: result.rows, total: result.total, page,
-		totalPages: result.totalPages, showChatId: scope === 'all',
+		totalPages: result.totalPages, showChatId: scope === 'all' || scope === 'killer',
 		historyNote: searchHistoryNote(scopeChatIds)
 	});
 	const keyboard = buildAdPaginationKeyboard(SEARCH_PREFIX, page, result.totalPages,

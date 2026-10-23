@@ -97,6 +97,7 @@
 - `/menu` —— **群设置菜单页**，三入口（群统计 / 资料卡 / 运行检查），点入口原地切换；返回键只在第一主人打开时挂
 - `/search 关键词` `TGID` `@用户名` —— 关键词搜索带分页，大小写不敏感、`LIKE` 走 `ESCAPE` 转义；**普通管理员 / 副主人 / 超管不可用**
 - 杀手群（`KILLER_MODE_GROUPS`，规则固定无开关）—— **自动检测永久禁言**（退群再进重新禁言）、**`/ban` `/spam` `/sban` 踢出**（复入群踢回）；同款直封 / 同款连带 / `/ad` 投票与杀手群**完全隔离**。非杀手群的 `/ban` `/spam` 恒为禁言，要踢人用 `/sban`
+- 杀手权限（`KILLER_ADMIN_IDS`）—— 只作用于杀手群：`/ban /sban /spam /unban /rm /check /profile /search /stats /notice /health /job /jobrun /help`，**碰不到 GROUP_ID 的群**；封的人进独立的**杀手黑名单**（只在杀手群拦截）、一律踢出、不学特征；**按群分身份**（杀手群里 = 杀手身份，私聊时 `/ban /spam /unban /check` 若他也是超管则走超管）；每次封禁 / 解封 / 通知 / 删消息抄送第一主人；本人豁免广告自动检测
 - `/dryrun [on|off|status]` —— **演练模式**：判定照跑但不删不封不加黑不学习，命中写流水 + 私聊通知**带两个按钮当场拍板**（✅确认封 / ❌不该封）。群内回执发完即撤；**只挡处置不挡同款**（重发照删、`/spam` 连带照追）。⚠️ 演练期间该群完全不设防
 - `/recent [N]` —— 捞回已被删的广告：按广告特征强度取最近 48 小时，冻结成快照私聊
 
@@ -212,6 +213,7 @@
 | `OWNER_IDS` | 空数组 | 主人 / 副主人 TGID。**第一个是主人**（收全部通知），其余副主人（收加黑踢出通知） |
 | `SUPER_ADMIN_IDS` | 空数组 | 超管 TGID，**等同群管理员全部权限但免挂管理员身份**；不含主人高级命令、不参与 `/stats`、本人豁免广告自动检测 |
 | `KILLER_MODE_GROUPS` | 空数组 | 杀手群，**自动并入 GROUP_IDS**（自动检测禁言、人工命令踢出；不参与同款 / 连带 / 投票） |
+| `KILLER_ADMIN_IDS` | 空数组 | 杀手权限 TGID，**只管杀手群**、与超管分开管；只放 Dashboard，别写进 `wrangler.toml` 的 `[vars]` |
 | `STAT_SEARCH_GROUPS` | 空数组 | 关键词搜索的**正文保留群**（这些群按 `created_at` 保留 180 天，其余群只留全局最新 200 条）；**自动并入 GROUP_IDS**，不并入则不写缓存、配了也搜不到 |
 | `PROFILE_LOOKUP_GROUPS` | 空 | **只读资料群**，仅供 `/admins` 查昵称，**完全不参与治理** |
 | `STATIC_USER_PROFILES` | 空 | `/admins` 静态资料兜底（JSON），查到实时资料后自动覆盖 |
@@ -326,7 +328,7 @@ wrangler secret put GROUP_ID     # -1001234567890（可逗号分隔多群）
 
 `OWNER_IDS` —— 主人 + 副主人 TGID，**第一个是主人**；不填则不发任何私聊通知。
 
-**可选** —— 解封文案 `SELF_UNBAN_KEYWORD` `START_WELCOME` `SELF_UNBAN_PROMPT` `SELF_UNBAN_APPROVED` `_NOLINK` `SELF_UNBAN_CONTACT_GROUP`；群与权限 `SUPER_ADMIN_IDS` `KILLER_MODE_GROUPS` `STAT_SEARCH_GROUPS` `PROFILE_LOOKUP_GROUPS` `STATIC_USER_PROFILES`；其它 `BLACKLIST_PAGE_LIMIT` `GKY_BANLIST_ENDPOINT` `FLASH_MESSAGE_TTL_MS` `MSG_CACHE_SIZE` `STATS_TZ_OFFSET`；广告阈值 `AD_*`（含 `AD_JOIN_SCORE_THRESHOLD`）**建议一个都不填**，理由见 [阈值调优与运维](#阈值调优与运维)。默认值见源码顶部 `=可修改=` 区段。
+**可选** —— 解封文案 `SELF_UNBAN_KEYWORD` `START_WELCOME` `SELF_UNBAN_PROMPT` `SELF_UNBAN_APPROVED` `_NOLINK` `SELF_UNBAN_CONTACT_GROUP`；群与权限 `SUPER_ADMIN_IDS` `KILLER_MODE_GROUPS` `KILLER_ADMIN_IDS` `STAT_SEARCH_GROUPS` `PROFILE_LOOKUP_GROUPS` `STATIC_USER_PROFILES`；其它 `BLACKLIST_PAGE_LIMIT` `GKY_BANLIST_ENDPOINT` `FLASH_MESSAGE_TTL_MS` `MSG_CACHE_SIZE` `STATS_TZ_OFFSET`；广告阈值 `AD_*`（含 `AD_JOIN_SCORE_THRESHOLD`）**建议一个都不填**，理由见 [阈值调优与运维](#阈值调优与运维)。默认值见源码顶部 `=可修改=` 区段。
 `
 
 #### 6.3 老部署升级需要做什么
