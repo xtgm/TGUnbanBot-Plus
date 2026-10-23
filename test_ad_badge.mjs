@@ -396,10 +396,13 @@ section('[6] payload.badgeId 与 /ignore 快照往返');
 	// 快照还原端（白名单重建）—— 漏一个字段整条纠错链路静默失效
 	assert('adPayloadFromSnapshot 还原 badgeId', src.includes('badgeId: String(snap.badgeId || \'\'),'), '');
 	assert('/ignore 回滚调用 clearAdBadgeOnIgnore', src.includes('clearAdBadgeOnIgnore(env, payload?.badgeId)'), '');
-	// 逐字段断言 + 必须都在同一个 return 行里：比整串精确匹配健壮（新增纠错字段
-	// 不会撞红），又不像单看字段名那样松 —— 漏写在 return 里照样抓得到。
+	// 【定位串只取到 unbanSummary，另外用 fp/sampleRemoved 认出「最终成功返回」】：
+	// strict 回滚模式在中间插了 unbanResults / snapshotProcessed / complete / errors，
+	// 若继续要求这几个词相邻就会把「新增字段」误判成「纠错字段丢了」。同时不能只按
+	// 前缀 find —— 函数里有两条提前返回（移除黑名单失败 / 部分群解封失败）开头一样，
+	// 会先命中错误分支。要断言的是五个字段同处一行，不是它们相邻。
 	const ignoreReturnLine = src.split('\r\n')
-		.find((l) => l.includes('return { targetId, removed, unbanSummary, fp, sampleRemoved')) || '';
+		.find((l) => l.includes('return { targetId, removed, unbanSummary,') && l.includes('fp, sampleRemoved')) || '';
 	assert('/ignore 返回结果含 badgeCleared',
 		['avatarCleared', 'badgeCleared', 'bodyEmojiCleared', 'imageCleared', 'shapeCleared']
 			.every((f) => ignoreReturnLine.includes(f)),

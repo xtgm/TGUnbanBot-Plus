@@ -356,15 +356,24 @@ export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 		const path = url.pathname.slice(1); // 移除开头的斜杠
+		// 公共页面只返回静态外壳；身份与权限由 API 校验，不消耗 D1。
+		if (url.pathname === '/app') {
+			if (request.method !== 'GET') return miniAppJson({ success: false, error: '仅支持 GET' }, 405);
+			return miniAppHtmlResponse();
+		}
+		const miniAppApi = url.pathname.startsWith('/app/api/');
 
 		try {
 			applyRuntimeConfig(loadRequiredConfig(env));
 		} catch (error) {
+			if (miniAppApi) return miniAppJson({ success: false, error: '机器人配置未就绪' }, 503);
 			return jsonResponse({
 				success: false,
 				error: error.message
 			}, 500);
 		}
+		// 必须在动态群合并等任何 D1 操作之前鉴权。
+		if (miniAppApi) return handleMiniAppApi(request, env, ctx, url);
 		// ===== Webhook 来源校验（放在任何 D1 读写之前）=====
 		// 校验不通过就不碰数据库：伪造请求连一次 D1 查询都不该消耗。
 		// 只拦 POST 根路径（Telegram 更新入口）；GET/POST `/{TOKEN}` 初始化走 TOKEN 鉴权，不受影响。
@@ -796,6 +805,793 @@ function beautifyJsonResponse(request, data, status = 200) {
 	});
 }
 
+// Telegram Mini App：只信任 Telegram 签名数据，不接受前端提供的管理身份。
+class MiniAppError extends Error {
+	constructor(status, message) {
+		super(message);
+		this.status = status;
+	}
+}
+
+const MINI_APP_ACTIONS = new Set(['bootstrap', 'groups/list', 'groups/add', 'groups/remove', 'groups/leave', 'blacklist/list', 'blacklist/unban', 'ads/summary', 'ads/pending', 'ads/ignore', 'users/query']);
+const MINI_APP_BODY_LIMIT = 32768;
+
+function miniAppJson(data, status = 200) {
+	return new Response(JSON.stringify(data), { status, headers: {
+		'Content-Type': 'application/json; charset=UTF-8',
+		'Cache-Control': 'no-store',
+		'X-Content-Type-Options': 'nosniff',
+		'Referrer-Policy': 'no-referrer'
+	} });
+}
+
+function renderMiniAppHtml() {
+  return String.raw`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>群务台 · Telegram</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root{--canvas:var(--tg-theme-secondary-bg-color,#edf2ef);--surface:var(--tg-theme-bg-color,#fff);--text:var(--tg-theme-text-color,#172c24);--muted:var(--tg-theme-hint-color,#718078);--accent:var(--tg-theme-button-color,#157759);--accent-text:var(--tg-theme-button-text-color,#fff);--link:var(--tg-theme-link-color,#157759);--line:#dce5df;--soft:#f4f7f5;--danger:#be3c3c;--warning:#956c18;--success:#157759;--radius:18px;--mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;--body:"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;--title:"Songti SC","Noto Serif CJK SC",Georgia,serif}
+    @media(prefers-color-scheme:dark){:root{--canvas:var(--tg-theme-secondary-bg-color,#111a17);--surface:var(--tg-theme-bg-color,#1b2621);--text:var(--tg-theme-text-color,#e5eee8);--muted:var(--tg-theme-hint-color,#96a69d);--line:#344239;--soft:#233129;--danger:#f28181;--warning:#ddb963;--success:#79c9a3}}
+    body[data-theme="dark"]{--canvas:var(--tg-theme-secondary-bg-color,#111a17);--surface:var(--tg-theme-bg-color,#1b2621);--text:var(--tg-theme-text-color,#e5eee8);--muted:var(--tg-theme-hint-color,#96a69d);--line:#344239;--soft:#233129;--danger:#f28181;--warning:#ddb963;--success:#79c9a3}
+    body[data-theme="light"]{--canvas:var(--tg-theme-secondary-bg-color,#edf2ef);--surface:var(--tg-theme-bg-color,#fff);--text:var(--tg-theme-text-color,#172c24);--muted:var(--tg-theme-hint-color,#718078);--line:#dce5df;--soft:#f4f7f5;--danger:#be3c3c;--warning:#956c18;--success:#157759}
+    *{box-sizing:border-box}html{min-height:100%;background:var(--canvas)}body{margin:0;color:var(--text);font-family:var(--body);font-size:14px;line-height:1.55;-webkit-tap-highlight-color:transparent}body.dialog-open{overflow:hidden}button,input{font:inherit}button{cursor:pointer}button,input{touch-action:manipulation}button{color:inherit}button:disabled{cursor:default;opacity:.48}button:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid var(--accent);outline-offset:3px}button:active:not(:disabled){transform:translateY(1px)}[hidden]{display:none!important}svg{width:20px;height:20px;display:block;fill:none;stroke:currentColor;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round}a{color:var(--link)}
+    .shell{max-width:760px;margin:auto;min-height:100vh;padding:calc(18px + env(safe-area-inset-top,0px)) 18px calc(112px + env(safe-area-inset-bottom,0px))}.masthead{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px}.brand{display:flex;align-items:center;gap:11px}.brand-mark{width:36px;height:36px;display:grid;place-items:center;background:var(--accent);color:var(--accent-text);border-radius:10px;font-family:var(--title);font-size:22px;font-weight:700}.brand-title{font-family:var(--title);font-size:22px;font-weight:700;line-height:1.1;letter-spacing:1px}.brand-subtitle{color:var(--muted);font-family:var(--mono);font-size:10px;letter-spacing:1.5px;margin-top:4px}.icon-button{border:1px solid var(--line);background:var(--surface);width:40px;height:40px;border-radius:13px;display:grid;place-items:center;flex:0 0 auto}.identity{border-top:1px solid var(--line);padding:10px 0 15px;display:flex;gap:8px;align-items:center;font-size:12px;color:var(--muted)}.identity-dot{width:6px;height:6px;border-radius:100%;background:var(--success);flex:none}.identity-name{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:62%}.identity-role{margin-left:auto;white-space:nowrap}.page{animation:appear .22s ease-out}.page-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:8px 0 18px}.eyebrow{font:10px var(--mono);letter-spacing:2px;color:var(--accent);margin-bottom:4px}.page-title{font-family:var(--title);font-size:29px;line-height:1.25;letter-spacing:1px;margin:0;font-weight:700}.description{color:var(--muted);font-size:12px;margin:7px 0 0}.counter{font:11px var(--mono);color:var(--muted);white-space:nowrap;margin-top:8px}.button{min-height:42px;padding:10px 15px;border-radius:12px;border:1px solid var(--line);background:var(--surface);font-weight:600;font-size:13px;display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap}.button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-text)}.button.danger{color:var(--danger)}.button.small{min-height:36px;padding:7px 12px;font-size:12px;border-radius:10px}.button.quiet{background:transparent}.button.wide{width:100%}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:16px 0 10px}.section-label{font-size:12px;font-weight:600;margin:0}.muted{color:var(--muted)}.mono{font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}.subtle{font-size:12px;color:var(--muted)}.notice{border-left:3px solid var(--accent);padding:10px 13px;background:var(--surface);border-radius:0 10px 10px 0;color:var(--muted);font-size:12px;margin:0 0 14px}.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:17px;margin:0 0 12px;overflow:hidden}.card-heading{display:flex;align-items:flex-start;gap:10px;justify-content:space-between}.card-title{font-size:15px;font-weight:650;line-height:1.45;margin:0;overflow-wrap:anywhere;min-width:0}.card-subtitle{color:var(--muted);font-size:12px;margin-top:3px;overflow-wrap:anywhere}.badge{display:inline-block;flex:none;max-width:160px;padding:3px 7px;background:var(--soft);color:var(--muted);font-size:10px;font-weight:600;line-height:1.5;border-radius:6px;overflow-wrap:anywhere}.badge.accent{color:var(--accent)}.badge.warning{color:var(--warning)}.badge.danger{color:var(--danger)}.card-actions{display:flex;flex-wrap:wrap;gap:8px;padding-top:14px;margin-top:13px;border-top:1px solid var(--line)}.card-actions .button{flex:1}.field{display:block;margin:0 0 7px;font-size:12px;font-weight:600}.input{width:100%;min-height:45px;background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:12px;padding:10px 13px;outline:none}.input::placeholder{color:var(--muted);opacity:.8}.input:focus{border-color:var(--accent)}.search-form{display:flex;gap:8px;margin:0 0 7px}.search-form .input{min-width:0}.form-hint{font-size:11px;color:var(--muted);margin:0 0 17px}.pager{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0 16px}.page-position{font:11px var(--mono);color:var(--muted);text-align:center}.detail-grid{display:grid;grid-template-columns:75px minmax(0,1fr);gap:7px 10px;font-size:12px;margin:13px 0 0}.detail-grid dt{color:var(--muted)}.detail-grid dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap}.detail-grid dd.mono{white-space:normal}.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:14px}.stat{background:var(--surface);border:1px solid var(--line);padding:12px 9px 10px;border-radius:13px;min-width:0}.stat-value{font:23px var(--mono);letter-spacing:-1px;line-height:1.35;color:var(--text)}.stat-label{font-size:10px;color:var(--muted);margin-top:4px}.stat.emphasis{border-color:var(--accent)}.stat.emphasis .stat-value{color:var(--accent)}.config-row{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:11px;color:var(--muted);margin:0 0 4px}.config-row strong{font-weight:600;color:var(--text);margin-left:5px}.score{font:20px var(--mono);color:var(--warning);line-height:1.2;text-align:right;flex:none}.score small{display:block;font:9px var(--body);color:var(--muted);margin-top:4px}.reason-list{display:flex;flex-wrap:wrap;gap:6px;margin:13px 0 10px}.evidence{margin:12px 0 0;border-top:1px solid var(--line);padding-top:10px}.evidence summary{font-size:12px;color:var(--link);cursor:pointer}.evidence-text{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--soft);padding:12px;border-radius:10px;margin-top:10px;max-height:320px;overflow:auto}.profile-top{display:flex;align-items:center;gap:12px}.avatar{width:46px;height:46px;border-radius:14px;background:var(--soft);color:var(--accent);font-family:var(--title);font-size:21px;display:grid;place-items:center;flex:none}.profile-info{min-width:0}.profile-info h2{margin:0 0 2px;font-size:18px;overflow-wrap:anywhere}.profile-badges{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}.speech-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding-top:14px;margin-top:15px;border-top:1px solid var(--line)}.speech-stats span{display:block;font-size:10px;color:var(--muted);margin-bottom:3px}.speech-stats strong{font:11px var(--mono);overflow-wrap:anywhere}.timeline{list-style:none;margin:13px 0 0;padding:0}.timeline-item{position:relative;padding:0 0 17px 19px;margin-left:3px;border-left:1px solid var(--line)}.timeline-item:last-child{padding-bottom:0}.timeline-item:before{content:"";position:absolute;left:-4px;top:6px;width:7px;height:7px;border-radius:50%;background:var(--accent);border:2px solid var(--surface)}.timeline-title{font-size:12px;font-weight:600;overflow-wrap:anywhere}.timeline-time{font:10px var(--mono);color:var(--muted);margin:3px 0}.timeline-detail{font-size:12px;color:var(--muted);overflow-wrap:anywhere;white-space:pre-wrap}.empty{padding:30px 18px;text-align:center;border:1px dashed var(--line);border-radius:var(--radius);background:var(--surface)}.empty-symbol{font-family:var(--title);font-size:28px;color:var(--accent);margin-bottom:8px}.empty h3{font-size:14px;margin:0 0 6px}.empty p{font-size:12px;color:var(--muted);margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.empty .button{margin-top:15px}.loading{padding:30px 12px;display:flex;flex-direction:column;align-items:center;gap:13px;color:var(--muted);font-size:12px}.spinner{width:21px;height:21px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}.bottom-nav{position:fixed;z-index:20;bottom:0;left:0;right:0;background:var(--surface);border-top:1px solid var(--line);padding:8px 12px calc(8px + env(safe-area-inset-bottom,0px))}.nav-inner{max-width:724px;margin:auto;display:grid;grid-template-columns:repeat(4,1fr);gap:5px}.nav-item{border:0;background:transparent;color:var(--muted);display:flex;align-items:center;flex-direction:column;gap:5px;min-height:55px;padding:9px 5px 5px;border-radius:12px;font-size:10px;font-weight:600;position:relative}.nav-item[aria-selected="true"]{color:var(--accent);background:var(--soft)}.nav-item[aria-selected="true"]:before{content:"";position:absolute;top:3px;width:16px;height:2px;background:var(--accent);border-radius:2px}.nav-item svg{width:21px;height:21px}.auth-wrap{min-height:76vh;display:grid;align-items:center}.auth-card{background:var(--surface);border:1px solid var(--line);border-radius:22px;padding:30px 23px;text-align:center}.auth-card .brand-mark{margin:0 auto 18px;width:48px;height:48px;border-radius:15px;font-size:28px}.auth-card h1{font-family:var(--title);font-size:27px;margin:0 0 12px}.auth-card p{color:var(--muted);font-size:13px;white-space:pre-wrap;margin:0 0 16px}.auth-card .button{margin-top:5px}.toast{position:fixed;z-index:60;left:50%;bottom:calc(92px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);width:max-content;max-width:calc(100% - 36px);padding:12px 16px;background:var(--text);color:var(--surface);border-radius:12px;font-size:12px;box-shadow:0 7px 25px #0002;white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:none;animation:appear .15s ease-out}.toast[data-kind="error"]{border-left:4px solid var(--danger)}dialog{color:var(--text);background:var(--surface);border:1px solid var(--line);border-radius:22px;padding:23px;width:calc(100% - 36px);max-width:420px;box-shadow:0 24px 90px #0004;max-height:85vh;overflow:auto}dialog::backdrop{background:#0b171370;backdrop-filter:blur(3px)}dialog h2{font-family:var(--title);font-size:23px;margin:0 0 10px}dialog p{color:var(--muted);font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 18px}.dialog-object{display:block;color:var(--text);background:var(--soft);font:12px var(--mono);border-radius:10px;padding:10px 12px;overflow-wrap:anywhere;margin:0 0 15px}.dialog-actions{display:flex;gap:9px;margin-top:20px}.dialog-actions .button{flex:1}.dialog-warning{color:var(--danger)!important;font-size:11px!important}.busy-label{display:inline-flex;align-items:center;gap:7px}.busy-label .spinner{width:14px;height:14px;border-top-color:currentColor}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
+    @keyframes spin{to{transform:rotate(360deg)}}@keyframes appear{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}@media(min-width:600px){.shell{padding-left:30px;padding-right:30px}.group-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.group-list .card{margin:0}.stat{padding:15px}.stat-value{font-size:30px}.stat-label{font-size:11px}.page-title{font-size:33px}.card-actions{gap:6px}.card-actions .button{padding:7px 9px}}@media(max-width:350px){.shell{padding-left:12px;padding-right:12px}.stat-grid{gap:5px}.stat{padding:10px 7px}.stat-value{font-size:20px}.stat-label{font-size:9px}.page-title{font-size:26px}.button{padding:10px 12px}.card-actions .button{font-size:11px;padding:7px 9px}}@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="masthead">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">群</span><div><div class="brand-title">群务台</div><div class="brand-subtitle">GROUP OPERATIONS</div></div></div>
+      <button id="refresh" class="icon-button" type="button" aria-label="刷新当前页面" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></svg></button>
+    </header>
+    <div id="auth" class="auth-wrap"><div class="auth-card"><div class="brand-mark" aria-hidden="true">群</div><h1 id="auth-title">正在连接群务台</h1><p id="auth-text">正在确认管理权限…</p><div id="auth-spinner" class="loading"><span class="spinner" aria-hidden="true"></span></div><button id="auth-retry" class="button primary" type="button" hidden>重新连接</button></div></div>
+    <div id="app" hidden>
+      <div class="identity"><span class="identity-dot" aria-hidden="true"></span><span id="identity-name" class="identity-name"></span><span class="subtle">已连接</span><span id="identity-role" class="identity-role"></span></div>
+      <main id="main">
+        <section id="page-groups" class="page" role="tabpanel" aria-labelledby="tab-groups">
+          <div class="page-head"><div><div class="eyebrow">01 / GOVERNANCE</div><h1 class="page-title" tabindex="-1">群组管理</h1><p class="description">查看治理范围，管理机器人所在群组。</p></div><button id="add-group" class="button primary" type="button">＋ 添加</button></div>
+          <p id="group-permission" class="notice" hidden>群组变更由第一主人操作。</p>
+          <div class="toolbar"><h2 class="section-label">治理中的群组</h2><span id="groups-count" class="counter"></span></div>
+          <div id="groups-content" class="group-list"></div>
+        </section>
+        <section id="page-blacklist" class="page" role="tabpanel" aria-labelledby="tab-blacklist" hidden>
+          <div class="page-head"><div><div class="eyebrow">02 / BLACKLIST</div><h1 class="page-title" tabindex="-1">黑名单</h1><p class="description">查找封禁记录，按需解除跨群封禁。</p></div></div>
+          <label class="sr-only" for="blacklist-query">搜索黑名单</label><form id="blacklist-search" class="search-form"><input id="blacklist-query" class="input" type="search" placeholder="用户 ID、封禁原因或备注" maxlength="160" autocomplete="off"><button class="button primary" type="submit">搜索</button></form>
+          <p class="form-hint">留空搜索可查看全部记录。</p>
+          <div class="toolbar"><h2 class="section-label" id="blacklist-label">全部记录</h2><span id="blacklist-count" class="counter"></span></div>
+          <div id="blacklist-content"></div><div id="blacklist-pager"></div>
+        </section>
+        <section id="page-ads" class="page" role="tabpanel" aria-labelledby="tab-ads" hidden>
+          <div class="page-head"><div><div class="eyebrow">03 / AD REVIEW</div><h1 class="page-title" tabindex="-1">广告治理</h1><p class="description">了解识别状态，复核待处理广告记录。</p></div></div>
+          <div id="ads-summary"></div>
+          <div class="toolbar"><h2 class="section-label">待复核记录</h2><span id="ads-count" class="counter"></span></div>
+          <div id="ads-content"></div><div id="ads-pager"></div>
+        </section>
+        <section id="page-users" class="page" role="tabpanel" aria-labelledby="tab-users" hidden>
+          <div class="page-head"><div><div class="eyebrow">04 / USER LOOKUP</div><h1 class="page-title" tabindex="-1">用户查询</h1><p class="description">通过 Telegram 用户 ID 查看资料与处理记录。</p></div></div>
+          <label class="sr-only" for="user-query">Telegram 用户 ID</label><form id="user-search" class="search-form"><input id="user-query" class="input mono" type="text" inputmode="numeric" pattern="[0-9]{1,20}" maxlength="20" placeholder="Telegram 用户 ID" autocomplete="off" required><button class="button primary" type="submit">查询</button></form>
+          <p class="form-hint">请输入数字 ID，例如 123456789。</p><div id="users-content"></div>
+        </section>
+      </main>
+    </div>
+  </div>
+  <nav id="nav" class="bottom-nav" aria-label="管理模块" hidden><div class="nav-inner" role="tablist" aria-label="管理模块">
+    <button id="tab-groups" class="nav-item" type="button" role="tab" aria-selected="true" aria-controls="page-groups" data-tab="groups"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 21V5l8-2v18M12 8h8v13M2 21h20M7 7v1M7 11v1M7 15v1M16 11h1M16 15h1"/></svg><span>群组</span></button>
+    <button id="tab-blacklist" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="page-blacklist" data-tab="blacklist" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 4.4-3.5 7.4-8 9-4.5-1.6-8-4.6-8-9V6zM9 9l6 6M15 9l-6 6"/></svg><span>黑名单</span></button>
+    <button id="tab-ads" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="page-ads" data-tab="ads" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9l13-4v14L4 15zM4 9H2v6h2M6 16l2 5h3l-2-4M21 9v6"/></svg><span>广告</span></button>
+    <button id="tab-users" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="page-users" data-tab="users" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="8" r="4"/><path d="M3 21v-2a7 7 0 0 1 10-6"/><circle cx="17" cy="17" r="4"/><path d="M20 20l2 2"/></svg><span>用户</span></button>
+  </div></nav>
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title"><h2 id="confirm-title"></h2><p id="confirm-description"></p><span id="confirm-object" class="dialog-object" hidden></span><p id="confirm-warning" class="dialog-warning" hidden></p><div class="dialog-actions"><button id="confirm-cancel" class="button" type="button">取消</button><button id="confirm-submit" class="button primary" type="button">确认</button></div></dialog>
+  <dialog id="add-dialog" aria-labelledby="add-title"><form id="add-form"><h2 id="add-title">添加治理群组</h2><p>将机器人已加入的群组纳入治理范围。</p><label class="field" for="add-chat-id">群组 ID</label><input id="add-chat-id" class="input mono" type="text" pattern="-[0-9]{5,20}" maxlength="21" placeholder="-1001234567890" autocomplete="off" required><p class="form-hint" style="margin-top:8px">请输入以负号开头的数字群组 ID。</p><div class="dialog-actions"><button id="add-cancel" class="button" type="button">取消</button><button id="add-submit" class="button primary" type="submit">添加群组</button></div></form></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script>
+  (function () {
+    'use strict';
+    var tg = window.Telegram && window.Telegram.WebApp;
+    var state = { active: 'groups', primaryOwner: false, authenticated: false, loaded: {}, busy: new Set(), generation: {}, groups: [], blacklistPage: 1, blacklistQuery: '', adsPage: 1, queriedUser: '', toastTimer: null };
+    var $ = function (id) { return document.getElementById(id); };
+    function element(tag, className, content) { var el = document.createElement(tag); if (className) el.className = className; if (content !== undefined && content !== null) el.textContent = String(content); return el; }
+    function text(value, fallback) { return value === undefined || value === null || value === '' ? (fallback || '—') : String(value); }
+    function count(value) { var n = Number(value); return Number.isFinite(n) && n >= 0 ? n.toLocaleString('zh-CN') : '—'; }
+    function date(value, short) { if (value === undefined || value === null || value === '') return '—'; var raw = Number(value); var d = new Date(Number.isFinite(raw) && raw > 0 ? (raw < 1e12 ? raw * 1000 : raw) : value); if (Number.isNaN(d.getTime())) return String(value); return d.toLocaleString('zh-CN', short ? { year: 'numeric', month: '2-digit', day: '2-digit' } : { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }); }
+    function valueFrom(row, keys) { for (var i = 0; row && i < keys.length; i++) if (row[keys[i]] !== undefined && row[keys[i]] !== null && row[keys[i]] !== '') return row[keys[i]]; return null; }
+    function displayValue(value) { if (value === null || value === undefined || value === '') return '—'; if (Array.isArray(value)) return value.map(displayValue).join('、'); if (typeof value === 'object') return Object.keys(value).map(function (key) { return key + '：' + displayValue(value[key]); }).join('\n'); return String(value); }
+    function toast(message, kind) { clearTimeout(state.toastTimer); $('toast').textContent = String(message); $('toast').dataset.kind = kind || 'success'; $('toast').hidden = false; state.toastTimer = setTimeout(function () { $('toast').hidden = true; }, kind === 'error' ? 6500 : 4000); }
+    function makeButton(label, className, action) { var b = element('button', 'button ' + (className || ''), label); b.type = 'button'; if (action) b.addEventListener('click', function () { Promise.resolve(action(b)).catch(function (err) { toast(err.message || '操作失败，请稍后重试。', 'error'); }); }); return b; }
+    function empty(container, title, detail, retry) { container.replaceChildren(); var box = element('div', 'empty'); box.append(element('div', 'empty-symbol', retry ? '!' : '·'), element('h3', '', title), element('p', '', detail)); if (retry) box.append(makeButton('重试', 'small', retry)); container.append(box); }
+    function loading(container, label) { container.replaceChildren(); var box = element('div', 'loading'); var spinner = element('span', 'spinner'); spinner.setAttribute('aria-hidden', 'true'); box.setAttribute('role', 'status'); box.append(spinner, element('span', '', label || '正在加载…')); container.append(box); }
+    function detailList(pairs) { var dl = element('dl', 'detail-grid'); pairs.forEach(function (pair) { dl.append(element('dt', '', pair[0]), element('dd', pair[2] ? 'mono' : '', pair[1])); }); return dl; }
+    function begin(key) { state.generation[key] = (state.generation[key] || 0) + 1; return state.generation[key]; }
+    function current(key, seq) { return state.authenticated && state.generation[key] === seq; }
+    function setFormBusy(form, busy) { Array.from(form.elements).forEach(function (el) { el.disabled = busy; }); }
+    function permissionNotice() { $('add-group').hidden = !state.primaryOwner; $('group-permission').hidden = state.primaryOwner; }
+    function theme() { if (tg && tg.colorScheme) document.body.dataset.theme = tg.colorScheme; }
+    function updateBackButton() { if (!tg || !tg.BackButton) return; if (state.active !== 'groups' || document.querySelector('dialog[open]')) tg.BackButton.show(); else tg.BackButton.hide(); }
+    function authMessage(title, message, retry) { $('auth-title').textContent = title; $('auth-text').textContent = message; $('auth-spinner').hidden = true; $('auth-retry').hidden = !retry; $('auth').hidden = false; $('app').hidden = true; $('nav').hidden = true; $('refresh').hidden = true; }
+    function expireSession(message) { state.authenticated = false; document.querySelectorAll('dialog[open]').forEach(closeDialog); authMessage('连接已失效', message || '请从机器人的菜单重新打开群务台。', false); }
+    async function api(action, params) {
+      if (!tg || !tg.initData) throw new Error('请从 Telegram 机器人菜单打开群务台。');
+      var isWrite = /\/(?:add|remove|leave|unban|ignore)$/.test(action); var controller = new AbortController(); var timeout = setTimeout(function () { controller.abort(); }, isWrite ? 60000 : 25000);
+      try {
+        var response = await fetch('/app/api/' + action, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify(Object.assign({}, params || {}, { initData: tg.initData })), signal: controller.signal });
+        var result; try { result = await response.json(); } catch (_) { throw new Error('服务暂时无法响应，请稍后重试。'); }
+        if (response.status === 401 || response.status === 403) { var denied = new Error(text(result.error, '暂无管理权限，请使用已授权的 Telegram 账号打开。')); denied.auth = true; expireSession(denied.message); throw denied; }
+        if (!response.ok || !result || result.success !== true) throw new Error(text(result && result.error, '操作失败，请稍后重试。'));
+        return result.data;
+      } catch (err) { if (err.name === 'AbortError') throw new Error(isWrite ? '处理仍可能在继续。请先刷新确认结果，再决定是否重试。' : '请求超时，请稍后重试。'); if (err instanceof TypeError) throw new Error(isWrite ? '连接中断。请先刷新确认处理结果，再决定是否重试。' : '网络连接失败，请检查连接后重试。'); throw err; } finally { clearTimeout(timeout); }
+    }
+    function showDialog(dialog) { if (typeof dialog.showModal === 'function') dialog.showModal(); else dialog.setAttribute('open', ''); document.body.classList.add('dialog-open'); updateBackButton(); }
+    function closeDialog(dialog) { if (typeof dialog.close === 'function') dialog.close(); else { dialog.removeAttribute('open'); dialog.dispatchEvent(new Event('close')); } if (!document.querySelector('dialog[open]')) document.body.classList.remove('dialog-open'); updateBackButton(); }
+    function confirmAction(options) {
+      var dialog = $('confirm-dialog'); if (dialog.open) return Promise.resolve(false);
+      $('confirm-title').textContent = options.title; $('confirm-description').textContent = options.description;
+      $('confirm-object').textContent = options.object || ''; $('confirm-object').hidden = !options.object;
+      $('confirm-warning').textContent = options.warning || ''; $('confirm-warning').hidden = !options.warning;
+      $('confirm-cancel').hidden = !!options.result;
+      $('confirm-submit').textContent = options.label || '确认'; $('confirm-submit').className = 'button ' + (options.danger ? 'danger' : 'primary');
+      return new Promise(function (resolve) { var approved = false; function accept() { approved = true; closeDialog(dialog); } function cancel() { closeDialog(dialog); } function done() { $('confirm-submit').removeEventListener('click', accept); $('confirm-cancel').removeEventListener('click', cancel); dialog.removeEventListener('close', done); document.body.classList.remove('dialog-open'); updateBackButton(); resolve(approved); } $('confirm-submit').addEventListener('click', accept); $('confirm-cancel').addEventListener('click', cancel); dialog.addEventListener('close', done); showDialog(dialog); $(options.result ? 'confirm-submit' : 'confirm-cancel').focus(); });
+    }
+    function showResult(options) { return confirmAction(Object.assign({}, options, { result: true, label: '知道了' })); }
+    async function actionButton(button, key, work) { if (state.busy.has(key)) return; state.busy.add(key); var original = Array.from(button.childNodes); var icon = button.classList.contains('icon-button'); button.disabled = true; if (icon) { var spinner = element('span', 'spinner'); spinner.setAttribute('aria-hidden', 'true'); button.replaceChildren(spinner); } else button.textContent = '处理中…'; try { await work(); } finally { state.busy.delete(key); button.disabled = false; button.replaceChildren.apply(button, original); } }
+    function pager(container, data, changePage) { container.replaceChildren(); var page = Math.max(1, Number(data.page) || 1); var pages = Math.max(1, Number(data.totalPages) || 1); if (pages < 2) return; var row = element('div', 'pager'); var prev = makeButton('← 上一页', 'small', function () { return changePage(page - 1); }); var next = makeButton('下一页 →', 'small', function () { return changePage(page + 1); }); prev.disabled = page <= 1; next.disabled = page >= pages; row.append(prev, element('span', 'page-position', page + ' / ' + pages), next); container.append(row); }
+    function renderGroups(groups) {
+      var container = $('groups-content'); container.replaceChildren(); state.groups = Array.isArray(groups) ? groups : []; $('groups-count').textContent = count(state.groups.length) + ' 个群组';
+      if (!state.groups.length) { empty(container, '尚无治理群组', state.primaryOwner ? '添加机器人已加入的群组，开始统一治理。' : '第一主人添加群组后，治理范围会显示在这里。'); return; }
+      state.groups.forEach(function (group) {
+        var id = text(group.chatId); var card = element('article', 'card'); var heading = element('div', 'card-heading'); var title = element('div'); title.append(element('h3', 'card-title', text(group.title, '未命名群组')), element('div', 'card-subtitle mono', id));
+        var labels = { dynamic: '手动添加', static: '预设群组', env: '预设群组', config: '预设群组', both: '预设 / 手动', manual: '手动添加', environment: '预设群组' };
+        heading.append(title, element('span', 'badge', labels[group.source] || text(group.source, '治理中'))); card.append(heading);
+        if (state.primaryOwner) { var actions = element('div', 'card-actions'); actions.append(makeButton('停止治理', 'small', function (button) { return mutateGroup(button, group, 'remove'); }), makeButton('退出群组', 'small danger', function (button) { return mutateGroup(button, group, 'leave'); })); card.append(actions); }
+        container.append(card);
+      });
+    }
+    async function loadGroups() { var seq = begin('groups'); loading($('groups-content'), '正在读取群组…'); try { var data = await api('groups/list'); if (!current('groups', seq)) return; renderGroups(Array.isArray(data) ? data : data && data.groups); state.loaded.groups = true; } catch (err) { if (err.auth || !current('groups', seq)) return; empty($('groups-content'), '群组加载失败', err.message, loadGroups); } }
+    async function mutateGroup(button, group, action) {
+      if (!state.primaryOwner) return toast('群组变更由第一主人操作。', 'error');
+      var leaving = action === 'leave'; var confirmed = await confirmAction({ title: leaving ? '退出这个群组？' : '停止治理这个群组？', description: leaving ? '机器人将退出该群组，并将其移出治理范围。' : '该群组将移出治理范围，机器人继续留在群内。', object: text(group.title, '群组') + '\n' + text(group.chatId), warning: leaving ? '重新启用时，需要将机器人重新加入群组。' : '该群组后续将不参与统一治理。', label: leaving ? '确认退群' : '停止治理', danger: true });
+      if (!confirmed) return; await actionButton(button, 'group:' + group.chatId, async function () { var result = await api('groups/' + action, { chatId: String(group.chatId) }); toast(result && result.message ? result.message : (leaving ? '机器人已退出群组。' : '已停止治理该群组。'), result && result.complete === false ? 'error' : 'success'); await loadGroups(); });
+    }
+    async function loadBlacklist(page, query) {
+      state.blacklistPage = Math.max(1, Number(page) || 1); if (query !== undefined) state.blacklistQuery = String(query).trim(); var seq = begin('blacklist'); setFormBusy($('blacklist-search'), true); loading($('blacklist-content'), '正在读取黑名单…'); $('blacklist-pager').replaceChildren(); $('blacklist-count').textContent = ''; $('blacklist-label').textContent = state.blacklistQuery ? '搜索结果' : '全部记录';
+      try { var data = await api('blacklist/list', { page: state.blacklistPage, query: state.blacklistQuery }); if (!current('blacklist', seq)) return; data = data || {}; state.blacklistPage = Number(data.page) || state.blacklistPage; if (state.blacklistPage > Math.max(1, Number(data.totalPages) || 1)) return loadBlacklist(Math.max(1, Number(data.totalPages) || 1)); renderBlacklist(data); state.loaded.blacklist = true; } catch (err) { if (err.auth || !current('blacklist', seq)) return; empty($('blacklist-content'), '黑名单加载失败', err.message, function () { return loadBlacklist(state.blacklistPage); }); } finally { if (state.generation.blacklist === seq) setFormBusy($('blacklist-search'), false); }
+    }
+    function renderBlacklist(data) {
+      var container = $('blacklist-content'); container.replaceChildren(); var items = Array.isArray(data.items) ? data.items : []; $('blacklist-count').textContent = count(data.total === undefined ? items.length : data.total) + ' 条记录';
+      if (!items.length) empty(container, state.blacklistQuery ? '没有匹配的记录' : '暂无黑名单记录', state.blacklistQuery ? '试试完整用户 ID，或更短的关键词。' : '需要处理的封禁记录会显示在这里。');
+      items.forEach(function (record) { var card = element('article', 'card'); var head = element('div', 'card-heading'); head.append(element('h3', 'card-title mono', 'ID ' + text(record.id)), element('span', 'badge danger', '已封禁')); card.append(head, detailList([['原因', text(record.reason, '未填写')], ['备注', text(record.note)], ['操作人', text(record.by), true], ['记录时间', date(record.at)]])); var actions = element('div', 'card-actions'); actions.append(makeButton('查询用户', 'small', function () { return openUser(record.id); }), makeButton('解除封禁', 'small danger', function (button) { return unban(button, record); })); card.append(actions); container.append(card); });
+      pager($('blacklist-pager'), data, function (page) { return loadBlacklist(page); });
+    }
+    async function unban(button, record) { var confirmed = await confirmAction({ title: '解除此用户的封禁？', description: '从黑名单移除该用户，并尝试解除各治理群组中的封禁。', object: '用户 ID ' + text(record.id), warning: '部分群组可能因权限或网络原因未能完成解封。', label: '确认解封', danger: true }); if (!confirmed) return false; var completed = false; await actionButton(button, 'unban:' + record.id, async function () { var data = await api('blacklist/unban', { userId: String(record.id) }); completed = true; var results = data && Array.isArray(data.results) ? data.results : []; var failed = results.filter(function (row) { return !row.ok; }); var removed = data && data.removed === false ? '用户未从黑名单移除。' : '已移除黑名单记录。'; toast(data && data.message ? data.message : removed + (results.length ? ' 群组解封 ' + (results.length - failed.length) + '/' + results.length + ' 成功。' : ''), failed.length || data && data.complete === false ? 'error' : 'success'); if (failed.length) { await showResult({ title: '部分群组未能解封', description: failed.map(function (row) { return text(row.groupId) + '：' + text(row.error, '操作未完成'); }).join('\n'), object: '用户 ID ' + text(record.id) }); } state.loaded.blacklist = false; state.loaded.users = false; if (state.active === 'blacklist') await loadBlacklist(state.blacklistPage); }); return completed; }
+    async function loadAdsSummary() { var seq = begin('ads-summary'); loading($('ads-summary'), '正在读取广告概况…'); try { var data = await api('ads/summary'); if (!current('ads-summary', seq)) return; renderAdsSummary(data || {}); } catch (err) { if (err.auth || !current('ads-summary', seq)) return; empty($('ads-summary'), '概况加载失败', err.message, loadAdsSummary); } }
+    function renderAdsSummary(data) { var container = $('ads-summary'); container.replaceChildren(); var counts = data.counts || {}; var config = data.config || {}; var grid = element('div', 'stat-grid'); [['指纹', counts.fingerprints], ['广告样本', counts.samples], ['观察中', counts.observing], ['待复核', counts.pending]].forEach(function (pair, i) { var stat = element('div', 'stat' + (i === 3 ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(pair[1])), element('div', 'stat-label', pair[0])); grid.append(stat); }); var card = element('div', 'card'); var row = element('div', 'config-row'); [['封禁阈值', text(config.scoreThreshold)], ['观察阈值', text(config.observationScore)], ['AI 识别', config.aiEnabled === true ? '已启用' : config.aiEnabled === false ? '未启用' : '—'], ['AI 日额度', displayValue(config.llmDaily)]].forEach(function (pair) { var span = element('span', '', pair[0]); span.append(element('strong', '', pair[1])); row.append(span); }); card.append(row); if (data.visionModel) card.append(element('div', 'subtle', '图像识别 · ' + text(data.visionModel))); container.append(grid, card); }
+    async function loadAdsPending(page) { state.adsPage = Math.max(1, Number(page) || 1); var seq = begin('ads-pending'); loading($('ads-content'), '正在读取待复核记录…'); $('ads-pager').replaceChildren(); $('ads-count').textContent = ''; try { var data = await api('ads/pending', { page: state.adsPage }); if (!current('ads-pending', seq)) return; data = data || {}; state.adsPage = Number(data.page) || state.adsPage; if (state.adsPage > Math.max(1, Number(data.totalPages) || 1)) return loadAdsPending(Math.max(1, Number(data.totalPages) || 1)); renderAdsPending(data); state.loaded.ads = true; } catch (err) { if (err.auth || !current('ads-pending', seq)) return; empty($('ads-content'), '待复核记录加载失败', err.message, function () { return loadAdsPending(state.adsPage); }); } }
+    async function loadAds() { await Promise.allSettled([loadAdsSummary(), loadAdsPending(state.adsPage)]); }
+    function renderAdsPending(data) {
+      var container = $('ads-content'); container.replaceChildren(); var items = Array.isArray(data.items) ? data.items : []; $('ads-count').textContent = count(data.total === undefined ? items.length : data.total) + ' 条记录'; if (!items.length) empty(container, '暂无待复核记录', '需要人工复核的广告记录会显示在这里。');
+      items.forEach(function (record) { var snapshot = record.snapshot || {}; var card = element('article', 'card'); var head = element('div', 'card-heading'); var identity = element('div'); identity.append(element('h3', 'card-title', text(snapshot.name, '用户 ' + text(record.userId))), element('div', 'card-subtitle mono', 'ID ' + text(record.userId) + ' · #' + text(record.seq))); var score = element('div', 'score', text(record.score)); score.append(element('small', '', '广告评分')); head.append(identity, score); card.append(head); var reasons = element('div', 'reason-list'); (Array.isArray(record.reasons) ? record.reasons : record.reasons ? [record.reasons] : []).forEach(function (reason) { reasons.append(element('span', 'badge warning', displayValue(reason))); }); if (reasons.childNodes.length) card.append(reasons); card.append(detailList([['所在群组', text(record.chatId), true], ['记录时间', date(record.createdAt)]])); var evidence = element('details', 'evidence'); evidence.append(element('summary', '', '查看识别时的资料与内容')); var pieces = []; if (snapshot.username) pieces.push('用户名：' + (String(snapshot.username).startsWith('@') ? snapshot.username : '@' + snapshot.username)); if (snapshot.bio) pieces.push('简介：' + displayValue(snapshot.bio)); if (snapshot.text) pieces.push('内容：' + displayValue(snapshot.text)); evidence.append(element('div', 'evidence-text', pieces.length ? pieces.join('\n\n') : '该记录暂无文字快照。')); card.append(evidence); var actions = element('div', 'card-actions'); actions.append(makeButton('查询用户', 'small', function () { return openUser(record.userId); }), makeButton('标为误报', 'small', function (button) { return ignoreAd(button, record); })); card.append(actions); container.append(card); });
+      pager($('ads-pager'), data, function (page) { return loadAdsPending(page); });
+    }
+    async function ignoreAd(button, record) { var confirmed = await confirmAction({ title: '将这条记录标为误报？', description: '撤销这次广告判定及其相关学习与处罚，具体结果会在处理后显示。', object: '记录 #' + text(record.seq) + '\n用户 ID ' + text(record.userId), label: '确认误报' }); if (!confirmed) return; await actionButton(button, 'ignore:' + record.seq, async function () { var result = await api('ads/ignore', { seq: record.seq }); var message = result && result.message ? result.message : '已标为误报，并完成相关记录处理。'; toast(message, result && result.complete === false ? 'error' : 'success'); var rollback = result && (result.rollback || result.results || result); if (rollback) await showResult({ title: '误报处理结果', description: formatRollback(rollback), object: '记录 #' + text(record.seq) }); state.loaded.blacklist = false; state.loaded.users = false; await loadAds(); }); }
+    function formatRollback(result) { if (Array.isArray(result)) return result.map(function (row) { var label = row.label || row.groupId || row.chatId || '处理项目'; var ok = row.ok === true || row.complete === true; var status = ok ? '已完成' : text(row.error || row.message, '未完成'); if (row.unmuted !== undefined || row.unbanned !== undefined) status += '（解除禁言' + (row.unmuted ? '成功' : '未完成') + '，解封' + (row.unbanned ? '成功' : '未完成') + '）'; if (row.affected !== undefined || row.removed !== undefined) status += ' · 已处理 ' + count(row.affected === undefined ? row.removed : row.affected) + ' 条'; return label + '：' + status; }).join('\n'); var labels = { removed: '已移除', blacklistRemoved: '移除黑名单', samplesRemoved: '移除样本', fingerprintsRemoved: '移除指纹', unbanned: '解除封禁', unbanResults: '群组解封', profileReset: '重置判定', learningRemoved: '撤销学习', error: '未完成原因', snapshotProcessed: '关闭复核记录', corrections: '撤销学习', falsePositiveRecorded: '记录误报' }; return Object.keys(labels).filter(function (key) { return result && result[key] !== undefined; }).map(function (key) { var v = result[key]; return labels[key] + '：' + (typeof v === 'boolean' ? (v ? '已完成' : '未完成') : Array.isArray(v) ? '\n' + formatRollback(v) : displayValue(v)); }).join('\n') || text(result && result.message, '处理结果已更新。'); }
+    function userEmpty() { empty($('users-content'), '按 ID 查看一个用户', '可查看已保存的资料、黑名单状态和处理时间线。'); }
+    async function openUser(id) { $('user-query').value = String(id); state.queriedUser = String(id); await navigate('users', false); return queryUser(id); }
+    async function queryUser(userId) { var id = String(userId || $('user-query').value).trim(); if (!/^\d{1,20}$/.test(id)) { toast('请输入有效的数字用户 ID。', 'error'); $('user-query').focus(); return; } state.queriedUser = id; var seq = begin('users'); setFormBusy($('user-search'), true); loading($('users-content'), '正在查询用户资料与记录…'); try { var data = await api('users/query', { userId: id }); if (!current('users', seq)) return; renderUser(data || {}, id); state.loaded.users = true; } catch (err) { if (err.auth || !current('users', seq)) return; empty($('users-content'), '用户查询失败', err.message, function () { return queryUser(id); }); } finally { if (state.generation.users === seq) setFormBusy($('user-search'), false); } }
+    function renderUser(data, requestedId) {
+      var container = $('users-content'); container.replaceChildren(); var id = text(data.userId, requestedId); var profile = data.profile || {}; var card = element('article', 'card'); var head = element('div', 'profile-top'); var name = text(profile.name || [profile.first_name, profile.last_name].filter(Boolean).join(' '), '用户 ' + id); var info = element('div', 'profile-info'); info.append(element('h2', '', name), element('div', 'mono muted', 'ID ' + id)); if (profile.username) info.append(element('div', 'card-subtitle', (String(profile.username).startsWith('@') ? '' : '@') + profile.username)); head.append(element('div', 'avatar', Array.from(name)[0]), info); card.append(head); var badges = element('div', 'profile-badges'); badges.append(element('span', 'badge ' + (data.blacklist ? 'danger' : 'accent'), data.blacklist ? '黑名单中' : '未列入黑名单')); if (!data.profile) badges.append(element('span', 'badge', '暂无保存的资料')); card.append(badges); var speech = data.speech || {}; var stats = element('div', 'speech-stats'); [['发言记录', count(speech.count)], ['首次发言', date(speech.first, true)], ['最近发言', date(speech.last, true)]].forEach(function (pair) { var cell = element('div'); cell.append(element('span', '', pair[0]), element('strong', '', pair[1])); stats.append(cell); }); card.append(stats); container.append(card);
+      var errors = data.errors || {}; if (Object.keys(errors).length) { var labels = { profile: '用户资料', blacklist: '黑名单状态', events: '处理时间线', cases: '处罚记录', speech: '发言统计' }; var notice = element('div', 'notice'); notice.append(element('div', '', '部分记录暂时无法读取')); Object.keys(errors).forEach(function (key) { if (errors[key]) notice.append(element('div', '', (labels[key] || '记录') + '：' + text(errors[key]))); }); notice.append(makeButton('重新查询', 'small quiet', function () { return queryUser(id); })); container.append(notice); if (errors.blacklist) badges.firstChild.textContent = '黑名单状态暂时未知'; }
+      if (data.blacklist) { var black = data.blacklist; var blackCard = element('article', 'card'); blackCard.append(element('h2', 'section-label', '黑名单记录'), detailList([['原因', text(black.reason)], ['备注', text(black.note)], ['操作人', text(black.by), true], ['记录时间', date(black.at || black.created_at)]])); var actions = element('div', 'card-actions'); actions.append(makeButton('解除封禁', 'small danger', async function (button) { var completed = await unban(button, Object.assign({}, black, { id: id })); if (completed && state.active === 'users' && state.queriedUser === id) await queryUser(id); })); blackCard.append(actions); container.append(blackCard); }
+      var cases = Array.isArray(data.cases) ? data.cases : []; var events = Array.isArray(data.events) ? data.events : []; renderTimeline(container, '处罚记录', cases, true); renderTimeline(container, '处理时间线', events, false);
+      if (data.gky || data.gkyError) { var gkyCard = element('article', 'card'); gkyCard.append(element('h2', 'section-label', '外部风险记录')); if (data.gkyError) gkyCard.append(element('p', 'subtle', '暂时无法查询：' + text(data.gkyError))); else { var gky = data.gky; var pairs = []; var labels = { reason: '原因', note: '备注', message: '说明', score: '风险评分', count: '记录数', found: '查询结果', first: '首次记录', last: '最近记录', ban_time: '封禁时间', ban_reason: '封禁原因', chatId: '来源群组', msgId: '消息 ID', info: '记录内容', recordedDate: '记录日期' }; if (typeof gky === 'object') { if (gky.banned !== undefined) pairs.push(['封禁状态', gky.banned ? '有封禁记录' : '无封禁记录']); Object.keys(labels).forEach(function (key) { var value = gky[key]; if (value !== null && value !== undefined && value !== '') pairs.push([labels[key], typeof value === 'boolean' ? (value ? '是' : '否') : displayValue(value)]); }); } else pairs.push(['结果', displayValue(gky)]); gkyCard.append(pairs.length ? detailList(pairs) : element('p', 'subtle', '未发现外部风险记录。')); } container.append(gkyCard); }
+    }
+    function renderTimeline(container, title, entries, isCase) {
+      var card = element('article', 'card'); var heading = element('div', 'card-heading'); heading.append(element('h2', 'section-label', title), element('span', 'counter', count(entries.length) + ' 条')); card.append(heading);
+      if (!entries.length) { card.append(element('p', 'subtle', isCase ? '暂无处罚记录。' : '暂无处理记录。')); container.append(card); return; }
+      var timeline = element('ol', 'timeline'); var labels = { ban: '封禁', unban: '解封', kick: '移出群组', mute: '禁言', unmute: '解除禁言', warn: '警告', ad: '广告判定', ad_ignore: '撤销广告判定', ignored: '已撤销', auto: '自动处理', manual: '人工处理', leave: '离开群组', join: '加入群组' };
+      entries.forEach(function (row) { if (!row || typeof row !== 'object') { var simple = element('li', 'timeline-item'); simple.append(element('div', 'timeline-title', displayValue(row))); timeline.append(simple); return; } var rawTitle = valueFrom(row, ['title', 'action', 'type', 'event', 'kind', 'event_type', 'status']); var titleText = labels[rawTitle] || text(rawTitle, isCase ? '广告判定' : '处理记录'); var seq = valueFrom(row, ['seq', 'caseId', 'case_id', 'id']); var item = element('li', 'timeline-item'); item.append(element('div', 'timeline-title', titleText + (seq !== null ? ' · #' + seq : '')), element('div', 'timeline-time', date(valueFrom(row, ['at', 'createdAt', 'created_at', 'timestamp', 'time', 'date'])))); var pieces = []; var reason = valueFrom(row, ['reasons', 'reason', 'description', 'message', 'text', 'note', 'detail']); var group = valueFrom(row, ['chatId', 'groupId', 'chat_id', 'group_id']); var by = valueFrom(row, ['by', 'operatorId', 'operator_id', 'actor_id']); if (reason && (!Array.isArray(reason) || reason.length)) pieces.push(displayValue(reason)); if (isCase && row.score !== null && row.score !== undefined) pieces.push('广告评分 ' + text(row.score)); if (group) pieces.push('群组 ' + displayValue(group)); if (by) pieces.push('操作人 ' + displayValue(by)); if (row.revoked || row.ignored || row.reverted) pieces.push('此记录已撤销'); else if (isCase && row.processed) pieces.push('处理状态：' + ({ ignored: '已标为误报', done: '已完成', banned: '已封禁', pending: '待处理', true: '已处理' }[String(row.processed)] || text(row.processed))); if (pieces.length) item.append(element('div', 'timeline-detail', pieces.join('\n'))); if (isCase && row.snapshot) { var snapshot = row.snapshot; var evidence = element('details', 'evidence'); evidence.append(element('summary', '', '查看判定时的资料与内容')); var content = []; [['姓名', snapshot.name], ['用户名', snapshot.username], ['简介', snapshot.bio], ['内容', snapshot.text]].forEach(function (pair) { if (pair[1]) content.push(pair[0] + '：' + displayValue(pair[1])); }); evidence.append(element('div', 'evidence-text', content.length ? content.join('\n\n') : '暂无文字快照。')); item.append(evidence); } timeline.append(item); }); card.append(timeline); container.append(card);
+    }
+    async function navigate(tab, load) { if (!state.authenticated) return; state.active = tab; document.querySelectorAll('[data-tab]').forEach(function (button) { var active = button.dataset.tab === tab; button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1; $('page-' + button.dataset.tab).hidden = !active; }); updateBackButton(); var heading = $('page-' + tab).querySelector('h1'); heading.focus({ preventScroll: true }); window.scrollTo({ top: 0, behavior: 'instant' }); if (load === false || state.loaded[tab]) return; if (tab === 'groups') await loadGroups(); else if (tab === 'blacklist') await loadBlacklist(state.blacklistPage); else if (tab === 'ads') await loadAds(); else if (state.queriedUser) await queryUser(state.queriedUser); else userEmpty(); }
+    async function bootstrap() {
+      if (!tg || !tg.initData) { authMessage('请从 Telegram 打开', '在机器人私聊中打开菜单，点击「群务台」即可进入。', false); return; }
+      $('auth-retry').disabled = true; $('auth-spinner').hidden = false; $('auth-title').textContent = '正在连接群务台'; $('auth-text').textContent = '正在确认管理权限…';
+      try { var data = await api('bootstrap'); data = data || {}; state.primaryOwner = data.primaryOwner === true; state.authenticated = true; var user = data.user || {}; $('identity-name').textContent = text(user.name, '用户 ' + text(user.id)); $('identity-role').textContent = state.primaryOwner ? '第一主人' : '管理员'; permissionNotice(); renderGroups(data.groups); state.loaded.groups = true; $('auth').hidden = true; $('app').hidden = false; $('nav').hidden = false; $('refresh').hidden = false; userEmpty(); await navigate(state.active); } catch (err) { if (!err.auth) authMessage('暂时无法连接', err.message, true); } finally { $('auth-retry').disabled = false; $('auth-spinner').hidden = true; }
+    }
+    $('auth-retry').addEventListener('click', bootstrap);
+    document.querySelectorAll('[data-tab]').forEach(function (button) { button.addEventListener('click', function () { navigate(button.dataset.tab).catch(function (err) { toast(err.message, 'error'); }); }); button.addEventListener('keydown', function (event) { var keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End']; if (!keys.includes(event.key)) return; event.preventDefault(); var tabs = Array.from(document.querySelectorAll('[data-tab]')); var index = tabs.indexOf(button); index = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length; tabs[index].focus(); navigate(tabs[index].dataset.tab).catch(function (err) { toast(err.message, 'error'); }); }); });
+    $('refresh').addEventListener('click', function () { actionButton($('refresh'), 'refresh', async function () { if (state.active === 'groups') await loadGroups(); else if (state.active === 'blacklist') await loadBlacklist(state.blacklistPage); else if (state.active === 'ads') await loadAds(); else if (state.queriedUser) await queryUser(state.queriedUser); else userEmpty(); }).catch(function (err) { toast(err.message, 'error'); }); });
+    $('blacklist-search').addEventListener('submit', function (event) { event.preventDefault(); loadBlacklist(1, $('blacklist-query').value).catch(function (err) { toast(err.message, 'error'); }); });
+    $('user-search').addEventListener('submit', function (event) { event.preventDefault(); queryUser($('user-query').value).catch(function (err) { toast(err.message, 'error'); }); });
+    $('add-group').addEventListener('click', function () { if (!state.primaryOwner) return; $('add-form').reset(); showDialog($('add-dialog')); $('add-chat-id').focus(); });
+    $('add-cancel').addEventListener('click', function () { if (!state.busy.has('add-group')) closeDialog($('add-dialog')); });
+    $('add-form').addEventListener('submit', async function (event) { event.preventDefault(); if (!state.primaryOwner || state.busy.has('add-group')) return; var id = $('add-chat-id').value.trim(); if (!/^-\d{5,20}$/.test(id)) { toast('请输入以负号开头的有效群组 ID。', 'error'); return; } await actionButton($('add-submit'), 'add-group', async function () { setFormBusy($('add-form'), true); try { var result = await api('groups/add', { chatId: id }); closeDialog($('add-dialog')); toast(result && result.message ? result.message : '群组已纳入治理。', result && result.complete === false ? 'error' : 'success'); await loadGroups(); } catch (err) { if (!err.auth) toast(err.message, 'error'); } finally { setFormBusy($('add-form'), false); } }); });
+    document.querySelectorAll('dialog').forEach(function (dialog) { dialog.addEventListener('cancel', function (event) { if (dialog.id === 'add-dialog' && state.busy.has('add-group')) { event.preventDefault(); return; } event.preventDefault(); closeDialog(dialog); }); dialog.addEventListener('close', function () { if (!document.querySelector('dialog[open]')) document.body.classList.remove('dialog-open'); updateBackButton(); }); dialog.addEventListener('click', function (event) { if (event.target !== dialog) return; var rect = dialog.getBoundingClientRect(); if (event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom) return; if (dialog.id === 'add-dialog' && state.busy.has('add-group')) return; closeDialog(dialog); }); });
+    theme(); if (tg) { try { tg.ready(); tg.expand(); tg.onEvent('themeChanged', theme); if (tg.BackButton) tg.BackButton.onClick(function () { var dialog = document.querySelector('dialog[open]'); if (dialog) { if (dialog.id !== 'add-dialog' || !state.busy.has('add-group')) closeDialog(dialog); } else navigate('groups').catch(function (err) { toast(err.message, 'error'); }); }); } catch (_) {} }
+    bootstrap();
+  })();
+  </script>
+</body>
+</html>`;
+}
+
+function miniAppHtmlResponse() {
+	const nonce = crypto.randomUUID().replace(/-/g, '');
+	const html = renderMiniAppHtml().replace(/<script\b/g, '<script nonce="' + nonce + '"');
+	return new Response(html, { headers: {
+		'Content-Type': 'text/html; charset=UTF-8',
+		'Cache-Control': 'no-store',
+		'X-Content-Type-Options': 'nosniff',
+		'Referrer-Policy': 'no-referrer',
+		'Content-Security-Policy': "default-src 'self'; script-src 'nonce-" + nonce + "' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+	} });
+}
+
+async function miniAppHmac(keyBytes, message) {
+	const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+	return new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message)));
+}
+
+async function validateMiniAppInitData(initData, botToken, now = Math.floor(Date.now() / 1000)) {
+	const reject = () => { throw new MiniAppError(401, 'Telegram 身份无效或已过期，请关闭后重新打开小程序'); };
+	if (typeof initData !== 'string' || !initData || initData.length > 16384 || !botToken) reject();
+	const params = new URLSearchParams(initData);
+	const seen = new Set();
+	for (const [key] of params) {
+		if (seen.has(key) || !/^[a-z_]+$/.test(key)) reject();
+		seen.add(key);
+	}
+	const hash = params.get('hash') || '';
+	if (!/^[a-f0-9]{64}$/.test(hash)) reject();
+	// bot-token HMAC 只排除 hash；signature 也参与。Ed25519 第三方校验规则不同。
+	const check = [...params.entries()].filter(([key]) => key !== 'hash')
+		.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+		.map(([key, value]) => key + '=' + value).join('\n');
+	const secret = await miniAppHmac(new TextEncoder().encode('WebAppData'), botToken);
+	const digest = await miniAppHmac(secret, check);
+	let difference = 0;
+	for (let i = 0; i < digest.length; i++) difference |= digest[i] ^ parseInt(hash.slice(i * 2, i * 2 + 2), 16);
+	if (difference !== 0) reject();
+	const dateText = params.get('auth_date') || '';
+	const date = Number(dateText);
+	if (!/^\d+$/.test(dateText) || !Number.isSafeInteger(date) || date <= 0 || date < now - 3600 || date > now + 60) reject();
+	let user;
+	try { user = JSON.parse(params.get('user') || 'null'); } catch { reject(); }
+	if (!user || typeof user !== 'object' || Array.isArray(user) || !Number.isSafeInteger(user.id) || user.id <= 0 || user.is_bot === true) reject();
+	return { userId: String(user.id), user };
+}
+
+async function readMiniAppBody(request) {
+	if (!/^application\/json(?:\s*;|\s*$)/i.test(request.headers.get('Content-Type') || '')) throw new MiniAppError(415, '请使用 JSON 请求');
+	const declaredSize = Number(request.headers.get('Content-Length') || 0);
+	if (declaredSize > MINI_APP_BODY_LIMIT) throw new MiniAppError(413, '请求内容过大');
+	const reader = request.body?.getReader();
+	if (!reader) throw new MiniAppError(400, '请求内容为空');
+	let size = 0;
+	let raw = '';
+	const decoder = new TextDecoder();
+	try {
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			size += value.byteLength;
+			if (size > MINI_APP_BODY_LIMIT) {
+				await reader.cancel();
+				throw new MiniAppError(413, '请求内容过大');
+			}
+			raw += decoder.decode(value, { stream: true });
+		}
+		raw += decoder.decode();
+	} finally { reader.releaseLock(); }
+	let body;
+	try { body = JSON.parse(raw); } catch { throw new MiniAppError(400, 'JSON 格式无效'); }
+	if (!body || typeof body !== 'object' || Array.isArray(body)) throw new MiniAppError(400, '请求参数必须为对象');
+	return body;
+}
+
+async function handleMiniAppApi(request, env, ctx, url = new URL(request.url)) {
+	try {
+		if (request.method !== 'POST') throw new MiniAppError(405, '仅支持 POST');
+		const origin = request.headers.get('Origin');
+		if (origin && origin !== url.origin) throw new MiniAppError(403, '请求来源不受支持');
+		const action = url.pathname.slice('/app/api/'.length);
+		if (!MINI_APP_ACTIONS.has(action)) throw new MiniAppError(404, '接口不存在');
+		const body = await readMiniAppBody(request);
+		const auth = await validateMiniAppInitData(body.initData, env.BOT_TOKEN);
+		const owners = loadRequiredConfig(env).OWNER_IDS;
+		auth.primaryOwner = owners.length > 0 && auth.userId === owners[0];
+		if (!auth.primaryOwner) throw new MiniAppError(403, '仅第一主人可以使用管理小程序');
+		const data = await dispatchMiniAppAction(action, body, env, auth, ctx);
+		return miniAppJson({ success: true, data });
+	} catch (error) {
+		if (error instanceof MiniAppError) return miniAppJson({ success: false, error: error.message }, error.status);
+		console.error('[Mini App] 接口失败'); // 不记录签名数据、用户资料或带 token 的异常。
+		return miniAppJson({ success: false, error: '操作暂未完成，请稍后重试' }, 503);
+	}
+}
+
+// ===== Mini App 各接口实现 =====
+// 与 / 命令共用同一批底层函数，避免两套口径：
+//   群组   → addDynamicGroup / removeDynamicGroup / leaveTelegramChat
+//   黑名单 → readD1Blacklist / removeFromBlacklist / unbanUserFromAllGroups
+//   广告   → rollbackAdPendingSnapshot（strict 模式）
+//   用户   → fetchAdUserProfile / readMemberEvents / handleBanlist
+// 每个写操作都回传 complete：只要有一处没完成就是 false，前端据此显示错误色，
+// 避免「提示成功、实际只解了一半」—— 与 /ignore 的 strict 口径完全一致。
+
+const MINI_APP_PAGE_SIZE = 20;
+const MINI_APP_AD_PAGE_SIZE = 10;
+
+function miniAppPaging(items, page, pageSize) {
+	const size = pageSize || MINI_APP_PAGE_SIZE;
+	const list = Array.isArray(items) ? items : [];
+	const total = list.length;
+	const totalPages = Math.max(1, Math.ceil(total / size));
+	const current = Math.min(Math.max(1, Number(page) || 1), totalPages);
+	const start = (current - 1) * size;
+	return { items: list.slice(start, start + size), page: current, total, totalPages };
+}
+
+// Mini App 请求在 mergeDynamicGroupsFromD1 之前就鉴权返回，运行期的群组变量可能
+// 还是上一个请求留下的快照。这里按 ENV_GROUP_IDS（applyRuntimeConfig 每请求重置的
+// 基线）重建 GROUP_IDS 的动态部分。
+// 【不能直接复用 mergeDynamicGroupsFromD1】它拿 GROUP_IDS 当基线，而 GROUP_IDS
+// 在合并之后已经包含动态群 —— 同一个请求里第二次调用会把动态群误当成环境变量群，
+// 于是页面上它们变成「预设群组」，删除和退群按钮也会跟着失效。
+async function miniAppRefreshGroups(env) {
+	const rows = await loadDynamicGroupsFromD1(env);
+	const list = Array.isArray(rows) ? rows : [];
+	const envSet = new Set(ENV_GROUP_IDS.map((id) => String(id)));
+	const extra = [];
+	for (const row of list) {
+		const id = String(row.chatId || '').trim();
+		if (!id || envSet.has(id)) continue;
+		envSet.add(id);
+		extra.push(id);
+	}
+	DYNAMIC_GROUP_IDS = extra;
+	GROUP_IDS = [...ENV_GROUP_IDS, ...extra];
+	return { rows: list, readable: Array.isArray(rows) };
+}
+
+// 群组列表：环境变量群在前（第一个是主群），动态群在后。
+// source 只用于前端上色：env = 预设群组，dynamic = 手动添加。
+// 群名：动态群库里有就直接用（/addgroup 或自动登记时存下的），环境变量群库里没有，
+// 走 10 分钟缓存的 getChat —— 拉不到就退回只显示 ID，不能因为一个群名拉不到让整页失败。
+async function miniAppGroupList(env, loaded) {
+	const source = loaded || await miniAppRefreshGroups(env);
+	const dynamicRows = source.rows;
+	const envInfos = await Promise.all(ENV_GROUP_IDS.map((id) => resolveGroupInfoCached(String(id))));
+	const list = ENV_GROUP_IDS.map((id, index) => ({
+		chatId: String(id),
+		title: String(envInfos[index]?.title || ''),
+		source: 'env',
+		primary: index === 0
+	}));
+	for (const row of dynamicRows) {
+		list.push({
+			chatId: String(row.chatId),
+			title: String(row.title || ''),
+			source: 'dynamic',
+			note: String(row.note || ''),
+			addedAt: String(row.addedAt || '')
+		});
+	}
+	return { list, readable: source.readable };
+}
+
+async function miniAppBootstrap(env, auth, loaded) {
+	const groups = await miniAppGroupList(env, loaded);
+	const user = auth?.user || {};
+	const name = [user.first_name, user.last_name].filter(Boolean).join(' ')
+		|| String(user.username || '');
+	return {
+		user: { id: auth.userId, name, username: String(user.username || '') },
+		primaryOwner: auth.primaryOwner === true,
+		groups: groups.list,
+		groupsReadable: groups.readable
+	};
+}
+
+async function miniAppAddGroup(env, payload, actorId) {
+	const id = String(payload.chatId || '').trim();
+	if (!isSupergroupChatId(id)) throw new MiniAppError(400, '群组 ID 必须是 -100 开头的超级群组 ID');
+	if (ENV_GROUP_IDS.some((g) => String(g) === id)) {
+		throw new MiniAppError(400, '该群已在 GROUP_ID 环境变量中，无需重复添加');
+	}
+	if (isDynamicGroup(id)) throw new MiniAppError(409, '该群已在动态群组列表中');
+	// 硬性前置与 /addgroup 完全一致：bot 必须已在群里且具备封禁权限，
+	// 否则加进来只会让每次全群操作都为它报一次错。
+	const botId = await getBotId();
+	if (!botId) throw new MiniAppError(503, '暂时无法获取机器人身份，请稍后重试');
+	const access = await checkPurgeGroupAccess(id, botId);
+	if (!access.ok) {
+		throw new MiniAppError(400, '无法添加该群：' + String(access.reason || '未知原因')
+			+ '。请先把机器人拉进该群、设为管理员并开启「封禁用户」权限');
+	}
+	let title = '';
+	try {
+		const info = await getChatInfoFromId(id);
+		title = String(info?.title || '').trim();
+	} catch (_) { /* 群名拿不到不阻断添加 */ }
+	const added = await addDynamicGroup(env, id, {
+		title: title || null,
+		addedBy: String(actorId || 'mini-app'),
+		note: '通过管理小程序添加'
+	});
+	if (!added.ok) throw new MiniAppError(400, added.message || '添加失败');
+	await miniAppRefreshGroups(env);
+	return {
+		chatId: id,
+		title,
+		message: '已添加治理群组' + (title ? '：' + title : ''),
+		complete: true
+	};
+}
+
+async function miniAppRemoveGroup(env, payload) {
+	const id = String(payload.chatId || '').trim();
+	if (!isSupergroupChatId(id)) throw new MiniAppError(400, '群组 ID 格式错误');
+	if (ENV_GROUP_IDS.some((g) => String(g) === id)) {
+		throw new MiniAppError(400, '该群来自 GROUP_ID 环境变量，不能在页面停止治理。请到 Cloudflare 后台修改 GROUP_ID');
+	}
+	const removed = await removeDynamicGroup(env, id);
+	if (!removed.ok) {
+		if (removed.code === 'NOT_FOUND') throw new MiniAppError(404, '该群不在动态群组列表中');
+		throw new MiniAppError(503, removed.message || '停止治理失败');
+	}
+	await miniAppRefreshGroups(env);
+	return { chatId: id, message: '已停止治理该群组，机器人仍留在群内', complete: true };
+}
+
+async function miniAppLeaveGroup(env, payload) {
+	const id = String(payload.chatId || '').trim();
+	if (!isSupergroupChatId(id)) throw new MiniAppError(400, '群组 ID 格式错误');
+	if (ENV_GROUP_IDS.some((g) => String(g) === id)) {
+		// 与群内 /delgroup 同一条理由：Worker 写不了自己的环境变量，
+		// 主群这样退掉之后没有任何入口能把它加回来。
+		throw new MiniAppError(400, '该群来自 GROUP_ID 环境变量，不能在这里退出。请先到 Cloudflare 后台修改 GROUP_ID');
+	}
+	// 顺序是死的：先删治理配置，再退群。反过来的话「已退群但仍在动态列表」，
+	// 之后每次全群操作都要为它吃一次 chat not found，而群里已经没人能补救。
+	const removed = await removeDynamicGroup(env, id);
+	await miniAppRefreshGroups(env);
+	const before = await getBotChatMembership(id);
+	if (before.ok && !before.inChat) {
+		return {
+			chatId: id,
+			message: removed.ok ? '治理已停止；机器人本就不在该群' : '机器人本就不在该群',
+			complete: true
+		};
+	}
+	const leave = await leaveTelegramChat(id);
+	if (!leave.ok) {
+		return {
+			chatId: id,
+			message: '治理已停止，但退出群组失败：' + translateLeaveChatError(leave.error),
+			complete: false
+		};
+	}
+	const after = await getBotChatMembership(id);
+	if (after.ok && !after.inChat) return { chatId: id, message: '已退出该群组', complete: true };
+	if (after.ok && after.inChat) {
+		return {
+			chatId: id,
+			message: 'Telegram 返回退出成功，但复查显示机器人仍在群内（'
+				+ formatBotChatMembershipStatus(after) + '）',
+			complete: false
+		};
+	}
+	return {
+		chatId: id,
+		message: '退出请求已发送，但无法确认最终状态：' + translateLeaveChatError(after.error),
+		complete: false
+	};
+}
+
+async function miniAppBlacklistList(env, payload) {
+	let rows;
+	try {
+		rows = await readD1Blacklist(env);
+	} catch (error) {
+		throw new MiniAppError(503, '黑名单读取失败，请稍后重试');
+	}
+	const query = String(payload.query || '').trim().slice(0, 160).toLowerCase();
+	if (query) {
+		rows = rows.filter((row) => String(row.id || '').toLowerCase().includes(query)
+			|| String(row.reason || '').toLowerCase().includes(query)
+			|| String(row.note || '').toLowerCase().includes(query));
+	}
+	// 最新在前：readD1Blacklist 按 at ASC 返回，复核时最常看的是刚封的。
+	return miniAppPaging(rows.slice().reverse(), payload.page, MINI_APP_PAGE_SIZE);
+}
+
+async function miniAppUnban(env, payload) {
+	const userId = String(payload.userId || '').trim();
+	if (!/^\d{1,20}$/.test(userId)) throw new MiniAppError(400, '用户 ID 必须是纯数字');
+	// 与 /ignore 同一顺序：先确认黑名单已清（或本就不在），再解 Telegram 封禁，
+	// 避免解完又被复入群拦截按旧记录踢回去。
+	const removed = await removeFromBlacklist(userId, env);
+	if (!removed.success && removed.code !== 'NOT_FOUND') {
+		throw new MiniAppError(503, '移除黑名单失败：' + String(removed.message || '未知错误').replace(/^❌\s*/, ''));
+	}
+	const results = await unbanUserFromAllGroups(userId, GROUP_IDS);
+	const failed = results.filter((row) => !row.ok);
+	return {
+		userId,
+		removed: removed.success === true,
+		complete: failed.length === 0,
+		message: (removed.success ? '已移除黑名单；' : '该用户本就不在黑名单；')
+			+ results.filter((row) => row.ok).length + '/' + results.length + ' 个群组已解除',
+		results: results.map((row) => ({
+			groupId: row.groupId,
+			ok: row.ok,
+			error: row.error ? toChineseErrorText(row.error, { action: 'unban' }) : null,
+			unmuted: row.unmuted === true,
+			unbanned: row.unbanned === true
+		}))
+	};
+}
+
+async function miniAppAdSummary(env) {
+	const config = loadAdDetectionConfig(env);
+	const counts = { fingerprints: 0, samples: 0, observing: 0, pending: 0 };
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		const rows = await env.DB.batch([
+			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints'),
+			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_user_screening WHERE expires_at > ?').bind(now),
+			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE expires_at > ?').bind(now)
+		]);
+		counts.fingerprints = Number(rows[0]?.results?.[0]?.c) || 0;
+		counts.observing = Number(rows[1]?.results?.[0]?.c) || 0;
+		counts.pending = Number(rows[2]?.results?.[0]?.c) || 0;
+	} catch (error) {
+		console.error('[Mini App] 广告统计查询失败:', error);
+	}
+	try {
+		const samples = await countAdSamples(env);
+		counts.samples = Number(samples?.total) || 0;
+	} catch (_) { /* 样本数拿不到就显示 0，不阻断概况 */ }
+	return {
+		counts,
+		config: {
+			scoreThreshold: config.scoreThreshold,
+			observationScore: config.observationScore,
+			aiEnabled: config.aiEnabled === true,
+			llmDaily: config.llmDaily
+		},
+		visionModel: AD_AVATAR_VISION_MODEL
+	};
+}
+
+async function miniAppAdPending(env, payload) {
+	if (!(await adDetectionReady(env))) throw new MiniAppError(503, '广告检测尚未就绪');
+	// 快照只发给第一主人：序号是 /ignore 的唯一入口，多人共用会互相抢号。
+	const ownerId = OWNER_IDS[0] || '';
+	const now = Math.floor(Date.now() / 1000);
+	const size = MINI_APP_AD_PAGE_SIZE;
+	try {
+		const totalRow = await env.DB.prepare(
+			'SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE owner_id = ? AND expires_at > ?'
+		).bind(String(ownerId), now).first();
+		const total = Number(totalRow?.c) || 0;
+		const totalPages = Math.max(1, Math.ceil(total / size));
+		const current = Math.min(Math.max(1, Number(payload.page) || 1), totalPages);
+		const res = await env.DB.prepare(
+			'SELECT seq, user_id, chat_id, score, reasons, snapshot, created_at FROM ad_pending_snapshots '
+			+ 'WHERE owner_id = ? AND expires_at > ? ORDER BY seq DESC LIMIT ? OFFSET ?'
+		).bind(String(ownerId), now, size, (current - 1) * size).all();
+		const items = (res?.results || []).map((row) => {
+			let reasons = [];
+			let snapshot = {};
+			try { reasons = JSON.parse(String(row.reasons || '[]')); } catch (_) { reasons = []; }
+			try { snapshot = JSON.parse(String(row.snapshot || '{}')); } catch (_) { snapshot = {}; }
+			return {
+				seq: Number(row.seq) || 0,
+				userId: String(row.user_id || ''),
+				chatId: String(row.chat_id || ''),
+				score: Number(row.score) || 0,
+				reasons: Array.isArray(reasons) ? reasons : [],
+				snapshot: snapshot && typeof snapshot === 'object' ? snapshot : {},
+				createdAt: Number(row.created_at) || 0
+			};
+		});
+		return { items, page: current, total, totalPages };
+	} catch (error) {
+		console.error('[Mini App] 待复核记录读取失败:', error);
+		throw new MiniAppError(503, '待复核记录读取失败，请稍后重试');
+	}
+}
+
+async function miniAppAdIgnore(env, payload) {
+	const seq = Number(payload.seq);
+	if (!Number.isSafeInteger(seq) || seq <= 0) throw new MiniAppError(400, '序号无效');
+	if (!(await adDetectionReady(env))) throw new MiniAppError(503, '广告检测尚未就绪');
+	const ownerId = OWNER_IDS[0] || '';
+	const snapshot = await readAdPendingSnapshot(env, ownerId, seq);
+	if (!snapshot) throw new MiniAppError(404, '序号 #' + seq + ' 不存在或已复核过');
+	const result = await rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, {
+		strict: true,
+		groupIds: GROUP_IDS
+	});
+	// 记反例：与 /ignore 同一条路 —— 删掉特征之外，还要告诉模型「这段话主人确认过是正常的」，
+	// 否则下次看到同类内容它还会再判一次。失败只记日志，不影响回滚结果。
+	try {
+		const snap = snapshot?.snapshot || {};
+		await addAdFalsePositive(env, String(snap.text || ''), {
+			firstName: String(snap.name || ''),
+			lastName: '',
+			username: String(snap.username || ''),
+			bio: String(snap.bio || '')
+		});
+	} catch (error) {
+		console.error('[Mini App] 误报记反例失败:', error);
+	}
+	const complete = result.complete === true;
+	const errors = Array.isArray(result.errors) ? result.errors : [];
+	return {
+		seq,
+		userId: result.targetId,
+		complete,
+		message: complete
+			? '已标为误报并完成回滚：' + String(result.unbanSummary || '')
+			: '已标为误报，但有步骤未完成：' + (errors.length ? errors.join('；') : '请刷新后查看状态'),
+		rollback: {
+			blacklistRemoved: result.removed?.success === true,
+			unbanResults: (result.unbanResults || []).map((row) => ({
+				groupId: row.groupId,
+				ok: row.ok,
+				unmuted: row.unmuted === true,
+				unbanned: row.unbanned === true,
+				error: row.error ? toChineseErrorText(row.error, { action: 'unban' }) : null
+			})),
+			unbanSummary: result.unbanSummary,
+			avatarCleared: result.avatarCleared,
+			badgeCleared: result.badgeCleared,
+			imageCleared: result.imageCleared,
+			fingerprints: result.fp,
+			samplesRemoved: result.sampleRemoved,
+			snapshotProcessed: result.snapshotProcessed === true,
+			errors
+		}
+	};
+}
+
+async function miniAppUserQuery(env, payload) {
+	const userId = String(payload.userId || '').trim();
+	if (!/^\d{1,20}$/.test(userId)) throw new MiniAppError(400, '用户 ID 必须是纯数字');
+	const errors = {};
+	const data = {
+		userId,
+		profile: null,
+		blacklist: null,
+		events: [],
+		cases: [],
+		speech: { count: 0, first: 0, last: 0 },
+		gky: null,
+		gkyError: null,
+		errors
+	};
+
+	// 资料：fetchAdUserProfile 自带 5 分钟缓存，反复点不会反复拉。
+	try {
+		const profile = await fetchAdUserProfile(userId, {});
+		data.profile = {
+			name: [profile.firstName, profile.lastName].filter(Boolean).join(' '),
+			firstName: String(profile.firstName || ''),
+			lastName: String(profile.lastName || ''),
+			username: String(profile.username || ''),
+			bio: String(profile.bio || ''),
+			bioFetched: profile.bioFetched === true
+		};
+	} catch (error) {
+		errors.profile = '读取失败';
+	}
+
+	try { data.blacklist = await readD1BlacklistEntry(env, userId); }
+	catch (error) { errors.blacklist = '读取失败'; }
+
+	try { data.events = await readMemberEvents(env, userId); }
+	catch (error) { errors.events = '读取失败'; }
+
+	// 处罚记录：与 /user 同一条 SQL。快照长期保留，expires_at = 0 表示已复核过。
+	try {
+		if (await adDetectionReady(env)) {
+			const res = await env.DB.prepare(
+				'SELECT seq, chat_id, score, reasons, snapshot, created_at, expires_at '
+				+ 'FROM ad_pending_snapshots WHERE user_id = ? ORDER BY created_at DESC LIMIT 100'
+			).bind(userId).all();
+			data.cases = (res?.results || []).map((row) => {
+				let reasons = [];
+				let snapshot = {};
+				try { reasons = JSON.parse(String(row.reasons || '[]')); } catch (_) { reasons = []; }
+				try { snapshot = JSON.parse(String(row.snapshot || '{}')); } catch (_) { snapshot = {}; }
+				return {
+					seq: Number(row.seq) || 0,
+					chatId: String(row.chat_id || ''),
+					score: Number(row.score) || 0,
+					reasons: Array.isArray(reasons) ? reasons : [],
+					snapshot: snapshot && typeof snapshot === 'object' ? snapshot : {},
+					createdAt: Number(row.created_at) || 0,
+					processed: Number(row.expires_at) === 0 ? 'ignored' : 'done'
+				};
+			});
+		}
+	} catch (error) {
+		errors.cases = '读取失败';
+	}
+
+	// 发言统计：时间来自名册（first_seen / last_seen），条数来自消息缓存。
+	// 缓存有保留期会被裁剪，所以这个数是「缓存内的条数」，不是终身发言数。
+	try {
+		const member = await readAdGroupMember(env, userId);
+		data.speech.first = Number(member?.first_seen) || 0;
+		data.speech.last = Number(member?.last_seen) || 0;
+		const row = await env.DB.prepare(
+			'SELECT COUNT(*) AS c FROM moderation_messages WHERE from_id = ?'
+		).bind(userId).first();
+		data.speech.count = Number(row?.c) || 0;
+	} catch (error) {
+		errors.speech = '读取失败';
+	}
+
+	// 外部风险库：第三方站点，慢且可能挂 —— 失败只填 gkyError，绝不影响本地结果。
+	try {
+		const raw = await handleBanlist(userId);
+		const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+		if (parsed && parsed.success === false) {
+			data.gkyError = String(parsed.error || '查询失败');
+		} else {
+			data.gky = parsed;
+		}
+	} catch (error) {
+		data.gkyError = '暂时无法连接外部风险库';
+	}
+
+	return data;
+}
+
+async function dispatchMiniAppAction(action, body, env, auth, ctx) {
+	// Mini App 在 mergeDynamicGroupsFromD1 之前就鉴权返回，运行期的群组变量可能还是
+	// 上一个请求留下的快照。这里按当前请求重建一次，与 / 命令路径吃的是同一份数据。
+	const loaded = await miniAppRefreshGroups(env);
+	const payload = body && typeof body === 'object' ? body : {};
+	switch (action) {
+		case 'bootstrap': return miniAppBootstrap(env, auth, loaded);
+		case 'groups/list': return (await miniAppGroupList(env, loaded)).list;
+		case 'groups/add': return miniAppAddGroup(env, payload, auth?.userId);
+		case 'groups/remove': return miniAppRemoveGroup(env, payload);
+		case 'groups/leave': return miniAppLeaveGroup(env, payload);
+		case 'blacklist/list': return miniAppBlacklistList(env, payload);
+		case 'blacklist/unban': return miniAppUnban(env, payload);
+		case 'ads/summary': return miniAppAdSummary(env);
+		case 'ads/pending': return miniAppAdPending(env, payload);
+		case 'ads/ignore': return miniAppAdIgnore(env, payload);
+		case 'users/query': return miniAppUserQuery(env, payload);
+		default: throw new MiniAppError(404, '接口不存在');
+	}
+}
+
+async function setMiniAppMenuButton(request) {
+	if (!OWNER_IDS.length) return { 已设置: false, 原因: '未配置 OWNER_IDS，管理小程序未启用' };
+	const appUrl = new URL('/app', request.url);
+	if (appUrl.protocol !== 'https:') return { 已设置: false, 原因: 'Telegram 小程序入口需要 HTTPS' };
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setChatMenuButton`, {
+			method: 'POST', headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: OWNER_IDS[0], menu_button: { type: 'web_app', text: '群务台', web_app: { url: appUrl.toString() } } })
+		});
+		const result = await response.json();
+		if (!response.ok || result.ok !== true) return { 已设置: false, HTTP状态码: response.status, 原因: String(result.description || 'Telegram 未确认菜单设置成功') };
+		return { 已设置: true, 入口: appUrl.toString(), 权限: '仅第一主人' };
+	} catch { return { 已设置: false, 原因: 'Telegram 菜单设置请求失败，请重新初始化' }; }
+}
+
 async function handleInitialization(request, env) {
 	try {
 		// 设置 Webhook
@@ -911,9 +1707,11 @@ async function handleInitialization(request, env) {
 		});
 
 		if (commandsResponse.ok) {
+			const miniAppMenu = await setMiniAppMenuButton(request);
+			const miniAppMenuFailed = OWNER_IDS.length > 0 && !miniAppMenu.已设置;
 			return beautifyJsonResponse(request, {
-				成功: true,
-				消息: 'Webhook 和命令设置成功',
+				成功: !miniAppMenuFailed,
+				消息: miniAppMenuFailed ? 'Webhook 和命令已设置，小程序菜单设置失败，请重试初始化' : 'Webhook、命令和管理入口设置完成',
 				Webhook: {
 					已设置: true,
 					目标地址: webhookUrl.toString(),
@@ -922,8 +1720,9 @@ async function handleInitialization(request, env) {
 				命令: {
 					已设置: true
 				},
-				管理员同步: adminSync
-			});
+				管理员同步: adminSync,
+				MiniApp: miniAppMenu
+			}, miniAppMenuFailed ? 500 : 200);
 		} else {
 			const result = await commandsResponse.json();
 			return beautifyJsonResponse(request, {
@@ -1967,9 +2766,9 @@ async function banUserFromAllGroups(userId, options = {}) {
 // 所以每个群固定两步：先 restrictChatMember 恢复发言，再 unbanChatMember 解除封禁。
 // 顺序固定「先恢复发言、后解除封禁」，两者终态等价（群成员 + 默认权限），
 // 对「本就不存在的状态」（没被禁言的人 / 没被封的人）报错即吞掉 —— 至少一步成功就算该群成功。
-async function unbanUserFromAllGroups(userId) {
+async function unbanUserFromAllGroups(userId, groupIds = GROUP_IDS) {
 	const results = [];
-	for (const groupId of GROUP_IDS) {
+	for (const groupId of groupIds) {
 		let restrictOk = false;
 		let restrictError = null;
 		let unbanOk = false;
@@ -15283,9 +16082,12 @@ async function confirmAdLinkOnBan(env, evaluation) {
 
 // /ignore 纠错：被误封的人挂的那个频道不能继续挂着「已确认广告位」，
 // 否则下一个人挂同款照样 +3 —— 与头像 / 会员标 / 正文图片的纠错完全同一理由。
-async function clearAdLinkConfirmedOnIgnore(env, handles) {
+async function clearAdLinkConfirmedOnIgnore(env, handles, options = {}) {
 	if (!env?.DB || !Array.isArray(handles) || !handles.length) return 0;
-	if (!(await ensureAdLinkCacheTable(env))) return 0;
+	if (!(await ensureAdLinkCacheTable(env))) {
+		if (options.strict) throw new MiniAppError(503, '链接纠错存储未就绪，待复核记录已保留');
+		return 0;
+	}
 	let cleared = 0;
 	for (const handle of handles) {
 		const key = String(handle || '').toLowerCase();
@@ -15296,6 +16098,7 @@ async function clearAdLinkConfirmedOnIgnore(env, handles) {
 			).bind(key).run();
 			if (Number(result?.meta?.changes || 0) > 0) cleared += 1;
 		} catch (error) {
+			if (options.strict) throw new MiniAppError(503, '链接纠错未完成，待复核记录已保留，请刷新后重试');
 			console.error('[广告检测·链接] 撤销案底失败 handle=' + key + ':', error?.message || error);
 		}
 	}
@@ -23972,19 +24775,27 @@ async function handleAdPendingCommand(env, chatId, ownerId, arg) {
 
 // 单条误判回滚：移出黑名单 → 全群解封 → 指纹记误报并即删 → 删掉对应 AI 样本 → 标记快照已复核。
 // 抽出来给 /ignore 的单条与批量两种用法共用，保证两条路径的副作用完全一致。
-async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
+async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, options = {}) {
 	const targetId = snapshot.userId;
 	const removed = await removeFromBlacklist(targetId, env);
 	// 必须先确认黑名单已清（或本就不在），再解 Telegram 封禁，避免解完又被兜底拦截重新踢掉。
 	let unbanSummary = '未执行';
+	let unbanResults = [];
+	if (options.strict && !removed.success && removed.code !== 'NOT_FOUND') {
+		return { targetId, removed, unbanSummary, unbanResults, snapshotProcessed: false, complete: false, errors: ['移除黑名单失败，未执行解封和学习纠错，待复核记录已保留'] };
+	}
 	if (removed.success || removed.code === 'NOT_FOUND') {
-		const results = await unbanUserFromAllGroups(targetId);
+		const results = await unbanUserFromAllGroups(targetId, options.groupIds || GROUP_IDS);
+		unbanResults = results;
 		const okCount = results.filter((r) => r.ok).length;
 		unbanSummary = okCount + '/' + results.length + ' 个群成功';
 		const failed = results.filter((r) => !r.ok);
 		if (failed.length) {
 			unbanSummary += '；失败群：' + failed.slice(0, 3).map((r) => r.groupId + '（' + toChineseErrorText(r.error || '未知', { action: 'unban' }) + '）').join('、');
 		}
+	}
+	if (options.strict && unbanResults.some((r) => !r.unbanned || !r.unmuted)) {
+		return { targetId, removed, unbanSummary, unbanResults, snapshotProcessed: false, complete: false, errors: ['部分群组解除禁言或封禁失败，待复核记录已保留，尚未执行学习纠错'] };
 	}
 
 	const payload = adPayloadFromSnapshot(snapshot);
@@ -24014,7 +24825,7 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	// 这个号既然是误封，他挂的那个频道就不能继续挂着「已确认广告位」，否则
 	// 下一个人挂同款照样 +3，连坐持续到缓存被自然覆盖为止。
 	// 老快照没有 scoredLinks 字段 → 空数组 → 循环不执行，与加它之前逐字节一致。
-	const linkConfirmedCleared = await clearAdLinkConfirmedOnIgnore(env, payload?.scoredLinks);
+	const linkConfirmedCleared = await clearAdLinkConfirmedOnIgnore(env, payload?.scoredLinks, options);
 	// purge: true —— 主人已明确说这是误判，命中的指纹当次即删，不再攒 3 次误报。
 	// 同批改动拆掉了自动学习的强动词闸门，指纹写入变宽，纠错端必须同步变快。
 	const fp = await markAdFingerprintFalsePositive(env, payload, { purge: true });
@@ -24026,9 +24837,23 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	// 于是指纹删了、号解封了，错样本却永久留在 AI 样本库里继续误伤相似的正常用户，
 	// 而 AI 层是硬命中即封、不看豁免词也不看总分的，一条错样本比一条错指纹更危险。
 	const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
-	await deleteAdScreening(env, targetId);
-	await deleteAdPendingSnapshot(env, ownerId, seq);
-	return { targetId, removed, unbanSummary, fp, sampleRemoved, avatarCleared, badgeCleared, bodyEmojiCleared, imageCleared, linkConfirmedCleared, shapeCleared };
+	const errors = [];
+	if (options.strict) {
+		if (payload?.avatarId && !avatarCleared) errors.push('头像纠错失败');
+		if (payload?.badgeId && !badgeCleared) errors.push('会员标纠错失败');
+		if (bodyEmojiCleared.some((ok) => !ok)) errors.push('自定义表情纠错失败');
+		if (payload?.imageId && !imageCleared) errors.push('图片纠错失败');
+		if (!fp?.ok) errors.push('指纹纠错失败');
+		if (payload?.profileShape && !shapeCleared?.ok) errors.push('资料形状纠错失败');
+		if (!sampleRemoved?.ok && sampleRemoved?.reason !== 'too_short') errors.push('语义样本纠错失败');
+		if (!errors.length) {
+			try { await env.DB.prepare('DELETE FROM ad_user_screening WHERE user_id = ?').bind(String(targetId)).run(); }
+			catch { errors.push('观察记录清理失败'); }
+		}
+	} else { await deleteAdScreening(env, targetId); }
+	const snapshotProcessed = !errors.length && await deleteAdPendingSnapshot(env, ownerId, seq);
+	if (options.strict && !snapshotProcessed && !errors.length) errors.push('待复核记录状态更新失败');
+	return { targetId, removed, unbanSummary, unbanResults, snapshotProcessed, complete: errors.length === 0 && snapshotProcessed, errors, fp, sampleRemoved, avatarCleared, badgeCleared, bodyEmojiCleared, imageCleared, linkConfirmedCleared, shapeCleared };
 }
 
 // /ignore 单次最多处理多少个序号。
