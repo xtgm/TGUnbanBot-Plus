@@ -1215,7 +1215,7 @@ function renderMiniAppHtml() {
     </header>
     <div id="auth" class="auth-wrap"><div class="auth-card"><div class="brand-mark" aria-hidden="true">群</div><h1 id="auth-title">正在连接群务台</h1><p id="auth-text">正在确认管理权限…</p><div id="auth-spinner" class="loading"><span class="spinner" aria-hidden="true"></span></div><button id="auth-retry" class="button primary" type="button" hidden>重新连接</button></div></div>
     <div id="app" hidden>
-      <div class="identity"><span class="identity-dot" aria-hidden="true"></span><span id="identity-name" class="identity-name"></span><span class="subtle">已连接</span><span id="identity-role" class="identity-role"></span></div>
+      <div class="identity"><span class="identity-dot" aria-hidden="true"></span><span id="identity-name" class="identity-name"></span><span class="subtle">已连接</span><span id="identity-role" class="identity-role"></span><button id="killer-entry" class="button small quiet" type="button" hidden>杀手后台</button></div>
       <main id="main">
         <section id="page-groups" class="page" role="tabpanel" aria-labelledby="tab-groups">
           <div class="page-head"><div class="page-head-text"><div class="eyebrow">01 / GOVERNANCE</div><h1 class="page-title" tabindex="-1">群组管理</h1><p class="description">查看治理范围，管理机器人所在群组。</p></div><button id="add-group" class="button primary" type="button">＋ 添加</button></div>
@@ -1535,7 +1535,7 @@ function renderMiniAppHtml() {
     async function bootstrap() {
       if (!tg || !tg.initData) { authMessage('请从 Telegram 打开', '在机器人私聊中打开菜单，点击「群务台」即可进入。', false); return; }
       $('auth-retry').disabled = true; $('auth-spinner').hidden = false; $('auth-title').textContent = '正在连接群务台'; $('auth-text').textContent = '正在确认管理权限…';
-      try { var data = await api('bootstrap'); data = data || {}; if (data.role === 'killer' && data.redirect) { location.replace(data.redirect + location.search + location.hash); return; } state.primaryOwner = data.primaryOwner === true; state.authenticated = true; var user = data.user || {}; $('identity-name').textContent = text(user.name, '用户 ' + text(user.id)); $('identity-role').textContent = state.primaryOwner ? '第一主人' : '管理员'; permissionNotice(); renderGroups(data.groups); state.loaded.groups = true; $('auth').hidden = true; $('app').hidden = false; $('nav').hidden = false; $('refresh').hidden = false; updateFullscreenButton(); autoFullscreen(); userEmpty(); await navigate(state.active); } catch (err) { if (!err.auth) authMessage('暂时无法连接', err.message, true); } finally { $('auth-retry').disabled = false; $('auth-spinner').hidden = true; }
+      try { var data = await api('bootstrap'); data = data || {}; if (data.role === 'killer' && data.redirect) { location.replace(data.redirect + location.search + location.hash); return; } state.primaryOwner = data.primaryOwner === true; state.authenticated = true; var user = data.user || {}; $('identity-name').textContent = text(user.name, '用户 ' + text(user.id)); $('identity-role').textContent = state.primaryOwner ? '第一主人' : '管理员'; $('killer-entry').hidden = data.killerEntry !== true; $('killer-entry').onclick = function () { location.assign('/app/killer' + location.search + location.hash); }; permissionNotice(); renderGroups(data.groups); state.loaded.groups = true; $('auth').hidden = true; $('app').hidden = false; $('nav').hidden = false; $('refresh').hidden = false; updateFullscreenButton(); autoFullscreen(); userEmpty(); await navigate(state.active); } catch (err) { if (!err.auth) authMessage('暂时无法连接', err.message, true); } finally { $('auth-retry').disabled = false; $('auth-spinner').hidden = true; }
     }
     $('auth-retry').addEventListener('click', bootstrap);
     document.querySelectorAll('[data-tab]').forEach(function (button) { button.addEventListener('click', function () { navigate(button.dataset.tab).catch(function (err) { toast(err.message, 'error'); }); }); button.addEventListener('keydown', function (event) { var keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End']; if (!keys.includes(event.key)) return; event.preventDefault(); var tabs = Array.from(document.querySelectorAll('[data-tab]')); var index = tabs.indexOf(button); index = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length; tabs[index].focus(); navigate(tabs[index].dataset.tab).catch(function (err) { toast(err.message, 'error'); }); }); });
@@ -1600,13 +1600,14 @@ const KILLER_MINI_APP_HTML_BODY = String.raw`<body>
     <header class="masthead">
       <div class="brand"><span class="brand-mark" aria-hidden="true">杀</span><div><div class="brand-title">杀手后台</div><div class="brand-subtitle">KILLER GROUPS ONLY</div></div></div>
       <div class="masthead-actions">
+        <button id="back-main" class="button small quiet" type="button" hidden>返回群务台</button>
         <button id="refresh" class="icon-button" type="button" aria-label="刷新当前页面" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></svg></button>
       </div>
     </header>
     <div id="auth" class="auth-wrap"><div class="auth-card"><div class="brand-mark" aria-hidden="true">杀</div><h1 id="auth-title">正在连接杀手后台</h1><p id="auth-text">正在确认权限…</p><div id="auth-spinner" class="loading"><span class="spinner" aria-hidden="true"></span></div><button id="auth-retry" class="button primary" type="button" hidden>重新连接</button></div></div>
     <div id="app" hidden>
-      <div class="identity"><span class="identity-dot" aria-hidden="true"></span><span id="identity-name" class="identity-name"></span><span class="subtle">已连接</span><span class="identity-role">杀手权限</span></div>
-      <p class="notice">这里的所有操作只作用于杀手群，碰不到其他群；封禁、解封、通知都会抄送第一主人。</p>
+      <div class="identity"><span class="identity-dot" aria-hidden="true"></span><span id="identity-name" class="identity-name"></span><span class="subtle">已连接</span><span id="identity-role" class="identity-role"></span></div>
+      <p id="scope-notice" class="notice">这里的所有操作只作用于杀手群，碰不到其他群；封禁、解封、通知都会抄送第一主人。</p>
       <main id="main">
         <section id="page-groups" class="page" role="tabpanel" aria-labelledby="tab-groups">
           <div class="page-head"><div class="page-head-text"><div class="eyebrow">01 / GROUPS</div><h1 class="page-title" tabindex="-1">杀手群</h1><p class="description">你能管理的全部群组，以及机器人在每个群的权限。</p></div></div>
@@ -1826,7 +1827,7 @@ const KILLER_MINI_APP_HTML_SCRIPT = String.raw`  <script>
     async function bootstrap() {
       if (!tg || !tg.initData) { authMessage('请从 Telegram 打开', '在机器人私聊中点菜单「杀手后台」进入。', false); return; }
       $('auth-retry').disabled = true; $('auth-spinner').hidden = false;
-      try { var data = await api('bootstrap'); data = data || {}; state.authenticated = true; state.groups = Array.isArray(data.groups) ? data.groups : []; state.banLimit = Number(data.banLimit) || 50; $('ban-hint').textContent = '一次最多 ' + state.banLimit + ' 个；超过 19 个会转成批量任务，完成后私聊通知你。手动封禁一律踢出，不学习广告特征。'; var user = data.user || {}; $('identity-name').textContent = text(user.name, '用户 ' + text(user.id)); renderGroups(); state.loaded.groups = true; $('auth').hidden = true; $('app').hidden = false; $('nav').hidden = false; $('refresh').hidden = false; userEmpty(); await navigate('groups'); } catch (err) { if (!err.auth) authMessage('暂时无法连接', err.message, true); } finally { $('auth-retry').disabled = false; $('auth-spinner').hidden = true; }
+      try { var data = await api('bootstrap'); data = data || {}; state.authenticated = true; state.groups = Array.isArray(data.groups) ? data.groups : []; state.banLimit = Number(data.banLimit) || 50; $('ban-hint').textContent = '一次最多 ' + state.banLimit + ' 个；超过 19 个会转成批量任务，完成后私聊通知你。手动封禁一律踢出，不学习广告特征。'; var user = data.user || {}; $('identity-name').textContent = text(user.name, '用户 ' + text(user.id)); var owner = data.role === 'owner'; $('identity-role').textContent = owner ? '第一主人' : '杀手权限'; $('back-main').hidden = !owner; $('back-main').onclick = function () { location.assign('/app' + location.search + location.hash); }; $('scope-notice').textContent = owner ? '这里的所有操作只作用于杀手群，碰不到其他群；你本人操作不抄送给自己。' : '这里的所有操作只作用于杀手群，碰不到其他群；封禁、解封、通知都会抄送第一主人。'; renderGroups(); state.loaded.groups = true; $('auth').hidden = true; $('app').hidden = false; $('nav').hidden = false; $('refresh').hidden = false; userEmpty(); await navigate('groups'); } catch (err) { if (!err.auth) authMessage('暂时无法连接', err.message, true); } finally { $('auth-retry').disabled = false; $('auth-spinner').hidden = true; }
     }
     $('auth-retry').addEventListener('click', bootstrap);
     document.querySelectorAll('[data-tab]').forEach(function (button) { button.addEventListener('click', function () { navigate(button.dataset.tab).catch(function (err) { toast(err.message, 'error'); }); }); });
@@ -1938,7 +1939,10 @@ async function handleMiniAppApi(request, env, ctx, url = new URL(request.url)) {
 		auth.killer = !auth.primaryOwner && (config.KILLER_ADMIN_IDS || []).includes(auth.userId)
 			&& (config.KILLER_MODE_GROUPS || []).length > 0;
 		if (!auth.primaryOwner && !auth.killer) throw new MiniAppError(403, '仅第一主人可以使用管理小程序');
-		const data = auth.killer
+		// 第一主人也能进杀手后台（主后台「杀手后台」按钮）。身份仍是 primaryOwner：
+		// 范围照样只有杀手群，但操作人显示为第一主人、不抄送给他自己。
+		const killerDispatch = auth.killer || (auth.primaryOwner && KILLER_MINI_APP_ACTIONS.has(action));
+		const data = killerDispatch
 			? await dispatchKillerMiniAppAction(action, body, env, auth, ctx)
 			: await dispatchMiniAppAction(action, body, env, auth, ctx);
 		return miniAppJson({ success: true, data });
@@ -2027,6 +2031,8 @@ async function miniAppBootstrap(env, auth, loaded) {
 	return {
 		user: { id: auth.userId, name, username: String(user.username || '') },
 		primaryOwner: auth.primaryOwner === true,
+		// 主后台给第一主人一个进杀手后台的入口；没配杀手群就整个不显示。
+		killerEntry: KILLER_MODE_GROUPS.length > 0,
 		groups: groups.list,
 		groupsReadable: groups.readable
 	};
@@ -2601,6 +2607,8 @@ function killerMiniAppOperator(auth) {
 }
 
 async function notifyOwnerOfKillerMiniApp(auth, detailText) {
+	// 第一主人自己做的就是主人操作，抄送给他本人没有意义。
+	if (auth?.primaryOwner) return;
 	await notifyPrimaryOwnerOfKillerAction(null, detailText, killerMiniAppOperator(auth), '杀手子后台');
 }
 
@@ -2842,7 +2850,8 @@ async function dispatchKillerMiniAppAction(action, body, env, auth, ctx) {
 		case 'killer/bootstrap': {
 			const user = auth?.user || {};
 			return {
-				role: 'killer',
+				// 第一主人与杀手权限共用同一个后台，身份在本页顶部区分开。
+				role: auth.primaryOwner ? 'owner' : 'killer',
 				user: { id: auth.userId, name: [user.first_name, user.last_name].filter(Boolean).join(' ') || String(user.username || ''), username: String(user.username || '') },
 				groups: await killerMiniAppGroups(),
 				banLimit: BATCH_LIMIT

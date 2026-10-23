@@ -136,7 +136,7 @@ log('\n=== 2. 身份分流 ===');
 	r = await api(NOBODY, 'killer/bootstrap');
 	check('无权限的人调杀手接口 → 403', r.status === 403, r.status);
 	r = await api(OWNER, 'killer/blacklist/ban', { userIds: '55600' });
-	check('第一主人走主后台分发，杀手接口不会替他执行', r.json?.success !== true && !inKillerBl('55600'), JSON.stringify(r.json));
+	check('第一主人调杀手接口 → 走杀手分发并执行', r.status === 200 && r.data?.complete === true && inKillerBl('55600'), JSON.stringify(r.json));
 }
 
 log('\n=== 3. 范围钉死：传 GROUP_ID 群一律 403 ===');
@@ -268,6 +268,46 @@ log('\n=== 11. 菜单按钮：只给非主人的杀手权限持有者 ===');
 	check('两个杀手权限都设置了', r.已设置 === 2 && targets.includes(KA) && targets.includes(KS), JSON.stringify(r));
 	check('菜单指向 /app、文字是杀手后台', callsOf('setChatMenuButton').every((c) => c.body?.menu_button?.web_app?.url === 'https://bot.example/app' && c.body?.menu_button?.text === '杀手后台'));
 	check('越界：没碰主人的菜单', !targets.includes(OWNER));
+}
+
+log('\n=== 12. 第一主人进杀手后台：同一个后台、身份区分 ===');
+{
+	let b = await api(OWNER, 'bootstrap');
+	check('主后台 bootstrap 给主人杀手入口', b.data?.killerEntry === true, JSON.stringify(b.data && { killerEntry: b.data.killerEntry }));
+	const html = await (await handler.fetch(new Request('https://bot.example/app/killer'), env, ctx)).text();
+	check('杀手后台有「返回群务台」按钮', html.includes('id="back-main"'));
+	let r = await api(OWNER, 'killer/bootstrap');
+	check('主人进杀手后台身份是 owner', r.status === 200 && r.data?.role === 'owner', JSON.stringify(r.json));
+	check('主人的群组范围与杀手权限一致', JSON.stringify((r.data?.groups || []).map((g) => g.chatId)) === JSON.stringify([K]), JSON.stringify(r.data?.groups));
+
+	reset();
+	const before = learnTotal();
+	r = await api(OWNER, 'killer/blacklist/ban', { userIds: '55611', note: '主人操作' });
+	check('主人封禁成功', r.status === 200 && r.data?.complete === true, JSON.stringify(r.json));
+	check('只踢杀手群', bannedIn(K, '55611') && !touched(G));
+	check('记进杀手黑名单', inKillerBl('55611'));
+	check('操作人记为主人自己的 ID', env.DB.query("SELECT by_user FROM killer_blacklist WHERE id = '55611'")[0]?.by_user === OWNER, JSON.stringify(env.DB.query("SELECT by_user FROM killer_blacklist WHERE id = '55611'")));
+	check('主人操作不抄送给自己', !sentTo(OWNER), sentTo(OWNER).slice(0, 200));
+	check('主人操作也不学习特征', learnTotal() === before);
+	reset();
+	r = await api(OWNER, 'killer/blacklist/unban', { userIds: '55611' });
+	check('主人解封成功', r.status === 200 && r.data?.complete === true, JSON.stringify(r.json));
+	check('解封也不抄送给自己', !sentTo(OWNER), sentTo(OWNER).slice(0, 200));
+
+	reset();
+	r = await api(OWNER, 'killer/blacklist/ban', { userIds: Array.from({ length: 20 }, (_, i) => String(58000 + i)).join(' ') });
+	check('主人超预算同样转批量任务', r.status === 200 && r.data?.queued === true, JSON.stringify(r.json).slice(0, 200));
+	check('主人的批量任务也不抄送自己', !sentTo(OWNER), sentTo(OWNER).slice(0, 200));
+
+	reset();
+	r = await api(OWNER, 'killer/blacklist/ban', { userIds: KA });
+	check('主人在杀手后台也封不了杀手权限持有者', r.status === 400 && !inKillerBl(KA), r.status + ' ' + JSON.stringify(r.json));
+	r = await api(OWNER, 'killer/stats', { chatId: G });
+	check('主人查 GROUP_ID 群统计 → 403', r.status === 403, r.status);
+	const main = await api(OWNER, 'groups/list');
+	check('主人主后台功能不受影响', main.status === 200 && Array.isArray(main.data), main.status);
+	const k = await api(KA, 'groups/list');
+	check('杀手权限仍然进不了主后台', k.status === 403, k.status);
 }
 
 log('\n' + (fail ? '❌' : '✅') + ' 杀手子后台：' + pass + ' 通过，' + fail + ' 失败');
