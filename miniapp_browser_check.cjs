@@ -63,7 +63,7 @@ async function run() {
   try {
     const context=await browser.newContext({viewport:{width:390,height:844},deviceScaleFactor:1,isMobile:true,hasTouch:true});
     await context.route('**/*',fixture);
-    await context.addInitScript(()=>{window.Telegram={WebApp:{initData:'mock-telegram-signed-data',colorScheme:'light',ready(){},expand(){},onEvent(){},BackButton:{show(){},hide(){},onClick(){}}}};});
+    await context.addInitScript(()=>{window.Telegram={WebApp:{initData:'mock-telegram-signed-data',colorScheme:'light',isFullscreen:false,handlers:{},ready(){},expand(){},onEvent(type,cb){this.handlers[type]=cb;},requestFullscreen(){this.isFullscreen=true;if(this.handlers.fullscreenChanged)this.handlers.fullscreenChanged();},exitFullscreen(){this.isFullscreen=false;if(this.handlers.fullscreenChanged)this.handlers.fullscreenChanged();},BackButton:{show(){},hide(){},onClick(){}}}};});
     const page=await context.newPage();
     page.on('pageerror',error=>errors.push(error.message));
     await page.goto('https://miniapp.test/app');
@@ -71,6 +71,15 @@ async function run() {
     assert.equal(await page.locator('#groups-content .card').count(),2);
     assert.equal(await page.locator('#groups-content img').count(),0);
     await page.screenshot({path:'miniapp_groups_light.png',fullPage:true});
+    // 全屏按钮：点一次进全屏、再点一次退出，图标随状态切换（data-full 由事件驱动）
+    assert.equal(await page.locator('#fullscreen').isVisible(),true,'Fullscreen button should be visible');
+    assert.equal(await page.locator('#fullscreen').getAttribute('data-full'),'0');
+    await page.locator('#fullscreen').click();
+    await page.waitForFunction(()=>document.getElementById('fullscreen').dataset.full==='1');
+    assert.equal(await page.evaluate(()=>window.Telegram.WebApp.isFullscreen),true,'Click should enter fullscreen');
+    await page.locator('#fullscreen').click();
+    await page.waitForFunction(()=>document.getElementById('fullscreen').dataset.full==='0');
+    assert.equal(await page.evaluate(()=>window.Telegram.WebApp.isFullscreen),false,'Second click should exit fullscreen');
     await page.locator('#refresh').click();
     await page.waitForSelector('#refresh:not([disabled])');
     assert.equal(await page.locator('#refresh svg').count(),1,'Refresh icon lost');
@@ -147,6 +156,20 @@ async function run() {
     assert.equal(noAuthRequests,0);
     assert.equal(await noAuthPage.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth),false,'Overflow on 320px');
     await noAuth.close();
+    // 宽屏自适应：1280px 下群组铺成三列，且不横向溢出
+    const wide = await browser.newContext({viewport:{width:1280,height:900}});
+    await wide.route('**/*',fixture);
+    await wide.addInitScript(()=>{window.Telegram={WebApp:{initData:'mock-telegram-signed-data',colorScheme:'light',isFullscreen:false,handlers:{},ready(){},expand(){},onEvent(type,cb){this.handlers[type]=cb;},requestFullscreen(){this.isFullscreen=true;if(this.handlers.fullscreenChanged)this.handlers.fullscreenChanged();},exitFullscreen(){this.isFullscreen=false;if(this.handlers.fullscreenChanged)this.handlers.fullscreenChanged();},BackButton:{show(){},hide(){},onClick(){}}}};});
+    const widePage = await wide.newPage();
+    widePage.on('pageerror',error=>errors.push(error.message));
+    await widePage.goto('https://miniapp.test/app');
+    await widePage.waitForSelector('#app:not([hidden])');
+    const columns = await widePage.evaluate(()=>getComputedStyle(document.getElementById('groups-content')).gridTemplateColumns.split(' ').length);
+    assert.equal(columns,3,'Wide screen should lay groups out in 3 columns');
+    assert.equal(await widePage.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth),false,'Overflow on 1280px');
+    await widePage.waitForTimeout(350);
+    await widePage.screenshot({path:'miniapp_wide_light.png',fullPage:true});
+    await wide.close();
     assert.deepEqual(errors,[]);
     console.log(JSON.stringify({passed:true,apiCalls:calls.length,actions:[...new Set(calls.map(row=>row.action))],mobile:'390x844 and 320x640',themes:'light/dark',xss:'text only',network:'fully mocked',errors}));
   } finally {await browser.close();}
