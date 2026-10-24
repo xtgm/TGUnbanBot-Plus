@@ -67,6 +67,11 @@ function killerData(action, body) {
 			: { kind: 'leave', rows: [{ userId: '998', kind: 'kicked', at: 1780000000, displayName: '被移出乙' }], total: 1, page: 1, totalPages: 1 };
 		case 'search': return { page: 1, total: 1, totalPages: 1, rows: searchRows };
 		case 'users/query': return userData(body.userId);
+		case 'blacklist/list': return { items: [{ id: '55601', reason: '手动封禁', note: '', by: '10001', at: '2026-10-24T00:00:00Z' }], total: 1, page: 1, totalPages: 1 };
+		case 'blacklist/ban': return String(body.userIds).includes('55609')
+			? { complete: false, users: [{ userId: '55609', existed: true, ok: 0, total: 1, results: [{ groupId: '-1001111111111', ok: false, error: '机器人没有封禁权限' }] }], failed: [], skipped: ['10001'], invalid: ['abc'], scope: 1, note: '', message: '已处理 1 人，跳过 1 个受保护账号' }
+			: { complete: true, users: [{ userId: '55601', existed: false, ok: 1, total: 1, results: [{ groupId: '-1001111111111', ok: true, error: null }] }], failed: [], skipped: [], invalid: [], scope: 1, note: body.note, message: '已处理 1 人' };
+		case 'blacklist/unban': return { complete: true, users: [{ userId: '55601', removed: true, ok: 1, total: 1, results: [{ groupId: '-1001111111111', ok: true, error: null }] }], blocked: [], failed: [], invalid: [], scope: 1, message: '已解封 1 人' };
 		default: throw new Error('未 mock 的杀手后台接口 ' + action);
 	}
 }
@@ -305,8 +310,43 @@ async function run() {
 			check('键盘 Enter 点结果 → 查发言人 123456789', await waitText(kp, 'users-content', 'ID 123456789'));
 		}
 
+		console.info('\n[杀手后台] 封禁 / 解封每次都给完整结果');
+		const closeResult = async () => { if (await kp.locator('#confirm-dialog[open]').count()) await kp.locator('#confirm-submit').click(); await kp.waitForTimeout(150); };
+		const dialogText = () => kp.evaluate(() => ({ open: !!document.querySelector('#confirm-dialog[open]'), title: document.getElementById('confirm-title').textContent, body: document.getElementById('confirm-description').textContent, cancelHidden: document.getElementById('confirm-cancel').hidden }));
+		await kp.locator('#tab-blacklist').click();
+		await waitText(kp, 'blacklist-content', 'ID 55601');
+		await kp.locator('#ban-ids').fill('55601');
+		await kp.locator('#ban-note').fill('发广告');
+		await kp.locator('#ban-form button[type=submit]').click();
+		await kp.locator('#confirm-submit').click();
+		check('全部成功也弹结果窗「封禁完成」', await waitText(kp, 'confirm-title', '封禁完成'));
+		let d = await dialogText();
+		check('结果窗只有「知道了」', d.open && d.cancelHidden, JSON.stringify(d));
+		check('结果写明作用范围与原因', d.body.includes('作用范围：1 个杀手群') && d.body.includes('原因：发广告'), d.body);
+		check('结果逐人写踢出 x/y', d.body.includes('55601：踢出 1/1'), d.body);
+		check('结果逐群列出成功的群（群名 + ID）', d.body.includes('✓ 示例群 A · -1001111111111'), d.body);
+		await closeResult();
+
+		await kp.locator('#ban-ids').fill('55609 10001 abc');
+		await kp.locator('#ban-form button[type=submit]').click();
+		await kp.locator('#confirm-submit').click();
+		check('部分失败弹「封禁部分未完成」', await waitText(kp, 'confirm-title', '封禁部分未完成'));
+		d = await dialogText();
+		check('失败的群带原因', d.body.includes('✗ 示例群 A · -1001111111111 — 机器人没有封禁权限'), d.body);
+		check('原本已在黑名单的要标出', d.body.includes('55609：踢出 0/1（原本已在杀手黑名单）'), d.body);
+		check('跳过与格式错误都列出', d.body.includes('跳过（主人 / 杀手权限）：10001') && d.body.includes('格式不对已忽略：abc'), d.body);
+		await closeResult();
+
+		await waitText(kp, 'blacklist-content', 'ID 55601');
+		await kp.locator('#blacklist-content .card-actions button', { hasText: '解除封禁' }).first().click();
+		await kp.locator('#confirm-submit').click();
+		check('解封全部成功也弹「解封完成」', await waitText(kp, 'confirm-title', '解封完成'));
+		d = await dialogText();
+		check('解封结果逐人逐群列出', d.body.includes('55601：解封 1/1（已移出杀手黑名单）') && d.body.includes('✓ 示例群 A · -1001111111111'), d.body);
+		await closeResult();
+
 		check('全程无页面脚本错误', errors.length === 0, errors.join(' | '));
-		check('只调用已有接口 + 批次 2 的 6 个广告下钻 + 批次 3 的 killer/stats/members', calls.every((a) => ['bootstrap', 'groups/list', 'health', 'admins/list', 'ads/summary', 'ads/pending', 'ads/fingerprints', 'ads/samples', 'ads/observing', 'ads/llm', 'ads/dryrun', 'ads/whitelist', 'ads/whitelist/add', 'ads/whitelist/remove', 'groups/detail', 'search', 'users/query', 'killer/bootstrap', 'killer/groups', 'killer/stats', 'killer/stats/members', 'killer/search', 'killer/users/query'].includes(a)), calls.join(','));
+		check('只调用已有接口 + 批次 2 的 6 个广告下钻 + 批次 3 的 killer/stats/members', calls.every((a) => ['bootstrap', 'groups/list', 'health', 'admins/list', 'ads/summary', 'ads/pending', 'ads/fingerprints', 'ads/samples', 'ads/observing', 'ads/llm', 'ads/dryrun', 'ads/whitelist', 'ads/whitelist/add', 'ads/whitelist/remove', 'groups/detail', 'search', 'users/query', 'killer/bootstrap', 'killer/groups', 'killer/stats', 'killer/stats/members', 'killer/search', 'killer/users/query', 'killer/blacklist/list', 'killer/blacklist/ban', 'killer/blacklist/unban'].includes(a)), calls.join(','));
 	} finally {
 		await browser.close();
 	}

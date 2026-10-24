@@ -174,6 +174,7 @@ log('\n=== 4. 封禁：只踢杀手群、只进杀手黑名单、不学习、抄
 	check('备注落库', env.DB.query("SELECT note FROM killer_blacklist WHERE id = '55601'")[0]?.note === '发广告');
 	check('抄送第一主人且标明来源', /杀手子后台/.test(sentTo(OWNER)) && /55601/.test(sentTo(OWNER)), sentTo(OWNER).slice(0, 300));
 	check('回执里有逐人结果', r.data?.users?.[0]?.userId === '55601' && r.data.users[0].ok === 1 && r.data.users[0].total === 1, JSON.stringify(r.data?.users));
+	check('回执带作用范围与原因（页面结果窗要用）', r.data?.scope === 1 && r.data?.note === '发广告', JSON.stringify({ scope: r.data?.scope, note: r.data?.note }));
 
 	reset();
 	let p = await api(KA, 'killer/blacklist/ban', { userIds: OWNER });
@@ -194,6 +195,7 @@ log('\n=== 5. 解封：只解杀手群，主黑名单的人解不了 ===');
 	check('越界：GROUP_ID 群没被解封', !touched(G));
 	check('杀手群有解封调用', calls.some((c) => ['unbanChatMember', 'restrictChatMember'].includes(c.method) && String(c.body?.chat_id) === K));
 	check('解封也抄送第一主人', /解封/.test(sentTo(OWNER)), sentTo(OWNER).slice(0, 200));
+	check('解封回执带作用范围', r.data?.scope === 1, JSON.stringify(r.data?.scope));
 	reset();
 	r = await api(KA, 'killer/blacklist/unban', { userIds: '55603' });
 	check('主黑名单的人 → blocked，complete=false', (r.data?.blocked || []).includes('55603') && r.data?.complete === false, JSON.stringify(r.json));

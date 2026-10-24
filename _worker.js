@@ -1877,20 +1877,22 @@ const KILLER_MINI_APP_HTML_SCRIPT = String.raw`  <script>
       items.forEach(function (record) { var card = element('article', 'card'); var head = element('div', 'card-heading'); head.append(element('h3', 'card-title mono', 'ID ' + text(record.id)), element('span', 'badge danger', '已封禁')); card.append(head, detailList([['方式', text(record.reason)], ['原因', text(record.note)], ['操作人', text(record.by), true], ['时间', date(record.at)]])); var actions = element('div', 'card-actions'); actions.append(makeButton('查询用户', 'small', function () { return openUser(record.id); }), makeButton('解除封禁', 'small danger', function (button) { return unban(button, String(record.id)); })); card.append(actions); container.append(card); });
       pager($('blacklist-pager'), data, function (page) { return loadBlacklist(page); });
     }
-    function describeUsers(users, verb) { return users.map(function (u) { var failed = (u.results || []).filter(function (r) { return !r.ok; }); return u.userId + '：' + verb + ' ' + u.ok + '/' + u.total + (failed.length ? '\n  ' + failed.map(function (r) { return groupName(r.groupId) + ' — ' + text(r.error, '未完成'); }).join('\n  ') : ''); }).join('\n'); }
+    // 封禁 / 解封的完整结果：范围、原因、逐人逐群（成功 ✓ / 失败 ✗ 带原因）、跳过与忽略的 ID。成功失败都弹，不只靠 4 秒的提示。
+    function describeUsers(users, verb, mark) { return users.map(function (u) { var tag = mark(u); return u.userId + '：' + verb + ' ' + u.ok + '/' + u.total + (tag ? '（' + tag + '）' : '') + (u.results || []).map(function (r) { return '\n  ' + (r.ok ? '✓ ' + groupName(r.groupId) : '✗ ' + groupName(r.groupId) + ' — ' + text(r.error, '未完成')); }).join(''); }).join('\n'); }
+    function showActionResult(data, title, verb, head, mark, tail) { var parts = ['作用范围：' + count(data.scope) + ' 个杀手群'].concat(head); var body = describeUsers(data.users || [], verb, mark); if (body) parts.push('', body); var extra = tail.filter(function (pair) { return pair[1] && pair[1].length; }).map(function (pair) { return pair[0] + '：' + pair[1].join('、'); }); (data.failed || []).forEach(function (f) { extra.push(text(f.userId) + '：写入失败 — ' + text(f.error, '未完成')); }); if (extra.length) parts.push('', extra.join('\n')); return showResult({ title: title + (data.complete === false ? '部分未完成' : '完成'), description: parts.join('\n') }); }
     async function ban(ids, note) {
       var confirmed = await confirmAction({ title: '封禁这些用户？', description: '加入杀手黑名单，并从全部 ' + state.groups.length + ' 个杀手群踢出。', object: ids, warning: '之后他们复入群、发言都会被拦截。', label: '确认封禁', danger: true });
       if (!confirmed) return false;
       var data = await api('blacklist/ban', { userIds: ids, note: note });
       toast(text(data && data.message, '已处理。'), data && data.complete === false ? 'error' : 'success');
-      if (data && !data.queued) { var lines = describeUsers(data.users || [], '踢出'); if (data.skipped && data.skipped.length) lines += '\n跳过（主人 / 杀手权限）：' + data.skipped.join('、'); if (data.invalid && data.invalid.length) lines += '\n格式不对已忽略：' + data.invalid.join('、'); (data.failed || []).forEach(function (f) { lines += '\n' + f.userId + '：' + text(f.error); }); if (data.complete === false) await showResult({ title: '部分未完成', description: lines }); }
+      if (data && !data.queued) await showActionResult(data, '封禁', '踢出', ['原因：' + text(data.note, '未填写')], function (u) { return u.existed ? '原本已在杀手黑名单' : ''; }, [['跳过（主人 / 杀手权限）', data.skipped], ['格式不对已忽略', data.invalid]]);
       state.loaded.blacklist = false; if (state.active === 'blacklist') await loadBlacklist(1);
       return true;
     }
     async function unban(button, ids) {
       var confirmed = await confirmAction({ title: '解除封禁？', description: '移出杀手黑名单，并在全部杀手群解封。', object: ids, warning: '在主黑名单里的人由主人管理，这里解不了。', label: '确认解封', danger: true });
       if (!confirmed) return false; var done = false;
-      await actionButton(button, 'unban:' + ids, async function () { var data = await api('blacklist/unban', { userIds: ids }); done = true; toast(text(data && data.message, '已处理。'), data && data.complete === false ? 'error' : 'success'); if (data && !data.queued && data.complete === false) { var lines = describeUsers(data.users || [], '解封'); if (data.blocked && data.blocked.length) lines += (lines ? '\n' : '') + '在主黑名单（未解封）：' + data.blocked.join('、'); await showResult({ title: '部分未完成', description: lines }); } state.loaded.blacklist = false; if (state.active === 'blacklist') await loadBlacklist(state.blacklistPage); });
+      await actionButton(button, 'unban:' + ids, async function () { var data = await api('blacklist/unban', { userIds: ids }); done = true; toast(text(data && data.message, '已处理。'), data && data.complete === false ? 'error' : 'success'); if (data && !data.queued) await showActionResult(data, '解封', '解封', [], function (u) { return u.removed ? '已移出杀手黑名单' : '原本不在杀手黑名单'; }, [['在主黑名单（由主人管理，未解封）', data.blocked], ['格式不对已忽略', data.invalid]]); state.loaded.blacklist = false; if (state.active === 'blacklist') await loadBlacklist(state.blacklistPage); });
       return done;
     }
     function userEmpty() { empty($('users-content'), '按 ID 查一个用户', '可查看资料、杀手黑名单与主黑名单状态、杀手群里的进退群记录。'); }
@@ -3137,6 +3139,8 @@ async function killerMiniAppBan(env, payload, auth, ctx) {
 		failed,
 		skipped: protectedIds,
 		invalid,
+		scope: scope.length,
+		note,
 		message: '已处理 ' + users.length + ' 人' + (protectedIds.length ? '，跳过 ' + protectedIds.length + ' 个受保护账号' : '')
 			+ (failed.length ? '，' + failed.length + ' 人写入失败' : '')
 	};
@@ -3166,6 +3170,7 @@ async function killerMiniAppUnban(env, payload, auth, ctx) {
 		blocked,
 		failed,
 		invalid,
+		scope: scope.length,
 		message: '已解封 ' + users.length + ' 人' + (blocked.length ? '；' + blocked.length + ' 人在主黑名单（由主人管理），未解封' : '')
 	};
 }
