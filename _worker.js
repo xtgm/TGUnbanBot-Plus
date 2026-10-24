@@ -400,6 +400,10 @@ export default {
 				headers: { 'Content-Type': 'application/json; charset=UTF-8' }
 			});
 		}
+		// 独立查询页：打开 /check 输入 TGID 查询（GKY + 全局黑名单 + 独立群本群黑名单）。
+		if (request.method === 'GET' && path === 'check' && path !== TOKEN) {
+			return await handlePublicCheckPage(env, url);
+		}
 		if (request.method === 'GET' && path !== TOKEN && PUBLIC_TGID_PATTERN.test(path)) {
 			return await handlePublicLookup(env, url, path);
 		}
@@ -1411,9 +1415,12 @@ function renderMiniAppHtml() {
       var statusLabel = { creator: '群主', administrator: '管理员', member: '普通成员', restricted: '受限成员', left: '不在群内', kicked: '已被移出' }[bot.status] || '状态未知';
       perm.append(element('p', bot.ok ? 'subtle' : 'dialog-warning', (bot.ok ? '✅ ' : '⚠️ ') + statusLabel + (bot.ok ? '，可以正常封禁' : '，无法执行封禁') + (bot.reason ? '（' + bot.reason + '）' : '')));
       if (Array.isArray(bot.permissions) && bot.permissions.length) { var badges = element('div', 'reason-list'); bot.permissions.forEach(function (p) { badges.append(element('span', 'badge ' + (p.on ? 'accent' : (p.key === 'can_restrict_members' ? 'danger' : '')), (p.on ? '✓ ' : '✗ ') + text(p.label))); }); perm.append(badges); }
+      var modeSec = element('section', 'detail-section'); modeSec.append(element('h4', 'detail-title', '群模式'));
+      if (data.mode === 'independent') { var ls = data.localSettings || {}; modeSec.append(ls.error ? element('p', 'dialog-warning', '独立群，本群设置读取失败') : detailList([['模式', '独立（全局黑名单不生效，群主自治）'], ['自动检测', ls.detect === false ? '已关闭' : '开启'], ['处置方式', ls.action === 'mute' ? '禁言' : '踢出'], ['本群黑名单', count(ls.banCount) + ' 人'], ['本群白名单', Array.isArray(ls.whitelist) && ls.whitelist.length ? ls.whitelist.join('、') : '（空）']])); }
+      else modeSec.append(detailList([['模式', '全局（默认）']]));
       var st = data.dryRunStats || {}; var dry = element('section', 'detail-section'); dry.append(element('h4', 'detail-title', '演练模式'));
       dry.append(detailList([['开关', data.dryRun ? '已开启（只记录不处置）' : '未开启'], ['演练命中', count(st.total) + ' 条（近 24 小时 ' + count(st.today) + '）'], ['主人判误报 / 确认封', count(st.fp) + ' / ' + count(st.done)], ['误报最低分', st.lowestFp === null || st.lowestFp === undefined ? '—' : text(st.lowestFp)]]));
-      box.append(perm, dry,
+      box.append(perm, modeSec, dry,
         detailRows('近期演练流水', Array.isArray(data.dryrunLog) ? data.dryrunLog : [], '这个群还没有演练记录。', function (r) { var reasons = (r.reasons || []).join('、'); return { badge: DRY_STATUS[r.status] || DRY_STATUS.open, text: '评分 ' + text(r.score) + ' / 封禁线 ' + text(r.threshold) + ' · ' + text(r.layer) + (reasons ? '\n' + reasons : '') }; }),
         detailRows('入群检查流水', Array.isArray(data.joinChecks) ? data.joinChecks : [], '这个群还没有入群检查记录。', function (r) { var reasons = (r.reasons || []).join('、'); return { badge: JOIN_VERDICT[r.verdict] || [text(r.verdict), ''], text: '评分 ' + text(r.score) + ' / 封禁线 ' + text(r.threshold) + ' · ' + text(r.layer) + (reasons ? '\n' + reasons : '') }; }));
     }
@@ -1634,6 +1641,8 @@ function renderMiniAppHtml() {
       if (black) lines.push('本地原因：' + text(black.reason, '未填写') + '　操作人 ' + text(black.by));
       if (gkyBanned) { var parts = []; if (gky.chatId) parts.push('来源群 ' + gky.chatId); if (gky.reason) parts.push('原因 ' + gky.reason); if (gky.recordedDate) parts.push('时间 ' + gky.recordedDate); lines.push('外部记录：' + (parts.length ? parts.join('　') : '已命中封禁')); }
       if (gkyFailed && !gkyBanned) lines.push('外部记录：' + text(data.gkyError, '暂时无法查询'));
+      var activeGroupBans = (Array.isArray(data.groupBans) ? data.groupBans : []).filter(function (b) { return b.independent; });
+      if (activeGroupBans.length) { lines.push('本群黑名单：' + activeGroupBans.length + ' 个独立群（' + activeGroupBans.map(function (b) { return text(b.chatId); }).join('、') + '）'); if (tone === 'success') { tone = 'warning'; mark = '⚠️'; title = '在独立群的本群黑名单中'; } }
       if (!lines.length) lines.push('本地黑名单与外部风险库都没有该用户的记录。');
       var box = element('div', 'verdict'); box.dataset.tone = tone; box.append(element('span', 'verdict-mark', mark));
       var body = element('div', 'verdict-body'); body.append(element('div', 'verdict-title', title), element('p', 'verdict-text', lines.join('\n'))); box.append(body);
@@ -1641,8 +1650,9 @@ function renderMiniAppHtml() {
     }
     function renderUser(data, requestedId) {
       var container = $('users-content'); container.replaceChildren(); var id = text(data.userId, requestedId); container.append(renderVerdict(data, id)); var profile = data.profile || {}; var card = element('article', 'card'); var head = element('div', 'profile-top'); var name = text(profile.name || [profile.first_name, profile.last_name].filter(Boolean).join(' '), '用户 ' + id); var info = element('div', 'profile-info'); info.append(element('h2', '', name), element('div', 'mono muted', 'ID ' + id)); if (profile.username) info.append(element('div', 'card-subtitle', (String(profile.username).startsWith('@') ? '' : '@') + profile.username)); head.append(element('div', 'avatar', Array.from(name)[0]), info); card.append(head); var badges = element('div', 'profile-badges'); badges.append(element('span', 'badge ' + (data.blacklist ? 'danger' : 'accent'), data.blacklist ? '黑名单中' : '未列入黑名单')); if (!data.profile) badges.append(element('span', 'badge', '暂无保存的资料')); if (data.whitelist) badges.append(element('span', 'badge accent', '白名单中')); card.append(badges); var wlActions = element('div', 'card-actions'); var refresh = function () { state.loaded.ads = false; if (state.active === 'users' && state.queriedUser === id) return queryUser(id); }; wlActions.append(data.whitelist ? makeButton('移出白名单', 'small danger', function (button) { return removeWhitelist(button, id, name, refresh); }) : makeButton('加入白名单', 'small', function (button) { return addWhitelist(button, id, refresh); })); if (data.whitelist) wlActions.append(element('span', 'subtle', '加入于 ' + date(data.whitelist.at) + (data.whitelist.note ? ' · ' + data.whitelist.note : ''))); card.append(wlActions); var speech = data.speech || {}; var stats = element('div', 'speech-stats'); [['发言记录', count(speech.count)], ['首次发言', date(speech.first, true)], ['最近发言', date(speech.last, true)]].forEach(function (pair) { var cell = element('div'); cell.append(element('span', '', pair[0]), element('strong', '', pair[1])); stats.append(cell); }); card.append(stats); container.append(card);
-      var errors = data.errors || {}; if (Object.keys(errors).length) { var labels = { profile: '用户资料', blacklist: '黑名单状态', whitelist: '白名单状态', events: '处理时间线', cases: '处罚记录', speech: '发言统计' }; var notice = element('div', 'notice'); notice.append(element('div', '', '部分记录暂时无法读取')); Object.keys(errors).forEach(function (key) { if (errors[key]) notice.append(element('div', '', (labels[key] || '记录') + '：' + text(errors[key]))); }); notice.append(makeButton('重新查询', 'small quiet', function () { return queryUser(id); })); container.append(notice); if (errors.blacklist) badges.firstChild.textContent = '黑名单状态暂时未知'; }
+      var errors = data.errors || {}; if (Object.keys(errors).length) { var labels = { profile: '用户资料', blacklist: '黑名单状态', groupBans: '本群黑名单', whitelist: '白名单状态', events: '处理时间线', cases: '处罚记录', speech: '发言统计' }; var notice = element('div', 'notice'); notice.append(element('div', '', '部分记录暂时无法读取')); Object.keys(errors).forEach(function (key) { if (errors[key]) notice.append(element('div', '', (labels[key] || '记录') + '：' + text(errors[key]))); }); notice.append(makeButton('重新查询', 'small quiet', function () { return queryUser(id); })); container.append(notice); if (errors.blacklist) badges.firstChild.textContent = '黑名单状态暂时未知'; }
       if (data.blacklist) { var black = data.blacklist; var blackCard = element('article', 'card'); blackCard.append(element('h2', 'section-label', '黑名单记录'), detailList([['原因', text(black.reason)], ['备注', text(black.note)], ['操作人', text(black.by), true], ['记录时间', date(black.at || black.created_at)]])); var actions = element('div', 'card-actions'); actions.append(makeButton('解除封禁', 'small danger', async function (button) { var completed = await unban(button, Object.assign({}, black, { id: id })); if (completed && state.active === 'users' && state.queriedUser === id) await queryUser(id); })); blackCard.append(actions); container.append(blackCard); }
+      var groupBans = Array.isArray(data.groupBans) ? data.groupBans : []; if (groupBans.length) { var gbCard = element('article', 'card'); var gbHead = element('div', 'card-heading'); gbHead.append(element('h2', 'section-label', '本群黑名单（独立群）'), element('span', 'counter', count(groupBans.length) + ' 条')); gbCard.append(gbHead); groupBans.forEach(function (b) { gbCard.append(detailList([['群组', text(b.chatId) + (b.independent ? '（独立群）' : '（已切回全局，不生效）'), true], ['原因', text(b.reason)], ['备注', text(b.note)], ['记录时间', date(b.at)]])); }); gbCard.append(element('p', 'subtle', '本群记录由该群管理员在该群发 /unban 解除。')); container.append(gbCard); }
       var cases = Array.isArray(data.cases) ? data.cases : []; var events = Array.isArray(data.events) ? data.events : []; renderTimeline(container, '处罚记录', cases, true); renderTimeline(container, '处理时间线', events, false);
       if (data.gky || data.gkyError) { var gkyCard = element('article', 'card'); gkyCard.append(element('h2', 'section-label', '外部风险记录')); if (data.gkyError) gkyCard.append(element('p', 'subtle', '暂时无法查询：' + text(data.gkyError))); else { var gky = data.gky; var pairs = []; var labels = { reason: '原因', note: '备注', message: '说明', score: '风险评分', count: '记录数', found: '查询结果', first: '首次记录', last: '最近记录', ban_time: '封禁时间', ban_reason: '封禁原因', chatId: '来源群组', msgId: '消息 ID', info: '记录内容', recordedDate: '记录日期' }; if (typeof gky === 'object') { if (gky.banned !== undefined) pairs.push(['封禁状态', gky.banned ? '有封禁记录' : '无封禁记录']); Object.keys(labels).forEach(function (key) { var value = gky[key]; if (value !== null && value !== undefined && value !== '') pairs.push([labels[key], typeof value === 'boolean' ? (value ? '是' : '否') : displayValue(value)]); }); } else pairs.push(['结果', displayValue(gky)]); gkyCard.append(pairs.length ? detailList(pairs) : element('p', 'subtle', '未发现外部风险记录。')); } container.append(gkyCard); }
     }
@@ -2614,10 +2624,29 @@ async function miniAppGroupDetail(env, payload) {
 		readAdDryRunLog(env, { chatId, limit: 20 }),
 		readAdJoinChecks(env, { chatId, limit: 20 })
 	]);
+	// 群模式与本群设置：只有独立群才读 group_settings / group_blacklist，全局群不多花 SQL。
+	const independent = isIndependentGroup(chatId);
+	let localSettings = null;
+	if (independent) {
+		try {
+			const local = await loadGroupLocalSettings(env, chatId);
+			let banCount = 0;
+			if (await d1TableExists(env, 'group_blacklist')) {
+				const row = await env.DB.prepare('SELECT COUNT(*) AS c FROM group_blacklist WHERE chat_id = ?').bind(chatId).first();
+				banCount = Number(row?.c) || 0;
+			}
+			localSettings = { detect: local.detect, action: local.action, whitelist: local.whitelist, banCount };
+		} catch (error) {
+			console.error('[小程序] 读取本群设置失败:', error);
+			localSettings = { error: '读取失败' };
+		}
+	}
 	return {
 		chatId,
 		title: String(info?.title || ''),
 		bot,
+		mode: independent ? 'independent' : 'global',
+		localSettings,
 		dryRun,
 		dryRunStats: { total: dryRunStats.total, today: dryRunStats.today, fp: dryRunStats.fp, done: dryRunStats.done, lowestFp: dryRunStats.lowestFp },
 		dryrunLog: dryRows.map((row) => ({
@@ -2759,6 +2788,10 @@ async function miniAppUserQuery(env, payload) {
 
 	try { data.blacklist = await readD1BlacklistEntry(env, userId); }
 	catch (error) { errors.blacklist = '读取失败'; }
+	// 本群黑名单（独立群）：与 /check 同一份读取。
+	data.groupBans = [];
+	try { data.groupBans = await readUserGroupBans(env, userId); }
+	catch (error) { errors.groupBans = '读取失败'; }
 
 	// 白名单状态：用户页据此显示「加入白名单 / 移出白名单」。主键单行查询。
 	data.whitelist = null;
@@ -8494,6 +8527,28 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 			localLines.push('状态　　✅ 不在黑名单');
 		}
 	}
+	// 本群黑名单（独立模式）：没有独立群、也查不到记录时整节不出，未用独立模式的部署 /check 原样不变。
+	const groupBanLines = [];
+	if (options.env) {
+		try {
+			const groupBans = await readUserGroupBans(options.env, queryTgid);
+			if (groupBans.length || INDEPENDENT_GROUP_IDS.length) {
+				groupBanLines.push('<b>━━ 本群黑名单（独立群）━━</b>');
+				if (!groupBans.length) groupBanLines.push('状态　　✅ 不在任何群的本群黑名单');
+				groupBans.forEach((ban, idx) => {
+					if (idx > 0) groupBanLines.push('');
+					groupBanLines.push('群组　　<code>' + escapeHtml(ban.chatId) + '</code>（' + (ban.independent ? '独立群' : '已切回全局，记录不生效') + '）');
+					groupBanLines.push('加黑方式　' + escapeHtml(formatGroupBanReason(ban.reason)));
+					if (ban.note) groupBanLines.push('执行原因　' + escapeHtml(String(ban.note)));
+					groupBanLines.push('加黑时间　' + escapeHtml(ban.at || '未知'));
+				});
+				if (groupBans.length) groupBanLines.push('', 'ℹ️ 本群记录由该群管理员在该群发 <code>/unban ' + escapeHtml(queryTgid) + '</code> 解除');
+			}
+		} catch (error) {
+			console.error('[本群黑名单] /check 读取失败:', error);
+			groupBanLines.push('<b>━━ 本群黑名单（独立群）━━</b>', '状态　　❌ 读取失败，请稍后重试');
+		}
+	}
 
 	const userMention = options.targetUser ? formatUserMention(options.targetUser) : '';
 	const userLine = '用户　　' + (userMention
@@ -8546,6 +8601,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	const composeText = () => {
 		const parts = ['🔍 <b>封禁查询结果</b>', '', ...gkyLines];
 		if (localLines.length) parts.push('', ...localLines);
+		if (groupBanLines.length) parts.push('', ...groupBanLines);
 		if (notes.length) parts.push('', '<b>━━ 提示 ━━</b>', ...notes);
 		return parts.join('\n');
 	};
@@ -8553,6 +8609,17 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	if (!options.includeReviewAction) {
 		return { text: composeText() };
 	}
+
+	// 网页版入口：跳到公开查询页 /check?tgid=，任何人点开都能看完整原因、也能改查别的 TGID。
+	// 非配置群照旧「不出任何按钮」；Telegram 的 url 按钮只认 https，取不到就不出按钮。
+	let lookupRow = null;
+	try {
+		const lookupUrl = new URL('/check', options.requestUrl || '');
+		if (lookupUrl.protocol === 'https:') {
+			lookupUrl.searchParams.set('tgid', queryTgid);
+			lookupRow = [{ text: '🌐 网页查看完整封禁详情', url: lookupUrl.toString() }];
+		}
+	} catch (_) { lookupRow = null; }
 
 	// 非配置群仍可查询两套状态，但不开放任何复制操作。
 	if (options.dispatchSourceAllowed === false) {
@@ -8591,6 +8658,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		}]);
 	}
 
+	if (lookupRow) inlineKeyboard.push(lookupRow);
 	const responseMessage = composeText();
 	if (!inlineKeyboard.length) {
 		return { text: responseMessage };
@@ -9748,6 +9816,47 @@ async function listGroupBlacklist(env, chatId, limit = 50) {
 	return (results || []).map((row) => ({ id: String(row.user_id), reason: row.reason || 'local', by: row.by_user || null, at: row.at || null, note: row.note || null }));
 }
 
+// 某人在哪些群的本群黑名单里（/check、小程序、公开查询页共用）。
+// 只读不建表：公开查询页有「不写任何数据」的守卫断言，表不存在 = 一条记录都没有。
+// independent 直接读 group_mode 表而不是 isIndependentGroup：公开查询走在 loadIndependentGroups 之前，
+// 那份内存名单可能还是上一个请求留下的。
+async function readUserGroupBans(env, userId, limit = 20) {
+	if (!env?.DB) return [];
+	const isMissingTable = (error) => /no such table/i.test(String(error?.message || error || ''));
+	let rows = [];
+	try {
+		const { results } = await env.DB.prepare('SELECT chat_id, reason, by_user, at, note FROM group_blacklist WHERE user_id = ? ORDER BY at DESC LIMIT ?')
+			.bind(String(userId), Math.max(1, Math.min(50, Number(limit) || 20))).all();
+		rows = results || [];
+	} catch (error) {
+		if (isMissingTable(error)) return [];
+		throw error;
+	}
+	if (!rows.length) return [];
+	const independent = new Set();
+	try {
+		const { results } = await env.DB.prepare("SELECT chat_id FROM group_mode WHERE mode = 'independent'").all();
+		for (const row of results || []) independent.add(String(row.chat_id));
+	} catch (error) {
+		if (!isMissingTable(error)) throw error;
+	}
+	return rows.map((row) => ({
+		chatId: String(row.chat_id),
+		reason: row.reason || 'local',
+		by: row.by_user || null,
+		at: row.at || null,
+		note: row.note || null,
+		independent: independent.has(String(row.chat_id))
+	}));
+}
+
+// 本群黑名单的原因说明：reason 只有 manual / spam / ad_auto 三种来源（/ban /sban、/spam、本群自动检测）。
+function formatGroupBanReason(code) {
+	const labels = { manual: '/ban 或 /sban 本群处置', spam: '/spam 本群举报', ad_auto: '本群广告自动检测', local: '本群处置' };
+	const key = String(code || 'local');
+	return labels[key] ? key + '（' + labels[key] + '）' : key;
+}
+
 // --- 本群设置 group_settings + 本群白名单 group_whitelist（/localset，只对独立群生效）---
 // 两张表都懒建；只在独立群里读（15 秒缓存），全局群热路径零额外 SQL。
 // 演练开关不另存，沿用 dryrun_groups（isDryRunGroup / setDryRun）。
@@ -10415,7 +10524,7 @@ async function handleKillerAdminCommand(message, env, ctx, requestUrl = '') {
 			if (!rest) return false;
 			return handleKillerUnban(message, env, ctx, { rest, requestUrl });
 		case '/check':
-			return handleKillerCheck(message, env, rest);
+			return handleKillerCheck(message, env, rest, requestUrl);
 		case '/profile':
 			return handleKillerProfile(message, env, rest);
 		case '/stats':
@@ -10607,7 +10716,7 @@ async function handleKillerUnban(message, env, ctx, { rest, requestUrl }) {
 }
 
 // /check：主黑名单与 GKY 只读展示，外加杀手黑名单一节。
-async function handleKillerCheck(message, env, rest) {
+async function handleKillerCheck(message, env, rest, requestUrl = '') {
 	const isInGroup = message.chat.type !== 'private';
 	const repliedUser = isInGroup && !/^\d+$/.test(rest) ? message.reply_to_message?.from : null;
 	const tgid = /^\d+$/.test(rest) ? rest : String(repliedUser?.id || '');
@@ -10615,7 +10724,7 @@ async function handleKillerCheck(message, env, rest) {
 		await sendTelegramMessage(message.chat.id, '❌ 使用方法：<code>/check 用户ID</code>，或在杀手群里回复消息发 <code>/check</code>');
 		return true;
 	}
-	const response = await buildBanlistCheckResponse(tgid, { includeReviewAction: true, env, targetUser: repliedUser || undefined });
+	const response = await buildBanlistCheckResponse(tgid, { includeReviewAction: true, env, targetUser: repliedUser || undefined, requestUrl });
 	const killerLines = await renderKillerBlacklistLines(env, tgid);
 	await sendTelegramMessageChunks(message.chat.id, [response.text, '', ...killerLines].join('\n').trim(), response.replyMarkup || null);
 	return true;
@@ -14598,6 +14707,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			includeReviewAction: true,
 			dispatchSourceAllowed,
 			env,
+			requestUrl,
 		});
 		// 资料卡 + 时间线（第1批）：/check 与 /profile 共用同一份渲染，避免两处口径分叉。
 		const profileLines = await buildProfileBlock(env, profileGroupId, tgidToCheck, isGroupChat);
@@ -14787,7 +14897,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/sban TGID [原因]　加黑 + 全群踢出并撤回其历史发言（第一主人 / 副主人 / 该群群主）',
 			'/spam　回复广告：删消息 + 全群禁言',
 			'/unban TGID　移出黑名单 + 全群解封并恢复发言（不带 ID 则是自助解封）',
-			'/check TGID　查封禁状态：GKY + 本地黑名单（群内可回复消息使用）',
+			'/check TGID　查 GKY + 全局 + 独立群本群黑名单（群内可回复消息）；网页版 域名/check',
 			'/profile TGID　资料卡：昵称 / 简介 / 时间线 / 黑名单 / GKY（群内可回复消息使用）',
 			'/rm　回复要删的消息后发送 → 删除该消息（仅第一主人 / 该群群主）',
 			'/health　运行检查：bot 状态自检 + 逐群查在不在群、是不是管理员、三个权限',
@@ -14810,6 +14920,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'自动检测命中广告　永久禁言，人留群；退群再进会重新禁言',
 			'/ban /spam /sban　踢出；之后复入群会被踢回',
 			'同款直封 / 同款连带 / /ad 投票　与杀手群完全隔离，杀手群里不触发，别的群触发也不波及杀手群',
+			'',
+			'<b>━━ 独立模式（群主自治）━━</b>',
+			'/groupmode independent|global　切本群模式（第一主人 / 群主；私聊加群 ID）',
+			'/localbans　看本群黑名单',
+			'/localset 检测 开|关 · 演练 开|关 · 处置 踢出|禁言 · 白名单 加|删 TGID　本群设置',
 			'',
 			'<b>━━ 演练模式（仅第一主人 · 任意配置群）━━</b>',
 			'/dryrun　翻转本群开关；私聊发送则列出已开演练的群与命中数',
@@ -17358,6 +17473,17 @@ function formatBeijingDate(value) {
 	return new Date(time + 8 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
+// 独立查询页 GET /check：打开是空白查询框，输入 TGID 提交后同一页出结果（地址 /check?tgid=…）。
+// 与 /{TGID} 共用同一份读取与渲染；/{TGID} 保留给已经发出去的旧链接。
+async function handlePublicCheckPage(env, url) {
+	const asked = url.searchParams.has('tgid') ? String(url.searchParams.get('tgid') || '').trim() : '';
+	if (!asked) return publicLookupHtml(renderPublicLookupPage('', null, ''), 200);
+	if (!PUBLIC_TGID_PATTERN.test(asked)) {
+		return publicLookupHtml(renderPublicLookupPage('', null, 'TGID 必须是 1~20 位纯数字，请重新输入。'), 400);
+	}
+	return respondPublicLookup(env, url, asked);
+}
+
 async function handlePublicLookup(env, url, tgid) {
 	// 页面上的查询框提交 ?tgid=，转成干净的 /{TGID} 地址
 	const asked = url.searchParams.has('tgid') ? String(url.searchParams.get('tgid') || '').trim() : null;
@@ -17367,8 +17493,33 @@ async function handlePublicLookup(env, url, tgid) {
 		}
 		return publicLookupHtml(renderPublicLookupPage(tgid, null, 'TGID 必须是 1~20 位纯数字，请重新输入。'), 400);
 	}
-	const [gky, local] = await Promise.all([readPublicGky(tgid), readPublicLocalBan(env, tgid)]);
-	const result = { tgid, local, gky };
+	return respondPublicLookup(env, url, tgid);
+}
+
+// 本群黑名单（独立群）那一块：读失败只让这一块显示错误，不影响 GKY 与全局两块。
+async function readPublicGroupBans(env, tgid) {
+	if (!env?.DB) return { list: [] };
+	try {
+		const rows = await readUserGroupBans(env, tgid);
+		return {
+			list: rows.map((row) => ({
+				chatId: row.chatId,
+				since: formatBeijingDate(row.at),
+				reasonCode: row.reason,
+				reason: formatGroupBanReason(row.reason),
+				note: row.note ? String(row.note) : null,
+				active: row.independent
+			}))
+		};
+	} catch (error) {
+		console.error('[公开查询] 读本群黑名单失败:', error?.message || error);
+		return { error: '暂时无法查询独立群的本群黑名单，请稍后再试' };
+	}
+}
+
+async function respondPublicLookup(env, url, tgid) {
+	const [gky, local, groups] = await Promise.all([readPublicGky(tgid), readPublicLocalBan(env, tgid), readPublicGroupBans(env, tgid)]);
+	const result = { tgid, local, gky, groups };
 	if ((url.searchParams.get('format') || '').toLowerCase() === 'json') {
 		return new Response(JSON.stringify(result, null, 2), {
 			headers: { 'Content-Type': 'application/json; charset=UTF-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' }
@@ -17452,11 +17603,26 @@ function renderPublicLookupPage(tgid, result, formError) {
 				+ block('Info', local.info ? `<div class="info">${escapeHtml(local.info)}</div>` : missing);
 		}
 		body += `<section><h2>GKY 封禁库</h2>${gkyHtml}</section><section><h2>本机器人全局黑名单</h2>${localHtml}</section>`;
+		// 第三块：独立群的本群黑名单。一条都没有就不出这一块（没用独立模式的部署页面原样不变）。
+		const groups = result.groups || { list: [] };
+		if (groups.error) {
+			body += `<section><h2>独立群本群黑名单</h2><p class="muted">${escapeHtml(groups.error)}</p></section>`;
+		} else if (Array.isArray(groups.list) && groups.list.length) {
+			const items = groups.list.map((g, idx) => '<div class="group-ban">'
+				+ `<p class="tag ${g.active ? 'bad' : 'muted-tag'}">${g.active ? '本群已封禁' : '该群已切回全局，此记录不生效'}</p>`
+				+ row('Recorded Date', g.since ? escapeHtml(g.since + '（北京时间）') : missing)
+				+ row('ChatID', text(g.chatId))
+				+ row('Reason', text(g.reason))
+				+ block('Detail', g.note ? `<div class="info">${escapeHtml(g.note)}</div>` : missing)
+				+ (g.active ? unlockButton('group-note-' + idx, '/unban ' + tgid, '已复制，请由该群管理员在该群内发送进行解封。') : '')
+				+ '</div>').join('');
+			body += `<section><h2>独立群本群黑名单</h2>${items}</section>`;
+		}
 		body += `<p class="muted small">JSON：<a href="/${escapeHtml(tgid)}?format=json">/${escapeHtml(tgid)}?format=json</a></p>`;
 		body += '<p><a href="" class="back" data-back>Back</a></p>';
 	}
 	return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark"><title>封禁查询 · ${escapeHtml(tgid)}</title>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark"><title>封禁查询${tgid ? ' · ' + escapeHtml(tgid) : ''}</title>
 <style>
 body{margin:0;font:15px/1.6 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#121214;color:#e5e6eb}
 main{max-width:640px;margin:0 auto;padding:24px 16px}
@@ -17478,10 +17644,11 @@ ul.info{padding-left:28px}
 .alert{background:#4d1418;color:#f98981;border-radius:8px;padding:10px 12px}
 .muted{color:#a9aeb8}.small{font-size:12px}a{color:#4080ff}small{display:block}
 .back{display:inline-block;padding:8px 18px;border:1px solid #484849;border-radius:8px;text-decoration:none}
+.group-ban+.group-ban{margin-top:14px;padding-top:12px;border-top:2px solid #333335}.muted-tag{background:#2a2a2b;color:#a9aeb8}
 </style></head>
 <body><main>
-<h1>封禁查询</h1><p class="muted">TGID <strong>${escapeHtml(tgid)}</strong></p>
-<form method="get" action=""><label for="tgid" class="muted" style="position:absolute;left:-9999px">要查询的 TGID</label><input id="tgid" name="tgid" inputmode="numeric" maxlength="20" placeholder="输入 TGID 查询" autocomplete="off" required><button type="submit">查询</button></form>
+<h1>封禁查询</h1><p class="muted">${tgid ? `TGID <strong>${escapeHtml(tgid)}</strong>` : '输入 Telegram 用户 ID（TGID），同时查询 GKY 封禁库、本机器人全局黑名单与独立群本群黑名单。'}</p>
+<form method="get" action="/check"><label for="tgid" class="muted" style="position:absolute;left:-9999px">要查询的 TGID</label><input id="tgid" name="tgid" inputmode="numeric" pattern="[0-9]{1,20}" maxlength="20" placeholder="输入 TGID 查询" autocomplete="off" required><button type="submit">查询</button></form>
 ${body}
 </main><script>${PUBLIC_LOOKUP_SCRIPT}</script></body></html>`;
 }

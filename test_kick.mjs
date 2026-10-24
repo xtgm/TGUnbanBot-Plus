@@ -5378,9 +5378,13 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 		const sent = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === String(chat.id));
 		const resultChatId = String(chat.id);
 		const result = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === resultChatId).at(-1);
-		const buttons = (result?.body.reply_markup?.inline_keyboard || []).flat();
-		return { sent, result, buttons, copies: buttons.map((button) => button.copy_text?.text) };
+		const allButtons = (result?.body.reply_markup?.inline_keyboard || []).flat();
+		// 网页查询按钮（url）单独拎出来断言；其余必须全是复制按钮，口径与改动前一致。
+		const lookups = allButtons.filter((button) => Object.prototype.hasOwnProperty.call(button, 'url'));
+		const buttons = allButtons.filter((button) => !Object.prototype.hasOwnProperty.call(button, 'url'));
+		return { sent, result, buttons, allButtons, lookups, copies: buttons.map((button) => button.copy_text?.text) };
 	}
+	const LOOKUP_URL = 'https://x.com/check?tgid=' + TARGET_ID;
 
 	const basicCases = [
 		{ name: '两边正常', gky: GKY_NONE, seed: [], copies: [] },
@@ -5393,6 +5397,8 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 		const check = await runCheck({ gky: item.gky, env });
 		assert(item.name + ' → 复制按钮数量与内容正确', JSON.stringify(check.copies) === JSON.stringify(item.copies));
 		assert(item.name + ' → 所有按钮只有 copy_text', check.buttons.every((button) => !!button.copy_text?.text && !Object.prototype.hasOwnProperty.call(button, 'callback_data')));
+		assert(item.name + ' → 恰好一个网页查询按钮，指向 /check?tgid=', check.lookups.length === 1 && check.lookups[0].url === LOOKUP_URL && !check.lookups[0].callback_data, JSON.stringify(check.lookups));
+		assert(item.name + ' → 网页查询按钮在最后一行', check.allButtons.at(-1)?.url === LOOKUP_URL);
 		// 记录就在自己的配置群时，语义是「移出该群 GKY 黑名单」，按钮文字必须这么写；
 		// 别群记录走的是「加 GKY 全局白名单」，见下方外部群用例。
 		if (item.gkyButtonText) {
@@ -5441,7 +5447,7 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 	});
 	const quietGroupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
 	const ownerCheckResult = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').at(-1);
-	const ownerCheckButtons = (ownerCheckResult?.body.reply_markup?.inline_keyboard || []).flat();
+	const ownerCheckButtons = (ownerCheckResult?.body.reply_markup?.inline_keyboard || []).flat().filter((button) => !button.url);
 	const adminTriggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '7777');
 	assert('群管理员群内 /check 保留完整结果及复制按钮', quietGroupSends.some((c) => c.body.text.includes('封禁查询结果') && JSON.stringify(c.body.reply_markup) === JSON.stringify(ownerCheckResult?.body.reply_markup)));
 	assert('群管理员群内 /check 完整结果发给主人', !!ownerCheckResult && ownerCheckResult.body.text.includes('封禁查询结果'));
@@ -5482,12 +5488,12 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 
 	check = await runCheck({ gky: GKY_CONFIGURED, env: makeCheckEnv([localEntry]), chat: { id: -2001, type: 'supergroup', title: '未配置群' } });
 	assert('非 GROUP_ID 来源群 → 仍返回双库详情', String(check.result?.body.text || '').includes('封禁查询结果') && String(check.result?.body.text || '').includes('状态　　🚫 在黑名单中'));
-	assert('非 GROUP_ID 来源群 → 仅查询且无复制按钮', String(check.result?.body.text || '').includes('不提供任何复制按钮') && check.buttons.length === 0);
+	assert('非 GROUP_ID 来源群 → 仅查询且无复制按钮', String(check.result?.body.text || '').includes('不提供任何复制按钮') && check.allButtons.length === 0);
 
 	check = await runCheck({ gky: GKY_EXTERNAL, env: makeCheckEnv([localEntry]), chat: { id: -2001, type: 'supergroup', title: '未配置群' }, text: '/check', replyTo: { message_id: 3, from: { id: Number(TARGET_ID), is_bot: false, first_name: '目标用户' } } });
 	// 这道门与「记录属于哪个群」无关，防的是在陌生群里能查能复制 —— 不能松。
 	assert('非 GROUP_ID 来源群回复 /check → 仍无任何按钮',
-		String(check.result?.body.text || '').includes('不提供任何复制按钮') && check.buttons.length === 0);
+		String(check.result?.body.text || '').includes('不提供任何复制按钮') && check.allButtons.length === 0);
 
 	check = await runCheck({ gky: GKY_NONE, env: makeCheckEnv(), chat: { id: 5555, type: 'private' }, from: { id: 5555, is_bot: false }, adminIds: [999] });
 	assert('非管理员私聊 /check TGID → 权限不足', String(check.result?.body.text || '').includes('权限不足'));
