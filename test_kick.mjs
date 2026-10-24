@@ -4558,7 +4558,7 @@ console.log('\n[23] 一键代发链路已移除');
 	assert('Webhook 初始化 → /ad 投票按钮回调已启用', webhookCall?.body?.allowed_updates?.includes('callback_query'));
 	// 【2026-10-14 补】主菜单补进 start/menu/user/adstats/dryrun 五条第一主人命令（各注明确是什么），
 	// 同日再补 /wl 与 /del —— 一对用户白名单的增删入口，与 /whitelist（域名白名单，判据层）分名。
-	assert('BotFather 菜单统一注册（含 /rm /profile + 新补五条 + /wl + /del + /listgroups + /addgroup /delgroup /leavegroup + /groupmode /localbans）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice', 'start', 'menu', 'user', 'adstats', 'dryrun', 'wl', 'del', 'listgroups', 'addgroup', 'delgroup', 'leavegroup', 'groupmode', 'localbans']));
+	assert('BotFather 菜单统一注册（含 /rm /profile + 新补五条 + /wl + /del + /listgroups + /addgroup /delgroup /leavegroup + /groupmode /localbans /localset）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice', 'start', 'menu', 'user', 'adstats', 'dryrun', 'wl', 'del', 'listgroups', 'addgroup', 'delgroup', 'leavegroup', 'groupmode', 'localbans', 'localset']));
 	// /wl /del 与 rm/profile 同口径：菜单说明必须标权限，否则主人看不出它只给第一主人用
 	assert('/wl 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'wl')?.description || '').includes('仅第一主人'));
 	assert('/del 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'del')?.description || '').includes('仅第一主人'));

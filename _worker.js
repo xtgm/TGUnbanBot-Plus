@@ -3528,7 +3528,9 @@ async function handleInitialization(request, env) {
 				{ command: "leavegroup", description: "让 bot 退出指定群；参数 -100xxx (仅第一主人私聊)" },
 				// 独立模式：/groupmode 切群模式（第一主人或该群群主），/localbans 看本群黑名单。
 				{ command: "groupmode", description: "切换群模式：全局 / 独立 (第一主人/该群群主)" },
-				{ command: "localbans", description: "查看本群黑名单 (有封禁权限的群管理员)" }
+				{ command: "localbans", description: "查看本群黑名单 (有封禁权限的群管理员)" },
+				// /localset：独立群的本群设置（群主或有「修改群组信息」权限的管理员）。
+				{ command: "localset", description: "本群设置：检测/演练/处置/白名单 (独立群)" }
 			]
 		};
 
@@ -9746,6 +9748,164 @@ async function listGroupBlacklist(env, chatId, limit = 50) {
 	return (results || []).map((row) => ({ id: String(row.user_id), reason: row.reason || 'local', by: row.by_user || null, at: row.at || null, note: row.note || null }));
 }
 
+// --- 本群设置 group_settings + 本群白名单 group_whitelist（/localset，只对独立群生效）---
+// 两张表都懒建；只在独立群里读（15 秒缓存），全局群热路径零额外 SQL。
+// 演练开关不另存，沿用 dryrun_groups（isDryRunGroup / setDryRun）。
+const D1_GROUP_LOCAL_INIT = new WeakMap();
+const D1_GROUP_LOCAL_CACHE = new WeakMap();
+const GROUP_LOCAL_DEFAULTS = Object.freeze({ detect: true, action: 'kick' });
+
+async function ensureGroupLocalTables(env) {
+	if (!env?.DB) return false;
+	const cached = D1_GROUP_LOCAL_INIT.get(env.DB);
+	if (cached) return cached;
+	const initPromise = (async () => {
+		await env.DB.prepare("CREATE TABLE IF NOT EXISTS group_settings (chat_id TEXT PRIMARY KEY, detect INTEGER NOT NULL DEFAULT 1, action TEXT NOT NULL DEFAULT 'kick', set_by TEXT, set_at TEXT)").run();
+		await env.DB.prepare('CREATE TABLE IF NOT EXISTS group_whitelist (chat_id TEXT NOT NULL, user_id TEXT NOT NULL, by_user TEXT, at TEXT, PRIMARY KEY (chat_id, user_id))').run();
+		return true;
+	})().catch((error) => {
+		D1_GROUP_LOCAL_INIT.delete(env.DB);
+		throw error;
+	});
+	D1_GROUP_LOCAL_INIT.set(env.DB, initPromise);
+	return initPromise;
+}
+
+// 一次读全部群的设置与白名单（只有独立群会走到这里，量很小）。表不存在时只有 sqlite_master 探测。
+async function loadGroupLocalStateFromD1(env) {
+	const state = { settings: {}, whitelist: {} };
+	if (await d1TableExists(env, 'group_settings')) {
+		const { results } = await env.DB.prepare('SELECT chat_id, detect, action FROM group_settings').all();
+		for (const row of results || []) {
+			state.settings[String(row.chat_id)] = { detect: Number(row.detect) !== 0, action: row.action === 'mute' ? 'mute' : 'kick' };
+		}
+	}
+	if (await d1TableExists(env, 'group_whitelist')) {
+		const { results } = await env.DB.prepare('SELECT chat_id, user_id FROM group_whitelist').all();
+		for (const row of results || []) {
+			const chat = String(row.chat_id);
+			(state.whitelist[chat] || (state.whitelist[chat] = [])).push(String(row.user_id));
+		}
+	}
+	return state;
+}
+
+async function loadGroupLocalSettings(env, chatId) {
+	const id = String(chatId ?? '');
+	const state = await loadD1RuntimeCachedValue(env, D1_GROUP_LOCAL_CACHE, loadGroupLocalStateFromD1);
+	const settings = state?.settings?.[id] || GROUP_LOCAL_DEFAULTS;
+	return { detect: settings.detect !== false, action: settings.action === 'mute' ? 'mute' : 'kick', whitelist: state?.whitelist?.[id] || [] };
+}
+
+// 独立群自动检测的入口闸：'whitelisted' = 本群白名单；'disabled' = 本群关了检测；'' = 照常检测。
+// 读失败按「照常检测」处理：一次 D1 抖动不能把整个群静默变成不设防（与 isDryRunGroup 同口径）。
+async function resolveLocalAdDetectionSkip(env, chatId, userId) {
+	if (!env?.DB || !isIndependentGroup(chatId)) return '';
+	try {
+		const local = await loadGroupLocalSettings(env, chatId);
+		if (local.whitelist.includes(String(userId ?? ''))) return 'whitelisted';
+		return local.detect ? '' : 'disabled';
+	} catch (error) {
+		console.error('[本群设置] 读取失败（按照常检测继续）:', error);
+		return '';
+	}
+}
+
+async function saveGroupLocalSettings(env, chatId, patch, setBy) {
+	await ensureGroupLocalTables(env);
+	const id = String(chatId);
+	const cur = await env.DB.prepare('SELECT detect, action FROM group_settings WHERE chat_id = ?').bind(id).first();
+	const detect = patch.detect !== undefined ? patch.detect : (cur ? Number(cur.detect) !== 0 : GROUP_LOCAL_DEFAULTS.detect);
+	const action = patch.action || (cur?.action === 'mute' ? 'mute' : GROUP_LOCAL_DEFAULTS.action);
+	await env.DB.prepare('INSERT OR REPLACE INTO group_settings (chat_id, detect, action, set_by, set_at) VALUES (?, ?, ?, ?, ?)')
+		.bind(id, detect ? 1 : 0, action, String(setBy ?? ''), new Date().toISOString()).run();
+	D1_GROUP_LOCAL_CACHE.delete(env.DB);
+}
+
+async function updateGroupWhitelist(env, chatId, ids, add, by) {
+	await ensureGroupLocalTables(env);
+	const uniqueIds = normalizeBatchMutationIds(ids);
+	if (!uniqueIds.length) return 0;
+	const chat = String(chatId);
+	const at = new Date().toISOString();
+	const statements = uniqueIds.map((id) => (add
+		? env.DB.prepare('INSERT OR IGNORE INTO group_whitelist (chat_id, user_id, by_user, at) VALUES (?, ?, ?, ?)').bind(chat, id, String(by ?? ''), at)
+		: env.DB.prepare('DELETE FROM group_whitelist WHERE chat_id = ? AND user_id = ?').bind(chat, id)));
+	await env.DB.batch(statements);
+	D1_GROUP_LOCAL_CACHE.delete(env.DB);
+	return uniqueIds.length;
+}
+
+// 独立群的自动定罪：写本群黑名单 → 只在本群按本群处置方式执行 → 删触发消息 → 通知第一主人。
+// 刻意不做：全局加黑、学特征（判据库全局共用）、同款连带 / 同款名单 / 重发名单（都会外溢到别的群）。
+// 通知不挂 /ignore 快照与纠错按钮：那几档操作的是全局黑名单与判据库，对本群记录不对口。
+async function enforceLocalAdDetection(env, input, evaluation, options, ctx) {
+	const { userId, chatId, note } = ctx;
+	let action = GROUP_LOCAL_DEFAULTS.action;
+	try {
+		action = (await loadGroupLocalSettings(env, chatId)).action;
+	} catch (error) {
+		console.error('[广告检测·本群] 读取处置方式失败（按踢出执行）:', error);
+	}
+	let blacklistCode = 'ERROR';
+	try {
+		const added = await addToGroupBlacklist(env, chatId, [userId], { reason: 'ad_auto', by: 'system', note });
+		blacklistCode = added.success.length ? 'ADDED' : added.exists.length ? 'EXISTS' : 'ERROR';
+	} catch (error) {
+		console.error('[广告检测·本群] 加入本群黑名单失败:', error);
+	}
+	let banResults = [];
+	try {
+		banResults = await banUserFromAllGroups(userId, {
+			primaryGroupId: options.primaryGroupId,
+			probeMembership: options.probeMembership !== false,
+			revokeMessages: true,
+			mode: action,
+			groupIds: [chatId]
+		});
+	} catch (error) {
+		console.error('[广告检测·本群] 本群处置失败:', error);
+	}
+	await recordDisposalsFromBanResults(env, banResults);
+	const okCount = banResults.filter((r) => r.ok).length;
+	const failedGroupLines = banResults.filter((r) => !r.ok)
+		.map((r) => r.groupId + '（' + toChineseErrorText(r.error || '未知') + '）');
+	const actionLabel = action === 'mute' ? '禁言' : '踢出';
+	const banResultLine = '本群' + actionLabel + ' ' + okCount + '/' + banResults.length;
+	if (chatId && input?.messageId) {
+		try {
+			await deleteMessage(chatId, input.messageId);
+		} catch (error) {
+			console.error('[广告检测·本群] 删除触发消息失败:', error);
+		}
+	}
+	const ownerId = getOwnerNotifyTargets()[0] || '';
+	if (ownerId) {
+		const notice = renderAdDetectionNotice(evaluation, {
+			userId,
+			chatTitle: input?.chatTitle || '',
+			seq: null,
+			banResultLine,
+			failedGroupLines,
+			learnLine: '独立群不学特征（判据库全部配置群共用）'
+		});
+		const tail = [
+			'',
+			'范围：本群黑名单（独立群 <code>' + escapeHtml(chatId) + '</code>，只处置本群，不进全局黑名单）',
+			'误判由该群管理员在群里发 <code>/unban ' + escapeHtml(userId) + '</code> 解除'
+		];
+		try {
+			await sendTelegramMessageChunks(ownerId, notice + '\n' + tail.join('\n'));
+		} catch (error) {
+			console.error('[广告检测·本群] 推送判定通知失败:', error);
+		}
+	}
+	const banSummary = banResultLine + (failedGroupLines.length ? '；失败：' + failedGroupLines.join('、') : '');
+	console.log('[广告检测·本群] 已处置 user=' + userId + ' chat=' + chatId + ' layer=' + evaluation.layer
+		+ ' score=' + evaluation.score + ' 本群黑名单=' + blacklistCode + ' 处置=' + banSummary);
+	return { banned: true, local: true, seq: null, blacklistCode, banSummary, learned: 0, sampleAdded: false };
+}
+
 // 拦截判定（发言 / 复入群 / 原生解封封回共用），输入是 checkBlacklist 的结果，返回同形状：
 //   独立群：全局记录只认第一主人封的；其余看本群黑名单。
 //   全局群：全局记录照旧；没命中且该群有本群黑名单记录（超管「拉入本群黑名单」）才多查一条主键。
@@ -10071,6 +10231,97 @@ async function handleLocalBansCommand(message, env, ctx) {
 	if (rows.length >= 50) lines.push('', 'ℹ️ 只显示最近 50 条。');
 	lines.push('', '解封本群记录：<code>/unban 用户ID</code>');
 	await sendTelegramMessageChunks(chatId, lines.join('\n'));
+}
+
+// /localset —— 独立群的本群设置（只在群里用）。
+// 权限：第一主人、本群群主、有 Telegram「修改群组信息」权限的管理员。
+// 匿名管理员查不到真实身份与权限 → 明确拒绝；普通成员静默（不暴露命令）。
+const LOCALSET_USAGE = '用法：\n'
+	+ '<code>/localset</code> 查看本群设置\n'
+	+ '<code>/localset 检测 开|关</code> 本群广告自动检测\n'
+	+ '<code>/localset 演练 开|关</code> 演练：只记录不处置\n'
+	+ '<code>/localset 处置 踢出|禁言</code> 自动检测命中后的处置方式\n'
+	+ '<code>/localset 白名单 加|删 TGID,TGID</code> 本群白名单（只免本群自动检测）';
+
+async function handleLocalSetCommand(message, env, ctx, rest) {
+	const chatId = String(message.chat.id);
+	const operatorId = getMessageActorId(message);
+	const flash = (textOut) => sendFlashMessage(chatId, textOut, ctx);
+	if (isAnonymousAdminMessage(message)) {
+		await flash('❌ /localset 不支持匿名管理员：无法确认你的权限，请关闭匿名后再发。');
+		return;
+	}
+	if (!isPrimaryOwner(operatorId)) {
+		let member = null;
+		const isAdmin = await checkIfUserIsAdminInGroup(operatorId, chatId, { onMember: (m) => { member = m; } });
+		const canChangeInfo = member?.status === 'creator' || member?.can_change_info === true;
+		if (!isAdmin && !isPrivilegedManager(operatorId) && !isSuperAdmin(operatorId)) return;
+		if (!canChangeInfo) {
+			await flash('❌ /localset 需要本群群主或有 Telegram「修改群组信息」权限的管理员。');
+			return;
+		}
+	}
+	await deleteAuthorizedGroupCommandMessage(message, '/localset');
+	if (!isIndependentGroup(chatId)) {
+		await flash('ℹ️ /localset 仅独立群可用。全局群的设置由第一主人统一管理（切独立：<code>/groupmode independent</code>）。');
+		return;
+	}
+	if (!env?.DB) {
+		await flash('❌ 未绑定 D1 存储空间，无法读写本群设置。');
+		return;
+	}
+	const tokens = String(rest || '').split(/[\s,，]+/).filter(Boolean);
+	const key = tokens[0] || '';
+	const value = tokens[1] || '';
+	const ON = ['开', '开启', 'on'];
+	const OFF = ['关', '关闭', 'off'];
+	const isOn = ON.includes(value.toLowerCase());
+	const isOff = OFF.includes(value.toLowerCase());
+	try {
+		if (!key) {
+			const local = await loadGroupLocalSettings(env, chatId);
+			const dry = await isDryRunGroup(env, chatId);
+			const lines = [
+				'⚙️ <b>本群设置</b>（' + formatGroupModeLabel(chatId) + '）',
+				'检测：' + (local.detect ? '✅ 开' : '⛔ 关'),
+				'演练：' + (dry ? '🧪 开（只记录不处置）' : '关'),
+				'处置：' + (local.action === 'mute' ? '禁言' : '踢出'),
+				'白名单：' + (local.whitelist.length ? local.whitelist.map((id) => '<code>' + escapeHtml(id) + '</code>').join('、') : '（空）'),
+				'',
+				LOCALSET_USAGE
+			];
+			await sendTelegramMessageChunks(chatId, lines.join('\n'));
+			return;
+		}
+		if (key === '检测' && (isOn || isOff)) {
+			await saveGroupLocalSettings(env, chatId, { detect: isOn }, operatorId);
+			await flash('✅ 本群广告自动检测已' + (isOn ? '开启' : '关闭') + '。');
+			return;
+		}
+		if (key === '演练' && (isOn || isOff)) {
+			const res = await setDryRun(env, chatId, isOn, operatorId);
+			await flash(res.ok ? '✅ 本群演练已' + (isOn ? '开启：命中只记录、不处置' : '关闭：恢复正常处置') + '。' : '❌ 保存失败：' + escapeHtml(res.error || '未知'));
+			return;
+		}
+		const actionMap = { 踢出: 'kick', 踢: 'kick', kick: 'kick', 禁言: 'mute', mute: 'mute' };
+		if (key === '处置' && actionMap[value.toLowerCase()]) {
+			const action = actionMap[value.toLowerCase()];
+			await saveGroupLocalSettings(env, chatId, { action }, operatorId);
+			await flash('✅ 本群自动检测处置方式已改为：' + (action === 'mute' ? '禁言' : '踢出') + '。');
+			return;
+		}
+		const ids = tokens.slice(2).filter((id) => /^\d{1,20}$/.test(id));
+		if (key === '白名单' && (value === '加' || value === '删') && ids.length) {
+			const n = await updateGroupWhitelist(env, chatId, ids, value === '加', operatorId);
+			await flash('✅ 本群白名单已' + (value === '加' ? '加入 ' : '移除 ') + n + ' 人：' + ids.map((id) => '<code>' + escapeHtml(id) + '</code>').join('、'));
+			return;
+		}
+	} catch (error) {
+		console.error('[本群设置] 读写失败:', error);
+		await flash('❌ 读写本群设置失败，请稍后重试。');
+		return;
+	}
+	await flash('❌ 无法识别的参数。\n' + LOCALSET_USAGE);
 }
 
 // /ban /sban /spam 在分流为非全局时的统一出口；返回 true = 已处理完。
@@ -13813,8 +14064,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 其余消息照旧放后台写，不阻塞热路径。群管理员放到命中之后再查（罕见路径才花这一次请求）。
 		const senderIdStr = String(message.from.id);
 		// 杀手群与同款直封隔离：在杀手群里发同款不触发直封（消息照常写缓存，只是不查名单）。
+		// 独立群同理：同款直封写的是全局黑名单、封的是全局群，独立群的消息不能把人送进全局名单
+		//（独立群里的同款仍由本群自动检测判定，受 /localset 检测 / 白名单 / 演练 管）。
 		const spamEligible = !message.reply_to_message && !isOwner(senderIdStr) && !isSuperAdmin(senderIdStr)
-			&& !isKillerModeGroup(chatId);
+			&& !isKillerModeGroup(chatId) && !isIndependentGroup(chatId);
 		if (spamEligible) {
 			const cached = await cacheModerationMessage(env, message, { isAd: adObserved });
 			// senderIdStr 已排除主人/副主人/超管；这里再补「任意配置群的群主/管理员」豁免。
@@ -15022,6 +15275,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	if (parseTelegramCommand(text).head === '/localbans') {
 		if (isBotOperator(message.from) || message.chat.type === 'private' || !isConfiguredGroup(chatId)) return;
 		await handleLocalBansCommand(message, env, ctx);
+		return;
+	}
+
+	// /localset —— 独立群的本群设置（检测 / 演练 / 处置 / 本群白名单），只在群里用。
+	if (parseTelegramCommand(text).head === '/localset') {
+		if (isBotOperator(message.from) || message.chat.type === 'private' || !isConfiguredGroup(chatId)) return;
+		await handleLocalSetCommand(message, env, ctx, parseTelegramCommand(text).rest);
 		return;
 	}
 
@@ -27456,6 +27716,11 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// 所以这里无条件拦，【不看 options.force】：force 的语义只是「跳过阈值裁决」，
 	// 不是「跳过白名单」—— 主人手动点确认时若目标在白名单，回执会写明原因而不是静默失败。
 	if (await isAdUserWhitelisted(env, userId)) return { banned: false, seq: null, reason: 'whitelisted' };
+	// 独立群的本群白名单同理（只在独立群读，全局群零额外 SQL）。
+	const localScope = Boolean(chatId) && isIndependentGroup(chatId);
+	if (localScope && (await resolveLocalAdDetectionSkip(env, chatId, userId)) === 'whitelisted') {
+		return { banned: false, seq: null, reason: 'whitelisted' };
+	}
 
 	// ===== 演练模式：命中记流水 + 学特征 + 推私聊，处置一个都不做 =====
 	//
@@ -27495,13 +27760,16 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		// 判据不另写一套。学完把七类结果一并写进流水：确认封时据此跳过重复学习，
 		// 关演练时据此出汇总回执。
 		let tally = { learned: 0, sampleAdded: false, badges: 0, avatars: 0, images: 0, shapes: 0, links: 0 };
-		try {
-			tally = await learnAdFeaturesOnVerdict(env, evaluation, {
-				userId,
-				whitelist: options.whitelist
-			});
-		} catch (error) {
-			console.error('[广告检测·演练] 特征学习失败:', error);
+		// 独立群不学：判据库是全部配置群共用的，独立群自治不能反过来改全局判据。
+		if (!localScope) {
+			try {
+				tally = await learnAdFeaturesOnVerdict(env, evaluation, {
+					userId,
+					whitelist: options.whitelist
+				});
+			} catch (error) {
+				console.error('[广告检测·演练] 特征学习失败:', error);
+			}
 		}
 		const learnedCount = Number(tally.learned) || 0;
 		const sampleLearned = Boolean(tally.sampleAdded);
@@ -27549,6 +27817,13 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	];
 	if (evaluation.aiSimilarity > 0) noteParts.push('相似度 ' + evaluation.aiSimilarity.toFixed(3));
 	const note = noteParts.join(' | ').slice(0, 200);
+
+	// 独立群：只记本群黑名单、只处置本群，不进全局黑名单、不学特征、不做同款连带。
+	if (localScope) {
+		const result = await enforceLocalAdDetection(env, input, evaluation, options, { userId, chatId, note });
+		await deleteAdScreening(env, userId);
+		return result;
+	}
 
 	let blacklistCode = 'SKIPPED';
 	try {
@@ -27758,6 +28033,10 @@ async function screenAdJoinMember(env, member, options = {}) {
 	const chatId = String(options.chatId ?? '');
 	if (!chatId) return 'skipped';
 	if (!env?.DB) return 'skipped';
+	// 独立群：本群白名单整体不查；本群关了检测也整体不查（全局群不读这两张表）。
+	const localSkip = await resolveLocalAdDetectionSkip(env, chatId, userId);
+	if (localSkip === 'whitelisted') return 'whitelisted';
+	if (localSkip === 'disabled') return 'skipped';
 	if (!(await adDetectionReady(env))) return 'skipped';
 
 	try {
@@ -27972,6 +28251,8 @@ async function detectAdOnMessage(message, env) {
 	// 不依赖任何具体 handle 名单（快照 #1961 正是靠「引流出口×3(含bot)」命中的）。
 	if (isAdExemptBot(from)) return false;
 	if (!isConfiguredGroup(chat.id)) return false;
+	// 独立群：本群白名单 / 本群关了检测 → 整条判定链不进（全局群直接返回 ''，不读表）。
+	if (await resolveLocalAdDetectionSkip(env, chat.id, from.id)) return false;
 
 	// 临时诊断开关：环境变量 AD_DEBUG_DUMP_UPDATE=1 时，把本群每条消息的 update 原文打进日志。
 	// 刻意放在【所有豁免检查之前】—— 主人 / 管理员会在下面几行直接 return，
