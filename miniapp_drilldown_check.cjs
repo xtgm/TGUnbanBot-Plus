@@ -48,7 +48,7 @@ function killerData(action, body) {
 		case 'groups': return groups;
 		case 'stats': { lastStats = body; const single = /^\d{4}-\d{2}-\d{2}$/.test(String(body.range)); return { chatId: body.chatId, range: body.range || 'day', label: single ? body.range + ' 单日' : '今日', start: single ? body.range : '2026-10-24', end: single ? body.range : '2026-10-24', summary: { totalMsg: 9, activeUsers: 2, join: 1, leave: 1, kicked: 0 }, ranking: { rows: [{ rank: 1, userId: '777', displayName: '排行第一', count: 6 }, { rank: 2, userId: '888', displayName: '排行第二', count: 3 }], total: 2, page: 1, totalPages: 1 }, trend: [{ day: '2026-10-23', msg: 9 }] }; }
 		case 'stats/members': lastMembers = body; return body.kind === 'join'
-			? { kind: 'join', rows: [{ userId: '999', kind: 'join', at: 1780000000, displayName: '入群甲' }], total: 1, page: 1, totalPages: 1 }
+			? { kind: 'join', rows: [{ userId: '999', kind: 'join', at: 1780000000, displayName: '入群甲', username: 'jia' }], total: 1, page: 1, totalPages: 1 }
 			: { kind: 'leave', rows: [{ userId: '998', kind: 'kicked', at: 1780000000, displayName: '被移出乙' }], total: 1, page: 1, totalPages: 1 };
 		case 'search': return { page: 1, total: 1, totalPages: 1, rows: searchRows };
 		case 'users/query': return userData(body.userId);
@@ -150,6 +150,8 @@ async function run() {
 		await waitText(kp, 'stats-content', '排行第一');
 		const rank = kp.locator('#stats-content .rank-row.clickable');
 		check('排行每行可点（2 行）', (await rank.count()) === 2, String(await rank.count()));
+		const rankText = await kp.evaluate(() => [...document.querySelectorAll('#stats-content .rank-row')].map((el) => el.textContent));
+		check('排行有昵称时 TGID 照样显示', rankText[0] && rankText[0].includes('排行第一') && rankText[0].includes('ID 777'), JSON.stringify(rankText));
 		const killerStat = kp.locator('#stats-content .stat.clickable');
 		check('发言 / 活跃人数两个数字可点', await kp.evaluate(() => [...document.querySelectorAll('#stats-content .stat')].slice(0, 2).every((el) => el.classList.contains('clickable'))));
 		if (await rank.count()) {
@@ -172,6 +174,8 @@ async function run() {
 			check('入群明细请求带 kind=join', lastMembers && lastMembers.kind === 'join' && lastMembers.range === 'day', JSON.stringify(lastMembers));
 			const mrow = kp.locator('#stats-members .rank-row.clickable');
 			check('入群明细每行可点', (await mrow.count()) === 1, String(await mrow.count()));
+			const mText = await kp.evaluate(() => document.querySelector('#stats-members .rank-row')?.textContent || '');
+			check('明细同时显示昵称、@用户名、TGID', mText.includes('入群甲') && mText.includes('@jia') && mText.includes('ID 999'), mText);
 			await kp.locator('#stats-content .stat.clickable').nth(3).focus(); await kp.keyboard.press('Enter');
 			check('键盘 Enter 点「退群」→ 列出退群与被移出的人', await waitText(kp, 'stats-members', '被移出乙') && lastMembers.kind === 'leave');
 			if (await mrow.count()) {

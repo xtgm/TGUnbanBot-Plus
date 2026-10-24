@@ -1613,7 +1613,9 @@ const KILLER_MINI_APP_HTML_HEAD = String.raw`<!doctype html>
     .rank-row{display:grid;grid-template-columns:34px minmax(0,1fr) max-content;gap:8px;align-items:center;padding:8px 0;border-top:1px solid var(--line-soft);font-size:12px}
     .rank-row:first-child{border-top:0}
     .rank-no{font:11px var(--mono);color:var(--muted)}
-    .rank-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .rank-name{display:flex;flex-direction:column;min-width:0}
+    .rank-nick,.rank-meta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .rank-meta{font:10px var(--mono);color:var(--muted)}
     .rank-count{font:12px var(--mono);color:var(--accent)}
     .trend-row{display:grid;grid-template-columns:92px minmax(0,1fr) 46px;gap:8px;align-items:center;font-size:11px;padding:4px 0}
     .trend-bar{height:8px;border-radius:4px;background:var(--accent);opacity:.75;min-width:2px}
@@ -1855,11 +1857,13 @@ const KILLER_MINI_APP_HTML_SCRIPT = String.raw`  <script>
       var members = element('div'); members.id = 'stats-members';
       var grid = element('div', 'stat-grid'); [['发言', s.totalMsg, true, ''], ['活跃人数', s.activeUsers, false, ''], ['入群', s.join, false, 'join'], ['退群', Number(s.leave || 0) + Number(s.kicked || 0), false, 'leave']].forEach(function (row) { var stat = element('div', 'stat' + (row[2] ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(row[1])), element('div', 'stat-label', row[0])); if (!row[3]) clickable(stat, row[0] + ' ' + count(row[1]) + '，点击跳到发言排行', function () { jumpTo(rankLabel); }); else clickable(stat, row[0] + ' ' + count(row[1]) + '，点击查看是哪些人', function () { if (stat.classList.contains('active')) { stat.classList.remove('active'); members.replaceChildren(); return; } grid.querySelectorAll('.stat.active').forEach(function (el) { el.classList.remove('active'); }); stat.classList.add('active'); return loadStatMembers(members, data, row[3], 1); }); grid.append(stat); }); container.append(grid, members);
       var rank = element('article', 'card'); var rh = element('div', 'card-heading'); rh.append(rankLabel, element('span', 'counter', count(data.ranking && data.ranking.total) + ' 人')); rank.append(rh); var rows = (data.ranking && data.ranking.rows) || [];
-      if (!rows.length) rank.append(element('p', 'subtle', '这个时间段没有发言记录。')); else rows.forEach(function (r) { var row = element('div', 'rank-row'); var name = text(r.displayName, r.username ? '@' + r.username : 'ID ' + r.userId); row.append(element('span', 'rank-no', '#' + r.rank), element('span', 'rank-name', name), element('span', 'rank-count', count(r.count) + ' 条')); if (/^\d{1,20}$/.test(String(r.userId))) clickable(row, '查询 ' + name + ' 的资料与记录', function () { return openUser(r.userId); }); rank.append(row); });
+      if (!rows.length) rank.append(element('p', 'subtle', '这个时间段没有发言记录。')); else rows.forEach(function (r) { var row = element('div', 'rank-row'); var person = personCell(r); var name = person.name; row.append(element('span', 'rank-no', '#' + r.rank), person.cell, element('span', 'rank-count', count(r.count) + ' 条')); if (/^\d{1,20}$/.test(String(r.userId))) clickable(row, '查询 ' + name + ' 的资料与记录', function () { return openUser(r.userId); }); rank.append(row); });
       container.append(rank); if (data.ranking) pager($('stats-pager'), data.ranking, function (page) { return loadStats(page); });
       var trend = Array.isArray(data.trend) ? data.trend : []; var max = Math.max.apply(null, [1].concat(trend.map(function (d) { return d.msg; }))); var tc = element('article', 'card'); tc.append(element('h2', 'section-label', '近 7 天发言'));
       trend.forEach(function (d) { var row = element('div', 'trend-row'); var bar = element('div', 'trend-bar'); bar.style.width = Math.round(d.msg / max * 100) + '%'; var wrap = element('div'); wrap.append(bar); row.append(element('span', 'trend-day', d.day), wrap, element('span', 'trend-num', count(d.msg))); if (/^\d{4}-\d{2}-\d{2}$/.test(String(d.day))) clickable(row, d.day + ' 发言 ' + count(d.msg) + ' 条，点击查看这一天的统计', function () { return showStatDay(d.day); }); tc.append(row); }); container.append(tc);
     }
+    // 人名格：第一行昵称（没有就用 @用户名，再没有就用 ID），第二行 @用户名 · ID —— TGID 永远显示。
+    function personCell(r) { var cell = element('span', 'rank-name'); var nick = text(r.displayName, r.username ? '@' + r.username : 'ID ' + r.userId); var meta = [r.username && r.displayName ? '@' + r.username : '', nick === 'ID ' + r.userId ? '' : 'ID ' + r.userId].filter(Boolean).join(' · '); cell.append(element('span', 'rank-nick', nick)); if (meta) cell.append(element('span', 'rank-meta', meta)); return { cell: cell, name: nick }; }
     // 趋势行点开：时间下拉切到那一天（单日选项只保留一个，不在下拉里越攒越多），按那一天重载整页统计。
     function showStatDay(day) { var select = $('stats-range'); var option = select.querySelector('option[data-day]'); if (!option) { option = element('option'); option.dataset.day = '1'; select.append(option); } option.value = day; option.textContent = day + '（单日）'; select.value = day; return loadStats(1); }
     async function loadStatMembers(box, stats, kind, page) {
@@ -1870,7 +1874,7 @@ const KILLER_MINI_APP_HTML_SCRIPT = String.raw`  <script>
       box.replaceChildren(); var kindName = data.kind === 'join' ? '入群' : '退群'; var card = element('article', 'card'); var head = element('div', 'card-heading'); var label = element('h2', 'section-label', kindName + '明细'); label.tabIndex = -1; head.append(label, element('span', 'counter', count(data.total) + ' 条')); card.append(head);
       var rows = Array.isArray(data.rows) ? data.rows : []; var tags = { join: '入群', leave: '退群', kicked: '被移出' };
       if (!rows.length) card.append(element('p', 'subtle', '这个时间段没有' + kindName + '明细（明细从记录功能上线后开始积累，数字与明细可能对不上）。'));
-      rows.forEach(function (r) { var row = element('div', 'rank-row'); var name = text(r.displayName, r.username ? '@' + r.username : 'ID ' + r.userId); row.append(element('span', 'rank-no', tags[r.kind] || text(r.kind)), element('span', 'rank-name', name), element('span', 'rank-count', date(r.at))); if (/^\d{1,20}$/.test(String(r.userId))) clickable(row, '查询 ' + name + ' 的资料与记录', function () { return openUser(r.userId); }); card.append(row); });
+      rows.forEach(function (r) { var row = element('div', 'rank-row'); var person = personCell(r); var name = person.name; row.append(element('span', 'rank-no', tags[r.kind] || text(r.kind)), person.cell, element('span', 'rank-count', date(r.at))); if (/^\d{1,20}$/.test(String(r.userId))) clickable(row, '查询 ' + name + ' 的资料与记录', function () { return openUser(r.userId); }); card.append(row); });
       var nav = element('div'); card.append(nav); pager(nav, data, function (page) { return loadStatMembers(box, stats, data.kind, page); }); box.append(card); jumpTo(label);
     }
     async function navigate(tab, load) { if (!state.authenticated) return; state.active = tab; document.querySelectorAll('[data-tab]').forEach(function (button) { var active = button.dataset.tab === tab; button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1; $('page-' + button.dataset.tab).hidden = !active; }); updateBackButton(); window.scrollTo({ top: 0, behavior: 'instant' }); if (load === false) return; if (state.loaded[tab]) return; if (tab === 'groups') await loadGroups(); else if (tab === 'blacklist') await loadBlacklist(state.blacklistPage); else if (tab === 'stats') await loadStats(1); else if (tab === 'users') { if (!$('users-content').childNodes.length) userEmpty(); } }
@@ -2889,7 +2893,7 @@ function killerMiniAppStatRange(payload) {
 // 入群 / 退群明细：统计页「入群」「退群」两张卡点开看是哪些人。
 // 读 stat_member_events（逐条明细）；退群 = leave + kicked，与卡片上的数字同口径。
 // 时间段按统计时区切天：start 当天 0 点 ~ end 次日 0 点，换成 unix 秒（at 列存的是秒）。
-// 昵称取该人在本群的发言记录（stat_speech），没发过言就只有 ID。
+// 昵称三级回退：事件当场存的名字 → 本群发言记录（stat_speech）→ 广告名册（ad_group_members）；都没有就只给 ID。
 const KILLER_STAT_MEMBERS_PAGE_LIMIT = 30;
 async function killerMiniAppStatMembers(env, payload) {
 	const chatId = killerMiniAppGroupArg(payload, { required: true });
@@ -2906,38 +2910,50 @@ async function killerMiniAppStatMembers(env, payload) {
 	const toSec = Date.parse(info.end + 'T00:00:00Z') / 1000 + 86400 - offsetSec;
 	const kinds = kind === 'join' ? ['join'] : ['leave', 'kicked'];
 	const kindSql = kinds.map(() => '?').join(', ');
-	try {
-		const totalRow = await env.DB.prepare(
-			'SELECT COUNT(*) AS c FROM stat_member_events WHERE chat_id = ? AND kind IN (' + kindSql + ') AND at >= ? AND at < ?'
-		).bind(String(chatId), ...kinds, fromSec, toSec).first();
-		result.total = Number(totalRow?.c) || 0;
-		result.totalPages = Math.max(1, Math.ceil(result.total / limit));
-		const { results } = await env.DB.prepare(
-			'SELECT e.user_id, e.kind, e.at, e.actor_id, e.via_request, '
-			+ '(SELECT MAX(s.display_name) FROM stat_speech s WHERE s.chat_id = e.chat_id AND s.user_id = e.user_id) AS display_name, '
-			+ '(SELECT MAX(s.username) FROM stat_speech s WHERE s.chat_id = e.chat_id AND s.user_id = e.user_id) AS username '
-			+ 'FROM stat_member_events e WHERE e.chat_id = ? AND e.kind IN (' + kindSql + ') AND e.at >= ? AND e.at < ? '
-			+ 'ORDER BY e.at DESC, e.user_id ASC LIMIT ? OFFSET ?'
-		).bind(String(chatId), ...kinds, fromSec, toSec, limit, (page - 1) * limit).all();
-		result.rows = (results || []).map((r) => ({
-			userId: String(r.user_id || ''),
-			kind: String(r.kind || ''),
-			at: Number(r.at) || 0,
-			actorId: r.actor_id ? String(r.actor_id) : '',
-			viaRequest: Number(r.via_request) === 1,
-			displayName: String(r.display_name || ''),
-			username: String(r.username || '')
-		}));
-	} catch (error) {
-		// stat_speech 尚未建表时子查询会报 no such table：退回不带昵称的查询，明细照样给
-		if (!/no such table/i.test(String(error?.message || error))) throw error;
-		const { results } = await env.DB.prepare(
-			'SELECT user_id, kind, at, actor_id, via_request FROM stat_member_events WHERE chat_id = ? AND kind IN (' + kindSql + ') AND at >= ? AND at < ? '
-			+ 'ORDER BY at DESC, user_id ASC LIMIT ? OFFSET ?'
-		).bind(String(chatId), ...kinds, fromSec, toSec, limit, (page - 1) * limit).all();
-		result.rows = (results || []).map((r) => ({ userId: String(r.user_id || ''), kind: String(r.kind || ''), at: Number(r.at) || 0, actorId: r.actor_id ? String(r.actor_id) : '', viaRequest: Number(r.via_request) === 1, displayName: '', username: '' }));
-	}
+	const totalRow = await env.DB.prepare(
+		'SELECT COUNT(*) AS c FROM stat_member_events WHERE chat_id = ? AND kind IN (' + kindSql + ') AND at >= ? AND at < ?'
+	).bind(String(chatId), ...kinds, fromSec, toSec).first();
+	result.total = Number(totalRow?.c) || 0;
+	result.totalPages = Math.max(1, Math.ceil(result.total / limit));
+	const { results } = await env.DB.prepare(
+		'SELECT user_id, kind, at, actor_id, via_request, display_name, username FROM stat_member_events '
+		+ 'WHERE chat_id = ? AND kind IN (' + kindSql + ') AND at >= ? AND at < ? '
+		+ 'ORDER BY at DESC, user_id ASC LIMIT ? OFFSET ?'
+	).bind(String(chatId), ...kinds, fromSec, toSec, limit, (page - 1) * limit).all();
+	result.rows = (results || []).map((r) => ({
+		userId: String(r.user_id || ''),
+		kind: String(r.kind || ''),
+		at: Number(r.at) || 0,
+		actorId: r.actor_id ? String(r.actor_id) : '',
+		viaRequest: Number(r.via_request) === 1,
+		displayName: String(r.display_name || ''),
+		username: String(r.username || '')
+	}));
+	await fillStatMemberNames(env, chatId, result.rows);
 	return result;
+}
+
+// 旧记录（补列之前写的）没有名字：一页最多 30 人，按「本群发言记录 → 广告名册」各查一次补上。
+// 两张表各自 try：哪张没建表只少一级回退，不影响明细本身。
+async function fillStatMemberNames(env, chatId, rows) {
+	const missing = () => [...new Set(rows.filter((r) => !r.displayName && !r.username).map((r) => r.userId))];
+	const apply = (map) => { for (const r of rows) { const hit = map.get(r.userId); if (hit && !r.displayName && !r.username) { r.displayName = hit.displayName; r.username = hit.username; } } };
+	const sources = [
+		(ids) => env.DB.prepare('SELECT user_id, MAX(display_name) AS display_name, MAX(username) AS username FROM stat_speech '
+			+ 'WHERE chat_id = ? AND user_id IN (' + ids.map(() => '?').join(', ') + ') GROUP BY user_id').bind(String(chatId), ...ids).all(),
+		(ids) => env.DB.prepare("SELECT user_id, TRIM(COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')) AS display_name, username FROM ad_group_members "
+			+ 'WHERE user_id IN (' + ids.map(() => '?').join(', ') + ')').bind(...ids).all()
+	];
+	for (const query of sources) {
+		const ids = missing();
+		if (!ids.length) return;
+		try {
+			const { results } = await query(ids);
+			apply(new Map((results || []).map((x) => [String(x.user_id), { displayName: String(x.display_name || ''), username: String(x.username || '') }])));
+		} catch (error) {
+			if (!/no such table/i.test(String(error?.message || error))) console.error('[杀手统计] 补昵称失败:', error);
+		}
+	}
 }
 async function killerMiniAppStats(env, payload) {
 	const chatId = killerMiniAppGroupArg(payload, { required: true });
@@ -8208,6 +8224,9 @@ async function handleChatMemberUpdate(chatMember, env) {
 					actorId: fromIdStr,
 					inviteLink: chatMember?.invite_link?.invite_link || null,
 					viaRequest: chatMember?.via_join_request === true,
+					firstName: targetUser.first_name || '',
+					lastName: targetUser.last_name || '',
+					username: targetUser.username || '',
 				});
 		}
 	}
@@ -29197,7 +29216,22 @@ async function ensureStatMemberEventsTable(env) {
 				'CREATE TABLE IF NOT EXISTS stat_member_events ('
 				+ 'chat_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL, '
 				+ 'actor_id TEXT, invite_link TEXT, via_request INTEGER NOT NULL DEFAULT 0, '
+				+ "display_name TEXT NOT NULL DEFAULT '', username TEXT NOT NULL DEFAULT '', "
 				+ 'PRIMARY KEY (chat_id, user_id, kind, at))');
+			// 存量库补列（2026-10-24）：进退群明细要显示昵称，事件里自带的名字当场存下。
+			// 先查后加，同 stat_speech.last_msg_id：新建表已带这两列，无脑 ALTER 会撞 duplicate column。
+			let cols = null;
+			try {
+				const colRows = await env.DB.prepare('PRAGMA table_info(stat_member_events)').all();
+				cols = new Set((colRows?.results || []).map((c) => String(c?.name || '')));
+			} catch (error) {
+				console.warn('[入群记录] 检查名字列失败，尝试直接补列:', error && error.message);
+			}
+			for (const column of ['display_name', 'username']) {
+				if (cols && cols.has(column)) continue;
+				await runD1SchemaStatement(env, 'stat_member_events.' + column,
+					'ALTER TABLE stat_member_events ADD COLUMN ' + column + " TEXT NOT NULL DEFAULT ''", { optional: true });
+			}
 			await runD1SchemaStatement(env, 'idx_stat_member_events_user',
 				'CREATE INDEX IF NOT EXISTS idx_stat_member_events_user ON stat_member_events (user_id, at)', { optional: true });
 			return true;
@@ -29225,8 +29259,8 @@ async function recordMemberEventDetail(env, chatId, userId, kind, atMs = Date.no
 	if (!(await ensureStatMemberEventsTable(env))) return;
 	try {
 		await env.DB.prepare(
-			'INSERT INTO stat_member_events (chat_id, user_id, kind, at, actor_id, invite_link, via_request) '
-			+ 'VALUES (?, ?, ?, ?, ?, ?, ?) '
+			'INSERT INTO stat_member_events (chat_id, user_id, kind, at, actor_id, invite_link, via_request, display_name, username) '
+			+ 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) '
 			+ 'ON CONFLICT(chat_id, user_id, kind, at) DO NOTHING'
 		).bind(
 			String(chatId),
@@ -29235,7 +29269,10 @@ async function recordMemberEventDetail(env, chatId, userId, kind, atMs = Date.no
 			Math.floor(Number(atMs) / 1000),
 			meta.actorId ? String(meta.actorId) : null,
 			meta.inviteLink ? String(meta.inviteLink) : null,
-			meta.viaRequest ? 1 : 0
+			meta.viaRequest ? 1 : 0,
+			// 事件自带的名字（ChatMemberUpdated / ChatJoinRequest 的 user），进群没说过话的人也有昵称
+			[meta.firstName, meta.lastName].filter(Boolean).map(String).join(' ').slice(0, 128),
+			String(meta.username || '').slice(0, 64)
 		).run();
 	} catch (error) {
 		console.error('[入群记录] 写入失败:', error);
@@ -30120,6 +30157,9 @@ async function handleChatJoinRequest(req, env) {
 		await recordMemberEventDetail(env, chatId, userId, 'join_request', req.date ? req.date * 1000 : Date.now(), {
 			inviteLink: req.invite_link?.invite_link || null,
 			viaRequest: true,
+			firstName: user?.first_name || '',
+			lastName: user?.last_name || '',
+			username: user?.username || '',
 		});
 	} catch (error) {
 		console.error('[入群记录] 申请事件处理失败:', error);

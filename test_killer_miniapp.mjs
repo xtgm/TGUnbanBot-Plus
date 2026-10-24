@@ -354,5 +354,32 @@ log('\n=== 13. 统计下钻：入群 / 退群明细 + 单日时间段 ===');
 	check('不合法的日期仍回退为今天', r.data?.range === 'day', JSON.stringify(r.data?.range));
 }
 
+log('\n=== 14. 进退群明细的昵称：事件当场存 + 旧记录回退名册 ===');
+{
+	const dayStartSec = Date.parse(W.statRangeDays(env, 'day').start + 'T00:00:00Z') / 1000 - 8 * 3600;
+	// 新记录：入群事件自带的名字当场存进明细（没发过言也有昵称）
+	await W.recordMemberEventDetail(env, K, '67001', 'join', (dayStartSec + 200) * 1000, { firstName: '新人', lastName: '丙', username: 'bing' });
+	// 旧记录：明细里没名字，名册 ad_group_members 里有
+	env.DB.prepare('INSERT INTO stat_member_events (chat_id, user_id, kind, at, via_request) VALUES (?, ?, ?, ?, 0)').bind(K, '67002', 'join', dayStartSec + 210).run();
+	env.DB.prepare('INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at) VALUES (?, ?, ?, ?, ?, 0, 0, 0)').bind('67002', K, '老成员', '丁', 'ding').run();
+	// 哪里都没有名字
+	env.DB.prepare('INSERT INTO stat_member_events (chat_id, user_id, kind, at, via_request) VALUES (?, ?, ?, ?, 0)').bind(K, '67003', 'join', dayStartSec + 220).run();
+	const r = await api(KA, 'killer/stats/members', { chatId: K, range: 'day', kind: 'join' });
+	const by = Object.fromEntries((r.data?.rows || []).map((x) => [x.userId, x]));
+	check('新记录：事件当场存的昵称与用户名', by['67001']?.displayName === '新人 丙' && by['67001']?.username === 'bing', JSON.stringify(by['67001']));
+	check('旧记录：回退名册取昵称与用户名', by['67002']?.displayName === '老成员 丁' && by['67002']?.username === 'ding', JSON.stringify(by['67002']));
+	check('旧记录：回退发言记录取昵称（66001）', by['66001']?.displayName === '进群甲', JSON.stringify(by['66001']));
+	check('哪里都没有名字 → 昵称为空，TGID 照给', by['67003'] && by['67003'].displayName === '' && by['67003'].userId === '67003', JSON.stringify(by['67003']));
+	const stored = env.DB.query("SELECT display_name, username FROM stat_member_events WHERE user_id = '67001'")[0];
+	check('名字真的落进 stat_member_events 两列', stored?.display_name === '新人 丙' && stored?.username === 'bing', JSON.stringify(stored));
+
+	// 老部署：表是旧结构（没有两列），懒加列后照常写入
+	const oldEnv = { ...env, DB: makeD1() };
+	oldEnv.DB.prepare('CREATE TABLE stat_member_events (chat_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL, actor_id TEXT, invite_link TEXT, via_request INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (chat_id, user_id, kind, at))').run();
+	await W.recordMemberEventDetail(oldEnv, K, '67009', 'join', Date.now(), { firstName: '旧库', username: 'oldlib' });
+	const migrated = oldEnv.DB.query("SELECT display_name, username FROM stat_member_events WHERE user_id = '67009'")[0];
+	check('旧结构的表自动补列后照常写入名字', migrated?.display_name === '旧库' && migrated?.username === 'oldlib', JSON.stringify(migrated));
+}
+
 log('\n' + (fail ? '❌' : '✅') + ' 杀手子后台：' + pass + ' 通过，' + fail + ' 失败');
 process.exit(fail ? 1 : 0);
