@@ -224,34 +224,22 @@ console.log('\n[9] HTML 注入防护');
 	assert('by 被转义', body.includes('&quot;&gt;&lt;svg&gt;') || body.includes('&#34;&gt;&lt;svg&gt;') || body.includes('"><svg>') === false);
 }
 
-// ---------- [10] 独立导出密钥 /export/{EXPORT_KEY}（给可信用户私发，不用交出 TOKEN） ----------
-console.log('\n[10] 独立导出密钥');
+// ---------- [10] 旧的独立密钥入口 /export/{KEY} 已删除 → 改由 域名/export 一次性密码登录（见 test_export_login.mjs） ----------
+console.log('\n[10] 旧密钥入口已删除');
 {
 	const KEY = 'export-key-for-test-0001';
 	const env = { ...baseEnv, EXPORT_KEY: KEY, DB: makeFakeDB(seed) };
-	let res = await call(`/export/${KEY}`, env);
-	const body = await res.text();
-	assert('正确密钥 → 200 HTML', res.status === 200 && res.headers.get('Content-Type').includes('text/html'), String(res.status));
-	assert('数据与 TOKEN 导出同一份黑名单（3 条）', body.includes('总计：<b>3</b>') && body.includes('1001') && body.includes('1003'));
-	assert('页面里的下载按钮走密钥路径，不出现 TOKEN', body.includes(`/export/${KEY}?format=csv`) && !body.includes(TOKEN));
-	assert('带 noindex 与 no-referrer 头', /noindex/.test(res.headers.get('X-Robots-Tag') || '') && res.headers.get('Referrer-Policy') === 'no-referrer');
-	res = await call(`/export/${KEY}?format=csv`, env);
-	const csv = await res.text();
-	assert('CSV 下载可用', res.status === 200 && (res.headers.get('Content-Disposition') || '').includes('.csv') && csv.split('\r\n').length === 4);
-	res = await call(`/export/${KEY}?format=json`, env);
-	assert('JSON 下载可用', res.status === 200 && JSON.parse(await res.text()).length === 3);
-	res = await call('/export/export-key-for-test-0002', env);
-	assert('错误密钥 → 404，不给数据', res.status === 404 && !(await res.text()).includes('1001'));
-	res = await call(`/export/${KEY}x`, env);
-	assert('密钥多一位 → 404', res.status === 404);
-	res = await call('/export/', env);
-	assert('空密钥 → 404', res.status === 404);
-	res = await call(`/export/${KEY}`, { ...baseEnv, DB: makeFakeDB(seed) });
-	assert('没配 EXPORT_KEY → 404（入口不存在）', res.status === 404);
-	res = await call('/export/short', { ...baseEnv, EXPORT_KEY: 'short', DB: makeFakeDB(seed) });
-	assert('密钥短于 16 位 → 不启用（404）', res.status === 404);
-	const same = await call('/export/SAME-AS-EXPORT-KEY-0001', { ...baseEnv, TOKEN: 'SAME-AS-EXPORT-KEY-0001', EXPORT_KEY: 'SAME-AS-EXPORT-KEY-0001', DB: makeFakeDB(seed) });
-	assert('EXPORT_KEY 与 TOKEN 相同 → 不启用（发出去等于交出 TOKEN）', same.status === 404);
+	for (const p of [`/export/${KEY}`, `/export/${KEY}?format=csv`, `/export/${KEY}?format=json`]) {
+		const res = await call(p, env);
+		const body = await res.text();
+		assert(`${p.replace(KEY, '{KEY}')} → 即使配了 EXPORT_KEY 也不给数据`, res.status !== 200 && !body.includes('1001') && !body.includes('1003'), String(res.status));
+	}
+	let res = await call('/export', env);
+	let body = await res.text();
+	assert('/export 没登录 → 登录页，不给数据', res.status === 200 && body.includes('type="password"') && !body.includes('1001'), String(res.status));
+	res = await call('/export?format=csv', env);
+	body = await res.text();
+	assert('/export?format=csv 没登录 → 不给文件', !(res.headers.get('Content-Disposition') || '').includes('.csv') && !body.includes('1001'));
 	res = await call(`/${TOKEN}/export`, env);
 	assert('原 TOKEN 导出照旧可用', res.status === 200);
 }

@@ -415,9 +415,9 @@ export default {
 		if (request.method === 'GET' && path === `${TOKEN}/export`) {
 			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
 			return await handleExport(env, url);
-		} else if (path.startsWith('export/')) {
-			// 黑名单导出（独立密钥 EXPORT_KEY）：私发给可信用户，只能看/下载黑名单，碰不到任何 TOKEN 管理接口
-			return await handleKeyedExport(request, env, url, path.slice('export/'.length));
+		} else if (path === 'export') {
+			// 黑名单导出（一次性密码登录）：给可信用户，只能看/下载黑名单，碰不到任何 TOKEN 管理接口
+			return await handlePasswordExport(request, env, url);
 		} else if (request.method === 'GET' && path === `${TOKEN}/purge/groups`) {
 			// 清扫前预检：只保留 bot 具备封禁权限的群
 			return await handlePurgeGroups();
@@ -6328,38 +6328,122 @@ async function handleBulkJobAutoRun(env, url, ctx, requestUrl) {
 //   ?format=json → application/json，触发浏览器下载
 //   ?format=csv  → text/csv，UTF-8 + BOM，Excel 可直接打开
 //   其它/默认    → HTML 表格，浏览器直接查看
-// 独立导出密钥：Dashboard 变量 EXPORT_KEY（建议设成 Secret）。
-// 不配 / 短于 16 位 / 与 TOKEN 相同 → 入口不启用，一律 404（与 TOKEN 相同时发出去就等于交出 TOKEN）。
-// 撤销某人的权限：在 Dashboard 换一个 EXPORT_KEY，旧链接立即失效。
-const EXPORT_KEY_MIN_LENGTH = 16;
-function getConfiguredExportKey(env) {
-	const raw = String(env?.EXPORT_KEY || '').trim();
-	if (raw.length < EXPORT_KEY_MIN_LENGTH || raw.length > 256) return '';
-	if (raw === String(env?.TOKEN || '').trim()) return '';
-	return raw;
+// ===== 域名/export：一次性密码登录后导出全局黑名单（给可信用户，不交出 TOKEN）=====
+// 第一主人私聊 /exportpass → 生成随机一次性密码（D1 只存 SHA-256），主人转发给对方；
+// 对方打开 域名/export 输入密码 → 换一个会话 cookie（不设过期 = 关掉浏览器即失效）→ 看 / 下载。
+// 密码登录成功一次即作废；没用过的 24 小时后也作废。会话服务端另有 12 小时上限，防浏览器「恢复会话」无限续命。
+const EXPORT_PASSWORD_TTL_SECONDS = 24 * 3600;
+const EXPORT_SESSION_MAX_SECONDS = 12 * 3600;
+const EXPORT_PASSWORD_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // 去掉 0/O、1/I，手抄不混
+const D1_EXPORT_AUTH_INIT = new WeakMap();
+
+async function ensureExportAuthTables(env) {
+	if (!env?.DB) return false;
+	const cached = D1_EXPORT_AUTH_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			await runD1SchemaStatement(env, 'export_passwords',
+				'CREATE TABLE IF NOT EXISTS export_passwords (hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER NOT NULL DEFAULT 0)');
+			await runD1SchemaStatement(env, 'export_sessions',
+				'CREATE TABLE IF NOT EXISTS export_sessions (hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
+			return true;
+		} catch (error) {
+			console.error('[导出登录] 建表失败:', formatD1SchemaError(error));
+			return false;
+		}
+	})();
+	D1_EXPORT_AUTH_INIT.set(env.DB, init);
+	const ok = await init;
+	if (!ok) D1_EXPORT_AUTH_INIT.delete(env.DB);
+	return ok;
 }
 
-// 定长比较：逐字节异或累加，不因前缀匹配提前返回，避免按耗时逐位猜密钥。
-function exportKeyMatches(received, expected) {
-	const enc = new TextEncoder();
-	const a = enc.encode(String(received || ''));
-	const b = enc.encode(String(expected || ''));
-	let diff = a.length ^ b.length;
-	for (let i = 0; i < b.length; i++) diff |= (a[i] ?? 0) ^ b[i];
-	return diff === 0;
+async function exportSha256Hex(value) {
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(value)));
+	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function handleKeyedExport(request, env, url, receivedKey) {
-	const expected = getConfiguredExportKey(env);
-	if (request.method !== 'GET' || !expected || !exportKeyMatches(receivedKey, expected)) {
-		return new Response('Not Found', { status: 404, headers: { 'Cache-Control': 'no-store' } });
+// 密码统一成「大写、去横杠和空白」再哈希：对方手抄时大小写、横杠写不写都认
+function normalizeExportPassword(raw) {
+	return String(raw || '').toUpperCase().replace(/[\s-]/g, '');
+}
+
+// 16 位，字母表 32 个字符 → 80 bit 随机；每 4 位一组用横杠分开
+async function createExportPassword(env) {
+	if (!(await ensureExportAuthTables(env))) return '';
+	const bytes = crypto.getRandomValues(new Uint8Array(16));
+	const plain = [...bytes].map((b) => EXPORT_PASSWORD_ALPHABET[b % EXPORT_PASSWORD_ALPHABET.length]).join('');
+	const now = Math.floor(Date.now() / 1000);
+	await env.DB.batch([
+		env.DB.prepare('DELETE FROM export_passwords WHERE expires_at < ? OR used_at > 0').bind(now),
+		env.DB.prepare('DELETE FROM export_sessions WHERE expires_at < ?').bind(now),
+		env.DB.prepare('INSERT INTO export_passwords (hash, created_at, expires_at, used_at) VALUES (?, ?, ?, 0)')
+			.bind(await exportSha256Hex(plain), now, now + EXPORT_PASSWORD_TTL_SECONDS)
+	]);
+	return plain.match(/.{4}/g).join('-');
+}
+
+// 核销密码：一条 UPDATE 同时判「存在、没用过、没过期」，changes=1 才算成功 —— 两个人同时用同一个密码只有一个能进
+async function redeemExportPassword(env, raw) {
+	const plain = normalizeExportPassword(raw);
+	if (!/^[A-Z0-9]{16}$/.test(plain)) return '';
+	if (!(await ensureExportAuthTables(env))) return '';
+	const now = Math.floor(Date.now() / 1000);
+	const res = await env.DB.prepare('UPDATE export_passwords SET used_at = ? WHERE hash = ? AND used_at = 0 AND expires_at >= ?')
+		.bind(now, await exportSha256Hex(plain), now).run();
+	if (Number(res?.meta?.changes) !== 1) return '';
+	const token = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, '0')).join('');
+	await env.DB.prepare('INSERT INTO export_sessions (hash, created_at, expires_at) VALUES (?, ?, ?)')
+		.bind(await exportSha256Hex(token), now, now + EXPORT_SESSION_MAX_SECONDS).run();
+	return token;
+}
+
+async function exportSessionValid(env, request) {
+	const hit = String(request.headers.get('Cookie') || '').match(/(?:^|;\s*)export_session=([0-9a-f]{64})(?:;|$)/);
+	if (!hit || !(await ensureExportAuthTables(env))) return false;
+	const row = await env.DB.prepare('SELECT expires_at FROM export_sessions WHERE hash = ?').bind(await exportSha256Hex(hit[1])).first();
+	return !!row && Number(row.expires_at) >= Math.floor(Date.now() / 1000);
+}
+
+const EXPORT_PRIVATE_HEADERS = { 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow', 'Referrer-Policy': 'no-referrer' };
+
+function renderExportLoginPage(error = '') {
+	const html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+		+ '<meta name="robots" content="noindex, nofollow"><title>黑名单导出 · 登录</title><style>'
+		+ 'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f5f7fa;color:#1f2937}'
+		+ '.box{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:28px;width:min(360px,92vw)}h1{font-size:20px;margin:0 0 6px}p{color:#6b7280;font-size:13px;margin:0 0 16px}'
+		+ 'label{display:block;font-size:13px;margin-bottom:6px}input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #d1d5db;border-radius:6px;font:15px ui-monospace,Consolas,monospace;letter-spacing:1px}'
+		+ 'button{margin-top:14px;width:100%;padding:10px;border:0;border-radius:6px;background:#2563eb;color:#fff;font-size:15px;cursor:pointer}button:hover{background:#1d4ed8}'
+		+ '.err{color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:8px 10px;font-size:13px;margin-bottom:12px}'
+		+ '</style></head><body><main class="box"><h1>🚫 黑名单导出</h1><p>输入临时密码登录。密码只能用一次；关闭浏览器后需要重新登录。</p>'
+		+ (error ? '<div class="err" role="alert">' + escapeHtml(error) + '</div>' : '')
+		+ '<form method="post" action="/export"><label for="password">临时密码</label>'
+		+ '<input id="password" name="password" type="password" autocomplete="off" autocapitalize="characters" spellcheck="false" required maxlength="64" placeholder="XXXX-XXXX-XXXX-XXXX" autofocus>'
+		+ '<button type="submit">登录</button></form></main></body></html>';
+	return new Response(html, { status: error ? 401 : 200, headers: {
+		...EXPORT_PRIVATE_HEADERS,
+		'Content-Type': 'text/html; charset=UTF-8',
+		'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+	} });
+}
+
+async function handlePasswordExport(request, env, url) {
+	if (!env.DB) return new Response('❌ 未绑定 D1 存储空间', { status: 400 });
+	if (request.method === 'POST') {
+		let password = '';
+		try { password = String((await request.formData()).get('password') || ''); } catch (_) { password = ''; }
+		const token = await redeemExportPassword(env, password);
+		if (!token) return renderExportLoginPage('密码错误或已失效（每个密码只能登录一次），请向主人重新索取。');
+		// 不设 Max-Age / Expires = 会话 cookie，关掉浏览器就没了
+		return new Response(null, { status: 303, headers: { ...EXPORT_PRIVATE_HEADERS, Location: '/export',
+			'Set-Cookie': 'export_session=' + token + '; Path=/export; HttpOnly; Secure; SameSite=Strict' } });
 	}
+	if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405 });
+	if (!(await exportSessionValid(env, request))) return renderExportLoginPage();
 	const res = await handleExport(env, url);
 	const headers = new Headers(res.headers);
-	// 链接是私发的：不让搜索引擎收录，也不让页面跳出去时把带密钥的地址放进 Referer
-	headers.set('X-Robots-Tag', 'noindex, nofollow');
-	headers.set('Referrer-Policy', 'no-referrer');
-	headers.set('Cache-Control', 'no-store');
+	for (const [k, v] of Object.entries(EXPORT_PRIVATE_HEADERS)) headers.set(k, v);
 	return new Response(res.body, { status: res.status, headers });
 }
 
@@ -13210,6 +13294,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/addgroup -100xxx [备注]　新增治理群，免改环境变量',
 			'/delgroup -100xxx　停止治理该群，bot 仍留在群里',
 			'/listgroups　列出全部生效群组与群名（含环境变量群，标出主群）',
+			'/exportpass　生成一次性导出密码，转发给可信用户登录 域名/export 看/下载黑名单',
 			'',
 			'<b>━━ 查询与退群（仅私聊）━━</b>',
 			'/admins　查看主人、副主人与超级管理员名单',
@@ -13358,6 +13443,36 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// /addgroup -100xxxx [备注] | /delgroup -100xxxx | /listgroups
 	// 加进来的群与 GROUP_ID 环境变量分离存放（Worker 无法写自己的环境变量），
 	// 但合并后享受完全相同的治理能力：封禁/踢人/广告检测/黑名单拦截/purge/批量任务。
+	// /exportpass：生成「域名/export」的一次性登录密码，主人转发给可信用户。
+	// 只认第一主人私聊；群内一律静默且不生成（密码出现在群里就等于公开了）。
+	if (text && /^\/exportpass(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		if (message.chat.type !== 'private') return;
+		if (!isPrimaryOwner(userId)) {
+			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n导出密码仅限第一主人生成。');
+			return;
+		}
+		if (!env.DB) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间，无法生成导出密码。');
+			return;
+		}
+		let password = '';
+		try { password = await createExportPassword(env); } catch (error) { console.error('[导出登录] 生成密码失败:', error); }
+		if (!password) {
+			await sendTelegramMessage(chatId, '❌ 生成导出密码失败，请稍后重试。');
+			return;
+		}
+		let loginUrl = '/export';
+		try { loginUrl = new URL(requestUrl).origin + '/export'; } catch (_) {}
+		await sendTelegramMessage(chatId,
+			'🔑 <b>黑名单导出 · 临时密码</b>\n\n'
+			+ '登录地址：' + escapeHtml(loginUrl) + '\n'
+			+ '密码：<code>' + password + '</code>\n\n'
+			+ 'ℹ️ 一次性：登录成功一次即作废；24 小时内没用也作废。\n'
+			+ 'ℹ️ 对方关掉浏览器后需要新密码重新登录。\n'
+			+ 'ℹ️ 对方只能看 / 下载全局黑名单（CSV、JSON），碰不到其它管理功能。');
+		return;
+	}
+
 	if (text && /^\/(addgroup|delgroup|listgroups)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
 		// 群内一律静默（避免泄漏命令存在），私聊才给权限提示
