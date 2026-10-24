@@ -415,6 +415,9 @@ export default {
 		if (request.method === 'GET' && path === `${TOKEN}/export`) {
 			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
 			return await handleExport(env, url);
+		} else if (path.startsWith('export/')) {
+			// 黑名单导出（独立密钥 EXPORT_KEY）：私发给可信用户，只能看/下载黑名单，碰不到任何 TOKEN 管理接口
+			return await handleKeyedExport(request, env, url, path.slice('export/'.length));
 		} else if (request.method === 'GET' && path === `${TOKEN}/purge/groups`) {
 			// 清扫前预检：只保留 bot 具备封禁权限的群
 			return await handlePurgeGroups();
@@ -6309,6 +6312,41 @@ async function handleBulkJobAutoRun(env, url, ctx, requestUrl) {
 //   ?format=json → application/json，触发浏览器下载
 //   ?format=csv  → text/csv，UTF-8 + BOM，Excel 可直接打开
 //   其它/默认    → HTML 表格，浏览器直接查看
+// 独立导出密钥：Dashboard 变量 EXPORT_KEY（建议设成 Secret）。
+// 不配 / 短于 16 位 / 与 TOKEN 相同 → 入口不启用，一律 404（与 TOKEN 相同时发出去就等于交出 TOKEN）。
+// 撤销某人的权限：在 Dashboard 换一个 EXPORT_KEY，旧链接立即失效。
+const EXPORT_KEY_MIN_LENGTH = 16;
+function getConfiguredExportKey(env) {
+	const raw = String(env?.EXPORT_KEY || '').trim();
+	if (raw.length < EXPORT_KEY_MIN_LENGTH || raw.length > 256) return '';
+	if (raw === String(env?.TOKEN || '').trim()) return '';
+	return raw;
+}
+
+// 定长比较：逐字节异或累加，不因前缀匹配提前返回，避免按耗时逐位猜密钥。
+function exportKeyMatches(received, expected) {
+	const enc = new TextEncoder();
+	const a = enc.encode(String(received || ''));
+	const b = enc.encode(String(expected || ''));
+	let diff = a.length ^ b.length;
+	for (let i = 0; i < b.length; i++) diff |= (a[i] ?? 0) ^ b[i];
+	return diff === 0;
+}
+
+async function handleKeyedExport(request, env, url, receivedKey) {
+	const expected = getConfiguredExportKey(env);
+	if (request.method !== 'GET' || !expected || !exportKeyMatches(receivedKey, expected)) {
+		return new Response('Not Found', { status: 404, headers: { 'Cache-Control': 'no-store' } });
+	}
+	const res = await handleExport(env, url);
+	const headers = new Headers(res.headers);
+	// 链接是私发的：不让搜索引擎收录，也不让页面跳出去时把带密钥的地址放进 Referer
+	headers.set('X-Robots-Tag', 'noindex, nofollow');
+	headers.set('Referrer-Policy', 'no-referrer');
+	headers.set('Cache-Control', 'no-store');
+	return new Response(res.body, { status: res.status, headers });
+}
+
 async function handleExport(env, url) {
 	if (!env.DB) {
 		return new Response('❌ 未绑定 D1 存储空间', { status: 400 });

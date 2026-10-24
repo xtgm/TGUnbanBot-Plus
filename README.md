@@ -400,6 +400,10 @@ Workers 已连 GitHub 时，`git push` 即自动部署。
 
 `GET /{TOKEN}/export` —— 浏览器看 HTML 表格（带搜索），`?format=json` / `?format=csv` 下载（CSV 带 BOM，Excel 不乱码），`POST` 同路径返回 JSON；必须带正确 `TOKEN` 否则返回 405，字段全部 `escapeHtml` 转义。
 
+### 黑名单导出（给可信用户，不用交出 TOKEN）
+
+在 Dashboard 加变量 `EXPORT_KEY`（建议设成密钥类型，至少 16 位、不能和 `TOKEN` 相同），把 `https://你的域名/export/{EXPORT_KEY}` 私发给对方。内容、搜索、JSON / CSV 下载与 `/{TOKEN}/export` 完全相同，但只能导出黑名单，其他管理接口一个都进不去。密钥错误或没配置一律 404；想收回权限，换一个 `EXPORT_KEY` 即可，旧链接立刻失效。
+
 ### 黑名单清扫入口（受 TOKEN 保护）
 
 `GET /{TOKEN}/purge` 分批清扫 D1 存量黑名单里仍在群里的人；`GET /{TOKEN}/purge/run` 立即执行一次（默认分批，避免撞子请求上限）。
