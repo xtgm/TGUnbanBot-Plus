@@ -1035,6 +1035,14 @@ function renderMiniAppHtml() {
     .stat-label{font-size:10px;color:var(--muted);margin-top:3px;letter-spacing:.3px}
     .stat.emphasis{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 7%,var(--surface))}
     .stat.emphasis .stat-value{color:var(--accent)}
+    /* 可点项（数字卡 / 名单行 / 检索结果）：两个后台共用 */
+    .clickable{cursor:pointer;border-radius:var(--radius-sm);transition:background-color .15s,border-color .15s}
+    .clickable:hover{background:color-mix(in srgb,var(--accent) 6%,transparent)}
+    .clickable:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+    .clickable:active{transform:translateY(1px)}
+    .stat.clickable:hover,.stat.active{border-color:var(--accent)}
+    .stat.clickable:hover{background:color-mix(in srgb,var(--accent) 6%,var(--surface))}
+    .stat.active{background:color-mix(in srgb,var(--accent) 10%,var(--surface))}
 
     .config-row{display:flex;flex-wrap:wrap;gap:8px 20px;font-size:11px;color:var(--muted);margin:0}
     .config-row strong{font-weight:650;color:var(--text);margin-left:4px}
@@ -1245,7 +1253,7 @@ function renderMiniAppHtml() {
         <section id="page-ads" class="page" role="tabpanel" aria-labelledby="tab-ads" hidden>
           <div class="page-head"><div class="page-head-text"><div class="eyebrow">03 / AD REVIEW</div><h1 class="page-title" tabindex="-1">广告治理</h1><p class="description">了解识别状态，复核待处理广告记录。</p></div></div>
           <div id="ads-summary"></div>
-          <div class="toolbar"><h2 class="section-label">待复核记录</h2><span id="ads-count" class="counter"></span></div>
+          <div class="toolbar"><h2 id="ads-pending-label" class="section-label" tabindex="-1">待复核记录</h2><span id="ads-count" class="counter"></span></div>
           <div id="ads-content" class="list-grid"></div><div id="ads-pager"></div>
         </section>
         <section id="page-users" class="page" role="tabpanel" aria-labelledby="tab-users" hidden>
@@ -1307,6 +1315,9 @@ function renderMiniAppHtml() {
     function empty(container, title, detail, retry) { container.replaceChildren(); var box = element('div', 'empty'); box.append(element('div', 'empty-symbol', retry ? '!' : '·'), element('h3', '', title), element('p', '', detail)); if (retry) box.append(makeButton('重试', 'small', retry)); container.append(box); }
     function loading(container, label) { container.replaceChildren(); var box = element('div', 'loading'); var spinner = element('span', 'spinner'); spinner.setAttribute('aria-hidden', 'true'); box.setAttribute('role', 'status'); box.append(spinner, element('span', '', label || '正在加载…')); container.append(box); }
     function detailList(pairs) { var dl = element('dl', 'detail-grid'); pairs.forEach(function (pair) { dl.append(element('dt', '', pair[0]), element('dd', pair[2] ? 'mono' : '', pair[1])); }); return dl; }
+    // 让一个已有元素（数字卡、名单行、检索结果）可点：鼠标、触屏、键盘 Enter / 空格都能触发。
+    function clickable(el, label, action) { el.classList.add('clickable'); el.tabIndex = 0; el.setAttribute('role', 'button'); el.setAttribute('aria-label', label); function run() { Promise.resolve(action()).catch(function (err) { toast(err.message || '操作失败，请稍后重试。', 'error'); }); } el.addEventListener('click', run); el.addEventListener('keydown', function (event) { if (event.key !== 'Enter' && event.key !== ' ') return; event.preventDefault(); run(); }); return el; }
+    function jumpTo(target) { if (!target) return; target.scrollIntoView({ behavior: 'smooth', block: 'start' }); target.focus({ preventScroll: true }); }
     function begin(key) { state.generation[key] = (state.generation[key] || 0) + 1; return state.generation[key]; }
     function current(key, seq) { return state.authenticated && state.generation[key] === seq; }
     function setFormBusy(form, busy) { Array.from(form.elements).forEach(function (el) { el.disabled = busy; }); }
@@ -1368,9 +1379,12 @@ function renderMiniAppHtml() {
       var okCount = layer1.filter(function (row) { return row.ok === true; }).length; var badCount = layer1.filter(function (row) { return row.ok === false; }).length; var warnCount = layer1.length - okCount - badCount;
       $('health-count').textContent = okCount + ' 正常 · ' + warnCount + ' 警告 · ' + badCount + ' 异常';
       var grid = element('div', 'stat-grid');
-      [[okCount, '正常', ''], [warnCount, '警告', ''], [badCount, '异常', '']].forEach(function (row) { var stat = element('div', 'stat'); stat.append(element('div', 'stat-value', count(row[0])), element('div', 'stat-label', row[1])); grid.append(stat); });
+      // 三个数字可点：点一个只看该状态的检查项，再点一次恢复全部。
+      state.healthFilter = '';
+      [[okCount, '正常', 'ok'], [warnCount, '警告', 'warn'], [badCount, '异常', 'bad']].forEach(function (row) { var stat = element('div', 'stat'); stat.dataset.status = row[2]; stat.setAttribute('aria-pressed', 'false'); stat.append(element('div', 'stat-value', count(row[0])), element('div', 'stat-label', row[1])); clickable(stat, row[1] + ' ' + row[0] + ' 项，点击只看' + row[1] + '项', function () { filterHealth(row[2], row[1]); }); grid.append(stat); });
       container.append(grid);
-      layer1.forEach(function (item) { var line = element('div', 'status-line'); line.append(element('span', 'dot ' + (item.ok === true ? 'ok' : item.ok === false ? 'bad' : 'warn')), element('span', '', text(item.text))); container.append(line); });
+      layer1.forEach(function (item) { var status = item.ok === true ? 'ok' : item.ok === false ? 'bad' : 'warn'; var line = element('div', 'status-line'); line.dataset.status = status; line.append(element('span', 'dot ' + status), element('span', '', text(item.text))); container.append(line); });
+      var none = element('p', 'subtle health-filter-empty'); none.hidden = true; container.append(none);
       if (!layer2.length) return;
       var head = element('div', 'toolbar'); head.append(element('h3', 'section-label', '逐群权限'), element('span', 'counter', layer2.length + ' 个群'));
       container.append(head);
@@ -1384,6 +1398,12 @@ function renderMiniAppHtml() {
         list.append(card);
       });
       container.append(list);
+    }
+    function filterHealth(key, label) {
+      state.healthFilter = state.healthFilter === key ? '' : key; var shown = 0;
+      document.querySelectorAll('#health-content .status-line').forEach(function (line) { line.hidden = !!state.healthFilter && line.dataset.status !== state.healthFilter; if (!line.hidden) shown++; });
+      document.querySelectorAll('#health-content .stat[data-status]').forEach(function (stat) { var on = stat.dataset.status === state.healthFilter; stat.classList.toggle('active', on); stat.setAttribute('aria-pressed', String(on)); });
+      var none = document.querySelector('#health-content .health-filter-empty'); if (none) { none.textContent = '没有' + label + '项，再点一次数字恢复全部。'; none.hidden = !state.healthFilter || shown > 0; }
     }
     // 权限名单（/admins）：三段固定分组，资料来自 Telegram 可读到的群成员信息。
     async function loadAdmins() { var seq = begin('admins'); loading($('admins-content'), '正在读取权限名单…'); $('admins-count').textContent = ''; try { var data = await api('admins/list'); if (!current('admins', seq)) return; renderAdmins(data || {}); } catch (err) { if (err.auth || !current('admins', seq)) return; empty($('admins-content'), '权限名单读取失败', err.message, loadAdmins); } }
@@ -1403,7 +1423,7 @@ function renderMiniAppHtml() {
           var groupLabel = labels[person.groupId];
           if (groupLabel && groupLabel.title) meta.push('来自 ' + groupLabel.title);
           body.append(element('div', 'person-meta', meta.join(' · ')));
-          row.append(body); box.append(row);
+          row.append(body); if (/^\d{1,20}$/.test(String(person.id))) clickable(row, '查询 ' + text(person.name, '用户') + ' 的资料与记录', function () { return openUser(person.id); }); box.append(row);
         });
         container.append(box);
       });
@@ -1422,7 +1442,7 @@ function renderMiniAppHtml() {
     }
     async function unban(button, record) { var confirmed = await confirmAction({ title: '解除此用户的封禁？', description: '从黑名单移除该用户，并尝试解除各治理群组中的封禁。', object: '用户 ID ' + text(record.id), warning: '部分群组可能因权限或网络原因未能完成解封。', label: '确认解封', danger: true }); if (!confirmed) return false; var completed = false; await actionButton(button, 'unban:' + record.id, async function () { var data = await api('blacklist/unban', { userId: String(record.id) }); completed = true; var results = data && Array.isArray(data.results) ? data.results : []; var failed = results.filter(function (row) { return !row.ok; }); var removed = data && data.removed === false ? '用户未从黑名单移除。' : '已移除黑名单记录。'; toast(data && data.message ? data.message : removed + (results.length ? ' 群组解封 ' + (results.length - failed.length) + '/' + results.length + ' 成功。' : ''), failed.length || data && data.complete === false ? 'error' : 'success'); if (failed.length) { await showResult({ title: '部分群组未能解封', description: failed.map(function (row) { return text(row.groupId) + '：' + text(row.error, '操作未完成'); }).join('\n'), object: '用户 ID ' + text(record.id) }); } state.loaded.blacklist = false; state.loaded.users = false; if (state.active === 'blacklist') await loadBlacklist(state.blacklistPage); }); return completed; }
     async function loadAdsSummary() { var seq = begin('ads-summary'); loading($('ads-summary'), '正在读取广告概况…'); try { var data = await api('ads/summary'); if (!current('ads-summary', seq)) return; renderAdsSummary(data || {}); } catch (err) { if (err.auth || !current('ads-summary', seq)) return; empty($('ads-summary'), '概况加载失败', err.message, loadAdsSummary); } }
-    function renderAdsSummary(data) { var container = $('ads-summary'); container.replaceChildren(); var counts = data.counts || {}; var config = data.config || {}; var grid = element('div', 'stat-grid'); [['指纹', counts.fingerprints], ['广告样本', counts.samples], ['观察中', counts.observing], ['待复核', counts.pending]].forEach(function (pair, i) { var stat = element('div', 'stat' + (i === 3 ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(pair[1])), element('div', 'stat-label', pair[0])); grid.append(stat); }); var card = element('div', 'card'); var row = element('div', 'config-row'); [['封禁阈值', text(config.scoreThreshold)], ['观察阈值', text(config.observationScore)], ['AI 识别', config.aiEnabled === true ? '已启用' : config.aiEnabled === false ? '未启用' : '—'], ['AI 日额度', displayValue(config.llmDaily)]].forEach(function (pair) { var span = element('span', '', pair[0]); span.append(element('strong', '', pair[1])); row.append(span); }); card.append(row); if (data.visionModel) card.append(element('div', 'subtle', '图像识别 · ' + text(data.visionModel))); container.append(grid, card); }
+    function renderAdsSummary(data) { var container = $('ads-summary'); container.replaceChildren(); var counts = data.counts || {}; var config = data.config || {}; var grid = element('div', 'stat-grid'); [['指纹', counts.fingerprints], ['广告样本', counts.samples], ['观察中', counts.observing], ['待复核', counts.pending]].forEach(function (pair, i) { var stat = element('div', 'stat' + (i === 3 ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(pair[1])), element('div', 'stat-label', pair[0])); if (i === 3) clickable(stat, '待复核 ' + count(pair[1]) + ' 条，点击跳到待复核记录', function () { jumpTo($('ads-pending-label')); }); grid.append(stat); }); var card = element('div', 'card'); var row = element('div', 'config-row'); [['封禁阈值', text(config.scoreThreshold)], ['观察阈值', text(config.observationScore)], ['AI 识别', config.aiEnabled === true ? '已启用' : config.aiEnabled === false ? '未启用' : '—'], ['AI 日额度', displayValue(config.llmDaily)]].forEach(function (pair) { var span = element('span', '', pair[0]); span.append(element('strong', '', pair[1])); row.append(span); }); card.append(row); if (data.visionModel) card.append(element('div', 'subtle', '图像识别 · ' + text(data.visionModel))); container.append(grid, card); }
     async function loadAdsPending(page) { state.adsPage = Math.max(1, Number(page) || 1); var seq = begin('ads-pending'); loading($('ads-content'), '正在读取待复核记录…'); $('ads-pager').replaceChildren(); $('ads-count').textContent = ''; try { var data = await api('ads/pending', { page: state.adsPage }); if (!current('ads-pending', seq)) return; data = data || {}; state.adsPage = Number(data.page) || state.adsPage; if (state.adsPage > Math.max(1, Number(data.totalPages) || 1)) return loadAdsPending(Math.max(1, Number(data.totalPages) || 1)); renderAdsPending(data); state.loaded.ads = true; } catch (err) { if (err.auth || !current('ads-pending', seq)) return; empty($('ads-content'), '待复核记录加载失败', err.message, function () { return loadAdsPending(state.adsPage); }); } }
     async function loadAds() { await Promise.allSettled([loadAdsSummary(), loadAdsPending(state.adsPage)]); }
     function renderAdsPending(data) {
@@ -1449,7 +1469,7 @@ function renderMiniAppHtml() {
       var note = '共 ' + count(total) + ' 条'; if (data.resolvedUserId) note += ' · @' + text(data.value) + ' 对应 TGID ' + data.resolvedUserId; if (pages > 1) note += '　第 ' + data.page + '/' + pages + ' 页';
       container.append(element('p', 'form-hint', note));
       var list = element('div', 'result-list');
-      rows.forEach(function (row) { var item = element('div', 'result-item'); var head = element('div', 'result-head'); head.append(element('span', 'result-who', 'ID ' + text(row.from_id)), element('span', 'result-when', date(row.created_at))); item.append(head, element('div', 'result-text', text(row.text_norm, '（无正文）')), element('div', 'result-chat', '群组 ' + text(row.chat_id) + ' · 消息 ' + text(row.mid))); list.append(item); });
+      rows.forEach(function (row) { var item = element('div', 'result-item'); var head = element('div', 'result-head'); head.append(element('span', 'result-who', 'ID ' + text(row.from_id)), element('span', 'result-when', date(row.created_at))); item.append(head, element('div', 'result-text', text(row.text_norm, '（无正文）')), element('div', 'result-chat', '群组 ' + text(row.chat_id) + ' · 消息 ' + text(row.mid))); if (/^\d{1,20}$/.test(String(row.from_id))) clickable(item, '查询发言人 ' + text(row.from_id) + ' 的资料与记录', function () { return openUser(row.from_id); }); list.append(item); });
       container.append(list);
       pager($('search-pager'), data, function (page) { return loadSearch(page); });
     }
@@ -1695,6 +1715,9 @@ const KILLER_MINI_APP_HTML_SCRIPT = String.raw`  <script>
     function empty(container, title, detail, retry) { container.replaceChildren(); var box = element('div', 'empty'); box.append(element('div', 'empty-symbol', retry ? '!' : '·'), element('h3', '', title), element('p', '', detail)); if (retry) box.append(makeButton('重试', 'small', retry)); container.append(box); }
     function loading(container, label) { container.replaceChildren(); var box = element('div', 'loading'); var spinner = element('span', 'spinner'); spinner.setAttribute('aria-hidden', 'true'); box.setAttribute('role', 'status'); box.append(spinner, element('span', '', label || '正在加载…')); container.append(box); }
     function detailList(pairs) { var dl = element('dl', 'detail-grid'); pairs.forEach(function (pair) { dl.append(element('dt', '', pair[0]), element('dd', pair[2] ? 'mono' : '', pair[1])); }); return dl; }
+    // 让一个已有元素（数字卡、排行行、检索结果）可点：鼠标、触屏、键盘 Enter / 空格都能触发。
+    function clickable(el, label, action) { el.classList.add('clickable'); el.tabIndex = 0; el.setAttribute('role', 'button'); el.setAttribute('aria-label', label); function run() { Promise.resolve(action()).catch(function (err) { toast(err.message || '操作失败，请稍后重试。', 'error'); }); } el.addEventListener('click', run); el.addEventListener('keydown', function (event) { if (event.key !== 'Enter' && event.key !== ' ') return; event.preventDefault(); run(); }); return el; }
+    function jumpTo(target) { if (!target) return; target.scrollIntoView({ behavior: 'smooth', block: 'start' }); target.focus({ preventScroll: true }); }
     function begin(key) { state.generation[key] = (state.generation[key] || 0) + 1; return state.generation[key]; }
     function current(key, seq) { return state.authenticated && state.generation[key] === seq; }
     function setFormBusy(form, busy) { Array.from(form.elements).forEach(function (el) { el.disabled = busy; }); }
@@ -1799,7 +1822,7 @@ const KILLER_MINI_APP_HTML_SCRIPT = String.raw`  <script>
     function renderSearch(data) {
       var container = $('search-content'); container.replaceChildren(); var rows = Array.isArray(data.rows) ? data.rows : []; var total = Number(data.total) || 0; $('search-count').textContent = count(total) + ' 条记录';
       if (!total) { empty(container, '没有匹配的记录', '换个关键词，或确认这个用户是否在杀手群里发过言。'); return; }
-      var list = element('div', 'result-list'); rows.forEach(function (row) { var item = element('div', 'result-item'); var head = element('div', 'result-head'); head.append(element('span', 'result-who', 'ID ' + text(row.from_id)), element('span', 'result-when', date(row.created_at))); item.append(head, element('div', 'result-text', text(row.text_norm, '（无正文）')), element('div', 'result-chat', groupName(row.chat_id))); list.append(item); }); container.append(list);
+      var list = element('div', 'result-list'); rows.forEach(function (row) { var item = element('div', 'result-item'); var head = element('div', 'result-head'); head.append(element('span', 'result-who', 'ID ' + text(row.from_id)), element('span', 'result-when', date(row.created_at))); item.append(head, element('div', 'result-text', text(row.text_norm, '（无正文）')), element('div', 'result-chat', groupName(row.chat_id))); if (/^\d{1,20}$/.test(String(row.from_id))) clickable(item, '查询发言人 ' + text(row.from_id) + ' 的资料与记录', function () { return openUser(row.from_id); }); list.append(item); }); container.append(list);
       pager($('search-pager'), data, function (page) { return loadSearch(page); });
     }
     async function sendNotice() {
@@ -1816,9 +1839,11 @@ const KILLER_MINI_APP_HTML_SCRIPT = String.raw`  <script>
     function renderStats(data) {
       var container = $('stats-content'); container.replaceChildren(); var s = data.summary || {};
       container.append(element('p', 'form-hint', text(data.label) + '　' + (data.start === data.end ? text(data.start) : text(data.start) + ' ~ ' + text(data.end)) + '（北京时间）'));
-      var grid = element('div', 'stat-grid'); [['发言', s.totalMsg, true], ['活跃人数', s.activeUsers], ['入群', s.join], ['退群', Number(s.leave || 0) + Number(s.kicked || 0)]].forEach(function (row) { var stat = element('div', 'stat' + (row[2] ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(row[1])), element('div', 'stat-label', row[0])); grid.append(stat); }); container.append(grid);
-      var rank = element('article', 'card'); var rh = element('div', 'card-heading'); rh.append(element('h2', 'section-label', '发言排行'), element('span', 'counter', count(data.ranking && data.ranking.total) + ' 人')); rank.append(rh); var rows = (data.ranking && data.ranking.rows) || [];
-      if (!rows.length) rank.append(element('p', 'subtle', '这个时间段没有发言记录。')); else rows.forEach(function (r) { var row = element('div', 'rank-row'); row.append(element('span', 'rank-no', '#' + r.rank), element('span', 'rank-name', text(r.displayName, r.username ? '@' + r.username : 'ID ' + r.userId)), element('span', 'rank-count', count(r.count) + ' 条')); rank.append(row); });
+      // 「发言」「活跃人数」点开跳到发言排行；排行每行点开查这个人（入群 / 退群明细在批次 3 接）。
+      var rankLabel = element('h2', 'section-label', '发言排行'); rankLabel.tabIndex = -1;
+      var grid = element('div', 'stat-grid'); [['发言', s.totalMsg, true, true], ['活跃人数', s.activeUsers, false, true], ['入群', s.join], ['退群', Number(s.leave || 0) + Number(s.kicked || 0)]].forEach(function (row) { var stat = element('div', 'stat' + (row[2] ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(row[1])), element('div', 'stat-label', row[0])); if (row[3]) clickable(stat, row[0] + ' ' + count(row[1]) + '，点击跳到发言排行', function () { jumpTo(rankLabel); }); grid.append(stat); }); container.append(grid);
+      var rank = element('article', 'card'); var rh = element('div', 'card-heading'); rh.append(rankLabel, element('span', 'counter', count(data.ranking && data.ranking.total) + ' 人')); rank.append(rh); var rows = (data.ranking && data.ranking.rows) || [];
+      if (!rows.length) rank.append(element('p', 'subtle', '这个时间段没有发言记录。')); else rows.forEach(function (r) { var row = element('div', 'rank-row'); var name = text(r.displayName, r.username ? '@' + r.username : 'ID ' + r.userId); row.append(element('span', 'rank-no', '#' + r.rank), element('span', 'rank-name', name), element('span', 'rank-count', count(r.count) + ' 条')); if (/^\d{1,20}$/.test(String(r.userId))) clickable(row, '查询 ' + name + ' 的资料与记录', function () { return openUser(r.userId); }); rank.append(row); });
       container.append(rank); if (data.ranking) pager($('stats-pager'), data.ranking, function (page) { return loadStats(page); });
       var trend = Array.isArray(data.trend) ? data.trend : []; var max = Math.max.apply(null, [1].concat(trend.map(function (d) { return d.msg; }))); var tc = element('article', 'card'); tc.append(element('h2', 'section-label', '近 7 天发言'));
       trend.forEach(function (d) { var row = element('div', 'trend-row'); var bar = element('div', 'trend-bar'); bar.style.width = Math.round(d.msg / max * 100) + '%'; var wrap = element('div'); wrap.append(bar); row.append(element('span', 'trend-day', d.day), wrap, element('span', 'trend-num', count(d.msg))); tc.append(row); }); container.append(tc);
