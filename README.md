@@ -394,7 +394,7 @@ Workers 已连 GitHub 时，`git push` 即自动部署。
 
 ### 查询封禁记录（公开）
 
-`GET /{TGID}` —— 查该 TGID 的 GKY 封禁记录（HTML），`?format=json` 返回结构化数据；公开可访问，不含敏感数据。
+`GET /{TGID}` —— 给普通用户自查，不要 TOKEN、只读。页面带查询框，同时显示 GKY 封禁库记录和本机器人黑名单的「是否封禁 + 封禁日期」（原因 / 备注 / 操作人不公开）；`?format=json` 返回 `{tgid, local, gky}`。`GET /banlist?tgid=` 只查 GKY，返回 JSON。
 
 ### 黑名单导出（受 TOKEN 保护）
 

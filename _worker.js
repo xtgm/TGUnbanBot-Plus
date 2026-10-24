@@ -382,6 +382,20 @@ export default {
 		}
 		// 必须在动态群合并等任何 D1 操作之前鉴权。
 		if (miniAppApi) return handleMiniAppApi(request, env, ctx, url);
+		// ===== 公开只读查询（不要 TOKEN）=====
+		// 放在动态群合并之前：这两条只读 GKY + 本地黑名单一行，合并动态群那次 D1 读是白花的。
+		// path !== TOKEN：纯数字 TOKEN 的初始化入口不能被公开查询抢走。
+		if (url.pathname === "/banlist" && url.searchParams.has('tgid') && url.searchParams.get('tgid') != '') {
+			const tgid = url.searchParams.get('tgid').trim();
+			if (!PUBLIC_TGID_PATTERN.test(tgid)) return jsonResponse({ success: false, error: 'tgid 必须是 1~20 位纯数字' }, 400);
+			const banlist = await handleBanlist(tgid);
+			return new Response(banlist, {
+				headers: { 'Content-Type': 'application/json; charset=UTF-8' }
+			});
+		}
+		if (request.method === 'GET' && path !== TOKEN && PUBLIC_TGID_PATTERN.test(path)) {
+			return await handlePublicLookup(env, url, path);
+		}
 		// ===== Webhook 来源校验（放在任何 D1 读写之前）=====
 		// 校验不通过就不碰数据库：伪造请求连一次 D1 查询都不该消耗。
 		// 只拦 POST 根路径（Telegram 更新入口）；GET/POST `/{TOKEN}` 初始化走 TOKEN 鉴权，不受影响。
@@ -398,13 +412,7 @@ export default {
 		// 都依赖 GROUP_IDS，晚于分发会导致动态群被当成"非配置群"直接忽略。
 		await mergeDynamicGroupsFromD1(env);
 
-		if (url.pathname === "/banlist" && url.searchParams.has('tgid') && url.searchParams.get('tgid') != '') {
-			const tgid = url.searchParams.get('tgid');
-			const banlist = await handleBanlist(tgid);
-			return new Response(banlist, {
-				headers: { 'Content-Type': 'application/json; charset=UTF-8' }
-			});;
-		} else if (request.method === 'GET' && path === `${TOKEN}/export`) {
+		if (request.method === 'GET' && path === `${TOKEN}/export`) {
 			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
 			return await handleExport(env, url);
 		} else if (request.method === 'GET' && path === `${TOKEN}/purge/groups`) {
@@ -15341,6 +15349,128 @@ async function handleBanlist(chatId) {
 	const result = parseBanlistHTML(html, chatId);
 
 	return JSON.stringify(result);
+}
+
+// ===== 公开封禁查询：GET /{TGID}（不要 TOKEN）=====
+// 给普通用户自查用。两块结果：
+//   GKY 外部库 —— 原样转述（那边本来就是公开站）
+//   本机器人黑名单 —— 只给「是否封禁 + 封禁日期」；原因 / 备注 / 操作人一律不出门，
+//                     操作人是真实管理员 ID，原因备注是内部口径。
+// 只读：本地黑名单直接 SELECT 一行，不走 ensureD1Table（那条会建表、写 schema_meta）。
+// 两块各自容错：一边挂了另一边照出，挂的那边给中文说明，绝不把「查不到」说成「未封禁」。
+const PUBLIC_TGID_PATTERN = /^\d{1,20}$/;
+
+async function readPublicLocalBan(env, tgid) {
+	if (!env.DB) return { error: '本机器人未启用黑名单库' };
+	try {
+		const row = await env.DB.prepare('SELECT at FROM blacklist WHERE id = ? LIMIT 1').bind(tgid).first();
+		if (!row) return { banned: false };
+		return { banned: true, since: formatBeijingDate(row.at) };
+	} catch (error) {
+		// 表还没建 = 一个人都没封过，这是确定的「未封禁」，不是故障
+		if (/no such table/i.test(String(error?.message || ''))) return { banned: false };
+		console.error('[公开查询] 读本地黑名单失败:', error?.message || error);
+		return { error: '暂时无法查询本机器人黑名单，请稍后再试' };
+	}
+}
+
+async function readPublicGky(tgid) {
+	try {
+		return JSON.parse(await handleBanlist(tgid));
+	} catch (error) {
+		console.error('[公开查询] GKY 查询失败:', error?.message || error);
+		return { success: false, error: '暂时无法查询外部封禁库，请稍后再试' };
+	}
+}
+
+// 北京时间日期 YYYY-MM-DD；解析不了返回 null（页面显示「日期未知」，不瞎猜）
+function formatBeijingDate(value) {
+	const time = Date.parse(String(value ?? ''));
+	if (!Number.isFinite(time)) return null;
+	return new Date(time + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+async function handlePublicLookup(env, url, tgid) {
+	// 页面上的查询框提交 ?tgid=，转成干净的 /{TGID} 地址
+	const asked = url.searchParams.has('tgid') ? String(url.searchParams.get('tgid') || '').trim() : null;
+	if (asked !== null) {
+		if (PUBLIC_TGID_PATTERN.test(asked)) {
+			return new Response(null, { status: 302, headers: { Location: '/' + asked, 'Cache-Control': 'no-store' } });
+		}
+		return publicLookupHtml(renderPublicLookupPage(tgid, null, 'TGID 必须是 1~20 位纯数字，请重新输入。'), 400);
+	}
+	const [gky, local] = await Promise.all([readPublicGky(tgid), readPublicLocalBan(env, tgid)]);
+	const result = { tgid, local, gky };
+	if ((url.searchParams.get('format') || '').toLowerCase() === 'json') {
+		return new Response(JSON.stringify(result, null, 2), {
+			headers: { 'Content-Type': 'application/json; charset=UTF-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' }
+		});
+	}
+	return publicLookupHtml(renderPublicLookupPage(tgid, result, ''), 200);
+}
+
+function publicLookupHtml(html, status) {
+	return new Response(html, {
+		status,
+		headers: {
+			'Content-Type': 'text/html; charset=UTF-8',
+			'Cache-Control': 'no-store',
+			// 页面零脚本：只放行内联样式与同源表单提交
+			'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+			'Referrer-Policy': 'no-referrer',
+			'X-Content-Type-Options': 'nosniff'
+		}
+	});
+}
+
+function renderPublicLookupPage(tgid, result, formError) {
+	const row = (label, value) => `<div class="row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
+	let body = '';
+	if (formError) body += `<p class="alert">${escapeHtml(formError)}</p>`;
+	if (result) {
+		const { local, gky } = result;
+		let localHtml;
+		if (local.error) localHtml = `<p class="muted">${escapeHtml(local.error)}</p>`;
+		else if (local.banned) localHtml = `<p class="tag bad">已封禁</p>${row('封禁日期', local.since ? local.since + '（北京时间）' : '日期未知')}`;
+		else localHtml = '<p class="tag ok">未封禁</p>';
+		let gkyHtml;
+		if (!gky || gky.success === false) gkyHtml = `<p class="muted">${escapeHtml(gky?.error || '暂时无法查询外部封禁库，请稍后再试')}</p>`;
+		else if (!gky.banned) gkyHtml = '<p class="tag ok">无封禁记录</p>';
+		else {
+			gkyHtml = '<p class="tag bad">有封禁记录</p>';
+			if (gky.reason) gkyHtml += row('原因', gky.reason);
+			if (gky.recordedDate) gkyHtml += row('记录日期', gky.recordedDate);
+			if (gky.chatId) gkyHtml += row('来源群', gky.chatId);
+			if (gky.info) gkyHtml += `<div class="info">${escapeHtml(gky.info)}</div>`;
+		}
+		body += `<section><h2>本机器人黑名单</h2>${localHtml}</section><section><h2>GKY 封禁库</h2>${gkyHtml}</section>`;
+		body += `<p class="muted small">JSON：<a href="/${escapeHtml(tgid)}?format=json">/${escapeHtml(tgid)}?format=json</a></p>`;
+	}
+	return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>封禁查询 · ${escapeHtml(tgid)}</title>
+<style>
+body{margin:0;font:15px/1.6 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f4f5f7;color:#1d2129}
+main{max-width:560px;margin:0 auto;padding:24px 16px}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:14px;margin:0 0 10px;color:#4e5969}
+form{display:flex;gap:8px;margin:16px 0}
+input{flex:1;min-width:0;padding:10px 12px;font:inherit;border:1px solid #c9cdd4;border-radius:8px;background:#fff;color:inherit}
+button{padding:10px 18px;font:inherit;border:0;border-radius:8px;background:#165dff;color:#fff;cursor:pointer}
+input:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid #165dff;outline-offset:2px}
+section{background:#fff;border:1px solid #e5e6eb;border-radius:10px;padding:14px 16px;margin-bottom:12px}
+.tag{display:inline-block;margin:0 0 8px;padding:2px 10px;border-radius:999px;font-weight:600}
+.ok{background:#e8ffea;color:#00692a}.bad{background:#ffece8;color:#a1151e}
+.row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-top:1px solid #f2f3f5}
+.row span{color:#4e5969}.row strong{font-weight:500;text-align:right;word-break:break-all}
+.info{white-space:pre-wrap;word-break:break-all;background:#f7f8fa;border-radius:6px;padding:8px 10px;margin-top:8px;font-size:13px}
+.alert{background:#ffece8;color:#a1151e;border-radius:8px;padding:10px 12px}
+.muted{color:#4e5969}.small{font-size:12px}a{color:#165dff}
+@media(prefers-color-scheme:dark){body{background:#17171a;color:#e5e6eb}section{background:#232324;border-color:#333335}input{background:#232324;border-color:#484849}h2,.muted,.row span{color:#a9aeb8}.row{border-color:#333335}.info{background:#2a2a2b}.ok{background:#0b3d1c;color:#7be188}.bad,.alert{background:#4d1418;color:#f98981}a{color:#4080ff}}
+</style></head>
+<body><main>
+<h1>封禁查询</h1><p class="muted">TGID <strong>${escapeHtml(tgid)}</strong></p>
+<form method="get" action=""><label for="tgid" class="muted" style="position:absolute;left:-9999px">要查询的 TGID</label><input id="tgid" name="tgid" inputmode="numeric" maxlength="20" placeholder="输入 TGID 查询" autocomplete="off" required><button type="submit">查询</button></form>
+${body}
+</main></body></html>`;
 }
 
 // 通过群组ID获取群组信息

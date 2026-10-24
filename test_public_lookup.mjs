@@ -1,0 +1,190 @@
+// 公开封禁查询（GET /{TGID}，方案 B，2026-10-24）
+// 给普通用户的只读入口：不要 TOKEN，不碰任何管理功能。
+// 结果两块：GKY 记录（照旧）+ 本机器人黑名单只给「是否封禁 + 封禁日期」，
+// 原因 / 备注 / 操作人一律不出门。
+// D1 用 node:sqlite 内存库，跑真实 SQL；GKY 上游用假 fetch。
+
+import fs from 'node:fs';
+import vm from 'node:vm';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const src = fs.readFileSync(path.join(__dirname, '_worker.js'), 'utf8');
+
+function stripExportDefault(source) {
+	const start = source.indexOf('export default');
+	const braceStart = source.indexOf('{', start);
+	let depth = 0;
+	let i = braceStart;
+	for (; i < source.length; i++) {
+		if (source[i] === '{') depth++;
+		else if (source[i] === '}') {
+			depth--;
+			if (depth === 0) { i++; break; }
+		}
+	}
+	if (source[i] === ';') i++;
+	return source.slice(0, start) + 'globalThis.__handler = ' + source.slice(start + 'export default'.length, i) + ';' + source.slice(i);
+}
+
+// GKY 上游：按 tgid 返回不同页面；gkyMode='down' 时模拟上游不可达
+let gkyMode = 'ok';
+const gkyCalls = [];
+const tgCalls = [];
+const GKY_BANNED_HTML = '<p><strong>TGID:</strong> 222222222</p><p><strong>ChatID:</strong> -1001111111111</p><p><strong>MsgID:</strong> 77</p><p><strong>Reason:</strong> SpamGP</p><p>Recorded Date: 2026-01-02</p><p><strong>Info:</strong></p>示例广告<script>alert(1)</script><br>';
+const sandbox = {
+	console: { log() {}, warn() {}, error() {}, info() {}, debug() {} },
+	URL, URLSearchParams, TextEncoder, TextDecoder,
+	Response, Request, Headers, atob, btoa, setTimeout, clearTimeout,
+	fetch: async (url, init) => {
+		const raw = String(url);
+		if (raw.includes('gkybot')) {
+			gkyCalls.push(raw);
+			if (gkyMode === 'down') throw new Error('network down');
+			const tgid = new URL(raw).searchParams.get('tgid');
+			const html = tgid === '222222222' ? GKY_BANNED_HTML : '此TG账号并沒有封鎖記錄';
+			return { ok: true, status: 200, text: async () => html, json: async () => ({}) };
+		}
+		tgCalls.push(raw.split('/').pop());
+		return { ok: true, status: 200, text: async () => '{}', json: async () => ({ ok: true, result: true }) };
+	},
+};
+sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(stripExportDefault(src), sandbox, { filename: '_worker.js' });
+const handler = sandbox.__handler;
+
+// node:sqlite 包成 D1 接口，顺带记下每条 SQL
+function makeSqliteD1(options = {}) {
+	const db = new DatabaseSync(':memory:');
+	const sqlLog = [];
+	const wrap = (sql) => {
+		let args = [];
+		sqlLog.push(sql);
+		const stmt = {
+			bind(...a) { args = a; return stmt; },
+			async first() { if (options.fail) throw new Error('D1_ERROR: forced'); const r = db.prepare(sql).get(...args); return r ? { ...r } : null; },
+			async run() { if (options.fail) throw new Error('D1_ERROR: forced'); const r = db.prepare(sql).run(...args); return { meta: { changes: Number(r.changes) } }; },
+			async all() { if (options.fail) throw new Error('D1_ERROR: forced'); return { results: db.prepare(sql).all(...args).map((r) => ({ ...r })) }; },
+		};
+		return stmt;
+	};
+	return {
+		_db: db, sqlLog,
+		prepare: wrap,
+		async exec(sql) { if (options.fail) throw new Error('D1_ERROR: forced'); sqlLog.push(sql); db.exec(sql); },
+		async batch(stmts) { const out = []; for (const s of stmts) out.push(await s.all()); return out; },
+	};
+}
+
+let pass = 0, fail = 0;
+function assert(name, cond, detail) {
+	if (cond) { pass++; process.stdout.write(`  ✅ ${name}\n`); }
+	else { fail++; process.stdout.write(`  ❌ ${name}${detail ? ' — ' + detail : ''}\n`); }
+}
+
+const env = { TOKEN: 'tok-secret', BOT_TOKEN: '0:fake', GROUP_ID: '-1001111111111', OWNER_IDS: '999999999' };
+const PRIVATE_REASON = '内部原因-不可外泄';
+const PRIVATE_NOTE = '内部备注-不可外泄';
+const PRIVATE_BY = '888888888';
+
+const db = makeSqliteD1();
+db._db.exec('CREATE TABLE blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT)');
+db._db.prepare('INSERT INTO blacklist (id, reason, by_user, at, note) VALUES (?, ?, ?, ?, ?)').run('111111111', PRIVATE_REASON, PRIVATE_BY, '2026-03-04T20:30:00.000Z', PRIVATE_NOTE);
+const fullEnv = { ...env, DB: db };
+const get = (p, e = fullEnv) => handler.fetch(new Request('https://bot.example' + p), e);
+
+console.log('\n[1] 本地已封禁的人：HTML 页');
+{
+	const res = await get('/111111111');
+	const html = await res.text();
+	assert('返回 200 HTML', res.status === 200 && /text\/html/.test(res.headers.get('Content-Type') || ''), res.status + ' ' + res.headers.get('Content-Type'));
+	assert('显示「已封禁」', html.includes('已封禁'));
+	assert('封禁日期按北京时间显示（UTC 20:30 → 次日 03-05）', html.includes('2026-03-05'), html.slice(0, 300));
+	assert('不出现原因 / 备注 / 操作人', !html.includes(PRIVATE_REASON) && !html.includes(PRIVATE_NOTE) && !html.includes(PRIVATE_BY));
+	assert('页面带查询框（可直接换个 ID 查）', /<form[^>]*method="get"/i.test(html) && html.includes('name="tgid"'));
+	assert('页面不含脚本', !/<script/i.test(html));
+	assert('CSP 禁脚本', /script-src 'none'|default-src 'none'/.test(res.headers.get('Content-Security-Policy') || ''), res.headers.get('Content-Security-Policy'));
+}
+
+console.log('\n[2] ?format=json');
+{
+	const res = await get('/111111111?format=json');
+	const data = await res.json();
+	assert('local.banned=true + since 日期', data.local && data.local.banned === true && data.local.since === '2026-03-05', JSON.stringify(data.local));
+	const localKeys = Object.keys(data.local || {}).sort().join(',');
+	assert('local 只有 banned / since 两个字段', localKeys === 'banned,since', localKeys);
+	assert('JSON 全文不含原因 / 备注 / 操作人', !JSON.stringify(data).includes(PRIVATE_REASON) && !JSON.stringify(data).includes(PRIVATE_NOTE) && !JSON.stringify(data).includes(PRIVATE_BY));
+	assert('gky 结果照常带回', data.gky && data.gky.success === true && data.gky.banned === false, JSON.stringify(data.gky));
+	assert('tgid 回显', data.tgid === '111111111');
+}
+
+console.log('\n[3] 本地未封禁、GKY 命中');
+{
+	const data = await (await get('/222222222?format=json')).json();
+	assert('local.banned=false', data.local && data.local.banned === false, JSON.stringify(data.local));
+	assert('GKY 命中 + 原因映射中文', data.gky && data.gky.banned === true && data.gky.reason === '群众举报', JSON.stringify(data.gky));
+	const html = await (await get('/222222222')).text();
+	assert('HTML 显示 GKY 原因', html.includes('群众举报'));
+	assert('GKY 内容里的 <script> 不会原样进页面', !/<script/i.test(html) && html.includes('示例广告'));
+}
+
+console.log('\n[4] 上游与 D1 故障互不连坐');
+{
+	gkyMode = 'down';
+	const res = await get('/111111111?format=json');
+	const data = await res.json();
+	gkyMode = 'ok';
+	assert('GKY 挂了仍 200，本地结果照出', res.status === 200 && data.local && data.local.banned === true, res.status + ' ' + JSON.stringify(data));
+	assert('GKY 挂了给中文错误', data.gky && data.gky.success === false && /暂时无法查询/.test(data.gky.error || ''), JSON.stringify(data.gky));
+	const bad = makeSqliteD1({ fail: true });
+	const r2 = await get('/111111111?format=json', { ...env, DB: bad });
+	const d2 = await r2.json();
+	assert('D1 挂了仍 200，GKY 结果照出', r2.status === 200 && d2.gky && d2.gky.success === true, r2.status + ' ' + JSON.stringify(d2));
+	assert('D1 挂了 local 给中文错误、不谎报未封禁', d2.local && d2.local.banned === undefined && /暂时无法查询/.test(d2.local.error || ''), JSON.stringify(d2.local));
+	const r3 = await get('/111111111?format=json', { ...env });
+	const d3 = await r3.json();
+	assert('没绑 D1 时 local 说明未启用', d3.local && d3.local.banned === undefined && /未启用/.test(d3.local.error || ''), JSON.stringify(d3.local));
+}
+
+console.log('\n[5] 输入校验与路由边界');
+{
+	gkyCalls.length = 0;
+	const r1 = await get('/banlist?tgid=abc');
+	const d1 = await r1.json();
+	assert('/banlist 非数字 tgid 拒绝且不打上游', d1.success === false && gkyCalls.length === 0, JSON.stringify(d1) + ' calls=' + gkyCalls.length);
+	const d2 = await (await get('/banlist?tgid=222222222')).json();
+	assert('/banlist 老接口结构不变（只有 GKY 字段）', d2.success === true && d2.banned === true && d2.reason === '群众举报' && d2.local === undefined, JSON.stringify(d2));
+	const r3 = await get('/111111111?tgid=333333333', fullEnv);
+	assert('查询框提交 ?tgid= → 302 跳到 /333333333', r3.status === 302 && r3.headers.get('Location') === '/333333333', r3.status + ' ' + r3.headers.get('Location'));
+	const r4 = await get('/111111111?tgid=12a');
+	assert('查询框填了非数字 → 原页提示格式不对、不跳转', r4.status === 400 && (await r4.text()).includes('纯数字'), String(r4.status));
+	const r5 = await get('/123456789012345678901');
+	assert('超过 20 位不当 TGID（仍 405）', r5.status === 405, String(r5.status));
+	const r6 = await handler.fetch(new Request('https://bot.example/111111111', { method: 'POST' }), fullEnv);
+	assert('POST /{TGID} 不走公开查询', !(await r6.text()).includes('封禁查询'));
+}
+
+console.log('\n[6] 纯数字 TOKEN 不被公开查询抢走');
+{
+	tgCalls.length = 0;
+	const r = await get('/424242', { ...env, TOKEN: '424242', DB: makeSqliteD1() });
+	const body = await r.text();
+	assert('/{TOKEN} 仍走初始化', !body.includes('封禁查询') && tgCalls.includes('setWebhook'), tgCalls.join(','));
+}
+
+console.log('\n[7] 公开查询不碰与它无关的 D1');
+{
+	const fresh = makeSqliteD1();
+	fresh._db.exec('CREATE TABLE blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT)');
+	await get('/111111111', { ...env, DB: fresh });
+	const touched = fresh.sqlLog.filter((s) => /dynamic_groups/i.test(s));
+	assert('不合并动态群（不读 dynamic_groups）', touched.length === 0, touched.join(' | '));
+	const writes = fresh.sqlLog.filter((s) => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(s));
+	assert('不写任何数据', writes.length === 0, writes.join(' | '));
+}
+
+console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);
+process.exit(fail ? 1 : 0);
