@@ -24,7 +24,11 @@ function check(name, cond, detail) {
 }
 
 const calls = [];
-let lastStats = null, lastMembers = null;
+let lastStats = null, lastMembers = null, lastAdsQuery = null;
+const fpRows = [
+	{ type: 'keyword', value: '下钻词甲', weight: 0.5, matchCount: 9, falsePositiveCount: 0, confidence: 1, source: 'auto', createdAt: 1780000000 },
+	{ type: 'keyword', value: '下钻词乙', weight: 1, matchCount: 3, falsePositiveCount: 1, confidence: 1, source: 'seed', createdAt: 1780000000 }
+];
 const groups = [{ chatId: '-1001111111111', title: '示例群 A', source: 'dynamic' }];
 const searchRows = [{ mid: 501, chat_id: '-1001111111111', from_id: '123456789', created_at: 1780000000, text_norm: '一条发言' }];
 function userData(id) { return { userId: id, profile: { name: '用户' + id }, blacklist: null, events: [], cases: [], speech: { count: 1 }, gky: { success: true, banned: false } }; }
@@ -37,6 +41,12 @@ function mainData(action, body) {
 		case 'admins/list': return { primary: [{ id: '10001', name: '主人', username: 'owner' }], secondary: [{ id: '10002', name: '副主人', username: '' }], superAdmins: [], groupLabels: {} };
 		case 'ads/summary': return { counts: { fingerprints: 3, samples: 2, observing: 1, pending: 1 }, config: {} };
 		case 'ads/pending': return { items: [{ seq: 1, userId: '555', chatId: '-1001111111111', score: 90, reasons: [], snapshot: {}, createdAt: 1780000000 }], page: 1, total: 1, totalPages: 1 };
+		case 'ads/fingerprints': lastAdsQuery = body; return body.query ? { items: [fpRows[0]], page: 1, total: 1, totalPages: 1, query: body.query } : { items: fpRows, page: 1, total: 2, totalPages: 1, query: '' };
+		case 'ads/samples': return { items: [{ id: 1, text: '<b>样本</b>原文', source: 'spam', createdAt: 1780000000, status: 'ready' }], counts: { total: 1, ready: 1, stale: 0, usable: 1 }, page: 1, total: 1, totalPages: 1 };
+		case 'ads/observing': return { items: [{ userId: '700001', name: '观察甲', username: 'obs', chatId: '-1001111111111', score: 40, reasons: ['简介含联系方式'], layer: 'score', expiresAt: 1780003600, updatedAt: 1780000000 }], page: 1, total: 1, totalPages: 1 };
+		case 'ads/llm': return { enabled: true, day: '2026-10-24', daily: 1000, used: 7, pools: { message: { used: 5, limit: 500 }, join: { used: 2, limit: 300 }, cron: { used: 0, limit: 100 } }, hits: 3, bans: 1, parseFail: 0, broken: false, consecFail: 0, candidates: { total: 2, promoted: 1 } };
+		case 'ads/dryrun': return { items: [{ id: 1, chatId: '-1001111111111', userId: '710001', score: 88, threshold: 80, layer: 'score', reasons: [], status: 'fp', createdAt: 1780000000 }], chatId: '', page: 1, total: 1, totalPages: 1 };
+		case 'ads/whitelist': return { items: [{ userId: '720003', name: '白名单丙', username: 'wl', by: '10001', at: '2026-10-10T00:00:00Z', note: '老成员' }], page: 1, total: 1, totalPages: 1 };
 		case 'search': return { kind: 'keyword', value: body.query, page: 1, total: 1, totalPages: 1, rows: searchRows };
 		case 'users/query': return userData(body.userId);
 		default: throw new Error('未 mock 的主后台接口 ' + action);
@@ -129,6 +139,38 @@ async function run() {
 			check('点待复核 → 焦点落到待复核列表', (await page.evaluate(() => document.activeElement && document.activeElement.id)) === 'ads-pending-label');
 		}
 
+		console.info('\n[主后台] 广告页下钻（批次 2）');
+		await page.evaluate(() => window.scrollTo(0, 0));
+		const drill = (k) => page.locator('#ads-summary [data-drill="' + k + '"]');
+		check('概况里 3 个数字 + 3 个入口可下钻', (await page.locator('#ads-summary [data-drill]').count()) === 6, String(await page.locator('#ads-summary [data-drill]').count()));
+		if ((await page.locator('#ads-summary [data-drill]').count()) === 6) {
+			await drill('fingerprints').click();
+			check('点「指纹」→ 展开指纹列表', await waitText(page, 'ads-drill', '下钻词甲'));
+			check('指纹点开后标为展开', (await drill('fingerprints').getAttribute('aria-expanded')) === 'true');
+			await page.locator('#ads-drill input[type=search]').fill('甲');
+			await page.locator('#ads-drill form button[type=submit]').click();
+			await page.waitForFunction(() => !(document.getElementById('ads-drill')?.textContent || '').includes('下钻词乙'), null, { timeout: 4000 }).catch(() => {});
+			check('指纹搜索把关键词传给接口、只剩匹配项', lastAdsQuery && lastAdsQuery.query === '甲' && !(await page.locator('#ads-drill').textContent()).includes('下钻词乙'), JSON.stringify(lastAdsQuery));
+			await drill('fingerprints').click();
+			check('再点一次收起', (await page.locator('#ads-drill').textContent()) === '' && (await drill('fingerprints').getAttribute('aria-expanded')) === 'false');
+			await drill('samples').focus(); await page.keyboard.press('Enter');
+			check('键盘 Enter 点「广告样本」→ 原文按纯文本显示', await waitText(page, 'ads-drill', '<b>样本</b>原文') && (await page.locator('#ads-drill b').count()) === 0);
+			await drill('observing').click();
+			check('点「观察中」→ 列出观察用户', await waitText(page, 'ads-drill', '观察甲'));
+			await drill('llm').click();
+			check('点「AI 今日用量」→ 三池用量', await waitText(page, 'ads-drill', '5 / 500'));
+			await drill('dryrun').click();
+			check('点「演练流水」→ 列出演练记录', await waitText(page, 'ads-drill', '710001'));
+			await drill('whitelist').click();
+			check('点「白名单」→ 列出白名单用户', await waitText(page, 'ads-drill', '白名单丙'));
+			const wl = page.locator('#ads-drill .card.clickable');
+			check('白名单每人可点', (await wl.count()) === 1, String(await wl.count()));
+			if (await wl.count()) {
+				await wl.first().click();
+				check('点白名单里的人 → 查用户 720003', await waitText(page, 'users-content', 'ID 720003'));
+			}
+		}
+
 		console.info('\n[主后台] 发言检索结果');
 		await page.locator('#tab-users').click();
 		await page.locator('#search-query').fill('一条');
@@ -206,7 +248,7 @@ async function run() {
 		}
 
 		check('全程无页面脚本错误', errors.length === 0, errors.join(' | '));
-		check('只调用已有接口 + 批次 3 的 killer/stats/members', calls.every((a) => ['bootstrap', 'groups/list', 'health', 'admins/list', 'ads/summary', 'ads/pending', 'search', 'users/query', 'killer/bootstrap', 'killer/groups', 'killer/stats', 'killer/stats/members', 'killer/search', 'killer/users/query'].includes(a)), calls.join(','));
+		check('只调用已有接口 + 批次 2 的 6 个广告下钻 + 批次 3 的 killer/stats/members', calls.every((a) => ['bootstrap', 'groups/list', 'health', 'admins/list', 'ads/summary', 'ads/pending', 'ads/fingerprints', 'ads/samples', 'ads/observing', 'ads/llm', 'ads/dryrun', 'ads/whitelist', 'search', 'users/query', 'killer/bootstrap', 'killer/groups', 'killer/stats', 'killer/stats/members', 'killer/search', 'killer/users/query'].includes(a)), calls.join(','));
 	} finally {
 		await browser.close();
 	}

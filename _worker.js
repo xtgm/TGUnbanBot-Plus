@@ -840,7 +840,7 @@ class MiniAppError extends Error {
 	}
 }
 
-const MINI_APP_ACTIONS = new Set(['bootstrap', 'groups/list', 'groups/add', 'groups/remove', 'groups/leave', 'blacklist/list', 'blacklist/unban', 'ads/summary', 'ads/pending', 'ads/ignore', 'users/query', 'health', 'admins/list', 'search', 'notice/send']);
+const MINI_APP_ACTIONS = new Set(['bootstrap', 'groups/list', 'groups/add', 'groups/remove', 'groups/leave', 'blacklist/list', 'blacklist/unban', 'ads/summary', 'ads/pending', 'ads/ignore', 'ads/fingerprints', 'ads/samples', 'ads/observing', 'ads/llm', 'ads/dryrun', 'ads/whitelist', 'users/query', 'health', 'admins/list', 'search', 'notice/send']);
 // 杀手子后台的接口（与主后台同一个 /app/api/ 前缀，按身份分流；杀手身份调主后台独有的接口一律 404）。
 const KILLER_MINI_APP_ACTIONS = new Set(['killer/bootstrap', 'killer/groups', 'killer/health', 'killer/blacklist/list', 'killer/blacklist/ban', 'killer/blacklist/unban', 'killer/users/query', 'killer/search', 'killer/notice/send', 'killer/stats', 'killer/stats/members']);
 const MINI_APP_BODY_LIMIT = 32768;
@@ -1056,6 +1056,8 @@ function renderMiniAppHtml() {
     .stat.active{background:color-mix(in srgb,var(--accent) 10%,var(--surface))}
 
     .config-row{display:flex;flex-wrap:wrap;gap:8px 20px;font-size:11px;color:var(--muted);margin:0}
+    .drill-links{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line-soft)}
+    .drill-links .button.active{border-color:var(--accent);color:var(--accent)}
     .config-row strong{font-weight:650;color:var(--text);margin-left:4px}
 
     /* 广告卡评分 */
@@ -1264,6 +1266,7 @@ function renderMiniAppHtml() {
         <section id="page-ads" class="page" role="tabpanel" aria-labelledby="tab-ads" hidden>
           <div class="page-head"><div class="page-head-text"><div class="eyebrow">03 / AD REVIEW</div><h1 class="page-title" tabindex="-1">广告治理</h1><p class="description">了解识别状态，复核待处理广告记录。</p></div></div>
           <div id="ads-summary"></div>
+          <div id="ads-drill"></div>
           <div class="toolbar"><h2 id="ads-pending-label" class="section-label" tabindex="-1">待复核记录</h2><span id="ads-count" class="counter"></span></div>
           <div id="ads-content" class="list-grid"></div><div id="ads-pager"></div>
         </section>
@@ -1313,7 +1316,7 @@ function renderMiniAppHtml() {
   (function () {
     'use strict';
     var tg = window.Telegram && window.Telegram.WebApp;
-    var state = { active: 'groups', primaryOwner: false, authenticated: false, loaded: {}, busy: new Set(), generation: {}, groups: [], blacklistPage: 1, blacklistQuery: '', adsPage: 1, queriedUser: '', searchPage: 1, searchQuery: '', toastTimer: null };
+    var state = { active: 'groups', primaryOwner: false, authenticated: false, loaded: {}, busy: new Set(), generation: {}, groups: [], blacklistPage: 1, blacklistQuery: '', adsPage: 1, adsDrill: '', adsDrillQuery: '', queriedUser: '', searchPage: 1, searchQuery: '', toastTimer: null };
     var $ = function (id) { return document.getElementById(id); };
     function element(tag, className, content) { var el = document.createElement(tag); if (className) el.className = className; if (content !== undefined && content !== null) el.textContent = String(content); return el; }
     function text(value, fallback) { return value === undefined || value === null || value === '' ? (fallback || '—') : String(value); }
@@ -1453,7 +1456,41 @@ function renderMiniAppHtml() {
     }
     async function unban(button, record) { var confirmed = await confirmAction({ title: '解除此用户的封禁？', description: '从黑名单移除该用户，并尝试解除各治理群组中的封禁。', object: '用户 ID ' + text(record.id), warning: '部分群组可能因权限或网络原因未能完成解封。', label: '确认解封', danger: true }); if (!confirmed) return false; var completed = false; await actionButton(button, 'unban:' + record.id, async function () { var data = await api('blacklist/unban', { userId: String(record.id) }); completed = true; var results = data && Array.isArray(data.results) ? data.results : []; var failed = results.filter(function (row) { return !row.ok; }); var removed = data && data.removed === false ? '用户未从黑名单移除。' : '已移除黑名单记录。'; toast(data && data.message ? data.message : removed + (results.length ? ' 群组解封 ' + (results.length - failed.length) + '/' + results.length + ' 成功。' : ''), failed.length || data && data.complete === false ? 'error' : 'success'); if (failed.length) { await showResult({ title: '部分群组未能解封', description: failed.map(function (row) { return text(row.groupId) + '：' + text(row.error, '操作未完成'); }).join('\n'), object: '用户 ID ' + text(record.id) }); } state.loaded.blacklist = false; state.loaded.users = false; if (state.active === 'blacklist') await loadBlacklist(state.blacklistPage); }); return completed; }
     async function loadAdsSummary() { var seq = begin('ads-summary'); loading($('ads-summary'), '正在读取广告概况…'); try { var data = await api('ads/summary'); if (!current('ads-summary', seq)) return; renderAdsSummary(data || {}); } catch (err) { if (err.auth || !current('ads-summary', seq)) return; empty($('ads-summary'), '概况加载失败', err.message, loadAdsSummary); } }
-    function renderAdsSummary(data) { var container = $('ads-summary'); container.replaceChildren(); var counts = data.counts || {}; var config = data.config || {}; var grid = element('div', 'stat-grid'); [['指纹', counts.fingerprints], ['广告样本', counts.samples], ['观察中', counts.observing], ['待复核', counts.pending]].forEach(function (pair, i) { var stat = element('div', 'stat' + (i === 3 ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(pair[1])), element('div', 'stat-label', pair[0])); if (i === 3) clickable(stat, '待复核 ' + count(pair[1]) + ' 条，点击跳到待复核记录', function () { jumpTo($('ads-pending-label')); }); grid.append(stat); }); var card = element('div', 'card'); var row = element('div', 'config-row'); [['封禁阈值', text(config.scoreThreshold)], ['观察阈值', text(config.observationScore)], ['AI 识别', config.aiEnabled === true ? '已启用' : config.aiEnabled === false ? '未启用' : '—'], ['AI 日额度', displayValue(config.llmDaily)]].forEach(function (pair) { var span = element('span', '', pair[0]); span.append(element('strong', '', pair[1])); row.append(span); }); card.append(row); if (data.visionModel) card.append(element('div', 'subtle', '图像识别 · ' + text(data.visionModel))); container.append(grid, card); }
+    function renderAdsSummary(data) { var container = $('ads-summary'); container.replaceChildren(); var counts = data.counts || {}; var config = data.config || {}; var grid = element('div', 'stat-grid'); [['指纹', counts.fingerprints, 'fingerprints'], ['广告样本', counts.samples, 'samples'], ['观察中', counts.observing, 'observing'], ['待复核', counts.pending]].forEach(function (pair, i) { var stat = element('div', 'stat' + (i === 3 ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(pair[1])), element('div', 'stat-label', pair[0])); if (i === 3) clickable(stat, '待复核 ' + count(pair[1]) + ' 条，点击跳到待复核记录', function () { jumpTo($('ads-pending-label')); }); else { stat.setAttribute('data-drill', pair[2]); clickable(stat, pair[0] + ' ' + count(pair[1]) + '，点击展开明细', function () { return toggleAdsDrill(pair[2]); }); } grid.append(stat); }); var links = element('div', 'drill-links'); ['llm', 'dryrun', 'whitelist'].forEach(function (key) { var b = makeButton(ADS_DRILL[key].label, 'small', function () { return toggleAdsDrill(key); }); b.setAttribute('data-drill', key); links.append(b); }); var card = element('div', 'card'); var row = element('div', 'config-row'); [['封禁阈值', text(config.scoreThreshold)], ['观察阈值', text(config.observationScore)], ['AI 识别', config.aiEnabled === true ? '已启用' : config.aiEnabled === false ? '未启用' : '—'], ['AI 日额度', displayValue(config.llmDaily)]].forEach(function (pair) { var span = element('span', '', pair[0]); span.append(element('strong', '', pair[1])); row.append(span); }); card.append(row); if (data.visionModel) card.append(element('div', 'subtle', '图像识别 · ' + text(data.visionModel))); card.append(links); container.append(grid, card); syncAdsDrill(); }
+    // 广告页下钻（批次 2）：概况里的数字 / 入口点开，在 #ads-drill 里列明细；再点同一个收起。
+    // 一次只展开一个；原文（指纹值、样本、原因）一律 textContent，不渲染成链接。
+    var ADS_DRILL = {
+      fingerprints: { label: '指纹', action: 'ads/fingerprints', search: true, render: renderDrillFingerprints },
+      samples: { label: '广告样本', action: 'ads/samples', render: renderDrillSamples },
+      observing: { label: '观察中', action: 'ads/observing', render: renderDrillObserving },
+      llm: { label: 'AI 今日用量', action: 'ads/llm', render: renderDrillLLM },
+      dryrun: { label: '演练流水', action: 'ads/dryrun', render: renderDrillDryRun },
+      whitelist: { label: '白名单', action: 'ads/whitelist', render: renderDrillWhitelist }
+    };
+    function syncAdsDrill() { document.querySelectorAll('#ads-summary [data-drill]').forEach(function (el) { var on = el.getAttribute('data-drill') === state.adsDrill; el.setAttribute('aria-expanded', on ? 'true' : 'false'); el.classList.toggle('active', on); }); }
+    function toggleAdsDrill(key) { var box = $('ads-drill'); if (state.adsDrill === key) { state.adsDrill = ''; begin('ads-drill'); box.replaceChildren(); syncAdsDrill(); return; } state.adsDrill = key; state.adsDrillQuery = ''; syncAdsDrill(); return loadAdsDrill(1); }
+    async function loadAdsDrill(page) {
+      var key = state.adsDrill; var def = ADS_DRILL[key]; if (!def) return; var box = $('ads-drill'); var seq = begin('ads-drill'); box.replaceChildren();
+      var head = element('div', 'toolbar'); head.append(element('h2', 'section-label', def.label + '明细')); var counter = element('span', 'counter'); head.append(counter); box.append(head);
+      if (def.search) { var form = element('form', 'search-form'); var input = element('input', 'input'); input.type = 'search'; input.maxLength = 100; input.placeholder = '按指纹内容搜索'; input.value = state.adsDrillQuery; input.setAttribute('aria-label', '搜索指纹'); var go = element('button', 'button primary', '搜索'); go.type = 'submit'; form.append(input, go); form.addEventListener('submit', function (event) { event.preventDefault(); state.adsDrillQuery = input.value.trim(); loadAdsDrill(1); }); box.append(form); }
+      var list = element('div', 'list-grid'); var pagerBox = element('div'); box.append(list, pagerBox); loading(list, '正在读取' + def.label + '…');
+      try { var data = await api(def.action, { page: page, query: state.adsDrillQuery }); if (!current('ads-drill', seq)) return; data = data || {}; list.replaceChildren(); if (data.total !== undefined) counter.textContent = count(data.total) + ' 条'; def.render(list, data); if (Array.isArray(data.items) && !data.items.length) empty(list, '暂无' + def.label + '记录', state.adsDrillQuery ? '没有匹配的内容，换个关键词试试。' : '有数据后会显示在这里。'); if (data.totalPages) pager(pagerBox, data, function (p) { return loadAdsDrill(p); }); }
+      catch (err) { if (err.auth || !current('ads-drill', seq)) return; empty(list, def.label + '读取失败', err.message, function () { return loadAdsDrill(page); }); }
+    }
+    function drillCard(title, subtitle, badge, badgeClass) { var card = element('article', 'card'); var head = element('div', 'card-heading'); var id = element('div'); id.append(element('h3', 'card-title', title)); if (subtitle) id.append(element('div', 'card-subtitle mono', subtitle)); head.append(id); if (badge) head.append(element('span', 'badge ' + (badgeClass || ''), badge)); card.append(head); return card; }
+    function reasonBadges(reasons) { var box = element('div', 'reason-list'); (Array.isArray(reasons) ? reasons : []).forEach(function (r) { box.append(element('span', 'badge warning', displayValue(r))); }); return box.childNodes.length ? box : null; }
+    function personTitle(r) { return text(r.name, r.username ? '@' + r.username : '用户 ' + text(r.userId)); }
+    function personSub(r) { return (r.username && r.name ? '@' + r.username + ' · ' : '') + 'ID ' + text(r.userId); }
+    var FP_SOURCE = { seed: '内置', auto: '自动学习', manual: '手动' };
+    function renderDrillFingerprints(list, data) { (data.items || []).forEach(function (r) { var card = drillCard(text(r.value), text(r.type), FP_SOURCE[r.source] || text(r.source, '未知来源'), r.source === 'seed' ? '' : 'accent'); card.append(detailList([['权重', text(r.weight)], ['命中', count(r.matchCount)], ['误报', count(r.falsePositiveCount)], ['收录时间', date(r.createdAt)]])); list.append(card); }); }
+    var SAMPLE_STATUS = { ready: ['可用', 'accent'], stale: ['旧模型向量', 'warning'], pending: ['未生成向量', ''] };
+    function renderDrillSamples(list, data) { var c = data.counts || {}; list.append(element('p', 'subtle', '共 ' + count(c.total) + ' 条 · 已生成向量 ' + count(c.ready) + ' · 换模型失效 ' + count(c.stale) + ' · 实际可用 ' + count(c.usable))); (data.items || []).forEach(function (r) { var s = SAMPLE_STATUS[r.status] || ['—', '']; var card = drillCard('样本 #' + text(r.id), text(r.source, '未知来源') + ' · ' + date(r.createdAt), s[0], s[1]); card.append(element('div', 'evidence-text', text(r.text))); list.append(card); }); }
+    function renderDrillObserving(list, data) { (data.items || []).forEach(function (r) { var card = drillCard(personTitle(r), personSub(r), '评分 ' + text(r.score), 'warning'); var reasons = reasonBadges(r.reasons); if (reasons) card.append(reasons); card.append(detailList([['所在群组', text(r.chatId), true], ['判定层', text(r.layer)], ['最近更新', date(r.updatedAt)], ['观察到期', date(r.expiresAt)]])); clickable(card, '查询用户 ' + text(r.userId), function () { return openUser(r.userId); }); list.append(card); }); }
+    var LLM_POOL = { message: '群消息', join: '入群', cron: '定时扫描' };
+    function renderDrillLLM(list, data) { var card = drillCard('第⑥层 AI 判定 · ' + text(data.day), data.enabled ? '已启用' : '未启用（没绑定 Workers AI 或已关闭）', data.broken ? '今日已熔断' : '', data.broken ? 'danger' : ''); var pools = data.pools || {}; var pairs = [['今日已用', count(data.used) + ' / ' + count(data.daily)]]; Object.keys(LLM_POOL).forEach(function (k) { var p = pools[k] || {}; pairs.push([LLM_POOL[k] + '池', count(p.used) + ' / ' + count(p.limit)]); }); pairs.push(['判为广告', count(data.hits)], ['达线封禁', count(data.bans)], ['解析失败', count(data.parseFail)], ['连续失败', count(data.consecFail)]); var cand = data.candidates || {}; pairs.push(['候选池', count(cand.total) + '（已转正 ' + count(cand.promoted) + '）']); card.append(detailList(pairs)); list.append(card); }
+    var DRY_STATUS = { fp: ['主人判误报', 'danger'], done: ['主人确认封', 'accent'], open: ['未处理', ''] };
+    function renderDrillDryRun(list, data) { (data.items || []).forEach(function (r) { var s = DRY_STATUS[r.status] || DRY_STATUS.open; var card = drillCard('用户 ' + text(r.userId), '#' + text(r.id) + ' · ' + date(r.createdAt), s[0], s[1]); var reasons = reasonBadges(r.reasons); if (reasons) card.append(reasons); card.append(detailList([['所在群组', text(r.chatId), true], ['评分 / 封禁线', text(r.score) + ' / ' + text(r.threshold)], ['判定层', text(r.layer)]])); clickable(card, '查询用户 ' + text(r.userId), function () { return openUser(r.userId); }); list.append(card); }); }
+    function renderDrillWhitelist(list, data) { (data.items || []).forEach(function (r) { var card = drillCard(personTitle(r), personSub(r), '白名单', 'accent'); card.append(detailList([['备注', text(r.note)], ['操作人', text(r.by), true], ['加入时间', date(r.at)]])); clickable(card, '查询用户 ' + text(r.userId), function () { return openUser(r.userId); }); list.append(card); }); }
     async function loadAdsPending(page) { state.adsPage = Math.max(1, Number(page) || 1); var seq = begin('ads-pending'); loading($('ads-content'), '正在读取待复核记录…'); $('ads-pager').replaceChildren(); $('ads-count').textContent = ''; try { var data = await api('ads/pending', { page: state.adsPage }); if (!current('ads-pending', seq)) return; data = data || {}; state.adsPage = Number(data.page) || state.adsPage; if (state.adsPage > Math.max(1, Number(data.totalPages) || 1)) return loadAdsPending(Math.max(1, Number(data.totalPages) || 1)); renderAdsPending(data); state.loaded.ads = true; } catch (err) { if (err.auth || !current('ads-pending', seq)) return; empty($('ads-content'), '待复核记录加载失败', err.message, function () { return loadAdsPending(state.adsPage); }); } }
     async function loadAds() { await Promise.allSettled([loadAdsSummary(), loadAdsPending(state.adsPage)]); }
     function renderAdsPending(data) {
@@ -2305,6 +2342,163 @@ async function miniAppAdPending(env, payload) {
 	}
 }
 
+// ===== 广告页下钻（方案 C 批次 2）：6 个只读接口，只给第一主人 =====
+// 点开概况里的数字才查，每次 1～3 条只读 SQL、每页 20 条；不调 Workers AI、不写库。
+// 原文（指纹值、样本、原因）一律原样回传，前端只按 textContent 显示，不渲染成链接。
+function miniAppPageArgs(payload, total, size = MINI_APP_PAGE_SIZE) {
+	const totalPages = Math.max(1, Math.ceil((Number(total) || 0) / size));
+	const page = Math.min(Math.max(1, Number(payload?.page) || 1), totalPages);
+	return { page, totalPages, size, offset: (page - 1) * size };
+}
+
+function miniAppJsonList(raw) {
+	try {
+		const parsed = JSON.parse(String(raw || '[]'));
+		return Array.isArray(parsed) ? parsed.map((item) => miniAppPlainText(typeof item === 'string' ? item : JSON.stringify(item))) : [];
+	} catch (_) { return []; }
+}
+
+const MINI_APP_FINGERPRINT_QUERY_MAX = 100;
+async function miniAppAdFingerprints(env, payload) {
+	const keyword = String(payload?.query || '').trim();
+	if (keyword.length > MINI_APP_FINGERPRINT_QUERY_MAX) throw new MiniAppError(400, '关键词不能超过 ' + MINI_APP_FINGERPRINT_QUERY_MAX + ' 字');
+	const size = MINI_APP_PAGE_SIZE;
+	const wanted = Math.max(1, Number(payload?.page) || 1);
+	let result = await listAdFingerprints(env, { keyword, limit: size, offset: (wanted - 1) * size });
+	if (!result.ok) throw new MiniAppError(503, '指纹读取失败，请稍后重试');
+	const paging = miniAppPageArgs({ page: wanted }, result.total, size);
+	// 页码越界（列表被删短了）：钳到最后一页重查一次
+	if (paging.page !== wanted) {
+		result = await listAdFingerprints(env, { keyword, limit: size, offset: paging.offset });
+		if (!result.ok) throw new MiniAppError(503, '指纹读取失败，请稍后重试');
+	}
+	return { items: result.rows, page: paging.page, total: result.total, totalPages: paging.totalPages, query: keyword };
+}
+
+async function miniAppAdSamples(env, payload) {
+	if (!(await adDetectionReady(env))) throw new MiniAppError(503, '广告检测尚未就绪');
+	const stats = await countAdSamples(env);
+	const counts = { total: stats.total, ready: stats.ready, stale: stats.stale, usable: Math.max(0, stats.ready - stats.stale) };
+	const paging = miniAppPageArgs(payload, stats.total);
+	try {
+		// 只取「有没有向量」与维度，不把向量本体拉出来（一条 1024 维，一页 20 条就是几百 KB）
+		const { results } = await env.DB.prepare(
+			'SELECT id, sample_text, source, created_at, CASE WHEN embedding IS NULL THEN 0 ELSE 1 END AS has_vec, dimension '
+			+ 'FROM ad_sample_embeddings ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?'
+		).bind(paging.size, paging.offset).all();
+		const items = (results || []).map((row) => {
+			const dimension = row.dimension === null || row.dimension === undefined ? null : Number(row.dimension);
+			const status = Number(row.has_vec) !== 1 ? 'pending' : (dimension !== null && dimension !== AD_EMBEDDING_DIMENSION ? 'stale' : 'ready');
+			return { id: Number(row.id) || 0, text: String(row.sample_text || ''), source: String(row.source || ''), createdAt: Number(row.created_at) || 0, status };
+		});
+		return { items, counts, page: paging.page, total: stats.total, totalPages: paging.totalPages };
+	} catch (error) {
+		console.error('[Mini App] 广告样本读取失败:', error);
+		throw new MiniAppError(503, '广告样本读取失败，请稍后重试');
+	}
+}
+
+async function miniAppAdObserving(env, payload) {
+	if (!(await adDetectionReady(env))) throw new MiniAppError(503, '广告检测尚未就绪');
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		const totalRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_user_screening WHERE expires_at > ?').bind(now).first();
+		const total = Number(totalRow?.c) || 0;
+		const paging = miniAppPageArgs(payload, total);
+		const { results } = await env.DB.prepare(
+			'SELECT s.user_id, s.chat_id, s.score, s.reasons, s.layer, s.joined_at, s.expires_at, s.updated_at, m.first_name, m.last_name, m.username '
+			+ 'FROM ad_user_screening s LEFT JOIN ad_group_members m ON m.user_id = s.user_id '
+			+ 'WHERE s.expires_at > ? ORDER BY s.updated_at DESC, s.user_id ASC LIMIT ? OFFSET ?'
+		).bind(now, paging.size, paging.offset).all();
+		const items = (results || []).map((row) => ({
+			userId: String(row.user_id || ''),
+			name: [row.first_name, row.last_name].filter(Boolean).map(String).join(' '),
+			username: String(row.username || ''),
+			chatId: String(row.chat_id || ''),
+			score: Number(row.score) || 0,
+			reasons: miniAppJsonList(row.reasons),
+			layer: String(row.layer || ''),
+			joinedAt: Number(row.joined_at) || 0,
+			expiresAt: Number(row.expires_at) || 0,
+			updatedAt: Number(row.updated_at) || 0
+		}));
+		return { items, page: paging.page, total, totalPages: paging.totalPages };
+	} catch (error) {
+		console.error('[Mini App] 观察名单读取失败:', error);
+		throw new MiniAppError(503, '观察名单读取失败，请稍后重试');
+	}
+}
+
+// 第⑥层今日用量。readAdLLMOutcome 只读不写（跨天清零在 readAdLLMQuota 里，这里刻意不调它）。
+async function miniAppAdLLM(env) {
+	const config = loadAdDetectionConfig(env);
+	const now = Math.floor(Date.now() / 1000);
+	const outcome = await readAdLLMOutcome(env, now);
+	const candidates = await readAdLLMCandidateStats(env);
+	const pools = {};
+	for (const pool of AD_LLM_POOLS) pools[pool] = { used: Number(outcome.pools?.[pool]) || 0, limit: adLLMPoolLimit(config, pool) };
+	return {
+		enabled: config.aiEnabled === true,
+		day: new Date(now * 1000).toISOString().slice(0, 10),
+		daily: Number(config.llmDaily) || 0,
+		used: outcome.used,
+		pools,
+		hits: outcome.hits,
+		bans: outcome.bans,
+		parseFail: outcome.parseFail,
+		broken: outcome.broken === true,
+		consecFail: outcome.consecFail,
+		candidates
+	};
+}
+
+async function miniAppAdDryRun(env, payload) {
+	const chatId = String(payload?.chatId || '').trim();
+	if (chatId && !(GROUP_IDS || []).map(String).includes(chatId)) throw new MiniAppError(400, '该群组不在治理范围内');
+	if (!(await ensureAdDryRunLogTable(env))) throw new MiniAppError(503, '演练流水暂不可用');
+	const where = chatId ? ' WHERE chat_id = ?' : '';
+	const args = chatId ? [chatId] : [];
+	try {
+		const totalRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_dryrun_log' + where).bind(...args).first();
+		const total = Number(totalRow?.c) || 0;
+		const paging = miniAppPageArgs(payload, total);
+		const { results } = await env.DB.prepare(
+			'SELECT id, chat_id, user_id, score, threshold, layer, reasons, fp, done, created_at FROM ad_dryrun_log'
+			+ where + ' ORDER BY id DESC LIMIT ? OFFSET ?'
+		).bind(...args, paging.size, paging.offset).all();
+		const items = (results || []).map((row) => ({
+			id: Number(row.id) || 0,
+			chatId: String(row.chat_id || ''),
+			userId: String(row.user_id || ''),
+			score: Number(row.score) || 0,
+			threshold: Number(row.threshold) || 0,
+			layer: String(row.layer || ''),
+			reasons: miniAppJsonList(row.reasons),
+			// 主人在演练通知上点的结论：fp = 不该封，done = 确认封；都没点就是 open
+			status: Number(row.fp) === 1 ? 'fp' : (Number(row.done) === 1 ? 'done' : 'open'),
+			createdAt: Number(row.created_at) || 0
+		}));
+		return { items, chatId, page: paging.page, total, totalPages: paging.totalPages };
+	} catch (error) {
+		console.error('[Mini App] 演练流水读取失败:', error);
+		throw new MiniAppError(503, '演练流水读取失败，请稍后重试');
+	}
+}
+
+async function miniAppAdWhitelist(env, payload) {
+	const result = await listAdUserWhitelist(env);
+	if (!result.ok) throw new MiniAppError(503, '白名单读取失败，请稍后重试');
+	const rows = result.rows.map((row) => ({
+		userId: row.userId,
+		name: [row.firstName, row.lastName].filter(Boolean).join(' '),
+		username: row.username,
+		by: row.byUser,
+		at: row.at,
+		note: row.note
+	}));
+	return miniAppPaging(rows, payload?.page, MINI_APP_PAGE_SIZE);
+}
+
 async function miniAppAdIgnore(env, payload) {
 	const seq = Number(payload.seq);
 	if (!Number.isSafeInteger(seq) || seq <= 0) throw new MiniAppError(400, '序号无效');
@@ -2636,6 +2830,12 @@ async function dispatchMiniAppAction(action, body, env, auth, ctx) {
 		case 'ads/summary': return miniAppAdSummary(env);
 		case 'ads/pending': return miniAppAdPending(env, payload);
 		case 'ads/ignore': return miniAppAdIgnore(env, payload);
+		case 'ads/fingerprints': return miniAppAdFingerprints(env, payload);
+		case 'ads/samples': return miniAppAdSamples(env, payload);
+		case 'ads/observing': return miniAppAdObserving(env, payload);
+		case 'ads/llm': return miniAppAdLLM(env);
+		case 'ads/dryrun': return miniAppAdDryRun(env, payload);
+		case 'ads/whitelist': return miniAppAdWhitelist(env, payload);
 		case 'users/query': return miniAppUserQuery(env, payload);
 		case 'health': return miniAppHealth(env);
 		case 'admins/list': return miniAppAdmins(env);
