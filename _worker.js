@@ -4350,6 +4350,119 @@ const AD_BLACKLIST_REASON_LABELS = {
 	ad_vote: '群内 /ad 举报投票通过',
 };
 
+// ===== 加黑附表 blacklist_detail（2026-10-24 主人定）=====
+// 公开查询页 /{TGID} 要给被封的人看「谁封的、在哪个群、哪条消息、原文、逐条判据」。
+// 主人原话：「旧记录一概不管。 全部以新来开始实行。」—— 所以这些全在【加黑那一刻】存下来，
+// 不事后反查（事后 by_user 只剩一个 TGID，群主 / 群管理员分不出来，消息也早被撤回了）。
+// 【单独一张表、懒建】不动 blacklist 表结构也不动 D1_SCHEMA_VERSION（动版本号会触发整套核心迁移）。
+// 【只在真正新增时写】已在黑名单（EXISTS）不覆盖第一次的现场；解封后再封是新的一次，INSERT OR REPLACE 覆盖。
+// 【写失败不影响加黑】附表是给人看的说明，封禁本身才是正事 —— 失败只记日志。
+// operator_role 存英文代号（展示层再翻中文）：primary_owner / secondary_owner / super_admin /
+// group_creator / group_admin / anonymous_admin / system。
+const BLACKLIST_DETAIL_TEXT_MAX = 1000;
+const BLACKLIST_DETAIL_REASONS_MAX = 30;
+// D1 单条语句最多绑定 100 个参数：8 列 × 12 行 = 96。
+const BLACKLIST_DETAIL_CHUNK = 12;
+const D1_BLACKLIST_DETAIL_INIT = new WeakMap();
+
+async function ensureBlacklistDetailTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_BLACKLIST_DETAIL_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			await runD1SchemaStatement(env, 'blacklist_detail',
+				'CREATE TABLE IF NOT EXISTS blacklist_detail (id TEXT PRIMARY KEY, chat_id TEXT, msg_id INTEGER, operator_role TEXT, operator_username TEXT, text TEXT, detail TEXT, at TEXT NOT NULL)');
+			return true;
+		} catch (error) {
+			console.error('[加黑附表] 建表失败:', error?.message || error);
+			return false;
+		}
+	})();
+	D1_BLACKLIST_DETAIL_INIT.set(env.DB, init);
+	const ok = await init;
+	if (!ok) D1_BLACKLIST_DETAIL_INIT.delete(env.DB);   // 失败不缓存，下次再试
+	return ok;
+}
+
+// 只凭 by_user 推身份：调用方没给 operatorRole 时的兜底（自动路径、旧批量任务）。
+// 推不出「群主」—— 群主得问 Telegram，所以命令路径都由 resolveMessageBlacklistOperator 先算好传进来。
+function inferBlacklistOperatorRole(by) {
+	const raw = String(by || '').trim();
+	if (!raw) return '';
+	if (raw === 'system') return 'system';
+	if (/^anonymous_admin:/.test(raw)) return 'anonymous_admin';
+	if (isPrimaryOwner(raw)) return 'primary_owner';
+	if (isSecondaryOwner(raw)) return 'secondary_owner';
+	if (isSuperAdmin(raw)) return 'super_admin';
+	return /^\d+$/.test(raw) ? 'group_admin' : '';
+}
+
+// 命令路径：按发命令的那条消息定身份 + 现场（群 ID）。
+// 私聊不存 chat_id：私聊的 chat id 就是操作人自己的 TGID，主人定了查询页不显示操作人 TGID。
+async function resolveMessageBlacklistOperator(message) {
+	const isPrivate = message?.chat?.type === 'private';
+	const chatId = isPrivate ? '' : String(message?.chat?.id ?? '');
+	if (isAnonymousAdminMessage(message)) {
+		return { operatorRole: 'anonymous_admin', operatorUsername: '', chatId };
+	}
+	const uid = String(message?.from?.id || '');
+	const operatorUsername = String(message?.from?.username || '');
+	let operatorRole = inferBlacklistOperatorRole(uid);
+	// 主人 / 超管按配置就能定；剩下的「群管理员」要区分是不是该群 Telegram 群主。
+	if (operatorRole === 'group_admin' && !isPrivate && chatId) {
+		const creator = message.__operatorIsCreator ?? await isGroupCreator(uid, chatId);
+		if (creator) operatorRole = 'group_creator';
+	}
+	return { operatorRole, operatorUsername, chatId };
+}
+
+function normalizeBlacklistDetailRow(userId, by, detail, fallbackReasons, at) {
+	const d = detail || {};
+	const msgId = Number(d.msgId);
+	const reasons = (Array.isArray(d.reasons) && d.reasons.length ? d.reasons : fallbackReasons || [])
+		.map((x) => String(x || '').trim())
+		.filter(Boolean)
+		// 主人定：Detail 去掉「操作人 TGID」那一行 —— 身份另有一栏，TGID 不公开。
+		.filter((x) => !/^操作人\s*TGID/.test(x))
+		.slice(0, BLACKLIST_DETAIL_REASONS_MAX);
+	return [
+		String(userId),
+		d.chatId != null && String(d.chatId) ? String(d.chatId) : null,
+		Number.isInteger(msgId) && msgId > 0 ? msgId : null,
+		String(d.operatorRole || inferBlacklistOperatorRole(by) || '') || null,
+		String(d.operatorUsername || '').replace(/^@/, '').slice(0, 64) || null,
+		String(d.text || '').trim().slice(0, BLACKLIST_DETAIL_TEXT_MAX) || null,
+		reasons.length ? JSON.stringify(reasons) : null,
+		at
+	];
+}
+
+function buildBlacklistFallbackReasons(reason, note) {
+	const label = AD_BLACKLIST_REASON_LABELS[String(reason || '')] || String(reason || '');
+	const out = [];
+	if (label) out.push('处置方式：' + label);
+	if (note) out.push('原因说明：' + note);
+	return out;
+}
+
+async function writeBlacklistDetails(env, rows) {
+	if (!rows.length) return;
+	try {
+		if (!(await ensureBlacklistDetailTable(env))) return;
+		for (let i = 0; i < rows.length; i += BLACKLIST_DETAIL_CHUNK) {
+			const chunk = rows.slice(i, i + BLACKLIST_DETAIL_CHUNK);
+			await env.DB
+				.prepare('INSERT OR REPLACE INTO blacklist_detail (id, chat_id, msg_id, operator_role, operator_username, text, detail, at) VALUES '
+					+ chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?)').join(', '))
+				.bind(...chunk.flat())
+				.run();
+		}
+	} catch (error) {
+		console.error('[加黑附表] 写入失败（不影响加黑）:', error?.message || error);
+	}
+}
+
 async function addToBlacklistCore(userId, env, options = {}) {
 	if (!env.DB) {
 		return { success: false, code: 'NO_DB', message: '❌ 未绑定 D1 存储空间' };
@@ -4377,6 +4490,10 @@ async function addToBlacklistCore(userId, env, options = {}) {
 		if (!changed) {
 			return { success: false, code: 'EXISTS', message: '⚠️ 该用户已在黑名单中' };
 		}
+
+		// 公开查询的现场：身份 / 群 / 消息 / 原文 / 逐条判据（见 blacklist_detail 那段说明）。
+		await writeBlacklistDetails(env, [normalizeBlacklistDetailRow(
+			userIdStr, by, options.detail, buildBlacklistFallbackReasons(reason, note), at)]);
 
 		// 【任何原因进黑名单，/user 都要查得到】（2026-10-13 主人要求）
 		// addToBlacklist 是所有封禁的唯一入口（10 个调用点），但原先【只有】
@@ -5238,7 +5355,7 @@ function isAdDetectionExemptUser(userId) {
 
 // 只检查用户是否为“指定当前群”的 Telegram 管理员。
 // 普通管理员的 /ban、/spam 必须使用该鉴权，禁止遍历其它 GROUP_IDS 借权。
-async function checkIfUserIsAdminInGroup(userId, groupId) {
+async function checkIfUserIsAdminInGroup(userId, groupId, options = {}) {
 	const userIdStr = String(userId || '');
 	const groupIdStr = String(groupId || '');
 	if (!userIdStr || !isConfiguredGroup(groupIdStr)) return false;
@@ -5255,6 +5372,7 @@ async function checkIfUserIsAdminInGroup(userId, groupId) {
 			return false;
 		}
 		const hit = result.result.find((member) => member?.user && String(member.user.id) === userIdStr);
+		if (typeof options.onStatus === 'function') options.onStatus(hit?.status || '');
 		if (hit) {
 			console.log(`[当前群鉴权] 用户 ${userIdStr} 在当前群 ${groupIdStr} 是 ${hit.status} ✅`);
 			return true;
@@ -5279,7 +5397,11 @@ async function checkMessageOperatorCanModerate(message, userId) {
 		return message?.chat?.type === 'private' ? true : isConfiguredGroup(message?.chat?.id);
 	}
 	if (message?.chat?.type === 'private') return checkIfUserIsAdmin(userId);
-	return checkIfUserIsAdminInGroup(userId, message?.chat?.id);
+	// 鉴权这一次查询顺带拿到 status：记在消息上给加黑附表定「群主 / 群管理员」，
+	// 不再为身份多问一次 Telegram（命令链路的调用次数有守卫断言）。
+	return checkIfUserIsAdminInGroup(userId, message?.chat?.id, {
+		onStatus: (status) => { if (message) message.__operatorIsCreator = status === 'creator'; }
+	});
 }
 
 function shouldSilenceAuthorizedGroupCommand(message) {
@@ -5558,6 +5680,7 @@ async function addManyToBlacklist(ids, env, options = {}) {
 	const by = options.by != null ? String(options.by) : null;
 	const note = normalizeActionNote(options.note) || null;
 	const at = new Date().toISOString();
+	const fallbackReasons = buildBlacklistFallbackReasons(reason, note);
 
 	for (const chunk of chunkBatchItems(uniqueIds)) {
 		try {
@@ -5572,6 +5695,9 @@ async function addManyToBlacklist(ids, env, options = {}) {
 				if (inserted.has(id)) results.success.push(id);
 				else results.exists.push(id);
 			}
+			// 只给真正新增的写附表，与单条同口径（已存在的不覆盖第一次的现场）。
+			await writeBlacklistDetails(env, chunk.filter((id) => inserted.has(id))
+				.map((id) => normalizeBlacklistDetailRow(id, by, options.detail, fallbackReasons, at)));
 		} catch (error) {
 			console.error('批量添加黑名单时出错:', error);
 			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 添加黑名单失败: ${toChineseErrorText(error?.message || error)}` })));
@@ -5933,6 +6059,9 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		operatorRole: options.killer === true
 			? '杀手权限'
 			: classifyMessageOperatorRole(message, message.chat?.type === 'private' ? '管理员' : '群管理员'),
+		// 加黑附表用：身份英文代号 + 用户名（公开查询页的「操作人」栏）。
+		blacklistOperatorRole: options.blacklistOperator?.operatorRole || '',
+		blacklistOperatorUsername: options.blacklistOperator?.operatorUsername || '',
 		sourceChatId: String(message.chat?.id ?? ''),
 		sourceChatTitle: message.chat?.title || message.chat?.username || (message.chat?.type === 'private' ? '私聊' : '当前群组'),
 		sourceChatType: message.chat?.type || 'unknown',
@@ -6255,7 +6384,13 @@ async function performBulkJobD1Mutation(job, env, ids) {
 			: await addManyToBlacklist(ids, env, {
 				reason: job.reason,
 				by: job.createdBy,
-				note: job.note
+				note: job.note,
+				// 私聊发起的任务不存 chat_id（私聊 id 就是操作人 TGID）；旧任务没有这两个字段 → 按 createdBy 推身份。
+				detail: {
+					operatorRole: job.blacklistOperatorRole || '',
+					operatorUsername: job.blacklistOperatorUsername || '',
+					chatId: job.sourceChatType === 'private' ? '' : (job.sourceChatId || '')
+				}
 			});
 		// 人工批量判定的学习：/ban /sban /spam 的批量任务都汇到这里（job.reason / job.mode）。
 		// 此前只有 /spam 引用回复与自动定罪学，批量封禁一个特征都不学 ——
@@ -6644,7 +6779,10 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 		});
 		return true;
 	}
+	// 加黑附表的身份在建任务这一刻定（队列执行时已没有 message，判不了群主）。
+	const blacklistOperator = action === 'unban' ? null : await resolveMessageBlacklistOperator(message);
 	const job = await createBulkJob(env, action, valid, invalid, note, message, {
+		blacklistOperator,
 		allowD1Removal: action === 'unban' && options.allowD1Removal === true,
 		mode: options.mode || null,
 		// 群内静默/简洁（主人要求）：/ban·/spam·/unban 的批量任务【不再向源群推异步完成通知】，
@@ -7770,7 +7908,10 @@ async function checkSbanPermission(message, userId) {
 	if (!isConfiguredGroup(message?.chat?.id)) return false;
 	// 不复用 checkIfUserIsAdminInGroup：那个把管理员和群主一并放行，/sban 只认 creator。
 	// 不接 AD_ADMIN_CACHE：它存的是 id 列表、没有 status，区分不出群主。
-	return await isGroupCreator(userId, String(message.chat.id));
+	const creator = await isGroupCreator(userId, String(message.chat.id));
+	// 记在消息上：加黑附表定身份时直接复用，不再多问一次 Telegram。
+	message.__operatorIsCreator = creator;
+	return creator;
 }
 
 // 判断给定 chat_id 是否属于配置的任一群组
@@ -10561,7 +10702,12 @@ async function enforceLinkedSpamTargets(env, targets, options = {}) {
 		const added = await addToBlacklist(target.userId, env, {
 			reason: 'spam',
 			by: String(options.operatorId ?? 'system'),
-			note: options.note || '同款广告连带查杀'
+			note: options.note || '同款广告连带查杀',
+			// 连带的现场取反查到的第一条同款消息（原文已在上面删掉，这里只留位置）。
+			detail: {
+				chatId: target.messageIds?.[0]?.chatId || '',
+				msgId: target.messageIds?.[0]?.mid
+			}
 		});
 		const banResults = await banUserFromAllGroups(target.userId, { probeMembership: false, groupIds: nonKillerGroupIds() });
 		// 风控·处置：同款连带查杀按实际封成功的群逐群 +1。
@@ -10850,7 +10996,12 @@ async function enforceHandledRepeatBan(env, message, hit) {
 		const added = await addToBlacklist(userId, env, {
 			reason: 'spam',
 			by: 'system',
-			note: '同款广告直封（第一主人 /spam 过的文案）'
+			note: '同款广告直封（第一主人 /spam 过的文案）',
+			detail: {
+				chatId: String(message?.chat?.id ?? ''),
+				msgId: message?.message_id,
+				text: getAdDetectionBodyText(message)
+			}
 		});
 		blacklistCode = String(added?.code || (added?.success ? 'ADDED' : 'ERROR'));
 	} catch (error) {
@@ -12236,6 +12387,13 @@ async function enforceApprovedAdVote(env, state) {
 		reason: 'ad_vote',
 		by: state.creatorUserId,
 		note: ('群内 /ad 举报投票通过' + (state.reason ? '：' + state.reason : '')).slice(0, 500),
+		// 投票定罪是群众举报、不是哪个管理员拍板 → 身份记 system；现场是被举报的那条消息。
+		detail: {
+			operatorRole: 'system',
+			chatId: state.chatId,
+			msgId: state.reportedMessageId,
+			text: state.messagePreview || ''
+		}
 	});
 	const banResults = await banUserFromAllGroups(state.targetUserId, { probeMembership: true, revokeMessages: true, groupIds: nonKillerGroupIds() });
 	// 风控·处置：群内 /ad 举报投票通过后的定罪封禁，按实际封成功的群逐群 +1。
@@ -13014,7 +13172,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			// 单条
 			if (valid.length === 1 && invalid.length === 0) {
-				const result = await addToBlacklist(valid[0], env, { reason: 'spam', by: operatorId, note });
+				const result = await addToBlacklist(valid[0], env, { reason: 'spam', by: operatorId, note, detail: await resolveMessageBlacklistOperator(message) });
 				const alreadyExists = result.code === 'EXISTS';
 				let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
 				const lines = [`🎬 操作:举报加黑(/spam)`];
@@ -13061,7 +13219,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 
 			// 批量
-			const results = await addManyToBlacklist(valid, env, { reason: 'spam', by: operatorId, note });
+			const results = await addManyToBlacklist(valid, env, { reason: 'spam', by: operatorId, note, detail: await resolveMessageBlacklistOperator(message) });
 			const idsToKick = [...results.success, ...results.exists];
 			const userProfiles = await resolveBatchUserProfiles(idsToKick, chatId);
 			const banSummary = { success: idsToKick.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
@@ -13117,7 +13275,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		const replySpamNote = rawArg;
-		const result = await addToBlacklist(repliedUserId, env, { reason: 'spam', by: operatorId, note: replySpamNote });
+		// 引用模式：被引用的那条消息就是现场 —— MsgID 与原文一并存进附表。
+		const replySpamDetail = {
+			...(await resolveMessageBlacklistOperator(message)),
+			msgId: repliedMsg?.message_id,
+			text: getAdDetectionBodyText(repliedMsg)
+		};
+		const result = await addToBlacklist(repliedUserId, env, { reason: 'spam', by: operatorId, note: replySpamNote, detail: replySpamDetail });
 		const alreadyExists = result.code === 'EXISTS';
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
@@ -14180,7 +14344,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		// 单条且无格式错误
 		if (valid.length === 1 && invalid.length === 0) {
-			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: operatorId, note });
+			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: operatorId, note, detail: await resolveMessageBlacklistOperator(message) });
 			const alreadyExists = result.code === 'EXISTS';
 			// 统一详情格式:无论成功失败都展示完整字段
 			let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
@@ -14256,7 +14420,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		// 批量
-		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: operatorId, note });
+		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: operatorId, note, detail: await resolveMessageBlacklistOperator(message) });
 		const idsToKick = [...results.success, ...results.exists];
 		const userProfiles = await resolveBatchUserProfiles(idsToKick, chatId);
 		const banSummary = { success: idsToKick.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
@@ -26429,7 +26593,16 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 
 	let blacklistCode = 'SKIPPED';
 	try {
-		const added = await addToBlacklist(userId, env, { reason: 'ad_auto', by: 'system', note });
+		const added = await addToBlacklist(userId, env, {
+			reason: 'ad_auto', by: 'system', note,
+			// 自动定罪的现场：所在群、消息、原文、逐条判据（与 /pending 案底同一份 reasons）。
+			detail: {
+				chatId,
+				msgId: input?.messageId,
+				text: evaluation?.snapshot?.text || '',
+				reasons: Array.isArray(evaluation?.reasons) ? evaluation.reasons : []
+			}
+		});
 		blacklistCode = String(added?.code || (added?.success ? 'ADDED' : 'ERROR'));
 	} catch (error) {
 		console.error('[广告检测] 加入黑名单失败:', error);
