@@ -26,7 +26,7 @@ const sandbox = {
 		try { b = init?.body ? JSON.parse(init.body) : null; } catch (_) { b = null; }
 		let result = true;
 		if (m === 'sendMessage') {
-			sent.push({ chatId: String(b?.chat_id ?? ''), text: String(b?.text || '') });
+			sent.push({ chatId: String(b?.chat_id ?? ''), text: String(b?.text || ''), markup: b?.reply_markup ? JSON.stringify(b.reply_markup) : '' });
 			result = { message_id: 8000 + sent.length };
 		} else if (m === 'getChat') result = { id: Number(b?.chat_id), type: 'supergroup', title: '测试群' };
 		else if (m === 'getChatMember') result = { status: 'member', user: { id: Number(b?.user_id) } };
@@ -107,6 +107,19 @@ async function sendGroup(fromId, text, reply) {
 	}), env, { waitUntil() {} });
 }
 
+// 超管群内 /ban /spam 先弹范围按钮（独立模式口径），点「② 全域」才封；按钮路径同样不学
+async function clickSuperGlobalButton(fromId) {
+	const data = [...sent.map((s) => s.markup).join('\n').matchAll(/"callback_data":"(gmsa:G:[^"]+)"/g)].map((x) => x[1]).pop();
+	mid += 1;
+	await W.__h.fetch(new Request('https://x.com/', {
+		method: 'POST', headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ update_id: mid, callback_query: {
+			id: 'cb' + mid, data, from: { id: Number(fromId), is_bot: false, first_name: 'U' + fromId },
+			message: { message_id: 8000, chat: { id: Number(GROUPS[0]), type: 'supergroup', title: '测试群' } }
+		} })
+	}), env, { waitUntil() {} });
+}
+
 async function seedAd(uid) {
 	mid += 1;
 	await W.cacheModerationMessage(env, { message_id: mid, chat: { id: GROUPS[0] }, from: { id: uid }, text: AD });
@@ -134,6 +147,7 @@ for (const [label, operator, makeText, useReply] of cases) {
 	const uid = String(uidSeq);
 	const adMsg = await seedAd(uid);
 	await sendGroup(operator, makeText(uid), useReply ? adMsg : null);
+	if (operator === SUPER) await clickSuperGlobalButton(SUPER);
 	check(label + '：前置，目标已入黑名单', inBlacklist(uid));
 	check('★ ' + label + '：指纹库没有新增', fpCount() === 0, '实际 ' + fpCount());
 }

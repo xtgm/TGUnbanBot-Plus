@@ -218,7 +218,8 @@ console.log('\n=== /unban 引用：有权限的人都能用 ===');
 {
 	reset();
 	const uid = nextUid();
-	await send(OWNER, '/ban ' + uid);
+	// 由副主人封：第一主人封的只有第一主人能解（锁定见 test_group_independent）
+	await send(VICE, '/ban ' + uid);
 	check('前置：已入黑名单', inBlacklist(uid));
 	reset();
 	await send(ADMIN, '/unban', userMsg(uid, '我是被误封的'));

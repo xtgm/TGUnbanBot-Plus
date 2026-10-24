@@ -141,6 +141,13 @@ check('杀手群里 /ban 走杀手身份：不进主黑名单', !inMainBl('55605
 check('杀手群里 /ban 走杀手身份：GROUP_ID 群没动', !touched(G));
 reset();
 await send(groupMsg(G, KS, '/ban 55606'));
+// 独立模式口径：超管在 GROUP_ID 群 /ban 先弹范围按钮，点「② 全域」才进主黑名单
+check('GROUP_ID 群里 /ban 走超管身份：点按钮前不写库', !inMainBl('55606') && !inKillerBl('55606'));
+{
+	const gBtn = sentTo(G).flatMap((s) => (s.markup?.inline_keyboard || []).flat()).map((b) => b.callback_data).find((d) => String(d).startsWith('gmsa:G:'));
+	check('GROUP_ID 群里 /ban 走超管身份：弹出「② 全域」按钮', !!gBtn);
+	await post({ update_id: uid++, callback_query: { id: 'cb' + uid, data: gBtn, from: { id: Number(KS), is_bot: false, first_name: 'U' + KS }, message: { message_id: 9001, chat: { id: Number(G), type: 'supergroup', title: '群' } } } });
+}
 check('GROUP_ID 群里 /ban 走超管身份：进主黑名单', inMainBl('55606'));
 check('GROUP_ID 群里 /ban 走超管身份：不进杀手黑名单', !inKillerBl('55606'));
 

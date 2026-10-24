@@ -17,6 +17,7 @@ const ADMIN = '10004';
 const CREATOR = '10005';
 const ANON = '1087968824';
 
+const sentMarkups = [];
 const sandbox = {
 	console: { log() {}, warn() {}, error() {}, info() {}, debug() {} },
 	URL, URLSearchParams, TextEncoder, TextDecoder, Response, Request, Headers,
@@ -26,7 +27,10 @@ const sandbox = {
 		let b = null;
 		try { b = init?.body ? JSON.parse(init.body) : null; } catch (_) { b = null; }
 		let result = true;
-		if (m === 'sendMessage') result = { message_id: 9000 };
+		if (m === 'sendMessage') {
+			result = { message_id: 9000 };
+			if (b?.reply_markup) sentMarkups.push(JSON.stringify(b.reply_markup));
+		}
 		else if (m === 'getChat') result = { id: Number(b?.chat_id), type: 'supergroup', title: '测试群' };
 		else if (m === 'getChatMember') result = { status: 'member', user: { id: Number(b?.user_id) } };
 		else if (m === 'getChatAdministrators') result = [
@@ -108,6 +112,20 @@ async function send(fromId, text, opts = {}) {
 	}), env, { waitUntil() {} });
 }
 
+// 超管群内 /ban /spam 先弹范围按钮（独立模式口径），点「② 全域」才写主黑名单与附表
+async function clickSuperGlobalButton(fromId) {
+	const data = [...sentMarkups.join('\n').matchAll(/"callback_data":"(gmsa:G:[^"]+)"/g)].map((x) => x[1]).pop();
+	mid += 1;
+	await W.__h.fetch(new Request('https://x.com/', {
+		method: 'POST', headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ update_id: mid, callback_query: {
+			id: 'cb' + mid, data, from: { id: Number(fromId), is_bot: false, first_name: 'U' + fromId },
+			message: { message_id: 9000, chat: { id: Number(GROUPS[0]), type: 'supergroup', title: '测试群' } }
+		} })
+	}), env, { waitUntil() {} });
+	return data;
+}
+
 function adMessage(uid) {
 	mid += 1;
 	return { message_id: mid, date: 1, chat: { id: Number(GROUPS[0]), type: 'supergroup' }, from: { id: Number(uid), is_bot: false, first_name: 'Ad' }, text: AD };
@@ -129,6 +147,10 @@ for (const [label, operator, opts, role] of [
 ]) {
 	const uid = nextUid();
 	await send(operator, '/ban ' + uid + ' 发广告', opts);
+	if (operator === SUPER) {
+		check('超管 群内 /ban：点按钮前不写黑名单', !inBlacklist(uid));
+		check('超管 群内 /ban：弹出了「② 全域」按钮', !!(await clickSuperGlobalButton(SUPER)));
+	}
 	const r = row(uid);
 	check(label + '：前置，已入黑名单', inBlacklist(uid));
 	check('★ ' + label + '：附表有这一行', !!r);
@@ -164,6 +186,7 @@ console.log('\n=== 批量（多行 INSERT 那条路）===');
 	const a = nextUid();
 	const b = nextUid();
 	await send(SUPER, '/ban ' + a + ',' + b + ' 批量');
+	await clickSuperGlobalButton(SUPER);
 	check('前置：两个都入黑名单', inBlacklist(a) && inBlacklist(b));
 	check('★ 批量：两行附表都在', !!row(a) && !!row(b));
 	check('★ 批量：身份 super_admin', row(a)?.operator_role === 'super_admin' && row(b)?.operator_role === 'super_admin', '实际 ' + row(a)?.operator_role);

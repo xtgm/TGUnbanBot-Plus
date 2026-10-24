@@ -651,7 +651,8 @@ console.log('\n=== 12. 引用已处置广告的四条管理命令先鉴权撤回
 		await bootEnv(env);
 		await W.recordHandledAdText(env, AD_TEXT);
 		if (command.startsWith('/unban') || command.startsWith('/CHECK')) {
-			await W.addToBlacklist('88001', env, { reason: 'manual', by: '10001' });
+			// 由非第一主人封：第一主人封的人群管理员解不了（锁定见 test_group_independent）
+			await W.addToBlacklist('88001', env, { reason: 'manual', by: '10003' });
 		}
 		resetCalls();
 		requests.length = 0;

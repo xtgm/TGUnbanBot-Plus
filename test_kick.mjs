@@ -3234,7 +3234,8 @@ console.log('\n[12a1b] 管理层单条 /unban 命中 D1');
 console.log('\n[12a1c] 副主人和群管理员解除 D1 后解封');
 for (const scenario of [
 	{ label: '副主人', actorId: 998, targetId: '7070447002' },
-	{ label: '群管理员', actorId: 7777, targetId: '7070447003' },
+	// 独立模式口径：群管理员私聊发封禁/解封一律收回，请他到自己的群里发
+	{ label: '群管理员', actorId: 7777, targetId: '7070447003', redirect: true },
 ]) {
 	resetCalls();
 	sandbox.fetch = makeFetchMock({
@@ -3250,7 +3251,7 @@ for (const scenario of [
 		...baseEnv,
 		OWNER_IDS: '999,998',
 
-		DB: makeFakeDB([{ id: scenario.targetId, reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' }]),
+		DB: makeFakeDB([{ id: scenario.targetId, reason: 'manual', by: '1000', at: '2026-07-01T00:00:00Z' }]),
 	};
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
@@ -3263,6 +3264,13 @@ for (const scenario of [
 			}
 		})
 	}), env);
+	if (scenario.redirect) {
+		assert(scenario.label + ' 私聊 /unban 被收回：D1 记录保留', env.DB._rows.has(scenario.targetId));
+		assert(scenario.label + ' 私聊 /unban 被收回：不调用解封', callsOf('unbanChatMember').length === 0);
+		assert(scenario.label + ' 私聊 /unban 被收回：回执请到群里发', callsOf('sendMessage').some((c) => String(c.body.chat_id) === String(scenario.actorId) && c.body.text.includes('请在你的群里发')));
+		assert(scenario.label + ' /unban 绝不调用封禁接口', callsOf('banChatMember').length === 0);
+		continue;
+	}
 	assert(scenario.label + ' /unban 移除 D1 黑名单记录', !env.DB._rows.has(scenario.targetId));
 	assert(scenario.label + ' /unban 遍历两个配置群解封', callsOf('unbanChatMember').length === 2);
 	assert(scenario.label + ' /unban 绝不调用封禁接口', callsOf('banChatMember').length === 0);
@@ -3312,7 +3320,7 @@ console.log('\n[12a1e] 群管理员解除 D1 后解封');
 	});
 	const env = {
 		...baseEnv,
-		DB: makeFakeDB([{ id: '7070447005', reason: 'manual', by: '999', at: '2026-07-01T00:00:00Z' }]),
+		DB: makeFakeDB([{ id: '7070447005', reason: 'manual', by: '1000', at: '2026-07-01T00:00:00Z' }]),
 	};
 	await handler.fetch(new Request('https://x.com/', {
 		method: 'POST',
@@ -3357,7 +3365,7 @@ console.log('\n[12a2] 匿名管理员 /unban');
 	};
 	const env = {
 		...baseEnv,
-		DB: makeFakeDB([{ id: '5973367305', reason: 'manual', by: '999', at: '2026-06-22T00:00:00Z' }]),
+		DB: makeFakeDB([{ id: '5973367305', reason: 'manual', by: '1000', at: '2026-06-22T00:00:00Z' }]),
 	};
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify(update) }), env, fakeCtx);
 
@@ -4267,13 +4275,14 @@ console.log('\n[19a] 群管理员私聊 /ban /spam');
 			body: JSON.stringify({ message: { message_id: messageId, chat: { id: 6666, type: 'private' }, from: { id: 6666, is_bot: false }, text } }),
 		}), env, fakeCtx);
 	}
-	assert('群管理员私聊 /ban /spam 写入 D1', env.DB._rows.has('601') && env.DB._rows.has('602'));
-	assert('群管理员私聊 /ban /spam 执行全群禁言', callsOf('restrictChatMember').length === 4 && callsOf('banChatMember').length === 0);
+	// 独立模式口径：群管理员私聊封禁一律收回，请到自己的群里发；不写库、不禁言
+	assert('群管理员私聊 /ban /spam 被收回：不写入 D1', !env.DB._rows.has('601') && !env.DB._rows.has('602'));
+	assert('群管理员私聊 /ban /spam 被收回：不执行禁言或封禁', callsOf('restrictChatMember').length === 0 && callsOf('banChatMember').length === 0);
 	// 60 秒缓存：两条私聊命令由同一用户连续发出，只应查一次管理员列表。
 	// 改动前这里是 2（每次命令都查）；缓存的收益就体现在这个数字上。
 	assert('群管理员私聊通过配置群管理员鉴权（60 秒缓存只查一次）', callsOf('getChatAdministrators').length === 1);
 	const replies = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '6666');
-	assert('群管理员私聊 /ban /spam 收到完整结果', replies.length === 2 && replies.every((c) => c.body.text.includes('已永久禁言')));
+	assert('群管理员私聊 /ban /spam 收到「请在你的群里发」', replies.length === 2 && replies.every((c) => c.body.text.includes('请在你的群里发')));
 }
 
 // ---------- [19b] 群管理员仍无其它隐藏管理命令权限 ----------
@@ -4317,7 +4326,8 @@ console.log('\n[19b] 普通管理员其它管理命令拒绝');
 console.log('\n[19c] 超级管理员：免管理员身份用四条命令，且不碰 /stats 与主人命令');
 {
 	// 关键：7777 是超级管理员，但【不在】任何群的 getChatAdministrators 列表里（即非真实 TG 管理员）。
-	const superAdminGroupEnv = () => ({ TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMIN_IDS: '7777', DB: makeFakeDB([{ id: '703', reason: 'manual', by: '999', at: '2026-07-21T00:00:00Z' }]) });
+	// 703 由副主人封（第一主人封的只有第一主人能解，见 test_group_independent）
+	const superAdminGroupEnv = () => ({ TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999', SUPER_ADMIN_IDS: '7777', DB: makeFakeDB([{ id: '703', reason: 'manual', by: '1000', at: '2026-07-21T00:00:00Z' }]) });
 	const fakeCtx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
 	const superRoutes = {
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 1 }, status: 'creator' }] }), // 7777 不在
@@ -4334,14 +4344,16 @@ console.log('\n[19c] 超级管理员：免管理员身份用四条命令，且�
 	let env = superAdminGroupEnv();
 	sandbox.fetch = makeFetchMock(superRoutes);
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '超管' }, text: '/ban 701' } }) }), env, fakeCtx);
-	assert('超管群内 /ban 免管理员身份写入 D1', env.DB._rows.has('701'));
-	assert('超管群内 /ban 执行全群禁言', callsOf('restrictChatMember').length > 0 && callsOf('banChatMember').length === 0);
+	// 独立模式口径：超管群内 /ban /spam 改为弹范围按钮（①本群 ②全域），点了才写库；按钮全流程见 test_group_independent
+	assert('超管群内 /ban 不直接写入 D1（改走范围选择）', !env.DB._rows.has('701'));
+	assert('超管群内 /ban 不直接禁言或封禁', callsOf('restrictChatMember').length === 0 && callsOf('banChatMember').length === 0);
+	assert('超管群内 /ban 在群里给出范围选择回执', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001'));
 	assert('超管 /ban 不查询群管理员列表（免鉴权直通）', callsOf('getChatAdministrators').length === 0);
 
 	// B. 群内 /spam /unban /check 一并放行
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '超管' }, text: '/spam 702 广告' } }) }), env, fakeCtx);
-	assert('超管群内 /spam 免管理员身份写入 D1', env.DB._rows.has('702'));
+	assert('超管群内 /spam 不直接写入 D1（改走范围选择）', !env.DB._rows.has('702'));
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 3, chat: { id: -1001, type: 'supergroup' }, from: { id: 7777, is_bot: false, first_name: '超管' }, text: '/unban 703' } }) }), env, fakeCtx);
 	assert('超管群内 /unban 免管理员身份移出 D1', !env.DB._rows.has('703') && callsOf('unbanChatMember').length > 0);
 	resetCalls();
@@ -4546,7 +4558,7 @@ console.log('\n[23] 一键代发链路已移除');
 	assert('Webhook 初始化 → /ad 投票按钮回调已启用', webhookCall?.body?.allowed_updates?.includes('callback_query'));
 	// 【2026-10-14 补】主菜单补进 start/menu/user/adstats/dryrun 五条第一主人命令（各注明确是什么），
 	// 同日再补 /wl 与 /del —— 一对用户白名单的增删入口，与 /whitelist（域名白名单，判据层）分名。
-	assert('BotFather 菜单统一注册（含 /rm /profile + 新补五条 + /wl + /del + /listgroups + /addgroup /delgroup /leavegroup）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice', 'start', 'menu', 'user', 'adstats', 'dryrun', 'wl', 'del', 'listgroups', 'addgroup', 'delgroup', 'leavegroup']));
+	assert('BotFather 菜单统一注册（含 /rm /profile + 新补五条 + /wl + /del + /listgroups + /addgroup /delgroup /leavegroup + /groupmode /localbans）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice', 'start', 'menu', 'user', 'adstats', 'dryrun', 'wl', 'del', 'listgroups', 'addgroup', 'delgroup', 'leavegroup', 'groupmode', 'localbans']));
 	// /wl /del 与 rm/profile 同口径：菜单说明必须标权限，否则主人看不出它只给第一主人用
 	assert('/wl 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'wl')?.description || '').includes('仅第一主人'));
 	assert('/del 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'del')?.description || '').includes('仅第一主人'));
@@ -6328,9 +6340,9 @@ console.log('\n[98] 四条管理命令权限与回执矩阵');
 		{ name: '其他群管理员不能借权', actor: 7777, group: -1001, allowed: false },
 		{ name: '普通成员群聊', actor: 4444, group: -1001, allowed: false },
 		{ name: '普通成员私聊', actor: 4444, allowed: false },
-		{ name: '第一群管理员私聊', actor: 6666, allowed: true },
-		{ name: '第二群管理员私聊', actor: 7777, allowed: true },
-		{ name: '动态群管理员私聊', actor: 8888, allowed: true },
+		{ name: '第一群管理员私聊', actor: 6666, allowed: true, privateAdmin: true },
+		{ name: '第二群管理员私聊', actor: 7777, allowed: true, privateAdmin: true },
+		{ name: '动态群管理员私聊', actor: 8888, allowed: true, privateAdmin: true },
 		{ name: '动态群管理员群聊', actor: 8888, group: -1003904078173, allowed: true },
 		{ name: '资料群管理员私聊无管理权', actor: 5555, allowed: false },
 		{ name: '资料群群聊无管理权', actor: 5555, group: -1999, allowed: false },
@@ -6345,7 +6357,7 @@ console.log('\n[98] 四条管理命令权限与回执矩阵');
 		{ name: '第三方机器人私聊拒绝', actor: 2222, bot: true, allowed: false },
 		{ name: '群聊鉴权接口失败', actor: 6666, group: -1001, apiFails: true, allowed: false },
 		{ name: '私聊鉴权接口失败', actor: 6666, apiFails: true, allowed: false },
-		{ name: '首群失败后第二群管理员仍有效', actor: 7777, firstApiFails: true, allowed: true },
+		{ name: '首群失败后第二群管理员仍有效', actor: 7777, firstApiFails: true, allowed: true, privateAdmin: true },
 	];
 	for (const command of ['unban', 'ban', 'spam', 'check']) {
 		for (const scenario of scenarios) {
@@ -6356,7 +6368,7 @@ console.log('\n[98] 四条管理命令权限与回执矩阵');
 			resetCalls();
 			const target = '9876543210';
 			const seed = command === 'unban' || command === 'check'
-				? [{ id: target, reason: 'manual', by: '999', at: '2026-09-01T00:00:00Z' }]
+				? [{ id: target, reason: 'manual', by: '1000', at: '2026-09-01T00:00:00Z' }]
 				: [];
 			const env = {
 				...baseEnv, OWNER_IDS: '999,998',
@@ -6422,7 +6434,15 @@ console.log('\n[98] 四条管理命令权限与回执矩阵');
 				assert(label + ' 命令撤回早于业务操作和结果发送', apiCalls.every((c, index) => !['banChatMember', 'unbanChatMember', 'sendMessage'].includes(c.method) || index > deleteIndex));
 			}
 			const ownerMessages = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999');
-			if (scenario.allowed) {
+			if (scenario.privateAdmin && command !== 'check') {
+				// 独立模式口径：群管理员私聊 /ban /spam /unban 收回，请他到自己的群里发（/check 不受影响）
+				assert(label + ' 私聊被收回：回「请在你的群里发」', callsOf('sendMessage').some((c) => String(c.body.chat_id) === String(scenario.actor) && c.body.text.includes('请在你的群里发')));
+				assert(label + ' 私聊被收回：不执行 D1 变更、封禁、解封或双库查询',
+					env.DB._mutationCalls.length === 0 && env.DB._rows.has(target) === (command === 'unban')
+					&& callsOf('banChatMember').length === 0 && callsOf('restrictChatMember').length === 0
+					&& callsOf('unbanChatMember').length === 0 && remoteChecks === 0);
+				assert(label + ' 私聊被收回：不打扰第一主人', ownerMessages.length === 0);
+			} else if (scenario.allowed) {
 				assert(label + ' 第一主人收到完整结果', ownerMessages.some((c) => c.body.text.includes(target)));
 				if (!scenario.group) assert(label + ' 私聊发令者收到结果', callsOf('sendMessage').some((c) => String(c.body.chat_id) === String(scenario.actor) && c.body.text.includes(target)));
 				if (command === 'unban') {
@@ -6468,7 +6488,8 @@ for (const mode of ['private', 'supergroup']) {
 			const ids = Array.from({ length: count }, (_, i) => String(990000 + i));
 			const pending = [];
 			const ctx = { waitUntil: (p) => pending.push(Promise.resolve(p)) };
-			const db = makeFakeDB(ids.map((id) => ({ id, reason: 'manual', by: '999', at: '2026-09-01T00:00:00Z' })),
+			// 种子由副主人封：第一主人封的只有第一主人能解（锁定行为见 test_group_independent）
+			const db = makeFakeDB(ids.map((id) => ({ id, reason: 'manual', by: '1000', at: '2026-09-01T00:00:00Z' })),
 				{ failMutationCalls: fault === 'delete' ? [1, 2, 3, 4] : [] });
 			if (fault === 'query') {
 				const prepare = db.prepare.bind(db);
@@ -6501,6 +6522,14 @@ for (const mode of ['private', 'supergroup']) {
 			}), env, ctx);
 			await drainPending(pending);
 			const label = '管理员 /unban · ' + mode + ' · ' + count + ' 人 · ' + fault;
+			if (mode === 'private') {
+				// 独立模式口径：群管理员私聊 /unban 收回，请他到自己的群里发；D1 与 Telegram 都不动
+				assert(label + ' 私聊被收回：回「请在你的群里发」', callsOf('sendMessage').some((c) => String(c.body.chat_id) === '6666' && c.body.text.includes('请在你的群里发')));
+				assert(label + ' 私聊被收回：D1 全部保留、不调用解封与封禁',
+					db._rows.size === count && callsOf('unbanChatMember').length === 0 && callsOf('banChatMember').length === 0);
+				assert(label + ' 私聊被收回：不建批量任务', db._jobs.size === 0);
+				continue;
+			}
 			if (fault === 'none') {
 				assert(label + ' 每个 Telegram 解封之前 D1 都已删除',
 					d1RemovedBeforeUnban && db._rows.size === 0 && callsOf('unbanChatMember').length === count * 2);
@@ -6569,7 +6598,8 @@ console.log('\n[101] Telegram 消息操作失败隔离');
 for (const fault of ['delete', 'group_reply']) {
 	resetCalls();
 	const pending = [];
-	const env = { ...baseEnv, DB: makeFakeDB([{ id: '997001', reason: 'manual', by: '999', at: '2026-09-01T00:00:00Z' }]) };
+	// 种子由副主人封：群管理员解不了第一主人封的人
+	const env = { ...baseEnv, DB: makeFakeDB([{ id: '997001', reason: 'manual', by: '1000', at: '2026-09-01T00:00:00Z' }]) };
 	sandbox.fetch = makeFetchMock({
 		getChatAdministrators: () => ({ ok: true, result: [{ user: { id: 6666 }, status: 'administrator' }] }),
 		deleteMessage: () => fault === 'delete' ? { ok: false, description: 'Bad Request: not enough rights to delete messages' } : { ok: true, result: true },

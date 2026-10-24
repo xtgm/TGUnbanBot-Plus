@@ -261,6 +261,11 @@ let OWNER_IDS = [];
 let SUPER_ADMIN_IDS = [];
 // 杀手群 ID 列表（环境变量 KILLER_MODE_GROUPS）。处置口径固定，见顶部 10.6。
 let KILLER_MODE_GROUPS = [];
+// 独立模式群 ID 列表（D1 group_mode 表，/groupmode 切换）。全局黑名单在这些群不生效（第一主人封的除外），
+// 由群主自治、写本群黑名单 group_blacklist。每请求由 loadIndependentGroups 从 D1 重新加载。
+let INDEPENDENT_GROUP_IDS = [];
+// 有本群黑名单（group_blacklist）记录的群。超管「拉入本群黑名单」在全局群也可能写入，拦截链路据此决定要不要多查一条。
+let LOCAL_BLACKLIST_CHAT_IDS = [];
 // 杀手权限 TGID 列表（环境变量 KILLER_ADMIN_IDS），见顶部 10.6b。
 let KILLER_ADMIN_IDS = [];
 // 关键词搜索的保留群 ID 列表（环境变量 STAT_SEARCH_GROUPS）。这些群的正文按天保留 180 天，
@@ -335,6 +340,8 @@ function applyRuntimeConfig(config) {
 	ENV_GROUP_IDS = [...effectiveGroupIds];
 	DYNAMIC_GROUP_IDS = [];
 	DYNAMIC_GROUPS_READY = false;
+	INDEPENDENT_GROUP_IDS = [];
+	LOCAL_BLACKLIST_CHAT_IDS = [];
 	GROUP_ID = config.GROUP_ID;
 	OWNER_IDS = config.OWNER_IDS;
 	SUPER_ADMIN_IDS = config.SUPER_ADMIN_IDS || [];
@@ -411,6 +418,7 @@ export default {
 		// 必须在任何路由分发之前合并 /addgroup 动态群：isConfiguredGroup 及其 26 个调用点
 		// 都依赖 GROUP_IDS，晚于分发会导致动态群被当成"非配置群"直接忽略。
 		await mergeDynamicGroupsFromD1(env);
+		await loadIndependentGroups(env);
 
 		if (request.method === 'GET' && path === `${TOKEN}/export`) {
 			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
@@ -493,6 +501,7 @@ export default {
 		// 重新校验任务里存的 groupIds，此处不合并会把动态群静默丢弃 ——
 		// 任务回执显示成功，但那些群实际没有执行封禁。
 		await mergeDynamicGroupsFromD1(env);
+		await loadIndependentGroups(env);
 
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
@@ -528,6 +537,7 @@ export default {
 		}
 		try {
 			await mergeDynamicGroupsFromD1(env);
+			await loadIndependentGroups(env);
 			const summary = await runAdBioRescan(env);
 			// 头像视觉识别独立一轨：与 bio 复查共用 cron 节拍，但各自有日预算，
 			// 互不挤占（bio 扫描看 ad_scan_state 的 scan_*，这里看 avatar_*）。
@@ -2301,7 +2311,8 @@ async function miniAppUnban(env, payload) {
 	if (!removed.success && removed.code !== 'NOT_FOUND') {
 		throw new MiniAppError(503, '移除黑名单失败：' + String(removed.message || '未知错误').replace(/^❌\s*/, ''));
 	}
-	const results = await unbanUserFromAllGroups(userId, GROUP_IDS);
+	// 全局解封不碰独立群（本群黑名单与踢出由那个群自己管）。
+	const results = await unbanUserFromAllGroups(userId, globalUnbanScopeGroupIds());
 	const failed = results.filter((row) => !row.ok);
 	return {
 		userId,
@@ -2991,6 +3002,8 @@ async function dispatchMiniAppAction(action, body, env, auth, ctx) {
 	// Mini App 在 mergeDynamicGroupsFromD1 之前就鉴权返回，运行期的群组变量可能还是
 	// 上一个请求留下的快照。这里按当前请求重建一次，与 / 命令路径吃的是同一份数据。
 	const loaded = await miniAppRefreshGroups(env);
+	// 群模式跟着群列表一起重建：小程序的解封同样不碰独立群。
+	await loadIndependentGroups(env);
 	const payload = body && typeof body === 'object' ? body : {};
 	switch (action) {
 		case 'bootstrap': return miniAppBootstrap(env, auth, loaded);
@@ -3512,7 +3525,10 @@ async function handleInitialization(request, env) {
 				// 看起来就像命令坏了。
 				{ command: "addgroup", description: "新增治理群，免改环境变量；参数 -100xxx [备注] (仅第一主人私聊)" },
 				{ command: "delgroup", description: "停止治理该群，bot 仍留在群里；参数 -100xxx (仅第一主人私聊)" },
-				{ command: "leavegroup", description: "让 bot 退出指定群；参数 -100xxx (仅第一主人私聊)" }
+				{ command: "leavegroup", description: "让 bot 退出指定群；参数 -100xxx (仅第一主人私聊)" },
+				// 独立模式：/groupmode 切群模式（第一主人或该群群主），/localbans 看本群黑名单。
+				{ command: "groupmode", description: "切换群模式：全局 / 独立 (第一主人/该群群主)" },
+				{ command: "localbans", description: "查看本群黑名单 (有封禁权限的群管理员)" }
 			]
 		};
 
@@ -3697,8 +3713,11 @@ function buildActionContextLines(message, actionNote) {
 		const title = message?.chat?.title || message?.chat?.username || '当前群组';
 		const chatId = message?.chat?.id ?? '未知';
 		lines.push(`📍 命令来源:${escapeHtml(title)} <code>${escapeHtml(String(chatId))}</code>`);
+		const scope = Array.isArray(message?.__moderationScope) ? message.__moderationScope : null;
 		const groupCount = Array.isArray(GROUP_IDS) ? GROUP_IDS.length : 0;
-		lines.push(`🧹 作用范围:全部 ${groupCount} 个配置群`);
+		if (message?.__moderationScopeLocal === true) lines.push('🧹 作用范围:仅本群(本群黑名单)');
+		else if (scope && scope.length !== groupCount) lines.push(`🧹 作用范围:${scope.length} 个群(已跳过独立群)`);
+		else lines.push(`🧹 作用范围:全部 ${groupCount} 个配置群`);
 	}
 	lines.push(`📝 执行原因:${formatActionNote(actionNote)}`);
 	return lines;
@@ -4344,6 +4363,13 @@ async function checkBlacklist(userId, env, options = {}) {
 async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, options = {}) {
 	const blacklistCheck = await checkBlacklist(userId, env, { strict: true });
 	if (!blacklistCheck.isBlacklisted) {
+		return false;
+	}
+	// 独立群不认全局黑名单（第一主人封的除外）：有独立群时放行，但只允许在独立群自助解封。
+	// options.scope 由调用方传入一个对象，这里写 independentOnly 告诉它只解独立群。
+	if (!blacklistCheck.checkFailed && INDEPENDENT_GROUP_IDS.length > 0
+		&& !isPrimaryOwner(blacklistCheck.entry?.by) && options.scope && typeof options.scope === 'object') {
+		options.scope.independentOnly = true;
 		return false;
 	}
 
@@ -5403,6 +5429,7 @@ async function checkIfUserIsAdminInGroup(userId, groupId, options = {}) {
 		}
 		const hit = result.result.find((member) => member?.user && String(member.user.id) === userIdStr);
 		if (typeof options.onStatus === 'function') options.onStatus(hit?.status || '');
+		if (typeof options.onMember === 'function') options.onMember(hit || null);
 		if (hit) {
 			console.log(`[当前群鉴权] 用户 ${userIdStr} 在当前群 ${groupIdStr} 是 ${hit.status} ✅`);
 			return true;
@@ -5429,9 +5456,15 @@ async function checkMessageOperatorCanModerate(message, userId) {
 	if (message?.chat?.type === 'private') return checkIfUserIsAdmin(userId);
 	// 鉴权这一次查询顺带拿到 status：记在消息上给加黑附表定「群主 / 群管理员」，
 	// 不再为身份多问一次 Telegram（命令链路的调用次数有守卫断言）。
-	return checkIfUserIsAdminInGroup(userId, message?.chat?.id, {
-		onStatus: (status) => { if (message) message.__operatorIsCreator = status === 'creator'; }
+	let canRestrict = false;
+	const isAdmin = await checkIfUserIsAdminInGroup(userId, message?.chat?.id, {
+		onStatus: (status) => { if (message) message.__operatorIsCreator = status === 'creator'; },
+		// 同一次查询顺带拿封禁权限：独立群里普通管理员必须有 can_restrict_members（群主视为全权）。
+		onMember: (member) => { canRestrict = member?.status === 'creator' || member?.can_restrict_members === true; }
 	});
+	// 只记下来，不在这里拒：/check 等只读命令不看这一项，由 resolveModerationRoute 按命令判。
+	if (message) message.__operatorCanRestrict = canRestrict;
+	return isAdmin;
 }
 
 function shouldSilenceAuthorizedGroupCommand(message) {
@@ -5741,7 +5774,7 @@ async function addManyToBlacklist(ids, env, options = {}) {
 // - 通过命令鉴权的管理员可显式传 allowD1Removal，先移除 D1 再允许 Telegram 解封。
 // 查询或移除失败时严格拒绝对应目标，任何分支都不调用 Telegram 封禁接口。
 async function checkManyUnbanEligibility(ids, env, options = {}) {
-	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [] };
+	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [], primaryLocked: [] };
 	const uniqueIds = normalizeBatchMutationIds(ids);
 	if (!env.DB) {
 		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间，无法确认解封资格' })));
@@ -5772,6 +5805,23 @@ async function checkManyUnbanEligibility(ids, env, options = {}) {
 			console.error('批量检查 /unban D1 资格时出错:', error);
 			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 无法确认 D1 黑名单状态: ${toChineseErrorText(error?.message || error)}` })));
 		}
+	}
+	// 第一主人封的人只有第一主人能解：别人发的 /unban（含管理层）一律拒，D1 记录不动。
+	// 逐条读记录而不是在上面的 IN 查询里带 by_user —— 只有命中黑名单的才多读一条，未命中零开销。
+	if (results.blacklisted.length && OWNER_IDS.length && !isPrimaryOwner(options.operatorId)) {
+		const stillBlocked = [];
+		for (const id of results.blacklisted) {
+			let entry = null;
+			try {
+				entry = await readD1BlacklistEntry(env, id);
+			} catch (error) {
+				results.failed.push({ id, msg: `❌ 无法确认 D1 黑名单状态: ${toChineseErrorText(error?.message || error)}` });
+				continue;
+			}
+			if (entry && isPrimaryOwner(entry.by)) results.primaryLocked.push(id);
+			else stillBlocked.push(id);
+		}
+		results.blacklisted = stillBlocked;
 	}
 	if (options.allowD1Removal !== true || results.blacklisted.length === 0) {
 		return results;
@@ -5870,6 +5920,7 @@ function renderBatchUnbanEligibilityResult(results, invalid, userProfiles = null
 	const lines = ['🔎 <b>批量解封资格检查完成</b>', ''];
 	lines.push(`✅ 可执行 Telegram 解封: ${results.eligible.length}`);
 	if (results.blacklisted.length) lines.push(`⛔ D1 黑名单拒绝: ${results.blacklisted.length}`);
+	if (results.primaryLocked?.length) lines.push(`⛔ ${PRIMARY_LOCKED_UNBAN_TEXT}: ${results.primaryLocked.length}`);
 	if (invalid.length) lines.push(`❌ 格式错误: ${invalid.length}`);
 	if (results.failed.length) lines.push(`❌ D1 检查失败: ${results.failed.length}`);
 
@@ -5882,6 +5933,7 @@ function renderBatchUnbanEligibilityResult(results, invalid, userProfiles = null
 		lines.push(`✅ ${formatBatchUserTarget(id, userProfiles)} ${status}`);
 	}
 	for (const id of results.blacklisted) lines.push(`⛔ ${formatBatchUserTarget(id, userProfiles)} 在 D1 黑名单，拒绝解封（记录已保留）`);
+	for (const id of results.primaryLocked || []) lines.push(`⛔ ${formatBatchUserTarget(id, userProfiles)} ${PRIMARY_LOCKED_UNBAN_TEXT}，拒绝解封`);
 	for (const id of invalid) lines.push(`❌ <code>${escapeHtml(id)}</code> 格式错误`);
 	for (const f of results.failed) lines.push(`❌ ${formatBatchUserTarget(f.id, userProfiles)} ${escapeHtml(f.msg)}`);
 
@@ -6083,6 +6135,8 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		groupIds,
 		// 杀手权限建的任务：写杀手黑名单（killer_blacklist）、只处置 groupIds（杀手群）、不学习特征。
 		killer: options.killer === true,
+		// 本群黑名单任务：写 group_blacklist（sourceChatId 那个群）、只处置 groupIds、不学习。
+		local: options.local === true,
 		createdBy: getMessageActorId(message),
 		unbanAllowD1Removal: isUnban && (options.allowD1Removal === true || isPrivilegedManager(getMessageActorId(message))),
 		operator,
@@ -6186,6 +6240,9 @@ function formatBulkJobFailureLine(failure) {
 	const groupText = failure.groupId ? ` 群 <code>${escapeHtml(failure.groupId)}</code>` : '';
 	if (failure.phase === 'unban_blocked') {
 		return `⛔ <code>${escapeHtml(failure.userId || '')}</code>: D1 黑名单拒绝解封，记录已保留，未调用 Telegram`;
+	}
+	if (failure.phase === 'unban_primary_locked') {
+		return `⛔ <code>${escapeHtml(failure.userId || '')}</code>: ${PRIMARY_LOCKED_UNBAN_TEXT}，已拒绝解封，未调用 Telegram`;
 	}
 	const rawError = failure.error || failure.message || '失败';
 	const isUnban = failure.phase === 'unban' || failure.phase === 'remove';
@@ -6413,8 +6470,18 @@ async function performBulkJobD1Mutation(job, env, ids) {
 			if (attempt < BULK_TASK_D1_RETRY_LIMIT) await new Promise((resolve) => setTimeout(resolve, BULK_TASK_D1_RETRY_DELAY_MS));
 			continue;
 		}
+		if (job.local === true) {
+			// 本群黑名单任务（独立群的群主 / 管理员 / 副主人，或超管选「拉入本群黑名单」）：
+			// 只写 group_blacklist、只处置 groupIds（就是那一个群）、不学习特征。
+			lastResults = job.action === 'unban'
+				? await checkLocalUnbanEligibility(env, job.sourceChatId, ids, job.createdBy)
+				: await addToGroupBlacklist(env, job.sourceChatId, ids, { reason: job.reason || 'local', by: job.createdBy, note: job.note });
+			if (!lastResults.failed.length) return lastResults;
+			if (attempt < BULK_TASK_D1_RETRY_LIMIT) await new Promise((resolve) => setTimeout(resolve, BULK_TASK_D1_RETRY_DELAY_MS));
+			continue;
+		}
 		lastResults = job.action === 'unban'
-			? await checkManyUnbanEligibility(ids, env, { allowD1Removal })
+			? await checkManyUnbanEligibility(ids, env, { allowD1Removal, operatorId: job.createdBy })
 			: await addManyToBlacklist(ids, env, {
 				reason: job.reason,
 				by: job.createdBy,
@@ -6505,6 +6572,12 @@ async function prepareBulkJobActiveBatch(job, env) {
 			pushBulkJobFailure(job, {
 				userId: id,
 				phase: 'unban_blocked'
+			});
+		}
+		for (const id of results.primaryLocked || []) {
+			pushBulkJobFailure(job, {
+				userId: id,
+				phase: 'unban_primary_locked'
 			});
 		}
 	} else {
@@ -6794,7 +6867,9 @@ async function runBulkModerationJob(env, jobId, options = {}) {
 
 async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 	const { action, valid, invalid, note, isInGroup } = options;
-	const budget = shouldUseBulkQueue(valid.length, GROUP_IDS.length, {
+	// options.groupIds：本次作用的群（独立群本群 / 跳过独立群的全局范围）；不给 = 全部配置群。
+	const scopeGroupIds = Array.isArray(options.groupIds) ? options.groupIds : GROUP_IDS;
+	const budget = shouldUseBulkQueue(valid.length, scopeGroupIds.length, {
 		probeMembership: action !== 'unban' && valid.length === 1,
 		authorizationRequests: estimateBulkAuthorizationRequests(message)
 	});
@@ -6821,6 +6896,8 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 		replyDetail: options.replyDetail || null,
 		allowD1Removal: action === 'unban' && options.allowD1Removal === true,
 		mode: options.mode || null,
+		groupIds: scopeGroupIds,
+		local: options.local === true,
 		// 群内静默/简洁（主人要求）：/ban·/spam·/unban 的批量任务【不再向源群推异步完成通知】，
 		// 与它们的同步群内策略一致（/ban·/spam 群内全程静默；/unban 群内只保留同步阶段的
 		// 「任务已创建」简洁提示）。完整结果照旧私聊第一主人与副主人（job.notifyTargets 不受影响）。
@@ -8895,7 +8972,8 @@ async function handleChatMemberUpdate(chatMember, env) {
 		oldStatusEarly !== 'administrator' &&
 		oldStatusEarly !== 'creator';
 	if (enteredGroup) {
-		const blacklistCheck = await checkBlacklist(targetIdStr, env);
+		// 独立群：全局记录只认第一主人封的，其余看本群黑名单（群主自治）。
+		const blacklistCheck = await resolveChatBlacklistCheck(env, chat.id, targetIdStr, await checkBlacklist(targetIdStr, env));
 		if (blacklistCheck.isBlacklisted) {
 			// 受保护角色（主/副/超管/任一配置群群主·管理员）复入不踢：避免误加黑把他们踢出。
 			if (await isProtectedFromAutoModeration(targetIdStr, String(chat.id))) {
@@ -8985,7 +9063,8 @@ async function handleChatMemberUpdate(chatMember, env) {
 		// 群内原生手动解封：D1 黑名单是权威封禁，禁止普通管理员经此绕过或清除。
 		// 管理层必须通过 /unban TGID 先移除 D1 再解封；该命令路径不会进入这里的封回逻辑。
 		// 普通管理员直接使用 Telegram 原生解封时，D1 仍在，因此继续由独立保护链封回。
-		const blacklistCheck = await checkBlacklist(targetIdStr, env);
+		// 独立群：全局记录只认第一主人封的，其余看本群黑名单 —— 群主解封自己封的人不封回。
+		const blacklistCheck = await resolveChatBlacklistCheck(env, chat.id, targetIdStr, await checkBlacklist(targetIdStr, env));
 		if (blacklistCheck.isBlacklisted) {
 			if (isKillerModeGroup(chat.id) && isKillerMuteReason(blacklistCheck.entry?.reason)) {
 				// 杀手群里自动检测禁言的人本来就没被踢过，原生解封对他无意义：不封回，仅记日志。
@@ -9241,8 +9320,9 @@ function isKillerModeGroup(chatId) {
 
 // 同款直封 / 同款连带 / /ad 投票的作用范围：全部配置群减去杀手群。
 // 杀手群与这三个功能完全隔离 —— 杀手群里不触发，别的群触发时封禁也不波及杀手群。
+// 独立群同理不被这些全局扇出波及（群主自治，见 group_mode）。
 function nonKillerGroupIds() {
-	return GROUP_IDS.filter((groupId) => !isKillerModeGroup(groupId));
+	return GROUP_IDS.filter((groupId) => !isKillerModeGroup(groupId) && !isIndependentGroup(groupId));
 }
 
 // ===== 杀手权限（KILLER_ADMIN_IDS）=====
@@ -9411,6 +9491,604 @@ async function checkKillerUnbanEligibility(env, ids) {
 	results.d1Removed = [...removal.removed];
 	results.eligible = candidates.filter((id) => !failedIds.has(id));
 	return results;
+}
+
+// ===== 独立模式群（group_mode 表，/groupmode 切换）=====
+// 口径：每个群二选一 —— 全局（默认，行为与改动前逐字节一致）或独立（全局黑名单不生效、群主自治）。
+// 独立群里只有【第一主人】封的人照样拦（entry.by === OWNER_IDS[0]）；其余人走本群黑名单 group_blacklist。
+// 表懒建：从没切过独立模式的部署，热路径只多一条 sqlite_master 探测（15 秒缓存），零读取。
+const D1_GROUP_MODE_INIT = new WeakMap();
+const D1_GROUP_MODE_CACHE = new WeakMap();
+const D1_GROUP_BLACKLIST_INIT = new WeakMap();
+
+async function ensureGroupModeTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_GROUP_MODE_INIT.get(env.DB);
+	if (cached) return cached;
+	const initPromise = (async () => {
+		await env.DB.prepare('CREATE TABLE IF NOT EXISTS group_mode (chat_id TEXT PRIMARY KEY, mode TEXT NOT NULL, set_by TEXT, set_at TEXT)').run();
+		return true;
+	})().catch((error) => {
+		D1_GROUP_MODE_INIT.delete(env.DB);
+		throw error;
+	});
+	D1_GROUP_MODE_INIT.set(env.DB, initPromise);
+	return initPromise;
+}
+
+// 一次读两样：独立群列表 + 「有本群黑名单记录的群」列表（拦截热路径只对后者多查一条主键）。
+// 两张表都不存在时只有 sqlite_master 探测，零业务读取。
+async function loadGroupModeStateFromD1(env) {
+	const state = { independent: [], localChats: [] };
+	if (await d1TableExists(env, 'group_mode')) {
+		const { results } = await env.DB.prepare("SELECT chat_id FROM group_mode WHERE mode = 'independent'").all();
+		state.independent = (results || []).map((row) => String(row.chat_id || '').trim()).filter(Boolean);
+	}
+	if (await d1TableExists(env, 'group_blacklist')) {
+		const { results } = await env.DB.prepare('SELECT DISTINCT chat_id FROM group_blacklist').all();
+		state.localChats = (results || []).map((row) => String(row.chat_id || '').trim()).filter(Boolean);
+	}
+	return state;
+}
+
+// 每请求入口调用。读失败一律当空集 = 全部按全局处理（不因 D1 抖动放松全局黑名单）。
+async function loadIndependentGroups(env) {
+	INDEPENDENT_GROUP_IDS = [];
+	LOCAL_BLACKLIST_CHAT_IDS = [];
+	if (!env?.DB) return;
+	try {
+		const state = await loadD1RuntimeCachedValue(env, D1_GROUP_MODE_CACHE, loadGroupModeStateFromD1);
+		// 只认当前配置群里的；杀手群永远不算独立（双保险，/groupmode 本身也拒绝）。
+		const configured = new Set(GROUP_IDS.map((id) => String(id)));
+		INDEPENDENT_GROUP_IDS = (Array.isArray(state?.independent) ? state.independent : [])
+			.filter((id) => configured.has(id) && !isKillerModeGroup(id));
+		LOCAL_BLACKLIST_CHAT_IDS = (Array.isArray(state?.localChats) ? state.localChats : [])
+			.filter((id) => configured.has(id));
+	} catch (error) {
+		console.error('[群模式] 读取失败，全部按全局处理:', error);
+		INDEPENDENT_GROUP_IDS = [];
+		LOCAL_BLACKLIST_CHAT_IDS = [];
+	}
+}
+
+function isIndependentGroup(chatId) {
+	return INDEPENDENT_GROUP_IDS.length > 0 && INDEPENDENT_GROUP_IDS.includes(String(chatId ?? ''));
+}
+
+function hasGroupLocalBlacklist(chatId) {
+	return LOCAL_BLACKLIST_CHAT_IDS.length > 0 && LOCAL_BLACKLIST_CHAT_IDS.includes(String(chatId ?? ''));
+}
+
+// 全局 /unban 的作用范围：一律不碰独立群（第一主人的也一样）。
+function globalUnbanScopeGroupIds(base = GROUP_IDS) {
+	const list = Array.isArray(base) ? base : GROUP_IDS;
+	return list.filter((groupId) => !isIndependentGroup(groupId));
+}
+
+// 全局封禁 / 解封的作用范围：第一主人 = 全部（含独立群）；其他人一律跳过独立群。
+function globalScopeGroupIds(operatorId, base = GROUP_IDS) {
+	const list = Array.isArray(base) ? base : GROUP_IDS;
+	if (isPrimaryOwner(operatorId) || !INDEPENDENT_GROUP_IDS.length) return [...list];
+	return list.filter((groupId) => !isIndependentGroup(groupId));
+}
+
+// 自动检测的扇出：跳过独立群，事发群若是独立群仍照封（只封那一个，不外溢到别的独立群）。
+function autoDetectionScopeGroupIds(eventChatId) {
+	const scope = globalScopeGroupIds('system');
+	const eventId = String(eventChatId ?? '');
+	if (eventId && isIndependentGroup(eventId) && !scope.includes(eventId)) scope.push(eventId);
+	return scope;
+}
+
+// 第一主人封的人只有第一主人能解：单条回执、批量失败行、按钮回执共用这一句。
+const PRIMARY_LOCKED_UNBAN_TEXT = '此人由第一主人封杀';
+
+// 本群黑名单的解封资格：第一主人封的全局记录（独立群也生效）别人解不了；
+// 本群记录直接移除。返回形状与 checkManyUnbanEligibility 一致，批量任务按同一套推进。
+async function checkLocalUnbanEligibility(env, chatId, ids, operatorId) {
+	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [], primaryLocked: [] };
+	const uniqueIds = normalizeBatchMutationIds(ids);
+	if (!env?.DB) {
+		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间，无法确认解封资格' })));
+		return results;
+	}
+	const candidates = [];
+	for (const id of uniqueIds) {
+		if (isPrimaryOwner(operatorId)) { candidates.push(id); continue; }
+		let entry = null;
+		try {
+			entry = await readD1BlacklistEntry(env, id);
+		} catch (error) {
+			results.failed.push({ id, msg: `❌ 无法确认 D1 黑名单状态: ${toChineseErrorText(error?.message || error)}` });
+			continue;
+		}
+		if (entry && isPrimaryOwner(entry.by)) results.primaryLocked.push(id);
+		else candidates.push(id);
+	}
+	if (!candidates.length) return results;
+	const removal = await removeFromGroupBlacklist(env, chatId, candidates);
+	results.d1Removed = [...removal.removed];
+	for (const failure of removal.failed) results.failed.push({ id: String(failure.id), msg: failure.msg });
+	const failedSet = new Set(removal.failed.map((f) => String(f.id)));
+	results.eligible = candidates.filter((id) => !failedSet.has(id));
+	return results;
+}
+
+// 全局黑名单记录在这个群生不生效：全局群一律生效；独立群只认第一主人封的。
+function isGlobalEntryEffectiveInGroup(entry, chatId) {
+	if (!entry) return false;
+	if (!isIndependentGroup(chatId)) return true;
+	return isPrimaryOwner(entry.by);
+}
+
+async function setGroupMode(env, chatId, mode, setBy) {
+	await ensureGroupModeTable(env);
+	const id = String(chatId);
+	if (mode === 'independent') {
+		await env.DB.prepare('INSERT OR REPLACE INTO group_mode (chat_id, mode, set_by, set_at) VALUES (?, ?, ?, ?)')
+			.bind(id, 'independent', String(setBy ?? ''), new Date().toISOString()).run();
+	} else {
+		await env.DB.prepare('DELETE FROM group_mode WHERE chat_id = ?').bind(id).run();
+	}
+	await refreshGroupModeState(env);
+}
+
+// --- 本群黑名单 group_blacklist：只在对应的独立群拦截，与全局黑名单互不读写 ---
+async function ensureGroupBlacklistTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_GROUP_BLACKLIST_INIT.get(env.DB);
+	if (cached) return cached;
+	const initPromise = (async () => {
+		await env.DB.prepare('CREATE TABLE IF NOT EXISTS group_blacklist (chat_id TEXT NOT NULL, user_id TEXT NOT NULL, reason TEXT, by_user TEXT, at TEXT, note TEXT, PRIMARY KEY (chat_id, user_id))').run();
+		return true;
+	})().catch((error) => {
+		D1_GROUP_BLACKLIST_INIT.delete(env.DB);
+		throw error;
+	});
+	D1_GROUP_BLACKLIST_INIT.set(env.DB, initPromise);
+	return initPromise;
+}
+
+async function readGroupBlacklistEntry(env, chatId, userId) {
+	if (!env?.DB) return null;
+	const id = String(userId ?? '').trim();
+	if (!id) return null;
+	await ensureGroupBlacklistTable(env);
+	const row = await env.DB.prepare('SELECT chat_id, user_id, reason, by_user, at, note FROM group_blacklist WHERE chat_id = ? AND user_id = ? LIMIT 1')
+		.bind(String(chatId), id).first();
+	return row ? { id: String(row.user_id), chatId: String(row.chat_id), reason: row.reason || 'local', by: row.by_user || null, at: row.at || null, note: row.note || null } : null;
+}
+
+// 拦截链路用：读失败当作不在名单（不因 D1 抖动误封）。
+async function readGroupBlacklistEntrySafe(env, chatId, userId) {
+	try {
+		return await readGroupBlacklistEntry(env, chatId, userId);
+	} catch (error) {
+		console.error('[本群黑名单] 读取失败:', error);
+		return null;
+	}
+}
+
+// 返回形状与 addManyToBlacklist 一致：{ success, exists, failed }。
+async function addToGroupBlacklist(env, chatId, ids, options = {}) {
+	const results = { success: [], exists: [], failed: [] };
+	const uniqueIds = normalizeBatchMutationIds(ids);
+	if (!env?.DB) {
+		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间' })));
+		return results;
+	}
+	if (!uniqueIds.length) return results;
+	await ensureGroupBlacklistTable(env);
+	const chat = String(chatId);
+	const reason = options.reason || 'local';
+	const by = options.by != null ? String(options.by) : null;
+	const note = normalizeActionNote(options.note) || null;
+	const at = new Date().toISOString();
+	for (const chunk of chunkBatchItems(uniqueIds)) {
+		try {
+			const valuesSql = chunk.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
+			const params = chunk.flatMap((id) => [chat, id, reason, by, at, note]);
+			const response = await env.DB
+				.prepare(`INSERT OR IGNORE INTO group_blacklist (chat_id, user_id, reason, by_user, at, note) VALUES ${valuesSql} RETURNING user_id`)
+				.bind(...params)
+				.all();
+			const inserted = new Set((response?.results || []).map((row) => String(row.user_id)));
+			for (const id of chunk) {
+				if (inserted.has(id)) results.success.push(id);
+				else results.exists.push(id);
+			}
+		} catch (error) {
+			console.error('[本群黑名单] 批量写入失败:', error);
+			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 加入本群黑名单失败: ${toChineseErrorText(error?.message || error)}` })));
+		}
+	}
+	// 新出现「有本群黑名单的群」时拦截链路要立刻知道，不等 15 秒缓存过期。
+	if (results.success.length && !hasGroupLocalBlacklist(chat)) await refreshGroupModeState(env);
+	return results;
+}
+
+async function refreshGroupModeState(env) {
+	if (env?.DB) D1_GROUP_MODE_CACHE.delete(env.DB);
+	await loadIndependentGroups(env);
+}
+
+async function removeFromGroupBlacklist(env, chatId, ids) {
+	const results = { removed: [], notFound: [], failed: [] };
+	const uniqueIds = normalizeBatchMutationIds(ids);
+	if (!env?.DB || !uniqueIds.length) return results;
+	await ensureGroupBlacklistTable(env);
+	for (const chunk of chunkBatchItems(uniqueIds)) {
+		try {
+			const placeholders = chunk.map(() => '?').join(', ');
+			const response = await env.DB
+				.prepare(`DELETE FROM group_blacklist WHERE chat_id = ? AND user_id IN (${placeholders}) RETURNING user_id`)
+				.bind(String(chatId), ...chunk)
+				.all();
+			const removed = new Set((response?.results || []).map((row) => String(row.user_id)));
+			for (const id of chunk) {
+				if (removed.has(id)) results.removed.push(id);
+				else results.notFound.push(id);
+			}
+		} catch (error) {
+			console.error('[本群黑名单] 批量移除失败:', error);
+			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 移出本群黑名单失败: ${toChineseErrorText(error?.message || error)}` })));
+		}
+	}
+	if (results.removed.length) await refreshGroupModeState(env);
+	return results;
+}
+
+async function listGroupBlacklist(env, chatId, limit = 50) {
+	if (!env?.DB) return [];
+	await ensureGroupBlacklistTable(env);
+	const { results } = await env.DB.prepare('SELECT user_id, reason, by_user, at, note FROM group_blacklist WHERE chat_id = ? ORDER BY at DESC LIMIT ?')
+		.bind(String(chatId), Math.max(1, Math.min(200, Number(limit) || 50))).all();
+	return (results || []).map((row) => ({ id: String(row.user_id), reason: row.reason || 'local', by: row.by_user || null, at: row.at || null, note: row.note || null }));
+}
+
+// 拦截判定（发言 / 复入群 / 原生解封封回共用），输入是 checkBlacklist 的结果，返回同形状：
+//   独立群：全局记录只认第一主人封的；其余看本群黑名单。
+//   全局群：全局记录照旧；没命中且该群有本群黑名单记录（超管「拉入本群黑名单」）才多查一条主键。
+// 没有独立群、也没有任何本群黑名单记录时原样返回，热路径零额外 SQL。
+async function resolveChatBlacklistCheck(env, chatId, userId, globalCheck) {
+	const independent = isIndependentGroup(chatId);
+	if (!independent) {
+		if (globalCheck?.isBlacklisted || !hasGroupLocalBlacklist(chatId)) return globalCheck;
+	} else if (globalCheck?.isBlacklisted && isPrimaryOwner(globalCheck.entry?.by)) {
+		return { ...globalCheck, localSource: 'primary' };
+	}
+	const local = await readGroupBlacklistEntrySafe(env, chatId, userId);
+	if (local) {
+		return { isBlacklisted: true, message: '❌ 您在本群黑名单中，请联系本群管理员。', entry: local, localSource: 'local' };
+	}
+	return { isBlacklisted: false, message: null };
+}
+
+const PRIVATE_MODERATION_REDIRECT_TEXT = 'ℹ️ <b>请在你的群里发这条命令</b>\n\n私聊的封禁与解封只限主人、副主人和超管；群管理员请到自己管理的群里发。';
+const INDEPENDENT_LOCAL_NOTICE = 'ℹ️ 独立群只封本群，要全局封禁请私聊机器人。';
+const GROUP_SCOPE_BUTTON_PREFIX = 'gmsa:';
+
+// /ban /sban /spam /unban 的分流（鉴权通过之后调用）。返回：
+//   { kind: 'global', groupIds }        → 原有全局流程，只是作用范围按身份收窄
+//   { kind: 'local', groupIds, notice } → 写本群黑名单、只踢本群、不学习
+//   { kind: 'super_choice', allowGlobal } → 超管在群里：弹按钮让他选范围
+//   { kind: 'reject', text }            → 拒绝（私聊收回 / 独立群缺权限）
+// 口径：第一主人在哪都是全局（含独立群）；全局 /unban 一律不碰独立群。
+function resolveModerationRoute(message, operatorId, cmd) {
+	const isUnban = cmd === 'unban';
+	const globalScope = (id) => (isUnban ? globalUnbanScopeGroupIds() : globalScopeGroupIds(id));
+	const chatId = String(message?.chat?.id ?? '');
+	if (isPrimaryOwner(operatorId)) {
+		return { kind: 'global', groupIds: globalScope(operatorId) };
+	}
+	if (message?.chat?.type === 'private') {
+		if (isSecondaryOwner(operatorId) || isSuperAdmin(operatorId)) return { kind: 'global', groupIds: globalScope(operatorId) };
+		return { kind: 'reject', text: PRIVATE_MODERATION_REDIRECT_TEXT };
+	}
+	const independent = isIndependentGroup(chatId);
+	if (isSecondaryOwner(operatorId)) {
+		return independent
+			? { kind: 'local', groupIds: [chatId], notice: INDEPENDENT_LOCAL_NOTICE }
+			: { kind: 'global', groupIds: globalScope(operatorId) };
+	}
+	if (isSuperAdmin(operatorId)) {
+		// 杀手群不在独立模式范围内（永远不会是独立群），超管在那里照旧直接执行，不弹按钮。
+		if (!isUnban && !isKillerModeGroup(chatId)) return { kind: 'super_choice', allowGlobal: !independent };
+		return independent ? { kind: 'local', groupIds: [chatId] } : { kind: 'global', groupIds: globalScope(operatorId) };
+	}
+	if (!independent) return { kind: 'global', groupIds: globalScope(operatorId) };
+	if (isAnonymousAdminMessage(message)) {
+		return isUnban
+			? { kind: 'reject', text: '❌ 独立群的匿名管理员只能用封禁类命令；/unban 请关闭匿名身份后再发。' }
+			: { kind: 'local', groupIds: [chatId] };
+	}
+	if (message?.__operatorIsCreator === true || message?.__operatorCanRestrict === true) {
+		return { kind: 'local', groupIds: [chatId] };
+	}
+	return { kind: 'reject', text: '❌ 独立群里使用 /' + cmd + ' 需要 Telegram「封禁用户」管理员权限，请联系群主开通。' };
+}
+
+// 分流结果落到消息上：回执的「作用范围」一行据此写实际范围。
+function markModerationScope(message, route) {
+	if (!message || !route) return;
+	message.__moderationScope = Array.isArray(route.groupIds) ? route.groupIds : null;
+	message.__moderationScopeLocal = route.kind === 'local';
+}
+
+// 本群黑名单（local）与超管选「全域」（global）共用的执行器：
+// 写名单 → 只在 groupIds 里踢出并撤回历史发言 → 单目标时清扫当前群缓存消息。一律不学习。
+async function executeScopedModeration(message, env, ctx, opts) {
+	const { action, ids, invalid = [], note = '', local, groupIds, replyTarget = null, requestUrl = '', notice = '' } = opts;
+	const chatId = String(message.chat.id);
+	const commandName = '/' + action;
+	const reason = action === 'spam' ? 'spam' : 'manual';
+	markModerationScope(message, { kind: local ? 'local' : 'global', groupIds });
+	const replyDetail = replyTarget?.messageId ? { msgId: replyTarget.messageId, text: replyTarget.text || '' } : null;
+	if (await startBulkModerationJobFromCommand(message, env, ctx, {
+		action, mode: 'kick', valid: ids, invalid, note, isInGroup: true, requestUrl, replyDetail, groupIds, local
+	})) {
+		if (replyTarget?.messageId) await deleteMessage(chatId, replyTarget.messageId);
+		return;
+	}
+	const by = getMessageActorId(message);
+	const results = local
+		? await addToGroupBlacklist(env, chatId, ids, { reason, by, note })
+		: await addManyToBlacklist(ids, env, { reason, by, note, detail: { ...(await resolveMessageBlacklistOperator(message)), ...(replyDetail || {}) } });
+	const idsToKick = [...results.success, ...results.exists];
+	const perUser = await mapWithConcurrency(idsToKick, BULK_TASK_CONCURRENCY, async (id) => ({
+		userId: id,
+		banResults: await banUserFromAllGroups(id, { mode: 'kick', groupIds, probeMembership: idsToKick.length === 1 })
+	}));
+	for (const { banResults } of perUser) await recordDisposalsFromBanResults(env, banResults);
+	const cleanup = idsToKick.length === 1
+		? await cleanupCurrentChatUserMessages(env, chatId, idsToKick[0], replyTarget?.messageId ? [replyTarget.messageId] : [])
+		: null;
+	const listLabel = local ? '本群黑名单' : '全局黑名单';
+	const kickLabel = local ? '本群踢出' : '踢出';
+	const failedCount = invalid.length + results.failed.length;
+	const head = `${results.success.length ? '✅' : '⚠️'} 已加入${listLabel}并${kickLabel}(${commandName})：新增 ${results.success.length}`
+		+ (results.exists.length ? ` / 已在名单 ${results.exists.length}` : '')
+		+ (failedCount ? ` / 失败 ${failedCount}` : '');
+	const targetLines = [];
+	for (const { userId: uid, banResults } of perUser) {
+		targetLines.push(`🎯 ${formatTargetFromBanResults(uid, banResults)}　${renderBanResults(banResults)}`);
+	}
+	const flashText = [head, ...targetLines, notice].filter(Boolean).join('\n');
+	const detailLines = [`🎬 操作:加入${listLabel}并${kickLabel}(${commandName})`, '', head];
+	const chatInfoCache = new Map();
+	for (const { userId: uid, banResults } of perUser) {
+		detailLines.push('', `<b>用户</b> ${formatBatchUserCompactTarget(uid)}`,
+			await renderBanResultsDetail(banResults, chatInfoCache, { userId: uid, retryCommand: commandName, compactSpacing: true }));
+	}
+	for (const id of invalid) detailLines.push(`❌ <code>${escapeHtml(id)}</code> 格式错误`);
+	for (const f of results.failed) detailLines.push(`❌ <code>${escapeHtml(f.id)}</code> ${escapeHtml(f.msg)}`);
+	if (cleanup) detailLines.push(renderCurrentChatCleanupResult(cleanup));
+	if (notice) detailLines.push('', notice);
+	await replyToModerationAdmin(message, ctx, {
+		flashText,
+		groupText: flashText,
+		detailText: withActionContext(message, detailLines.join('\n'), note),
+		isInGroup: true,
+		notifySecondaryOwners: true
+	});
+}
+
+// 超管在群里发 /ban /spam：先弹范围按钮（60 秒、仅发令人、一次性），点了才执行。
+async function offerSuperAdminScopeChoice(message, env, ctx, opts) {
+	const { action, ids, invalid = [], note = '', allowGlobal, replyTarget = null } = opts;
+	const chatId = String(message.chat.id);
+	const operatorId = getMessageActorId(message);
+	const token = await issueAdConfirmToken(env, 'gmsa', operatorId, {
+		c: chatId, a: action, i: ids, x: invalid, n: String(note || '').slice(0, 200), m: replyTarget?.messageId || null
+	});
+	if (!token) {
+		await sendFlashMessage(chatId, '❌ 签发确认按钮失败，请稍后重试。', ctx);
+		return;
+	}
+	const row = [{ text: '① 拉入本群黑名单并踢出', callback_data: GROUP_SCOPE_BUTTON_PREFIX + 'L:' + token }];
+	if (allowGlobal) row.push({ text: '② 拉入全域黑名单并踢出', callback_data: GROUP_SCOPE_BUTTON_PREFIX + 'G:' + token });
+	const lines = [
+		`🛡️ <b>超管 /${escapeHtml(action)}：请选择封禁范围</b>`,
+		'🎯 目标:' + ids.map((id) => formatBatchUserCompactTarget(id)).join('、'),
+		'两个选项都会踢出并撤回其历史发言。',
+		`⏱ ${AD_CONFIRM_TOKEN_TTL_SECONDS} 秒内有效，只有发令人能点，点一次即失效。`
+	];
+	if (!allowGlobal) lines.push(INDEPENDENT_LOCAL_NOTICE);
+	await sendTelegramMessage(chatId, lines.join('\n'), { inline_keyboard: [row] });
+}
+
+async function handleGroupScopeButtonCallback(callbackQuery, env, ctx) {
+	const data = String(callbackQuery?.data || '');
+	const match = data.slice(GROUP_SCOPE_BUTTON_PREFIX.length).match(/^([LG]):([0-9a-f]+)$/);
+	if (!match) {
+		await answerAdVoteCallback(callbackQuery?.id);
+		return;
+	}
+	const choice = match[1];
+	const token = match[2];
+	const fromId = String(callbackQuery?.from?.id || '');
+	const chat = callbackQuery?.message?.chat;
+	const buttonMessageId = Number(callbackQuery?.message?.message_id) || 0;
+	if (!env?.DB || !(await adDetectionReady(env))) {
+		await answerAdVoteCallback(callbackQuery?.id, '存储未就绪，请稍后重试', true);
+		return;
+	}
+	// 先只读核对发令人：consumeAdConfirmToken 读到就删，别人误点不能把发令人的按钮烧掉。
+	const owner = await env.DB.prepare('SELECT user_id FROM ad_confirm_tokens WHERE token = ?').bind(token).first();
+	if (owner && String(owner.user_id) !== fromId) {
+		await answerAdVoteCallback(callbackQuery?.id, '只有发令人能点这个按钮', true);
+		return;
+	}
+	const consumed = await consumeAdConfirmToken(env, token, 'gmsa', fromId);
+	if (!consumed) {
+		await answerAdVoteCallback(callbackQuery?.id, '按钮已失效（超时或已使用），请重新发命令', true);
+		if (chat?.id && buttonMessageId) await editTelegramMessage(chat.id, buttonMessageId, '⌛ 该封禁选择已失效，请重新发命令。');
+		return;
+	}
+	const p = consumed.payload || {};
+	const chatId = String(p.c || '');
+	const ids = normalizeBatchMutationIds(p.i);
+	if (!chatId || chatId !== String(chat?.id ?? '') || !isConfiguredGroup(chatId) || !ids.length || !isSuperAdmin(fromId)) {
+		await answerAdVoteCallback(callbackQuery?.id, '按钮数据无效', true);
+		return;
+	}
+	// 点击时再判一次：发令后群若被切成独立，「全域」就不能再给。
+	if (choice === 'G' && isIndependentGroup(chatId)) {
+		await answerAdVoteCallback(callbackQuery?.id, INDEPENDENT_LOCAL_NOTICE.replace(/^ℹ️\s*/, ''), true);
+		return;
+	}
+	const local = choice === 'L';
+	await answerAdVoteCallback(callbackQuery?.id, local ? '已选择：本群黑名单' : '已选择：全域黑名单');
+	if (buttonMessageId) {
+		await editTelegramMessage(chatId, buttonMessageId, `🛡️ 已选择：${local ? '① 拉入本群黑名单并踢出' : '② 拉入全域黑名单并踢出'}，执行中…`);
+	}
+	// 队列与回执都要一条「消息」：用按钮所在的群 + 点按钮的人拼一条，身份与发命令时一致。
+	const pseudoMessage = { chat, from: callbackQuery.from, message_id: null, __moderationGroupMode: 'brief' };
+	await executeScopedModeration(pseudoMessage, env, ctx, {
+		action: p.a === 'spam' ? 'spam' : 'ban',
+		ids,
+		invalid: Array.isArray(p.x) ? p.x.map(String) : [],
+		note: String(p.n || ''),
+		local,
+		groupIds: local ? [chatId] : globalScopeGroupIds(fromId),
+		replyTarget: p.m ? { messageId: Number(p.m) || null, text: '' } : null
+	});
+	if (buttonMessageId) await deleteMessage(chatId, buttonMessageId);
+}
+
+function parseGroupModeArg(token) {
+	const t = String(token || '').trim().toLowerCase();
+	if (t === 'independent' || t === '独立') return 'independent';
+	if (t === 'global' || t === '全局') return 'global';
+	return '';
+}
+
+function formatGroupModeLabel(chatId) {
+	return isIndependentGroup(chatId) ? '独立（全局黑名单不生效，群主自治）' : '全局（默认）';
+}
+
+async function handleGroupModeCommand(message, env, ctx, rest) {
+	const isPrivate = message.chat.type === 'private';
+	const operatorId = getMessageActorId(message);
+	const tokens = String(rest || '').split(/\s+/).filter(Boolean);
+	let targetChatId = isPrivate ? '' : String(message.chat.id);
+	if (tokens.length && /^-?\d+$/.test(tokens[0])) targetChatId = String(tokens.shift());
+	const modeToken = tokens[0] || '';
+	const wanted = parseGroupModeArg(modeToken);
+	const reply = async (textOut) => {
+		if (isPrivate) await sendTelegramMessage(message.chat.id, textOut);
+		else await sendFlashMessage(message.chat.id, textOut, ctx);
+	};
+	const usage = '用法：群里发 <code>/groupmode independent</code> 或 <code>/groupmode global</code>（也可写「独立 / 全局」）；'
+		+ '私聊发 <code>/groupmode 群ID independent|global</code>。不带模式只查看当前模式。';
+	if (!targetChatId) {
+		await reply('❌ 私聊使用请带群 ID。\n' + usage);
+		return;
+	}
+	if (!isPrivate && !isConfiguredGroup(targetChatId)) return;
+	// 权限：第一主人，或目标群的 Telegram 群主（creator）。副主人、超管、普通管理员都不行。
+	const allowed = isPrimaryOwner(operatorId) || (isConfiguredGroup(targetChatId) && await isGroupCreator(operatorId, targetChatId));
+	if (!allowed) {
+		// 群里静默（不暴露命令）；私聊明确告知。
+		if (isPrivate) await sendTelegramMessage(message.chat.id, '❌ <b>权限不足</b>\n\n/groupmode 只限第一主人与该群群主使用。');
+		return;
+	}
+	if (!isPrivate) await deleteAuthorizedGroupCommandMessage(message, '/groupmode');
+	if (!isConfiguredGroup(targetChatId)) {
+		await reply(`❌ <code>${escapeHtml(targetChatId)}</code> 不是配置群。`);
+		return;
+	}
+	if (modeToken && !wanted) {
+		await reply(`❌ 未知模式「${escapeHtml(modeToken)}」。\n` + usage);
+		return;
+	}
+	if (!wanted) {
+		await reply(`ℹ️ 群 <code>${escapeHtml(targetChatId)}</code> 当前模式：${formatGroupModeLabel(targetChatId)}\n` + usage);
+		return;
+	}
+	if (wanted === 'independent' && isKillerModeGroup(targetChatId)) {
+		await reply('❌ 杀手群不能切成独立模式。');
+		return;
+	}
+	if (!env?.DB) {
+		await reply('❌ 未绑定 D1 存储空间，无法保存群模式。');
+		return;
+	}
+	const before = isIndependentGroup(targetChatId) ? 'independent' : 'global';
+	if (before === wanted) {
+		await reply(`ℹ️ 群 <code>${escapeHtml(targetChatId)}</code> 已是${formatGroupModeLabel(targetChatId)}，未改动。`);
+		return;
+	}
+	try {
+		await setGroupMode(env, targetChatId, wanted, operatorId);
+	} catch (error) {
+		console.error('[群模式] 保存失败:', error);
+		await reply('❌ 保存群模式失败，请稍后重试。');
+		return;
+	}
+	const lines = [`✅ 群 <code>${escapeHtml(targetChatId)}</code> 已切换为：${formatGroupModeLabel(targetChatId)}`];
+	if (wanted === 'independent') {
+		lines.push(
+			'· 全局黑名单在本群不再生效（第一主人封杀的除外）；本群用 /ban /spam /sban 写本群黑名单。',
+			'· 已经被封的人不会自动解封。',
+			'· 全局 /unban 不再作用于本群。'
+		);
+	} else {
+		lines.push('· 恢复全局黑名单与全局封禁；本群黑名单记录保留，但只在独立模式下拦截。');
+	}
+	await reply(lines.join('\n'));
+	// 群主切的：私聊告知第一主人一声（谁、哪个群、切成什么）。
+	if (!isPrimaryOwner(operatorId) && OWNER_IDS.length) {
+		await sendTelegramMessage(OWNER_IDS[0], `🔔 <b>群模式变更</b>\n👤 操作人:${formatMessageActorMention(message)}（群主）\n${lines.join('\n')}`);
+	}
+}
+
+async function handleLocalBansCommand(message, env, ctx) {
+	const chatId = String(message.chat.id);
+	const operatorId = getMessageActorId(message);
+	const allowed = await checkMessageOperatorCanModerate(message, message.from?.id || ANON_ADMIN_BOT_ID);
+	if (!allowed) return;
+	const privileged = isOwner(operatorId) || isSuperAdmin(operatorId) || isAnonymousAdminMessage(message);
+	if (!privileged && message.__operatorIsCreator !== true && message.__operatorCanRestrict !== true) {
+		await sendFlashMessage(chatId, '❌ /localbans 需要 Telegram「封禁用户」管理员权限。', ctx);
+		return;
+	}
+	await deleteAuthorizedGroupCommandMessage(message, '/localbans');
+	let rows = [];
+	try {
+		rows = await listGroupBlacklist(env, chatId, 50);
+	} catch (error) {
+		console.error('[本群黑名单] 读取失败:', error);
+		await sendFlashMessage(chatId, '❌ 读取本群黑名单失败，请稍后重试。', ctx);
+		return;
+	}
+	const lines = [`📋 <b>本群黑名单</b>（模式：${formatGroupModeLabel(chatId)}）`];
+	if (!rows.length) lines.push('', '（空）');
+	for (const row of rows) {
+		const when = row.at ? escapeHtml(String(row.at).slice(0, 10)) : '';
+		lines.push(`· ${formatBatchUserCompactTarget(row.id)}${when ? '　' + when : ''}${row.note ? '　' + escapeHtml(String(row.note).slice(0, 60)) : ''}`);
+	}
+	if (rows.length >= 50) lines.push('', 'ℹ️ 只显示最近 50 条。');
+	lines.push('', '解封本群记录：<code>/unban 用户ID</code>');
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
+}
+
+// /ban /sban /spam 在分流为非全局时的统一出口；返回 true = 已处理完。
+async function dispatchNonGlobalModerationRoute(route, message, env, ctx, opts) {
+	if (route.kind === 'reject') {
+		if (message.chat.type === 'private') await sendTelegramMessage(message.chat.id, route.text);
+		else await sendFlashMessage(message.chat.id, route.text, ctx);
+		return true;
+	}
+	if (route.kind === 'super_choice') {
+		await offerSuperAdminScopeChoice(message, env, ctx, { ...opts, allowGlobal: route.allowGlobal });
+		return true;
+	}
+	if (route.kind === 'local') {
+		await executeScopedModeration(message, env, ctx, { ...opts, local: true, groupIds: route.groupIds, notice: route.notice || '' });
+		return true;
+	}
+	return false;
 }
 
 // /check /profile 里的「杀手黑名单」一节。未配置杀手群时不出这一节（零开销）。
@@ -12687,6 +13365,10 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 		await handleAdFixButtonCallback(callbackQuery, env);
 		return;
 	}
+	if (data.startsWith(GROUP_SCOPE_BUTTON_PREFIX)) {
+		await handleGroupScopeButtonCallback(callbackQuery, env, ctx);
+		return;
+	}
 	if (data.startsWith(DRYRUN_BUTTON_PREFIX)) {
 		await handleDryRunButtonCallback(callbackQuery, env);
 		return;
@@ -12912,7 +13594,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		message.from &&
 		!message.from.is_bot
 	) {
-		const blacklistCheck = await checkBlacklist(userId, env);
+		// 独立群：全局记录只认第一主人封的，其余看本群黑名单；独立群命中、或本群黑名单命中，一律踢出。
+		const blacklistCheck = await resolveChatBlacklistCheck(env, chatId, userId, await checkBlacklist(userId, env));
+		const independentChat = isIndependentGroup(chatId) || blacklistCheck.localSource === 'local';
 		if (blacklistCheck.isBlacklisted) {
 			// 双保险：受保护角色豁免，避免误加黑导致他们被踢。
 			// checkIfUserIsAdmin 已含主人/副主人/任意配置群管理员；再补超管。
@@ -12926,9 +13610,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				// 杀手群按 reason 分流（见上）。处置结果真实回传，失败时通知写明原因，不再静默。
 				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+按人工命令口径处置`);
 				await deleteMessage(chatId, message.message_id);
-				const interceptMode = isKillerModeGroup(chatId) && isKillerMuteReason(blacklistCheck.entry?.reason)
-					? 'mute'
-					: 'human';
+				const interceptMode = independentChat
+					? 'kick'
+					: (isKillerModeGroup(chatId) && isKillerMuteReason(blacklistCheck.entry?.reason)
+						? 'mute'
+						: 'human');
 				const moderation = await applyGroupModeration(chatId, userId, interceptMode);
 				await recordDisposalsFromBanResults(env, [{ groupId: chatId, ok: moderation?.ok === true }]);
 				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, moderation, env);
@@ -13174,6 +13860,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		//（目标渲染成可点击昵称 + 可复制 TGID）；完整逐群明细仍私聊第一主人与副主人。
 		// 撤回命令消息、指纹/样本学习、同款连带等原有行为一律不变。
 		message.__moderationGroupMode = 'brief';
+		// 独立模式分流：私聊收回 / 独立群走本群黑名单（/spam 等同 /ban）/ 超管弹范围按钮。
+		const spamRoute = resolveModerationRoute(message, operatorId, 'spam');
+		if (spamRoute.kind === 'reject') {
+			await dispatchNonGlobalModerationRoute(spamRoute, message, env, ctx, {});
+			return;
+		}
+		markModerationScope(message, spamRoute);
 
 		// 提取 /spam 后面的参数。回复模式优先把参数当执行原因；无回复时才按 TGID 模式解析。
 		const argMatch = text.trim().match(/^\/spam(?:@[^\s]+)?\s*([\s\S]*)/i);
@@ -13194,6 +13887,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				await replyToModerationAdmin(message, ctx, { flashText: limitText });
 				return;
 			}
+			if (await dispatchNonGlobalModerationRoute(spamRoute, message, env, ctx, { action: 'spam', ids: valid, invalid, note, requestUrl })) {
+				return;
+			}
 			if (await startBulkModerationJobFromCommand(message, env, ctx, {
 				action: 'spam',
 				mode: 'human',
@@ -13201,7 +13897,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				invalid,
 				note,
 				isInGroup,
-				requestUrl
+				requestUrl,
+				groupIds: spamRoute.groupIds
 			})) {
 				return;
 			}
@@ -13215,7 +13912,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				let flashText;
 				if (result.success || alreadyExists) {
 					// mode:'human' = /spam 与 /ban 同口径：杀手群踢出、其余群禁言不踢。
-					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true, mode: 'human' });
+					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true, mode: 'human', groupIds: spamRoute.groupIds });
 					// 风控·处置：/spam 单条按实际处置成功的群逐群 +1。
 					await recordDisposalsFromBanResults(env, banResults);
 					targetMention = formatTargetFromBanResults(valid[0], banResults);
@@ -13262,7 +13959,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const perUserBanResults = await mapWithConcurrency(
 				idsToKick,
 				BULK_TASK_CONCURRENCY,
-				async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id, { mode: 'human' }) })
+				async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id, { mode: 'human', groupIds: spamRoute.groupIds }) })
 			);
 			for (const { banResults } of perUserBanResults) {
 				const okCount = banResults.filter((r) => r.ok).length;
@@ -13311,6 +14008,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		const replySpamNote = rawArg;
+		if (await dispatchNonGlobalModerationRoute(spamRoute, message, env, ctx, {
+			action: 'spam',
+			ids: [String(repliedUserId)],
+			note: replySpamNote,
+			requestUrl,
+			replyTarget: { messageId: repliedMsg.message_id, text: getAdDetectionBodyText(repliedMsg) }
+		})) {
+			return;
+		}
 		// 引用模式：被引用的那条消息就是现场 —— MsgID 与原文一并存进附表。
 		const replySpamDetail = {
 			...(await resolveMessageBlacklistOperator(message)),
@@ -13324,7 +14030,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (result.success || alreadyExists) {
 			// 加黑成功或已存在 → Telegram 群封禁/预封(revoke_messages 默认 true:封禁同时删该用户在各群全部消息)
 			//   + 缓存清扫兜底(补删 revoke 偶尔漏的、当前群近期消息)
-			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true, mode: 'human' });
+			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true, mode: 'human', groupIds: spamRoute.groupIds });
 			// 风控·处置：引用回复 /spam（对发出广告那条消息的发送者处置）按封成功群逐群 +1。
 			await recordDisposalsFromBanResults(env, banResults);
 			const cleanupResult = await cleanupCurrentChatUserMessages(env, chatId, repliedUserId, [repliedMsg.message_id]);
@@ -14304,8 +15010,20 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
+	// /groupmode —— 切换群模式（全局 / 独立）。只有第一主人与该群 Telegram 群主能切。
+	// 群里：/groupmode [independent|global]；私聊：/groupmode 群ID [independent|global]。不带模式 = 只查看。
+	if (parseTelegramCommand(text).head === '/groupmode') {
+		if (isBotOperator(message.from) || isAnonymousAdminMessage(message)) return;
+		await handleGroupModeCommand(message, env, ctx, parseTelegramCommand(text).rest);
+		return;
+	}
 
-
+	// /localbans —— 列出本群黑名单（只在群里用）：主人、超管、本群群主或有封禁权限的管理员。
+	if (parseTelegramCommand(text).head === '/localbans') {
+		if (isBotOperator(message.from) || message.chat.type === 'private' || !isConfiguredGroup(chatId)) return;
+		await handleLocalBansCommand(message, env, ctx);
+		return;
+	}
 
 	// 处理 /ban 与 /sban 命令 - 添加用户到黑名单（支持批量、群内/私聊双场景；兼容 @机器人名）
 	//   /ban  → 加黑 + 全群【禁言】（杀手群踢出，见 resolveHumanCommandMode）
@@ -14329,6 +15047,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (!isAdmin) {
 			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
 			if (!isInGroup) {
+				// 群管理员（含群主）私聊 /sban：与 /ban /spam /unban 同口径收回到群里。
+				if (isSban && await checkIfUserIsAdmin(userId)) {
+					await sendTelegramMessage(chatId, PRIVATE_MODERATION_REDIRECT_TEXT);
+					return;
+				}
 				await sendTelegramMessage(chatId, isSban
 					? '❌ <b>权限不足</b>\n\n/sban 限第一主人、副主人或该群群主使用（私聊仅第一主人与副主人）。'
 					: '❌ <b>权限不足</b>\n\n/ban 仅限配置群的 Telegram 管理员、主人或副主人使用。');
@@ -14348,6 +15071,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 退化部署会自动回退成群内发完整结果，避免操作完全零反馈。
 		// 撤回命令消息、副主人通知等原有行为一律不变。
 		message.__moderationGroupMode = isSban ? 'silent' : 'brief';
+		// 独立模式分流：私聊收回 / 独立群走本群黑名单（/ban 在独立群也是踢出）/ 超管弹范围按钮。
+		const banRoute = resolveModerationRoute(message, operatorId, isSban ? 'sban' : 'ban');
+		if (banRoute.kind === 'reject') {
+			await dispatchNonGlobalModerationRoute(banRoute, message, env, ctx, {});
+			return;
+		}
+		markModerationScope(message, banRoute);
 
 		// 提取参数（支持单个 / 批量；开头 TGID 列表之后的文本作为执行原因）
 		// 用正则提取,与 /spam 完全对称:兼容 /ban、/ban@机器人名、/sban、多空格;彻底不依赖命令长度,
@@ -14384,6 +15114,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await replyToModerationAdmin(message, ctx, { flashText: limitText });
 			return;
 		}
+		if (await dispatchNonGlobalModerationRoute(banRoute, message, env, ctx, {
+			action: isSban ? 'sban' : 'ban', ids: valid, invalid, note, requestUrl, replyTarget
+		})) {
+			return;
+		}
 		if (await startBulkModerationJobFromCommand(message, env, ctx, {
 			action: isSban ? 'sban' : 'ban',
 			mode: moderationMode,
@@ -14392,7 +15127,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			note,
 			isInGroup,
 			requestUrl,
-			replyDetail
+			replyDetail,
+			groupIds: banRoute.groupIds
 		})) {
 			// 走了队列也要撤回被引用的那条（队列里没有「当前群清扫」）。
 			if (replyTarget?.messageId) await deleteMessage(chatId, replyTarget.messageId);
@@ -14411,7 +15147,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const lines = [`🎬 操作:${isSban ? '全群踢出并加黑(/sban)' : '加入黑名单(/ban)'}`];
 			let flashText;
 			if (result.success || alreadyExists) {
-				const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true, mode: moderationMode });
+				const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true, mode: moderationMode, groupIds: banRoute.groupIds });
 				// 风控·处置：单条按实际处置成功的群逐群 +1。
 				await recordDisposalsFromBanResults(env, banResults);
 				// 与 /spam 对齐：Telegram 的 revoke_messages 只对【仍在群里】的成员生效，
@@ -14490,7 +15226,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const perUserBanResults = await mapWithConcurrency(
 			idsToKick,
 			BULK_TASK_CONCURRENCY,
-			async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id, { mode: moderationMode }) })
+			async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id, { mode: moderationMode, groupIds: banRoute.groupIds }) })
 		);
 		for (const { banResults } of perUserBanResults) {
 			const okCount = banResults.filter((r) => r.ok).length;
@@ -14558,6 +15294,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 但不含逐群明细 / 群 ID / 群名；完整结果仍私聊第一主人。
 			// 撤回命令消息、D1 黑名单硬闸门等原有行为一律不变。
 			message.__moderationGroupMode = 'brief';
+			// 独立模式分流：私聊收回；独立群只解本群黑名单与本群；全局解封一律不碰独立群。
+			const unbanRoute = resolveModerationRoute(message, operatorId, 'unban');
+			if (unbanRoute.kind === 'reject') {
+				await dispatchNonGlobalModerationRoute(unbanRoute, message, env, ctx, {});
+				return;
+			}
+			markModerationScope(message, unbanRoute);
+			const unbanLocal = unbanRoute.kind === 'local';
+			const checkUnbanTargets = (ids) => (unbanLocal
+				? checkLocalUnbanEligibility(env, chatId, ids, operatorId)
+				: checkManyUnbanEligibility(ids, env, { allowD1Removal: isAdmin, operatorId }));
 
 			if (unbanReplyTarget?.unrecognized) {
 				await replyToModerationAdmin(message, ctx, { flashText: REPLY_TARGET_UNRECOGNIZED_TEXT.replace('{cmd}', '/unban') });
@@ -14585,7 +15332,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				invalid,
 				note: '',
 				isInGroup,
-				requestUrl
+				requestUrl,
+				groupIds: unbanRoute.groupIds,
+				local: unbanLocal
 			})) {
 				return;
 			}
@@ -14593,7 +15342,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 单条且无格式错误
 			if (valid.length === 1 && invalid.length === 0) {
 				const targetId = valid[0];
-				const eligibility = await checkManyUnbanEligibility([targetId], env, { allowD1Removal: isAdmin });
+				const eligibility = await checkUnbanTargets([targetId]);
 				const userProfiles = await resolveBatchUserProfiles([targetId], chatId);
 				const targetMention = formatBatchUserTarget(targetId, userProfiles);
 				const lines = [
@@ -14601,6 +15350,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					`🎯 目标用户:${targetMention}`,
 					'',
 				];
+
+				if ((eligibility.primaryLocked || []).includes(targetId)) {
+					lines.push(`⛔ <b>${PRIMARY_LOCKED_UNBAN_TEXT}，已拒绝解封</b>`, 'ℹ️ 只有第一主人能解除；D1 记录保持不变，未调用 Telegram 解封接口。');
+					await replyToModerationAdmin(message, ctx, {
+						flashText: `⛔ <code>${targetId}</code> ${PRIMARY_LOCKED_UNBAN_TEXT}，已拒绝解封`,
+						groupText: `⛔ ${targetMention} ${PRIMARY_LOCKED_UNBAN_TEXT}，已拒绝解封`,
+						detailText: lines.join('\n'),
+						isInGroup
+					});
+					return;
+				}
 
 				if (eligibility.blacklisted.includes(targetId)) {
 					lines.push('⛔ <b>目标仍在 D1 黑名单，已拒绝解封</b>', 'ℹ️ D1 记录保持不变，未调用 Telegram 解封接口。');
@@ -14627,10 +15387,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				}
 
 				const d1RecordRemoved = eligibility.d1Removed.includes(targetId);
-				const unbanResults = await unbanUserFromAllGroups(targetId);
+				const unbanResults = await unbanUserFromAllGroups(targetId, unbanRoute.groupIds);
 				lines.push(
 					d1RecordRemoved
-						? '✅ <b>目标原在 D1 黑名单，已由管理层移除记录并允许解封</b>'
+						? (unbanLocal ? '✅ <b>目标原在本群黑名单，已移除记录并允许解封</b>' : '✅ <b>目标原在 D1 黑名单，已由管理层移除记录并允许解封</b>')
 						: '✅ <b>目标不在 D1 黑名单，允许执行 Telegram 原生解封</b>',
 					d1RecordRemoved
 						? 'ℹ️ D1 黑名单记录已删除；本次仅调用 Telegram 原生解封接口。'
@@ -14651,14 +15411,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 
 			// 批量：管理层先移除命中的 D1 记录，再对全部资格通过目标执行群解封。
-			const results = await checkManyUnbanEligibility(valid, env, { allowD1Removal: isAdmin });
+			const results = await checkUnbanTargets(valid);
 			const idsToUnban = [...results.eligible];
 			const userProfiles = await resolveBatchUserProfiles(valid, chatId);
 			const unbanSummary = { okAll: 0, partial: 0, failedAll: 0 };
 			const perUserUnbanResults = await mapWithConcurrency(
 				idsToUnban,
 				BULK_TASK_CONCURRENCY,
-				async (id) => ({ userId: id, unbanResults: await unbanUserFromAllGroups(id) })
+				async (id) => ({ userId: id, unbanResults: await unbanUserFromAllGroups(id, unbanRoute.groupIds) })
 			);
 			for (const { unbanResults } of perUserUnbanResults) {
 				const okCount = unbanResults.filter((r) => r.ok).length;
@@ -14667,7 +15427,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				else unbanSummary.partial += 1;
 			}
 			const failedCount = invalid.length + results.failed.length;
-			const flashText = `🔓 批量解封：允许 ${results.eligible.length}${results.blacklisted.length ? ` / D1拒绝 ${results.blacklisted.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+			const lockedCount = (results.primaryLocked || []).length;
+			const flashText = `🔓 批量解封：允许 ${results.eligible.length}${results.blacklisted.length ? ` / D1拒绝 ${results.blacklisted.length}` : ''}${lockedCount ? ` / ${PRIMARY_LOCKED_UNBAN_TEXT} ${lockedCount}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
 			let detailText = renderBatchUnbanEligibilityResult(results, invalid, userProfiles);
 			if (idsToUnban.length > 0) {
 				const unbanHeaderLines = ['<b>Telegram 群解封结果</b>:', `✅ 全部群解封成功: ${unbanSummary.okAll}`];
@@ -14692,6 +15453,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await replyToModerationAdmin(message, ctx, {
 				flashText,
 				groupText: `🔓 批量解封完成\n✅ 解封 ${results.eligible.length}　⛔ D1拒绝 ${results.blacklisted.length}　❌ 失败 ${failedCount}`
+					+ (lockedCount ? `\n⛔ ${PRIMARY_LOCKED_UNBAN_TEXT}: ${lockedCount}` : '')
 					+ (idsToUnban.length ? '\n' + idsToUnban.map((id) => `· ${formatBatchUserTarget(id, userProfiles)}`).join('\n') : '')
 					+ '\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）',
 				detailText,
@@ -14771,6 +15533,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			silentGroupReply: quietManagerCommand && OWNER_IDS.length > 0,
 			ctx,
 			message,
+			scope: {},
 		})) {
 			return;
 		}
@@ -14794,7 +15557,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 检查用户回复是否完全匹配提示语，禁止夹带其它内容
 	else if (text && text.trim() === SELF_UNBAN_KEYWORD) {
 		// D1 全局黑名单是自助解封的硬闸门：命中任何 reason 都拒绝，且不自动移除黑名单。
-		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env)) {
+		const selfUnbanScope = {};
+		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env, { scope: selfUnbanScope })) {
 			return;
 		}
 		const approvedReply = await buildSelfUnbanApprovedReply();
@@ -14802,11 +15566,21 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		// 遍历所有配置群组，按用户在每个群的状态分别尝试解封/解禁
 		// 杀手黑名单里的人：杀手群跳过（那张表只管杀手群，其余群照常自助解封）。
+		// 在全局黑名单（非第一主人封的）里的人：只解独立群，全局群保持封禁。
 		const killerHit = KILLER_MODE_GROUPS.length ? await readKillerBlacklistEntrySafe(env, userId) : null;
 		const perGroupResults = [];
-		for (const groupId of GROUP_IDS) {
+		const selfUnbanGroupIds = selfUnbanScope.independentOnly ? GROUP_IDS.filter((g) => isIndependentGroup(g)) : GROUP_IDS;
+		if (selfUnbanScope.independentOnly) {
+			perGroupResults.push('ℹ️ 你仍在全局黑名单中，全局群保持封禁；以下仅为独立群的自助解封结果。');
+		}
+		for (const groupId of selfUnbanGroupIds) {
 			if (killerHit && isKillerModeGroup(groupId)) {
 				perGroupResults.push(`⛔ <code>${escapeHtml(groupId)}</code>：在杀手黑名单中，不能自助解封。`);
+				continue;
+			}
+			// 本群黑名单里的人跳过这个群（群主自治 / 超管本群封禁，自助解封不替他解）。
+			if (hasGroupLocalBlacklist(groupId) && await readGroupBlacklistEntrySafe(env, groupId, userId)) {
+				perGroupResults.push(`⛔ <code>${escapeHtml(groupId)}</code>：在本群黑名单中，请联系本群管理员。`);
 				continue;
 			}
 			let groupLabel = `<code>${escapeHtml(groupId)}</code>`;
@@ -26216,7 +26990,7 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 	}
 
 	const uid = String(payload);
-	const eligibility = await checkManyUnbanEligibility([uid], env, { allowD1Removal: true });
+	const eligibility = await checkManyUnbanEligibility([uid], env, { allowD1Removal: true, operatorId: fromId });
 	if (!eligibility.eligible.includes(uid)) {
 		const failure = (eligibility.failed || []).find((item) => String(item.id) === uid);
 		await answerAdVoteCallback(callbackQuery?.id, failure?.msg || '解封未执行：无法确认 D1 黑名单状态', true);
@@ -26224,7 +26998,7 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 	}
 	let results = [];
 	try {
-		results = await unbanUserFromAllGroups(uid);
+		results = await unbanUserFromAllGroups(uid, globalUnbanScopeGroupIds());
 	} catch (error) {
 		console.error('[封禁回执] 解封按钮执行失败:', error);
 	}
@@ -26808,7 +27582,9 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			// 必然是 member，这一次 getChatMember 纯属浪费（与 screenAdJoinMember 里
 			// 「不查 getChatMember」那条注释同一取向）。
 			probeMembership: options.probeMembership !== false,
-			revokeMessages: true
+			revokeMessages: true,
+			// 自动检测记的是 system，不是第一主人：扇出跳过独立群，但事发群本身照封（批次 2 再细分独立群口径）。
+			groupIds: autoDetectionScopeGroupIds(chatId)
 		});
 	} catch (error) {
 		console.error('[广告检测] 全群封禁失败:', error);
@@ -28121,7 +28897,7 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, options = 
 		return { targetId, removed, unbanSummary, unbanResults, snapshotProcessed: false, complete: false, errors: ['移除黑名单失败，未执行解封和学习纠错，待复核记录已保留'] };
 	}
 	if (removed.success || removed.code === 'NOT_FOUND') {
-		const results = await unbanUserFromAllGroups(targetId, options.groupIds || GROUP_IDS);
+		const results = await unbanUserFromAllGroups(targetId, globalUnbanScopeGroupIds(options.groupIds || GROUP_IDS));
 		unbanResults = results;
 		const okCount = results.filter((r) => r.ok).length;
 		unbanSummary = okCount + '/' + results.length + ' 个群成功';
@@ -29660,7 +30436,7 @@ async function handleAdReplyLearning(message, env, ctx) {
 		let unbanOk = 0;
 		let unbanTotal = 0;
 		if (removed.success || removed.code === 'NOT_FOUND') {
-			const results = await unbanUserFromAllGroups(targetId);
+			const results = await unbanUserFromAllGroups(targetId, globalUnbanScopeGroupIds());
 			unbanTotal = results.length;
 			unbanOk = results.filter((r) => r.ok).length;
 		}

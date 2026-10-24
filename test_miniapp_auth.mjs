@@ -91,7 +91,7 @@ assert.ok(menu);
 assert.equal(menu.body.chat_id, '10001');
 assert.equal(menu.body.menu_button.web_app.url, 'https://bot.example/app');
 assert.equal(menu.body.menu_button.type, 'web_app');
-assert.equal(calls.find(call => call.url.endsWith('/setMyCommands')).body.commands.length, 21);
+assert.equal(calls.find(call => call.url.endsWith('/setMyCommands')).body.commands.length, 23); // 独立模式新增 /groupmode /localbans
 context.fetch = async (url) => Response.json(url.endsWith('/setChatMenuButton') ? { ok: false, description: 'menu failed' } : { ok: true, result: true });
 response = await context.handleInitialization(new Request('https://bot.example/' + env.TOKEN + '?raw=1'), env);
 assert.equal(response.status, 500);
