@@ -1147,7 +1147,9 @@ console.log('\n[4b] 黑名单发言拦截处置失败 → 通知写明失败原�
 	const ownerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
 	assert('处置失败时主人收到拦截通知', !!ownerDm);
 	assert('通知含「处置结果:失败」', !!ownerDm && ownerDm.body.text.includes('处置结果:失败'));
-	assert('通知带 Telegram 原始报错（看得出是权限不足）', !!ownerDm && ownerDm.body.text.includes('not enough rights'));
+	// 【2026-10-24】主人定的口径：失败原因只给中文（英文原文进 Worker 日志），仍要看得出是权限不足。
+	assert('通知用中文写明原因（看得出是权限不足）', !!ownerDm && ownerDm.body.text.includes('bot 权限不足'));
+	assert('通知不带 Telegram 英文原文', !!ownerDm && !ownerDm.body.text.includes('not enough rights'));
 }
 
 // ---------- [4a] D1 高频路径固定上限 ----------

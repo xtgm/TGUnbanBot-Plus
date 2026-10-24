@@ -8112,7 +8112,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 			}));
 			// 风控·处置：黑名单用户复入被当场踢回，算本群挡下一次（失败不计）。
 			await recordDisposalsFromBanResults(env, [{ groupId: chat.id, ok: banResult?.ok === true }]);
-			await notifyOwnerBlacklistIntercept(targetUser, chat, '复入群拦截', blacklistCheck, banResult);
+			await notifyOwnerBlacklistIntercept(targetUser, chat, '复入群拦截', blacklistCheck, banResult, env);
 			return; // 已处理，不再走后面"管理员操作同步"分支
 		}
 		// 杀手黑名单：只在杀手群拦截，复入即踢回。
@@ -8124,7 +8124,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 					群ID: chat.id, 用户ID: targetIdStr, 踢人结果: banResult.ok ? '成功' : `失败:${banResult.error}`
 				}));
 				await recordDisposalsFromBanResults(env, [{ groupId: chat.id, ok: banResult?.ok === true }]);
-				await notifyOwnerBlacklistIntercept(targetUser, chat, '复入群拦截（杀手黑名单）', { entry: killerEntry }, banResult);
+				await notifyOwnerBlacklistIntercept(targetUser, chat, '复入群拦截（杀手黑名单）', { entry: killerEntry }, banResult, env);
 				return;
 			}
 		}
@@ -8187,7 +8187,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 				console.log('[chat_member] 拦截群内手动解封(D1黑名单保护):', JSON.stringify({ ...logCommon, 封回结果: banResult.ok ? '成功' : `失败:${banResult.error}` }));
 				// 风控·处置：封回成功即本群挡下一次（管理员试图绕过 D1 黑名单解封）。
 				await recordDisposalsFromBanResults(env, [{ groupId: chat.id, ok: banResult?.ok === true }]);
-				await notifyOwnerBlacklistIntercept(targetUser, chat, '群内手动解封拦截', blacklistCheck, banResult);
+				await notifyOwnerBlacklistIntercept(targetUser, chat, '群内手动解封拦截', blacklistCheck, banResult, env);
 			}
 		} else {
 			// 杀手黑名单同理：杀手群里被原生解封 → 封回（只看杀手群，GROUP_ID 群不读这张表）。
@@ -8196,7 +8196,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 				const banResult = await banUserFromGroup(chat.id, targetIdStr);
 				console.log('[chat_member] 拦截杀手群内手动解封(杀手黑名单保护):', JSON.stringify({ ...logCommon, 封回结果: banResult.ok ? '成功' : `失败:${banResult.error}` }));
 				await recordDisposalsFromBanResults(env, [{ groupId: chat.id, ok: banResult?.ok === true }]);
-				await notifyOwnerBlacklistIntercept(targetUser, chat, '群内手动解封拦截（杀手黑名单）', { entry: killerEntry }, banResult);
+				await notifyOwnerBlacklistIntercept(targetUser, chat, '群内手动解封拦截（杀手黑名单）', { entry: killerEntry }, banResult, env);
 			} else {
 				// 不在 D1 黑名单：无黑名单变化，仅记日志，不再通知主人（原生操作通知已取消）。
 				console.log('[chat_member] 群内原生解封（非黑名单用户），不再通知主人:', JSON.stringify(logCommon));
@@ -10763,9 +10763,76 @@ async function formatOriginLabel(chatOrId) {
 // （曾写过一个 formatOriginActor，实测在全部调用点下恒返回空串，已删：不给将来
 //  留死代码。真出现「管理员代发」的路径时再补，那时要连 userId 的来源一起改。）
 
-// 黑名单自动拦截通知主人（复入群拦截 / 发言拦截时调用）
-async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklistInfo, banResult) {
+// 【2026-10-24】拦截通知去重：同一人 × 同一群 × 同一结果（成功/失败）只通知第一次，
+// 之后永久不再发，直到结果变化（失败 → 成功、成功 → 失败）才再发一次，并带上期间压下的次数。
+// 主人定的口径：失败通知要，但不要刷屏；成功也一样；不同群各自去重；
+// 「群内手动解封拦截」是有人在撤销封禁，不去重、每次都发（调用方不走这里）。
+// 落 D1 而不用内存 Map：Worker 多实例各有一份 Map，挡不住重复。
+// 判定用一条原子 UPSERT + RETURNING：并发的两次拦截不会都判成「第一次」。
+const D1_INTERCEPT_NOTIFY_INIT = new WeakMap();
+
+async function ensureInterceptNotifyTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_INTERCEPT_NOTIFY_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			await runD1SchemaStatement(env, 'intercept_notify_log',
+				'CREATE TABLE IF NOT EXISTS intercept_notify_log (user_id TEXT NOT NULL, chat_id TEXT NOT NULL, outcome TEXT NOT NULL, suppressed INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, chat_id))');
+			return true;
+		} catch (error) {
+			console.error('[拦截通知去重] 建表失败:', error);
+			D1_INTERCEPT_NOTIFY_INIT.delete(env.DB);
+			return false;
+		}
+	})();
+	D1_INTERCEPT_NOTIFY_INIT.set(env.DB, init);
+	return init;
+}
+
+// 返回 { send, suppressed }：send=false 表示这次压下不发；
+// suppressed 是结果变化前、上一种结果被压下的次数（只在 send=true 时有意义）。
+// D1 不可用或读写失败一律 send=true —— 宁可多发一条，不能把处置失败静默掉。
+async function claimInterceptNotify(env, userId, chatId, outcome) {
+	if (!(await ensureInterceptNotifyTable(env))) return { send: true, suppressed: 0 };
+	try {
+		const prev = await env.DB.prepare(
+			'SELECT outcome, suppressed FROM intercept_notify_log WHERE user_id = ? AND chat_id = ?'
+		).bind(String(userId), String(chatId)).first();
+		const now = Math.floor(Date.now() / 1000);
+		// 同一结果：原子 +1，changes=1 说明确实是重复 → 压下。
+		// 条件写在 WHERE 里，并发时只有结果仍相同的那次才会被计成重复。
+		if (prev && prev.outcome === outcome) {
+			const res = await env.DB.prepare(
+				'UPDATE intercept_notify_log SET suppressed = suppressed + 1, updated_at = ? WHERE user_id = ? AND chat_id = ? AND outcome = ?'
+			).bind(now, String(userId), String(chatId), outcome).run();
+			if (Number(res?.meta?.changes) > 0) return { send: false, suppressed: 0 };
+		}
+		// 第一次或结果变化：抢占这一格。WHERE 挡住「另一个并发请求已经抢先写成同一结果」的情况。
+		const claim = await env.DB.prepare(
+			'INSERT INTO intercept_notify_log (user_id, chat_id, outcome, suppressed, updated_at) VALUES (?, ?, ?, 0, ?) '
+			+ 'ON CONFLICT(user_id, chat_id) DO UPDATE SET outcome = excluded.outcome, suppressed = 0, updated_at = excluded.updated_at '
+			+ 'WHERE intercept_notify_log.outcome != excluded.outcome'
+		).bind(String(userId), String(chatId), outcome, now).run();
+		if (prev && Number(claim?.meta?.changes) === 0) return { send: false, suppressed: 0 };
+		return { send: true, suppressed: prev ? Number(prev.suppressed) || 0 : 0 };
+	} catch (error) {
+		console.error('[拦截通知去重] 读写失败，本次照常通知:', error);
+		return { send: true, suppressed: 0 };
+	}
+}
+
+// 黑名单自动拦截通知主人（复入群拦截 / 发言拦截 / 群内手动解封拦截时调用）
+async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklistInfo, banResult, env) {
 	if (!OWNER_IDS.length) return;
+	const failed = !!(banResult && !banResult.ok);
+	let suppressed = 0;
+	const deduped = !String(action || '').startsWith('群内手动解封拦截');
+	if (deduped) {
+		const claim = await claimInterceptNotify(env, targetUser?.id ?? '未知', chat?.id ?? '未知', failed ? 'fail' : 'ok');
+		if (!claim.send) return;
+		suppressed = claim.suppressed;
+	}
 	const target = targetUser
 		? formatUserMention(targetUser)
 		: '<code>未知</code>';
@@ -10793,8 +10860,19 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 	];
 	// 【2026-10-17】文案从「踢人结果」改中性：拦截处置现在跟随 /ban /spam 口径，
 	// 普通配置群禁言、杀手群踢出，不再只有踢人一种可能。
-	if (banResult && !banResult.ok) {
-		lines.push(`⚠️ 处置结果:失败 - ${escapeHtml(banResult.error || '未知')}`);
+	// 【2026-10-24】失败原因只给中文 + 建议，英文原文由 translateTelegramError 兜底写入 Worker 日志。
+	if (failed) {
+		const translated = translateTelegramError(banResult.error || '未知错误');
+		lines.push(`⚠️ 处置结果:失败 - ${escapeHtml(translated.中文)}`);
+		lines.push(`💡 建议:${escapeHtml(translated.建议)}`);
+	}
+	if (suppressed > 0) {
+		lines.push(`🔁 此前在本群又拦截 ${suppressed} 次（${failed ? '均为处置成功' : '均为处置失败'}，未重复通知）`);
+	}
+	if (deduped) {
+		lines.push(failed
+			? `🔕 该用户在本群再次处置失败不再重复通知，处置成功时会再提醒`
+			: `🔕 该用户在本群再次拦截成功不再重复通知，处置失败时会再提醒`);
 	}
 
 	await notifyAllOwners(lines.join('\n'), null);
@@ -12027,7 +12105,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					: 'human';
 				const moderation = await applyGroupModeration(chatId, userId, interceptMode);
 				await recordDisposalsFromBanResults(env, [{ groupId: chatId, ok: moderation?.ok === true }]);
-				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, moderation);
+				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, moderation, env);
 				return;
 			}
 		}
@@ -12040,7 +12118,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				await deleteMessage(chatId, message.message_id);
 				const moderation = await applyGroupModeration(chatId, userId, 'kick');
 				await recordDisposalsFromBanResults(env, [{ groupId: chatId, ok: moderation?.ok === true }]);
-				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截（杀手黑名单）', { entry: killerEntry }, moderation);
+				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截（杀手黑名单）', { entry: killerEntry }, moderation, env);
 				return;
 			}
 		}
