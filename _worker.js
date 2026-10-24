@@ -3623,6 +3623,36 @@ function parseBatchTgids(raw) {
 	return { valid, invalid };
 }
 
+// /ban /sban /unban 的引用目标（2026-10-24 主人定）：
+//   null                    → 不算引用（没引用 / 私聊 / 话题群里自动挂上的「话题创建」消息）
+//   { unrecognized: true }  → 引用了，但认不出是哪个真人（机器人 / 频道 / 匿名管理员 / Telegram 服务号）
+//   { userId, messageId, text } → 可处置的真人
+// 【只认群内】私聊里引用的只能是 bot 或自己的消息，按引用处置只会封错人。
+// 【话题群】话题里不点「回复」发的消息，Telegram 也会把 reply_to_message 填成该话题的创建消息，
+// 那不是管理员想引用的人 —— 认作没引用，照旧回使用说明。
+// 【sender_chat 一律认不出】以频道 / 匿名管理员身份发的消息，from 是 Telegram 的占位账号，
+// 按 from.id 处置会封到占位号上（与 /spam 回复 sender_chat 不加黑同一口径）。
+const TELEGRAM_SERVICE_USER_ID = '777000';
+
+function getReplyModerationTarget(message) {
+	if (!message || message.chat?.type === 'private') return null;
+	const reply = message.reply_to_message;
+	if (!reply) return null;
+	if (reply.forum_topic_created) return null;
+	if (message.is_topic_message && Number(reply.message_id) === Number(message.message_thread_id)) return null;
+	const from = reply.from;
+	if (reply.sender_chat || !from || from.is_bot || String(from.id) === TELEGRAM_SERVICE_USER_ID) {
+		return { unrecognized: true };
+	}
+	return {
+		userId: String(from.id),
+		messageId: Number(reply.message_id) || null,
+		text: getAdDetectionBodyText(reply)
+	};
+}
+
+const REPLY_TARGET_UNRECOGNIZED_TEXT = '❌ 无法从这条消息识别用户\n\n引用的是机器人、频道或匿名管理员发的消息，请改用 <code>{cmd} 用户ID</code>。';
+
 function parseTargetIdsAndNote(raw) {
 	const trimmed = String(raw || '').trim();
 	if (!trimmed) return { valid: [], invalid: [], note: '' };
@@ -6062,6 +6092,10 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		// 加黑附表用：身份英文代号 + 用户名（公开查询页的「操作人」栏）。
 		blacklistOperatorRole: options.blacklistOperator?.operatorRole || '',
 		blacklistOperatorUsername: options.blacklistOperator?.operatorUsername || '',
+		// 引用模式建的任务（只有一个目标）：被引用消息的 MsgID 与原文。
+		blacklistReplyDetail: options.replyDetail
+			? { msgId: options.replyDetail.msgId || null, text: String(options.replyDetail.text || '').slice(0, BLACKLIST_DETAIL_TEXT_MAX) }
+			: null,
 		sourceChatId: String(message.chat?.id ?? ''),
 		sourceChatTitle: message.chat?.title || message.chat?.username || (message.chat?.type === 'private' ? '私聊' : '当前群组'),
 		sourceChatType: message.chat?.type || 'unknown',
@@ -6387,6 +6421,7 @@ async function performBulkJobD1Mutation(job, env, ids) {
 				note: job.note,
 				// 私聊发起的任务不存 chat_id（私聊 id 就是操作人 TGID）；旧任务没有这两个字段 → 按 createdBy 推身份。
 				detail: {
+					...(job.blacklistReplyDetail || {}),
 					operatorRole: job.blacklistOperatorRole || '',
 					operatorUsername: job.blacklistOperatorUsername || '',
 					chatId: job.sourceChatType === 'private' ? '' : (job.sourceChatId || '')
@@ -6783,6 +6818,7 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 	const blacklistOperator = action === 'unban' ? null : await resolveMessageBlacklistOperator(message);
 	const job = await createBulkJob(env, action, valid, invalid, note, message, {
 		blacklistOperator,
+		replyDetail: options.replyDetail || null,
 		allowD1Removal: action === 'unban' && options.allowD1Removal === true,
 		mode: options.mode || null,
 		// 群内静默/简洁（主人要求）：/ban·/spam·/unban 的批量任务【不再向源群推异步完成通知】，
@@ -14318,7 +14354,25 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 根除早期 slice(5) 吃掉参数首字符那类"命令一改短就错位"的隐患。
 		const argMatch = text.trim().match(/^\/(?:ban|sban)(?:@[^\s]+)?\s*([\s\S]*)/i);
 		const rawArg = argMatch ? argMatch[1] : '';
-		const { valid, invalid, note } = parseTargetIdsAndNote(rawArg);
+		const parsedArgs = parseTargetIdsAndNote(rawArg);
+
+		// ===== 引用模式（2026-10-24 主人定）=====
+		// 带了 TGID 就按 TGID；一个 TGID 都没带才看引用 —— 此时命令后面的文字整段当原因。
+		// /ban：有 /ban 权限的人都能引用；/sban 引用只给第一主人（TGID 用法的权限不变）。
+		const replyTarget = parsedArgs.valid.length === 0 ? getReplyModerationTarget(message) : null;
+		if (replyTarget?.unrecognized) {
+			await replyToModerationAdmin(message, ctx, { flashText: REPLY_TARGET_UNRECOGNIZED_TEXT.replace('{cmd}', commandName) });
+			return;
+		}
+		if (replyTarget && isSban && !isPrimaryOwner(operatorId)) {
+			await replyToModerationAdmin(message, ctx, { flashText: '❌ <b>/sban 引用仅限第一主人使用</b>\n\n请改用 <code>/sban 用户ID</code>。' });
+			return;
+		}
+		const valid = replyTarget ? [replyTarget.userId] : parsedArgs.valid;
+		const invalid = replyTarget ? [] : parsedArgs.invalid;
+		const note = replyTarget ? String(rawArg || '').trim() : parsedArgs.note;
+		// 附表现场：引用时把被引用的那条消息（MsgID + 原文）一并存下。
+		const replyDetail = replyTarget ? { msgId: replyTarget.messageId, text: replyTarget.text } : null;
 
 		if (valid.length === 0 && invalid.length === 0) {
 			const usageText = `❌ 使用方法：<code>${commandName} 用户ID</code> 或 <code>${commandName} 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
@@ -14337,14 +14391,20 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			invalid,
 			note,
 			isInGroup,
-			requestUrl
+			requestUrl,
+			replyDetail
 		})) {
+			// 走了队列也要撤回被引用的那条（队列里没有「当前群清扫」）。
+			if (replyTarget?.messageId) await deleteMessage(chatId, replyTarget.messageId);
 			return;
 		}
 
 		// 单条且无格式错误
 		if (valid.length === 1 && invalid.length === 0) {
-			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: operatorId, note, detail: await resolveMessageBlacklistOperator(message) });
+			const result = await addToBlacklist(valid[0], env, {
+				reason: 'manual', by: operatorId, note,
+				detail: { ...(await resolveMessageBlacklistOperator(message)), ...(replyDetail || {}) }
+			});
 			const alreadyExists = result.code === 'EXISTS';
 			// 统一详情格式:无论成功失败都展示完整字段
 			let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
@@ -14365,9 +14425,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				// 正是 loadRecentUserAdText 唯一的正文来源 —— 晚读一步就是空串。
 				// 私聊路径不清扫，所以只有群内 /ban 会踩到这一点。
 				// 读出来的正文在下面交给 learnAdFromOperatorAction。
-				const banIdTextForLearn = await loadRecentUserAdText(env, valid[0]);
+				// 引用时被引用的那条就是广告原文，优先学它（缓存里不一定有，比如刚发就被引用）。
+				const banIdTextForLearn = replyTarget?.text || await loadRecentUserAdText(env, valid[0]);
+				// 引用时被引用的那条一并撤回（与 /spam 引用同口径：作为清扫的兜底 ID，清扫内部去重）。
 				const cleanupResult = isInGroup
-					? await cleanupCurrentChatUserMessages(env, chatId, valid[0])
+					? await cleanupCurrentChatUserMessages(env, chatId, valid[0], replyTarget?.messageId ? [replyTarget.messageId] : [])
 					: null;
 				targetMention = formatTargetFromBanResults(valid[0], banResults);
 				lines.push(`🎯 目标用户:${targetMention}`);
@@ -14473,9 +14535,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	const unbanCommand = parseTelegramCommand(text);
 	if (unbanCommand.head === '/unban') {
 		const rest = unbanCommand.rest;
+		// 引用模式（2026-10-24 主人定）：有 /unban 权限的人都能引用；带了 TGID 就按 TGID。
+		// 只在群内引用了消息时才进下面的管理分支 —— 裸 /unban（不引用）仍是自助解封清单，逐字节不变。
+		const unbanReplyTarget = parseBatchTgids(rest).valid.length === 0 ? getReplyModerationTarget(message) : null;
 
-		// 如果有参数，处理黑名单移除
-		if (rest.trim()) {
+		// 如果有参数（或引用了消息），处理黑名单移除
+		if (rest.trim() || unbanReplyTarget) {
 			const isInGroup = message.chat.type !== 'private';
 
 			// 权限统一，原有 D1 检查、移除及 Telegram 解封流程保持原样。
@@ -14494,7 +14559,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 撤回命令消息、D1 黑名单硬闸门等原有行为一律不变。
 			message.__moderationGroupMode = 'brief';
 
-			const { valid, invalid } = parseBatchTgids(rest);
+			if (unbanReplyTarget?.unrecognized) {
+				await replyToModerationAdmin(message, ctx, { flashText: REPLY_TARGET_UNRECOGNIZED_TEXT.replace('{cmd}', '/unban') });
+				return;
+			}
+			// 引用时命令后面的文字不当 TGID 解析（/unban 没有原因字段，忽略即可）。
+			const { valid, invalid } = unbanReplyTarget
+				? { valid: [unbanReplyTarget.userId], invalid: [] }
+				: parseBatchTgids(rest);
 
 			if (valid.length === 0 && invalid.length === 0) {
 				const usageText = `❌ 使用方法：<code>/unban 用户ID</code> 或 <code>/unban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
