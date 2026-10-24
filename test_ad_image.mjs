@@ -872,7 +872,7 @@ section('[8] /spam /ban /sban 引用的图片也进广告素材库');
 	const env = makeEnv();
 	await W.adDetectionReady(env);
 	const imgMessage = barePhotoMessage({ id: 770001, first_name: '广告号' }, 'IMG_LEARN_1', 'F_LEARN_1');
-	const out = await W.learnAdFromOperatorAction(env, 770001, imgMessage, { source: 'spam', createdBy: 'owner' });
+	const out = await W.learnAdFromOperatorAction(env, 770001, imgMessage, { source: 'spam', createdBy: String(OWNER_ID) });
 
 	const row = env.DB.query('SELECT verdict, source, kind, last_user_id FROM ad_images WHERE file_unique_id = ?', 'IMG_LEARN_1');
 	assert('★ 引用的图片已进广告素材库', row.length === 1, JSON.stringify(row));
@@ -885,7 +885,7 @@ section('[8] /spam /ban /sban 引用的图片也进广告素材库');
 
 	// /ban 12345 这种直接给 id 的用法没有引用消息 —— 不该误学出一张空图。
 	const before = env.DB.query('SELECT COUNT(*) AS c FROM ad_images')[0].c;
-	await W.learnAdFromOperatorAction(env, 770002, null, { source: 'ban', createdBy: 'owner' });
+	await W.learnAdFromOperatorAction(env, 770002, null, { source: 'ban', createdBy: String(OWNER_ID) });
 	const after = env.DB.query('SELECT COUNT(*) AS c FROM ad_images')[0].c;
 	assert('★ 没有引用消息时不误学图片', after === before, before + '→' + after);
 }

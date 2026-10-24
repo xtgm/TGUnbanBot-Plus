@@ -19927,6 +19927,11 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 	const source = String(options.source || 'manual');
 	const createdBy = String(options.createdBy || '');
 	const out = { learned: 0, sampleAdded: 0, enriched: 0, imageLearned: 0, avatars: 0, badges: 0, shapes: 0, aiPromoted: 0 };
+	// 【学习只限第一主人】（2026-10-24 主人定）：「学习规则是第一主人的权限 任何人都没权限」。
+	// 副主人 / 超管 / 群管理员的 /ban /spam /sban 照常封人，只是一个特征都不学。
+	// 卡在这里而不是各调用点：单条、引用、批量四个调用点全经过这一处，漏不掉；
+	// 返回全 0 的 out，renderAdLearnLines 自然一行「已学习」都不出。
+	if (!isPrimaryOwner(createdBy)) return out;
 	try {
 		// checklist 是与 text/caption 互斥的第六类正文来源 —— /spam /ban /sban 引用【清单】时
 		// message.text 恒为 undefined，不接它就只学得到一张空正文的资料卡。

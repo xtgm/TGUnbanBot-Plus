@@ -240,14 +240,14 @@ console.log('\n===== 人工判定学习 =====');
 
 	// ① 有正文 → 学指纹 + 加语义样本
 	const r1 = await W.learnAdFromOperatorAction(env, '990001', { text: '', from: {} }, {
-		source: 'manual', createdBy: '1', text: '收购网赚老号 日结5000'
+		source: 'manual', createdBy: OWNER, text: '收购网赚老号 日结5000'
 	});
 	check('有正文 → 学到指纹', r1.learned > 0, JSON.stringify(r1));
 	check('有正文 → 加了语义样本', r1.sampleAdded === 1, JSON.stringify(r1));
 
 	// ② text 传空串时只学资料卡 —— 命令消息的内容是「/ban 123」，学它等于把命令当广告样本
 	const r2 = await W.learnAdFromOperatorAction(env, '990002', { text: '/ban 123', from: {} }, {
-		source: 'manual', createdBy: '1', text: ''
+		source: 'manual', createdBy: OWNER, text: ''
 	});
 	check('text 空 → 仍学（资料卡有内容）', r2.learned > 0 || r2.sampleAdded === 1, JSON.stringify(r2));
 
@@ -270,7 +270,7 @@ console.log('\n===== 人工判定学习 =====');
 	const r4 = await W.learnAdFromOperatorAction(env, '990004', { text: '', from: {} }, {
 		// 【必须用不同内容】指纹有唯一键，与前面相同的文案会被去重，
 		// source 不会改写，断言就会假失败。
-		source: 'sban', createdBy: '1', text: '招代理 一条龙 sban专属文案2026'
+		source: 'sban', createdBy: OWNER, text: '招代理 一条龙 sban专属文案2026'
 	});
 	const src = env.DB.query("SELECT DISTINCT source FROM ad_fingerprints WHERE source IN ('sban','manual') ORDER BY source");
 	check('★ source 分档落库（sban 与 manual 各自独立）',
@@ -290,7 +290,7 @@ console.log('\n===== 人工判定学习 =====');
 		badgeId: '5387492010000000001'
 	});
 	const r5 = await W.learnAdFromOperatorAction(env, '990005', { text: '', from: {} }, {
-		source: 'manual', createdBy: '1', text: '出售老号 日结'
+		source: 'manual', createdBy: OWNER, text: '出售老号 日结'
 	});
 	check('★ 人工判定学头像', r5.avatars === 1, JSON.stringify(r5));
 	check('★ 人工判定学会员标', r5.badges === 1, JSON.stringify(r5));
@@ -316,7 +316,7 @@ console.log('\n===== 人工判定学习 =====');
 		avatarId: '', badgeId: ''
 	});
 	const r6 = await W.learnAdFromOperatorAction(env, '990006', { text: '', from: {} }, {
-		source: 'manual', createdBy: '1', text: ''
+		source: 'manual', createdBy: OWNER, text: ''
 	});
 	check('★ 三样全空 → 一个都不学（计数全 0）',
 		r6.avatars === 0 && r6.badges === 0 && r6.shapes === 0, JSON.stringify(r6));
@@ -329,7 +329,7 @@ console.log('\n===== 人工判定学习 =====');
 		firstName: '批量测试', lastName: '', username: 'bulk01', bio: '日结 出售账号 加群看',
 		avatarId: 'AQADTESTAVATAR002', badgeId: ''
 	});
-	const r7 = await W.learnAdFromOperatorAction(env, '990007', null, { source: 'manual', text: '' });
+	const r7 = await W.learnAdFromOperatorAction(env, '990007', null, { source: 'manual', createdBy: OWNER, text: '' });
 	check('★ 批量路径（message=null）也学头像', r7.avatars === 1, JSON.stringify(r7));
 	check('★ 批量路径也学资料形状', r7.shapes === 1, JSON.stringify(r7));
 	check('★ 无会员标不虚增', r7.badges === 0, JSON.stringify(r7));
@@ -380,7 +380,7 @@ console.log('\n===== 人工判定学习 =====');
 	};
 	const r8 = await W.learnAdFromOperatorAction(env, '990008',
 		{ text: '/ban 990008', from: {}, reply_to_message: quotedAd },
-		{ source: 'manual', createdBy: '1', text: '' });
+		{ source: 'manual', createdBy: OWNER, text: '' });
 	check('★ 命令消息引用的图片被学进去', r8.imageLearned === 1, JSON.stringify(r8));
 	check('★ 命令消息引用的正文 emoji 被学进去', r8.badges === 1, JSON.stringify(r8));
 	const imgRow = env.DB.query("SELECT * FROM ad_images WHERE file_unique_id='PHOTO_UNIQ_1'");
@@ -400,7 +400,7 @@ console.log('\n===== 人工判定学习 =====');
 	};
 	const r9 = await W.learnAdFromOperatorAction(env, '990009',
 		{ text: '随便说句话', from: {}, reply_to_message: quotedAd2 },
-		{ source: 'manual', createdBy: '1', text: '' });
+		{ source: 'manual', createdBy: OWNER, text: '' });
 	check('★ 非命令消息不回退（不误学引用的图）', r9.imageLearned === 0, JSON.stringify(r9));
 	check('★ 该图确实没入库',
 		env.DB.query("SELECT COUNT(*) c FROM ad_images WHERE file_unique_id='PHOTO_UNIQ_2'")[0].c === 0);
