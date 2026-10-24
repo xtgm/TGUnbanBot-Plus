@@ -314,5 +314,45 @@ log('\n=== 12. 第一主人进杀手后台：同一个后台、身份区分 ==='
 	check('杀手权限仍然进不了主后台', k.status === 403, k.status);
 }
 
+log('\n=== 13. 统计下钻：入群 / 退群明细 + 单日时间段 ===');
+{
+	// 统计时区（默认 +8）的今天 0 点 → unix 秒；边界两侧各放一条，验证按统计时区切天
+	const today = W.statRangeDays(env, 'day').start;
+	const yesterday = W.statRangeDays(env, 'yesterday').start;
+	const dayStartSec = Date.parse(today + 'T00:00:00Z') / 1000 - 8 * 3600;
+	const put = (chat, user, kind, at) => env.DB.prepare('INSERT INTO stat_member_events (chat_id, user_id, kind, at, actor_id, invite_link, via_request) VALUES (?, ?, ?, ?, NULL, NULL, 0)').bind(chat, user, kind, at).run();
+	await W.ensureStatMemberEventsTable(env);
+	await put(K, '66001', 'join', dayStartSec + 30);        // 今天 00:00:30
+	await put(K, '66002', 'join', dayStartSec + 60);
+	await put(K, '66003', 'leave', dayStartSec + 90);
+	await put(K, '66004', 'kicked', dayStartSec + 120);
+	await put(K, '66005', 'join', dayStartSec - 30);        // 昨天 23:59:30
+	await put(G, '66006', 'join', dayStartSec + 30);        // GROUP_ID 群
+	await W.ensureStatTables(env);
+	env.DB.prepare('INSERT INTO stat_speech (chat_id, user_id, day, msg_count, display_name, username, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(K, '66001', today, 1, '进群甲', 'jia', now).run();
+
+	let r = await api(KA, 'killer/stats/members', { chatId: K, range: 'day', kind: 'join' });
+	const ids = (r.data?.rows || []).map((x) => x.userId);
+	// 第 7 节已给 55603 记过一条今天的杀手群入群，所以总数是 3；本节只核对自己插的 66xxx 顺序
+	const mine = ids.filter((id) => id.startsWith('660'));
+	check('入群明细：今天杀手群 3 条、本节插的按时间倒序', r.status === 200 && JSON.stringify(mine) === JSON.stringify(['66002', '66001']) && ids.includes('55603') && r.data?.total === 3, JSON.stringify(r.json).slice(0, 300));
+	check('入群明细带昵称（取自发言记录）', (r.data?.rows || []).find((x) => x.userId === '66001')?.displayName === '进群甲', JSON.stringify(r.data?.rows));
+	check('越界：GROUP_ID 群的入群不出现', !ids.includes('66006'));
+	check('统计时区切天：昨天 23:59:30 的不算今天', !ids.includes('66005'));
+	r = await api(KA, 'killer/stats/members', { chatId: K, range: 'day', kind: 'leave' });
+	const leaveKinds = (r.data?.rows || []).map((x) => x.userId + ':' + x.kind).sort();
+	check('退群明细 = 主动退群 + 被移出', JSON.stringify(leaveKinds) === JSON.stringify(['66003:leave', '66004:kicked']), JSON.stringify(r.json).slice(0, 300));
+	r = await api(KA, 'killer/stats/members', { chatId: K, range: yesterday, kind: 'join' });
+	check('单日时间段：昨天只有 66005', JSON.stringify((r.data?.rows || []).map((x) => x.userId)) === JSON.stringify(['66005']), JSON.stringify(r.json).slice(0, 300));
+	r = await api(KA, 'killer/stats/members', { chatId: G, range: 'day', kind: 'join' });
+	check('越界：明细查 GROUP_ID 群 → 403', r.status === 403, r.status);
+	r = await api(KA, 'killer/stats/members', { chatId: K, range: 'day', kind: 'evil' });
+	check('非法 kind → 400', r.status === 400, r.status);
+	r = await api(KA, 'killer/stats', { chatId: K, range: yesterday });
+	check('统计接受单日时间段（趋势行点开用）', r.status === 200 && r.data?.range === yesterday && r.data?.start === yesterday && r.data?.end === yesterday, JSON.stringify(r.data && { range: r.data.range, start: r.data.start }));
+	r = await api(KA, 'killer/stats', { chatId: K, range: '2026-13-45' });
+	check('不合法的日期仍回退为今天', r.data?.range === 'day', JSON.stringify(r.data?.range));
+}
+
 log('\n' + (fail ? '❌' : '✅') + ' 杀手子后台：' + pass + ' 通过，' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

@@ -24,6 +24,7 @@ function check(name, cond, detail) {
 }
 
 const calls = [];
+let lastStats = null, lastMembers = null;
 const groups = [{ chatId: '-1001111111111', title: '示例群 A', source: 'dynamic' }];
 const searchRows = [{ mid: 501, chat_id: '-1001111111111', from_id: '123456789', created_at: 1780000000, text_norm: '一条发言' }];
 function userData(id) { return { userId: id, profile: { name: '用户' + id }, blacklist: null, events: [], cases: [], speech: { count: 1 }, gky: { success: true, banned: false } }; }
@@ -45,7 +46,10 @@ function killerData(action, body) {
 	switch (action) {
 		case 'bootstrap': return { role: 'owner', user: { id: '10001', name: '主人' }, groups, banLimit: 50 };
 		case 'groups': return groups;
-		case 'stats': return { chatId: body.chatId, range: 'day', label: '今日', start: '2026-10-24', end: '2026-10-24', summary: { totalMsg: 9, activeUsers: 2, join: 1, leave: 0, kicked: 0 }, ranking: { rows: [{ rank: 1, userId: '777', displayName: '排行第一', count: 6 }, { rank: 2, userId: '888', displayName: '排行第二', count: 3 }], total: 2, page: 1, totalPages: 1 }, trend: [{ day: '2026-10-24', msg: 9 }] };
+		case 'stats': { lastStats = body; const single = /^\d{4}-\d{2}-\d{2}$/.test(String(body.range)); return { chatId: body.chatId, range: body.range || 'day', label: single ? body.range + ' 单日' : '今日', start: single ? body.range : '2026-10-24', end: single ? body.range : '2026-10-24', summary: { totalMsg: 9, activeUsers: 2, join: 1, leave: 1, kicked: 0 }, ranking: { rows: [{ rank: 1, userId: '777', displayName: '排行第一', count: 6 }, { rank: 2, userId: '888', displayName: '排行第二', count: 3 }], total: 2, page: 1, totalPages: 1 }, trend: [{ day: '2026-10-23', msg: 9 }] }; }
+		case 'stats/members': lastMembers = body; return body.kind === 'join'
+			? { kind: 'join', rows: [{ userId: '999', kind: 'join', at: 1780000000, displayName: '入群甲' }], total: 1, page: 1, totalPages: 1 }
+			: { kind: 'leave', rows: [{ userId: '998', kind: 'kicked', at: 1780000000, displayName: '被移出乙' }], total: 1, page: 1, totalPages: 1 };
 		case 'search': return { page: 1, total: 1, totalPages: 1, rows: searchRows };
 		case 'users/query': return userData(body.userId);
 		default: throw new Error('未 mock 的杀手后台接口 ' + action);
@@ -147,7 +151,7 @@ async function run() {
 		const rank = kp.locator('#stats-content .rank-row.clickable');
 		check('排行每行可点（2 行）', (await rank.count()) === 2, String(await rank.count()));
 		const killerStat = kp.locator('#stats-content .stat.clickable');
-		check('发言 / 活跃人数两个数字可点', (await killerStat.count()) === 2, String(await killerStat.count()));
+		check('发言 / 活跃人数两个数字可点', await kp.evaluate(() => [...document.querySelectorAll('#stats-content .stat')].slice(0, 2).every((el) => el.classList.contains('clickable'))));
 		if (await rank.count()) {
 			await rank.first().click();
 			check('点排行第一 → 查用户 777', await waitText(kp, 'users-content', 'ID 777') && !(await kp.locator('#page-users').isHidden()));
@@ -158,6 +162,34 @@ async function run() {
 			await kp.locator('#stats-content .stat.clickable').first().click();
 			check('点「发言」数字 → 焦点落到发言排行', (await kp.evaluate(() => document.activeElement && document.activeElement.textContent)) === '发言排行');
 		}
+		console.info('\n[杀手后台] 入群 / 退群明细与趋势日（批次 3）');
+		await kp.locator('#tab-stats').click();
+		await waitText(kp, 'stats-content', '排行第一');
+		check('四个数字全部可点', (await kp.locator('#stats-content .stat.clickable').count()) === 4, String(await kp.locator('#stats-content .stat.clickable').count()));
+		if ((await kp.locator('#stats-content .stat.clickable').count()) === 4) {
+			await kp.locator('#stats-content .stat.clickable').nth(2).click();
+			check('点「入群」→ 列出入群的人', await waitText(kp, 'stats-members', '入群甲'));
+			check('入群明细请求带 kind=join', lastMembers && lastMembers.kind === 'join' && lastMembers.range === 'day', JSON.stringify(lastMembers));
+			const mrow = kp.locator('#stats-members .rank-row.clickable');
+			check('入群明细每行可点', (await mrow.count()) === 1, String(await mrow.count()));
+			await kp.locator('#stats-content .stat.clickable').nth(3).focus(); await kp.keyboard.press('Enter');
+			check('键盘 Enter 点「退群」→ 列出退群与被移出的人', await waitText(kp, 'stats-members', '被移出乙') && lastMembers.kind === 'leave');
+			if (await mrow.count()) {
+				await kp.locator('#stats-members .rank-row.clickable').first().click();
+				check('点明细里的人 → 查用户 998', await waitText(kp, 'users-content', 'ID 998'));
+			}
+		}
+		await kp.locator('#tab-stats').click();
+		await waitText(kp, 'stats-content', '排行第一');
+		const trendRow = kp.locator('#stats-content .trend-row.clickable');
+		check('趋势每天都可点', (await trendRow.count()) === 1, String(await trendRow.count()));
+		if (await trendRow.count()) {
+			await trendRow.first().click();
+			await waitText(kp, 'stats-content', '2026-10-23 单日');
+			check('点趋势某天 → 按那一天重载统计', lastStats && lastStats.range === '2026-10-23', JSON.stringify(lastStats));
+			check('时间下拉显示所选那天', (await kp.locator('#stats-range').inputValue()) === '2026-10-23');
+		}
+
 		await kp.locator('#tab-users').click();
 		await kp.locator('#search-query').fill('一条');
 		await kp.locator('#search-form button[type=submit]').click();
@@ -170,7 +202,7 @@ async function run() {
 		}
 
 		check('全程无页面脚本错误', errors.length === 0, errors.join(' | '));
-		check('批次 1 不新增任何接口（只调用已有接口）', calls.every((a) => ['bootstrap', 'groups/list', 'health', 'admins/list', 'ads/summary', 'ads/pending', 'search', 'users/query', 'killer/bootstrap', 'killer/groups', 'killer/stats', 'killer/search', 'killer/users/query'].includes(a)), calls.join(','));
+		check('只调用已有接口 + 批次 3 的 killer/stats/members', calls.every((a) => ['bootstrap', 'groups/list', 'health', 'admins/list', 'ads/summary', 'ads/pending', 'search', 'users/query', 'killer/bootstrap', 'killer/groups', 'killer/stats', 'killer/stats/members', 'killer/search', 'killer/users/query'].includes(a)), calls.join(','));
 	} finally {
 		await browser.close();
 	}

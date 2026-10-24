@@ -839,7 +839,7 @@ class MiniAppError extends Error {
 
 const MINI_APP_ACTIONS = new Set(['bootstrap', 'groups/list', 'groups/add', 'groups/remove', 'groups/leave', 'blacklist/list', 'blacklist/unban', 'ads/summary', 'ads/pending', 'ads/ignore', 'users/query', 'health', 'admins/list', 'search', 'notice/send']);
 // 杀手子后台的接口（与主后台同一个 /app/api/ 前缀，按身份分流；杀手身份调主后台独有的接口一律 404）。
-const KILLER_MINI_APP_ACTIONS = new Set(['killer/bootstrap', 'killer/groups', 'killer/health', 'killer/blacklist/list', 'killer/blacklist/ban', 'killer/blacklist/unban', 'killer/users/query', 'killer/search', 'killer/notice/send', 'killer/stats']);
+const KILLER_MINI_APP_ACTIONS = new Set(['killer/bootstrap', 'killer/groups', 'killer/health', 'killer/blacklist/list', 'killer/blacklist/ban', 'killer/blacklist/unban', 'killer/users/query', 'killer/search', 'killer/notice/send', 'killer/stats', 'killer/stats/members']);
 const MINI_APP_BODY_LIMIT = 32768;
 
 function miniAppJson(data, status = 200) {
@@ -1847,14 +1847,28 @@ const KILLER_MINI_APP_HTML_SCRIPT = String.raw`  <script>
     function renderStats(data) {
       var container = $('stats-content'); container.replaceChildren(); var s = data.summary || {};
       container.append(element('p', 'form-hint', text(data.label) + '　' + (data.start === data.end ? text(data.start) : text(data.start) + ' ~ ' + text(data.end)) + '（北京时间）'));
-      // 「发言」「活跃人数」点开跳到发言排行；排行每行点开查这个人（入群 / 退群明细在批次 3 接）。
+      // 「发言」「活跃人数」点开跳到发言排行；「入群」「退群」点开在卡片下方列出是哪些人（再点一次收起）；排行与明细每行点开查这个人。
       var rankLabel = element('h2', 'section-label', '发言排行'); rankLabel.tabIndex = -1;
-      var grid = element('div', 'stat-grid'); [['发言', s.totalMsg, true, true], ['活跃人数', s.activeUsers, false, true], ['入群', s.join], ['退群', Number(s.leave || 0) + Number(s.kicked || 0)]].forEach(function (row) { var stat = element('div', 'stat' + (row[2] ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(row[1])), element('div', 'stat-label', row[0])); if (row[3]) clickable(stat, row[0] + ' ' + count(row[1]) + '，点击跳到发言排行', function () { jumpTo(rankLabel); }); grid.append(stat); }); container.append(grid);
+      var members = element('div'); members.id = 'stats-members';
+      var grid = element('div', 'stat-grid'); [['发言', s.totalMsg, true, ''], ['活跃人数', s.activeUsers, false, ''], ['入群', s.join, false, 'join'], ['退群', Number(s.leave || 0) + Number(s.kicked || 0), false, 'leave']].forEach(function (row) { var stat = element('div', 'stat' + (row[2] ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(row[1])), element('div', 'stat-label', row[0])); if (!row[3]) clickable(stat, row[0] + ' ' + count(row[1]) + '，点击跳到发言排行', function () { jumpTo(rankLabel); }); else clickable(stat, row[0] + ' ' + count(row[1]) + '，点击查看是哪些人', function () { if (stat.classList.contains('active')) { stat.classList.remove('active'); members.replaceChildren(); return; } grid.querySelectorAll('.stat.active').forEach(function (el) { el.classList.remove('active'); }); stat.classList.add('active'); return loadStatMembers(members, data, row[3], 1); }); grid.append(stat); }); container.append(grid, members);
       var rank = element('article', 'card'); var rh = element('div', 'card-heading'); rh.append(rankLabel, element('span', 'counter', count(data.ranking && data.ranking.total) + ' 人')); rank.append(rh); var rows = (data.ranking && data.ranking.rows) || [];
       if (!rows.length) rank.append(element('p', 'subtle', '这个时间段没有发言记录。')); else rows.forEach(function (r) { var row = element('div', 'rank-row'); var name = text(r.displayName, r.username ? '@' + r.username : 'ID ' + r.userId); row.append(element('span', 'rank-no', '#' + r.rank), element('span', 'rank-name', name), element('span', 'rank-count', count(r.count) + ' 条')); if (/^\d{1,20}$/.test(String(r.userId))) clickable(row, '查询 ' + name + ' 的资料与记录', function () { return openUser(r.userId); }); rank.append(row); });
       container.append(rank); if (data.ranking) pager($('stats-pager'), data.ranking, function (page) { return loadStats(page); });
       var trend = Array.isArray(data.trend) ? data.trend : []; var max = Math.max.apply(null, [1].concat(trend.map(function (d) { return d.msg; }))); var tc = element('article', 'card'); tc.append(element('h2', 'section-label', '近 7 天发言'));
-      trend.forEach(function (d) { var row = element('div', 'trend-row'); var bar = element('div', 'trend-bar'); bar.style.width = Math.round(d.msg / max * 100) + '%'; var wrap = element('div'); wrap.append(bar); row.append(element('span', 'trend-day', d.day), wrap, element('span', 'trend-num', count(d.msg))); tc.append(row); }); container.append(tc);
+      trend.forEach(function (d) { var row = element('div', 'trend-row'); var bar = element('div', 'trend-bar'); bar.style.width = Math.round(d.msg / max * 100) + '%'; var wrap = element('div'); wrap.append(bar); row.append(element('span', 'trend-day', d.day), wrap, element('span', 'trend-num', count(d.msg))); if (/^\d{4}-\d{2}-\d{2}$/.test(String(d.day))) clickable(row, d.day + ' 发言 ' + count(d.msg) + ' 条，点击查看这一天的统计', function () { return showStatDay(d.day); }); tc.append(row); }); container.append(tc);
+    }
+    // 趋势行点开：时间下拉切到那一天（单日选项只保留一个，不在下拉里越攒越多），按那一天重载整页统计。
+    function showStatDay(day) { var select = $('stats-range'); var option = select.querySelector('option[data-day]'); if (!option) { option = element('option'); option.dataset.day = '1'; select.append(option); } option.value = day; option.textContent = day + '（单日）'; select.value = day; return loadStats(1); }
+    async function loadStatMembers(box, stats, kind, page) {
+      var seq = begin('stat-members'); loading(box, '正在读取' + (kind === 'join' ? '入群' : '退群') + '明细…');
+      try { var data = await api('stats/members', { chatId: stats.chatId, range: stats.range, kind: kind, page: page }); if (!current('stat-members', seq)) return; renderStatMembers(box, stats, data || {}); } catch (err) { if (err.auth || !current('stat-members', seq)) return; empty(box, '明细读取失败', err.message, function () { return loadStatMembers(box, stats, kind, page); }); }
+    }
+    function renderStatMembers(box, stats, data) {
+      box.replaceChildren(); var kindName = data.kind === 'join' ? '入群' : '退群'; var card = element('article', 'card'); var head = element('div', 'card-heading'); var label = element('h2', 'section-label', kindName + '明细'); label.tabIndex = -1; head.append(label, element('span', 'counter', count(data.total) + ' 条')); card.append(head);
+      var rows = Array.isArray(data.rows) ? data.rows : []; var tags = { join: '入群', leave: '退群', kicked: '被移出' };
+      if (!rows.length) card.append(element('p', 'subtle', '这个时间段没有' + kindName + '明细（明细从记录功能上线后开始积累，数字与明细可能对不上）。'));
+      rows.forEach(function (r) { var row = element('div', 'rank-row'); var name = text(r.displayName, r.username ? '@' + r.username : 'ID ' + r.userId); row.append(element('span', 'rank-no', tags[r.kind] || text(r.kind)), element('span', 'rank-name', name), element('span', 'rank-count', date(r.at))); if (/^\d{1,20}$/.test(String(r.userId))) clickable(row, '查询 ' + name + ' 的资料与记录', function () { return openUser(r.userId); }); card.append(row); });
+      var nav = element('div'); card.append(nav); pager(nav, data, function (page) { return loadStatMembers(box, stats, data.kind, page); }); box.append(card); jumpTo(label);
     }
     async function navigate(tab, load) { if (!state.authenticated) return; state.active = tab; document.querySelectorAll('[data-tab]').forEach(function (button) { var active = button.dataset.tab === tab; button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1; $('page-' + button.dataset.tab).hidden = !active; }); updateBackButton(); window.scrollTo({ top: 0, behavior: 'instant' }); if (load === false) return; if (state.loaded[tab]) return; if (tab === 'groups') await loadGroups(); else if (tab === 'blacklist') await loadBlacklist(state.blacklistPage); else if (tab === 'stats') await loadStats(1); else if (tab === 'users') { if (!$('users-content').childNodes.length) userEmpty(); } }
     async function refresh() { state.loaded = {}; if (state.active === 'groups') await loadGroups(); else if (state.active === 'blacklist') await loadBlacklist(state.blacklistPage); else if (state.active === 'stats') await loadStats(state.statsPage); else if (state.active === 'users' && $('user-query').value) await queryUser($('user-query').value); }
@@ -2857,10 +2871,74 @@ async function killerMiniAppNoticeSend(env, payload, auth) {
 }
 
 // 统计：只读，复用 /stats 的同一套查询（汇总 + 排行第一页 + 逐日趋势）。
+// 除固定档位外还收单日 'YYYY-MM-DD'（趋势行点开某一天），必须是真实存在的日期，否则回退今天。
 const KILLER_MINI_APP_STAT_RANGES = new Set(['day', 'yesterday', 'week', 'lastweek', 'month', '7d', '30d']);
+function killerMiniAppStatRange(payload) {
+	const raw = String(payload?.range || '');
+	if (KILLER_MINI_APP_STAT_RANGES.has(raw)) return raw;
+	if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+		const ms = Date.parse(raw + 'T00:00:00Z');
+		if (Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 10) === raw) return raw;
+	}
+	return 'day';
+}
+
+// 入群 / 退群明细：统计页「入群」「退群」两张卡点开看是哪些人。
+// 读 stat_member_events（逐条明细）；退群 = leave + kicked，与卡片上的数字同口径。
+// 时间段按统计时区切天：start 当天 0 点 ~ end 次日 0 点，换成 unix 秒（at 列存的是秒）。
+// 昵称取该人在本群的发言记录（stat_speech），没发过言就只有 ID。
+const KILLER_STAT_MEMBERS_PAGE_LIMIT = 30;
+async function killerMiniAppStatMembers(env, payload) {
+	const chatId = killerMiniAppGroupArg(payload, { required: true });
+	const kind = String(payload?.kind || '');
+	if (kind !== 'join' && kind !== 'leave') throw new MiniAppError(400, 'kind 只能是 join 或 leave');
+	const range = killerMiniAppStatRange(payload);
+	const info = statRangeDays(env, range);
+	const page = Math.max(1, Number(payload?.page) || 1);
+	const limit = KILLER_STAT_MEMBERS_PAGE_LIMIT;
+	const result = { chatId, kind, range, label: info.label, start: info.start, end: info.end, rows: [], total: 0, page, totalPages: 1 };
+	if (!(await ensureStatMemberEventsTable(env))) return result;
+	const offsetSec = getStatTzOffsetHours(env) * 3600;
+	const fromSec = Date.parse(info.start + 'T00:00:00Z') / 1000 - offsetSec;
+	const toSec = Date.parse(info.end + 'T00:00:00Z') / 1000 + 86400 - offsetSec;
+	const kinds = kind === 'join' ? ['join'] : ['leave', 'kicked'];
+	const kindSql = kinds.map(() => '?').join(', ');
+	try {
+		const totalRow = await env.DB.prepare(
+			'SELECT COUNT(*) AS c FROM stat_member_events WHERE chat_id = ? AND kind IN (' + kindSql + ') AND at >= ? AND at < ?'
+		).bind(String(chatId), ...kinds, fromSec, toSec).first();
+		result.total = Number(totalRow?.c) || 0;
+		result.totalPages = Math.max(1, Math.ceil(result.total / limit));
+		const { results } = await env.DB.prepare(
+			'SELECT e.user_id, e.kind, e.at, e.actor_id, e.via_request, '
+			+ '(SELECT MAX(s.display_name) FROM stat_speech s WHERE s.chat_id = e.chat_id AND s.user_id = e.user_id) AS display_name, '
+			+ '(SELECT MAX(s.username) FROM stat_speech s WHERE s.chat_id = e.chat_id AND s.user_id = e.user_id) AS username '
+			+ 'FROM stat_member_events e WHERE e.chat_id = ? AND e.kind IN (' + kindSql + ') AND e.at >= ? AND e.at < ? '
+			+ 'ORDER BY e.at DESC, e.user_id ASC LIMIT ? OFFSET ?'
+		).bind(String(chatId), ...kinds, fromSec, toSec, limit, (page - 1) * limit).all();
+		result.rows = (results || []).map((r) => ({
+			userId: String(r.user_id || ''),
+			kind: String(r.kind || ''),
+			at: Number(r.at) || 0,
+			actorId: r.actor_id ? String(r.actor_id) : '',
+			viaRequest: Number(r.via_request) === 1,
+			displayName: String(r.display_name || ''),
+			username: String(r.username || '')
+		}));
+	} catch (error) {
+		// stat_speech 尚未建表时子查询会报 no such table：退回不带昵称的查询，明细照样给
+		if (!/no such table/i.test(String(error?.message || error))) throw error;
+		const { results } = await env.DB.prepare(
+			'SELECT user_id, kind, at, actor_id, via_request FROM stat_member_events WHERE chat_id = ? AND kind IN (' + kindSql + ') AND at >= ? AND at < ? '
+			+ 'ORDER BY at DESC, user_id ASC LIMIT ? OFFSET ?'
+		).bind(String(chatId), ...kinds, fromSec, toSec, limit, (page - 1) * limit).all();
+		result.rows = (results || []).map((r) => ({ userId: String(r.user_id || ''), kind: String(r.kind || ''), at: Number(r.at) || 0, actorId: r.actor_id ? String(r.actor_id) : '', viaRequest: Number(r.via_request) === 1, displayName: '', username: '' }));
+	}
+	return result;
+}
 async function killerMiniAppStats(env, payload) {
 	const chatId = killerMiniAppGroupArg(payload, { required: true });
-	const range = KILLER_MINI_APP_STAT_RANGES.has(String(payload?.range || '')) ? String(payload.range) : 'day';
+	const range = killerMiniAppStatRange(payload);
 	const page = Math.max(1, Number(payload?.page) || 1);
 	const info = statRangeDays(env, range);
 	const [summary, ranking, trend] = await Promise.all([
@@ -2901,6 +2979,7 @@ async function dispatchKillerMiniAppAction(action, body, env, auth, ctx) {
 		case 'killer/search': return killerMiniAppSearch(env, payload);
 		case 'killer/notice/send': return killerMiniAppNoticeSend(env, payload, auth);
 		case 'killer/stats': return killerMiniAppStats(env, payload);
+		case 'killer/stats/members': return killerMiniAppStatMembers(env, payload);
 		default: throw new MiniAppError(404, '接口不存在');
 	}
 }
