@@ -4558,36 +4558,13 @@ console.log('\n[23] 一键代发链路已移除');
 	assert('Webhook 初始化 → /ad 投票按钮回调已启用', webhookCall?.body?.allowed_updates?.includes('callback_query'));
 	// 【2026-10-14 补】主菜单补进 start/menu/user/adstats/dryrun 五条第一主人命令（各注明确是什么），
 	// 同日再补 /wl 与 /del —— 一对用户白名单的增删入口，与 /whitelist（域名白名单，判据层）分名。
-	assert('BotFather 菜单统一注册（含 /rm /profile + 新补五条 + /wl + /del + /listgroups + /addgroup /delgroup /leavegroup + /groupmode /localbans /localset）', JSON.stringify(registeredCommands) === JSON.stringify(['unban', 'ban', 'sban', 'spam', 'rm', 'check', 'profile', 'stats', 'blacklist', 'notice', 'start', 'menu', 'user', 'adstats', 'dryrun', 'wl', 'del', 'listgroups', 'addgroup', 'delgroup', 'leavegroup', 'groupmode', 'localbans', 'localset']));
-	// /wl /del 与 rm/profile 同口径：菜单说明必须标权限，否则主人看不出它只给第一主人用
-	assert('/wl 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'wl')?.description || '').includes('仅第一主人'));
-	assert('/del 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'del')?.description || '').includes('仅第一主人'));
-	// 且说明要写清它与 /whitelist 的区别点：豁免人，不是豁免链接
-	assert('/wl 菜单说明写明白名单语义', /白名单/.test(String((commandCall?.body?.commands || []).find((x) => x.command === 'wl')?.description || '')));
-	// /del 的说明要写明它删的是白名单 —— 光写「删除」会被当成删消息或删黑名单
-	assert('/del 菜单说明写明删的是白名单', /白名单/.test(String((commandCall?.body?.commands || []).find((x) => x.command === 'del')?.description || '')));
-	// 【2026-10-15 补】/listgroups 摆上菜单，同样必须标权限，否则主人看不出它只给第一主人用
-	assert('/listgroups 菜单说明标注「仅第一主人」', String((commandCall?.body?.commands || []).find((x) => x.command === 'listgroups')?.description || '').includes('仅第一主人'));
-	// 【2026-10-22 补】动态群组三条摆上菜单，与 /listgroups 同口径：
-	// 必须标「仅第一主人」，且必须标「私聊」——这两条在群里发只会静默丢弃，
-	// 说明里不写清，看起来就像命令坏了。
-	for (const cmd of ['addgroup', 'delgroup', 'leavegroup']) {
-		const desc = String((commandCall?.body?.commands || []).find((x) => x.command === cmd)?.description || '');
-		assert(`/${cmd} 菜单说明标注「仅第一主人」`, desc.includes('仅第一主人'), desc);
-		assert(`/${cmd} 菜单说明标注「私聊」`, desc.includes('私聊'), desc);
-		// 说明里要给出 ID 形态，否则用户不知道该传什么参数
-		assert(`/${cmd} 菜单说明含 -100xxx 参数示例`, desc.includes('-100xxx'), desc);
-	}
-	// rm / profile 允许写说明，且必须标注权限「仅第一主人」
-	assert('rm / profile 菜单说明标注「仅第一主人」', ['rm', 'profile'].every((c) => {
-		const entry = (commandCall?.body?.commands || []).find((x) => x.command === c);
-		return Boolean(entry) && String(entry.description || '').includes('仅第一主人');
-	}));
-	// 【2026-10-14 改】/notice 从占位符「·」改为真说明 + 标「仅第一主人」（主人改口要求补充）
-	const noticeMenu = (commandCall?.body?.commands || []).find((c) => c.command === 'notice');
-	assert('/notice 菜单项有实质说明且标「仅第一主人」',
-		!!noticeMenu && noticeMenu.description !== '·'
-			&& String(noticeMenu.description || '').includes('仅第一主人'), noticeMenu?.description);
+	// 【改口径】主人原话：菜单只留 ban spam check unban stats，「只是清空展示出来的指令」。
+	// 下面原来逐条要求 /wl /del /listgroups /addgroup /delgroup /leavegroup /rm /profile /notice
+	// 进菜单并带权限说明的断言，随之改成「菜单恰好 5 条 + 每条有说明」；这些命令本身照常可用，
+	// 由本文件各自的功能节（[67] 之后的 /listgroups、/admins 等）与 test_web_admin.mjs 第 9 节覆盖。
+	assert('BotFather 菜单只留 5 条：ban spam check unban stats', JSON.stringify(registeredCommands) === JSON.stringify(['ban', 'spam', 'check', 'unban', 'stats']), JSON.stringify(registeredCommands));
+	assert('菜单 5 条都带实质说明', (commandCall?.body?.commands || []).every((x) => String(x.description || '').length > 4));
+	assert('菜单不再展示 /notice /wl /listgroups 等其余命令', !['notice', 'wl', 'del', 'listgroups', 'addgroup', 'rm', 'profile', 'sban'].some((c) => registeredCommands.includes(c)));
 }
 
 // ---------- [24] chat_member 手动 ban → 不再通知主人 ----------
@@ -4879,76 +4856,28 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	// 主人私聊 /help → 展开隐藏指令
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 1, chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false }, text: '/help@TestBot' } }) }), env, fakeCtxAd);
 	let dm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '999');
-	assert('主人 /help → 展开隐藏指令', !!dm && dm.body.text.includes('第一主人专属'));
-	const expectedHelpCommands = [
-		'/ban', '/spam', '/stats',
-		'/ad', '/add_ad_admin', '/del_ad_admin',
-		'/admins', '/groups', '/leavegroup',
-	];
-	const missingHelpCommands = expectedHelpCommands.filter((command) => !dm?.body?.text?.includes(command));
-	assert('主人 /help → 全部 9 个指令齐全', missingHelpCommands.length === 0, `缺少 ${missingHelpCommands.join(',')}`);
-	// /help 的 /stats 区一行一条：今日 / 本周 / 本月 与「私聊查指定群」各自独立成行，
-	// 不再写成 /stats today|week|month 这种合并形态（主人要求「一行一行区分」）。
-	assert('主人 /help → /stats 日 / 周 / 月各自独立成行',
-		!!dm && dm.body.text.includes('/stats today　') && dm.body.text.includes('/stats week　') && dm.body.text.includes('/stats month　'));
-	assert('主人 /help → /stats 指定群写法也逐行列出',
-		!!dm && dm.body.text.includes('/stats -100群ID today　') && dm.body.text.includes('/stats -100群ID month　'));
-	// 2026-10-23 杀手群重构：/killer 开关已删除，/help 改写成固定规则说明。
-	assert('主人 /help → 杀手群固定规则说明（自动禁言 / 人工踢 / 三功能隔离），不再列 /killer',
-		!!dm && dm.body.text.includes('杀手群（环境变量 KILLER_MODE_GROUPS')
-		&& dm.body.text.includes('自动检测命中广告　永久禁言')
-		&& dm.body.text.includes('/ban /spam /sban　踢出')
-		&& !dm.body.text.includes('/killer'));
-	// 曾漏列的三条：代码里实现了却查不到，主人无从知道它们存在。
-	assert('主人 /help → 含 /blacklist 与批量任务两条',
-		!!dm && dm.body.text.includes('/blacklist　') && dm.body.text.includes('/job 任务ID') && dm.body.text.includes('/jobrun 任务ID'));
-	// 旧版自动广告治理命令：这批必须从 /help 索引里彻底消失，不能只是不可用还在宣传。
-	// V2 广告检测方案重新提供了 /addword、/delword、/clearsamples 三个命令并挂进 /help，
-	// 故这三个从本清单移出；其余仍未恢复的必须保持不出现。
-	// 【2026-09-12】/recent 与 /learnlast 也已重新实现（捞回被别的 bot 删掉的广告来学习）
-	// 并挂进 /help，同样从清单移出。/learn（直接粘贴文本学习）仍未恢复，继续钉死。
-	const purgedHelpCommands = [
-		'/importdefault', '/listwords',
-		'/learn ',
-		'/listsamples', '/delsample',
-	];
-	const stillAdvertised = purgedHelpCommands.filter((command) => dm?.body?.text?.includes(command));
-	assert('主人 /help → 已移除的广告命令不再出现', stillAdvertised.length === 0, `仍在宣传 ${stillAdvertised.join(',')}`);
-	const mentionParseOk = expectedHelpCommands.every((command) => (
-		sandbox.parseTelegramCommand(`${command}@TestBot`).head === command
-	));
-	const argumentParseOk = [
-		['/ban@TestBot 12345 广告', '/ban', '12345 广告'],
-		['/ad@TestBot 12345 广告', '/ad', '12345 广告'],
-		['/add_ad_admin@TestBot 12345', '/add_ad_admin', '12345'],
-		['/leavegroup@TestBot -1001234567890', '/leavegroup', '-1001234567890'],
-	].every(([input, head, rest]) => {
-		const parsed = sandbox.parseTelegramCommand(input);
-		return parsed.head === head && parsed.rest === rest;
-	});
-	assert('/help 全部指令兼容 @机器人名', mentionParseOk && argumentParseOk);
-	const removedBanCommand = '/' + ['b', 'e'].join('');
-	const removedSpamCommand = '/' + ['s', 'a'].join('');
-	assert('主人 /help → 公开管理四条齐全', !!dm && dm.body.text.includes('/ban TGID') && dm.body.text.includes('/spam') && dm.body.text.includes('/unban TGID') && dm.body.text.includes('/check TGID'));
-	assert('主人 /help → 当前权限与回执说明准确', dm.body.text.includes('━━ 人工封禁与查询（群管理员 / 主人 / 副主人）━━') && dm.body.text.includes('结果留在群里并通知第一主人'));
-	assert('主人 /help → 含 /admins 名单与超级管理员说明', dm.body.text.includes('/admins　') && dm.body.text.includes('超管名单　环境变量 SUPER_ADMIN_IDS'));
-	assert('主人 /help → 不再显示旧短命令', !!dm && !dm.body.text.includes(removedBanCommand) && !dm.body.text.includes(removedSpamCommand));
-	assert('主人 /help → 含 /ad 投票与白名单管理', !!dm && dm.body.text.includes('/ad [原因]') && dm.body.text.includes('/add_ad_admin') && dm.body.text.includes('/del_ad_admin'));
-	assert('主人 /help → 含动态群组三条', !!dm && dm.body.text.includes('/addgroup') && dm.body.text.includes('/delgroup') && dm.body.text.includes('/listgroups'));
-	assert('主人 /help → 含查询与退群三条', !!dm && dm.body.text.includes('/admins') && dm.body.text.includes('/groups') && dm.body.text.includes('/leavegroup'));
-	// 第2批新增的隐藏命令（运行检查、群设置菜单、关键词搜索）必须进清单，否则主人找不到入口
-	assert('主人 /help → 含 /health 运行检查与 /menu 群设置菜单',
-		!!dm && dm.body.text.includes('/health　') && dm.body.text.includes('/menu　'),
-		!!dm ? dm.body.text.split('\n').filter((l) => l.startsWith('/health') || l.startsWith('/menu')).join(' | ') : '无 /help 回执');
-	assert('主人 /help → 含 /search 关键词搜索（写明权限是第一主人 + 群主）',
-		!!dm && dm.body.text.includes('/search ') && dm.body.text.includes('第一主人 + 该群群主'),
-		!!dm ? dm.body.text.split('\n').filter((l) => l.startsWith('/search')).join(' | ') : '无 /help 回执');
-	// 命令必须是裸文本（不包 <code>），Telegram 只对纯文本里的 /xxx 给「点击发送」
-	const helpCommandLines = dm.body.text.split('\n').filter((l) => /^\/[a-z_]/.test(l));
-	assert('主人 /help → 命令为裸文本，可点击直接发送',
-		helpCommandLines.length >= 12 && !/<code>\//.test(dm.body.text));
-	assert('主人 /help → 每条指令都带用途说明',
-		helpCommandLines.every((l) => l.replace(/<[^>]+>/g, '').replace(/^\/[a-z_]+/, '').replace(/^[^\u4e00-\u9fa5]*/, '').trim().length >= 4));
+	// 【改口径】主人原话「把 help 的全部清空…创建一个全新的主后台」：/help 只剩后台入口。
+	// 旧长清单的逐条断言（9 个指令齐全、/stats 逐行、杀手群规则、/blacklist /job、/ad、动态群组、
+	// /health /menu /search、裸文本可点击等）整组改到后台页面上验——同一批内容现在在命令手册里。
+	assert('主人 /help → 指向网页管理后台', !!dm && dm.body.text.includes('https://x.com/admin') && dm.body.text.includes('/adminpass'), dm?.body?.text);
+	assert('主人 /help → 只发一条、不再是长清单', callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').length === 1 && dm.body.text.length < 800 && !dm.body.text.includes('/learnlast'));
+	assert('主人 /help → 写明菜单只留五条、其余命令照样可发', !!dm && dm.body.text.includes('/ban /spam /check /unban /stats') && dm.body.text.includes('照样可以直接发送'));
+	{
+		const page = sandbox.renderWebAdminHtml();
+		const missing = ['/ban TGID', '/spam', '/unban TGID', '/check TGID', '/stats -100群ID today', '/stats -100群ID month',
+			'/ad [原因]', '/add_ad_admin', '/del_ad_admin', '/admins', '/groups', '/leavegroup', '/addgroup', '/delgroup', '/listgroups',
+			'/blacklist', '/job 任务ID', '/jobrun 任务ID', '/health', '/menu', '/search ', '第一主人 + 该群群主',
+			'杀手群（环境变量 KILLER_MODE_GROUPS', '自动检测命中广告：永久禁言', '超管名单：环境变量 SUPER_ADMIN_IDS',
+			'结果留在群里并通知第一主人', '/addword', '/delword', '/clearsamples', '/recent', '/learnlast', '/sban', '/rm', '/profile']
+			.filter((w) => !page.includes(w));
+		assert('后台命令手册 → 原 /help 的条目全部搬过去', missing.length === 0, '缺少 ' + missing.join(','));
+		const purged = ['/importdefault', '/listwords', '/learn ', '/listsamples', '/delsample', '/killer'].filter((w) => page.includes(w));
+		assert('后台命令手册 → 已移除的旧命令不出现', purged.length === 0, '仍在宣传 ' + purged.join(','));
+	}
+	const helpParseOk = ['/ban', '/ad', '/add_ad_admin', '/leavegroup', '/adminpass'].every((command) => sandbox.parseTelegramCommand(`${command}@TestBot`).head === command)
+		&& [['/ban@TestBot 12345 广告', '/ban', '12345 广告'], ['/leavegroup@TestBot -1001234567890', '/leavegroup', '-1001234567890']]
+			.every(([input, head, rest]) => { const p = sandbox.parseTelegramCommand(input); return p.head === head && p.rest === rest; });
+	assert('命令兼容 @机器人名', helpParseOk);
 	// 群管理员(非主人)私聊 /help → 权限不足,不泄漏指令
 	resetCalls();
 	await handler.fetch(new Request('https://x.com/', { method: 'POST', body: JSON.stringify({ message: { message_id: 2, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false }, text: '/help' } }) }), env, fakeCtxAd);
@@ -6168,11 +6097,10 @@ console.log('\n[96] 动态群组管理');
 	assert('动态群组:D1 中非法 chat_id 被过滤，不参与封禁',
 		!targets.includes('not-a-group') && targets.includes('-1003904078173'), JSON.stringify(targets));
 
-	// / 主菜单（setMyCommands）：/listgroups 此前只在 /help 里，输入 / 弹不出来。
-	// 权限闸门是本就在的「动态群组管理」那段 isPrimaryOwner，这里只是把入口摆到明面。
-	assert('动态群组:/listgroups 已进 / 主菜单，且说明写明仅第一主人',
-		/command: "listgroups", description: "[^"]*仅第一主人[^"]*"/.test(src),
-		'setMyCommands 里没有 listgroups，或说明未标注权限');
+	// 【改口径】菜单只留 5 条，/listgroups 移出菜单；入口改在网页后台（群组分区 + 命令手册）。
+	assert('动态群组:/listgroups 已移出 / 主菜单，入口在后台命令手册',
+		!/command: "listgroups"/.test(src) && sandbox.renderWebAdminHtml().includes('/listgroups'),
+		'setMyCommands 里仍有 listgroups，或后台手册缺 /listgroups');
 
 	// 群名标签（/listgroups 与 /admins 共用同一套口径）：有邀请链接做成超链接，
 	// 没链接就用加粗纯文本，拉不到群名返回空串让调用方只显示 ID。

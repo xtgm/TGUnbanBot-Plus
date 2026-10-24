@@ -213,8 +213,11 @@ console.log('\n=== /help ===');
 	reset();
 	await send(OWNER, '/help', 'private');
 	const t = allSent();
-	check('★ /help 有独立模式一节与 /localset 用法', t.includes('独立模式') && t.includes('处置 踢出|禁言') && t.includes('/groupmode'), t.slice(0, 200));
-	check('★ /help 写明网页版查询入口', t.includes('域名/check'));
+	// 【改口径】/help 清空成后台入口；独立模式 /localset 用法与「域名/check」说明搬进后台命令手册。
+	check('★ /help 指向网页后台', t.includes('/admin') && t.includes('/adminpass'), t.slice(0, 200));
+	const page = W.renderWebAdminHtml();
+	check('★ 后台命令手册有独立模式一节与 /localset 用法', page.includes('独立模式') && page.includes('处置 踢出|禁言') && page.includes('/groupmode'));
+	check('★ 后台命令手册写明网页版查询入口', page.includes('域名/check'));
 }
 
 console.log(`\n合计：通过 ${pass}，失败 ${fail}`);

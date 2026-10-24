@@ -162,7 +162,9 @@ log('\n=== 6. 旧入口删除、TOKEN 导出照旧 ===');
 	check('/{TOKEN}/export 照旧可用', t.status === 200 && (await t.text()).includes('1001'));
 	sent.length = 0;
 	await W.handleMessage(msg(OWNER, 'private', '/help', OWNER), env, ctx, BASE + '/');
-	check('主人 /help 里有 /exportpass', sent.some((m) => m.text.includes('/exportpass')), sent.map((m) => m.text.slice(0, 80)).join(' | '));
+	// 【改口径】/help 清空成后台入口，/exportpass 的说明搬进网页后台的命令手册与「导出密码」分区
+	// （test_web_admin.mjs 第 4 节断言后台页面含 /exportpass）。这里改成断言 /help 指向后台。
+	check('主人 /help 指向网页后台（/exportpass 已搬进后台）', sent.some((m) => m.text.includes(BASE + '/admin') && m.text.includes('/adminpass')), sent.map((m) => m.text.slice(0, 80)).join(' | '));
 }
 
 log('\n' + (fail ? '❌' : '✅') + ' 导出登录：' + pass + ' 通过，' + fail + ' 失败');

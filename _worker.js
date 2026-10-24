@@ -419,6 +419,11 @@ export default {
 			}
 		}
 
+		// 网页管理后台：登录页与鉴权不需要动态群；接口内部按本请求重建群列表（同小程序）。
+		if ((url.pathname === '/admin' || url.pathname.startsWith('/admin/api/')) && path !== TOKEN) {
+			return await handleWebAdmin(request, env, ctx, url);
+		}
+
 		// 必须在任何路由分发之前合并 /addgroup 动态群：isConfiguredGroup 及其 26 个调用点
 		// 都依赖 GROUP_IDS，晚于分发会导致动态群被当成"非配置群"直接忽略。
 		await mergeDynamicGroupsFromD1(env);
@@ -3515,55 +3520,13 @@ async function handleInitialization(request, env) {
 		const setCommandsUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
 		const setCommandsBody = {
 			commands: [
-				{ command: "unban", description: "开始自助解封" },
-				{ command: "ban", description: "添加用户到全局黑名单并全群禁言 (当前群管理员)" },
-				{ command: "sban", description: "加黑并全群踢出 (第一主人/副主人/群主)" },
-				{ command: "spam", description: "举报并加入全局黑名单 (当前群管理员)" },
-				{ command: "rm", description: "删除我回复的那条消息 (仅第一主人)" },
+				// 【2026-10-25 主人要求】/ 菜单只留五条常用命令；其余命令的处理代码全部保留、照样能直接发，
+				// 只是不在菜单里显示。完整说明与执行入口在网页管理后台（域名/admin，私聊 /adminpass 领密码）。
+				{ command: "ban", description: "加入全局黑名单并全群禁言 (群管理员)" },
+				{ command: "spam", description: "回复广告：删消息并加入全局黑名单 (群管理员)" },
 				{ command: "check", description: "查询封禁状态 (高级管理员)" },
-				{ command: "profile", description: "查看账号资料卡与时间线 (仅第一主人)" },
-				{ command: "stats", description: "本群发言/进退群统计 (群管理员)" },
-				{ command: "blacklist", description: "查看当前黑名单 (高级管理员)" },
-				// /notice：早先主人要求「只显示指令、不写说明」，故 description 用占位符「·」
-				//（setMyCommands 要求至少 1 个非空字符，空串会让整批命令更新失败）。
-				// 【2026-10-14 改】主人改口要「补充说明并写上仅第一主人使用」，故补回真说明。
-				{ command: "notice", description: "发起全体通知，群发到所有配置群 (仅第一主人)" },
-				// ↓【2026-10-14 补】主人要求把这五条「写在菜单明面上并注明是什么、仅第一主人使用」。
-				// 它们此前只在 /help 长清单里（/start 连那里面都没有），输入 / 弹不出来。
-				// 权限闸门本就全是第一主人（/dryrun 24512、/user·/adstats 21434、/menu 24004、
-				// /start 非第一主人走原介绍语），这里只是把入口摆到明面，没有放宽任何一道门。
-				{ command: "start", description: "统计面板首页，常用指令都在这一页 (仅第一主人)" },
-				{ command: "menu", description: "群设置菜单：群统计/资料卡/运行检查 (仅第一主人)" },
-				{ command: "user", description: "按 TGID 查这个人的全部案底 (仅第一主人)" },
-				{ command: "adstats", description: "广告检测状态总览 (仅第一主人)" },
-				{ command: "dryrun", description: "本群演练开关：只判定不处置不封 (仅第一主人)" },
-				// ↓【2026-10-14 补】用户白名单。与 /whitelist（域名白名单，判据层）是两回事，
-				// 刻意分名：/whitelist 管「这条链接不算广告链接」，/wl 管「这个人一律不判」。
-				// 权限闸门本就在 handleAdDetectionCommands 的 isPrimaryOwner 那一段，
-				// 这里同样只是把入口摆到明面，没有放宽任何一道门。
-				{ command: "wl", description: "用户白名单：名单里的人永不检测不封，/wl TGID 添加 (仅第一主人)" },
-				{ command: "del", description: "从用户白名单移除，支持批量，/del 123,321 123 (仅第一主人)" },
-				// ↓【2026-10-15 补】主人要求把 /listgroups 摆到 / 菜单明面。
-				// 权限闸门本就在「动态群组管理」那段的 isPrimaryOwner（非第一主人私聊回
-				// 权限不足、群内静默），这里只是把入口摆出来，没有放宽任何一道门。
-				{ command: "listgroups", description: "列出全部生效群组与群名 (仅第一主人)" },
-				// ↓【2026-10-22 补】主人要求把动态群组三条摆到 / 菜单明面上并附说明。
-				// 这三条此前只在 /help 长清单里（/start 里也没提），输入 / 弹不出来。
-				// 权限闸门本就全是第一主人：
-				//   /addgroup /delgroup —— 「动态群组管理」段 isPrimaryOwner，群内静默、
-				//                          非第一主人私聊回「权限不足」；
-				//   /leavegroup        —— 单独一段 isPrimaryOwner，且强制私聊。
-				// 这里只是把入口摆到明面，没有放宽任何一道门。
-				// 说明里必须写明「仅第一主人」与「私聊」，否则在群里输入会被静默丢弃，
-				// 看起来就像命令坏了。
-				{ command: "addgroup", description: "新增治理群，免改环境变量；参数 -100xxx [备注] (仅第一主人私聊)" },
-				{ command: "delgroup", description: "停止治理该群，bot 仍留在群里；参数 -100xxx (仅第一主人私聊)" },
-				{ command: "leavegroup", description: "让 bot 退出指定群；参数 -100xxx (仅第一主人私聊)" },
-				// 独立模式：/groupmode 切群模式（第一主人或该群群主），/localbans 看本群黑名单。
-				{ command: "groupmode", description: "切换群模式：全局 / 独立 (第一主人/该群群主)" },
-				{ command: "localbans", description: "查看本群黑名单 (有封禁权限的群管理员)" },
-				// /localset：独立群的本群设置（群主或有「修改群组信息」权限的管理员）。
-				{ command: "localset", description: "本群设置：检测/演练/处置/白名单 (独立群)" }
+				{ command: "unban", description: "解除封禁；不带 ID 是自助解封" },
+				{ command: "stats", description: "本群发言/进退群统计 (群管理员)" }
 			]
 		};
 
@@ -7001,26 +6964,31 @@ const EXPORT_PASSWORD_TTL_SECONDS = 24 * 3600;
 const EXPORT_SESSION_MAX_SECONDS = 12 * 3600;
 const EXPORT_PASSWORD_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // 去掉 0/O、1/I，手抄不混
 const D1_EXPORT_AUTH_INIT = new WeakMap();
+// 同一套一次性密码登录给两处用：export = 黑名单导出（给可信用户），admin = 网页管理后台（等同第一主人）。
+// 两套各用各的表（{kind}_passwords / {kind}_sessions），密码与会话互不通用。
+const ONE_TIME_AUTH_KINDS = ['export', 'admin'];
 
-async function ensureExportAuthTables(env) {
-	if (!env?.DB) return false;
-	const cached = D1_EXPORT_AUTH_INIT.get(env.DB);
+async function ensureExportAuthTables(env, kind = 'export') {
+	if (!env?.DB || !ONE_TIME_AUTH_KINDS.includes(kind)) return false;
+	let perDb = D1_EXPORT_AUTH_INIT.get(env.DB);
+	if (!perDb) { perDb = new Map(); D1_EXPORT_AUTH_INIT.set(env.DB, perDb); }
+	const cached = perDb.get(kind);
 	if (cached) return cached;
 	const init = (async () => {
 		try {
-			await runD1SchemaStatement(env, 'export_passwords',
-				'CREATE TABLE IF NOT EXISTS export_passwords (hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER NOT NULL DEFAULT 0)');
-			await runD1SchemaStatement(env, 'export_sessions',
-				'CREATE TABLE IF NOT EXISTS export_sessions (hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
+			await runD1SchemaStatement(env, kind + '_passwords',
+				'CREATE TABLE IF NOT EXISTS ' + kind + '_passwords (hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER NOT NULL DEFAULT 0)');
+			await runD1SchemaStatement(env, kind + '_sessions',
+				'CREATE TABLE IF NOT EXISTS ' + kind + '_sessions (hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
 			return true;
 		} catch (error) {
-			console.error('[导出登录] 建表失败:', formatD1SchemaError(error));
+			console.error('[' + (kind === 'admin' ? '后台' : '导出') + '登录] 建表失败:', formatD1SchemaError(error));
 			return false;
 		}
 	})();
-	D1_EXPORT_AUTH_INIT.set(env.DB, init);
+	perDb.set(kind, init);
 	const ok = await init;
-	if (!ok) D1_EXPORT_AUTH_INIT.delete(env.DB);
+	if (!ok) perDb.delete(kind);
 	return ok;
 }
 
@@ -7035,55 +7003,62 @@ function normalizeExportPassword(raw) {
 }
 
 // 16 位，字母表 32 个字符 → 80 bit 随机；每 4 位一组用横杠分开
-async function createExportPassword(env) {
-	if (!(await ensureExportAuthTables(env))) return '';
+async function createExportPassword(env, kind = 'export') {
+	if (!(await ensureExportAuthTables(env, kind))) return '';
 	const bytes = crypto.getRandomValues(new Uint8Array(16));
 	const plain = [...bytes].map((b) => EXPORT_PASSWORD_ALPHABET[b % EXPORT_PASSWORD_ALPHABET.length]).join('');
 	const now = Math.floor(Date.now() / 1000);
 	await env.DB.batch([
-		env.DB.prepare('DELETE FROM export_passwords WHERE expires_at < ? OR used_at > 0').bind(now),
-		env.DB.prepare('DELETE FROM export_sessions WHERE expires_at < ?').bind(now),
-		env.DB.prepare('INSERT INTO export_passwords (hash, created_at, expires_at, used_at) VALUES (?, ?, ?, 0)')
+		env.DB.prepare('DELETE FROM ' + kind + '_passwords WHERE expires_at < ? OR used_at > 0').bind(now),
+		env.DB.prepare('DELETE FROM ' + kind + '_sessions WHERE expires_at < ?').bind(now),
+		env.DB.prepare('INSERT INTO ' + kind + '_passwords (hash, created_at, expires_at, used_at) VALUES (?, ?, ?, 0)')
 			.bind(await exportSha256Hex(plain), now, now + EXPORT_PASSWORD_TTL_SECONDS)
 	]);
 	return plain.match(/.{4}/g).join('-');
 }
 
 // 核销密码：一条 UPDATE 同时判「存在、没用过、没过期」，changes=1 才算成功 —— 两个人同时用同一个密码只有一个能进
-async function redeemExportPassword(env, raw) {
+async function redeemExportPassword(env, raw, kind = 'export') {
 	const plain = normalizeExportPassword(raw);
 	if (!/^[A-Z0-9]{16}$/.test(plain)) return '';
-	if (!(await ensureExportAuthTables(env))) return '';
+	if (!(await ensureExportAuthTables(env, kind))) return '';
 	const now = Math.floor(Date.now() / 1000);
-	const res = await env.DB.prepare('UPDATE export_passwords SET used_at = ? WHERE hash = ? AND used_at = 0 AND expires_at >= ?')
+	const res = await env.DB.prepare('UPDATE ' + kind + '_passwords SET used_at = ? WHERE hash = ? AND used_at = 0 AND expires_at >= ?')
 		.bind(now, await exportSha256Hex(plain), now).run();
 	if (Number(res?.meta?.changes) !== 1) return '';
 	const token = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, '0')).join('');
-	await env.DB.prepare('INSERT INTO export_sessions (hash, created_at, expires_at) VALUES (?, ?, ?)')
+	await env.DB.prepare('INSERT INTO ' + kind + '_sessions (hash, created_at, expires_at) VALUES (?, ?, ?)')
 		.bind(await exportSha256Hex(token), now, now + EXPORT_SESSION_MAX_SECONDS).run();
 	return token;
 }
 
-async function exportSessionValid(env, request) {
-	const hit = String(request.headers.get('Cookie') || '').match(/(?:^|;\s*)export_session=([0-9a-f]{64})(?:;|$)/);
-	if (!hit || !(await ensureExportAuthTables(env))) return false;
-	const row = await env.DB.prepare('SELECT expires_at FROM export_sessions WHERE hash = ?').bind(await exportSha256Hex(hit[1])).first();
+function readOneTimeSessionCookie(request, kind) {
+	const hit = String(request.headers.get('Cookie') || '').match(new RegExp('(?:^|;\\s*)' + kind + '_session=([0-9a-f]{64})(?:;|$)'));
+	return hit ? hit[1] : '';
+}
+
+async function exportSessionValid(env, request, kind = 'export') {
+	const token = readOneTimeSessionCookie(request, kind);
+	if (!token || !(await ensureExportAuthTables(env, kind))) return false;
+	const row = await env.DB.prepare('SELECT expires_at FROM ' + kind + '_sessions WHERE hash = ?').bind(await exportSha256Hex(token)).first();
 	return !!row && Number(row.expires_at) >= Math.floor(Date.now() / 1000);
 }
 
 const EXPORT_PRIVATE_HEADERS = { 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow', 'Referrer-Policy': 'no-referrer' };
 
-function renderExportLoginPage(error = '') {
+const EXPORT_LOGIN_PAGE = { title: '黑名单导出', heading: '🚫 黑名单导出', action: '/export', hint: '输入临时密码登录。密码只能用一次；关闭浏览器后需要重新登录。' };
+
+function renderExportLoginPage(error = '', page = EXPORT_LOGIN_PAGE) {
 	const html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
-		+ '<meta name="robots" content="noindex, nofollow"><title>黑名单导出 · 登录</title><style>'
+		+ '<meta name="robots" content="noindex, nofollow"><title>' + escapeHtml(page.title) + ' · 登录</title><style>'
 		+ 'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f5f7fa;color:#1f2937}'
 		+ '.box{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:28px;width:min(360px,92vw)}h1{font-size:20px;margin:0 0 6px}p{color:#6b7280;font-size:13px;margin:0 0 16px}'
 		+ 'label{display:block;font-size:13px;margin-bottom:6px}input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #d1d5db;border-radius:6px;font:15px ui-monospace,Consolas,monospace;letter-spacing:1px}'
 		+ 'button{margin-top:14px;width:100%;padding:10px;border:0;border-radius:6px;background:#2563eb;color:#fff;font-size:15px;cursor:pointer}button:hover{background:#1d4ed8}'
 		+ '.err{color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:8px 10px;font-size:13px;margin-bottom:12px}'
-		+ '</style></head><body><main class="box"><h1>🚫 黑名单导出</h1><p>输入临时密码登录。密码只能用一次；关闭浏览器后需要重新登录。</p>'
+		+ '</style></head><body><main class="box"><h1>' + escapeHtml(page.heading) + '</h1><p>' + escapeHtml(page.hint) + '</p>'
 		+ (error ? '<div class="err" role="alert">' + escapeHtml(error) + '</div>' : '')
-		+ '<form method="post" action="/export"><label for="password">临时密码</label>'
+		+ '<form method="post" action="' + escapeHtml(page.action) + '"><label for="password">临时密码</label>'
 		+ '<input id="password" name="password" type="password" autocomplete="off" autocapitalize="characters" spellcheck="false" required maxlength="64" placeholder="XXXX-XXXX-XXXX-XXXX" autofocus>'
 		+ '<button type="submit">登录</button></form></main></body></html>';
 	return new Response(html, { status: error ? 401 : 200, headers: {
@@ -7110,6 +7085,948 @@ async function handlePasswordExport(request, env, url) {
 	const headers = new Headers(res.headers);
 	for (const [k, v] of Object.entries(EXPORT_PRIVATE_HEADERS)) headers.set(k, v);
 	return new Response(res.body, { status: res.status, headers });
+}
+
+// ===== 域名/admin：网页管理后台（2026-10-25 主人要求：/help 的功能集中到可视化后台）=====
+// 登录与导出页同一套一次性密码（kind='admin' 各用各的表）：第一主人私聊 /adminpass 领密码 →
+// 浏览器打开 域名/admin 输入 → 换会话 cookie（Path=/admin，不设过期 = 关浏览器即失效，服务端另有 12 小时上限）。
+// 后台等同第一主人：
+//   · 小程序已有的接口（MINI_APP_ACTIONS）原样复用 dispatchMiniAppAction，身份钉死为第一主人；
+//   · web/* 是后台专属接口：群模式、本群设置/白名单/黑名单、演练、群统计、导出密码、命令台、退出；
+//   · 命令台 web/exec = 以第一主人私聊身份把命令交给 handleMessage，回执照常发到 Telegram，同时镜像回网页。
+// 接口只收 POST JSON，且必须带同源 Origin（cookie 是 SameSite=Strict，这里再加一道防跨站）。
+const ADMIN_LOGIN_PAGE = { title: '管理后台', heading: '🛠 管理后台', action: '/admin', hint: '第一主人私聊机器人发 /adminpass 领取临时密码。密码只能用一次；关闭浏览器后需要重新登录。' };
+const WEB_ADMIN_ACTIONS = new Set(['web/exec', 'web/groupmode', 'web/localset', 'web/localwl', 'web/localbans', 'web/localunban', 'web/dryrun', 'web/stats', 'web/exportpass', 'web/logout']);
+const WEB_ADMIN_REPLY_LIMIT = 30;
+// 命令台回执镜像：执行期间发给第一主人私聊的消息同时记一份文本。
+// Worker 没开 nodejs_compat（没有 AsyncLocalStorage），用模块级变量；同一时刻别的请求恰好也给第一主人
+// 发了消息会被一起镜像进来 —— 那本来就是发给第一主人的内容，不泄漏给第三人。
+let WEB_ADMIN_CAPTURE = null;
+
+function captureWebAdminReply(chatId, text) {
+	if (!WEB_ADMIN_CAPTURE || String(chatId) !== WEB_ADMIN_CAPTURE.chatId) return;
+	if (WEB_ADMIN_CAPTURE.replies.length >= WEB_ADMIN_REPLY_LIMIT) return;
+	WEB_ADMIN_CAPTURE.replies.push(miniAppPlainText(text));
+}
+
+function webAdminAuth() {
+	const owner = String(OWNER_IDS[0] || '');
+	return { userId: owner, primaryOwner: true, killer: false, user: { id: Number(owner), first_name: '网页后台' } };
+}
+
+function webAdminJson(data, status = 200, extraHeaders = {}) {
+	const res = miniAppJson(data, status);
+	res.headers.set('X-Robots-Tag', 'noindex, nofollow');
+	for (const [k, v] of Object.entries(extraHeaders)) res.headers.set(k, v);
+	return res;
+}
+
+async function handleWebAdmin(request, env, ctx, url) {
+	if (url.pathname.startsWith('/admin/api/')) return handleWebAdminApi(request, env, ctx, url);
+	if (url.pathname !== '/admin') return new Response('Not Found', { status: 404 });
+	if (!env.DB) return new Response('❌ 未绑定 D1 存储空间', { status: 400 });
+	if (!OWNER_IDS.length) return new Response('❌ 未配置 OWNER_IDS，后台无人可用', { status: 503 });
+	if (request.method === 'POST') {
+		let password = '';
+		try { password = String((await request.formData()).get('password') || ''); } catch (_) { password = ''; }
+		const token = await redeemExportPassword(env, password, 'admin');
+		if (!token) return renderExportLoginPage('密码错误或已失效（每个密码只能登录一次），请私聊机器人发 /adminpass 重新领取。', ADMIN_LOGIN_PAGE);
+		return new Response(null, { status: 303, headers: { ...EXPORT_PRIVATE_HEADERS, Location: '/admin',
+			'Set-Cookie': 'admin_session=' + token + '; Path=/admin; HttpOnly; Secure; SameSite=Strict' } });
+	}
+	if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405 });
+	if (!(await exportSessionValid(env, request, 'admin'))) return renderExportLoginPage('', ADMIN_LOGIN_PAGE);
+	return webAdminHtmlResponse();
+}
+
+function webAdminHtmlResponse() {
+	const nonce = crypto.randomUUID().replace(/-/g, '');
+	const html = renderWebAdminHtml().replace(/<script\b/g, '<script nonce="' + nonce + '"');
+	return new Response(html, { headers: {
+		...EXPORT_PRIVATE_HEADERS,
+		'Content-Type': 'text/html; charset=UTF-8',
+		'X-Content-Type-Options': 'nosniff',
+		'Content-Security-Policy': "default-src 'none'; script-src 'nonce-" + nonce + "'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+	} });
+}
+async function handleWebAdminApi(request, env, ctx, url) {
+	try {
+		if (request.method !== 'POST') throw new MiniAppError(405, '仅支持 POST');
+		const origin = request.headers.get('Origin');
+		if (!origin || origin !== url.origin) throw new MiniAppError(403, '请求来源不受支持');
+		const action = url.pathname.slice('/admin/api/'.length);
+		if (!MINI_APP_ACTIONS.has(action) && !WEB_ADMIN_ACTIONS.has(action)) throw new MiniAppError(404, '接口不存在');
+		if (!env.DB || !OWNER_IDS.length) throw new MiniAppError(503, '后台未就绪（需要 D1 与 OWNER_IDS）');
+		if (!(await exportSessionValid(env, request, 'admin'))) throw new MiniAppError(401, '登录已失效，请刷新页面重新登录');
+		const body = await readMiniAppBody(request);
+		const auth = webAdminAuth();
+		if (action === 'web/logout') {
+			const token = readOneTimeSessionCookie(request, 'admin');
+			if (token) await env.DB.prepare('DELETE FROM admin_sessions WHERE hash = ?').bind(await exportSha256Hex(token)).run();
+			return webAdminJson({ success: true, data: { message: '已退出登录' } }, 200,
+				{ 'Set-Cookie': 'admin_session=; Path=/admin; Max-Age=0; HttpOnly; Secure; SameSite=Strict' });
+		}
+		const data = WEB_ADMIN_ACTIONS.has(action)
+			? await dispatchWebAdminAction(action, body, env, auth, ctx, url)
+			: await dispatchMiniAppAction(action, body, env, auth, ctx);
+		return webAdminJson({ success: true, data });
+	} catch (error) {
+		if (error instanceof MiniAppError) return webAdminJson({ success: false, error: error.message }, error.status);
+		console.error('[网页后台] 接口失败:', error?.message || error);
+		return webAdminJson({ success: false, error: '操作暂未完成，请稍后重试' }, 503);
+	}
+}
+
+// 群级接口的群 ID：必须是当前配置群；requireIndependent = 只对独立群生效的设置（与 /localset 同口径）。
+function webAdminGroupArg(payload, { requireIndependent = false } = {}) {
+	const chatId = String(payload?.chatId || '').trim();
+	if (!isSupergroupChatId(chatId)) throw new MiniAppError(400, '群组 ID 必须是 -100 开头的超级群组 ID');
+	if (!isConfiguredGroup(chatId)) throw new MiniAppError(404, '该群组不在治理范围内');
+	if (requireIndependent && !isIndependentGroup(chatId)) throw new MiniAppError(400, '该设置仅独立群可用，请先把群切成独立模式');
+	return chatId;
+}
+
+function webAdminIdsArg(payload) {
+	const { valid, invalid } = parseBatchTgids(String(payload?.userIds ?? payload?.userId ?? ''));
+	if (!valid.length) throw new MiniAppError(400, '请输入至少一个纯数字用户 ID');
+	if (valid.length > BATCH_LIMIT) throw new MiniAppError(400, '一次最多 ' + BATCH_LIMIT + ' 个（你输入了 ' + valid.length + ' 个）');
+	return { valid, invalid };
+}
+
+async function dispatchWebAdminAction(action, body, env, auth, ctx, url) {
+	// 后台路由在 mergeDynamicGroupsFromD1 之前，此刻 GROUP_IDS 只有环境变量群。
+	// 命令台走 handleMessage，要和 webhook 路径一模一样（含 DYNAMIC_GROUPS_READY），所以用同一个合并函数；
+	// 其余接口与小程序同口径用 miniAppRefreshGroups。两者只能二选一：先后各跑一次会把动态群当成环境变量群。
+	if (action === 'web/exec') await mergeDynamicGroupsFromD1(env);
+	else await miniAppRefreshGroups(env);
+	await loadIndependentGroups(env);
+	const payload = body && typeof body === 'object' ? body : {};
+	const owner = auth.userId;
+	switch (action) {
+		case 'web/exec': return webAdminExec(env, ctx, url, payload, auth);
+		case 'web/groupmode': {
+			const chatId = webAdminGroupArg(payload);
+			const mode = payload.mode === 'independent' ? 'independent' : (payload.mode === 'global' ? 'global' : '');
+			if (!mode) throw new MiniAppError(400, '模式只能是 independent 或 global');
+			if (mode === 'independent' && isKillerModeGroup(chatId)) throw new MiniAppError(400, '杀手群不能切成独立模式');
+			await setGroupMode(env, chatId, mode, owner);
+			const now = isIndependentGroup(chatId) ? 'independent' : 'global';
+			return { chatId, mode: now, complete: now === mode,
+				message: now === 'independent'
+					? '已切成独立模式：全局黑名单在本群不再生效（第一主人封的除外），已封的人不会自动解封。'
+					: '已切回全局模式：恢复全局黑名单与全局封禁，本群黑名单记录保留。' };
+		}
+		case 'web/localset': {
+			const chatId = webAdminGroupArg(payload, { requireIndependent: true });
+			const patch = {};
+			if (typeof payload.detect === 'boolean') patch.detect = payload.detect;
+			if (payload.action === 'kick' || payload.action === 'mute') patch.action = payload.action;
+			if (!Object.keys(patch).length) throw new MiniAppError(400, '没有要修改的设置');
+			await saveGroupLocalSettings(env, chatId, patch, owner);
+			const local = await loadGroupLocalSettings(env, chatId);
+			return { chatId, detect: local.detect, action: local.action, whitelist: local.whitelist, message: '本群设置已保存' };
+		}
+		case 'web/localwl': {
+			const chatId = webAdminGroupArg(payload, { requireIndependent: true });
+			const { valid } = webAdminIdsArg(payload);
+			const add = payload.add !== false;
+			await updateGroupWhitelist(env, chatId, valid, add, owner);
+			const local = await loadGroupLocalSettings(env, chatId);
+			return { chatId, whitelist: local.whitelist, message: (add ? '已加入本群白名单 ' : '已移出本群白名单 ') + valid.length + ' 人' };
+		}
+		case 'web/localbans': {
+			const chatId = webAdminGroupArg(payload);
+			const rows = await listGroupBlacklist(env, chatId, 200);
+			return { chatId, items: rows.map((r) => ({ userId: r.id, reason: formatGroupBanReason(r.reason), by: r.by || '', at: r.at || '', note: r.note || '' })) };
+		}
+		case 'web/localunban': {
+			const chatId = webAdminGroupArg(payload);
+			const { valid } = webAdminIdsArg(payload);
+			const eligibility = await checkLocalUnbanEligibility(env, chatId, valid, owner);
+			const users = [];
+			for (const userId of eligibility.eligible) {
+				const results = await unbanUserFromAllGroups(userId, [chatId]);
+				users.push({ userId, removed: eligibility.d1Removed.includes(userId), ok: results.every((r) => r.ok) });
+			}
+			const failed = eligibility.failed.map((f) => ({ userId: f.id, error: miniAppPlainText(f.msg) }));
+			return { chatId, users, failed, complete: !failed.length && users.every((u) => u.ok),
+				message: '本群解封 ' + users.length + ' 人' + (failed.length ? '，失败 ' + failed.length + ' 人' : '') };
+		}
+		case 'web/dryrun': {
+			const chatId = webAdminGroupArg(payload);
+			const result = await setDryRun(env, chatId, payload.on === true, owner);
+			if (!result.ok) throw new MiniAppError(503, '演练开关保存失败：' + String(result.error || '未知错误'));
+			return { chatId, on: result.on, message: result.on ? '演练已开启：本群只判定不处置，调完记得关' : '演练已关闭：恢复自动处置' };
+		}
+		case 'web/stats': {
+			const chatId = webAdminGroupArg(payload);
+			const range = ['day', 'week', 'month'].includes(payload.range) ? payload.range : String(payload.range || 'day').trim().slice(0, 40);
+			const label = statRangeDays(env, range).label || range;
+			const [summary, ranking] = await Promise.all([
+				queryStatSummary(env, chatId, range),
+				queryStatRanking(env, chatId, range, Number(payload.page) || 1)
+			]);
+			return { chatId, range, label, summary, ranking };
+		}
+		case 'web/exportpass': {
+			const password = await createExportPassword(env, 'export');
+			if (!password) throw new MiniAppError(503, '生成导出密码失败，请稍后重试');
+			return { password, url: url.origin + '/export', message: '一次性导出密码已生成，转发给可信用户即可（24 小时内有效，登录一次即作废）' };
+		}
+		default: throw new MiniAppError(404, '接口不存在');
+	}
+}
+
+// 命令台：网页里输入的 / 命令以「第一主人私聊机器人」的身份执行，与在 Telegram 里直接发完全同一条代码路径。
+// 回执照常发到 Telegram 私聊，同时镜像成纯文本返回给网页（只镜像本次执行期间发给第一主人的消息）。
+async function webAdminExec(env, ctx, url, payload, auth) {
+	const command = String(payload?.command || '').trim();
+	if (!command.startsWith('/')) throw new MiniAppError(400, '命令必须以 / 开头');
+	if (command.length > 4000) throw new MiniAppError(400, '命令太长');
+	const ownerId = Number(auth.userId);
+	const message = {
+		message_id: 0,
+		date: Math.floor(Date.now() / 1000),
+		chat: { id: ownerId, type: 'private', first_name: '网页后台' },
+		from: { id: ownerId, is_bot: false, first_name: '网页后台' },
+		text: command,
+		__webAdmin: true
+	};
+	const previous = WEB_ADMIN_CAPTURE;
+	const capture = { chatId: String(ownerId), replies: [] };
+	WEB_ADMIN_CAPTURE = capture;
+	try {
+		await handleMessage(message, env, ctx, url.origin + '/');
+	} finally {
+		WEB_ADMIN_CAPTURE = previous;
+	}
+	return { command, replies: capture.replies, truncated: capture.replies.length >= WEB_ADMIN_REPLY_LIMIT };
+}
+
+// 后台页面：单文件静态外壳，数据全走 /admin/api/*。渲染一律 textContent / createElement，不拼 HTML。
+// 「命令手册」= 原 /help 长清单的全部内容，每条点一下就填进命令台。
+function renderWebAdminHtml() {
+	return String.raw`<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>管理后台</title>
+<style>
+:root{--bg:#f5f7fa;--card:#fff;--line:#e5e7eb;--text:#1f2937;--muted:#6b7280;--blue:#2563eb;--red:#b91c1c;--green:#047857}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;gap:12px;padding:10px 20px;background:#111827;color:#fff;position:sticky;top:0;z-index:5}
+header h1{font-size:17px;margin:0}
+header .who{color:#9ca3af;font-size:13px;flex:1}
+.layout{display:grid;grid-template-columns:170px 1fr;min-height:calc(100vh - 48px)}
+nav{background:#fff;border-right:1px solid var(--line);padding:10px 8px}
+nav button{display:block;width:100%;text-align:left;border:0;background:none;padding:9px 12px;border-radius:6px;font-size:14px;color:var(--text);cursor:pointer}
+nav button[aria-selected="true"]{background:#eff6ff;color:var(--blue);font-weight:600}
+main{padding:18px 22px;min-width:0}
+section.tab[hidden]{display:none}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+.card h2{font-size:15px;margin:0 0 10px}
+.card h3{font-size:14px;margin:12px 0 6px}
+.muted{color:var(--muted)}
+.hint{color:var(--muted);font-size:12px;margin:4px 0 8px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+input,select,textarea{font:inherit;padding:6px 9px;border:1px solid #d1d5db;border-radius:6px;background:#fff;color:inherit}
+input[type="checkbox"]{padding:0}
+textarea{width:100%;min-height:90px}
+input.wide{flex:1;min-width:220px}
+button.btn{font:inherit;padding:6px 12px;border:1px solid #d1d5db;border-radius:6px;background:#fff;cursor:pointer}
+button.btn:hover{background:#f3f4f6}
+button.primary{background:var(--blue);border-color:var(--blue);color:#fff}
+button.primary:hover{background:#1d4ed8}
+button.danger{color:var(--red);border-color:#fecaca}
+button:disabled{opacity:.55;cursor:wait}
+.out{margin-top:10px;overflow-x:auto}
+pre.reply{white-space:pre-wrap;word-break:break-word;background:#f9fafb;border:1px solid var(--line);border-radius:6px;padding:10px;margin:6px 0;font:13px/1.55 ui-monospace,Consolas,monospace}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top;word-break:break-word}
+th{background:#f9fafb;font-weight:600;white-space:nowrap}
+dl.kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:0}
+dl.kv dt{color:var(--muted)}
+dl.kv dd{margin:0;min-width:0}
+.yes{color:var(--green);font-weight:600}
+.no{color:var(--red);font-weight:600}
+.pager{display:flex;gap:8px;align-items:center;margin-top:8px}
+.subtabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.subtabs button[aria-pressed="true"]{background:var(--blue);color:#fff;border-color:var(--blue)}
+.man-group h3{margin:14px 0 4px}
+.man-item{display:grid;grid-template-columns:minmax(200px,max-content) 1fr;gap:12px;padding:5px 8px;border-radius:6px;cursor:pointer}
+.man-item:hover{background:#eff6ff}
+.man-item code{font:13px ui-monospace,Consolas,monospace;color:var(--blue)}
+.grp-item{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;margin:6px 0;cursor:pointer}
+.grp-item:hover,.grp-item[aria-current="true"]{border-color:var(--blue);background:#eff6ff}
+.tag{display:inline-block;font-size:12px;padding:0 7px;border-radius:10px;background:#f3f4f6;color:var(--muted);margin-left:6px}
+.tag.ind{background:#fef3c7;color:#92400e}
+#toast{position:fixed;right:18px;bottom:18px;max-width:420px;padding:10px 14px;border-radius:8px;background:#111827;color:#fff;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;white-space:pre-wrap}
+#toast.show{opacity:.95}
+#toast.error{background:var(--red)}
+@media (max-width:760px){.layout{grid-template-columns:1fr}nav{display:flex;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line)}nav button{white-space:nowrap;width:auto}.man-item{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header><h1>🛠 管理后台</h1><span class="who" id="who">加载中…</span><button class="btn" id="logout" type="button">退出登录</button></header>
+<div class="layout">
+<nav id="nav" role="tablist" aria-label="后台分区">
+<button type="button" role="tab" data-tab="overview" aria-selected="true">概况</button>
+<button type="button" role="tab" data-tab="groups">群组</button>
+<button type="button" role="tab" data-tab="blacklist">黑名单</button>
+<button type="button" role="tab" data-tab="ads">广告检测</button>
+<button type="button" role="tab" data-tab="users">用户与搜索</button>
+<button type="button" role="tab" data-tab="notice">全体通知</button>
+<button type="button" role="tab" data-tab="admins">管理员</button>
+<button type="button" role="tab" data-tab="export">导出密码</button>
+<button type="button" role="tab" data-tab="console">命令台</button>
+</nav>
+<main>
+<section class="tab" id="tab-overview">
+<div class="card"><h2>概况</h2><div id="ov-info" class="out"></div></div>
+<div class="card"><h2>运行检查（/health）</h2><p class="hint">bot 状态自检 + 逐群查在不在群、是不是管理员、删消息 / 封禁 / 邀请三个权限。</p>
+<div class="row"><button class="btn primary" id="ov-health" type="button">开始检查</button></div><div id="ov-health-out" class="out"></div></div>
+</section>
+<section class="tab" id="tab-groups" hidden>
+<div class="card"><h2>群组</h2><p class="hint">环境变量群只读；动态群可在这里添加 / 停止治理（/addgroup /delgroup /listgroups /groups）。点一个群看详情。</p>
+<div class="row"><input id="g-add-id" placeholder="-100 开头的群 ID" aria-label="新增群 ID"><button class="btn primary" id="g-add" type="button">添加治理群</button><button class="btn" id="g-reload" type="button">刷新</button></div>
+<div id="g-list" class="out"></div></div>
+<div class="card" id="g-detail-card" hidden><h2 id="g-detail-title">群详情</h2>
+<div id="g-detail" class="out"></div>
+<h3>群模式 · 独立模式（/groupmode）</h3><p class="hint">独立模式 = 群主自治：本群有自己的黑名单与设置，不吃全局黑名单。杀手群不能切独立。</p>
+<div class="row"><button class="btn" id="g-mode-ind" type="button">切到独立模式</button><button class="btn" id="g-mode-glb" type="button">切回全局模式</button></div>
+<div id="g-local" hidden>
+<h3>本群设置（/localset）</h3>
+<div class="row"><label><input type="checkbox" id="g-ls-detect"> 本群开启广告检测</label><label>处置 <select id="g-ls-action" aria-label="处置方式"><option value="mute">禁言</option><option value="kick">踢出</option></select></label><button class="btn primary" id="g-ls-save" type="button">保存本群设置</button></div>
+<h3>本群白名单</h3>
+<div class="row"><input id="g-wl-ids" class="wide" placeholder="TGID，多个用空格或逗号隔开" aria-label="本群白名单 TGID"><button class="btn" id="g-wl-add" type="button">加入</button><button class="btn danger" id="g-wl-del" type="button">移除</button></div>
+<div id="g-wl-out" class="out"></div>
+<h3>本群黑名单（/localbans）</h3>
+<div class="row"><button class="btn" id="g-lb-load" type="button">读取本群黑名单</button><input id="g-lb-ids" placeholder="要解封的 TGID" aria-label="本群解封 TGID"><button class="btn" id="g-lb-unban" type="button">本群解封</button></div>
+<div id="g-lb-out" class="out"></div>
+</div>
+<h3>演练模式（/dryrun）</h3><p class="hint">开启后判定照跑，不删不封不加黑，但当场就学特征；演练期间本群完全不设防，调完阈值记得关。</p>
+<div class="row"><span id="g-dry-state" class="muted"></span><button class="btn" id="g-dry-on" type="button">开启演练</button><button class="btn" id="g-dry-off" type="button">关闭演练</button></div>
+<h3>群统计（/stats）</h3>
+<div class="row"><button class="btn" type="button" data-stats="day">今日</button><button class="btn" type="button" data-stats="week">本周</button><button class="btn" type="button" data-stats="month">本月</button></div>
+<div id="g-stats-out" class="out"></div>
+<h3>危险操作</h3>
+<div class="row"><button class="btn danger" id="g-remove" type="button">停止治理（/delgroup，bot 留群）</button><button class="btn danger" id="g-leave" type="button">让 bot 退群（/leavegroup）</button></div>
+</div>
+</section>
+<section class="tab" id="tab-blacklist" hidden>
+<div class="card"><h2>全局黑名单（/blacklist）</h2>
+<div class="row"><input id="bl-q" class="wide" placeholder="按 TGID / 原因筛选，留空看最近记录" aria-label="黑名单筛选"><button class="btn primary" id="bl-search" type="button">查询</button></div>
+<div id="bl-out" class="out"></div>
+<div class="pager"><button class="btn" id="bl-prev" type="button">上一页</button><span id="bl-page" class="muted"></span><button class="btn" id="bl-next" type="button">下一页</button></div></div>
+<div class="card"><h2>封禁与解封</h2><p class="hint">解封 = 移出全局黑名单 + 全群解封并恢复发言（/unban）。加黑与踢出请用命令台：/ban TGID 原因、/sban TGID 原因。</p>
+<div class="row"><input id="bl-unban-id" placeholder="TGID" aria-label="解封 TGID"><button class="btn primary" id="bl-unban" type="button">解封</button></div></div>
+</section>
+<section class="tab" id="tab-ads" hidden>
+<div class="card"><h2>广告检测</h2>
+<div class="subtabs" id="ads-sub">
+<button class="btn" type="button" data-ads="summary" aria-pressed="true">总览</button>
+<button class="btn" type="button" data-ads="pending">待复核</button>
+<button class="btn" type="button" data-ads="fingerprints">指纹库</button>
+<button class="btn" type="button" data-ads="samples">AI 样本</button>
+<button class="btn" type="button" data-ads="observing">观察窗口</button>
+<button class="btn" type="button" data-ads="llm">LLM 用量</button>
+<button class="btn" type="button" data-ads="dryrun">演练流水</button>
+<button class="btn" type="button" data-ads="whitelist">用户白名单</button>
+</div>
+<div class="row" id="ads-tools"><input id="ads-q" placeholder="指纹关键词（仅指纹库）" aria-label="指纹关键词"><button class="btn" id="ads-reload" type="button">刷新</button></div>
+<div class="row" id="ads-ignore-row" hidden><input id="ads-seq" placeholder="序号，如 3" aria-label="待复核序号"><button class="btn danger" id="ads-ignore" type="button">判错回滚（/ignore）</button></div>
+<div class="row" id="ads-wl-row" hidden><input id="ads-wl-ids" class="wide" placeholder="TGID，多个用空格隔开" aria-label="检测白名单 TGID"><button class="btn" id="ads-wl-add" type="button">加入白名单</button><button class="btn danger" id="ads-wl-del" type="button">移出白名单</button></div>
+<div id="ads-out" class="out"></div>
+<div class="pager"><button class="btn" id="ads-prev" type="button">上一页</button><span id="ads-page" class="muted"></span><button class="btn" id="ads-next" type="button">下一页</button></div>
+<p class="hint">指纹与样本的增删、/recent 与 /learnlast、/warmup、/vision、/digest 等维护命令在「命令台」里执行。</p></div>
+</section>
+<section class="tab" id="tab-users" hidden>
+<div class="card"><h2>用户查询（/user · /check · /profile）</h2>
+<div class="row"><input id="u-id" placeholder="TGID" aria-label="用户 TGID"><button class="btn primary" id="u-query" type="button">查询</button></div>
+<div id="u-out" class="out"></div></div>
+<div class="card"><h2>搜索发言（/search）</h2><p class="hint">关键词、TGID 或 @用户名，跨全部配置群。</p>
+<div class="row"><input id="s-q" class="wide" placeholder="关键词 | TGID | @用户名" aria-label="搜索内容"><button class="btn primary" id="s-go" type="button">搜索</button></div>
+<div id="s-out" class="out"></div>
+<div class="pager"><button class="btn" id="s-prev" type="button">上一页</button><span id="s-page" class="muted"></span><button class="btn" id="s-next" type="button">下一页</button></div></div>
+</section>
+<section class="tab" id="tab-notice" hidden>
+<div class="card"><h2>全体通知（/notice）</h2><p class="hint">以机器人身份发纯文本到全部配置群或指定群。要发图片 / 视频 / 文件请私聊机器人用 /notice。</p>
+<textarea id="n-text" maxlength="4096" aria-label="通知内容" placeholder="通知内容"></textarea>
+<div class="row"><select id="n-chat" aria-label="发送范围"><option value="">全部配置群</option></select><label><input type="checkbox" id="n-silent"> 静默发送</label><button class="btn primary" id="n-send" type="button">发送</button></div>
+<div id="n-out" class="out"></div></div>
+</section>
+<section class="tab" id="tab-admins" hidden>
+<div class="card"><h2>主人 / 副主人 / 超级管理员（/admins）</h2><div class="row"><button class="btn" id="a-load" type="button">读取名单</button></div><div id="a-out" class="out"></div>
+<p class="hint">广告举报投票的授权成员用命令台：/add_ad_admin TGID、/del_ad_admin TGID。</p></div>
+</section>
+<section class="tab" id="tab-export" hidden>
+<div class="card"><h2>导出密码（/exportpass）</h2><p class="hint">生成一次性导出密码，转发给可信用户登录导出页看 / 下载黑名单。导出密码登不进本后台。</p>
+<div class="row"><button class="btn primary" id="e-gen" type="button">生成导出密码</button></div><div id="e-out" class="out"></div></div>
+</section>
+<section class="tab" id="tab-console" hidden>
+<div class="card"><h2>命令台</h2><p class="hint">等同于你本人私聊机器人发命令：结果显示在下面，Telegram 私聊里也照常收到一份。按钮类交互（确认 / 翻页）请到 Telegram 里点。</p>
+<div class="row"><input id="c-cmd" class="wide" placeholder="/listgroups" aria-label="命令" autocomplete="off"><button class="btn primary" id="c-run" type="button">执行</button><button class="btn" id="c-clear" type="button">清空结果</button></div>
+<div id="c-out" class="out"></div></div>
+<div class="card"><h2>命令手册</h2><p class="hint">原 /help 的全部内容。点一条把命令填进命令台，补齐参数后执行。</p>
+<div class="row"><input id="m-filter" class="wide" placeholder="筛选命令或说明" aria-label="筛选命令手册"></div>
+<div id="m-list"></div></div>
+</section>
+</main>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+<script>
+'use strict';
+var $ = function (id) { return document.getElementById(id); };
+// 命令手册：原 /help 长清单逐条搬过来。[命令, 说明]；命令为空 = 纯说明行。
+var MANUAL = [
+['人工封禁与查询（群管理员 / 主人 / 副主人）', [
+['/ban TGID [原因]', '加黑 + 全群禁言（不踢出）'],
+['/sban TGID [原因]', '加黑 + 全群踢出并撤回其历史发言（第一主人 / 副主人 / 该群群主）'],
+['/spam', '回复广告：删消息 + 全群禁言（群里回复广告消息发送）'],
+['/unban TGID', '移出黑名单 + 全群解封并恢复发言（不带 ID 则是自助解封）'],
+['/check TGID', '查 GKY + 全局 + 独立群本群黑名单（群内可回复消息）；网页版 域名/check'],
+['/profile TGID', '资料卡：昵称 / 简介 / 时间线 / 黑名单 / GKY（群内可回复消息使用）'],
+['/rm', '回复要删的消息后发送 → 删除该消息（仅第一主人 / 该群群主，群里用）'],
+['/health', '运行检查：bot 状态自检 + 逐群查在不在群、是不是管理员、三个权限'],
+['/menu', '群设置菜单：群统计 / 资料卡 / 运行检查 的入口页（仅第一主人，群里发）'],
+['/search 关键词|TGID|@用户名', '查谁发过什么（第一主人 + 该群群主）'],
+['/blacklist', '查看全局黑名单最近记录（主人 / 副主人）'],
+['/job 任务ID [页码]', '查大批量封禁任务的进度'],
+['/jobrun 任务ID', '手动续跑未完成的批量任务']]],
+['群统计（群管理员 / 主人 / 副主人）', [
+['/stats', '群内出用法面板，带 今日 / 本周 / 本月 按钮'],
+['/stats -100群ID today', '查指定群的今日统计'],
+['/stats -100群ID week', '查指定群的本周统计'],
+['/stats -100群ID month', '查指定群的本月统计']]],
+['杀手群（环境变量 KILLER_MODE_GROUPS · 规则固定，无开关）', [
+['', '自动检测命中广告：永久禁言，人留群；退群再进会重新禁言'],
+['', '/ban /spam /sban：踢出；之后复入群会被踢回'],
+['', '同款直封 / 同款连带 / /ad 投票：与杀手群完全隔离，杀手群里不触发，别的群触发也不波及杀手群']]],
+['独立模式（群主自治）', [
+['/groupmode -100群ID independent', '把指定群切到独立模式（第一主人 / 群主）'],
+['/groupmode -100群ID global', '把指定群切回全局模式'],
+['/localbans', '看本群黑名单（群里发）'],
+['/localset 检测 开|关', '本群设置：广告检测开关（群里发）'],
+['/localset 演练 开|关', '本群设置：演练开关（群里发）'],
+['/localset 处置 踢出|禁言', '本群设置：处置方式（群里发）'],
+['/localset 白名单 加|删 TGID', '本群设置：本群白名单（群里发）']]],
+['演练模式（仅第一主人 · 任意配置群）', [
+['/dryrun', '群里发 = 翻转本群开关；私聊发 = 列出已开演练的群与命中数'],
+['/dryrun on', '开启：判定照跑，不删不封不加黑，但当场就学特征（全部配置群通用），命中写流水并私聊通知你'],
+['/dryrun off', '关闭：恢复自动处置（加黑 + 全群封禁 + 删消息 + 自动学习）'],
+['/dryrun status', '查看本群当前状态'],
+['', '⚠️ 演练期间本群完全不设防、广告照发，调完阈值记得关']]],
+['全体通知（仅第一主人私聊）', [
+['/notice', '发起全体通知，随后按提示发一条内容（文本/图片/视频/文件均可），确认后群发'],
+['/notice cancel', '取消本次通知']]],
+['广告举报投票（授权成员发起）', [
+['/ad [原因]', '回复广告发起群内投票，通过即加黑并全群封禁'],
+['/add_ad_admin TGID', '给该成员发起投票的权限'],
+['/del_ad_admin TGID', '收回该成员的发起权限']]],
+['动态群组（仅第一主人私聊）', [
+['/addgroup -100xxx [备注]', '新增治理群，免改环境变量'],
+['/delgroup -100xxx', '停止治理该群，bot 仍留在群里'],
+['/listgroups', '列出全部生效群组与群名（含环境变量群，标出主群）'],
+['/exportpass', '生成一次性导出密码，转发给可信用户登录 域名/export 看/下载黑名单'],
+['/adminpass', '生成本后台的一次性登录密码']]],
+['查询与退群（仅私聊）', [
+['/admins', '查看主人、副主人与超级管理员名单'],
+['/groups', '查看当前生效群组信息'],
+['/leavegroup -100xxx', '让 bot 退出该群']]],
+['广告自动检测（仅私聊）', [
+['/pending [N]', '列出待复核的自动判定快照，默认 10 条'],
+['/user TGID', '按用户 ID 查全部案底：每次判定的时间、得分、名称、原文与判据'],
+['/ignore 序号', '判错回滚：解黑 + 全群解封 + 删掉学到的指纹和样本（支持 3 5 7 与 3-8）'],
+['/rescreen [N]', '重新筛查观察窗口里的可疑用户，默认 10 人'],
+['/adstats', '检测状态总览：指纹、样本向量、观察窗口、入群检查流水与演练状态'],
+['/vision', '手动触发一轮视觉识别（头像 + 正文图）'],
+['/digest', '形态摘要：看当前注入的'],
+['/digest build', '形态摘要：手动构建'],
+['/digest clear', '形态摘要：清除']]],
+['指纹与样本维护（仅私聊）', [
+['/words [关键词] [页码]', '翻看 / 搜索指纹库，按命中次数倒序'],
+['/addword 值 [类型]', '新增指纹，类型可省略自动推断'],
+['/delword 值', '删除单条指纹'],
+['/delword noise', '批量删掉命中 0 次的噪声指纹（二次确认，不动种子）'],
+['/delword type:username', '批量删掉整类指纹（二次确认，不动种子）'],
+['/addsample 文本', '新增 AI 语义比对样本'],
+['/recent [N]', '捞回被别的 bot 抢先删掉的广告，冻结快照推私聊'],
+['/learnlast 序号', '按 /recent 序号学习 + 加黑封禁发送者（支持 1,3,5）'],
+['/warmup', '补齐 AI 样本向量（向量为 0 则第三层不生效，可反复发）'],
+['/clearsamples', '清空全部 AI 样本，需二次确认令牌'],
+['/whitelist list', '查看域名白名单'],
+['/whitelist add 域名', '添加域名白名单，命中即豁免'],
+['/whitelist del 域名', '删除域名白名单']]],
+['说明', [
+['', '杀手权限：环境变量 KILLER_ADMIN_IDS 里的人，只管杀手群：封的人进独立的杀手黑名单、一律踢出、不学特征，每次操作抄送你'],
+['', '超管名单：环境变量 SUPER_ADMIN_IDS 里的人；可用 /ban /spam /unban /check，无需群管理员身份；不能用 /stats，本人仍受黑名单拦截'],
+['', '检测豁免：超管、任一配置群的群主或管理员，发任何内容都不被广告自动检测'],
+['', '群内命令：发出即撤回，结果留在群里并通知第一主人；/dryrun 例外，命令与回执都撤回，完整信息走私聊'],
+['', '入群判定：进群那一刻就查 bio 与头像；更严可设环境变量 AD_JOIN_SCORE_THRESHOLD（如 9）'],
+['', '自动判定：加黑 + 全群封禁 + 自动学习，快照推给你复核；判错用 /ignore 序号撤销'],
+['', 'Telegram 菜单只留 /ban /spam /check /unban /stats；其余命令没删，照样可以直接发送']]]
+];
+var state = { groups: [], current: '', blPage: 1, blPages: 1, adsView: 'summary', adsPage: 1, adsPages: 1, sPage: 1, sPages: 1 };
+
+function api(action, body) {
+	return fetch('/admin/api/' + action, {
+		method: 'POST', credentials: 'same-origin',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body || {})
+	}).then(function (res) {
+		return res.text().then(function (txt) {
+			var data = null;
+			try { data = txt ? JSON.parse(txt) : null; } catch (e) { data = null; }
+			if (res.status === 401) { toast('登录已失效，正在回到登录页', true); setTimeout(function () { location.reload(); }, 1200); }
+			if (!res.ok || (data && data.ok === false)) {
+				var msg = (data && (data.error || data.message)) || ('请求失败（' + res.status + '）');
+				throw new Error(msg);
+			}
+			return data && Object.prototype.hasOwnProperty.call(data, 'data') ? data.data : data;
+		});
+	});
+}
+function el(tag, attrs, children) {
+	var node = document.createElement(tag);
+	if (attrs) Object.keys(attrs).forEach(function (k) {
+		if (k === 'text') node.textContent = attrs[k];
+		else if (k === 'cls') node.className = attrs[k];
+		else if (k === 'on') Object.keys(attrs.on).forEach(function (ev) { node.addEventListener(ev, attrs.on[ev]); });
+		else node.setAttribute(k, attrs[k]);
+	});
+	(children || []).forEach(function (c) { if (c != null) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+	return node;
+}
+function put(target, node) { var box = typeof target === 'string' ? $(target) : target; box.textContent = ''; if (node) box.appendChild(node); }
+function msg(target, text, isErr) { put(target, el('p', { cls: isErr ? 'no' : 'muted', text: text })); }
+var toastTimer = 0;
+function toast(text, isErr) {
+	var t = $('toast'); t.textContent = text; t.className = 'show' + (isErr ? ' error' : '');
+	clearTimeout(toastTimer); toastTimer = setTimeout(function () { t.className = ''; }, 3500);
+}
+function fmtTime(sec) {
+	var n = Number(sec) || 0; if (!n) return '';
+	if (n > 1e12) n = Math.floor(n / 1000);
+	var d = new Date(n * 1000);
+	function p(x) { return (x < 10 ? '0' : '') + x; }
+	return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function str(v) {
+	if (v == null) return '';
+	if (Array.isArray(v)) return v.map(str).join('；');
+	if (typeof v === 'object') { try { return JSON.stringify(v); } catch (e) { return String(v); } }
+	return String(v);
+}
+// cols: [[标题, 取值函数或字段名]]
+function table(rows, cols) {
+	if (!rows || !rows.length) return el('p', { cls: 'muted', text: '暂无记录' });
+	var head = el('tr', null, cols.map(function (c) { return el('th', { text: c[0] }); }));
+	var body = rows.map(function (r) {
+		return el('tr', null, cols.map(function (c) {
+			var v = typeof c[1] === 'function' ? c[1](r) : r[c[1]];
+			return el('td', null, [v instanceof Node ? v : str(v)]);
+		}));
+	});
+	return el('table', null, [el('thead', null, [head]), el('tbody', null, body)]);
+}
+function kv(pairs) {
+	var dl = el('dl', { cls: 'kv' });
+	pairs.forEach(function (p) { dl.appendChild(el('dt', { text: p[0] })); dl.appendChild(el('dd', null, [p[1] instanceof Node ? p[1] : str(p[1])])); });
+	return dl;
+}
+function yn(b) { return el('span', { cls: b ? 'yes' : 'no', text: b ? '是' : '否' }); }
+function busy(btn, promise) {
+	if (btn) btn.disabled = true;
+	return promise.catch(function (e) { toast(e.message || String(e), true); throw e; })
+		.finally(function () { if (btn) btn.disabled = false; });
+}
+function pager(prefix, page, pages) { $(prefix + '-page').textContent = '第 ' + page + ' / ' + Math.max(1, pages) + ' 页'; $(prefix + '-prev').disabled = page <= 1; $(prefix + '-next').disabled = page >= pages; }
+function idsOf(input) { return $(input).value.split(/[\s,，]+/).filter(Boolean); }
+
+// ===== 分区切换 =====
+var loaded = {};
+function showTab(name) {
+	Array.prototype.forEach.call(document.querySelectorAll('#nav button'), function (b) { b.setAttribute('aria-selected', String(b.getAttribute('data-tab') === name)); });
+	Array.prototype.forEach.call(document.querySelectorAll('section.tab'), function (s) { s.hidden = s.id !== 'tab-' + name; });
+	if (loaded[name]) return;
+	loaded[name] = true;
+	if (name === 'groups') loadGroups();
+	else if (name === 'blacklist') loadBlacklist(1);
+	else if (name === 'ads') loadAds(1);
+}
+$('nav').addEventListener('click', function (e) { var b = e.target.closest('button[data-tab]'); if (b) showTab(b.getAttribute('data-tab')); });
+
+// ===== 概况 =====
+function loadBootstrap() {
+	return api('bootstrap').then(function (d) {
+		var u = d.user || {};
+		$('who').textContent = '第一主人 · ' + (u.id || '');
+		state.groups = Array.isArray(d.groups) ? d.groups : [];
+		fillNoticeGroups();
+		put('ov-info', kv([
+			['身份', '第一主人（' + (u.id || '') + '）'],
+			['治理群数', String(state.groups.length)],
+			['杀手子后台入口', d.killerEntry ? '有' : '无'],
+			['群名可读', d.groupsReadable === false ? '部分群读取失败' : '正常']
+		]));
+	}).catch(function (e) { msg('ov-info', e.message, true); });
+}
+$('ov-health').addEventListener('click', function () {
+	var btn = this; msg('ov-health-out', '检查中，群多时需要十几秒…');
+	busy(btn, api('health')).then(function (d) {
+		var box = el('div');
+		box.appendChild(table(d.layer1 || [], [['结果', function (r) { return r.ok === null ? '—' : yn(r.ok); }], ['项目', 'text']]));
+		box.appendChild(el('h3', { text: '逐群检查（' + (d.total || 0) + ' 个群）' }));
+		box.appendChild(table(d.layer2 || [], [['群', function (r) { return (r.title || '') + ' ' + r.groupId; }], ['在群', function (r) { return yn(r.present); }], ['管理员', function (r) { return yn(r.isAdmin); }], ['删消息', function (r) { return yn(r.canDelete); }], ['封禁', function (r) { return yn(r.canRestrict); }], ['邀请', function (r) { return yn(r.canInvite); }], ['错误', 'error']]));
+		put('ov-health-out', box);
+	}).catch(function (e) { msg('ov-health-out', e.message, true); });
+});
+// ===== 群组 =====
+function loadGroups() {
+	msg('g-list', '读取中…');
+	return api('groups/list').then(function (list) {
+		state.groups = Array.isArray(list) ? list : [];
+		fillNoticeGroups();
+		if (!state.groups.length) { msg('g-list', '还没有治理群'); return; }
+		var box = el('div');
+		state.groups.forEach(function (g) {
+			var tags = [el('span', { cls: 'tag', text: g.source === 'env' ? (g.primary ? '主群 · 环境变量' : '环境变量') : '动态' })];
+			if (g.note) tags.push(el('span', { cls: 'tag', text: g.note }));
+			var item = el('div', { cls: 'grp-item', tabindex: '0', role: 'button', 'data-chat': g.chatId, 'aria-current': String(g.chatId === state.current) }, [
+				el('span', null, [el('b', { text: g.title || '（未取到群名）' }), ' ', el('span', { cls: 'muted', text: g.chatId })].concat(tags)),
+				el('span', { cls: 'muted', text: '详情 ›' })
+			]);
+			item.addEventListener('click', function () { openGroup(g.chatId); });
+			item.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openGroup(g.chatId); } });
+			box.appendChild(item);
+		});
+		put('g-list', box);
+	}).catch(function (e) { msg('g-list', e.message, true); });
+}
+$('g-reload').addEventListener('click', function () { busy(this, loadGroups()); });
+$('g-add').addEventListener('click', function () {
+	var id = $('g-add-id').value.trim();
+	busy(this, api('groups/add', { chatId: id })).then(function (d) { toast(d.message || '已添加'); $('g-add-id').value = ''; loadGroups(); });
+});
+function groupTitle(id) { for (var i = 0; i < state.groups.length; i++) if (state.groups[i].chatId === id) return state.groups[i].title || id; return id; }
+function openGroup(chatId) {
+	state.current = chatId;
+	Array.prototype.forEach.call(document.querySelectorAll('.grp-item'), function (n) { n.setAttribute('aria-current', String(n.getAttribute('data-chat') === chatId)); });
+	$('g-detail-card').hidden = false;
+	$('g-detail-title').textContent = '群详情 · ' + groupTitle(chatId);
+	put('g-stats-out', null); put('g-lb-out', null); put('g-wl-out', null);
+	msg('g-detail', '读取中…');
+	return api('groups/detail', { chatId: chatId }).then(function (d) {
+		var bot = d.bot || {};
+		var perms = (bot.permissions || []).map(function (p) { return (p.on ? '✅' : '❌') + p.label; }).join('  ');
+		var box = el('div');
+		box.appendChild(kv([
+			['群 ID', d.chatId],
+			['群名', d.title || ''],
+			['群模式', el('span', { cls: d.mode === 'independent' ? 'tag ind' : 'tag', text: d.mode === 'independent' ? '独立模式' : '全局模式' })],
+			['机器人身份', (bot.status || '未知') + (bot.reason ? '（' + bot.reason + '）' : '')],
+			['机器人权限', perms || '—'],
+			['演练', d.dryRun ? '开启中' : '关闭'],
+			['演练命中', '共 ' + (d.dryRunStats ? d.dryRunStats.total : 0) + ' 条，今日 ' + (d.dryRunStats ? d.dryRunStats.today : 0) + ' 条，标误报 ' + (d.dryRunStats ? d.dryRunStats.fp : 0) + ' 条']
+		]));
+		box.appendChild(el('h3', { text: '最近入群检查（20 条）' }));
+		box.appendChild(table(d.joinChecks || [], [['时间', function (r) { return fmtTime(r.createdAt); }], ['用户', 'userId'], ['得分', function (r) { return r.score + ' / ' + r.threshold; }], ['结论', 'verdict'], ['判据', 'reasons']]));
+		box.appendChild(el('h3', { text: '最近演练流水（20 条）' }));
+		box.appendChild(table(d.dryrunLog || [], [['时间', function (r) { return fmtTime(r.createdAt); }], ['用户', 'userId'], ['得分', function (r) { return r.score + ' / ' + r.threshold; }], ['状态', function (r) { return r.status === 'fp' ? '误报' : r.status === 'done' ? '确认' : '待定'; }], ['判据', 'reasons']]));
+		put('g-detail', box);
+		$('g-dry-state').textContent = d.dryRun ? '当前：演练开启中' : '当前：演练关闭';
+		var ind = d.mode === 'independent';
+		$('g-local').hidden = !ind;
+		$('g-mode-ind').disabled = ind; $('g-mode-glb').disabled = !ind;
+		if (ind && d.localSettings && !d.localSettings.error) {
+			$('g-ls-detect').checked = d.localSettings.detect !== false;
+			$('g-ls-action').value = d.localSettings.action === 'kick' ? 'kick' : 'mute';
+			showLocalWl(d.localSettings.whitelist);
+		}
+	}).catch(function (e) { msg('g-detail', e.message, true); });
+}
+function showLocalWl(list) {
+	var ids = Array.isArray(list) ? list : [];
+	msg('g-wl-out', ids.length ? '本群白名单：' + ids.join('、') : '本群白名单为空');
+}
+function needGroup() { if (!state.current) { toast('请先在上面选一个群', true); return false; } return true; }
+function groupAct(btn, action, body, after) {
+	if (!needGroup()) return;
+	body.chatId = state.current;
+	return busy(btn, api(action, body)).then(function (d) { if (d && d.message) toast(d.message); if (after) after(d); return d; });
+}
+$('g-mode-ind').addEventListener('click', function () { if (confirm('把本群切到独立模式？全局黑名单将不再在本群生效。')) groupAct(this, 'web/groupmode', { mode: 'independent' }, function () { openGroup(state.current); }); });
+$('g-mode-glb').addEventListener('click', function () { if (confirm('把本群切回全局模式？')) groupAct(this, 'web/groupmode', { mode: 'global' }, function () { openGroup(state.current); }); });
+$('g-ls-save').addEventListener('click', function () { groupAct(this, 'web/localset', { detect: $('g-ls-detect').checked, action: $('g-ls-action').value }); });
+$('g-wl-add').addEventListener('click', function () { groupAct(this, 'web/localwl', { userIds: idsOf('g-wl-ids').join(' '), add: true }, function (d) { showLocalWl(d.whitelist); }); });
+$('g-wl-del').addEventListener('click', function () { groupAct(this, 'web/localwl', { userIds: idsOf('g-wl-ids').join(' '), add: false }, function (d) { showLocalWl(d.whitelist); }); });
+$('g-lb-load').addEventListener('click', function () {
+	groupAct(this, 'web/localbans', {}, function (d) {
+		put('g-lb-out', table(d.items || [], [['TGID', 'userId'], ['原因', 'reason'], ['操作人', 'by'], ['时间', 'at'], ['备注', 'note']]));
+	});
+});
+$('g-lb-unban').addEventListener('click', function () {
+	groupAct(this, 'web/localunban', { userIds: idsOf('g-lb-ids').join(' ') }, function (d) {
+		var lines = (d.users || []).map(function (u) { return u.userId + '：' + (u.ok ? '已解封' : '解封未完成'); })
+			.concat((d.failed || []).map(function (f) { return f.userId + '：' + f.error; }));
+		msg('g-lb-out', lines.join('\n') || d.message);
+	});
+});
+$('g-dry-on').addEventListener('click', function () { groupAct(this, 'web/dryrun', { on: true }, function () { openGroup(state.current); }); });
+$('g-dry-off').addEventListener('click', function () { groupAct(this, 'web/dryrun', { on: false }, function () { openGroup(state.current); }); });
+Array.prototype.forEach.call(document.querySelectorAll('[data-stats]'), function (b) {
+	b.addEventListener('click', function () {
+		groupAct(b, 'web/stats', { range: b.getAttribute('data-stats') }, function (d) {
+			var s = d.summary || {};
+			var box = el('div');
+			box.appendChild(kv([['范围', d.label], ['发言总数', s.totalMsg], ['发言人数', s.activeUsers], ['进群', s.join], ['退群', s.leave], ['被踢', s.kicked]]));
+			box.appendChild(el('h3', { text: '发言排行' }));
+			box.appendChild(table((d.ranking && d.ranking.rows) || [], [['名次', 'rank'], ['用户', function (r) { return (r.displayName || '') + (r.username ? ' @' + r.username : '') + ' · ' + r.userId; }], ['发言数', 'count']]));
+			put('g-stats-out', box);
+		});
+	});
+});
+$('g-remove').addEventListener('click', function () { var id = state.current; if (needGroup() && confirm('停止治理 ' + id + '？机器人仍留在群里。')) busy(this, api('groups/remove', { chatId: id })).then(function (d) { toast(d.message); $('g-detail-card').hidden = true; state.current = ''; loadGroups(); }); });
+$('g-leave').addEventListener('click', function () { var id = state.current; if (needGroup() && confirm('让机器人退出 ' + id + '？此操作会同时停止治理。')) busy(this, api('groups/leave', { chatId: id })).then(function (d) { toast(d.message); $('g-detail-card').hidden = true; state.current = ''; loadGroups(); }); });
+
+// ===== 黑名单 =====
+function loadBlacklist(page) {
+	msg('bl-out', '读取中…');
+	return api('blacklist/list', { query: $('bl-q').value.trim(), page: page }).then(function (d) {
+		state.blPage = d.page || 1; state.blPages = d.totalPages || 1;
+		var box = el('div');
+		box.appendChild(el('p', { cls: 'muted', text: '共 ' + (d.total || 0) + ' 条，最新在前' }));
+		box.appendChild(table(d.items || [], [['TGID', 'id'], ['原因', 'reason'], ['操作人', 'by'], ['时间', 'at'], ['备注', 'note']]));
+		put('bl-out', box);
+		pager('bl', state.blPage, state.blPages);
+	}).catch(function (e) { msg('bl-out', e.message, true); });
+}
+$('bl-search').addEventListener('click', function () { busy(this, loadBlacklist(1)); });
+$('bl-q').addEventListener('keydown', function (e) { if (e.key === 'Enter') loadBlacklist(1); });
+$('bl-prev').addEventListener('click', function () { loadBlacklist(state.blPage - 1); });
+$('bl-next').addEventListener('click', function () { loadBlacklist(state.blPage + 1); });
+$('bl-unban').addEventListener('click', function () {
+	var id = $('bl-unban-id').value.trim();
+	if (!id || !confirm('把 ' + id + ' 移出全局黑名单并全群解封？')) return;
+	busy(this, api('blacklist/unban', { userId: id })).then(function (d) { toast(d.message); loadBlacklist(state.blPage); });
+});
+// ===== 广告检测 =====
+var ADS = {
+	summary: { action: 'ads/summary', paged: false, render: function (d) {
+		var c = d.counts || {}, f = d.config || {};
+		return kv([['指纹', c.fingerprints], ['AI 样本', c.samples], ['观察窗口', c.observing + ' 人'], ['待复核', c.pending + ' 条'], ['封禁分数线', f.scoreThreshold], ['观察分数线', f.observationScore], ['第⑥层 AI', f.aiEnabled ? '开启' : '关闭'], ['AI 每日额度', f.llmDaily], ['视觉模型', d.visionModel]]);
+	} },
+	pending: { action: 'ads/pending', paged: true, render: function (d) {
+		return table(d.items || [], [['序号', 'seq'], ['时间', function (r) { return fmtTime(r.createdAt); }], ['用户', function (r) { var s = r.snapshot || {}; return (s.name || '') + (s.username ? ' @' + s.username : '') + ' · ' + r.userId; }], ['群', function (r) { return groupTitle(r.chatId); }], ['得分', 'score'], ['判据', 'reasons'], ['内容', function (r) { return (r.snapshot && r.snapshot.text) || ''; }]]);
+	} },
+	fingerprints: { action: 'ads/fingerprints', paged: true, query: true, render: function (d) {
+		return table(d.items || [], [['类型', 'type'], ['值', 'value'], ['权重', 'weight'], ['命中', 'matchCount'], ['误报', 'falsePositiveCount'], ['来源', 'source'], ['时间', function (r) { return fmtTime(r.createdAt); }]]);
+	} },
+	samples: { action: 'ads/samples', paged: true, render: function (d) {
+		var c = d.counts || {};
+		var box = el('div');
+		box.appendChild(el('p', { cls: 'muted', text: '共 ' + (c.total || 0) + ' 条，向量就绪 ' + (c.ready || 0) + '，过期 ' + (c.stale || 0) + '，可用 ' + (c.usable || 0) }));
+		box.appendChild(table(d.items || [], [['ID', 'id'], ['文本', 'text'], ['来源', 'source'], ['状态', 'status'], ['时间', function (r) { return fmtTime(r.createdAt); }]]));
+		return box;
+	} },
+	observing: { action: 'ads/observing', paged: true, render: function (d) {
+		return table(d.items || [], [['用户', function (r) { return (r.name || '') + (r.username ? ' @' + r.username : '') + ' · ' + r.userId; }], ['群', function (r) { return groupTitle(r.chatId); }], ['得分', 'score'], ['层', 'layer'], ['判据', 'reasons'], ['入群', function (r) { return fmtTime(r.joinedAt); }], ['到期', function (r) { return fmtTime(r.expiresAt); }]]);
+	} },
+	llm: { action: 'ads/llm', paged: false, render: function (d) {
+		var pools = d.pools || {};
+		var poolText = Object.keys(pools).map(function (k) { return k + ' ' + pools[k].used + '/' + pools[k].limit; }).join('，');
+		return kv([['状态', d.enabled ? '开启' : '关闭'], ['日期', d.day], ['今日用量', d.used + ' / ' + d.daily], ['分池', poolText], ['判出广告', d.hits], ['因此封禁', d.bans], ['解析失败', d.parseFail], ['连续失败', d.consecFail], ['熔断', d.broken ? '已熔断' : '正常'], ['自学候选', d.candidates]]);
+	} },
+	dryrun: { action: 'ads/dryrun', paged: true, render: function (d) {
+		return table(d.items || [], [['时间', function (r) { return fmtTime(r.createdAt); }], ['群', function (r) { return groupTitle(r.chatId); }], ['用户', 'userId'], ['得分', function (r) { return r.score + ' / ' + r.threshold; }], ['层', 'layer'], ['状态', function (r) { return r.status === 'fp' ? '误报' : r.status === 'done' ? '确认' : '待定'; }], ['判据', 'reasons']]);
+	} },
+	whitelist: { action: 'ads/whitelist', paged: true, render: function (d) {
+		return table(d.items || [], [['TGID', 'userId'], ['名称', function (r) { return (r.name || '') + (r.username ? ' @' + r.username : ''); }], ['操作人', 'by'], ['时间', 'at'], ['备注', 'note']]);
+	} }
+};
+function loadAds(page) {
+	var view = ADS[state.adsView];
+	$('ads-ignore-row').hidden = state.adsView !== 'pending';
+	$('ads-wl-row').hidden = state.adsView !== 'whitelist';
+	$('ads-q').hidden = !view.query;
+	msg('ads-out', '读取中…');
+	var body = { page: page || 1 };
+	if (view.query) body.query = $('ads-q').value.trim();
+	return api(view.action, body).then(function (d) {
+		put('ads-out', view.render(d || {}));
+		state.adsPage = (d && d.page) || 1; state.adsPages = view.paged ? ((d && d.totalPages) || 1) : 1;
+		pager('ads', state.adsPage, state.adsPages);
+	}).catch(function (e) { msg('ads-out', e.message, true); });
+}
+$('ads-sub').addEventListener('click', function (e) {
+	var b = e.target.closest('button[data-ads]'); if (!b) return;
+	state.adsView = b.getAttribute('data-ads');
+	Array.prototype.forEach.call(this.querySelectorAll('button'), function (x) { x.setAttribute('aria-pressed', String(x === b)); });
+	loadAds(1);
+});
+$('ads-reload').addEventListener('click', function () { busy(this, loadAds(state.adsPage)); });
+$('ads-q').addEventListener('keydown', function (e) { if (e.key === 'Enter') loadAds(1); });
+$('ads-prev').addEventListener('click', function () { loadAds(state.adsPage - 1); });
+$('ads-next').addEventListener('click', function () { loadAds(state.adsPage + 1); });
+$('ads-ignore').addEventListener('click', function () {
+	var seq = $('ads-seq').value.trim();
+	if (!seq || !confirm('判错回滚 #' + seq + '？会解黑、全群解封并删掉这次学到的指纹和样本。')) return;
+	busy(this, api('ads/ignore', { seq: Number(seq) })).then(function (d) { toast(d.message); loadAds(state.adsPage); });
+});
+$('ads-wl-add').addEventListener('click', function () {
+	busy(this, api('ads/whitelist/add', { userIds: idsOf('ads-wl-ids') })).then(function (d) { toast(d.message); loadAds(1); });
+});
+$('ads-wl-del').addEventListener('click', function () {
+	var ids = idsOf('ads-wl-ids'); if (!ids.length) { toast('请输入 TGID', true); return; }
+	var btn = this, chain = Promise.resolve(), out = [];
+	ids.forEach(function (id) { chain = chain.then(function () { return api('ads/whitelist/remove', { userId: id }).then(function (d) { out.push(id + '：' + d.message); }, function (e) { out.push(id + '：' + e.message); }); }); });
+	busy(btn, chain).then(function () { toast(out.join('\n')); loadAds(1); });
+});
+// ===== 用户查询与搜索 =====
+$('u-query').addEventListener('click', function () {
+	var id = $('u-id').value.trim();
+	msg('u-out', '查询中…');
+	busy(this, api('users/query', { userId: id })).then(function (d) {
+		var p = d.profile || {}, b = d.blacklist, sp = d.speech || {};
+		var box = el('div');
+		box.appendChild(kv([
+			['TGID', d.userId],
+			['昵称', p.name || '（未取到）'],
+			['用户名', p.username ? '@' + p.username : ''],
+			['简介', p.bio || ''],
+			['全局黑名单', b ? '在黑名单：' + str(b.reason || '') + (b.at ? '（' + b.at + '）' : '') : '不在'],
+			['本群黑名单', (d.groupBans || []).length ? (d.groupBans || []).map(function (g) { return groupTitle(String(g.chatId || g.chat_id || '')) + '：' + str(g.reason || ''); }).join('；') : '无'],
+			['检测白名单', d.whitelist ? '在（' + (d.whitelist.at || '') + '）' : '不在'],
+			['发言', '缓存内 ' + (sp.count || 0) + ' 条；首次 ' + fmtTime(sp.first) + '，最近 ' + fmtTime(sp.last)],
+			['GKY', d.gkyError ? '查询失败：' + d.gkyError : str(d.gky)]
+		]));
+		box.appendChild(el('h3', { text: '判定案底' }));
+		box.appendChild(table(d.cases || [], [['序号', 'seq'], ['时间', function (r) { return fmtTime(r.createdAt); }], ['群', function (r) { return groupTitle(r.chatId); }], ['得分', 'score'], ['判据', 'reasons'], ['内容', function (r) { return (r.snapshot && r.snapshot.text) || ''; }], ['状态', function (r) { return r.processed === 'ignored' ? '已复核' : '有效'; }]]));
+		box.appendChild(el('h3', { text: '进退群时间线' }));
+		box.appendChild(table(d.events || [], [['时间', function (r) { return fmtTime(r.at); }], ['群', function (r) { return groupTitle(String(r.chat_id || '')); }], ['事件', function (r) { return ({ join: '进群', leave: '退群', kicked: '被踢', kick: '被踢' })[r.kind] || r.kind; }]]));
+		var errs = Object.keys(d.errors || {});
+		if (errs.length) box.appendChild(el('p', { cls: 'no', text: '部分读取失败：' + errs.join('、') }));
+		put('u-out', box);
+	}).catch(function (e) { msg('u-out', e.message, true); });
+});
+$('u-id').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('u-query').click(); });
+function runSearch(page) {
+	msg('s-out', '搜索中…');
+	return api('search', { query: $('s-q').value.trim(), page: page }).then(function (d) {
+		state.sPage = d.page || 1; state.sPages = d.totalPages || 1;
+		var box = el('div');
+		box.appendChild(el('p', { cls: 'muted', text: '共 ' + (d.total || 0) + ' 条' + (d.resolvedUserId ? '（@' + d.value + ' = ' + d.resolvedUserId + '）' : '') }));
+		box.appendChild(table(d.rows || [], [['时间', function (r) { return fmtTime(r.date || r.createdAt || r.created_at); }], ['群', function (r) { return groupTitle(String(r.chatId || r.chat_id || '')); }], ['用户', function (r) { return String(r.fromId || r.from_id || r.userId || ''); }], ['内容', function (r) { return r.text || r.text_norm || ''; }]]));
+		put('s-out', box);
+		pager('s', state.sPage, state.sPages);
+	}).catch(function (e) { msg('s-out', e.message, true); });
+}
+$('s-go').addEventListener('click', function () { busy(this, runSearch(1)); });
+$('s-q').addEventListener('keydown', function (e) { if (e.key === 'Enter') runSearch(1); });
+$('s-prev').addEventListener('click', function () { runSearch(state.sPage - 1); });
+$('s-next').addEventListener('click', function () { runSearch(state.sPage + 1); });
+
+// ===== 全体通知 =====
+function fillNoticeGroups() {
+	var sel = $('n-chat'), keep = sel.value;
+	while (sel.options.length > 1) sel.remove(1);
+	state.groups.forEach(function (g) { sel.appendChild(el('option', { value: g.chatId, text: (g.title || g.chatId) + '（' + g.chatId + '）' })); });
+	sel.value = keep;
+}
+$('n-send').addEventListener('click', function () {
+	var text = $('n-text').value.trim();
+	if (!text) { toast('请输入通知内容', true); return; }
+	var scope = $('n-chat').value ? groupTitle($('n-chat').value) : '全部配置群';
+	if (!confirm('以机器人身份发送到「' + scope + '」？')) return;
+	busy(this, api('notice/send', { text: text, chatId: $('n-chat').value, silent: $('n-silent').checked })).then(function (d) {
+		var rows = d.results || [];
+		var box = el('div');
+		box.appendChild(el('p', { text: d.message || ('已发送 ' + rows.filter(function (r) { return r.ok; }).length + '/' + rows.length) }));
+		box.appendChild(table(rows, [['群', function (r) { return groupTitle(r.groupId); }], ['结果', function (r) { return yn(r.ok); }], ['原因', 'error']]));
+		put('n-out', box);
+	}).catch(function (e) { msg('n-out', e.message, true); });
+});
+
+// ===== 管理员 =====
+$('a-load').addEventListener('click', function () {
+	busy(this, api('admins/list')).then(function (d) {
+		var cols = [['TGID', 'id'], ['昵称', function (r) { return r.name + (r.username ? ' @' + r.username : ''); }], ['群内身份', 'status'], ['所在群', function (r) { return r.groupId ? ((d.groupLabels && d.groupLabels[r.groupId] && d.groupLabels[r.groupId].title) || r.groupId) : ''; }]];
+		var box = el('div');
+		box.appendChild(el('h3', { text: '第一主人' })); box.appendChild(table(d.primary || [], cols));
+		box.appendChild(el('h3', { text: '副主人' })); box.appendChild(table(d.secondary || [], cols));
+		box.appendChild(el('h3', { text: '超级管理员' })); box.appendChild(table(d.superAdmins || [], cols));
+		if (d.truncated) box.appendChild(el('p', { cls: 'muted', text: '部分资料因请求上限未查询' }));
+		put('a-out', box);
+	}).catch(function (e) { msg('a-out', e.message, true); });
+});
+
+// ===== 导出密码 =====
+$('e-gen').addEventListener('click', function () {
+	busy(this, api('web/exportpass')).then(function (d) {
+		put('e-out', kv([['导出页', d.url], ['一次性密码', el('code', { text: d.password })], ['说明', d.message]]));
+	}).catch(function (e) { msg('e-out', e.message, true); });
+});
+// ===== 命令台 =====
+function runCommand() {
+	var cmd = $('c-cmd').value.trim();
+	if (!cmd) return;
+	if (cmd.charAt(0) !== '/') { toast('命令必须以 / 开头', true); return; }
+	var block = el('div', { cls: 'card' }, [el('b', { text: '› ' + cmd }), el('p', { cls: 'muted', text: '执行中…' })]);
+	var out = $('c-out');
+	out.insertBefore(block, out.firstChild);
+	return busy($('c-run'), api('web/exec', { command: cmd })).then(function (d) {
+		block.removeChild(block.lastChild);
+		var replies = d.replies || [];
+		if (!replies.length) block.appendChild(el('p', { cls: 'muted', text: '命令已执行，没有回执（部分命令只在 Telegram 里出按钮或静默生效）。' }));
+		replies.forEach(function (r) { block.appendChild(el('pre', { cls: 'reply', text: r })); });
+		if (d.truncated) block.appendChild(el('p', { cls: 'muted', text: '回执过多，只显示前 ' + replies.length + ' 条，完整内容见 Telegram 私聊。' }));
+	}).catch(function (e) { block.removeChild(block.lastChild); block.appendChild(el('p', { cls: 'no', text: e.message })); });
+}
+$('c-run').addEventListener('click', runCommand);
+$('c-cmd').addEventListener('keydown', function (e) { if (e.key === 'Enter') runCommand(); });
+$('c-clear').addEventListener('click', function () { put('c-out', null); });
+
+// ===== 命令手册 =====
+function renderManual() {
+	var kw = $('m-filter').value.trim().toLowerCase();
+	var box = el('div');
+	MANUAL.forEach(function (sec) {
+		var items = sec[1].filter(function (it) { return !kw || (it[0] + ' ' + it[1]).toLowerCase().indexOf(kw) >= 0; });
+		if (!items.length) return;
+		var g = el('div', { cls: 'man-group' }, [el('h3', { text: sec[0] })]);
+		items.forEach(function (it) {
+			if (!it[0]) { g.appendChild(el('p', { cls: 'hint', text: it[1] })); return; }
+			var row = el('div', { cls: 'man-item', tabindex: '0', role: 'button', title: '填进命令台' }, [el('code', { text: it[0] }), el('span', { text: it[1] })]);
+			var fill = function () {
+				// 只填命令本体和固定子命令；TGID / 序号 / [可选] 这类占位符留给你补
+				var cmd = it[0].split(' ').filter(function (w) { return /^[\/a-z:_-]+$/i.test(w) && w !== 'TGID'; }).join(' ');
+				$('c-cmd').value = cmd + (cmd === it[0] ? '' : ' ');
+				$('c-cmd').focus();
+				$('c-cmd').scrollIntoView({ block: 'center' });
+			};
+			row.addEventListener('click', fill);
+			row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fill(); } });
+			g.appendChild(row);
+		});
+		box.appendChild(g);
+	});
+	put('m-list', box);
+}
+$('m-filter').addEventListener('input', renderManual);
+
+// ===== 退出 =====
+$('logout').addEventListener('click', function () {
+	busy(this, api('web/logout')).then(function () { location.reload(); });
+});
+
+renderManual();
+loadBootstrap();
+</script>
+</body>
+</html>`;
 }
 
 async function handleExport(env, url) {
@@ -12987,7 +13904,7 @@ async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) 
 		});
 		const result = await response.json();
 		// 「message is not modified」= 文本本来就没变，不算失败。
-		if (response.ok && result?.ok) return { ok: true, result };
+		if (response.ok && result?.ok) { captureWebAdminReply(chatId, body.text); return { ok: true, result }; }
 		const description = String(result?.description || '');
 		if (/not modified/i.test(description)) return { ok: true, result };
 		return { ok: false, error: description || ('HTTP ' + response.status) };
@@ -14884,116 +15801,18 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (isInGroup) {
 			// 刻意显式传 6000（略长于 FLASH_MESSAGE_TTL_MS 默认值）：这条是引导性提示，
 			// 要留够时间让主人看到"去私聊发 /help"，不随全局时长调短。
-			await sendFlashMessage(chatId, 'ℹ️ 请私聊我发送 /help 查看 OWNER_IDS 专属指令。', ctx, 6000);
+			await sendFlashMessage(chatId, 'ℹ️ 请私聊我发送 /help 获取网页管理后台入口。', ctx, 6000);
 			return;
 		}
-		// 命令一律【裸文本】不包 <code>：Telegram 只会把纯文本里的 /xxx 识别成 bot_command
-		// 实体、渲染成蓝色链接并支持「点一下直接发送」；一旦包进 <code>，点击就只是复制。
-		const helpLines = [
-			'🔐 <b>第一主人专属帮助</b>（仅第一主人私聊可展开）',
-			'',
-			'<b>━━ 人工封禁与查询（群管理员 / 主人 / 副主人）━━</b>',
-			'/ban TGID [原因]　加黑 + 全群禁言（不踢出）',
-			'/sban TGID [原因]　加黑 + 全群踢出并撤回其历史发言（第一主人 / 副主人 / 该群群主）',
-			'/spam　回复广告：删消息 + 全群禁言',
-			'/unban TGID　移出黑名单 + 全群解封并恢复发言（不带 ID 则是自助解封）',
-			'/check TGID　查 GKY + 全局 + 独立群本群黑名单（群内可回复消息）；网页版 域名/check',
-			'/profile TGID　资料卡：昵称 / 简介 / 时间线 / 黑名单 / GKY（群内可回复消息使用）',
-			'/rm　回复要删的消息后发送 → 删除该消息（仅第一主人 / 该群群主）',
-			'/health　运行检查：bot 状态自检 + 逐群查在不在群、是不是管理员、三个权限',
-			'/menu　群设置菜单：群统计 / 资料卡 / 运行检查 的入口页（仅第一主人，群里发）',
-			'/search 关键词|TGID|@用户名　查谁发过什么（第一主人 + 该群群主）',
-			'/blacklist　查看全局黑名单最近记录（主人 / 副主人）',
-			'/job 任务ID [页码]　查大批量封禁任务的进度',
-			'/jobrun 任务ID　手动续跑未完成的批量任务',
-			'',
-			'<b>━━ 群统计（群管理员 / 主人 / 副主人）━━</b>',
-			'/stats　群内出用法面板，带 今日 / 本周 / 本月 按钮，点一下即查',
-			'/stats today　查本群今日的发言与进退群统计',
-			'/stats week　查本群本周的发言与进退群统计',
-			'/stats month　查本群本月的发言与进退群统计',
-			'/stats -100群ID today　私聊查指定群的今日统计',
-			'/stats -100群ID week　私聊查指定群的本周统计',
-			'/stats -100群ID month　私聊查指定群的本月统计',
-			'',
-			'<b>━━ 杀手群（环境变量 KILLER_MODE_GROUPS · 规则固定，无开关）━━</b>',
-			'自动检测命中广告　永久禁言，人留群；退群再进会重新禁言',
-			'/ban /spam /sban　踢出；之后复入群会被踢回',
-			'同款直封 / 同款连带 / /ad 投票　与杀手群完全隔离，杀手群里不触发，别的群触发也不波及杀手群',
-			'',
-			'<b>━━ 独立模式（群主自治）━━</b>',
-			'/groupmode independent|global　切本群模式（第一主人 / 群主；私聊加群 ID）',
-			'/localbans　看本群黑名单',
-			'/localset 检测 开|关 · 演练 开|关 · 处置 踢出|禁言 · 白名单 加|删 TGID　本群设置',
-			'',
-			'<b>━━ 演练模式（仅第一主人 · 任意配置群）━━</b>',
-			'/dryrun　翻转本群开关；私聊发送则列出已开演练的群与命中数',
-			'/dryrun on　开启：判定照跑，不删不封不加黑【但当场就学特征，全部配置群通用】，命中写流水并私聊通知你，通知带两个按钮拍板（✅确认封 / ❌不该封撤销特征+标误报）',
-			'/dryrun off　关闭：恢复自动处置（加黑 + 全群封禁 + 删消息 + 自动学习）',
-			'/dryrun status　查看本群当前状态',
-			'　　⚠️ 演练期间本群完全不设防、广告照发，调完阈值记得关',
-			'',
-			'<b>━━ 全体通知（仅第一主人私聊）━━</b>',
-			'/notice　发起全体通知，随后按提示发一条内容（文本/图片/视频/文件均可）',
-			'　　发完出预览与「✅ 确认发送」按钮，点了才以机器人身份群发到所有配置群',
-			'/notice cancel　取消本次通知',
-			'',
-			'<b>━━ 广告举报投票（授权成员发起）━━</b>',
-			'/ad [原因]　回复广告发起群内投票，通过即加黑并全群封禁',
-			'/add_ad_admin TGID　给该成员发起投票的权限',
-			'/del_ad_admin TGID　收回该成员的发起权限',
-			'',
-			'<b>━━ 动态群组（仅第一主人私聊）━━</b>',
-			'/addgroup -100xxx [备注]　新增治理群，免改环境变量',
-			'/delgroup -100xxx　停止治理该群，bot 仍留在群里',
-			'/listgroups　列出全部生效群组与群名（含环境变量群，标出主群）',
-			'/exportpass　生成一次性导出密码，转发给可信用户登录 域名/export 看/下载黑名单',
-			'',
-			'<b>━━ 查询与退群（仅私聊）━━</b>',
-			'/admins　查看主人、副主人与超级管理员名单',
-			'/groups　查看当前生效群组信息',
-			'/leavegroup -100xxx　让 bot 退出该群',
-			'',
-			'<b>━━ 广告自动检测（仅私聊）━━</b>',
-			'/pending [N]　列出待复核的自动判定快照，默认 10 条',
-			'/user TGID　按 Telegram 用户 ID 查这个人的全部案底：每次判定的时间、得分、名称、当时发的内容原文与判据（已复核过的也一并列出）',
-			'/ignore 序号　判错回滚：解黑 + 全群解封 + 删掉学到的指纹和样本（支持 3 5 7 与 3-8）。封禁回执上也有两个按钮：↩️误判=回滚全部、🔓解封=只放人不动判据',
-			'/rescreen [N]　重新筛查观察窗口里的可疑用户，默认 10 人',
-			'/adstats　检测状态总览：指纹、样本向量、观察窗口、入群检查流水与本群演练状态',
-			'/vision　手动触发一轮视觉识别（头像 + 正文图），出问题时不必等 cron'
-			+ '\n/digest　形态摘要：看当前注入的 / build 手动构建 / clear 清除',
-			'',
-			'<b>━━ 指纹与样本维护（仅私聊）━━</b>',
-			'/words [关键词] [页码]　翻看 / 搜索指纹库，按命中次数倒序，按钮翻页',
-			'/addword 值 [类型]　新增指纹，类型可省略自动推断',
-			'/delword 值　删除单条指纹',
-			'/delword noise　批量删掉命中 0 次的噪声指纹（二次确认，不动种子）',
-			'/delword type:username　批量删掉整类指纹（二次确认，不动种子）',
-			'/addsample 文本　新增 AI 语义比对样本',
-			'/recent [N]　捞回被别的 bot 抢先删掉的广告，冻结快照推私聊',
-			'/learnlast 序号　按 /recent 序号学习 + 加黑封禁发送者（支持 1,3,5）',
-			'/warmup　补齐 AI 样本向量（向量为 0 则第三层不生效，可反复发）',
-			'/clearsamples　清空全部 AI 样本，需二次确认令牌',
-			'/whitelist [list|add|del] [域名]　维护域名白名单，命中即豁免',
-			'',
-			'<b>━━ 说明 ━━</b>',
-			'杀手权限　环境变量 KILLER_ADMIN_IDS 里的人，只管杀手群：封的人进独立的杀手黑名单、一律踢出、不学特征，',
-			'　　　　　每次操作抄送你；在 GROUP_ID 群里按他的其他身份算（只有杀手权限 = 无权），私聊发 /help 看他的命令',
-			'超管名单　环境变量 SUPER_ADMIN_IDS 里的人',
-			'超管可用　/ban /spam /unban /check，无需群管理员身份',
-			'超管限制　不能用 /stats，本人仍受黑名单拦截',
-			'检测豁免　超管、任一配置群的群主或管理员，发任何内容都不被广告自动检测',
-			'群内命令　发出即撤回，结果留在群里并通知第一主人',
-			'　　　　　/dryrun 是例外：命令与回执都撤回，完整信息走私聊（群里不留痕）',
-			'入群判定　进群那一刻就查 bio 与头像，不等发言；封禁线默认与消息线相同，',
-			'　　　　　要更严可设环境变量 AD_JOIN_SCORE_THRESHOLD（如 9），每次检查都留流水',
-			'　　　　　资料里挂的 @xxx / t.me/xxx 会查清目标的简介与案底再打分（每人最多 5 个、',
-			'　　　　　按 handle 缓存 6 小时；资料里没链接则一个请求都不发）',
-			'私聊命令　命令和结果都保留',
-			'自动判定　加黑 + 全群封禁 + 自动学习，快照推给你复核',
-			'判错回滚　用 /ignore 序号撤销，判对不用管',
-		];
-		await sendTelegramMessageChunks(chatId, helpLines.join('\n'));
+		// 【2026-10-25 主人要求】/help 清空：全部命令说明搬进网页管理后台的「命令手册」，
+		// 那里每条命令点一下就填进命令台执行。这里只留后台入口。命令本身一个都没删，照样能直接发。
+		let adminUrl = '/admin';
+		try { adminUrl = new URL(requestUrl).origin + '/admin'; } catch (_) {}
+		await sendTelegramMessage(chatId,
+			'🛠 <b>全部功能已搬到网页管理后台</b>\n\n'
+			+ '后台地址：' + escapeHtml(adminUrl) + '\n'
+			+ '登录：私聊我发 /adminpass 领一次性密码\n\n'
+			+ '后台里有完整命令手册与命令台；菜单只留 /ban /spam /check /unban /stats，其余命令照样可以直接发送。');
 		return;
 	}
 
@@ -15096,6 +15915,41 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// /addgroup -100xxxx [备注] | /delgroup -100xxxx | /listgroups
 	// 加进来的群与 GROUP_ID 环境变量分离存放（Worker 无法写自己的环境变量），
 	// 但合并后享受完全相同的治理能力：封禁/踢人/广告检测/黑名单拦截/purge/批量任务。
+	// /adminpass：生成「域名/admin」网页管理后台的一次性登录密码（后台等同第一主人，只给自己用）。
+	// 只认第一主人私聊；群内一律静默且不生成。命令台里再发 /adminpass 也拒绝：已登录的人不需要新密码，
+	// 而且密码会被镜像到网页上。
+	if (text && /^\/adminpass(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		if (message.chat.type !== 'private') return;
+		if (!isPrimaryOwner(userId)) {
+			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n后台密码仅限第一主人生成。');
+			return;
+		}
+		if (message.__webAdmin === true) {
+			await sendTelegramMessage(chatId, 'ℹ️ 你已经在网页后台里了，不需要新的后台密码。');
+			return;
+		}
+		if (!env.DB) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间，无法生成后台密码。');
+			return;
+		}
+		let password = '';
+		try { password = await createExportPassword(env, 'admin'); } catch (error) { console.error('[后台登录] 生成密码失败:', error); }
+		if (!password) {
+			await sendTelegramMessage(chatId, '❌ 生成后台密码失败，请稍后重试。');
+			return;
+		}
+		let loginUrl = '/admin';
+		try { loginUrl = new URL(requestUrl).origin + '/admin'; } catch (_) {}
+		await sendTelegramMessage(chatId,
+			'🛠 <b>网页管理后台 · 临时密码</b>\n\n'
+			+ '后台地址：' + escapeHtml(loginUrl) + '\n'
+			+ '密码：<code>' + password + '</code>\n\n'
+			+ 'ℹ️ 一次性：登录成功一次即作废；24 小时内没用也作废。\n'
+			+ 'ℹ️ 关掉浏览器后需要重新领密码登录（会话最长 12 小时）。\n'
+			+ '⚠️ 后台等同第一主人权限，密码不要转发给别人（给别人看黑名单用 /exportpass）。');
+		return;
+	}
+
 	// /exportpass：生成「域名/export」的一次性登录密码，主人转发给可信用户。
 	// 只认第一主人私聊；群内一律静默且不生成（密码出现在群里就等于公开了）。
 	if (text && /^\/exportpass(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
@@ -16093,6 +16947,7 @@ async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId =
 			console.error(`[sendTelegramMessage] 发送失败 chat=${chatId}: ${result.description || `HTTP ${response.status}`}`);
 			return { ok: false, error: result.description || `HTTP ${response.status}` };
 		}
+		captureWebAdminReply(chatId, body.text);
 		return result;
 	} catch (error) {
 		console.error(`[sendTelegramMessage] 异常 chat=${chatId}:`, error);
