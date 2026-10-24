@@ -1,7 +1,7 @@
 // 公开封禁查询（GET /{TGID}，方案 B，2026-10-24）
 // 给普通用户的只读入口：不要 TOKEN，不碰任何管理功能。
-// 结果两块：GKY 记录（照旧）+ 本机器人黑名单只给「是否封禁 + 封禁日期」，
-// 原因 / 备注 / 操作人一律不出门。
+// 结果两块：GKY 封禁库 + 本机器人全局黑名单，按 GKY 详情页字段逐行展示。
+// 2026-10-24 主人改口径：原因 / 备注 / 消息原文公开，操作人只显示身份（附链接），操作人 TGID 数字不出门。
 // D1 用 node:sqlite 内存库，跑真实 SQL；GKY 上游用假 fetch。
 
 import fs from 'node:fs';
@@ -9,6 +9,7 @@ import vm from 'node:vm';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import crypto from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const src = fs.readFileSync(path.join(__dirname, '_worker.js'), 'utf8');
@@ -103,10 +104,19 @@ console.log('\n[1] 本地已封禁的人：HTML 页');
 	assert('返回 200 HTML', res.status === 200 && /text\/html/.test(res.headers.get('Content-Type') || ''), res.status + ' ' + res.headers.get('Content-Type'));
 	assert('显示「已封禁」', html.includes('已封禁'));
 	assert('封禁日期按北京时间显示（UTC 20:30 → 次日 03-05）', html.includes('2026-03-05'), html.slice(0, 300));
-	assert('不出现原因 / 备注 / 操作人', !html.includes(PRIVATE_REASON) && !html.includes(PRIVATE_NOTE) && !html.includes(PRIVATE_BY));
+	// 2026-10-24 主人定：原因 / 备注改为公开（旧断言「不出现」已反向）；操作人只显示身份，TGID 数字仍不出门
+	assert('公开原因（主表 reason 原样）', html.includes(PRIVATE_REASON));
+	assert('公开备注（Detail 退回「原因说明：备注」）', html.includes('原因说明：' + PRIVATE_NOTE));
+	assert('操作人 TGID 数字不出现', !html.includes(PRIVATE_BY));
+	assert('旧记录没有附表 → ChatID / MsgID / 操作人显示「未记录」', html.includes('未记录') && html.includes('ChatID') && html.includes('MsgID') && html.includes('操作人'));
 	assert('页面带查询框（可直接换个 ID 查）', /<form[^>]*method="get"/i.test(html) && html.includes('name="tgid"'));
-	assert('页面不含脚本', !/<script/i.test(html));
-	assert('CSP 禁脚本', /script-src 'none'|default-src 'none'/.test(res.headers.get('Content-Security-Policy') || ''), res.headers.get('Content-Security-Policy'));
+	const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gi)];
+	assert('页面只有一段内联脚本（复制 / Back）', (html.match(/<script/gi) || []).length === 1 && scripts.length === 1);
+	const csp = res.headers.get('Content-Security-Policy') || '';
+	const hash = scripts[0] ? 'sha256-' + crypto.createHash('sha256').update(scripts[0][1], 'utf8').digest('base64') : '';
+	assert('CSP 只放行这段脚本的 hash（改脚本忘改 hash 会红）', hash && csp.includes("script-src '" + hash + "'") && !/script-src[^;]*unsafe-inline/.test(csp), csp + ' 现算=' + hash);
+	assert('全局块复制 /unban TGID + 群管理员提示', html.includes('data-copy="/unban 111111111"') && html.includes('被第一主人封杀的用户无法解封'));
+	assert('页面有 Back、深色', html.includes('data-back') && html.includes('color-scheme" content="dark"'));
 }
 
 console.log('\n[2] ?format=json');
@@ -115,8 +125,9 @@ console.log('\n[2] ?format=json');
 	const data = await res.json();
 	assert('local.banned=true + since 日期', data.local && data.local.banned === true && data.local.since === '2026-03-05', JSON.stringify(data.local));
 	const localKeys = Object.keys(data.local || {}).sort().join(',');
-	assert('local 只有 banned / since 两个字段', localKeys === 'banned,since', localKeys);
-	assert('JSON 全文不含原因 / 备注 / 操作人', !JSON.stringify(data).includes(PRIVATE_REASON) && !JSON.stringify(data).includes(PRIVATE_NOTE) && !JSON.stringify(data).includes(PRIVATE_BY));
+	assert('local 字段集合 = GKY 同款字段 + 操作人 / Detail', localKeys === 'banned,chatId,detail,info,msgId,operator,reason,reasonCode,since,tgid', localKeys);
+	const json = JSON.stringify(data);
+	assert('JSON 含原因 / 备注、不含操作人 TGID', json.includes(PRIVATE_REASON) && json.includes(PRIVATE_NOTE) && !json.includes(PRIVATE_BY), json);
 	assert('gky 结果照常带回', data.gky && data.gky.success === true && data.gky.banned === false, JSON.stringify(data.gky));
 	assert('tgid 回显', data.tgid === '111111111');
 }
@@ -127,8 +138,11 @@ console.log('\n[3] 本地未封禁、GKY 命中');
 	assert('local.banned=false', data.local && data.local.banned === false, JSON.stringify(data.local));
 	assert('GKY 命中 + 原因映射中文', data.gky && data.gky.banned === true && data.gky.reason === '群众举报', JSON.stringify(data.gky));
 	const html = await (await get('/222222222')).text();
-	assert('HTML 显示 GKY 原因', html.includes('群众举报'));
-	assert('GKY 内容里的 <script> 不会原样进页面', !/<script/i.test(html) && html.includes('示例广告'));
+	assert('HTML 的 Reason 写成「原始代码（中文）」', html.includes('SpamGP（群众举报）'));
+	assert('HTML 显示 GKY 的 ChatID / MsgID', html.includes('-1001111111111') && html.includes('<strong>77</strong>'));
+	assert('GKY 内容里的 <script> 不会原样进页面', !html.includes('<script>alert(1)') && (html.match(/<script/gi) || []).length === 1 && html.includes('示例广告'));
+	assert('GKY 块复制 GKYbotSave + 换行 + TGID', html.includes('data-copy="GKYbotSave\n222222222"'));
+	assert('解锁只是复制按钮（type=button，不是表单 / 链接）', /<button type="button" class="unlock" data-copy=/.test(html) && !/action="[^"]*unban/i.test(html));
 }
 
 console.log('\n[4] 上游与 D1 故障互不连坐');
@@ -184,6 +198,42 @@ console.log('\n[7] 公开查询不碰与它无关的 D1');
 	assert('不合并动态群（不读 dynamic_groups）', touched.length === 0, touched.join(' | '));
 	const writes = fresh.sqlLog.filter((s) => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(s));
 	assert('不写任何数据', writes.length === 0, writes.join(' | '));
+}
+
+console.log('\n[8] 新记录带附表：ChatID / MsgID / 原文 / 操作人身份链接 / 逐条判据');
+{
+	const d = makeSqliteD1();
+	d._db.exec('CREATE TABLE blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT)');
+	d._db.exec('CREATE TABLE blacklist_detail (id TEXT PRIMARY KEY, chat_id TEXT, msg_id INTEGER, operator_role TEXT, operator_username TEXT, text TEXT, detail TEXT, at TEXT NOT NULL)');
+	const ins = d._db.prepare('INSERT INTO blacklist (id, reason, by_user, at, note) VALUES (?, ?, ?, ?, ?)');
+	const insD = d._db.prepare('INSERT INTO blacklist_detail VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+	ins.run('444444444', 'spam', PRIVATE_BY, '2026-03-04T01:00:00.000Z', '');
+	insD.run('444444444', '-1001111111111', 55, 'group_admin', 'fake_admin_x', '<img src=x onerror=alert(1)>买粉加我', JSON.stringify(['命中词表：加我', '操作人 TGID：' + PRIVATE_BY, '同款模板 3 次']), '2026-03-04T01:00:00.000Z');
+	ins.run('555555555', 'manual', PRIVATE_BY, '2026-03-04T01:00:00.000Z', '');
+	insD.run('555555555', null, null, 'super_admin', null, null, '[]', '2026-03-04T01:00:00.000Z');
+	ins.run('666666666', 'ad_auto', '0', '2026-03-04T01:00:00.000Z', '');
+	insD.run('666666666', '-1001111111111', 9, 'system', null, '广告原文', JSON.stringify(['AI 判定：广告']), '2026-03-04T01:00:00.000Z');
+	const e = { ...env, DB: d };
+
+	const html = await (await get('/444444444', e)).text();
+	const data = await (await get('/444444444?format=json', e)).json();
+	assert('ChatID 直接显示群 ID', data.local.chatId === '-1001111111111' && html.includes('-1001111111111'), JSON.stringify(data.local));
+	assert('MsgID 显示', data.local.msgId === '55' && html.includes('<strong>55</strong>'));
+	assert('Reason =「代码（中文）」', data.local.reason === 'spam（/spam 人工举报）' && html.includes('spam（/spam 人工举报）'), data.local.reason);
+	assert('操作人 = 群管理员，链接 t.me/用户名', html.includes('<a href="https://t.me/fake_admin_x" rel="noopener noreferrer">群管理员</a>'));
+	assert('操作人 TGID 不出现（页面与 JSON）', !html.includes(PRIVATE_BY) && !JSON.stringify(data).includes(PRIVATE_BY));
+	assert('Detail 逐条列出、去掉「操作人 TGID」行', html.includes('<li>命中词表：加我</li>') && html.includes('<li>同款模板 3 次</li>') && data.local.detail.length === 2, JSON.stringify(data.local.detail));
+	assert('Info = 消息原文，且被转义', html.includes('&lt;img src=x onerror=alert(1)&gt;买粉加我') && !html.includes('<img'));
+
+	const h2 = await (await get('/555555555', e)).text();
+	assert('没用户名 → tg://user?id= 并注明可能打不开', h2.includes('href="tg://user?id=' + PRIVATE_BY + '"') && h2.includes('超级管理员') && h2.includes('可能因对方隐私设置打不开'));
+	assert('私聊发起（无 chat_id）→ ChatID 显示「未记录」', /ChatID<\/span><strong><em class="muted">未记录/.test(h2));
+
+	const h3 = await (await get('/666666666', e)).text();
+	assert('系统自动：只显示身份、不给链接', /操作人<\/span><strong>系统自动<\/strong>/.test(h3));
+
+	const writes = d.sqlLog.filter((s) => /^\s*(INSERT|UPDATE|DELETE|CREATE)\b/i.test(s));
+	assert('查附表也不写任何数据 / 不建表', writes.length === 0, writes.join(' | '));
 }
 
 console.log(`\n=== 总计 ${pass + fail} 项，通过 ${pass}，失败 ${fail} ===`);

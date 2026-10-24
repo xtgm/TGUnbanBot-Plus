@@ -16109,6 +16109,16 @@ async function getGroupInfo() {
 	}
 }
 
+// GKY 封禁原因代码 → 中文。/banlist 老接口只回中文（结构不变）；
+// 公开查询页要「原始代码（中文）」，用 GKY_REASON_CODES 反查回代码。
+const GKY_REASON_LABELS = {
+	'SpamGP': '群众举报',
+	'ExReply': '违规转发',
+	'Ad Image': '违规图片',
+	'UserName': '违规用户名/签名'
+};
+const GKY_REASON_CODES = Object.fromEntries(Object.entries(GKY_REASON_LABELS).map(([code, label]) => [label, code]));
+
 async function handleBanlist(chatId) {
 	function parseBanlistHTML(html, tgid) {
 		// 检查是否没有封禁记录。
@@ -16166,13 +16176,7 @@ async function handleBanlist(chatId) {
 		if (reasonMatch) {
 			const rawReason = reasonMatch[1].trim();
 			// 映射封禁原因为中文
-			const reasonMap = {
-				'SpamGP': '群众举报',
-				'ExReply': '违规转发',
-				'Ad Image': '违规图片',
-				'UserName': '违规用户名/签名'
-			};
-			result.reason = reasonMap[rawReason] || rawReason;
+			result.reason = GKY_REASON_LABELS[rawReason] || rawReason;
 		}
 
 		// 提取 Info (封禁的消息内容)
@@ -16226,18 +16230,82 @@ async function handleBanlist(chatId) {
 // 两块各自容错：一边挂了另一边照出，挂的那边给中文说明，绝不把「查不到」说成「未封禁」。
 const PUBLIC_TGID_PATTERN = /^\d{1,20}$/;
 
+// 【2026-10-24 改：原因完整公开】主人定：「原因必须完整详细。让用户看得懂看得明白看得清楚。」
+// 「既然都走独立了 还怕什么公开不公开的」—— 本地块改为与 GKY 同样的详情：
+// Recorded Date / TGID / ChatID / MsgID / Reason（原始代码（中文））/ 操作人 / Detail / Info。
+// 操作人只给身份（第一主人 / 副主人 / 超管 / 群主 / 群管理员 / 系统自动 / 匿名管理员），
+// 身份做成可联系的链接，TGID 数字不显示。杀手黑名单不进查询页（只读 blacklist 表）。
+// ChatID / MsgID / 操作人 / 原文来自加黑附表 blacklist_detail，只有本功能上线后的新记录才有
+// （主人：「旧记录一概不管。 全部以新来开始实行。」），旧记录这几栏显示「未记录」。
+const PUBLIC_OPERATOR_ROLE_LABELS = {
+	primary_owner: '第一主人',
+	secondary_owner: '副主人',
+	super_admin: '超级管理员',
+	group_creator: '群主',
+	group_admin: '群管理员',
+	system: '系统自动',
+	anonymous_admin: '匿名管理员'
+};
+
+// 操作人链接：有用户名用 t.me/用户名（任何设备都能打开）；没有就退回 tg://user?id=
+//（只在装了 Telegram 的设备上能打开，且对方隐私设置可能让它打不开 —— 页面上注明）。
+// 系统自动 / 匿名管理员不是具体某个人，不给链接。
+function buildPublicOperator(role, username, byUser) {
+	const roleKey = String(role || '');
+	const label = PUBLIC_OPERATOR_ROLE_LABELS[roleKey] || '未知';
+	if (!roleKey || roleKey === 'system' || roleKey === 'anonymous_admin') return { role: roleKey || null, label, url: null, fallback: false };
+	const name = String(username || '').replace(/^@/, '');
+	if (/^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(name)) return { role: roleKey, label, url: 'https://t.me/' + name, fallback: false };
+	const id = String(byUser || '');
+	if (/^\d+$/.test(id)) return { role: roleKey, label, url: 'tg://user?id=' + id, fallback: true };
+	return { role: roleKey, label, url: null, fallback: false };
+}
+
+function parsePublicDetailReasons(raw) {
+	try {
+		const list = JSON.parse(String(raw || ''));
+		return Array.isArray(list) ? list.map((x) => String(x || '').trim()).filter(Boolean) : [];
+	} catch (_) {
+		return [];
+	}
+}
+
 async function readPublicLocalBan(env, tgid) {
 	if (!env.DB) return { error: '本机器人未启用黑名单库' };
+	let row;
 	try {
-		const row = await env.DB.prepare('SELECT at FROM blacklist WHERE id = ? LIMIT 1').bind(tgid).first();
-		if (!row) return { banned: false };
-		return { banned: true, since: formatBeijingDate(row.at) };
+		row = await env.DB.prepare('SELECT at, reason, note, by_user FROM blacklist WHERE id = ? LIMIT 1').bind(tgid).first();
 	} catch (error) {
 		// 表还没建 = 一个人都没封过，这是确定的「未封禁」，不是故障
 		if (/no such table/i.test(String(error?.message || ''))) return { banned: false };
 		console.error('[公开查询] 读本地黑名单失败:', error?.message || error);
 		return { error: '暂时无法查询本机器人黑名单，请稍后再试' };
 	}
+	if (!row) return { banned: false };
+	// 附表单独读、单独容错：附表没建 / 读失败只让那几栏显示「未记录」，不影响「已封禁」这个结论。
+	let detail = null;
+	try {
+		detail = await env.DB.prepare('SELECT chat_id, msg_id, operator_role, operator_username, text, detail FROM blacklist_detail WHERE id = ? LIMIT 1').bind(tgid).first();
+	} catch (error) {
+		if (!/no such table/i.test(String(error?.message || ''))) console.error('[公开查询] 读加黑附表失败:', error?.message || error);
+	}
+	const code = String(row.reason || '');
+	const label = AD_BLACKLIST_REASON_LABELS[code] || DEFAULT_BLACKLIST_REASON_LABELS[code] || '';
+	const reasons = parsePublicDetailReasons(detail?.detail);
+	return {
+		banned: true,
+		since: formatBeijingDate(row.at),
+		tgid,
+		chatId: detail?.chat_id ? String(detail.chat_id) : null,
+		msgId: detail?.msg_id != null ? String(detail.msg_id) : null,
+		reasonCode: code || null,
+		reason: code ? (label ? code + '（' + label + '）' : code) : '未标注原因',
+		operator: detail ? buildPublicOperator(detail.operator_role, detail.operator_username, row.by_user) : null,
+		// 逐条判据；附表里没有（旧记录）就退回主表的处置方式 + 原因说明。
+		detail: (reasons.length ? reasons : buildBlacklistFallbackReasons(code, row.note ? String(row.note) : ''))
+			.filter((x) => !/^操作人\s*TGID/.test(x)),
+		info: detail?.text ? String(detail.text) : null
+	};
 }
 
 async function readPublicGky(tgid) {
@@ -16275,68 +16343,113 @@ async function handlePublicLookup(env, url, tgid) {
 	return publicLookupHtml(renderPublicLookupPage(tgid, result, ''), 200);
 }
 
+// 页面唯一的脚本：「解锁 (Unban)」按钮只复制解封代码（主人定：不是点了就解封）+ 返回按钮。
+// 【不拼任何数据】要复制的内容放在按钮的 data-copy 属性里，脚本本身是固定文本 ——
+// 所以 CSP 能用 sha256 锁死这一段，别的脚本（包括 GKY 内容里夹带的）一律不执行。
+// 【改这段必须同步改 PUBLIC_LOOKUP_SCRIPT_HASH】test_public_lookup.mjs 会现算 sha256 比对，不一致就红。
+const PUBLIC_LOOKUP_SCRIPT = 'document.addEventListener("click",function(e){var k=e.target.closest("[data-back]");if(k&&history.length>1){e.preventDefault();history.back();return;}var b=e.target.closest("button[data-copy]");if(!b)return;var t=b.getAttribute("data-copy");var n=document.getElementById(b.getAttribute("data-note"));function show(ok){if(!n)return;n.textContent=ok?b.getAttribute("data-ok"):"复制失败，请手动复制："+t;n.hidden=false;}function legacy(){var a=document.createElement("textarea");a.value=t;a.setAttribute("readonly","");a.style.position="fixed";a.style.opacity="0";document.body.appendChild(a);a.select();var ok=false;try{ok=document.execCommand("copy");}catch(_){}a.remove();return ok;}if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){show(true);},function(){show(legacy());});}else{show(legacy());}});';
+const PUBLIC_LOOKUP_SCRIPT_HASH = 'sha256-RJfxuhAjAe6BTA1+KSgsNPbAEcMNetI96YaH0Gm5CEg=';
+
 function publicLookupHtml(html, status) {
 	return new Response(html, {
 		status,
 		headers: {
 			'Content-Type': 'text/html; charset=UTF-8',
 			'Cache-Control': 'no-store',
-			// 页面零脚本：只放行内联样式与同源表单提交
-			'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+			// 只放行内联样式、同源表单提交，以及 hash 锁定的那一段复制脚本
+			'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src '" + PUBLIC_LOOKUP_SCRIPT_HASH + "'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
 			'Referrer-Policy': 'no-referrer',
 			'X-Content-Type-Options': 'nosniff'
 		}
 	});
 }
 
+// 渲染公开查询页（GKY 详情页同款：字段逐行 + 解锁按钮 + Back，深色）。
+// 所有外来值（GKY 原文、消息原文、用户名）一律 escapeHtml；属性一律双引号（escapeHtml 转义了 "）。
 function renderPublicLookupPage(tgid, result, formError) {
-	const row = (label, value) => `<div class="row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
+	const missing = '<em class="muted">未记录</em>';
+	const row = (label, valueHtml) => `<div class="row"><span>${escapeHtml(label)}</span><strong>${valueHtml}</strong></div>`;
+	const text = (value) => (value == null || value === '' ? missing : escapeHtml(value));
+	const block = (label, valueHtml) => `<div class="field"><span>${escapeHtml(label)}</span>${valueHtml}</div>`;
+	const unlockButton = (id, copyText, okText) => `<button type="button" class="unlock" data-copy="${escapeHtml(copyText)}" data-note="${id}" data-ok="${escapeHtml(okText)}">解锁 (Unban)</button><p class="note" id="${id}" role="status" hidden></p>`;
 	let body = '';
 	if (formError) body += `<p class="alert">${escapeHtml(formError)}</p>`;
 	if (result) {
 		const { local, gky } = result;
-		let localHtml;
-		if (local.error) localHtml = `<p class="muted">${escapeHtml(local.error)}</p>`;
-		else if (local.banned) localHtml = `<p class="tag bad">已封禁</p>${row('封禁日期', local.since ? local.since + '（北京时间）' : '日期未知')}`;
-		else localHtml = '<p class="tag ok">未封禁</p>';
 		let gkyHtml;
 		if (!gky || gky.success === false) gkyHtml = `<p class="muted">${escapeHtml(gky?.error || '暂时无法查询外部封禁库，请稍后再试')}</p>`;
 		else if (!gky.banned) gkyHtml = '<p class="tag ok">无封禁记录</p>';
 		else {
-			gkyHtml = '<p class="tag bad">有封禁记录</p>';
-			if (gky.reason) gkyHtml += row('原因', gky.reason);
-			if (gky.recordedDate) gkyHtml += row('记录日期', gky.recordedDate);
-			if (gky.chatId) gkyHtml += row('来源群', gky.chatId);
-			if (gky.info) gkyHtml += `<div class="info">${escapeHtml(gky.info)}</div>`;
+			const code = GKY_REASON_CODES[gky.reason] || '';
+			const reason = gky.reason ? (code ? code + '（' + gky.reason + '）' : gky.reason) : '';
+			gkyHtml = '<p class="tag bad">有封禁记录</p>'
+				+ row('Recorded Date', text(gky.recordedDate))
+				+ unlockButton('gky-note', 'GKYbotSave\n' + tgid, '已复制，请把复制的内容发给 GKY 机器人申请解封。')
+				+ row('TGID', text(gky.tgid || tgid))
+				+ row('ChatID', text(gky.chatId))
+				+ row('MsgID', text(gky.msgId))
+				+ row('Reason', text(reason))
+				+ block('Info', gky.info ? `<div class="info">${escapeHtml(gky.info)}</div>` : missing);
 		}
-		body += `<section><h2>本机器人黑名单</h2>${localHtml}</section><section><h2>GKY 封禁库</h2>${gkyHtml}</section>`;
+		let localHtml;
+		if (local.error) localHtml = `<p class="muted">${escapeHtml(local.error)}</p>`;
+		else if (!local.banned) localHtml = '<p class="tag ok">未封禁</p>';
+		else {
+			const op = local.operator;
+			let operatorHtml = missing;
+			if (op?.url) {
+				operatorHtml = `<a href="${escapeHtml(op.url)}" rel="noopener noreferrer">${escapeHtml(op.label)}</a>`
+					+ (op.fallback ? '<small class="muted">（对方没有用户名，链接需已安装 Telegram，且可能因对方隐私设置打不开）</small>' : '');
+			} else if (op) {
+				operatorHtml = escapeHtml(op.label);
+			}
+			const detailHtml = Array.isArray(local.detail) && local.detail.length
+				? `<ul class="info">${local.detail.map((x) => `<li>${escapeHtml(x)}</li>`).join('')}</ul>`
+				: missing;
+			localHtml = '<p class="tag bad">已封禁</p>'
+				+ row('Recorded Date', local.since ? escapeHtml(local.since + '（北京时间）') : missing)
+				+ unlockButton('local-note', '/unban ' + tgid, '已复制，请由群管理员在群内发送进行解封。被第一主人封杀的用户无法解封。')
+				+ row('TGID', text(local.tgid || tgid))
+				+ row('ChatID', text(local.chatId))
+				+ row('MsgID', text(local.msgId))
+				+ row('Reason', text(local.reason))
+				+ row('操作人', operatorHtml)
+				+ block('Detail', detailHtml)
+				+ block('Info', local.info ? `<div class="info">${escapeHtml(local.info)}</div>` : missing);
+		}
+		body += `<section><h2>GKY 封禁库</h2>${gkyHtml}</section><section><h2>本机器人全局黑名单</h2>${localHtml}</section>`;
 		body += `<p class="muted small">JSON：<a href="/${escapeHtml(tgid)}?format=json">/${escapeHtml(tgid)}?format=json</a></p>`;
+		body += '<p><a href="" class="back" data-back>Back</a></p>';
 	}
 	return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>封禁查询 · ${escapeHtml(tgid)}</title>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark"><title>封禁查询 · ${escapeHtml(tgid)}</title>
 <style>
-body{margin:0;font:15px/1.6 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f4f5f7;color:#1d2129}
-main{max-width:560px;margin:0 auto;padding:24px 16px}
-h1{font-size:20px;margin:0 0 4px}h2{font-size:14px;margin:0 0 10px;color:#4e5969}
+body{margin:0;font:15px/1.6 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#121214;color:#e5e6eb}
+main{max-width:640px;margin:0 auto;padding:24px 16px}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:0 0 10px;color:#c9cdd4}
 form{display:flex;gap:8px;margin:16px 0}
-input{flex:1;min-width:0;padding:10px 12px;font:inherit;border:1px solid #c9cdd4;border-radius:8px;background:#fff;color:inherit}
+input{flex:1;min-width:0;padding:10px 12px;font:inherit;border:1px solid #484849;border-radius:8px;background:#232324;color:inherit}
 button{padding:10px 18px;font:inherit;border:0;border-radius:8px;background:#165dff;color:#fff;cursor:pointer}
-input:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid #165dff;outline-offset:2px}
-section{background:#fff;border:1px solid #e5e6eb;border-radius:10px;padding:14px 16px;margin-bottom:12px}
+input:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid #4080ff;outline-offset:2px}
+section{background:#1e1e20;border:1px solid #333335;border-radius:10px;padding:14px 16px;margin-bottom:12px}
 .tag{display:inline-block;margin:0 0 8px;padding:2px 10px;border-radius:999px;font-weight:600}
-.ok{background:#e8ffea;color:#00692a}.bad{background:#ffece8;color:#a1151e}
-.row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-top:1px solid #f2f3f5}
-.row span{color:#4e5969}.row strong{font-weight:500;text-align:right;word-break:break-all}
-.info{white-space:pre-wrap;word-break:break-all;background:#f7f8fa;border-radius:6px;padding:8px 10px;margin-top:8px;font-size:13px}
-.alert{background:#ffece8;color:#a1151e;border-radius:8px;padding:10px 12px}
-.muted{color:#4e5969}.small{font-size:12px}a{color:#165dff}
-@media(prefers-color-scheme:dark){body{background:#17171a;color:#e5e6eb}section{background:#232324;border-color:#333335}input{background:#232324;border-color:#484849}h2,.muted,.row span{color:#a9aeb8}.row{border-color:#333335}.info{background:#2a2a2b}.ok{background:#0b3d1c;color:#7be188}.bad,.alert{background:#4d1418;color:#f98981}a{color:#4080ff}}
+.ok{background:#0b3d1c;color:#7be188}.bad{background:#4d1418;color:#f98981}
+.row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-top:1px solid #333335}
+.row span,.field>span{color:#a9aeb8}.row strong{font-weight:500;text-align:right;word-break:break-all}
+.field{padding:6px 0;border-top:1px solid #333335}
+.info{white-space:pre-wrap;word-break:break-all;background:#2a2a2b;border-radius:6px;padding:8px 10px;margin:6px 0 0;font-size:13px}
+ul.info{padding-left:28px}
+.unlock{display:block;width:100%;margin:8px 0;background:#2e7d32}
+.note{margin:0 0 8px;color:#7be188;font-size:13px}
+.alert{background:#4d1418;color:#f98981;border-radius:8px;padding:10px 12px}
+.muted{color:#a9aeb8}.small{font-size:12px}a{color:#4080ff}small{display:block}
+.back{display:inline-block;padding:8px 18px;border:1px solid #484849;border-radius:8px;text-decoration:none}
 </style></head>
 <body><main>
 <h1>封禁查询</h1><p class="muted">TGID <strong>${escapeHtml(tgid)}</strong></p>
 <form method="get" action=""><label for="tgid" class="muted" style="position:absolute;left:-9999px">要查询的 TGID</label><input id="tgid" name="tgid" inputmode="numeric" maxlength="20" placeholder="输入 TGID 查询" autocomplete="off" required><button type="submit">查询</button></form>
 ${body}
-</main></body></html>`;
+</main><script>${PUBLIC_LOOKUP_SCRIPT}</script></body></html>`;
 }
 
 // 通过群组ID获取群组信息
