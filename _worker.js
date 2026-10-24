@@ -840,7 +840,7 @@ class MiniAppError extends Error {
 	}
 }
 
-const MINI_APP_ACTIONS = new Set(['bootstrap', 'groups/list', 'groups/add', 'groups/remove', 'groups/leave', 'blacklist/list', 'blacklist/unban', 'ads/summary', 'ads/pending', 'ads/ignore', 'ads/fingerprints', 'ads/samples', 'ads/observing', 'ads/llm', 'ads/dryrun', 'ads/whitelist', 'users/query', 'health', 'admins/list', 'search', 'notice/send']);
+const MINI_APP_ACTIONS = new Set(['bootstrap', 'groups/list', 'groups/add', 'groups/remove', 'groups/leave', 'blacklist/list', 'blacklist/unban', 'ads/summary', 'ads/pending', 'ads/ignore', 'ads/fingerprints', 'ads/samples', 'ads/observing', 'ads/llm', 'ads/dryrun', 'ads/whitelist', 'ads/whitelist/add', 'ads/whitelist/remove', 'groups/detail', 'users/query', 'health', 'admins/list', 'search', 'notice/send']);
 // 杀手子后台的接口（与主后台同一个 /app/api/ 前缀，按身份分流；杀手身份调主后台独有的接口一律 404）。
 const KILLER_MINI_APP_ACTIONS = new Set(['killer/bootstrap', 'killer/groups', 'killer/health', 'killer/blacklist/list', 'killer/blacklist/ban', 'killer/blacklist/unban', 'killer/users/query', 'killer/search', 'killer/notice/send', 'killer/stats', 'killer/stats/members']);
 const MINI_APP_BODY_LIMIT = 32768;
@@ -1058,6 +1058,11 @@ function renderMiniAppHtml() {
     .config-row{display:flex;flex-wrap:wrap;gap:8px 20px;font-size:11px;color:var(--muted);margin:0}
     .drill-links{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line-soft)}
     .drill-links .button.active{border-color:var(--accent);color:var(--accent)}
+    .whitelist-add{margin:0 0 4px}
+    .card-actions .subtle{align-self:center;margin:0}
+    .group-detail:empty{display:none}
+    .group-detail{margin-top:12px;padding-top:12px;border-top:1px solid var(--line-soft);display:flex;flex-direction:column;gap:14px}
+    .detail-title{font-size:12px;font-weight:600;margin:0 0 6px}
     .config-row strong{font-weight:650;color:var(--text);margin-left:4px}
 
     /* 广告卡评分 */
@@ -1375,11 +1380,33 @@ function renderMiniAppHtml() {
         var id = text(group.chatId); var card = element('article', 'card'); var heading = element('div', 'card-heading'); var title = element('div'); title.append(element('h3', 'card-title', text(group.title, '未命名群组')), element('div', 'card-subtitle mono', id));
         var labels = { dynamic: '手动添加', static: '预设群组', env: '预设群组', config: '预设群组', both: '预设 / 手动', manual: '手动添加', environment: '预设群组' };
         heading.append(title, element('span', 'badge', labels[group.source] || text(group.source, '治理中'))); card.append(heading);
-        if (state.primaryOwner) { var actions = element('div', 'card-actions'); actions.append(makeButton('停止治理', 'small', function (button) { return mutateGroup(button, group, 'remove'); }), makeButton('退出群组', 'small danger', function (button) { return mutateGroup(button, group, 'leave'); })); card.append(actions); }
-        container.append(card);
+        var detail = element('div', 'group-detail'); detail.setAttribute('data-group-detail', id);
+        if (state.primaryOwner) { var actions = element('div', 'card-actions'); var more = makeButton('查看详情', 'small primary', function () { return toggleGroupDetail(more, detail, group); }); more.setAttribute('aria-expanded', 'false'); actions.append(more, makeButton('停止治理', 'small', function (button) { return mutateGroup(button, group, 'remove'); }), makeButton('退出群组', 'small danger', function (button) { return mutateGroup(button, group, 'leave'); })); card.append(actions); }
+        card.append(detail); container.append(card);
       });
     }
     async function loadGroups() { var seq = begin('groups'); loading($('groups-content'), '正在读取群组…'); try { var data = await api('groups/list'); if (!current('groups', seq)) return; renderGroups(Array.isArray(data) ? data : data && data.groups); state.loaded.groups = true; } catch (err) { if (err.auth || !current('groups', seq)) return; empty($('groups-content'), '群组加载失败', err.message, loadGroups); } }
+    // 群组详情（批次 3）：卡片里点「查看详情」展开，再点收起。机器人权限 + 演练 + 两份流水，每条流水点开查用户。
+    var JOIN_VERDICT = { ban: ['判封', 'danger'], observe: ['进观察', 'warning'], pass: ['放行', 'accent'], pending: ['待定', ''] };
+    function toggleGroupDetail(button, box, group) { var key = 'group-detail:' + group.chatId; if (button.getAttribute('aria-expanded') === 'true') { begin(key); box.replaceChildren(); button.setAttribute('aria-expanded', 'false'); button.textContent = '查看详情'; return; } button.setAttribute('aria-expanded', 'true'); button.textContent = '收起详情'; return loadGroupDetail(box, group); }
+    async function loadGroupDetail(box, group) {
+      var key = 'group-detail:' + group.chatId; var seq = begin(key); loading(box, '正在读取群组详情…');
+      try { var data = await api('groups/detail', { chatId: String(group.chatId) }); if (!current(key, seq)) return; renderGroupDetail(box, data || {}); }
+      catch (err) { if (err.auth || !current(key, seq)) return; empty(box, '群组详情读取失败', err.message, function () { return loadGroupDetail(box, group); }); }
+    }
+    function detailRows(title, rows, emptyText, describe) { var section = element('section', 'detail-section'); var head = element('div', 'card-heading'); head.append(element('h4', 'detail-title', title), element('span', 'counter', count(rows.length) + ' 条')); section.append(head); if (!rows.length) { section.append(element('p', 'subtle', emptyText)); return section; } var list = element('div', 'result-list'); rows.forEach(function (r) { var d = describe(r); var item = element('div', 'result-item'); var who = element('div', 'result-who', '用户 ' + text(r.userId) + ' · ' + date(r.createdAt)); if (d.badge) who.append(' ', element('span', 'badge ' + (d.badge[1] || ''), d.badge[0])); item.append(who, element('div', 'result-text', d.text)); clickable(item, '查询用户 ' + text(r.userId), function () { return openUser(r.userId); }); list.append(item); }); section.append(list); return section; }
+    function renderGroupDetail(box, data) {
+      box.replaceChildren(); var bot = data.bot || {};
+      var perm = element('section', 'detail-section'); perm.append(element('h4', 'detail-title', '机器人权限'));
+      var statusLabel = { creator: '群主', administrator: '管理员', member: '普通成员', restricted: '受限成员', left: '不在群内', kicked: '已被移出' }[bot.status] || '状态未知';
+      perm.append(element('p', bot.ok ? 'subtle' : 'dialog-warning', (bot.ok ? '✅ ' : '⚠️ ') + statusLabel + (bot.ok ? '，可以正常封禁' : '，无法执行封禁') + (bot.reason ? '（' + bot.reason + '）' : '')));
+      if (Array.isArray(bot.permissions) && bot.permissions.length) { var badges = element('div', 'reason-list'); bot.permissions.forEach(function (p) { badges.append(element('span', 'badge ' + (p.on ? 'accent' : (p.key === 'can_restrict_members' ? 'danger' : '')), (p.on ? '✓ ' : '✗ ') + text(p.label))); }); perm.append(badges); }
+      var st = data.dryRunStats || {}; var dry = element('section', 'detail-section'); dry.append(element('h4', 'detail-title', '演练模式'));
+      dry.append(detailList([['开关', data.dryRun ? '已开启（只记录不处置）' : '未开启'], ['演练命中', count(st.total) + ' 条（近 24 小时 ' + count(st.today) + '）'], ['主人判误报 / 确认封', count(st.fp) + ' / ' + count(st.done)], ['误报最低分', st.lowestFp === null || st.lowestFp === undefined ? '—' : text(st.lowestFp)]]));
+      box.append(perm, dry,
+        detailRows('近期演练流水', Array.isArray(data.dryrunLog) ? data.dryrunLog : [], '这个群还没有演练记录。', function (r) { var reasons = (r.reasons || []).join('、'); return { badge: DRY_STATUS[r.status] || DRY_STATUS.open, text: '评分 ' + text(r.score) + ' / 封禁线 ' + text(r.threshold) + ' · ' + text(r.layer) + (reasons ? '\n' + reasons : '') }; }),
+        detailRows('入群检查流水', Array.isArray(data.joinChecks) ? data.joinChecks : [], '这个群还没有入群检查记录。', function (r) { var reasons = (r.reasons || []).join('、'); return { badge: JOIN_VERDICT[r.verdict] || [text(r.verdict), ''], text: '评分 ' + text(r.score) + ' / 封禁线 ' + text(r.threshold) + ' · ' + text(r.layer) + (reasons ? '\n' + reasons : '') }; }));
+    }
     async function mutateGroup(button, group, action) {
       if (!state.primaryOwner) return toast('群组变更由第一主人操作。', 'error');
       var leaving = action === 'leave'; var confirmed = await confirmAction({ title: leaving ? '退出这个群组？' : '停止治理这个群组？', description: leaving ? '机器人将退出该群组，并将其移出治理范围。' : '该群组将移出治理范围，机器人继续留在群内。', object: text(group.title, '群组') + '\n' + text(group.chatId), warning: leaving ? '重新启用时，需要将机器人重新加入群组。' : '该群组后续将不参与统一治理。', label: leaving ? '确认退群' : '停止治理', danger: true });
@@ -1474,7 +1501,7 @@ function renderMiniAppHtml() {
       var head = element('div', 'toolbar'); head.append(element('h2', 'section-label', def.label + '明细')); var counter = element('span', 'counter'); head.append(counter); box.append(head);
       if (def.search) { var form = element('form', 'search-form'); var input = element('input', 'input'); input.type = 'search'; input.maxLength = 100; input.placeholder = '按指纹内容搜索'; input.value = state.adsDrillQuery; input.setAttribute('aria-label', '搜索指纹'); var go = element('button', 'button primary', '搜索'); go.type = 'submit'; form.append(input, go); form.addEventListener('submit', function (event) { event.preventDefault(); state.adsDrillQuery = input.value.trim(); loadAdsDrill(1); }); box.append(form); }
       var list = element('div', 'list-grid'); var pagerBox = element('div'); box.append(list, pagerBox); loading(list, '正在读取' + def.label + '…');
-      try { var data = await api(def.action, { page: page, query: state.adsDrillQuery }); if (!current('ads-drill', seq)) return; data = data || {}; list.replaceChildren(); if (data.total !== undefined) counter.textContent = count(data.total) + ' 条'; def.render(list, data); if (Array.isArray(data.items) && !data.items.length) empty(list, '暂无' + def.label + '记录', state.adsDrillQuery ? '没有匹配的内容，换个关键词试试。' : '有数据后会显示在这里。'); if (data.totalPages) pager(pagerBox, data, function (p) { return loadAdsDrill(p); }); }
+      try { var data = await api(def.action, { page: page, query: state.adsDrillQuery }); if (!current('ads-drill', seq)) return; data = data || {}; list.replaceChildren(); if (data.total !== undefined) counter.textContent = count(data.total) + ' 条'; def.render(list, data); if (Array.isArray(data.items) && !data.items.length) { var hole = element('div'); list.append(hole); empty(hole, '暂无' + def.label + '记录', state.adsDrillQuery ? '没有匹配的内容，换个关键词试试。' : '有数据后会显示在这里。'); } if (data.totalPages) pager(pagerBox, data, function (p) { return loadAdsDrill(p); }); }
       catch (err) { if (err.auth || !current('ads-drill', seq)) return; empty(list, def.label + '读取失败', err.message, function () { return loadAdsDrill(page); }); }
     }
     function drillCard(title, subtitle, badge, badgeClass) { var card = element('article', 'card'); var head = element('div', 'card-heading'); var id = element('div'); id.append(element('h3', 'card-title', title)); if (subtitle) id.append(element('div', 'card-subtitle mono', subtitle)); head.append(id); if (badge) head.append(element('span', 'badge ' + (badgeClass || ''), badge)); card.append(head); return card; }
@@ -1490,7 +1517,26 @@ function renderMiniAppHtml() {
     function renderDrillLLM(list, data) { var card = drillCard('第⑥层 AI 判定 · ' + text(data.day), data.enabled ? '已启用' : '未启用（没绑定 Workers AI 或已关闭）', data.broken ? '今日已熔断' : '', data.broken ? 'danger' : ''); var pools = data.pools || {}; var pairs = [['今日已用', count(data.used) + ' / ' + count(data.daily)]]; Object.keys(LLM_POOL).forEach(function (k) { var p = pools[k] || {}; pairs.push([LLM_POOL[k] + '池', count(p.used) + ' / ' + count(p.limit)]); }); pairs.push(['判为广告', count(data.hits)], ['达线封禁', count(data.bans)], ['解析失败', count(data.parseFail)], ['连续失败', count(data.consecFail)]); var cand = data.candidates || {}; pairs.push(['候选池', count(cand.total) + '（已转正 ' + count(cand.promoted) + '）']); card.append(detailList(pairs)); list.append(card); }
     var DRY_STATUS = { fp: ['主人判误报', 'danger'], done: ['主人确认封', 'accent'], open: ['未处理', ''] };
     function renderDrillDryRun(list, data) { (data.items || []).forEach(function (r) { var s = DRY_STATUS[r.status] || DRY_STATUS.open; var card = drillCard('用户 ' + text(r.userId), '#' + text(r.id) + ' · ' + date(r.createdAt), s[0], s[1]); var reasons = reasonBadges(r.reasons); if (reasons) card.append(reasons); card.append(detailList([['所在群组', text(r.chatId), true], ['评分 / 封禁线', text(r.score) + ' / ' + text(r.threshold)], ['判定层', text(r.layer)]])); clickable(card, '查询用户 ' + text(r.userId), function () { return openUser(r.userId); }); list.append(card); }); }
-    function renderDrillWhitelist(list, data) { (data.items || []).forEach(function (r) { var card = drillCard(personTitle(r), personSub(r), '白名单', 'accent'); card.append(detailList([['备注', text(r.note)], ['操作人', text(r.by), true], ['加入时间', date(r.at)]])); clickable(card, '查询用户 ' + text(r.userId), function () { return openUser(r.userId); }); list.append(card); }); }
+    // 白名单（批次 3 追加）：顶部一栏可一次加多个 TGID；每人卡片可「移出白名单」。卡片本身点开查用户，按钮不冒泡到卡片。
+    function renderDrillWhitelist(list, data) {
+      var form = element('form', 'search-form whitelist-add'); var input = element('input', 'input'); input.type = 'text'; input.inputMode = 'numeric'; input.maxLength = 1100; input.placeholder = '输入 TGID，多个用空格或逗号隔开'; input.setAttribute('aria-label', '要加入白名单的 TGID'); var go = element('button', 'button primary', '加入白名单'); go.type = 'submit'; form.append(input, go);
+      form.addEventListener('submit', function (event) { event.preventDefault(); addWhitelist(go, input.value).catch(function (err) { toast(err.message || '操作失败，请稍后重试。', 'error'); }); }); list.append(form);
+      (data.items || []).forEach(function (r) { var card = drillCard(personTitle(r), personSub(r), '白名单', 'accent'); card.append(detailList([['备注', text(r.note)], ['操作人', text(r.by), true], ['加入时间', date(r.at)]])); var actions = element('div', 'card-actions'); var remove = makeButton('移出白名单', 'small danger', function (button) { return removeWhitelist(button, r.userId, personTitle(r), function () { return loadAdsDrill(data.page || 1); }); }); stopBubble(remove); actions.append(remove); card.append(actions); clickable(card, '查询用户 ' + text(r.userId), function () { return openUser(r.userId); }); list.append(card); });
+    }
+    function stopBubble(el) { el.addEventListener('click', function (event) { event.stopPropagation(); }); el.addEventListener('keydown', function (event) { event.stopPropagation(); }); return el; }
+    async function addWhitelist(button, raw, after) {
+      var ids = String(raw || '').match(/\d+/g) || []; if (!ids.length) { toast('请输入至少一个纯数字 TGID。', 'error'); return false; }
+      var confirmed = await confirmAction({ title: '加入白名单？', description: '加入后这些人入群不查、发消息不判、封禁一律拒绝。', object: ids.slice(0, 20).join('、') + (ids.length > 20 ? ' …共 ' + ids.length + ' 个' : ''), warning: '已在黑名单的人不会因此解封，要放出来需另外解封。', label: '确认加入' });
+      if (!confirmed) return false; var done = false;
+      await actionButton(button, 'wl-add', async function () { var result = await api('ads/whitelist/add', { userIds: ids.join(' ') }); done = true; toast(result && result.message ? result.message : '已加入白名单。', result && result.complete === false ? 'error' : 'success'); if (after) await after(); else if (state.adsDrill === 'whitelist') await loadAdsDrill(1); });
+      return done;
+    }
+    async function removeWhitelist(button, userId, label, after) {
+      var confirmed = await confirmAction({ title: '移出白名单？', description: '移出后恢复广告检测：入群检查、发言判定、封禁都照常进行。', object: text(label) + '\nID ' + text(userId), label: '确认移出', danger: true });
+      if (!confirmed) return false; var done = false;
+      await actionButton(button, 'wl-del:' + userId, async function () { var result = await api('ads/whitelist/remove', { userId: String(userId) }); done = true; toast(result && result.message ? result.message : '已移出白名单。', 'success'); if (after) await after(); });
+      return done;
+    }
     async function loadAdsPending(page) { state.adsPage = Math.max(1, Number(page) || 1); var seq = begin('ads-pending'); loading($('ads-content'), '正在读取待复核记录…'); $('ads-pager').replaceChildren(); $('ads-count').textContent = ''; try { var data = await api('ads/pending', { page: state.adsPage }); if (!current('ads-pending', seq)) return; data = data || {}; state.adsPage = Number(data.page) || state.adsPage; if (state.adsPage > Math.max(1, Number(data.totalPages) || 1)) return loadAdsPending(Math.max(1, Number(data.totalPages) || 1)); renderAdsPending(data); state.loaded.ads = true; } catch (err) { if (err.auth || !current('ads-pending', seq)) return; empty($('ads-content'), '待复核记录加载失败', err.message, function () { return loadAdsPending(state.adsPage); }); } }
     async function loadAds() { await Promise.allSettled([loadAdsSummary(), loadAdsPending(state.adsPage)]); }
     function renderAdsPending(data) {
@@ -1584,8 +1630,8 @@ function renderMiniAppHtml() {
       return box;
     }
     function renderUser(data, requestedId) {
-      var container = $('users-content'); container.replaceChildren(); var id = text(data.userId, requestedId); container.append(renderVerdict(data, id)); var profile = data.profile || {}; var card = element('article', 'card'); var head = element('div', 'profile-top'); var name = text(profile.name || [profile.first_name, profile.last_name].filter(Boolean).join(' '), '用户 ' + id); var info = element('div', 'profile-info'); info.append(element('h2', '', name), element('div', 'mono muted', 'ID ' + id)); if (profile.username) info.append(element('div', 'card-subtitle', (String(profile.username).startsWith('@') ? '' : '@') + profile.username)); head.append(element('div', 'avatar', Array.from(name)[0]), info); card.append(head); var badges = element('div', 'profile-badges'); badges.append(element('span', 'badge ' + (data.blacklist ? 'danger' : 'accent'), data.blacklist ? '黑名单中' : '未列入黑名单')); if (!data.profile) badges.append(element('span', 'badge', '暂无保存的资料')); card.append(badges); var speech = data.speech || {}; var stats = element('div', 'speech-stats'); [['发言记录', count(speech.count)], ['首次发言', date(speech.first, true)], ['最近发言', date(speech.last, true)]].forEach(function (pair) { var cell = element('div'); cell.append(element('span', '', pair[0]), element('strong', '', pair[1])); stats.append(cell); }); card.append(stats); container.append(card);
-      var errors = data.errors || {}; if (Object.keys(errors).length) { var labels = { profile: '用户资料', blacklist: '黑名单状态', events: '处理时间线', cases: '处罚记录', speech: '发言统计' }; var notice = element('div', 'notice'); notice.append(element('div', '', '部分记录暂时无法读取')); Object.keys(errors).forEach(function (key) { if (errors[key]) notice.append(element('div', '', (labels[key] || '记录') + '：' + text(errors[key]))); }); notice.append(makeButton('重新查询', 'small quiet', function () { return queryUser(id); })); container.append(notice); if (errors.blacklist) badges.firstChild.textContent = '黑名单状态暂时未知'; }
+      var container = $('users-content'); container.replaceChildren(); var id = text(data.userId, requestedId); container.append(renderVerdict(data, id)); var profile = data.profile || {}; var card = element('article', 'card'); var head = element('div', 'profile-top'); var name = text(profile.name || [profile.first_name, profile.last_name].filter(Boolean).join(' '), '用户 ' + id); var info = element('div', 'profile-info'); info.append(element('h2', '', name), element('div', 'mono muted', 'ID ' + id)); if (profile.username) info.append(element('div', 'card-subtitle', (String(profile.username).startsWith('@') ? '' : '@') + profile.username)); head.append(element('div', 'avatar', Array.from(name)[0]), info); card.append(head); var badges = element('div', 'profile-badges'); badges.append(element('span', 'badge ' + (data.blacklist ? 'danger' : 'accent'), data.blacklist ? '黑名单中' : '未列入黑名单')); if (!data.profile) badges.append(element('span', 'badge', '暂无保存的资料')); if (data.whitelist) badges.append(element('span', 'badge accent', '白名单中')); card.append(badges); var wlActions = element('div', 'card-actions'); var refresh = function () { state.loaded.ads = false; if (state.active === 'users' && state.queriedUser === id) return queryUser(id); }; wlActions.append(data.whitelist ? makeButton('移出白名单', 'small danger', function (button) { return removeWhitelist(button, id, name, refresh); }) : makeButton('加入白名单', 'small', function (button) { return addWhitelist(button, id, refresh); })); if (data.whitelist) wlActions.append(element('span', 'subtle', '加入于 ' + date(data.whitelist.at) + (data.whitelist.note ? ' · ' + data.whitelist.note : ''))); card.append(wlActions); var speech = data.speech || {}; var stats = element('div', 'speech-stats'); [['发言记录', count(speech.count)], ['首次发言', date(speech.first, true)], ['最近发言', date(speech.last, true)]].forEach(function (pair) { var cell = element('div'); cell.append(element('span', '', pair[0]), element('strong', '', pair[1])); stats.append(cell); }); card.append(stats); container.append(card);
+      var errors = data.errors || {}; if (Object.keys(errors).length) { var labels = { profile: '用户资料', blacklist: '黑名单状态', whitelist: '白名单状态', events: '处理时间线', cases: '处罚记录', speech: '发言统计' }; var notice = element('div', 'notice'); notice.append(element('div', '', '部分记录暂时无法读取')); Object.keys(errors).forEach(function (key) { if (errors[key]) notice.append(element('div', '', (labels[key] || '记录') + '：' + text(errors[key]))); }); notice.append(makeButton('重新查询', 'small quiet', function () { return queryUser(id); })); container.append(notice); if (errors.blacklist) badges.firstChild.textContent = '黑名单状态暂时未知'; }
       if (data.blacklist) { var black = data.blacklist; var blackCard = element('article', 'card'); blackCard.append(element('h2', 'section-label', '黑名单记录'), detailList([['原因', text(black.reason)], ['备注', text(black.note)], ['操作人', text(black.by), true], ['记录时间', date(black.at || black.created_at)]])); var actions = element('div', 'card-actions'); actions.append(makeButton('解除封禁', 'small danger', async function (button) { var completed = await unban(button, Object.assign({}, black, { id: id })); if (completed && state.active === 'users' && state.queriedUser === id) await queryUser(id); })); blackCard.append(actions); container.append(blackCard); }
       var cases = Array.isArray(data.cases) ? data.cases : []; var events = Array.isArray(data.events) ? data.events : []; renderTimeline(container, '处罚记录', cases, true); renderTimeline(container, '处理时间线', events, false);
       if (data.gky || data.gkyError) { var gkyCard = element('article', 'card'); gkyCard.append(element('h2', 'section-label', '外部风险记录')); if (data.gkyError) gkyCard.append(element('p', 'subtle', '暂时无法查询：' + text(data.gkyError))); else { var gky = data.gky; var pairs = []; var labels = { reason: '原因', note: '备注', message: '说明', score: '风险评分', count: '记录数', found: '查询结果', first: '首次记录', last: '最近记录', ban_time: '封禁时间', ban_reason: '封禁原因', chatId: '来源群组', msgId: '消息 ID', info: '记录内容', recordedDate: '记录日期' }; if (typeof gky === 'object') { if (gky.banned !== undefined) pairs.push(['封禁状态', gky.banned ? '有封禁记录' : '无封禁记录']); Object.keys(labels).forEach(function (key) { var value = gky[key]; if (value !== null && value !== undefined && value !== '') pairs.push([labels[key], typeof value === 'boolean' ? (value ? '是' : '否') : displayValue(value)]); }); } else pairs.push(['结果', displayValue(gky)]); gkyCard.append(pairs.length ? detailList(pairs) : element('p', 'subtle', '未发现外部风险记录。')); } container.append(gkyCard); }
@@ -2499,6 +2545,120 @@ async function miniAppAdWhitelist(env, payload) {
 	return miniAppPaging(rows, payload?.page, MINI_APP_PAGE_SIZE);
 }
 
+// 白名单增删（批次 3，主人追加）：与 /wl 走同一对函数，写完当场清缓存、立即生效。
+// 加：一次最多 50 个 TGID，分隔符与 /wl 同口径（任意非数字）；超限整批拒绝，不做「加一半」。
+const MINI_APP_WHITELIST_ADD_MAX = 50;
+async function miniAppAdWhitelistAdd(env, payload, actorId) {
+	const raw = Array.isArray(payload?.userIds) ? payload.userIds.join(' ') : String(payload?.userIds ?? payload?.userId ?? '');
+	const ids = [...new Set(raw.match(/\d+/g) || [])];
+	if (!ids.length) throw new MiniAppError(400, '没识别出任何纯数字 TGID');
+	if (ids.length > MINI_APP_WHITELIST_ADD_MAX) throw new MiniAppError(400, '一次最多加 ' + MINI_APP_WHITELIST_ADD_MAX + ' 个');
+	if (ids.some((id) => id.length > 20)) throw new MiniAppError(400, 'TGID 长度不对');
+	const added = [];
+	const existed = [];
+	const failed = [];
+	for (const id of ids) {
+		const result = await addAdUserWhitelist(env, id, actorId, '小程序添加');
+		if (!result.ok) failed.push(id);
+		else if (result.added) added.push(id);
+		else existed.push(id);
+	}
+	if (failed.length === ids.length) throw new MiniAppError(503, '白名单写入失败，请稍后重试');
+	const parts = ['已加入白名单 ' + added.length + ' 人'];
+	if (existed.length) parts.push('本来就在 ' + existed.length + ' 人');
+	if (failed.length) parts.push('失败 ' + failed.length + ' 人');
+	return { added, existed, failed, complete: failed.length === 0, message: parts.join('，') + '。' };
+}
+
+async function miniAppAdWhitelistRemove(env, payload) {
+	const id = String(payload?.userId || '').trim();
+	if (!/^\d{1,20}$/.test(id)) throw new MiniAppError(400, '用户 ID 必须是纯数字');
+	const result = await removeAdUserWhitelist(env, id);
+	if (!result.ok) throw new MiniAppError(503, '白名单删除失败，请稍后重试');
+	return { userId: id, removed: result.removed, message: result.removed ? '已移出白名单，恢复广告检测。' : '该用户本来就不在白名单。' };
+}
+
+// 群组详情（批次 3）：机器人在该群的权限 + 演练开关与统计 + 近期演练流水 + 入群检查流水。
+// 一次 getChatMember（查机器人自己）+ 4 条只读 SQL；流水各取最近 20 条（两个读函数的上限）。
+// 权限查不到不阻断：bot.ok=false 带原因，流水照常给。
+const MINI_APP_BOT_PERMISSIONS = [
+	['can_restrict_members', '封禁用户'],
+	['can_delete_messages', '删除消息'],
+	['can_invite_users', '邀请用户'],
+	['can_pin_messages', '置顶消息'],
+	['can_change_info', '修改群信息'],
+	['can_promote_members', '添加管理员']
+];
+async function miniAppGroupDetail(env, payload) {
+	const chatId = String(payload?.chatId || '').trim();
+	if (!isSupergroupChatId(chatId)) throw new MiniAppError(400, '群组 ID 必须是 -100 开头的超级群组 ID');
+	if (!(GROUP_IDS || []).map(String).includes(chatId)) throw new MiniAppError(404, '该群组不在治理范围内');
+	const [info, bot, dryRun, dryRunStats, dryRows, joinRows] = await Promise.all([
+		resolveGroupInfoCached(chatId),
+		miniAppBotPermissions(chatId),
+		isDryRunGroup(env, chatId),
+		countAdDryRun(env, chatId),
+		readAdDryRunLog(env, { chatId, limit: 20 }),
+		readAdJoinChecks(env, { chatId, limit: 20 })
+	]);
+	return {
+		chatId,
+		title: String(info?.title || ''),
+		bot,
+		dryRun,
+		dryRunStats: { total: dryRunStats.total, today: dryRunStats.today, fp: dryRunStats.fp, done: dryRunStats.done, lowestFp: dryRunStats.lowestFp },
+		dryrunLog: dryRows.map((row) => ({
+			id: Number(row.id) || 0,
+			chatId: String(row.chat_id || ''),
+			userId: String(row.user_id || ''),
+			score: Number(row.score) || 0,
+			threshold: Number(row.threshold) || 0,
+			layer: String(row.layer || ''),
+			reasons: miniAppJsonList(row.reasons),
+			status: Number(row.fp) === 1 ? 'fp' : (Number(row.done) === 1 ? 'done' : 'open'),
+			createdAt: Number(row.created_at) || 0
+		})),
+		joinChecks: joinRows.map((row) => ({
+			id: Number(row.id) || 0,
+			chatId: String(row.chat_id || ''),
+			userId: String(row.user_id || ''),
+			score: Number(row.score) || 0,
+			threshold: Number(row.threshold) || 0,
+			verdict: String(row.verdict || ''),
+			layer: String(row.layer || ''),
+			reasons: miniAppJsonList(row.reasons),
+			createdAt: Number(row.created_at) || 0
+		}))
+	};
+}
+
+async function miniAppBotPermissions(chatId) {
+	const botId = await getBotId();
+	if (!botId) return { ok: false, status: '', reason: '暂时无法获取机器人身份', permissions: [] };
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: chatId, user_id: Number(botId) })
+		});
+		const result = await response.json();
+		if (!response.ok || !result?.ok || !result.result) {
+			return { ok: false, status: '', reason: String(result?.description || ('HTTP ' + response.status)), permissions: [] };
+		}
+		const member = result.result;
+		const status = String(member.status || '');
+		// 群主天然拥有全部权限；非管理员一律全 ✗（Telegram 对普通成员不返回 can_* 管理字段）
+		const permissions = MINI_APP_BOT_PERMISSIONS.map(([key, label]) => ({
+			key,
+			label,
+			on: status === 'creator' || (status === 'administrator' && member[key] === true)
+		}));
+		return { ok: botCanRestrictMember(member), status, reason: '', permissions };
+	} catch (error) {
+		return { ok: false, status: '', reason: String(error?.message || error), permissions: [] };
+	}
+}
+
 async function miniAppAdIgnore(env, payload) {
 	const seq = Number(payload.seq);
 	if (!Number.isSafeInteger(seq) || seq <= 0) throw new MiniAppError(400, '序号无效');
@@ -2586,6 +2746,17 @@ async function miniAppUserQuery(env, payload) {
 
 	try { data.blacklist = await readD1BlacklistEntry(env, userId); }
 	catch (error) { errors.blacklist = '读取失败'; }
+
+	// 白名单状态：用户页据此显示「加入白名单 / 移出白名单」。主键单行查询。
+	data.whitelist = null;
+	try {
+		if (await adDetectionReady(env)) {
+			const row = await env.DB.prepare('SELECT by_user, at, note FROM ad_user_whitelist WHERE user_id = ?').bind(userId).first();
+			if (row) data.whitelist = { by: String(row.by_user || ''), at: String(row.at || ''), note: String(row.note || '') };
+		}
+	} catch (error) {
+		errors.whitelist = '读取失败';
+	}
 
 	try { data.events = await readMemberEvents(env, userId); }
 	catch (error) { errors.events = '读取失败'; }
@@ -2836,6 +3007,9 @@ async function dispatchMiniAppAction(action, body, env, auth, ctx) {
 		case 'ads/llm': return miniAppAdLLM(env);
 		case 'ads/dryrun': return miniAppAdDryRun(env, payload);
 		case 'ads/whitelist': return miniAppAdWhitelist(env, payload);
+		case 'ads/whitelist/add': return miniAppAdWhitelistAdd(env, payload, auth?.userId);
+		case 'ads/whitelist/remove': return miniAppAdWhitelistRemove(env, payload);
+		case 'groups/detail': return miniAppGroupDetail(env, payload);
 		case 'users/query': return miniAppUserQuery(env, payload);
 		case 'health': return miniAppHealth(env);
 		case 'admins/list': return miniAppAdmins(env);

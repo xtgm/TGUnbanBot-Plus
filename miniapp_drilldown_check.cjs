@@ -24,7 +24,9 @@ function check(name, cond, detail) {
 }
 
 const calls = [];
-let lastStats = null, lastMembers = null, lastAdsQuery = null;
+let lastStats = null, lastMembers = null, lastAdsQuery = null, lastGroupDetail = null;
+let wlList = ['720003'];
+const wlCalls = [];
 const fpRows = [
 	{ type: 'keyword', value: '下钻词甲', weight: 0.5, matchCount: 9, falsePositiveCount: 0, confidence: 1, source: 'auto', createdAt: 1780000000 },
 	{ type: 'keyword', value: '下钻词乙', weight: 1, matchCount: 3, falsePositiveCount: 1, confidence: 1, source: 'seed', createdAt: 1780000000 }
@@ -46,9 +48,12 @@ function mainData(action, body) {
 		case 'ads/observing': return { items: [{ userId: '700001', name: '观察甲', username: 'obs', chatId: '-1001111111111', score: 40, reasons: ['简介含联系方式'], layer: 'score', expiresAt: 1780003600, updatedAt: 1780000000 }], page: 1, total: 1, totalPages: 1 };
 		case 'ads/llm': return { enabled: true, day: '2026-10-24', daily: 1000, used: 7, pools: { message: { used: 5, limit: 500 }, join: { used: 2, limit: 300 }, cron: { used: 0, limit: 100 } }, hits: 3, bans: 1, parseFail: 0, broken: false, consecFail: 0, candidates: { total: 2, promoted: 1 } };
 		case 'ads/dryrun': return { items: [{ id: 1, chatId: '-1001111111111', userId: '710001', score: 88, threshold: 80, layer: 'score', reasons: [], status: 'fp', createdAt: 1780000000 }], chatId: '', page: 1, total: 1, totalPages: 1 };
-		case 'ads/whitelist': return { items: [{ userId: '720003', name: '白名单丙', username: 'wl', by: '10001', at: '2026-10-10T00:00:00Z', note: '老成员' }], page: 1, total: 1, totalPages: 1 };
+		case 'ads/whitelist': return { items: wlList.map((id) => ({ userId: id, name: id === '720003' ? '白名单丙' : '', username: id === '720003' ? 'wl' : '', by: '10001', at: '2026-10-10T00:00:00Z', note: '老成员' })), page: 1, total: wlList.length, totalPages: 1 };
+		case 'ads/whitelist/add': { wlCalls.push(['add', body.userIds]); const ids = String(body.userIds).match(/\d+/g) || []; ids.forEach((id) => { if (!wlList.includes(id)) wlList.push(id); }); return { added: ids, existed: [], failed: [], complete: true, message: '已加入白名单 ' + ids.length + ' 人。' }; }
+		case 'ads/whitelist/remove': { wlCalls.push(['remove', body.userId]); const had = wlList.includes(body.userId); wlList = wlList.filter((x) => x !== body.userId); return { userId: body.userId, removed: had, message: '已移出白名单，恢复广告检测。' }; }
+		case 'groups/detail': lastGroupDetail = body; return { chatId: body.chatId, title: '示例群 A', bot: { ok: false, status: 'administrator', reason: '', permissions: [{ key: 'can_restrict_members', label: '封禁用户', on: false }, { key: 'can_delete_messages', label: '删除消息', on: true }] }, dryRun: true, dryRunStats: { total: 1, today: 1, fp: 0, done: 0, lowestFp: null }, dryrunLog: [{ id: 1, chatId: body.chatId, userId: '810001', score: 88, threshold: 80, layer: 'score', reasons: ['<i>演练</i>原因'], status: 'open', createdAt: 1780000000 }], joinChecks: [{ id: 2, chatId: body.chatId, userId: '820001', score: 90, threshold: 80, verdict: 'ban', layer: 'profile', reasons: [], createdAt: 1780000000 }] };
 		case 'search': return { kind: 'keyword', value: body.query, page: 1, total: 1, totalPages: 1, rows: searchRows };
-		case 'users/query': return userData(body.userId);
+		case 'users/query': { const d = userData(body.userId); d.whitelist = wlList.includes(body.userId) ? { by: '10001', at: '2026-10-10T00:00:00Z', note: '老成员' } : null; return d; }
 		default: throw new Error('未 mock 的主后台接口 ' + action);
 	}
 }
@@ -171,6 +176,59 @@ async function run() {
 			}
 		}
 
+		console.info('\n[主后台] 白名单增删（批次 3）');
+		check('用户页：在白名单的人显示「白名单中」与「移出白名单」', (await page.locator('#users-content').textContent()).includes('白名单中') && (await page.locator('#users-content button', { hasText: '移出白名单' }).count()) === 1);
+		if ((await page.locator('#users-content button', { hasText: '移出白名单' }).count()) === 1) {
+			await page.locator('#users-content button', { hasText: '移出白名单' }).click();
+			await page.locator('#confirm-submit').click();
+			await page.waitForFunction(() => [...document.querySelectorAll('#users-content button')].some((b) => b.textContent === '加入白名单'), null, { timeout: 4000 }).catch(() => {});
+			check('用户页移出 → 调 remove 720003、按钮变「加入白名单」', JSON.stringify(wlCalls.at(-1)) === '["remove","720003"]' && (await page.locator('#users-content button', { hasText: '加入白名单' }).count()) === 1, JSON.stringify(wlCalls));
+			await page.locator('#users-content button', { hasText: '加入白名单' }).click();
+			await page.locator('#confirm-submit').click();
+			await page.waitForFunction(() => [...document.querySelectorAll('#users-content button')].some((b) => b.textContent === '移出白名单'), null, { timeout: 4000 }).catch(() => {});
+			check('用户页加入 → 调 add 720003、按钮变回「移出白名单」', JSON.stringify(wlCalls.at(-1)) === '["add","720003"]' && (await page.locator('#users-content button', { hasText: '移出白名单' }).count()) === 1, JSON.stringify(wlCalls));
+		}
+		await page.locator('#tab-ads').click();
+		await page.waitForSelector('#ads-summary [data-drill="whitelist"]');
+		if ((await page.locator('#ads-drill .whitelist-add').count()) === 0) await drill('whitelist').click();
+		await waitText(page, 'ads-drill', '白名单丙');
+		check('白名单明细有添加栏', (await page.locator('#ads-drill .whitelist-add input').count()) === 1);
+		if ((await page.locator('#ads-drill .whitelist-add input').count()) === 1) {
+			await page.locator('#ads-drill .whitelist-add input').fill('730001，730002');
+			await page.locator('#ads-drill .whitelist-add button[type=submit]').click();
+			await page.locator('#confirm-submit').click();
+			check('白名单栏一次加 2 个 → 列表里出现', await waitText(page, 'ads-drill', '730002') && JSON.stringify(wlCalls.at(-1)) === '["add","730001 730002"]', JSON.stringify(wlCalls));
+			const before = wlCalls.length;
+			await page.locator('#ads-drill .card', { hasText: '730001' }).locator('button', { hasText: '移出白名单' }).click();
+			check('点「移出白名单」先弹确认、不跳用户页', (await page.locator('#confirm-dialog').evaluate((d) => d.open)) && !(await page.locator('#page-ads').isHidden()));
+			await page.locator('#confirm-cancel').click();
+			check('取消确认 → 不调接口', wlCalls.length === before, JSON.stringify(wlCalls));
+			await page.locator('#ads-drill .card', { hasText: '730001' }).locator('button', { hasText: '移出白名单' }).click();
+			await page.locator('#confirm-submit').click();
+			await page.waitForFunction(() => !(document.getElementById('ads-drill')?.textContent || '').includes('730001'), null, { timeout: 4000 }).catch(() => {});
+			check('确认移出 → 列表里没了', JSON.stringify(wlCalls.at(-1)) === '["remove","730001"]' && !(await page.locator('#ads-drill').textContent()).includes('730001'), JSON.stringify(wlCalls));
+		}
+
+		console.info('\n[主后台] 群组详情（批次 3）');
+		await page.locator('#tab-groups').click();
+		await waitText(page, 'groups-content', '示例群 A');
+		const more = page.locator('#groups-content button', { hasText: '查看详情' });
+		check('群组卡片有「查看详情」', (await more.count()) === 1, String(await more.count()));
+		if (await more.count()) {
+			await more.click();
+			check('展开后显示权限、演练、两份流水', await waitText(page, 'groups-content', '入群检查流水') && (await page.locator('#groups-content').textContent()).includes('✗ 封禁用户') && (await page.locator('#groups-content').textContent()).includes('近期演练流水') && lastGroupDetail?.chatId === '-1001111111111', JSON.stringify(lastGroupDetail));
+			check('缺封禁权限 → 标出无法执行封禁', (await page.locator('#groups-content').textContent()).includes('无法执行封禁'));
+			check('流水原因按纯文本显示', (await page.locator('#groups-content').textContent()).includes('<i>演练</i>原因') && (await page.locator('#groups-content i').count()) === 0);
+			const rows = page.locator('#groups-content .group-detail .result-item.clickable');
+			check('两份流水每条可点（2 条）', (await rows.count()) === 2, String(await rows.count()));
+			await page.locator('#groups-content button', { hasText: '收起详情' }).click();
+			check('再点收起', (await page.locator('#groups-content .group-detail').textContent()) === '');
+			await page.locator('#groups-content button', { hasText: '查看详情' }).click();
+			await waitText(page, 'groups-content', '入群检查流水');
+			await page.locator('#groups-content .group-detail .result-item.clickable').nth(1).click();
+			check('点入群检查里的人 → 查用户 820001', await waitText(page, 'users-content', 'ID 820001'));
+		}
+
 		console.info('\n[主后台] 发言检索结果');
 		await page.locator('#tab-users').click();
 		await page.locator('#search-query').fill('一条');
@@ -248,7 +306,7 @@ async function run() {
 		}
 
 		check('全程无页面脚本错误', errors.length === 0, errors.join(' | '));
-		check('只调用已有接口 + 批次 2 的 6 个广告下钻 + 批次 3 的 killer/stats/members', calls.every((a) => ['bootstrap', 'groups/list', 'health', 'admins/list', 'ads/summary', 'ads/pending', 'ads/fingerprints', 'ads/samples', 'ads/observing', 'ads/llm', 'ads/dryrun', 'ads/whitelist', 'search', 'users/query', 'killer/bootstrap', 'killer/groups', 'killer/stats', 'killer/stats/members', 'killer/search', 'killer/users/query'].includes(a)), calls.join(','));
+		check('只调用已有接口 + 批次 2 的 6 个广告下钻 + 批次 3 的 killer/stats/members', calls.every((a) => ['bootstrap', 'groups/list', 'health', 'admins/list', 'ads/summary', 'ads/pending', 'ads/fingerprints', 'ads/samples', 'ads/observing', 'ads/llm', 'ads/dryrun', 'ads/whitelist', 'ads/whitelist/add', 'ads/whitelist/remove', 'groups/detail', 'search', 'users/query', 'killer/bootstrap', 'killer/groups', 'killer/stats', 'killer/stats/members', 'killer/search', 'killer/users/query'].includes(a)), calls.join(','));
 	} finally {
 		await browser.close();
 	}
