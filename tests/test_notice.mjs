@@ -29,6 +29,7 @@ const sandbox = {
 		}
 		else if (m === 'answerCallbackQuery') { answered.push({ text: String(b?.text || '') }); }
 		else if (m === 'getMe') payload = { ok: true, result: { id: 42, username: 'testbot', is_bot: true } };
+		else if (m === 'getChat') payload = { ok: true, result: { id: Number(b?.chat_id), title: '测试群' + b?.chat_id, type: 'supergroup' } };
 		return { ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) };
 	}
 };
@@ -201,7 +202,7 @@ await dmS(OWNER, { text: '/notice', message_id: 110 });
 const liveGroups = vm.runInContext('GROUP_IDS', sandbox).map(String);
 check('★ 搜索群仍在治理群里（只是不收通知）', liveGroups.includes('-100444') && liveGroups.includes('-100333'), JSON.stringify(liveGroups));
 check('★ 提示里的目标数只算正常群（2 个）', lastTo(OWNER)?.text.includes('<b>2</b> 个配置群'), lastTo(OWNER)?.text);
-check('★ 提示里写明已排除 2 个搜索群', lastTo(OWNER)?.text.includes('已排除 2 个搜索群'), lastTo(OWNER)?.text);
+check('★ 提示里写明已排除 2 个群', lastTo(OWNER)?.text.includes('已排除 2 个杀手群 / 搜索群'), lastTo(OWNER)?.text);
 reset();
 await dmS(OWNER, { text: '搜索群不该收到', message_id: 111 });
 check('★ 确认页目标数也是 2', lastTo(OWNER)?.text.includes('<b>2</b> 个配置群'), lastTo(OWNER)?.text);
@@ -214,6 +215,28 @@ reset();
 await dmMsg(OWNER, { text: '/notice', message_id: 120 });
 check('没配搜索群时提示不出现「搜索群」字样', !lastTo(OWNER)?.text.includes('搜索群'), lastTo(OWNER)?.text);
 await dmMsg(OWNER, { text: '/notice cancel', message_id: 121 });
+
+// 主人口径：杀手群（KILLER_MODE_GROUPS）里有搜索群也有普通禁言群，全体通知一律不发杀手群；
+// 杀手群的通知走杀手版 /notice / 杀手后台。没配 STAT_SEARCH_GROUPS 也要挡住。
+console.log('\n=== 12. 全体通知跳过杀手群 ===');
+const envK = { ...env, KILLER_MODE_GROUPS: '-100222,-100555' };
+const driveK = async (update) => { await W.__h.fetch(new Request('https://x/', { method: 'POST', body: JSON.stringify(update) }), envK, { waitUntil() {} }); };
+const dmK = (from, extra) => driveK({ message: { chat: priv(from), from: { id: Number(from), is_bot: false }, message_id: extra.message_id || 100, ...extra } });
+reset();
+await dmK(OWNER, { text: '/notice', message_id: 130 });
+check('★ 杀手群：提示目标数只算非杀手群（2 个）', lastTo(OWNER)?.text.includes('<b>2</b> 个配置群'), lastTo(OWNER)?.text);
+check('★ 杀手群：提示写明已排除 2 个杀手群', lastTo(OWNER)?.text.includes('已排除 2 个杀手群 / 搜索群'), lastTo(OWNER)?.text);
+reset();
+await dmK(OWNER, { text: '杀手群不该收到', message_id: 131 });
+// 确认页逐个列出目标群名，并单列「不发」的杀手群 —— 点确认前一眼看清会发到哪些群。
+const confirmText = lastTo(OWNER)?.text || '';
+const [sendPart = '', skipPart = ''] = confirmText.split('不发');
+check('★ 确认页列出每个目标群的群名与 ID', ['-100111', '-100333'].every((g) => sendPart.includes('测试群' + g) && sendPart.includes('<code>' + g + '</code>')), confirmText);
+check('★ 确认页单列不发的杀手群', ['-100222', '-100555'].every((g) => skipPart.includes('测试群' + g)) && !['-100222', '-100555'].some((g) => sendPart.includes(g)), confirmText);
+reset();
+await driveK({ callback_query: { id: 'cb', from: { id: Number(OWNER), is_bot: false }, data: 'notice:confirm', message: { chat: priv(OWNER), message_id: 200 } } });
+check('★ 非杀手群都收到', ['-100111', '-100333'].every((g) => copied.some((c) => c.chatId === g && c.msgId === 131)), JSON.stringify(copied));
+check('★ 杀手群一个都没收到（含 GROUP_ID 里也列了的）', !copied.some((c) => c.chatId === '-100222' || c.chatId === '-100555'), JSON.stringify(copied));
 
 console.log('\n全体通知验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 if (fail > 0) process.exitCode = 1;

@@ -769,11 +769,12 @@ section('[17] notice/send 跳过搜索群（STAT_SEARCH_GROUPS）');
 		const boot = await call(env, 'bootstrap');
 		const flag = Object.fromEntries(boot.groups.map((g) => [g.chatId, g.search === true]));
 		assert('★ 群列表给搜索群打 search 标记', flag[ENV_SECOND] === true && flag[SEARCH_ONLY] === true && flag[ENV_MAIN] === false, JSON.stringify(boot.groups));
+		assert('★ 搜索群同时标 noNotice（下拉据此过滤）', boot.groups.filter((g) => g.noNotice === true).map((g) => g.chatId).sort().join() === [ENV_SECOND, SEARCH_ONLY].sort().join(), JSON.stringify(boot.groups));
 
 		const all = await call(env, 'notice/send', { text: '只发正常群' });
 		assert('★ 全部群：只发正常群（1 个）', all.total === 1 && all.sent === 1, JSON.stringify(all));
 		assert('★ 搜索群一条都没发', sent.length === 1 && String(sent[0].chat_id) === ENV_MAIN, JSON.stringify(sent.map((b) => b.chat_id)));
-		assert('★ 返回里带跳过的搜索群数', all.skippedSearch === 2, JSON.stringify(all));
+		assert('★ 返回里带跳过数', all.skipped === 2, JSON.stringify(all));
 
 		sent.length = 0;
 		const pick = await callError(env, 'notice/send', { text: '指定搜索群', chatId: SEARCH_ONLY });
@@ -783,9 +784,48 @@ section('[17] notice/send 跳过搜索群（STAT_SEARCH_GROUPS）');
 		sandbox.fetch = baseFetch;
 	}
 	const html = W.renderMiniAppHtml();
-	assert('★ Mini App 通知下拉排除搜索群', /function loadNotice\(\)[\s\S]{0,600}!group\.search/.test(html));
+	assert('★ Mini App 通知下拉排除不收通知的群', /function loadNotice\(\)[\s\S]{0,600}!group\.noNotice/.test(html));
 	const admin = W.renderWebAdminHtml();
-	assert('★ 后台通知下拉排除搜索群', /function fillNoticeGroups\(\)[\s\S]{0,400}!g\.search/.test(admin));
+	assert('★ 后台通知下拉排除不收通知的群', /function fillNoticeGroups\(\)[\s\S]{0,400}!g\.noNotice/.test(admin));
+}
+
+// ================= [18] notice/send 跳过杀手群 =================
+// 杀手群里既有搜索群也有普通禁言群，全体通知一律不发；没配 STAT_SEARCH_GROUPS 也要挡住。
+section('[18] notice/send 跳过杀手群（KILLER_MODE_GROUPS）');
+{
+	const KILLER_ONLY = '-1005555555555';
+	const env = {
+		TOKEN: 'TESTTOKEN', BOT_TOKEN: '123456:fake', GROUP_ID: ENV_MAIN + ',' + ENV_SECOND,
+		KILLER_MODE_GROUPS: ENV_SECOND + ',' + KILLER_ONLY, OWNER_IDS: OWNER, DB: makeD1()
+	};
+	W.applyRuntimeConfig(W.loadRequiredConfig(env));
+	await W.ensureD1Table(env);
+	await W.mergeDynamicGroupsFromD1(env);
+	const sent = [];
+	const baseFetch = sandbox.fetch;
+	sandbox.fetch = async (url, init) => {
+		const method = String(url).split('/').pop();
+		if (method !== 'sendMessage') return baseFetch(url, init);
+		let body = null;
+		try { body = init?.body ? JSON.parse(init.body) : null; } catch (_) { body = null; }
+		sent.push(body || {});
+		return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 9001 } }; }, async text() { return ''; } };
+	};
+	try {
+		const boot = await call(env, 'bootstrap');
+		const flag = Object.fromEntries(boot.groups.map((g) => [g.chatId, g.noNotice === true]));
+		assert('★ 群列表给杀手群打 noNotice 标记', flag[ENV_SECOND] === true && flag[KILLER_ONLY] === true && flag[ENV_MAIN] === false, JSON.stringify(boot.groups));
+
+		const all = await call(env, 'notice/send', { text: '只发非杀手群' });
+		assert('★ 全部群：只发非杀手群（1 个）', all.total === 1 && sent.length === 1 && String(sent[0].chat_id) === ENV_MAIN, JSON.stringify(sent.map((b) => b.chat_id)));
+		assert('★ 返回里带跳过数', all.skipped === 2, JSON.stringify(all));
+
+		sent.length = 0;
+		const pick = await callError(env, 'notice/send', { text: '指定杀手群', chatId: KILLER_ONLY });
+		assert('★ 指定杀手群被拒（400）且未发', pick && pick.status === 400 && /杀手群/.test(pick.message) && sent.length === 0, pick && pick.message);
+	} finally {
+		sandbox.fetch = baseFetch;
+	}
 }
 
 console.log(`\n========== Mini App 接口：通过 ${pass} / 失败 ${fail} ==========`);

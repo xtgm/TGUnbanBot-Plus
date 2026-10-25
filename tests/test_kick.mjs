@@ -6098,6 +6098,26 @@ console.log('\n[96] 动态群组管理');
 	assert('动态群组:D1 中非法 chat_id 被过滤，不参与封禁',
 		!targets.includes('not-a-group') && targets.includes('-1003904078173'), JSON.stringify(targets));
 
+	// 杀手群 / 搜索群自动并入环境变量群段，逐行打标记，主人一眼分清哪些不收全体通知。
+	{
+		const dbM = makeFakeDB([]);
+		resetCalls();
+		sandbox.fetch = mkFetch();
+		await handler.fetch(new Request('https://x.com/', {
+			method: 'POST',
+			body: JSON.stringify({ message: { message_id: 1, chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false, first_name: '主人' }, text: '/listgroups' } }),
+		}), { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001', KILLER_MODE_GROUPS: '-1002', STAT_SEARCH_GROUPS: '-1005', OWNER_IDS: OWNER, DB: dbM }, fakeCtxAd);
+		const outM = callsOf('sendMessage').map((c) => c.body.text).join('\n');
+		const lineOf = (id) => outM.split('\n').find((l) => l.includes('<code>' + id + '</code>')) || '';
+		assert('★ /listgroups 杀手群行标「杀手群」', lineOf('-1002').includes('杀手群') && !lineOf('-1002').includes('搜索群'), lineOf('-1002'));
+		assert('★ /listgroups 搜索群行标「搜索群」', lineOf('-1005').includes('搜索群') && !lineOf('-1005').includes('杀手群'), lineOf('-1005'));
+		assert('★ /listgroups 普通群不打标记', !/杀手群|搜索群/.test(lineOf('-1001')), lineOf('-1001'));
+		assert('★ /listgroups 说明这两类不收全体通知', /不收全体通知/.test(outM), outM);
+		// 没配这两类时不出现陌生字眼
+		const outPlain = await run(makeFakeDB([]), '/listgroups');
+		assert('/listgroups 没配杀手群/搜索群时不出现这两个词', !/杀手群|搜索群/.test(outPlain), outPlain);
+	}
+
 	// 【改口径】菜单只留 5 条，/listgroups 移出菜单；入口改在网页后台（群组分区 + 命令手册）。
 	assert('动态群组:/listgroups 已移出 / 主菜单，入口在后台命令手册',
 		!/command: "listgroups"/.test(src) && sandbox.renderWebAdminHtml().includes('/listgroups'),

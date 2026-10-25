@@ -1604,7 +1604,7 @@ function renderMiniAppHtml() {
       try { await loadGroups(); } catch (_) { /* 群组读取失败时下面按空列表处理，按钮保持禁用 */ }
       if (!current('notice', seq)) return;
       // 搜索群不收全体通知：目标下拉与计数都只算正常群。
-      var groups = (Array.isArray(state.groups) ? state.groups : []).filter(function (group) { return !group.search; });
+      var groups = (Array.isArray(state.groups) ? state.groups : []).filter(function (group) { return !group.noNotice; });
       var select = $('notice-target'); var previous = select.value; select.replaceChildren();
       var all = element('option', '', '全部治理群组（' + groups.length + ' 个）'); all.value = ''; select.append(all);
       groups.forEach(function (group) { var option = element('option', '', text(group.title, '未命名群组') + ' · ' + text(group.chatId)); option.value = String(group.chatId); select.append(option); });
@@ -1617,7 +1617,7 @@ function renderMiniAppHtml() {
       var content = $('notice-text').value.trim();
       if (!content) { toast('请输入通知内容。', 'error'); $('notice-text').focus(); return null; }
       if (content.length > 4096) { toast('通知内容不能超过 4096 字。', 'error'); return null; }
-      var chatId = $('notice-target').value; var groups = (Array.isArray(state.groups) ? state.groups : []).filter(function (group) { return !group.search; });
+      var chatId = $('notice-target').value; var groups = (Array.isArray(state.groups) ? state.groups : []).filter(function (group) { return !group.noNotice; });
       var targetName = '全部治理群组（' + groups.length + ' 个）';
       if (chatId) { var found = groups.find(function (group) { return String(group.chatId) === chatId; }); targetName = found ? text(found.title, '未命名群组') + ' · ' + chatId : chatId; }
       var silent = $('notice-silent').checked;
@@ -2185,7 +2185,8 @@ async function miniAppGroupList(env, loaded) {
 		title: String(envInfos[index]?.title || ''),
 		source: 'env',
 		primary: index === 0,
-		search: isStatSearchGroup(id)
+		search: isStatSearchGroup(id),
+		noNotice: isNoticeExcludedGroup(id)
 	}));
 	for (const row of dynamicRows) {
 		list.push({
@@ -2193,6 +2194,7 @@ async function miniAppGroupList(env, loaded) {
 			title: String(row.title || ''),
 			source: 'dynamic',
 			search: isStatSearchGroup(row.chatId),
+			noNotice: isNoticeExcludedGroup(row.chatId),
 			note: String(row.note || ''),
 			addedAt: String(row.addedAt || '')
 		});
@@ -3012,11 +3014,12 @@ async function miniAppNoticeSend(env, payload) {
 	if (!configured.length) throw new MiniAppError(400, '还没有配置治理群组');
 	const target = String(payload?.chatId || '').trim();
 	if (target && !configured.includes(target)) throw new MiniAppError(400, '该群组不在治理范围内');
+	if (target && isKillerModeGroup(target)) throw new MiniAppError(400, '该群是杀手群，不收全体通知（杀手群通知请用杀手后台）');
 	if (target && isStatSearchGroup(target)) throw new MiniAppError(400, '该群是搜索群，不收全体通知');
-	const { groups, skippedSearch } = noticeTargetGroups();
-	if (!target && !groups.length) throw new MiniAppError(400, '除搜索群外没有可通知的群组');
+	const { groups, skipped } = noticeTargetGroups();
+	if (!target && !groups.length) throw new MiniAppError(400, '除杀手群 / 搜索群外没有可通知的群组');
 	const result = await sendMiniAppNoticeText(target ? [target] : groups, text, payload?.silent === true);
-	return { ...result, skippedSearch: target ? 0 : skippedSearch };
+	return { ...result, skipped: target ? 0 : skipped };
 }
 
 // 纯文本群发（主人后台与杀手子后台共用）。groups 由调用方按各自范围校验好再传进来。
@@ -8136,7 +8139,7 @@ function fillNoticeGroups() {
 	var sel = $('n-chat'), keep = sel.value;
 	while (sel.options.length > 1) sel.remove(1);
 	// 搜索群不收全体通知，下拉里也不列，免得选了再被接口拒。
-	state.groups.filter(function (g) { return !g.search; }).forEach(function (g) { sel.appendChild(el('option', { value: g.chatId, text: (g.title || g.chatId) + '（' + g.chatId + '）' })); });
+	state.groups.filter(function (g) { return !g.noNotice; }).forEach(function (g) { sel.appendChild(el('option', { value: g.chatId, text: (g.title || g.chatId) + '（' + g.chatId + '）' })); });
 	if (!Array.prototype.some.call(sel.options, function (o) { return o.value === keep; })) keep = '';
 	sel.value = keep;
 }
@@ -16322,7 +16325,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				lines.push('  （空）');
 			} else {
 				ENV_GROUP_IDS.forEach((id, index) => {
-					const mark = index === 0 ? ' ⭐ 主群' : '';
+					const mark = (index === 0 ? ' ⭐ 主群' : '') + groupRoleMark(id);
 					lines.push(`  ${index + 1}. ${renderGroupNameLabel(envInfos[index])}<code>${escapeHtml(String(id))}</code>${mark}`);
 				});
 			}
@@ -16349,6 +16352,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			lines.push('', `📊 合计生效群组:${ENV_GROUP_IDS.length + rows.length} 个`);
 			lines.push('ℹ️ 主群固定为 GROUP_ID 第一个群，指令添加的群不会顶替主群。');
+			if (ENV_GROUP_IDS.some((id) => groupRoleMark(id))) lines.push('ℹ️ 标 🚫 的杀手群 / 搜索群不收全体通知（/notice）。');
 			await sendTelegramMessageChunks(chatId, lines.join('\n'));
 			return;
 		}
@@ -17767,19 +17771,46 @@ async function clearNoticeState(env) { await writeAdScanState(env, NOTICE_PENDIN
 function isStatSearchGroup(chatId) {
 	return STAT_SEARCH_GROUPS.includes(String(chatId));
 }
-// 全体通知的目标：全部配置群去重后去掉搜索群。/notice 与后台 notice/send 共用这一份口径。
+// 全体通知不发的群：杀手群（KILLER_MODE_GROUPS，主人把搜索群也配在这里，且其中的普通禁言群一并不收）
+// 与搜索群。杀手群的通知走杀手版 /notice / 杀手后台，不受这里影响。
+function isNoticeExcludedGroup(chatId) {
+	return isKillerModeGroup(chatId) || isStatSearchGroup(chatId);
+}
+// 全体通知的目标：全部配置群去重后去掉杀手群与搜索群。/notice 与后台 notice/send 共用这一份口径。
 function noticeTargetGroups() {
 	const all = [...new Set((GROUP_IDS || []).map((g) => String(g)).filter(Boolean))];
-	const groups = all.filter((g) => !isStatSearchGroup(g));
-	return { groups, skippedSearch: all.length - groups.length };
+	const groups = all.filter((g) => !isNoticeExcludedGroup(g));
+	return { groups, skipped: all.length - groups.length };
 }
 function noticeConfiguredGroupCount() {
 	return noticeTargetGroups().groups.length;
 }
-// 提示里补一句排除了几个搜索群；没排除就不出现，免得没配搜索群的人看到陌生字眼。
+// 提示里补一句排除了几个群；没排除就不出现，免得没配这两类群的人看到陌生字眼。
 function noticeSearchSkipNote() {
-	const n = noticeTargetGroups().skippedSearch;
-	return n ? '（已排除 ' + n + ' 个搜索群）' : '';
+	const n = noticeTargetGroups().skipped;
+	return n ? '（已排除 ' + n + ' 个杀手群 / 搜索群）' : '';
+}
+// 杀手群 / 搜索群在群列表里的标记；两类都不是就返回空串。/listgroups 与通知确认页共用。
+function groupRoleMark(chatId) {
+	const marks = [];
+	if (isKillerModeGroup(chatId)) marks.push('杀手群');
+	if (isStatSearchGroup(chatId)) marks.push('搜索群');
+	return marks.length ? ' 🚫 ' + marks.join(' / ') : '';
+}
+// 确认页逐个列出会发到的群和不发的群（群名走 10 分钟缓存，拉不到只显示 ID），点确认前一眼看清范围。
+async function noticeConfirmGroupLines() {
+	const all = [...new Set((GROUP_IDS || []).map((g) => String(g)).filter(Boolean))];
+	const infos = await Promise.all(all.map((g) => resolveGroupInfoCached(g)));
+	const send = [];
+	const skip = [];
+	all.forEach((g, i) => {
+		const line = '  · ' + renderGroupNameLabel(infos[i]) + '<code>' + escapeHtml(g) + '</code>';
+		if (isNoticeExcludedGroup(g)) skip.push(line + groupRoleMark(g));
+		else send.push(line);
+	});
+	const lines = ['', '<b>发往：</b>', ...(send.length ? send : ['  （无）'])];
+	if (skip.length) lines.push('', '<b>不发：</b>', ...skip);
+	return lines;
 }
 
 // 群发到所有配置群（去重、排除搜索群）：一律用 copyMessage 原样搬运主人那条内容（文本/图片/视频都支持），
@@ -17843,6 +17874,7 @@ async function maybeCaptureNoticeContent(message, env) {
 	const previewLine = snippet
 		? escapeHtml(snippet.slice(0, 300))
 		: '（非文本消息：图片/视频/文件等，将按原样发送）';
+	const groupLines = await noticeConfirmGroupLines();
 	const keyboard = { inline_keyboard: [[
 		{ text: '✅ 确认发送', callback_data: NOTICE_CONFIRM_DATA },
 		{ text: '🚫 取消', callback_data: NOTICE_CANCEL_DATA }
@@ -17850,6 +17882,7 @@ async function maybeCaptureNoticeContent(message, env) {
 	await sendTelegramMessage(chatId, [
 		'📢 <b>全体通知 · 确认</b>',
 		'将发往 <b>' + noticeConfiguredGroupCount() + '</b> 个配置群' + noticeSearchSkipNote() + '，以机器人身份发送。',
+		...groupLines,
 		'',
 		'<b>内容预览：</b>',
 		previewLine,
