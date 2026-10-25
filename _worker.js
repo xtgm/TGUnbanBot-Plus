@@ -20573,6 +20573,11 @@ function loadAdDetectionConfig(env) {
 		// 正文图片视觉识别的每日张数上限（0 = 关闭 L2，只保留 L1 指纹查表）。
 		// 上限比头像宽一个量级（付费层超限是计费不是报错），理由见 AD_IMAGE_VISION_DAILY。
 		imageVisionDaily: pickInt(env.AD_IMAGE_VISION_DAILY, AD_IMAGE_VISION_DAILY, 0, 100000),
+		// 第三层语义嵌入的每日次数上限（0 = 关闭第三层，降级为评分 + 指纹两层）。
+		// 【2026-11 新增】在此之前这一轨是四轨里唯一【没有任何上限】的：
+		// 第⑥层有 canSpendAdLLMQuota、两类视觉有 daily + 熔断，只有它随消息量线性涨，
+		// 而且 /adstats 上看不见。没有上限的那一轨就是「不能超出」这条保证的唯一缺口。
+		embedDaily: pickInt(env.AD_EMBED_DAILY, AD_EMBED_DAILY, 0, 1000000),
 		// 生成式深度判定的【总】每日次数上限（0 = 关闭本路，只跑前三层）。
 		// 2026-10-11 从 200 提到 1000，并拆出下面三个分池 —— 详见 AD_LLM_DAILY 的成本账。
 		llmDaily: pickInt(env.AD_LLM_DAILY, AD_LLM_DAILY, 0, 100000),
@@ -23884,7 +23889,37 @@ function cosineSimilarity(a, b) {
 //
 // 【成本对比】缓存命中省下的是一次 bge-m3 调用（0.129 Neurons），
 // 代价是一次 D1 读（内存一级命中时连这个都没有）。D1 不计 Neurons，稳赚。
-const AD_EMBED_CACHE_PREFIX = 'emb_';
+// 第三层语义嵌入的每日次数上限。
+//
+// 【为什么这一轨也要有上限】改动前四轨的闸门严重不对等：
+//   第⑥层 LLM → canSpendAdLLMQuota（保底 + 共享余量）+ 两级去重 + 熔断
+//   正文图视觉 → AD_IMAGE_VISION_DAILY + 熔断 + 判过零成本
+//   头像视觉   → AD_AVATAR_VISION_DAILY + 熔断 + 判过零成本
+//   语义嵌入   → 什么都没有
+// 它随消息量线性涨，群里突然刷屏时无声无息地吃额度，/adstats 上还看不见。
+// 主人的口径是「不浪费、也不能超出」—— 没有上限的那一轨就是后半句唯一的缺口。
+//
+// 【默认 20000 怎么来的】bge-m3 实价 1,075 Neurons / M input tokens，
+// 典型中文消息约 120 token → 0.129 Neurons/次。
+//   20,000 × 0.129 = 2,580 Neurons = 免费版 10,000 的 26%
+// 而免费版的目标场景是每天 1 万条群消息 —— 给两倍配额留突增空间，
+// 且第一批的向量缓存会把重复文案挡在计数之前，实际远用不到这个数。
+//
+// 【为什么不按「够用就好」给 10000】配额打满的代价是第三层整层退场，
+// 那是功能损失。宁可上限给宽一点（26% 额度仍然装得下），
+// 也不要让正常流量的群在半夜被挡掉第三层。
+const AD_EMBED_DAILY = 20000;
+// 日用量计数键。与 img_count / llm_count 同一套 ad_scan_state 账本，
+// 所以 readImageVisionQuota(env, now, 'emb') 可以直接复用，不必新写读写函数。
+const AD_EMBED_COUNT_KEY = 'emb_count';
+
+// 向量缓存的键前缀。
+// 【必须与配额键前缀错开】配额走 readImageVisionQuota(env, now, 'emb')，
+// 它的键是 emb_day / emb_count。而剪枝那条 DELETE 用 `key LIKE 前缀 || '%'`：
+// 前缀若也是 'emb_'，`emb_count` 和 `emb_day` 会一起落进 LIKE 'emb_%' 被删掉 ——
+// 表现是配额每隔一会儿自己归零、上限形同不存在，而且不报任何错。
+// 所以这里用 'embc_'（c = cache），与 'emb_' 不互相匹配。
+const AD_EMBED_CACHE_PREFIX = 'embc_';
 // 缓存保留期：6 小时。
 // 【为什么不更久】样本库会随 /spam 学习变化，但那只影响【比对结果】不影响
 // 【查询向量本身】—— 同一文本的 bge-m3 向量是确定的，存多久都不会算错。
@@ -23953,16 +23988,31 @@ async function writeAdEmbedCache(env, key, vector, nowSeconds) {
 	}
 }
 
-// 带两级缓存的取向量。只给【查询侧】用（checkAdAiSimilarity）——
+// 带两级缓存 + 日配额的取向量。只给【查询侧】用（checkAdAiSimilarity）——
 // 样本侧（topUpAdSampleEmbeddings）不走这里：那条路的结果本来就落在
-// ad_sample_embeddings.embedding 里，已经是永久缓存，再加一层纯属多余。
-async function embedAdTextCached(env, text) {
+// ad_sample_embeddings.embedding 里，已经是永久缓存，再加一层纯属多余，
+// 而且样本补齐是一次性冷启动成本，不该占判定侧的日配额。
+async function embedAdTextCached(env, text, config = null) {
 	const source = String(text ?? '').trim().slice(0, 512);
 	if (!source) return null;
+	const cfg = config || loadAdDetectionConfig(env);
+	const dailyLimit = Number(cfg?.embedDaily);
+	// 【0 是开关，不是配额 —— 所以这道检查必须在查缓存【之前】】
+	// 配额打满是「钱花完了」，缓存命中零成本，挡它纯属浪费，所以那道检查放在
+	// 两级缓存之后。但 embedDaily = 0 的语义是「关掉第三层」，与 aiEnabled=false
+	// 一字不差 —— 关掉就是整层不跑，有没有缓存都一样。
+	// 【这个区分是测出来的】两道检查原本合在缓存之后：配额设 0 时模型一次没调
+	//（看着是对的），但内存里存着同一文案的旧向量，于是照样算出相似度 1、照样定罪。
+	// 开关关了功能还在跑，而且不报任何错。
+	if (!(dailyLimit > 0)) return null;
 	const key = adTextHash(source);
+	// ① 内存一级。命中时零 D1、零模型、【不扣配额】——
+	// 配额管的是「花掉的模型调用」，缓存命中一次钱都没花，扣它等于把第一批的
+	// 省额度成果又吐回去（刷屏文案会把配额飞快耗空，而实际成本是零）。
 	const hit = adEmbedCache.get(key);
 	if (hit) return hit;
 	const nowSeconds = Math.floor(Date.now() / 1000);
+	// ② D1 二级。同样不扣配额，理由同上。
 	const cached = await readAdEmbedCache(env, key, nowSeconds);
 	if (cached) {
 		// 回填内存一级：这个 isolate 接下来遇到同一条就不用再查 D1 了。
@@ -23970,10 +24020,18 @@ async function embedAdTextCached(env, text) {
 		adEmbedCache.set(key, cached);
 		return cached;
 	}
+	// ③ 两级都没有 —— 这次要真花钱了，先问配额。
+	const quota = await readImageVisionQuota(env, nowSeconds, 'emb');
+	// 打满后返回 null → checkAdAiSimilarity 回落成 similarity 0 → 第三层退场，
+	// 评分层、指纹层、四通道结构查杀照常跑。是降级，不是报错。
+	if (dailyLimit - quota.used <= 0) return null;
 	const vector = await embedAdText(env, source);
 	if (!vector) return null;
 	if (adEmbedCache.size >= AD_EMBED_CACHE_MEM_MAX) adEmbedCache.clear();
 	adEmbedCache.set(key, vector);
+	// 【先记账再写缓存】两者都失败也不影响本次判定（向量已经算出来了），
+	// 但记账失败比缓存失败严重 —— 它会让上限失效，所以放前面。
+	await bumpAdScanCounter(env, AD_EMBED_COUNT_KEY, 1, nowSeconds);
 	await writeAdEmbedCache(env, key, vector, nowSeconds);
 	return vector;
 }
@@ -24103,7 +24161,9 @@ async function checkAdAiSimilarity(env, text, options = {}) {
 	// 【走缓存版】这是本层唯一的查询侧取向量点，也是四轨里原先唯一没有去重的那处。
 	// 同一文本的 bge-m3 向量是确定的，缓存命中与重算逐位相同 —— 判定结果一字不变，
 	// 省掉的是纯重复的模型调用。详见 embedAdTextCached 上方那段。
-	const vector = await embedAdTextCached(env, source);
+	// 【传 config 进去】配额闸在 embedAdTextCached 内部、缓存全未命中那一点，
+	// 复用这里已经加载好的 config，避免每条消息多走一次 loadAdDetectionConfig。
+	const vector = await embedAdTextCached(env, source, config);
 	if (!vector) return { available: true, similarity: 0, sample: null };
 
 	let best = 0;
