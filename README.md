@@ -177,14 +177,14 @@
 .
 ├── _worker.js             # Worker 主程序（单文件，含广告检测层）
 ├── wrangler.toml          # Cloudflare Wrangler 配置（D1 / Queue / AI 绑定）
-├── tests/                 # 离线测试（不参与部署）
+├── tests/                 # 离线测试（不参与部署，仅本地，不进仓库）
 │   ├── test_*.mjs         # 70 个功能测试
 │   └── miniapp_*.cjs      # 3 个页面检查（browser / drilldown 两个要本机 Chrome + playwright-core）
 ├── README.md
 └── LICENSE
 ```
 
-- **测试** —— **70 个文件**，全绿才允许推送；`node tests/test_xxx.mjs` 单跑，退出码非 0 即失败；全跑：`for f in tests/test_*.mjs; do node "$f" >/dev/null || echo "FAIL $f"; done`
+- **测试** —— **70 个文件**，只存本地（`.gitignore` 已排除），全绿才允许推送；`node tests/test_xxx.mjs` 单跑，退出码非 0 即失败；全跑：`for f in tests/test_*.mjs; do node "$f" >/dev/null || echo "FAIL $f"; done`
 - **运行要求** —— **Node 22+**（`node:sqlite` 内置模块要求）
 - **测试环境** —— 全部离线：Bot API 全 mock，D1 用 `DatabaseSync(':memory:')` **真实 SQLite 后端**（`ON CONFLICT`、`UNIQUE`、`batch` 事务真跑），Workers AI 用固定向量函数模拟
 

@@ -17289,12 +17289,12 @@ function resolveRmTarget(message) {
 }
 
 // 私聊 /rm 的消息链接。两种格式：
-//   t.me/c/2443712513/354245   私有群 / 无用户名的群：数字前补 -100 就是群 ID
-//   t.me/ssoadmin/354245       公开群：用户名要 getChat 换成群 ID
+//   t.me/c/1111111111/123      私有群 / 无用户名的群：数字前补 -100 就是群 ID
+//   t.me/群用户名/123          公开群：用户名要 getChat 换成群 ID
 // 话题链接中间多一段话题 ID（t.me/c/群/话题/消息），一律取最后一段作消息 ID；?single 等参数忽略。
 const RM_LINK_RE = /(?:https?:\/\/)?(?:t|telegram)\.me\/(?:c\/(\d+)|([A-Za-z][A-Za-z0-9_]{3,31}))\/(?:\d+\/)?(\d+)/i;
 const RM_LINK_USAGE = '❌ <b>用法</b>\n\n· 群里：回复要删除的那条消息，再发送 <code>/rm</code>\n'
-	+ '· 私聊：<code>/rm 消息链接</code>，例如 <code>/rm https://t.me/c/2443712513/354245</code> 或 <code>/rm https://t.me/群用户名/354245</code>\n'
+	+ '· 私聊：<code>/rm 消息链接</code>，例如 <code>/rm https://t.me/c/1111111111/123</code> 或 <code>/rm https://t.me/群用户名/123</code>\n'
 	+ '（消息上右键「复制消息链接」即可，私聊删除群里不留任何痕迹）';
 
 function parseRmLink(text) {
