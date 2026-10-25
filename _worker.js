@@ -23867,6 +23867,117 @@ function cosineSimilarity(a, b) {
 	return Number.isFinite(value) ? value : 0;
 }
 
+// ===== 查询向量两级缓存（2026-11 第一批）=====
+//
+// 【这一轨原先是四轨里唯一没有去重的】checkAdAiSimilarity 调 embedAdText 之前
+// 只有一道 source.length < 4，同一句话发 100 次就调 100 次 bge-m3。
+// 第⑥层上一批已经修过同样的毛病（adLLMSeen + llm_seen_ 落库），这一轨漏了。
+// 刷屏广告正是这个形态：同一文案连发几十次，每次都重新付钱算同一个向量。
+//
+// 【为什么是值缓存，不是「判过」标记】第⑥层去重可以只记一个标记（判过就不再判），
+// 这里不行 —— 向量要拿来和样本库算余弦相似度，丢了向量就出不了相似度。
+// 所以必须把向量本身存下来，命中时返回与重算【逐位相同】的那一份。
+//
+// 【为什么复用 ad_scan_state】与第⑥层去重同一个理由：那张表已经是
+// key TEXT PRIMARY KEY 的 key-value 结构、已经建好、本模块已经在读写它。
+// 新建表要多一次 sqlite_master 探测，还得自己管剪枝。
+//
+// 【成本对比】缓存命中省下的是一次 bge-m3 调用（0.129 Neurons），
+// 代价是一次 D1 读（内存一级命中时连这个都没有）。D1 不计 Neurons，稳赚。
+const AD_EMBED_CACHE_PREFIX = 'emb_';
+// 缓存保留期：6 小时。
+// 【为什么不更久】样本库会随 /spam 学习变化，但那只影响【比对结果】不影响
+// 【查询向量本身】—— 同一文本的 bge-m3 向量是确定的，存多久都不会算错。
+// 真正的约束是 ad_scan_state 的体积：群聊文本千变万化，键只增不减会堆积，
+// 6 小时配合下面的剪枝批次足够跟上生成速度。
+// 【为什么不更短】刷屏广告往往持续几小时，太短等于没去重。
+const AD_EMBED_CACHE_TTL_SECONDS = 6 * 3600;
+// 单次调用顺带剪掉的过期缓存键条数。
+// 【为什么不一次清干净】DELETE 不带 LIMIT 会在键堆积时变成全表扫描，
+// 而这是每条消息都走的热路径。每次顺手清一点，摊到调用次数上足够。
+const AD_EMBED_CACHE_PRUNE_BATCH = 20;
+// 内存一级。值是向量数组本身，不是标记。
+// 【为什么内存一级不够、必须带 D1】Cloudflare 的 isolate 分钟级回收，
+// Map 随之清空。刷屏文案在新 isolate 里会被重新算、重新付钱，
+// 而 /adstats 上看不出任何异常 —— 这正是第⑥层去重上一批要落库的同一个理由。
+const adEmbedCache = new Map();
+// 内存一级的条数上限：isolate 内存有限，不能无界增长。
+// 超过就整体清空而不是 LRU —— 这一级只是省 D1 读，丢了仍有 D1 兜底，
+// 为了精确淘汰去维护访问顺序，复杂度换不回收益。
+const AD_EMBED_CACHE_MEM_MAX = 500;
+
+// 测试入口：清掉内存那一级，用来模拟 isolate 回收。
+// 【为什么要暴露它】跨 isolate 复用只能这样测 —— 真去重新 vm 加载一遍 _worker.js
+// 要 2 秒以上，而且两个沙箱之间还得手动共享 D1。生产代码不会调它。
+function clearAdEmbedCacheMemory() {
+	adEmbedCache.clear();
+}
+
+// 从 D1 读缓存的向量。读不到 / 过期 / 解析失败一律返回 null = 当没缓存过，
+// 宁可多算一次（0.129 Neurons）也不能因为一次 D1 抖动把第三层静默关掉。
+async function readAdEmbedCache(env, key, nowSeconds) {
+	if (!env?.DB) return null;
+	try {
+		const row = await env.DB.prepare(
+			'SELECT value, updated_at FROM ad_scan_state WHERE key = ? LIMIT 1')
+			.bind(AD_EMBED_CACHE_PREFIX + key).first();
+		if (!row) return null;
+		if (nowSeconds - (Number(row.updated_at) || 0) >= AD_EMBED_CACHE_TTL_SECONDS) return null;
+		const vector = JSON.parse(String(row.value || ''));
+		if (!Array.isArray(vector) || !vector.length) return null;
+		return vector;
+	} catch (error) {
+		console.error('[广告检测] 读取向量缓存失败:', error);
+		return null;
+	}
+}
+
+// 写一条向量缓存，并顺手剪掉一批过期的。
+// 【两件事放一起】剪枝没有独立的触发时机（这一层没有自己的 cron），
+// 挂在写入点上最自然：有新键产生，就意味着有旧键该走了。
+async function writeAdEmbedCache(env, key, vector, nowSeconds) {
+	if (!env?.DB) return;
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_scan_state (key, value, updated_at) VALUES (?, ?, ?) '
+			+ 'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+			.bind(AD_EMBED_CACHE_PREFIX + key, JSON.stringify(vector), Number(nowSeconds) || 0).run();
+		await env.DB.prepare(
+			'DELETE FROM ad_scan_state WHERE key IN ('
+			+ 'SELECT key FROM ad_scan_state WHERE key LIKE ? AND updated_at < ? LIMIT ?)')
+			.bind(AD_EMBED_CACHE_PREFIX + '%', Number(nowSeconds) - AD_EMBED_CACHE_TTL_SECONDS,
+				AD_EMBED_CACHE_PRUNE_BATCH).run();
+	} catch (error) {
+		// 写不进去只是失去跨实例复用，向量已经算出来了 —— 不能因此报错。
+		console.error('[广告检测] 写入向量缓存失败:', error);
+	}
+}
+
+// 带两级缓存的取向量。只给【查询侧】用（checkAdAiSimilarity）——
+// 样本侧（topUpAdSampleEmbeddings）不走这里：那条路的结果本来就落在
+// ad_sample_embeddings.embedding 里，已经是永久缓存，再加一层纯属多余。
+async function embedAdTextCached(env, text) {
+	const source = String(text ?? '').trim().slice(0, 512);
+	if (!source) return null;
+	const key = adTextHash(source);
+	const hit = adEmbedCache.get(key);
+	if (hit) return hit;
+	const nowSeconds = Math.floor(Date.now() / 1000);
+	const cached = await readAdEmbedCache(env, key, nowSeconds);
+	if (cached) {
+		// 回填内存一级：这个 isolate 接下来遇到同一条就不用再查 D1 了。
+		if (adEmbedCache.size >= AD_EMBED_CACHE_MEM_MAX) adEmbedCache.clear();
+		adEmbedCache.set(key, cached);
+		return cached;
+	}
+	const vector = await embedAdText(env, source);
+	if (!vector) return null;
+	if (adEmbedCache.size >= AD_EMBED_CACHE_MEM_MAX) adEmbedCache.clear();
+	adEmbedCache.set(key, vector);
+	await writeAdEmbedCache(env, key, vector, nowSeconds);
+	return vector;
+}
+
 // 取文本向量。失败一律返回 null 交由上层跳过，绝不抛到检测主链路。
 async function embedAdText(env, text) {
 	const source = String(text ?? '').trim().slice(0, 512);
@@ -23989,7 +24100,10 @@ async function checkAdAiSimilarity(env, text, options = {}) {
 	const samples = await loadAdSampleEmbeddings(env);
 	if (!samples.length) return { available: true, similarity: 0, sample: null };
 
-	const vector = await embedAdText(env, source);
+	// 【走缓存版】这是本层唯一的查询侧取向量点，也是四轨里原先唯一没有去重的那处。
+	// 同一文本的 bge-m3 向量是确定的，缓存命中与重算逐位相同 —— 判定结果一字不变，
+	// 省掉的是纯重复的模型调用。详见 embedAdTextCached 上方那段。
+	const vector = await embedAdTextCached(env, source);
 	if (!vector) return { available: true, similarity: 0, sample: null };
 
 	let best = 0;
