@@ -12138,13 +12138,13 @@ async function handleKillerRm(message, env, ctx) {
 		return true;
 	}
 	await deleteAuthorizedGroupCommandMessage(message, '/rm');
-	const target = message.reply_to_message;
-	if (!target?.message_id) {
-		await sendFlashMessage(chatId, '❌ 请<b>回复</b>要删除的那条消息，再发 /rm', ctx);
+	const target = resolveRmTarget(message);
+	if (!target) {
+		await sendFlashMessage(chatId, rmNoTargetText(message), ctx);
 		return true;
 	}
-	const del = await deleteMessage(chatId, target.message_id);
-	const content = String(target.text || target.caption || '').trim();
+	const del = await deleteMessage(chatId, target.messageId);
+	const content = target.content;
 	const detail = [
 		'🗑 <b>群内消息删除</b>（杀手权限）',
 		'',
@@ -17261,6 +17261,34 @@ function isRmCommand(text) {
 	return /^\/rm(?:@[^\s]+)?(?:\s|$)/i.test(String(text || '').trim());
 }
 
+// /rm 的删除目标。线上实测：回复着本群消息发 /rm，Telegram 推来的更新里可能没有 reply_to_message，
+// 被回复的消息落在 external_reply（ExternalReplyInfo，只有 chat + message_id + origin，没有正文）。
+// 先认 reply_to_message；没有再认 external_reply，但只认【指向本群】的 —— 指向别的群就删错地方了。
+// 返回 { messageId, from, content } 或 null。
+function resolveRmTarget(message) {
+	const reply = message?.reply_to_message;
+	if (reply?.message_id) {
+		return { messageId: reply.message_id, from: reply.from, content: String(reply.text || reply.caption || '').trim() };
+	}
+	const ext = message?.external_reply;
+	if (ext?.message_id && ext.chat && String(ext.chat.id) === String(message?.chat?.id)) {
+		const origin = ext.origin || {};
+		return {
+			messageId: ext.message_id,
+			from: origin.sender_user || null,
+			// external_reply 不带原文，用引用片段兜底，审计里至少看得出删的是哪条
+			content: String(message.quote?.text || '').trim()
+		};
+	}
+	return null;
+}
+
+// 认不出目标时的提示：附上这条更新实际带了哪些字段，下次再失败一眼看出 Telegram 推的是什么。
+function rmNoTargetText(message) {
+	const keys = Object.keys(message || {}).filter((k) => k !== 'text' && k !== 'entities');
+	return '❌ 请<b>回复</b>要删除的那条消息，再发 /rm\n收到的字段：<code>' + escapeHtml(keys.join(', ') || '无') + '</code>';
+}
+
 async function handleRmCommand(message, env, ctx) {
 	const chat = message?.chat;
 	const chatId = chat?.id;
@@ -17277,9 +17305,9 @@ async function handleRmCommand(message, env, ctx) {
 	// 先撤回命令本身：权限不足 / 参数缺失时，群里不会同时留下命令和提示两条消息。
 	await deleteAuthorizedGroupCommandMessage(message, '/rm');
 
-	const target = message.reply_to_message;
-	if (!target?.message_id) {
-		await sendFlashMessage(chatId, '❌ 请<b>回复</b>要删除的那条消息，再发 /rm', ctx);
+	const target = resolveRmTarget(message);
+	if (!target) {
+		await sendFlashMessage(chatId, rmNoTargetText(message), ctx);
 		return;
 	}
 
@@ -17291,7 +17319,7 @@ async function handleRmCommand(message, env, ctx) {
 		return;
 	}
 
-	const del = await deleteMessage(chatId, target.message_id);
+	const del = await deleteMessage(chatId, target.messageId);
 
 	// 完整结果分两条通道（用项目现成的 replyToAdmin）：
 	//   · 群内 = 5 秒闪屏回执。注意它有个规则：【只有第一主人执行时才发闪屏】，
@@ -17301,13 +17329,13 @@ async function handleRmCommand(message, env, ctx) {
 	const groupLabel = chat?.title
 		? escapeHtml(String(chat.title)) + '（<code>' + escapeHtml(String(chatId)) + '</code>）'
 		: '<code>' + escapeHtml(String(chatId)) + '</code>';
-	const rawContent = String(target.text || target.caption || '').trim();
+	const rawContent = target.content;
 	const detailBase = [
 		'🗑 <b>群内消息删除</b>',
 		'',
 		'群　　' + groupLabel,
 		'操作人　' + formatUserReference(userId, message.from),
-		'目标 ID　<code>' + escapeHtml(String(target.message_id)) + '</code>',
+		'目标 ID　<code>' + escapeHtml(String(target.messageId)) + '</code>',
 		'目标发送者　' + formatUserReference(target.from?.id, target.from),
 		'目标内容　' + (rawContent ? escapeHtml(rawContent.slice(0, 200)) : '（非文本消息，无文字内容）'),
 	];

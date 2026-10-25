@@ -274,6 +274,12 @@ reset();
 const targetG = groupMsg(G, '55609', '随便说说');
 await send(groupMsg(G, KA, '/rm', { reply_to_message: targetG }));
 check('越界：GROUP_ID 群里 /rm 删不了', !callsOf('deleteMessage').some((c) => Number(c.body?.message_id) === targetG.message_id));
+reset();
+await send(groupMsg(K, KA, '/rm', { external_reply: { origin: { type: 'user', date: 1, sender_user: { id: 55609, is_bot: false } }, chat: { id: Number(K), type: 'supergroup' }, message_id: 4321 } }));
+check('★ 杀手群 /rm 认 external_reply（指向本群）', callsOf('deleteMessage').some((c) => String(c.body?.chat_id) === K && Number(c.body?.message_id) === 4321));
+reset();
+await send(groupMsg(K, KA, '/rm', { external_reply: { origin: { type: 'user', date: 1 }, chat: { id: Number(G), type: 'supergroup' }, message_id: 4322 } }));
+check('★ 杀手群 /rm 的 external_reply 指向别的群 → 不删', !callsOf('deleteMessage').some((c) => Number(c.body?.message_id) === 4322));
 
 log('\n=== 15. 批量任务：杀手身份的大批量走独立黑名单、只踢杀手群 ===');
 reset();

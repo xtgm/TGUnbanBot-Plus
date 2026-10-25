@@ -333,5 +333,26 @@ console.log('\n=== 4. /profile 输出 ===');
 		outG2.slice(outG2.indexOf('群内身份'), outG2.indexOf('群内身份') + 70));
 }
 
+// 线上实测：回复着一条消息发 /rm，Telegram 推来的更新里没有 reply_to_message，
+// 被回复的消息落在 external_reply（ExternalReplyInfo：chat + message_id）。
+console.log('\n=== /rm 认 external_reply ===');
+{
+	failDeletes = false;
+	reset();
+	await rm(OWNER, '/rm', { message_id: 101, external_reply: { origin: { type: 'user', date: 1, sender_user: { id: 42, is_bot: true, first_name: '机器人' } }, chat: { id: Number(GROUP), type: 'supergroup', title: '本群' }, message_id: 777 }, quote: { text: '新增独立群模式', position: 0 } });
+	check('★ 只有 external_reply 且指向本群 → 删除目标', deleted.includes(GROUP + ':777'), deleted.join(' '));
+	check('★ 不再回「请回复要删除的那条消息」', !sent.some((s) => s.text.includes('请<b>回复</b>')), JSON.stringify(sent.map((s) => s.text.slice(0, 40))));
+	check('★ 审计里带上引用片段作为目标内容', sent.some((s) => s.chatId === String(OWNER) && s.text.includes('777') && s.text.includes('新增独立群模式')), JSON.stringify(sent.map((s) => s.text.slice(0, 200))));
+
+	reset();
+	await rm(OWNER, '/rm', { message_id: 102, external_reply: { origin: { type: 'chat', date: 1, sender_chat: { id: -100999 } }, chat: { id: -100999, type: 'supergroup' }, message_id: 778 } });
+	check('★ external_reply 指向别的群 → 不删', !deleted.some((x) => x.endsWith(':778')), deleted.join(' '));
+
+	reset();
+	await rm(OWNER, '/rm', { message_id: 103 });
+	const tip = sent.find((s) => s.text.includes('请<b>回复</b>'));
+	check('★ 两个字段都没有 → 提示里列出收到的字段', Boolean(tip) && tip.text.includes('收到的字段') && tip.text.includes('message_id'), tip && tip.text);
+}
+
 console.log('\n/rm + profile 验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 if (fail > 0) process.exitCode = 1;
