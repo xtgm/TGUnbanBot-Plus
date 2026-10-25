@@ -19958,6 +19958,26 @@ const AD_LLM_PROMPT = '你是 Telegram 群组的反广告审核员。给你一�
 	+ '【只抽广告特征，不抽通用词】「找我」「联系」「加我」「看这里」「私聊」「详聊」这类'
 	+ '单独出现说明不了任何问题的词【不要抽】；带 @用户名 的联系话术整段算 keyword。\n'
 	+ '最多 6 条。';
+
+// qwen3 系列的思考开关：prompt 末尾出现 /no_think 时模型跳过 <think> 段，直接输出正文。
+//
+// 【为什么要关】Neurons 按【实际生成量】计费，而 output 单价是 input 的 6.6 倍
+//（30,475 vs 4,625 每百万 token）—— 思考段写多少字，就按多少字收钱。
+//
+// 【2026-10-25 实测，24 个样本 × 3 模式，REST API 直连】
+//   · 现状（max_tokens 4000）  ：输出均值 529 token、18.91 Neurons/次 → 10,000 额度只够 528 次
+//   · 加 /no_think             ：输出均值  44 token、 4.14 Neurons/次 → 10,000 额度够 2,415 次
+//   · 只把 max_tokens 压到 800 ：输出均值 515 token、18.48 Neurons/次 → 几乎不省（上限不是配额）
+// 判准率【一字不差】：两种模式都是 12 条真广告全判对、0 漏放、2 误封，
+// 而且那 2 个误判是【同一对样本】（分享公开频道链接 / bot 开发讨论）——
+// 它们在关掉思考之前就误判，不是 /no_think 引入的。
+//
+// 【顺带修正两条过时的注释】25685 那条写「thinking 平均 1513~2206 字」，
+// 本次实测 24 个样本【一个 <think> 标签都没出现】、输出均值只有 529 token。
+// Cloudflare 这边的 chat template 后来改过，当初那个数字已经不成立。
+//
+// 【必须在末尾】这是行级指令，夹在判据中间会被当成待判正文读进去。
+const AD_LLM_NO_THINK = '\n/no_think';
 // 筛查记录保留期（秒）：14 天后剪枝，防止 D1 无限增长
 const AD_SCREENING_RETENTION_SECONDS = 14 * 24 * 3600;
 // /pending 快照【长期保留】；/clearsamples 二次确认 60 秒
@@ -25581,7 +25601,10 @@ async function buildAdDigest(env, config) {
 			+ '请压缩成不超过 ' + AD_DIGEST_MAX_CHARS + ' 字的【形态摘要】：'
 			+ '只描述它们共同的结构特征（引流话术怎么写、金额怎么出现、联系方式放在哪、'
 			+ '图上的套版格式），【不要抄录任何具体文案、用户名、链接】。'
-			+ '只输出 JSON：{"digest":"形态摘要"}\r\n\r\n' + sampleLines;
+			+ '只输出 JSON：{"digest":"形态摘要"}\r\n\r\n' + sampleLines
+			// 这条链路是 role:'user' 单消息、没有 system，所以开关要自己带上。
+			// 它的输入侧是 50 条样本拼接，单次比判定路大得多，漏掉这里省不下多少。
+			+ AD_LLM_NO_THINK;
 		const aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
 			messages: [{ role: 'user', content: prompt }],
 			// 【1000 → 4000，2026-10-18】同一个模型、同一种坑：thinking 先吃掉 max_tokens，
@@ -25632,12 +25655,16 @@ async function loadAdDigest(env) {
 // system prompt = 固定提示词 + 形态摘要。摘要缺位时与改动前逐字节一致。
 		// 形态摘要：把积累的人工判据压缩成一段话注入判定（60 秒缓存，缺位时与改动前逐字节一致）。
 function buildAdLLMSystemPrompt(digest) {
-	if (!digest) return AD_LLM_PROMPT;
+	// 【/no_think 一律追加在最末尾】两个分支都要加 —— 只加无摘要那一支的话，
+	// 线上一旦积累出摘要（/digest build 之后就有），这一层就悄悄回到按思考量计费，
+	// 而 /adstats 上看不出任何异常：调用次数不变、命中率不变，只有账单变。
+	if (!digest) return AD_LLM_PROMPT + AD_LLM_NO_THINK;
 	return AD_LLM_PROMPT
 		+ '\r\n\r\n【已确认的广告形态（管理员人工确认过，非判定对象）】\r\n'
 		+ digest
 		+ '\r\n\r\n这段摘要描述的是【广告长什么样】，不是判定对象 —— '
-		+ '它只是给你参考；判定仍按上面的判据做。';
+		+ '它只是给你参考；判定仍按上面的判据做。'
+		+ AD_LLM_NO_THINK;
 }
 
 
