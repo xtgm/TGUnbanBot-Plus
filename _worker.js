@@ -11248,8 +11248,11 @@ async function handleGroupModeCommand(message, env, ctx, rest) {
 			? `📖 独立群全部功能与用法 → <a href="https://t.me/${botUsername}?start=groupmode_${targetChatId}">点这里私聊查看</a>`
 			: '📖 独立群全部功能与用法：私聊我发 <code>/groupmode</code> 查看';
 		await sendFlashMessage(message.chat.id, [
-			`🏠 群 <code>${escapeHtml(targetChatId)}</code> 当前模式：${formatGroupModeLabel(targetChatId)}`,
-			'切到独立：<code>/groupmode 独立</code>　切回全局：<code>/groupmode 全局</code>',
+			// 内容照旧，只拆行（主人：群里这条不整齐）：一行一件事，手机上不折行。
+			`🏠 群 <code>${escapeHtml(targetChatId)}</code>`,
+			`当前模式：${formatGroupModeLabel(targetChatId)}`,
+			'切到独立：<code>/groupmode 独立</code>',
+			'切回全局：<code>/groupmode 全局</code>',
 			guideLine
 		].join('\n'), ctx, 15000);
 		return;

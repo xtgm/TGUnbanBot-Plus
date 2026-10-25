@@ -179,6 +179,15 @@ reset();
 await send(CREATOR, '/groupmode', G2);
 const gmFlash = flashes.find((f) => f.chatId === G2);
 check('★ 群主群里发 /groupmode → 闪屏提示带当前模式与切换写法', !!gmFlash && gmFlash.text.includes('当前模式') && gmFlash.text.includes('/groupmode 独立') && gmFlash.text.includes('/groupmode 全局'), gmFlash?.text);
+// 【2026-10-25 主人：群里这条也不整齐，按原有内容把换行弄好】内容不变，只拆行：群号 / 当前模式 / 切独立 / 切全局 / 私聊入口 各一行。
+const flashRows = String(gmFlash?.text || '').split('\n');
+check('★ 闪屏五行：群号、当前模式、切独立、切全局、私聊入口各占一行',
+	flashRows.length === 5
+	&& flashRows[0] === '🏠 群 <code>' + G2 + '</code>'
+	&& flashRows[1].startsWith('当前模式：')
+	&& flashRows[2] === '切到独立：<code>/groupmode 独立</code>'
+	&& flashRows[3] === '切回全局：<code>/groupmode 全局</code>'
+	&& flashRows[4].startsWith('📖 '), JSON.stringify(flashRows));
 check('★ 闪屏带私聊深链 start=groupmode_群ID', !!gmFlash && gmFlash.text.includes('https://t.me/mock_test_bot?start=groupmode_' + G2), gmFlash?.text);
 check('★ 闪屏会自动撤回且留够点链接的时间（≥10 秒）', !!gmFlash && Number(gmFlash.ttlMs) >= 10000, String(gmFlash?.ttlMs));
 check('★ 群里不发完整长文（/localset 写法不出现在群里）', !sent.some((s) => s.chatId === G2 && s.text.includes('/localset 检测')), allSent());
