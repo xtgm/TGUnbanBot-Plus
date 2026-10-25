@@ -14351,6 +14351,128 @@ async function claimInterceptNotify(env, userId, chatId, outcome) {
 	}
 }
 
+// ===== 群收走 bot「封禁用户」权限时的拦截降级（2026-10-25 乙方案）=====
+//
+// 【治的是什么】线上真实事故：某群把 bot 的「封禁用户」开关关掉、只留删除消息权限。
+// 全局黑名单用户每发一条消息 → 删得掉、禁不住 → 下一条又拦一次，一个人累计 273 次
+// 拦截全是「处置失败 - bot 权限不足」。Telegram 把禁言与踢出归在【同一个】权限
+// （can_restrict_members）之下，所以 human / mute / kick 三条路在缺权限时全都必然 400 ——
+// 换哪条路都救不了。能少做的只有一件：不再白调那一次注定失败的请求。
+//
+// 【为什么必须缓存】探测是一次 getChatMember，而拦截是按【每条消息】触发的。
+// 不缓存等于把刷屏的 restrictChatMember 换成刷屏的 getChatMember，一点没省。
+// 10 分钟与 GROUP_INFO_CACHE_TTL_MS 同口径：权限改动是人工操作，最多晚 10 分钟生效。
+//
+// 【探测失败一律按「有权限」处理】拿不到权限不等于没有权限。探测失败就放弃处置，
+// 会让一次网络抖动把该禁的人放过去 —— 与 applyGroupModeration 里「getChat 失败时
+// 维持原结论」同一取向：宁可白调一次，不能漏处置。失败【不写缓存】，下次重新探。
+const BOT_RESTRICT_RIGHT_CACHE = new Map();
+const BOT_RESTRICT_RIGHT_TTL_MS = 600000;
+
+async function botHasRestrictRight(chatId) {
+	const key = String(chatId || '');
+	if (!key) return true;
+	const hit = BOT_RESTRICT_RIGHT_CACHE.get(key);
+	if (hit && hit.expiresAt > Date.now()) return hit.value;
+	const botId = await getBotId();
+	if (!botId) return true;
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: chatId, user_id: Number(botId) })
+		});
+		const result = await response.json();
+		// 查不到就按有权限处理（理由见函数头），且【不写缓存】：下一条消息还要再试一次。
+		if (!response.ok || !result?.ok || !result.result) return true;
+		// 复用 botCanRestrictMember：群主天然全权，管理员才看 can_restrict_members。
+		const value = botCanRestrictMember(result.result);
+		BOT_RESTRICT_RIGHT_CACHE.set(key, { value, expiresAt: Date.now() + BOT_RESTRICT_RIGHT_TTL_MS });
+		return value;
+	} catch (error) {
+		console.error('[拦截权限探测] 查询失败，按有权限处理:', error);
+		return true;
+	}
+}
+
+// 群内提醒去重：每群每 24 小时最多一条。
+// 【为什么落 D1 而不是内存】与 claimInterceptNotify 同一个理由：Worker 多实例各有一份
+// Map，挡不住重复 —— 而这条消息是发到【别人群里】的，刷屏的代价比主人私聊大得多。
+const D1_PERM_NOTICE_INIT = new WeakMap();
+const PERM_NOTICE_COOLDOWN_SECONDS = 86400;
+
+async function ensurePermNoticeTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_PERM_NOTICE_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			await runD1SchemaStatement(env, 'perm_notice_log',
+				'CREATE TABLE IF NOT EXISTS perm_notice_log (chat_id TEXT PRIMARY KEY, notified_at INTEGER NOT NULL DEFAULT 0)');
+			return true;
+		} catch (error) {
+			console.error('[权限提醒] 建表失败:', error);
+			D1_PERM_NOTICE_INIT.delete(env.DB);
+			return false;
+		}
+	})();
+	D1_PERM_NOTICE_INIT.set(env.DB, init);
+	return init;
+}
+
+// 返回 true 表示这次该发。
+// 【D1 不可用时返回 false，与 claimInterceptNotify 取向相反】那条是发给主人的，
+// 宁可多发也不能把失败静默；这条是发到群里的，去重表读不出来就不发 ——
+// 在别人群里刷屏换来的只有被踢，提醒本身的价值远不值这个代价。
+async function claimPermNotice(env, chatId) {
+	if (!(await ensurePermNoticeTable(env))) return false;
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		// 一条原子 UPSERT：冷却未到期时 WHERE 不成立 → changes=0 → 不发。
+		// 并发的两次拦截只有一次能把 notified_at 写进去，另一次拿到 0。
+		const res = await env.DB.prepare(
+			'INSERT INTO perm_notice_log (chat_id, notified_at) VALUES (?, ?) '
+			+ 'ON CONFLICT(chat_id) DO UPDATE SET notified_at = excluded.notified_at '
+			+ 'WHERE perm_notice_log.notified_at < ?'
+		).bind(String(chatId), now, now - PERM_NOTICE_COOLDOWN_SECONDS).run();
+		return Number(res?.meta?.changes) > 0;
+	} catch (error) {
+		console.error('[权限提醒] 去重读写失败，本次不发:', error);
+		return false;
+	}
+}
+
+// 【文案为什么要解释「同一个权限」】群管理员看到的是两个独立的开关（删除消息、封禁用户），
+// 直觉上「关了封禁、留着删除」就该还能禁言。而 Telegram 把禁言与踢出都归在封禁用户下面，
+// 不说清这一点，对方会以为是 bot 坏了而不是权限被关了。
+const PERM_NOTICE_TEXT = '⚠️ <b>本群已关闭机器人的「封禁用户」权限</b>\n'
+	+ '\n'
+	+ '刚才有一位黑名单用户在本群发言，消息已删除，但<b>无法禁言</b>。\n'
+	+ 'Telegram 把「禁言」和「踢出」都归在<b>封禁用户</b>这一个权限下，'
+	+ '关掉它之后机器人只剩删除消息的能力。\n'
+	+ '\n'
+	+ '结果是：该用户仍能继续发言，机器人只能一条条删。\n'
+	+ '请群主在机器人的「管理员权限」里重新打开<b>封禁用户</b>开关。';
+
+async function noticeGroupMissingRestrictRight(env, chatId) {
+	if (!(await claimPermNotice(env, chatId))) return;
+	await sendTelegramMessage(chatId, PERM_NOTICE_TEXT);
+}
+
+// 缺权限时构造一个与 applyGroupModeration 同形状的失败结果。
+// error 文案刻意保留 not enough rights 这段英文：translateTelegramError 靠它翻成
+// 「bot 权限不足」，主人通知里的原因与真实 400 时逐字一致 —— 两条路径不能说两套话。
+function buildNoRestrictRightResult(groupId, userId) {
+	return {
+		groupId,
+		userId: String(userId),
+		ok: false,
+		error: 'not enough rights to restrict chat member'
+			+ '（已探测到本群关闭了 bot 的「封禁用户」权限，本次未发起请求）',
+		skipped: 'no_restrict_right'
+	};
+}
+
 // 黑名单自动拦截通知主人（复入群拦截 / 发言拦截 / 群内手动解封拦截时调用）
 async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklistInfo, banResult, env) {
 	if (!OWNER_IDS.length) return;
@@ -15647,7 +15769,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					: (isKillerModeGroup(chatId) && isKillerMuteReason(blacklistCheck.entry?.reason)
 						? 'mute'
 						: 'human');
-				const moderation = await applyGroupModeration(chatId, userId, interceptMode);
+				// 【2026-10-25】群收走「封禁用户」权限时不再白调注定失败的请求。
+				// kick / mute / human 三条路在 Telegram 都要 can_restrict_members，
+				// 所以这一道闸放在分派之前、对三者一视同仁。探测结果缓存 10 分钟，
+				// 热路径不会因此多出按条计的 getChatMember（理由见 botHasRestrictRight）。
+				const hasRestrictRight = await botHasRestrictRight(chatId);
+				const moderation = hasRestrictRight
+					? await applyGroupModeration(chatId, userId, interceptMode)
+					: buildNoRestrictRightResult(chatId, userId);
+				// 群里提醒一次，让群主知道「人还在发」是权限被关掉的结果，不是 bot 坏了。
+				if (!hasRestrictRight) await noticeGroupMissingRestrictRight(env, chatId);
 				await recordDisposalsFromBanResults(env, [{ groupId: chatId, ok: moderation?.ok === true }]);
 				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, moderation, env);
 				return;
