@@ -33,8 +33,9 @@ max_retries = 3
 # 每次触发扫 300 个（10 批 × 30 个、批间隔 3 秒，约 10 req/s，远离 Telegram 约 30 req/s 的限流线）；
 # 当日总量由 D1 里的计数按 UTC 日期戳约束，配多个时间点也不会超额。
 # 3:17 / 15:17 UTC：错开整点，避开 Cloudflare 平台侧 cron 在 :00 的集中触发高峰。
+# "*/10 * * * *"：联合封杀同步（只做这一件事）。没填 FED_SOURCE_URL / FED_SOURCE_KEY 时直接返回，不读 D1。
 [triggers]
-crons = ["17 3 * * *", "17 15 * * *"]
+crons = ["17 3 * * *", "17 15 * * *", "*/10 * * * *"]
 
 [observability]
 enabled = false			# 顶层 Observability 配置。当前配置不通过顶层开关一次性启用，下面单独开启 logs、关闭 traces。

@@ -228,6 +228,8 @@
 | `BLACKLIST_REASON_LABELS` | 见源码 | 原因字段中文映射（JSON） |
 | `GKY_BANLIST_ENDPOINT` | `https://gkybot.gmeow.cc/banlist` | GKY 封禁查询后端（新后端 HTML 须与 `parseBanlistHTML` 正则兼容） |
 | `FLASH_MESSAGE_TTL_MS` | `5000` | 群内闪屏存活毫秒数（0~60000） |
+| `FED_SOURCE_URL` | 空 | **联合封杀**：要订阅的那台机器人的域名（https），如 `https://对方域名`。和下一项都填了才开启 |
+| `FED_SOURCE_KEY` | 空 | 联合封杀：对方在后台「联合封杀」分区生成给你的 key（类型选「密钥」）。见 [联合封杀](#联合封杀订阅别人的黑名单) |
 | `ADMIN_PASSWORD` | 空 | 网页后台正式密码（长短不限，类型选「密钥」），打开域名即登录页。设了就用它、`/adminpass` 停用；空则照旧私聊 `/adminpass` 领一次性密码。陌生 IP 错 5 次锁 15 分钟，登录成功过的 IP 不锁；后台「登录记录」可看次数与 IP；改密码即踢掉旧登录 |
 | `MSG_CACHE_SIZE` | `50` | 清扫回看上限（1-500），`/spam` 按它回看当前群近期消息 |
 | `AD_SCORE_THRESHOLD` | `7` | 广告**封禁**阈值（1-100） |
@@ -276,6 +278,7 @@
 - **核心 5 张** —— `schema_meta` schema 版本号（当前 `8`）、`blacklist` 全局黑名单（TGID / 原因 / 操作人 / 时间 / 备注）、`moderation_messages` 群消息缓存（`/spam` `/ban` 清扫历史发言与**同款连带反查**；被判过的广告标 `is_ad=1`，`/spam` 追得到、`/search` 检索不到）、`batch_jobs` 批量任务状态与游标、`dynamic_groups` 动态治理群
 - **统计 4 张** —— `stat_speech` `stat_member` `stat_actions` 按天计数（`/stats` 数据源）、`stat_member_events` 入群/退群/申请**明细**（`/profile` 时间线，**永久不剪枝**）
 - **按需建立 3 张** —— `ad_votes` `ad_vote_allowlist`（`/ad` 投票）、`dryrun_groups`（旧版 `killer_mode` 表已停用，线上残留无害）
+- **联合封杀 5 张（按需）** —— 数据源：`fed_changelog` 黑名单变更流（每人只留最新一条）、`fed_keys` 发出去的 key（只存哈希）；订阅方：`federated_blacklist` 同步来的名单、`fed_exempt` 本地豁免、`fed_state` 同步游标与状态
 - **广告检测 18 张** —— 判定：`ad_fingerprints` 指纹库（keyword/domain/username/bio 四类）、`ad_user_screening` 观察窗口、`ad_sample_embeddings` AI 样本与向量、`ad_domain_whitelist` 域名白名单、`ad_profile_shapes` 资料形状库、`ad_spam_texts` 同款直封名单；**素材指纹三张**：`ad_avatars` 头像、`ad_images` 正文图片（多一列 `kind`，只有 photo/sticker 进视觉识别）、`ad_badges` 会员标 + 正文贴纸 emoji（同一 id 体系共用一张表与同一道安全阀）—— 三者 `verdict` 同为 `pending`/`ad`/`clean` 三态，`/ignore` 纠错口径一致；**流程**：`ad_group_members` 名册、`ad_scan_state` 滚动复查游标、`ad_learn_snapshots` `/recent` 冻结快照、`ad_confirm_tokens` 二次确认令牌、`ad_join_checks` 入群检查流水（含正常号，留 30 天）、`ad_dryrun_log` 演练命中流水（含整份 `evaluation` 供按钮回放，留 30 天）、`ad_pending_snapshots` 待复核快照（**100 年不过期**，`/ignore` 后置 `expires_at=0` 不再算案底）、`ad_link_cache` 资料挂载链接解析缓存（两本案底 `ad_known` 查用户黑名单、`ad_confirmed` 自举标记，按 `fetched_at` 6 小时过期）、`ad_group_admins` 配置群管理员同步（群内提权/撤职即时写、cron 全量兜底，热路径的免检读它）
 
 后两张按需建立、不进完整性复验。
@@ -331,7 +334,7 @@ wrangler secret put GROUP_ID     # -1001234567890（可逗号分隔多群）
 
 `OWNER_IDS` —— 主人 + 副主人 TGID，**第一个是主人**；不填则不发任何私聊通知。
 
-**可选** —— 解封文案 `SELF_UNBAN_KEYWORD` `START_WELCOME` `SELF_UNBAN_PROMPT` `SELF_UNBAN_APPROVED` `_NOLINK` `SELF_UNBAN_CONTACT_GROUP`；群与权限 `SUPER_ADMIN_IDS` `KILLER_MODE_GROUPS` `KILLER_ADMIN_IDS` `STAT_SEARCH_GROUPS` `PROFILE_LOOKUP_GROUPS` `STATIC_USER_PROFILES`；其它 `ADMIN_PASSWORD` `BLACKLIST_PAGE_LIMIT` `GKY_BANLIST_ENDPOINT` `FLASH_MESSAGE_TTL_MS` `MSG_CACHE_SIZE` `STATS_TZ_OFFSET`；广告阈值 `AD_*`（含 `AD_JOIN_SCORE_THRESHOLD`）**建议一个都不填**，理由见 [阈值调优与运维](#阈值调优与运维)。默认值见源码顶部 `=可修改=` 区段。
+**可选** —— 解封文案 `SELF_UNBAN_KEYWORD` `START_WELCOME` `SELF_UNBAN_PROMPT` `SELF_UNBAN_APPROVED` `_NOLINK` `SELF_UNBAN_CONTACT_GROUP`；群与权限 `SUPER_ADMIN_IDS` `KILLER_MODE_GROUPS` `KILLER_ADMIN_IDS` `STAT_SEARCH_GROUPS` `PROFILE_LOOKUP_GROUPS` `STATIC_USER_PROFILES`；联合封杀 `FED_SOURCE_URL` `FED_SOURCE_KEY`；其它 `ADMIN_PASSWORD` `BLACKLIST_PAGE_LIMIT` `GKY_BANLIST_ENDPOINT` `FLASH_MESSAGE_TTL_MS` `MSG_CACHE_SIZE` `STATS_TZ_OFFSET`；广告阈值 `AD_*`（含 `AD_JOIN_SCORE_THRESHOLD`）**建议一个都不填**，理由见 [阈值调优与运维](#阈值调优与运维)。默认值见源码顶部 `=可修改=` 区段。
 `
 
 #### 6.3 老部署升级需要做什么
@@ -398,6 +401,13 @@ Workers 已连 GitHub 时，`git push` 即自动部署。
 ### 查询封禁记录（公开）
 
 `GET /{TGID}` —— 给普通用户自查，不要 TOKEN、只读。页面带查询框，同时显示 GKY 封禁库记录和本机器人黑名单的「是否封禁 + 封禁日期」（原因 / 备注 / 操作人不公开）；`?format=json` 返回 `{tgid, local, gky}`。`GET /banlist?tgid=` 只查 GKY，返回 JSON。
+
+### 联合封杀（订阅别人的黑名单）
+
+- **分享自己的**：后台「联合封杀」分区 → 生成 key → 把页面上的地址和 key 发给对方。key 只显示一次，列表里能看到每把 key 的最后访问时间，随时可吊销。对方只拿得到 TGID 和封禁 / 解封时间，拿不到原因、备注、操作人。
+- **订阅别人的**：Dashboard 填 `FED_SOURCE_URL` + `FED_SOURCE_KEY`，每 10 分钟同步一次。名单里的人在全局群发言、进群，和本地全局黑名单一样处置；**独立群不接**。对方解封，下次同步自动移出。
+- **豁免**：后台「联合封杀」分区可豁免 / 取消豁免；`/unban` 或后台解封联合名单里的人会**自动本地豁免**，之后对方再封也不拦。
+- 接口：`GET /fed/changes?since=游标`，请求头带 `Authorization: Bearer` 加 key，key 错返回 401。
 
 ### 黑名单导出（受 TOKEN 保护）
 

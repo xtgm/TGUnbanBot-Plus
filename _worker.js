@@ -415,6 +415,15 @@ export default {
 		if (request.method === 'GET' && path !== TOKEN && PUBLIC_TGID_PATTERN.test(path)) {
 			return await handlePublicLookup(env, url, path);
 		}
+		// 联合封杀数据源：订阅方凭后台生成的 key 拉变更（鉴权在函数里，key 错 401，不碰黑名单表）。
+		if (url.pathname === '/fed/changes' && path !== TOKEN) {
+			try {
+				return await handleFedChanges(request, env, url);
+			} catch (error) {
+				console.error('[联合封杀] /fed/changes 失败:', error?.message || error);
+				return fedChangesResponse({ error: '数据源暂不可用' }, 503);
+			}
+		}
 		// ===== Webhook 来源校验（放在任何 D1 读写之前）=====
 		// 校验不通过就不碰数据库：伪造请求连一次 D1 查询都不该消耗。
 		// 只拦 POST 根路径（Telegram 更新入口）；GET/POST `/{TOKEN}` 初始化走 TOKEN 鉴权，不受影响。
@@ -550,6 +559,17 @@ export default {
 			// 配置缺失时直接返回而不 throw：cron 抛异常只会被记一条失败，
 			// 无人接收，重试也仍然缺配置。日志里写清原因更有用。
 			console.error('[广告检测·扫描] Cron 初始化失败:', error);
+			return;
+		}
+		// 10 分钟那条只做联合封杀同步：bio 复查、识图、剪枝都有日预算 / 天节拍，跟着跑 144 次会白烧额度。
+		// 没填订阅变量时 runFederationSync 第一行就返回，零 SQL、零外呼。
+		if (controller?.cron === FED_SYNC_CRON) {
+			try {
+				const fedSummary = await runFederationSync(env);
+				if (!fedSummary.skipped) console.log('[联合封杀] 同步结果: ' + JSON.stringify(fedSummary));
+			} catch (error) {
+				console.error('[联合封杀] 同步失败:', error);
+			}
 			return;
 		}
 		try {
@@ -2339,14 +2359,18 @@ async function miniAppUnban(env, payload) {
 	if (!removed.success && removed.code !== 'NOT_FOUND') {
 		throw new MiniAppError(503, '移除黑名单失败：' + String(removed.message || '未知错误').replace(/^❌\s*/, ''));
 	}
+	// 4甲：联合名单里的人同样写本地豁免（与 /unban 同口径）。没订阅时零 SQL。
+	const fedExempted = (await exemptFederatedOnUnban(env, [userId], String(OWNER_IDS[0] || ''))).includes(userId);
 	// 全局解封不碰独立群（本群黑名单与踢出由那个群自己管）。
 	const results = await unbanUserFromAllGroups(userId, globalUnbanScopeGroupIds());
 	const failed = results.filter((row) => !row.ok);
 	return {
 		userId,
 		removed: removed.success === true,
+		fedExempted,
 		complete: failed.length === 0,
 		message: (removed.success ? '已移除黑名单；' : '该用户本就不在黑名单；')
+			+ (fedExempted ? FED_EXEMPT_NOTICE + '；' : '')
 			+ results.filter((row) => row.ok).length + '/' + results.length + ' 个群组已解除',
 		results: results.map((row) => ({
 			groupId: row.groupId,
@@ -4353,12 +4377,16 @@ async function checkBlacklist(userId, env, options = {}) {
 	}
 
 	try {
-		const hit = await readD1BlacklistEntry(env, userId);
+		// 订阅了联合名单：本地 + 联合合成一条查询（热路径不多一条 SQL）；没订阅：原来那条主键查询，逐字节不变。
+		const hit = fedSourceConfig(env)
+			? await readD1BlacklistOrFederatedEntry(env, userId)
+			: await readD1BlacklistEntry(env, userId);
 		if (hit) {
 			return {
 				isBlacklisted: true,
 				message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。',
-				entry: hit
+				entry: hit,
+				...(hit.federated ? { federated: true } : {})
 			};
 		}
 
@@ -4538,6 +4566,281 @@ async function writeBlacklistDetails(env, rows) {
 	}
 }
 
+// ===== 联合封杀（2026-10-27 主人定「1甲 2乙 3甲 4甲」）=====
+// 别人部署了本项目，可以订阅本站的全局黑名单：
+//   · 数据源（本站）：后台生成 key 发给对方；GET /fed/changes?since=游标 凭 key 拉增量。
+//     只给 id / op（ban / unban）/ at，不给原因、备注、操作人。
+//   · 订阅方：Dashboard 填 FED_SOURCE_URL + FED_SOURCE_KEY，10 分钟 cron 拉增量写 federated_blacklist。
+//     命中 = 与本地全局黑名单同口径处置（checkBlacklist 合并查询）；独立群不接（by 不是第一主人）。
+//     /unban 或后台解封联合名单里的人 → 写 fed_exempt 本地豁免，之后数据源再封也不拦。
+// 【全部懒建表】不动 blacklist 表结构，也不动 D1_SCHEMA_VERSION。
+// 【没填订阅变量时零开销】热路径 checkBlacklist 仍是原来那一条主键查询，10 分钟 cron 直接返回。
+const FED_SYNC_CRON = '*/10 * * * *';
+const FED_PAGE_LIMIT = 500;
+const FED_SYNC_MAX_PAGES = 20;          // 一次 cron 最多拉 1 万条，剩下的下一轮接着拉
+const FED_SYNC_TIMEOUT_MS = 15000;
+const FED_KEY_PREFIX = 'fed_';
+const FED_KEY_MAX_ACTIVE = 50;
+const FED_REASON = 'federated';
+const FED_OPERATOR = 'federation';
+const FED_EXEMPT_NOTICE = '此人来自联合名单，已在本地豁免';
+const D1_FED_CHANGELOG_INIT = new WeakMap();
+const D1_FED_KEYS_INIT = new WeakMap();
+const D1_FED_SUBSCRIBER_INIT = new WeakMap();
+let FED_SOURCE_WARNED = false;
+
+// 订阅配置：两个变量都填了、地址是 https 才算开启。返回 { url（去尾斜杠）, key } 或 null。
+function fedSourceConfig(env) {
+	const rawUrl = String(env?.FED_SOURCE_URL || '').trim();
+	const key = String(env?.FED_SOURCE_KEY || '').trim();
+	if (!rawUrl || !key) return null;
+	let parsed = null;
+	try { parsed = new URL(rawUrl); } catch (_) { parsed = null; }
+	if (!parsed || parsed.protocol !== 'https:') {
+		if (!FED_SOURCE_WARNED) {
+			FED_SOURCE_WARNED = true;
+			console.warn('[联合封杀] FED_SOURCE_URL 不是 https 地址，已忽略，订阅未开启');
+		}
+		return null;
+	}
+	return { url: (parsed.origin + parsed.pathname).replace(/\/+$/, ''), key };
+}
+
+async function ensureFedTables(env, cache, label, statements, afterCreate = null) {
+	if (!env?.DB) return false;
+	const cached = cache.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		try {
+			const existed = afterCreate ? await d1TableExists(env, label) : true;
+			for (const [name, sql] of statements) await runD1SchemaStatement(env, name, sql);
+			if (!existed) await afterCreate();
+			return true;
+		} catch (error) {
+			console.error('[联合封杀] 建表失败 [' + label + ']:', error?.message || error);
+			return false;
+		}
+	})();
+	cache.set(env.DB, init);
+	const ok = await init;
+	if (!ok) cache.delete(env.DB);   // 失败不缓存，下次再试
+	return ok;
+}
+
+// 变更流。第一次建表时把现有全局黑名单整批补成 ban —— 否则联合功能上线前封的人，订阅方永远拿不到。
+// 补录失败就把表删掉，下次重建重补（留着一张空表会让「已存在 = 已补过」的判断永久出错）。
+function ensureFedChangelogTable(env) {
+	return ensureFedTables(env, D1_FED_CHANGELOG_INIT, 'fed_changelog', [
+		['fed_changelog', 'CREATE TABLE IF NOT EXISTS fed_changelog (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL, op TEXT NOT NULL, at INTEGER NOT NULL)'],
+		['idx_fed_changelog_id', 'CREATE INDEX IF NOT EXISTS idx_fed_changelog_id ON fed_changelog (id)']
+	], async () => {
+		try {
+			await ensureD1Table(env);
+			await env.DB.prepare("INSERT INTO fed_changelog (id, op, at) SELECT id, 'ban', ? FROM blacklist").bind(Date.now()).run();
+		} catch (error) {
+			try { await env.DB.exec('DROP TABLE IF EXISTS fed_changelog'); } catch (_) {}
+			throw error;
+		}
+	});
+}
+
+function ensureFedKeysTable(env) {
+	return ensureFedTables(env, D1_FED_KEYS_INIT, 'fed_keys', [
+		['fed_keys', 'CREATE TABLE IF NOT EXISTS fed_keys (hash TEXT PRIMARY KEY, label TEXT, created_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER)']
+	]);
+}
+
+function ensureFedSubscriberTables(env) {
+	return ensureFedTables(env, D1_FED_SUBSCRIBER_INIT, 'federated_blacklist', [
+		['federated_blacklist', 'CREATE TABLE IF NOT EXISTS federated_blacklist (id TEXT PRIMARY KEY, at INTEGER)'],
+		['fed_exempt', 'CREATE TABLE IF NOT EXISTS fed_exempt (id TEXT PRIMARY KEY, by_user TEXT, at INTEGER NOT NULL, note TEXT)'],
+		['fed_state', 'CREATE TABLE IF NOT EXISTS fed_state (key TEXT PRIMARY KEY, value TEXT)']
+	]);
+}
+
+// 数据源写变更：同一个 id 只留最新一条（先删旧的再插新的）。
+// 订阅方按 seq 顺序回放，只关心每个 id 的最终状态，所以删旧行不丢信息，表的大小 = 被封过的人数。
+// 写失败只记日志：变更流是给订阅方的，封禁 / 解封本身才是正事。
+async function recordFedChanges(env, ids, op) {
+	const list = normalizeBatchMutationIds(ids);
+	if (!env?.DB || !list.length) return;
+	try {
+		if (!(await ensureFedChangelogTable(env))) return;
+		const at = Date.now();
+		for (const chunk of chunkBatchItems(list)) {
+			const placeholders = chunk.map(() => '?').join(', ');
+			await env.DB.batch([
+				env.DB.prepare(`DELETE FROM fed_changelog WHERE id IN (${placeholders})`).bind(...chunk),
+				env.DB.prepare(`INSERT INTO fed_changelog (id, op, at) VALUES ${chunk.map(() => '(?, ?, ?)').join(', ')}`)
+					.bind(...chunk.flatMap((id) => [id, op, at]))
+			]);
+		}
+	} catch (error) {
+		console.error('[联合封杀] 记录变更失败:', error?.message || error);
+	}
+}
+
+function fedChangesResponse(data, status = 200) {
+	return new Response(JSON.stringify(data), { status, headers: { ...EXPORT_PRIVATE_HEADERS, 'Content-Type': 'application/json; charset=UTF-8' } });
+}
+
+// GET /fed/changes?since=游标：凭 key 拉变更。key 只存 sha256，鉴权通过才记最后访问时间。
+async function handleFedChanges(request, env, url) {
+	if (request.method !== 'GET') return fedChangesResponse({ error: '仅支持 GET' }, 405);
+	const auth = String(request.headers.get('Authorization') || '').match(/^Bearer\s+(\S{1,200})$/);
+	if (!auth) return fedChangesResponse({ error: 'key 无效或已吊销' }, 401);
+	if (!env.DB) return fedChangesResponse({ error: '数据源未绑定 D1' }, 503);
+	if (!(await ensureFedKeysTable(env))) return fedChangesResponse({ error: '数据源暂不可用' }, 503);
+	const hash = await exportSha256Hex(auth[1]);
+	const row = await env.DB.prepare('SELECT hash FROM fed_keys WHERE hash = ? AND revoked_at IS NULL LIMIT 1').bind(hash).first();
+	if (!row) return fedChangesResponse({ error: 'key 无效或已吊销' }, 401);
+	await env.DB.prepare('UPDATE fed_keys SET last_used_at = ? WHERE hash = ?').bind(Date.now(), hash).run();
+	if (!(await ensureFedChangelogTable(env))) return fedChangesResponse({ error: '数据源暂不可用' }, 503);
+	const since = Math.max(0, Math.floor(Number(url.searchParams.get('since')) || 0));
+	const { results } = await env.DB.prepare('SELECT seq, id, op, at FROM fed_changelog WHERE seq > ? ORDER BY seq LIMIT ?')
+		.bind(since, FED_PAGE_LIMIT + 1).all();
+	const rows = (results || []).slice(0, FED_PAGE_LIMIT);
+	const changes = rows.map((r) => ({ seq: Number(r.seq), id: String(r.id), op: String(r.op), at: Number(r.at) || 0 }));
+	return fedChangesResponse({ changes, next: changes.length ? changes[changes.length - 1].seq : since, more: (results || []).length > FED_PAGE_LIMIT });
+}
+
+function fedStateStatement(env, key, value) {
+	return env.DB.prepare('INSERT INTO fed_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+		.bind(String(key), String(value));
+}
+
+async function readFedState(env) {
+	const { results } = await env.DB.prepare('SELECT key, value FROM fed_state').all();
+	const state = {};
+	for (const row of results || []) state[String(row.key)] = String(row.value ?? '');
+	return state;
+}
+
+async function fetchFedChangesPage(source, cursor) {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), FED_SYNC_TIMEOUT_MS);
+	try {
+		const res = await fetch(source.url + '/fed/changes?since=' + cursor, {
+			headers: { Authorization: 'Bearer ' + source.key, Accept: 'application/json' },
+			signal: controller.signal
+		});
+		if (!res.ok) throw new Error('HTTP ' + res.status + (res.status === 401 ? '（key 无效或已吊销）' : ''));
+		const data = await res.json();
+		if (!data || !Array.isArray(data.changes)) throw new Error('数据源返回格式不对');
+		return data;
+	} catch (error) {
+		if (error?.name === 'AbortError') throw new Error('连接数据源超时');
+		throw error;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+// 订阅方同步（10 分钟 cron）。每页一个 batch（事务）：名单变化与游标一起落库，崩了整页重来，不会跳号。
+// 同步失败不清名单 —— 数据源暂时连不上时，已同步的人照样拦。
+async function runFederationSync(env) {
+	const source = fedSourceConfig(env);
+	if (!source) return { skipped: 'not_configured' };
+	if (!env.DB) return { skipped: 'no_db' };
+	if (!(await ensureFedSubscriberTables(env))) return { skipped: 'schema' };
+	const state = await readFedState(env);
+	let cursor = Math.max(0, Math.floor(Number(state.cursor) || 0));
+	if (state.source !== source.url) {
+		// 换了数据源：旧名单与游标都作废，从头拉。本地豁免是主人自己定的，保留。
+		cursor = 0;
+		await env.DB.batch([
+			env.DB.prepare('DELETE FROM federated_blacklist'),
+			fedStateStatement(env, 'source', source.url),
+			fedStateStatement(env, 'cursor', '0')
+		]);
+	}
+	let pages = 0;
+	let applied = 0;
+	let error = '';
+	while (pages < FED_SYNC_MAX_PAGES) {
+		pages += 1;
+		let data = null;
+		try {
+			data = await fetchFedChangesPage(source, cursor);
+		} catch (e) {
+			error = String(e?.message || e).slice(0, 200);
+			break;
+		}
+		const next = Math.floor(Number(data.next));
+		if (!Number.isFinite(next) || next < cursor) { error = '数据源返回的游标异常'; break; }
+		const finalOps = new Map();
+		for (const change of data.changes) {
+			const id = String(change?.id ?? '');
+			const op = String(change?.op ?? '');
+			if (!/^\d{1,20}$/.test(id) || (op !== 'ban' && op !== 'unban')) continue;
+			finalOps.set(id, { op, at: Math.floor(Number(change.at)) || Date.now() });
+		}
+		const bans = [...finalOps].filter(([, v]) => v.op === 'ban');
+		const unbans = [...finalOps].filter(([, v]) => v.op === 'unban').map(([id]) => id);
+		const statements = [];
+		for (const chunk of chunkBatchItems(bans)) {
+			statements.push(env.DB.prepare(`INSERT OR REPLACE INTO federated_blacklist (id, at) VALUES ${chunk.map(() => '(?, ?)').join(', ')}`)
+				.bind(...chunk.flatMap(([id, v]) => [id, v.at])));
+		}
+		for (const chunk of chunkBatchItems(unbans)) {
+			statements.push(env.DB.prepare(`DELETE FROM federated_blacklist WHERE id IN (${chunk.map(() => '?').join(', ')})`).bind(...chunk));
+		}
+		statements.push(fedStateStatement(env, 'cursor', String(next)));
+		await env.DB.batch(statements);
+		applied += finalOps.size;
+		const advanced = next > cursor;
+		cursor = next;
+		if (data.more !== true || !advanced) break;
+	}
+	const now = Date.now();
+	const tail = [fedStateStatement(env, 'last_sync_at', String(now)), fedStateStatement(env, 'last_error', error)];
+	if (!error) tail.push(fedStateStatement(env, 'last_ok_at', String(now)), fedStateStatement(env, 'last_count', String(applied)));
+	await env.DB.batch(tail);
+	return { pages, applied, cursor, error };
+}
+
+// checkBlacklist 在订阅开启时用的合并查询：本地全局黑名单优先，其次是没被本地豁免的联合名单。一条 SQL。
+async function readD1BlacklistOrFederatedEntry(env, userId) {
+	const id = String(userId ?? '').trim();
+	if (!id) return null;
+	// 表建不起来就退回只查本地：联合名单失效，本地黑名单不能跟着失效。
+	if (!(await ensureFedSubscriberTables(env))) return readD1BlacklistEntry(env, id);
+	await ensureD1Table(env);
+	const row = await env.DB.prepare('SELECT id, reason, by_user, at, note, 0 AS fed FROM blacklist WHERE id = ?'
+		+ ' UNION ALL SELECT f.id, NULL, NULL, f.at, NULL, 1 FROM federated_blacklist f WHERE f.id = ? AND NOT EXISTS (SELECT 1 FROM fed_exempt e WHERE e.id = f.id)'
+		+ ' ORDER BY fed LIMIT 1')
+		.bind(id, id)
+		.first();
+	if (!row) return null;
+	if (Number(row.fed) !== 1) return normalizeD1BlacklistRow(row);
+	const at = Number(row.at) > 0 ? new Date(Number(row.at)).toISOString() : null;
+	return { id, reason: FED_REASON, by: FED_OPERATOR, at, note: null, federated: true };
+}
+
+// 4甲：管理层解封时，目标若在联合名单里就写本地豁免（幂等，重试安全）。返回在联合名单里的那些 id。
+// 失败只记日志、不挡解封：解封本身已经通过了 D1 资格检查。
+async function exemptFederatedOnUnban(env, ids, by) {
+	const list = normalizeBatchMutationIds(ids);
+	if (!list.length || !fedSourceConfig(env) || !env?.DB) return [];
+	const hits = [];
+	try {
+		if (!(await ensureFedSubscriberTables(env))) return [];
+		const at = Date.now();
+		for (const chunk of chunkBatchItems(list)) {
+			const { results } = await env.DB.prepare(`SELECT id FROM federated_blacklist WHERE id IN (${chunk.map(() => '?').join(', ')})`)
+				.bind(...chunk).all();
+			const found = (results || []).map((r) => String(r.id));
+			if (!found.length) continue;
+			await env.DB.prepare(`INSERT OR IGNORE INTO fed_exempt (id, by_user, at, note) VALUES ${found.map(() => '(?, ?, ?, ?)').join(', ')}`)
+				.bind(...found.flatMap((id) => [id, String(by || ''), at, 'unban'])).run();
+			hits.push(...found);
+		}
+	} catch (error) {
+		console.error('[联合封杀] 解封时写本地豁免失败:', error?.message || error);
+	}
+	return hits;
+}
+
 async function addToBlacklistCore(userId, env, options = {}) {
 	if (!env.DB) {
 		return { success: false, code: 'NO_DB', message: '❌ 未绑定 D1 存储空间' };
@@ -4565,6 +4868,7 @@ async function addToBlacklistCore(userId, env, options = {}) {
 		if (!changed) {
 			return { success: false, code: 'EXISTS', message: '⚠️ 该用户已在黑名单中' };
 		}
+		await recordFedChanges(env, [userIdStr], 'ban');
 
 		// 公开查询的现场：身份 / 群 / 消息 / 原文 / 逐条判据（见 blacklist_detail 那段说明）。
 		await writeBlacklistDetails(env, [normalizeBlacklistDetailRow(
@@ -4636,10 +4940,12 @@ async function removeFromBlacklistCore(userId, env) {
 			.prepare('DELETE FROM blacklist WHERE id = ?')
 			.bind(userIdStr)
 			.run();
-		const changed = result?.meta?.changes ?? result?.changes ?? 0;
+		const changed = result?.meta?.changes ?? result?.changes
+			?? result?.results?.[0]?.meta?.changes ?? 0;
 		if (!changed) {
 			return { success: false, code: 'NOT_FOUND', message: '⚠️ 该用户不在黑名单中' };
 		}
+		await recordFedChanges(env, [userIdStr], 'unban');
 
 		return { success: true, code: 'REMOVED', message: `✅ 已将用户 <code>${userId}</code> 从黑名单中移除` };
 	} catch (error) {
@@ -5777,6 +6083,7 @@ async function addManyToBlacklist(ids, env, options = {}) {
 				if (inserted.has(id)) results.success.push(id);
 				else results.exists.push(id);
 			}
+			await recordFedChanges(env, [...inserted], 'ban');
 			// 只给真正新增的写附表，与单条同口径（已存在的不覆盖第一次的现场）。
 			await writeBlacklistDetails(env, chunk.filter((id) => inserted.has(id))
 				.map((id) => normalizeBlacklistDetailRow(id, by, options.detail, fallbackReasons, at)));
@@ -5793,6 +6100,16 @@ async function addManyToBlacklist(ids, env, options = {}) {
 // - 通过命令鉴权的管理员可显式传 allowD1Removal，先移除 D1 再允许 Telegram 解封。
 // 查询或移除失败时严格拒绝对应目标，任何分支都不调用 Telegram 封禁接口。
 async function checkManyUnbanEligibility(ids, env, options = {}) {
+	const results = await checkManyUnbanEligibilityCore(ids, env, options);
+	// 4甲：管理层解封（allowD1Removal）联合名单里的人 → 自动写本地豁免，否则解完下一条消息又被联合名单拦。
+	// 被联合名单拦的人不在本地 blacklist，一定落在 eligible 里。没订阅时 exemptFederatedOnUnban 直接返回，零 SQL。
+	results.fedExempted = options.allowD1Removal === true
+		? await exemptFederatedOnUnban(env, results.eligible, options.operatorId)
+		: [];
+	return results;
+}
+
+async function checkManyUnbanEligibilityCore(ids, env, options = {}) {
 	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [], primaryLocked: [] };
 	const uniqueIds = normalizeBatchMutationIds(ids);
 	if (!env.DB) {
@@ -5884,6 +6201,7 @@ async function removeManyFromBlacklist(ids, env) {
 				if (removed.has(id)) results.success.push(id);
 				else results.notFound.push(id);
 			}
+			await recordFedChanges(env, [...removed], 'unban');
 		} catch (error) {
 			console.error('批量移除黑名单时出错:', error);
 			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 移除黑名单失败: ${toChineseErrorText(error?.message || error)}` })));
@@ -5943,13 +6261,16 @@ function renderBatchUnbanEligibilityResult(results, invalid, userProfiles = null
 	if (invalid.length) lines.push(`❌ 格式错误: ${invalid.length}`);
 	if (results.failed.length) lines.push(`❌ D1 检查失败: ${results.failed.length}`);
 
+	const fedExemptedIds = new Set(results.fedExempted || []);
+	if (fedExemptedIds.size) lines.push(`🌐 ${FED_EXEMPT_NOTICE}: ${fedExemptedIds.size}`);
+
 	lines.push('', '<b>详情</b>:');
 	const removedIds = new Set(results.d1Removed || []);
 	for (const id of results.eligible) {
 		const status = removedIds.has(id)
 			? 'D1 黑名单记录已移除，可执行群解封'
 			: '不在 D1 黑名单，可执行群解封';
-		lines.push(`✅ ${formatBatchUserTarget(id, userProfiles)} ${status}`);
+		lines.push(`✅ ${formatBatchUserTarget(id, userProfiles)} ${status}${fedExemptedIds.has(id) ? '；' + FED_EXEMPT_NOTICE : ''}`);
 	}
 	for (const id of results.blacklisted) lines.push(`⛔ ${formatBatchUserTarget(id, userProfiles)} 在 D1 黑名单，拒绝解封（记录已保留）`);
 	for (const id of results.primaryLocked || []) lines.push(`⛔ ${formatBatchUserTarget(id, userProfiles)} ${PRIMARY_LOCKED_UNBAN_TEXT}，拒绝解封`);
@@ -7282,7 +7603,7 @@ async function webAdminLogins(env) {
 	]);
 	return { total: Number(total?.n) || 0, ips: ips?.results || [], logs: logs?.results || [] };
 }
-const WEB_ADMIN_ACTIONS = new Set(['web/exec', 'web/groupmode', 'web/localset', 'web/localwl', 'web/localbans', 'web/localunban', 'web/dryrun', 'web/stats', 'web/exportpass', 'web/logins', 'web/loginip-del', 'web/logout']);
+const WEB_ADMIN_ACTIONS = new Set(['web/exec', 'web/groupmode', 'web/localset', 'web/localwl', 'web/localbans', 'web/localunban', 'web/dryrun', 'web/stats', 'web/exportpass', 'web/logins', 'web/loginip-del', 'web/logout', 'web/fedkeys', 'web/fedkey-add', 'web/fedkey-del', 'web/fedlist', 'web/fedexempt']);
 const WEB_ADMIN_REPLY_LIMIT = 30;
 // 命令台回执镜像：执行期间发给第一主人私聊的消息同时记一份文本。
 // Worker 没开 nodejs_compat（没有 AsyncLocalStorage），用模块级变量；同一时刻别的请求恰好也给第一主人
@@ -7469,8 +7790,85 @@ async function dispatchWebAdminAction(action, body, env, auth, ctx, url) {
 			if (Number(res?.meta?.changes) !== 1) throw new MiniAppError(404, '没有这条登录 IP');
 			return { ip, message: '已移除：这个 IP 之后输错密码会照常计数锁定' };
 		}
+		case 'web/fedkeys': return webAdminFedKeys(env, url);
+		case 'web/fedkey-add': {
+			if (!(await ensureFedKeysTable(env)) || !(await ensureFedChangelogTable(env))) throw new MiniAppError(503, '联合封杀数据表暂不可用');
+			const active = await env.DB.prepare('SELECT COUNT(*) AS n FROM fed_keys WHERE revoked_at IS NULL').first();
+			if (Number(active?.n) >= FED_KEY_MAX_ACTIVE) throw new MiniAppError(400, '有效 key 已达 ' + FED_KEY_MAX_ACTIVE + ' 把，请先吊销不用的');
+			const label = String(payload.label || '').trim().slice(0, 40) || '未命名';
+			const bytes = crypto.getRandomValues(new Uint8Array(24));
+			const key = FED_KEY_PREFIX + [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+			await env.DB.prepare('INSERT INTO fed_keys (hash, label, created_at) VALUES (?, ?, ?)').bind(await exportSha256Hex(key), label, Date.now()).run();
+			return { key, label, sourceUrl: url.origin, message: 'key 只显示这一次，请马上复制发给对方；丢了就吊销重新生成' };
+		}
+		case 'web/fedkey-del': {
+			const hash = String(payload.id || '').trim();
+			if (!/^[0-9a-f]{64}$/.test(hash)) throw new MiniAppError(400, '缺少要吊销的 key');
+			if (!(await ensureFedKeysTable(env))) throw new MiniAppError(503, '联合封杀数据表暂不可用');
+			const res = await env.DB.prepare('UPDATE fed_keys SET revoked_at = ? WHERE hash = ? AND revoked_at IS NULL').bind(Date.now(), hash).run();
+			if (!Number(res?.meta?.changes)) throw new MiniAppError(404, '没有这把 key，或已吊销');
+			return { message: '已吊销：对方下次同步会收到 401，已同步的名单留在对方那边' };
+		}
+		case 'web/fedlist': return webAdminFedList(env, payload);
+		case 'web/fedexempt': {
+			const userId = String(payload.userId || '').trim();
+			if (!/^\d{1,20}$/.test(userId)) throw new MiniAppError(400, '用户 ID 必须是纯数字');
+			if (!(await ensureFedSubscriberTables(env))) throw new MiniAppError(503, '联合封杀数据表暂不可用');
+			if (payload.exempt === false) {
+				const res = await env.DB.prepare('DELETE FROM fed_exempt WHERE id = ?').bind(userId).run();
+				if (!Number(res?.meta?.changes)) throw new MiniAppError(404, '此人不在本地豁免里');
+				return { userId, exempt: false, message: '已取消豁免：此人若仍在联合名单里，下次发言会被拦' };
+			}
+			const hit = await env.DB.prepare('SELECT id FROM federated_blacklist WHERE id = ? LIMIT 1').bind(userId).first();
+			if (!hit) throw new MiniAppError(404, '此人不在联合名单里，不需要豁免');
+			await env.DB.prepare('INSERT OR IGNORE INTO fed_exempt (id, by_user, at, note) VALUES (?, ?, ?, ?)').bind(userId, owner, Date.now(), 'admin').run();
+			return { userId, exempt: true, message: '已豁免：联合名单不再拦此人（只影响本站）' };
+		}
 		default: throw new MiniAppError(404, '接口不存在');
 	}
+}
+
+// 联合封杀 · 数据源一侧：发出去的 key（只列哈希，明文从不回传）。
+async function webAdminFedKeys(env, url) {
+	if (!(await ensureFedKeysTable(env))) throw new MiniAppError(503, '联合封杀数据表暂不可用');
+	const { results } = await env.DB.prepare('SELECT hash, label, created_at, last_used_at, revoked_at FROM fed_keys ORDER BY created_at DESC LIMIT 100').all();
+	return {
+		sourceUrl: url.origin,
+		items: (results || []).map((r) => ({
+			id: String(r.hash), label: String(r.label || ''), createdAt: Number(r.created_at) || 0,
+			lastUsedAt: Number(r.last_used_at) || 0, revoked: Number(r.revoked_at) > 0, revokedAt: Number(r.revoked_at) || 0
+		}))
+	};
+}
+
+// 联合封杀 · 订阅方一侧：订阅状态 + 同步来的名单（带豁免标记）+ 本地豁免清单。
+async function webAdminFedList(env, payload) {
+	const source = fedSourceConfig(env);
+	if (!(await ensureFedSubscriberTables(env))) throw new MiniAppError(503, '联合封杀数据表暂不可用');
+	const query = String(payload.query || '').replace(/\D/g, '').slice(0, 20);
+	const like = query ? '%' + query + '%' : '%';
+	const page = Math.max(1, Math.floor(Number(payload.page) || 1));
+	const [state, total, rows, exempts] = await Promise.all([
+		readFedState(env),
+		env.DB.prepare('SELECT COUNT(*) AS n FROM federated_blacklist WHERE id LIKE ?').bind(like).first(),
+		env.DB.prepare('SELECT f.id, f.at, e.id AS ex FROM federated_blacklist f LEFT JOIN fed_exempt e ON e.id = f.id WHERE f.id LIKE ? ORDER BY f.at DESC, f.id LIMIT ? OFFSET ?')
+			.bind(like, MINI_APP_PAGE_SIZE, (page - 1) * MINI_APP_PAGE_SIZE).all(),
+		env.DB.prepare('SELECT id, by_user, at, note FROM fed_exempt ORDER BY at DESC LIMIT 200').all()
+	]);
+	const count = Number(total?.n) || 0;
+	return {
+		status: {
+			configured: !!source,
+			sourceUrl: source ? source.url : '',
+			lastSyncAt: Number(state.last_sync_at) || 0,
+			lastOkAt: Number(state.last_ok_at) || 0,
+			lastError: String(state.last_error || ''),
+			cursor: Number(state.cursor) || 0
+		},
+		items: (rows?.results || []).map((r) => ({ userId: String(r.id), at: Number(r.at) || 0, exempt: r.ex != null })),
+		page, total: count, totalPages: Math.max(1, Math.ceil(count / MINI_APP_PAGE_SIZE)),
+		exempts: (exempts?.results || []).map((r) => ({ userId: String(r.id), at: Number(r.at) || 0, via: r.note === 'unban' ? '解封时自动' : '后台手动' }))
+	};
 }
 
 // 命令台：网页里输入的 / 命令以「第一主人私聊机器人」的身份执行，与在 Telegram 里直接发完全同一条代码路径。
@@ -7577,6 +7975,7 @@ dl.kv dd{margin:0;min-width:0}
 <button type="button" role="tab" data-tab="notice">全体通知</button>
 <button type="button" role="tab" data-tab="admins">管理员</button>
 <button type="button" role="tab" data-tab="export">导出密码</button>
+<button type="button" role="tab" data-tab="fed">联合封杀</button>
 <button type="button" role="tab" data-tab="logins">登录记录</button>
 <button type="button" role="tab" data-tab="console">命令台</button>
 </nav>
@@ -7668,6 +8067,19 @@ dl.kv dd{margin:0;min-width:0}
 <div class="row"><button class="btn" id="l-reload" type="button">刷新</button><span id="l-total" class="muted"></span></div>
 <div id="l-ips" class="out"></div></div>
 <div class="card"><h2>登录日志</h2><p class="hint">每次登录成功一条，最近 50 条。</p><div id="l-logs" class="out"></div></div>
+</section>
+<section class="tab" id="tab-fed" hidden>
+<div class="card"><h2>联合名单（订阅别人的黑名单）</h2><p class="hint">在 Dashboard 填 FED_SOURCE_URL（对方域名）和 FED_SOURCE_KEY（对方给的 key）即开启，每 10 分钟同步一次。名单里的人在全局群里按全局黑名单处置，独立群不受影响。豁免只影响本站。</p>
+<div id="f-status" class="out"></div>
+<div class="row"><input id="f-q" placeholder="按 TGID 筛选" aria-label="联合名单筛选"><button class="btn primary" id="f-search" type="button">查询</button><button class="btn" id="f-reload" type="button">刷新</button></div>
+<div id="f-list" class="out"></div>
+<div class="pager"><button class="btn" id="f-prev" type="button">上一页</button><span id="f-page" class="muted"></span><button class="btn" id="f-next" type="button">下一页</button></div>
+<h3>本地豁免</h3><p class="hint">/unban 或后台解封联合名单里的人会自动加进来；之后对方再封此人，本站也不拦。</p>
+<div id="f-exempts" class="out"></div></div>
+<div class="card"><h2>分享我的黑名单（发 key 给别人）</h2><p class="hint">别人部署了本项目，就能凭 key 订阅你的全局黑名单。对方只拿得到 TGID 与封禁 / 解封时间，拿不到原因、备注和操作人。key 只在生成时显示一次。</p>
+<div class="row"><input id="fk-label" placeholder="备注，如：对方的群名" aria-label="key 备注" maxlength="40"><button class="btn primary" id="fk-add" type="button">生成 key</button></div>
+<div id="fk-new" class="out"></div>
+<div id="fk-list" class="out"></div></div>
 </section>
 <section class="tab" id="tab-console" hidden>
 <div class="card"><h2>命令台</h2><p class="hint">等同于你本人私聊机器人发命令：结果显示在下面，Telegram 私聊里也照常收到一份。按钮类交互（确认 / 翻页）请到 Telegram 里点。</p>
@@ -7771,7 +8183,8 @@ var MANUAL = [
 ['', '群内命令：发出即撤回，结果留在群里并通知第一主人；/dryrun 例外，命令与回执都撤回，完整信息走私聊'],
 ['', '入群判定：进群那一刻就查 bio 与头像；更严可设环境变量 AD_JOIN_SCORE_THRESHOLD（如 9）'],
 ['', '自动判定：加黑 + 全群封禁 + 自动学习，快照推给你复核；判错用 /ignore 序号撤销'],
-['', 'Telegram 菜单只留 /ban /spam /check /unban /stats /groupmode；其余命令没删，照样可以直接发送']]]
+['', 'Telegram 菜单只留 /ban /spam /check /unban /stats /groupmode；其余命令没删，照样可以直接发送'],
+['', '联合封杀：「联合封杀」分区里生成 key 发给别人，对方就能订阅你的全局黑名单；你也可以填 FED_SOURCE_URL + FED_SOURCE_KEY 订阅别人的。/unban 联合名单里的人会自动本地豁免']]]
 ];
 var state = { groups: [], current: '', blPage: 1, blPages: 1, adsView: 'summary', adsPage: 1, adsPages: 1, sPage: 1, sPages: 1 };
 
@@ -7861,6 +8274,7 @@ function showTab(name) {
 	else if (name === 'blacklist') loadBlacklist(1);
 	else if (name === 'ads') loadAds(1);
 	else if (name === 'logins') loadLogins();
+	else if (name === 'fed') { loadFed(1); loadFedKeys(); }
 }
 $('nav').addEventListener('click', function (e) { var b = e.target.closest('button[data-tab]'); if (b) showTab(b.getAttribute('data-tab')); });
 
@@ -8191,6 +8605,60 @@ function loadLogins() {
 	}).catch(function (e) { msg('l-ips', e.message, true); });
 }
 $('l-reload').addEventListener('click', loadLogins);
+// ===== 联合封杀 =====
+var fedState = { page: 1, pages: 1 };
+function fedExemptButton(userId, exempt, after) {
+	return el('button', { cls: exempt ? 'btn' : 'btn danger', type: 'button', text: exempt ? '取消豁免' : '豁免', on: { click: function () {
+		if (!confirm((exempt ? '取消豁免 ' : '豁免 ') + userId + '？')) return;
+		busy(this, api('web/fedexempt', { userId: userId, exempt: !exempt })).then(function (x) { toast(x.message); after(); }).catch(function () {});
+	} } });
+}
+function loadFed(page) {
+	msg('f-list', '读取中…');
+	return api('web/fedlist', { page: page, query: $('f-q').value.trim() }).then(function (d) {
+		var s = d.status || {};
+		put('f-status', kv([
+			['订阅状态', s.configured ? '已开启' : '未开启（Dashboard 没填 FED_SOURCE_URL / FED_SOURCE_KEY）'],
+			['数据源', s.sourceUrl || '—'],
+			['上次同步', s.lastSyncAt ? fmtTime(s.lastSyncAt) : '还没同步过'],
+			['上次成功', s.lastOkAt ? fmtTime(s.lastOkAt) : '—'],
+			['同步错误', s.lastError ? el('span', { cls: 'no', text: s.lastError }) : '无'],
+			['名单人数', String(d.total || 0)]
+		]));
+		fedState.page = d.page || 1; fedState.pages = d.totalPages || 1;
+		pager('f', fedState.page, fedState.pages);
+		var again = function () { loadFed(fedState.page); };
+		put('f-list', table(d.items || [], [['TGID', 'userId'], ['对方封禁时间', function (r) { return fmtTime(r.at); }], ['本地豁免', function (r) { return yn(r.exempt); }],
+			['', function (r) { return fedExemptButton(r.userId, r.exempt, again); }]]));
+		put('f-exempts', table(d.exempts || [], [['TGID', 'userId'], ['豁免时间', function (r) { return fmtTime(r.at); }], ['方式', 'via'],
+			['', function (r) { return fedExemptButton(r.userId, true, again); }]]));
+	}).catch(function (e) { msg('f-list', e.message, true); });
+}
+function loadFedKeys() {
+	return api('web/fedkeys').then(function (d) {
+		put('fk-list', table(d.items || [], [['备注', 'label'], ['生成时间', function (r) { return fmtTime(r.createdAt); }],
+			['最后访问', function (r) { return r.lastUsedAt ? fmtTime(r.lastUsedAt) : '从未访问'; }],
+			['状态', function (r) { return r.revoked ? el('span', { cls: 'no', text: '已吊销' }) : el('span', { cls: 'yes', text: '有效' }); }],
+			['', function (r) {
+				if (r.revoked) return '';
+				return el('button', { cls: 'btn danger', type: 'button', text: '吊销', on: { click: function () {
+					if (!confirm('吊销「' + r.label + '」？对方之后同步会失败，已同步过去的名单留在对方那边。')) return;
+					busy(this, api('web/fedkey-del', { id: r.id })).then(function (x) { toast(x.message); loadFedKeys(); }).catch(function () {});
+				} } });
+			}]]));
+	}).catch(function (e) { msg('fk-list', e.message, true); });
+}
+$('f-search').addEventListener('click', function () { loadFed(1); });
+$('f-reload').addEventListener('click', function () { loadFed(fedState.page); loadFedKeys(); });
+$('f-prev').addEventListener('click', function () { loadFed(fedState.page - 1); });
+$('f-next').addEventListener('click', function () { loadFed(fedState.page + 1); });
+$('fk-add').addEventListener('click', function () {
+	busy(this, api('web/fedkey-add', { label: $('fk-label').value.trim() })).then(function (d) {
+		$('fk-label').value = '';
+		put('fk-new', kv([['对方填 FED_SOURCE_URL', el('code', { text: d.sourceUrl })], ['对方填 FED_SOURCE_KEY', el('code', { text: d.key })], ['说明', d.message]]));
+		loadFedKeys();
+	}).catch(function () {});
+});
 // ===== 命令台 =====
 function runCommand() {
 	var cmd = $('c-cmd').value.trim();
@@ -13722,6 +14190,7 @@ function getAdQuotedText(message) {
 function translateBlacklistReason(reason) {
 	// ad_auto / ad_learn 已无写入方，仅用于渲染 D1 里的历史封禁记录。
 	const map = {
+		[FED_REASON]: '联合封杀名单（来自订阅源）',
 		manual_ban: '旧版 Telegram 原生封禁同步记录',
 		manual: '管理员 /ban 指令加黑',
 		sa: '管理员 /spam 引用回复加黑（历史记录）',
@@ -13740,6 +14209,7 @@ function translateBlacklistReason(reason) {
 async function translateBlacklistOperator(byId) {
 	if (!byId) return '未知';
 	if (byId === 'system') return '🤖 系统自动';
+	if (byId === FED_OPERATOR) return '🌐 联合封杀订阅源';
 	const anonymousMatch = String(byId).match(/^anonymous_admin:(-?\d+)$/);
 	if (anonymousMatch) {
 		const groupId = anonymousMatch[1];
@@ -16919,7 +17389,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				}
 
 				const d1RecordRemoved = eligibility.d1Removed.includes(targetId);
+				const fedExempted = (eligibility.fedExempted || []).includes(targetId);
+				const fedLine = fedExempted ? `\n🌐 ${FED_EXEMPT_NOTICE}` : '';
 				const unbanResults = await unbanUserFromAllGroups(targetId, unbanRoute.groupIds);
+				if (fedExempted) lines.push(`🌐 <b>${FED_EXEMPT_NOTICE}</b>`);
 				lines.push(
 					d1RecordRemoved
 						? (unbanLocal ? '✅ <b>目标原在本群黑名单，已移除记录并允许解封</b>' : '✅ <b>目标原在 D1 黑名单，已由管理层移除记录并允许解封</b>')
@@ -16934,8 +17407,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					'💡 <b>要彻底纠正请用 /ignore</b> —— /unban 只解封并移出黑名单，不撤销头像 / 指纹 / 会员标等判定痕迹；痕迹还在的话下一条消息可能又被封。'
 				);
 				await replyToModerationAdmin(message, ctx, {
-					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封\n${renderUnbanResults(unbanResults)}`,
-					groupText: `🔓 已解封\n🎯 ${targetMention}\n${renderUnbanResults(unbanResults)}\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）`,
+					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封${fedLine}\n${renderUnbanResults(unbanResults)}`,
+					groupText: `🔓 已解封\n🎯 ${targetMention}${fedLine}\n${renderUnbanResults(unbanResults)}\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）`,
 					detailText: lines.join('\n'),
 					isInGroup
 				});
@@ -16986,6 +17459,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				flashText,
 				groupText: `🔓 批量解封完成\n✅ 解封 ${results.eligible.length}　⛔ D1拒绝 ${results.blacklisted.length}　❌ 失败 ${failedCount}`
 					+ (lockedCount ? `\n⛔ ${PRIMARY_LOCKED_UNBAN_TEXT}: ${lockedCount}` : '')
+					+ ((results.fedExempted || []).length ? `\n🌐 ${FED_EXEMPT_NOTICE}: ${results.fedExempted.length}` : '')
 					+ (idsToUnban.length ? '\n' + idsToUnban.map((id) => `· ${formatBatchUserTarget(id, userProfiles)}`).join('\n') : '')
 					+ '\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）',
 				detailText,
