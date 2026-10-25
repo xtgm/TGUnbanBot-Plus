@@ -38,6 +38,7 @@ const sandbox = {
 		else if (m === 'unbanChatMember') unbanned.push({ chatId: String(b?.chat_id ?? ''), userId: String(b?.user_id) });
 		else if (m === 'banChatMember' || m === 'restrictChatMember') modded.push({ chatId: String(b?.chat_id ?? ''), userId: String(b?.user_id), m });
 		else if (m === 'answerCallbackQuery') answers.push({ text: String(b?.text || ''), alert: b?.show_alert === true });
+		else if (m === 'getMe') result = { id: 1, username: 'mock_test_bot' };
 		else if (m === 'getChat') result = { id: Number(b?.chat_id), type: 'supergroup', title: '测试群' };
 		else if (m === 'getChatMember') result = { status: 'member', user: { id: Number(b?.user_id) } };
 		else if (m === 'getChatAdministrators') result = [
@@ -167,6 +168,40 @@ check('★ 群主切换后私聊告知第一主人', sent.some((s) => s.chatId =
 reset();
 await send(OWNER, '/groupmode ' + G2, 'private');
 check('★ 第一主人私聊带群 ID 只查看', allSent().includes('当前模式') && allSent().includes('独立'), allSent());
+
+console.log('\n=== /groupmode 不带参数：群里短提示 + 私聊完整用法 ===');
+// 【2026-10-25 主人定】/groupmode 进菜单；群里发 = 闪一条短提示（当前模式 + 切换写法 + 私聊链接），
+// 点链接 = 私聊 /start groupmode_群ID → 独立群全部功能用法。用法谁都能看，当前模式只给第一主人与该群群主。
+const flashes = [];
+const origFlash = W.sendFlashMessage;
+W.sendFlashMessage = async (chatId, text, ctx, ttlMs) => { flashes.push({ chatId: String(chatId), text: String(text), ttlMs }); return origFlash(chatId, text, ctx, ttlMs); };
+reset();
+await send(CREATOR, '/groupmode', G2);
+const gmFlash = flashes.find((f) => f.chatId === G2);
+check('★ 群主群里发 /groupmode → 闪屏提示带当前模式与切换写法', !!gmFlash && gmFlash.text.includes('当前模式') && gmFlash.text.includes('/groupmode 独立') && gmFlash.text.includes('/groupmode 全局'), gmFlash?.text);
+check('★ 闪屏带私聊深链 start=groupmode_群ID', !!gmFlash && gmFlash.text.includes('https://t.me/mock_test_bot?start=groupmode_' + G2), gmFlash?.text);
+check('★ 闪屏会自动撤回且留够点链接的时间（≥10 秒）', !!gmFlash && Number(gmFlash.ttlMs) >= 10000, String(gmFlash?.ttlMs));
+check('★ 群里不发完整长文（/localset 写法不出现在群里）', !sent.some((s) => s.chatId === G2 && s.text.includes('/localset 检测')), allSent());
+flashes.length = 0;
+reset();
+await send(ADMIN_R, '/groupmode', G1);
+check('★ 普通管理员群里发 /groupmode 仍然静默', sent.length === 0 && flashes.length === 0, allSent());
+W.sendFlashMessage = origFlash;
+reset();
+await send(CREATOR, '/start groupmode_' + G2, 'private');
+const guideC = sent.filter((s) => s.chatId === CREATOR).map((s) => s.text).join('\n');
+check('★ 群主点深链 → 私聊收到独立群全部用法（/localset 五种写法齐全）',
+	['/localset</code>', '/localset 检测 开|关', '/localset 演练 开|关', '/localset 处置 踢出|禁言', '/localset 白名单 加|删'].every((k) => guideC.includes(k)), guideC);
+check('★ 用法含切换、/localbans、本群 /ban /unban', ['/groupmode 独立', '/groupmode 全局', '/localbans', '/ban', '/unban'].every((k) => guideC.includes(k)), guideC);
+check('★ 群主看到该群当前模式', guideC.includes('当前模式') && guideC.includes(G2), guideC);
+reset();
+await send(ADMIN_N, '/start groupmode_' + G2, 'private');
+const guideN = sent.filter((s) => s.chatId === ADMIN_N).map((s) => s.text).join('\n');
+check('★ 非群主点深链 → 只给用法，不给该群当前模式', guideN.includes('/localset 检测 开|关') && !guideN.includes('当前模式'), guideN);
+reset();
+await send(ADMIN_N, '/groupmode', 'private');
+const guideP = sent.filter((s) => s.chatId === ADMIN_N).map((s) => s.text).join('\n');
+check('★ 私聊不带群 ID 发 /groupmode → 回完整用法而不是报错', guideP.includes('/localset 检测 开|关') && !guideP.includes('请带群 ID'), guideP);
 
 console.log('\n=== 自动检测扇出 ===');
 check('★ 全局群事发：跳过独立群', !W.autoDetectionScopeGroupIds(G1).includes(G2));

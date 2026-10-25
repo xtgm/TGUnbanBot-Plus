@@ -175,12 +175,12 @@ check('超 10 分钟 → 失效、不群发', answered.some((a) => a.text.includ
 // 【改口径】主人原话：菜单只留 ban spam check unban stats，「其余指令全部清空…只是清空展示出来的指令」。
 // 旧断言要求 /notice /start /menu /user /adstats /dryrun /sban /rm 等进菜单，现在反过来：
 // 菜单恰好 5 条、/notice 不在菜单里；/notice 本身照常可用由上面 1～9 节全程覆盖。
-console.log('\n=== 10. 菜单只留 5 条，/notice 移出菜单但照常可用 ===');
+console.log('\n=== 10. 菜单只留 6 条，/notice 移出菜单但照常可用 ===');
 reset();
 await W.__h.fetch(new Request('https://x/T'), env, { waitUntil() {} });
 const allCmds = callsOf('setMyCommands')[0]?.body?.commands || [];
-check('★ 菜单恰好是 ban spam check unban stats',
-	JSON.stringify(allCmds.map((x) => x.command)) === JSON.stringify(['ban', 'spam', 'check', 'unban', 'stats']),
+check('★ 菜单恰好是 ban spam check unban stats groupmode',
+	JSON.stringify(allCmds.map((x) => x.command)) === JSON.stringify(['ban', 'spam', 'check', 'unban', 'stats', 'groupmode']),
 	JSON.stringify(allCmds.map((x) => x.command)));
 check('★ /notice 已移出菜单', !allCmds.some((c) => c.command === 'notice'));
 for (const c of allCmds) {

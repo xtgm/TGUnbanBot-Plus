@@ -4562,8 +4562,9 @@ console.log('\n[23] 一键代发链路已移除');
 	// 下面原来逐条要求 /wl /del /listgroups /addgroup /delgroup /leavegroup /rm /profile /notice
 	// 进菜单并带权限说明的断言，随之改成「菜单恰好 5 条 + 每条有说明」；这些命令本身照常可用，
 	// 由本文件各自的功能节（[67] 之后的 /listgroups、/admins 等）与 test_web_admin.mjs 第 9 节覆盖。
-	assert('BotFather 菜单只留 5 条：ban spam check unban stats', JSON.stringify(registeredCommands) === JSON.stringify(['ban', 'spam', 'check', 'unban', 'stats']), JSON.stringify(registeredCommands));
-	assert('菜单 5 条都带实质说明', (commandCall?.body?.commands || []).every((x) => String(x.description || '').length > 4));
+	// 同日主人加回 /groupmode（独立群入口），菜单变 6 条。
+	assert('BotFather 菜单只留 6 条：ban spam check unban stats groupmode', JSON.stringify(registeredCommands) === JSON.stringify(['ban', 'spam', 'check', 'unban', 'stats', 'groupmode']), JSON.stringify(registeredCommands));
+	assert('菜单 6 条都带实质说明', (commandCall?.body?.commands || []).every((x) => String(x.description || '').length > 4));
 	assert('菜单不再展示 /notice /wl /listgroups 等其余命令', !['notice', 'wl', 'del', 'listgroups', 'addgroup', 'rm', 'profile', 'sban'].some((c) => registeredCommands.includes(c)));
 }
 
@@ -4861,7 +4862,7 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	// /health /menu /search、裸文本可点击等）整组改到后台页面上验——同一批内容现在在命令手册里。
 	assert('主人 /help → 指向网页管理后台', !!dm && dm.body.text.includes('https://x.com/admin') && dm.body.text.includes('/adminpass'), dm?.body?.text);
 	assert('主人 /help → 只发一条、不再是长清单', callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').length === 1 && dm.body.text.length < 800 && !dm.body.text.includes('/learnlast'));
-	assert('主人 /help → 写明菜单只留五条、其余命令照样可发', !!dm && dm.body.text.includes('/ban /spam /check /unban /stats') && dm.body.text.includes('照样可以直接发送'));
+	assert('主人 /help → 写明菜单只留六条、其余命令照样可发', !!dm && dm.body.text.includes('/ban /spam /check /unban /stats /groupmode') && dm.body.text.includes('照样可以直接发送'));
 	{
 		const page = sandbox.renderWebAdminHtml();
 		const missing = ['/ban TGID', '/spam', '/unban TGID', '/check TGID', '/stats -100群ID today', '/stats -100群ID month',

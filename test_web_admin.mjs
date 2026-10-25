@@ -243,7 +243,7 @@ log('\n=== 9. 菜单只留五条 + /help 指向后台 ===');
 	calls.length = 0;
 	await handler.fetch(new Request(BASE + '/' + TOKEN), env, ctx);
 	const cmds = (calls.find((c) => c.method === 'setMyCommands')?.body?.commands || []).map((c) => c.command);
-	check('setMyCommands 只注册 ban spam check unban stats', JSON.stringify(cmds) === JSON.stringify(['ban', 'spam', 'check', 'unban', 'stats']), JSON.stringify(cmds));
+	check('setMyCommands 只注册 ban spam check unban stats groupmode', JSON.stringify(cmds) === JSON.stringify(['ban', 'spam', 'check', 'unban', 'stats', 'groupmode']), JSON.stringify(cmds));
 	let out = await say(OWNER, 'private', '/help', OWNER);
 	const t = out.map((m) => m.text).join('\n');
 	check('主人 /help → 给后台地址与 /adminpass', t.includes('https://bot.example/admin') && t.includes('/adminpass'), t);

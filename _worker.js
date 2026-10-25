@@ -3520,13 +3520,15 @@ async function handleInitialization(request, env) {
 		const setCommandsUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
 		const setCommandsBody = {
 			commands: [
-				// 【2026-10-25 主人要求】/ 菜单只留五条常用命令；其余命令的处理代码全部保留、照样能直接发，
+				// 【2026-10-25 主人要求】/ 菜单只留六条常用命令；其余命令的处理代码全部保留、照样能直接发，
 				// 只是不在菜单里显示。完整说明与执行入口在网页管理后台（域名/admin，私聊 /adminpass 领密码）。
+				// 同日加回 /groupmode：让群主在菜单里看得到独立群入口（群里闪提示 + 私聊完整用法）。
 				{ command: "ban", description: "加入全局黑名单并全群禁言 (群管理员)" },
 				{ command: "spam", description: "回复广告：删消息并加入全局黑名单 (群管理员)" },
 				{ command: "check", description: "查询封禁状态 (高级管理员)" },
 				{ command: "unban", description: "解除封禁；不带 ID 是自助解封" },
-				{ command: "stats", description: "本群发言/进退群统计 (群管理员)" }
+				{ command: "stats", description: "本群发言/进退群统计 (群管理员)" },
+				{ command: "groupmode", description: "独立群：切换模式 + 查看全部功能用法 (群主)" }
 			]
 		};
 
@@ -7506,6 +7508,7 @@ var MANUAL = [
 ['', '/ban /spam /sban：踢出；之后复入群会被踢回'],
 ['', '同款直封 / 同款连带 / /ad 投票：与杀手群完全隔离，杀手群里不触发，别的群触发也不波及杀手群']]],
 ['独立模式（群主自治）', [
+['/groupmode', '群里发：闪一条本群模式提示 + 私聊链接；私聊发：独立群全部功能用法（已进 / 菜单）'],
 ['/groupmode -100群ID independent', '把指定群切到独立模式（第一主人 / 群主）'],
 ['/groupmode -100群ID global', '把指定群切回全局模式'],
 ['/localbans', '看本群黑名单（群里发）'],
@@ -7567,7 +7570,7 @@ var MANUAL = [
 ['', '群内命令：发出即撤回，结果留在群里并通知第一主人；/dryrun 例外，命令与回执都撤回，完整信息走私聊'],
 ['', '入群判定：进群那一刻就查 bio 与头像；更严可设环境变量 AD_JOIN_SCORE_THRESHOLD（如 9）'],
 ['', '自动判定：加黑 + 全群封禁 + 自动学习，快照推给你复核；判错用 /ignore 序号撤销'],
-['', 'Telegram 菜单只留 /ban /spam /check /unban /stats；其余命令没删，照样可以直接发送']]]
+['', 'Telegram 菜单只留 /ban /spam /check /unban /stats /groupmode；其余命令没删，照样可以直接发送']]]
 ];
 var state = { groups: [], current: '', blPage: 1, blPages: 1, adsView: 'summary', adsPage: 1, adsPages: 1, sPage: 1, sPages: 1 };
 
@@ -11153,6 +11156,37 @@ function formatGroupModeLabel(chatId) {
 	return isIndependentGroup(chatId) ? '独立（全局黑名单不生效，群主自治）' : '全局（默认）';
 }
 
+// 【2026-10-25 主人定】/groupmode 进菜单：群里不带参数 = 闪一条短提示 + 私聊深链，
+// 完整用法只在私聊发（群里不刷长文）。showModeOf 只在第一主人 / 该群群主时传群 ID ——
+// 用法谁都能看，某个群的当前模式不给外人看。正文刻意不出现「当前模式」字样，那四个字只属于状态行。
+function buildGroupModeGuideText(showModeOf) {
+	const lines = ['📖 <b>独立群 · 全部功能与用法</b>'];
+	if (showModeOf) lines.push(`群 <code>${escapeHtml(showModeOf)}</code> 当前模式：${formatGroupModeLabel(showModeOf)}`);
+	lines.push(
+		'',
+		'<b>一、切换模式</b>（第一主人 / 该群群主）',
+		'<code>/groupmode</code> 群里发：看本群模式 + 本说明入口',
+		'<code>/groupmode 独立</code> 切到独立模式（也可写 independent）',
+		'<code>/groupmode 全局</code> 切回全局模式（也可写 global）',
+		'私聊发：<code>/groupmode 群ID 独立|全局</code>',
+		'· 独立 = 群主自治：全局黑名单在本群不生效（第一主人封杀的除外），本群有自己的黑名单与设置。',
+		'· 切到独立后，已经被封的人不会自动解封；全局 /unban 不再作用于本群。',
+		'· 切回全局：恢复全局黑名单与全局封禁；本群黑名单记录保留，但只在独立模式下拦截。',
+		'· 杀手群不能切成独立模式。',
+		'',
+		'<b>二、本群黑名单</b>（独立群里发；需要 Telegram「封禁用户」管理员权限）',
+		'<code>/ban 用户ID [原因]</code> 写本群黑名单并踢出本群（也可回复对方消息发 /ban）',
+		'<code>/spam</code> 回复广告：删消息并写本群黑名单',
+		'<code>/sban 用户ID</code> 同 /ban，并撤回其历史发言（第一主人 / 副主人 / 群主）',
+		'<code>/unban 用户ID</code> 解除本群黑名单记录并在本群解封',
+		'<code>/localbans</code> 查看本群黑名单（最近 50 条）',
+		'',
+		'<b>三、本群设置</b>（只限独立群；第一主人、群主或有「修改群组信息」权限的管理员；不支持匿名管理员）',
+		LOCALSET_USAGE.replace(/^用法：\n/, '')
+	);
+	return lines.join('\n');
+}
+
 async function handleGroupModeCommand(message, env, ctx, rest) {
 	const isPrivate = message.chat.type === 'private';
 	const operatorId = getMessageActorId(message);
@@ -11168,6 +11202,11 @@ async function handleGroupModeCommand(message, env, ctx, rest) {
 	const usage = '用法：群里发 <code>/groupmode independent</code> 或 <code>/groupmode global</code>（也可写「独立 / 全局」）；'
 		+ '私聊发 <code>/groupmode 群ID independent|global</code>。不带模式只查看当前模式。';
 	if (!targetChatId) {
+		// 私聊不带群 ID：直接给完整用法（不涉及任何群的状态，谁都能看）。
+		if (!modeToken) {
+			await sendTelegramMessage(message.chat.id, buildGroupModeGuideText(''));
+			return;
+		}
 		await reply('❌ 私聊使用请带群 ID。\n' + usage);
 		return;
 	}
@@ -11189,7 +11228,21 @@ async function handleGroupModeCommand(message, env, ctx, rest) {
 		return;
 	}
 	if (!wanted) {
-		await reply(`ℹ️ 群 <code>${escapeHtml(targetChatId)}</code> 当前模式：${formatGroupModeLabel(targetChatId)}\n` + usage);
+		if (isPrivate) {
+			// 私聊带群 ID 不带模式：状态行 + 完整用法（权限上面已核过）。
+			await sendTelegramMessage(message.chat.id, buildGroupModeGuideText(targetChatId));
+			return;
+		}
+		// 群里：只闪短提示 + 私聊深链；15 秒撤回，留够点链接的时间。
+		const botUsername = await getBotUsername();
+		const guideLine = botUsername
+			? `📖 独立群全部功能与用法 → <a href="https://t.me/${botUsername}?start=groupmode_${targetChatId}">点这里私聊查看</a>`
+			: '📖 独立群全部功能与用法：私聊我发 <code>/groupmode</code> 查看';
+		await sendFlashMessage(message.chat.id, [
+			`🏠 群 <code>${escapeHtml(targetChatId)}</code> 当前模式：${formatGroupModeLabel(targetChatId)}`,
+			'切到独立：<code>/groupmode 独立</code>　切回全局：<code>/groupmode 全局</code>',
+			guideLine
+		].join('\n'), ctx, 15000);
 		return;
 	}
 	if (wanted === 'independent' && isKillerModeGroup(targetChatId)) {
@@ -15638,6 +15691,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	const startCommand = parseTelegramCommand(text);
 	if (startCommand.head === '/start') {
 		const startArg = startCommand.rest.split(/\s+/)[0] || '';
+		// /groupmode 群里短提示的深链落点：私聊给独立群全部用法；当前模式只给第一主人与该群群主。
+		if (startArg.startsWith('groupmode_')) {
+			if (message.chat.type !== 'private') return;
+			const gmChatId = startArg.slice('groupmode_'.length);
+			const canSeeMode = /^-?\d+$/.test(gmChatId) && isConfiguredGroup(gmChatId)
+				&& (isPrimaryOwner(userId) || await isGroupCreator(userId, gmChatId));
+			await sendTelegramMessage(chatId, buildGroupModeGuideText(canSeeMode ? gmChatId : ''));
+			return;
+		}
 		if (startArg.startsWith('check_')) {
 			const isInGroup = message.chat.type !== 'private';
 			// 二次审核属于高级管理权限，普通 Telegram 群管理员不开放。
@@ -15812,7 +15874,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'🛠 <b>全部功能已搬到网页管理后台</b>\n\n'
 			+ '后台地址：' + escapeHtml(adminUrl) + '\n'
 			+ '登录：私聊我发 /adminpass 领一次性密码\n\n'
-			+ '后台里有完整命令手册与命令台；菜单只留 /ban /spam /check /unban /stats，其余命令照样可以直接发送。');
+			+ '后台里有完整命令手册与命令台；菜单只留 /ban /spam /check /unban /stats /groupmode，其余命令照样可以直接发送。');
 		return;
 	}
 
