@@ -32557,6 +32557,18 @@ async function handleAdStatsCommand(env, chatId) {
 		lines.push('　↳ ⚠️ 其中 <b>' + samples.stale + '</b> 条是旧模型维度，判定时会被跳过');
 		lines.push('　　 用 /clearsamples 清空后重新 /warmup 生成');
 	}
+	// 第三层的日额度与今日用量（2026-11 第二批的收尾）。
+	// 【为什么必须摆出来】那一批给嵌入轨补上 AD_EMBED_DAILY 与 emb_count 记账，
+	// 治的是三个毛病：没上限、随消息量线性涨、/adstats 上看不见。
+	// 只记账不显示等于只治了一半 —— 额度悄悄打满、第三层悄悄退场，
+	// 面板上「语义样本 N 条、向量已齐」照样一片正常，与头像视觉那次
+	//「永远显示 ✅ 每日上限 50 张、实际全线失败」是同一类静默失效。
+	// 口径照抄另两轨：开着写上限 + 今日已用，关掉写明是被哪个变量关的。
+	const embQuota = await readImageVisionQuota(env, Math.floor(Date.now() / 1000), 'emb');
+	lines.push('　↳ 查询额度：' + (config.embedDaily > 0
+		? '✅ 每日上限 <b>' + config.embedDaily + '</b> 次　今日已用 <b>' + embQuota.used + '</b> 次'
+			+ '（同一文案 ' + Math.round(AD_EMBED_CACHE_TTL_SECONDS / 3600) + ' 小时内重复出现不重复计数）'
+		: '⏸️ 已关闭（AD_EMBED_DAILY=0），降级为评分 + 指纹两层，不调模型'));
 	lines.push('<b>观察窗口</b>　窗口内 <b>' + screeningCount + '</b> 人');
 	// 【2026-10-13 修文案】这里原来写「保留 1 小时」，与实际行为完全相反 ——
 	// 2026-09-08 主人要求快照长期保留，pruneAdDetectionData 从那时起就刻意
