@@ -744,6 +744,50 @@ section('[16] notice/send 群发与指定群');
 	}
 }
 
+// ================= [17] notice/send 跳过搜索群 =================
+section('[17] notice/send 跳过搜索群（STAT_SEARCH_GROUPS）');
+{
+	const SEARCH_ONLY = '-1004444444444';
+	const env = {
+		TOKEN: 'TESTTOKEN', BOT_TOKEN: '123456:fake', GROUP_ID: ENV_MAIN + ',' + ENV_SECOND,
+		STAT_SEARCH_GROUPS: ENV_SECOND + ',' + SEARCH_ONLY, OWNER_IDS: OWNER, DB: makeD1()
+	};
+	W.applyRuntimeConfig(W.loadRequiredConfig(env));
+	await W.ensureD1Table(env);
+	await W.mergeDynamicGroupsFromD1(env);
+	const sent = [];
+	const baseFetch = sandbox.fetch;
+	sandbox.fetch = async (url, init) => {
+		const method = String(url).split('/').pop();
+		if (method !== 'sendMessage') return baseFetch(url, init);
+		let body = null;
+		try { body = init?.body ? JSON.parse(init.body) : null; } catch (_) { body = null; }
+		sent.push(body || {});
+		return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 9001 } }; }, async text() { return ''; } };
+	};
+	try {
+		const boot = await call(env, 'bootstrap');
+		const flag = Object.fromEntries(boot.groups.map((g) => [g.chatId, g.search === true]));
+		assert('★ 群列表给搜索群打 search 标记', flag[ENV_SECOND] === true && flag[SEARCH_ONLY] === true && flag[ENV_MAIN] === false, JSON.stringify(boot.groups));
+
+		const all = await call(env, 'notice/send', { text: '只发正常群' });
+		assert('★ 全部群：只发正常群（1 个）', all.total === 1 && all.sent === 1, JSON.stringify(all));
+		assert('★ 搜索群一条都没发', sent.length === 1 && String(sent[0].chat_id) === ENV_MAIN, JSON.stringify(sent.map((b) => b.chat_id)));
+		assert('★ 返回里带跳过的搜索群数', all.skippedSearch === 2, JSON.stringify(all));
+
+		sent.length = 0;
+		const pick = await callError(env, 'notice/send', { text: '指定搜索群', chatId: SEARCH_ONLY });
+		assert('★ 指定搜索群被拒（400）', pick && pick.status === 400 && /搜索群/.test(pick.message), pick && pick.message);
+		assert('★ 被拒时一条都没发', sent.length === 0, JSON.stringify(sent));
+	} finally {
+		sandbox.fetch = baseFetch;
+	}
+	const html = W.renderMiniAppHtml();
+	assert('★ Mini App 通知下拉排除搜索群', /function loadNotice\(\)[\s\S]{0,600}!group\.search/.test(html));
+	const admin = W.renderWebAdminHtml();
+	assert('★ 后台通知下拉排除搜索群', /function fillNoticeGroups\(\)[\s\S]{0,400}!g\.search/.test(admin));
+}
+
 console.log(`\n========== Mini App 接口：通过 ${pass} / 失败 ${fail} ==========`);
 if (fail > 0) {
 	console.log('失败项：');

@@ -190,5 +190,30 @@ reset();
 await dmMsg(OWNER, { text: '/notice', message_id: 90 });
 check('★ 不在菜单的 /notice 直接发送仍然进入发起流程', sent.some((m) => /通知/.test(m.text || '')), JSON.stringify(sent.map((m) => (m.text || '').slice(0, 40))));
 
+// 搜索群（STAT_SEARCH_GROUPS）会自动并入治理群，但全体通知不发给它们。
+// -100333 既在 GROUP_ID 里又是搜索群、-100444 只是搜索群 —— 两种都要排除。
+console.log('\n=== 11. 全体通知跳过搜索群 ===');
+const envS = { ...env, STAT_SEARCH_GROUPS: '-100333，-100444' };
+const driveS = async (update) => { await W.__h.fetch(new Request('https://x/', { method: 'POST', body: JSON.stringify(update) }), envS, { waitUntil() {} }); };
+const dmS = (from, extra) => driveS({ message: { chat: priv(from), from: { id: Number(from), is_bot: false }, message_id: extra.message_id || 100, ...extra } });
+reset();
+await dmS(OWNER, { text: '/notice', message_id: 110 });
+const liveGroups = vm.runInContext('GROUP_IDS', sandbox).map(String);
+check('★ 搜索群仍在治理群里（只是不收通知）', liveGroups.includes('-100444') && liveGroups.includes('-100333'), JSON.stringify(liveGroups));
+check('★ 提示里的目标数只算正常群（2 个）', lastTo(OWNER)?.text.includes('<b>2</b> 个配置群'), lastTo(OWNER)?.text);
+check('★ 提示里写明已排除 2 个搜索群', lastTo(OWNER)?.text.includes('已排除 2 个搜索群'), lastTo(OWNER)?.text);
+reset();
+await dmS(OWNER, { text: '搜索群不该收到', message_id: 111 });
+check('★ 确认页目标数也是 2', lastTo(OWNER)?.text.includes('<b>2</b> 个配置群'), lastTo(OWNER)?.text);
+reset();
+await driveS({ callback_query: { id: 'cb', from: { id: Number(OWNER), is_bot: false }, data: 'notice:confirm', message: { chat: priv(OWNER), message_id: 200 } } });
+check('★ 正常群都收到', ['-100111', '-100222'].every((g) => copied.some((c) => c.chatId === g && c.msgId === 111)), JSON.stringify(copied));
+check('★ 搜索群一个都没收到', !copied.some((c) => c.chatId === '-100333' || c.chatId === '-100444'), JSON.stringify(copied));
+check('★ 回执 2/2', sentTo(OWNER).some((s) => s.text.includes('2</b> / 2')), JSON.stringify(sentTo(OWNER).map((s) => s.text)));
+reset();
+await dmMsg(OWNER, { text: '/notice', message_id: 120 });
+check('没配搜索群时提示不出现「搜索群」字样', !lastTo(OWNER)?.text.includes('搜索群'), lastTo(OWNER)?.text);
+await dmMsg(OWNER, { text: '/notice cancel', message_id: 121 });
+
 console.log('\n全体通知验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 if (fail > 0) process.exitCode = 1;

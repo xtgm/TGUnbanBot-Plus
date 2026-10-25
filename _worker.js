@@ -1603,7 +1603,8 @@ function renderMiniAppHtml() {
       var seq = begin('notice'); $('notice-scope').textContent = '正在读取群组…';
       try { await loadGroups(); } catch (_) { /* 群组读取失败时下面按空列表处理，按钮保持禁用 */ }
       if (!current('notice', seq)) return;
-      var groups = Array.isArray(state.groups) ? state.groups : [];
+      // 搜索群不收全体通知：目标下拉与计数都只算正常群。
+      var groups = (Array.isArray(state.groups) ? state.groups : []).filter(function (group) { return !group.search; });
       var select = $('notice-target'); var previous = select.value; select.replaceChildren();
       var all = element('option', '', '全部治理群组（' + groups.length + ' 个）'); all.value = ''; select.append(all);
       groups.forEach(function (group) { var option = element('option', '', text(group.title, '未命名群组') + ' · ' + text(group.chatId)); option.value = String(group.chatId); select.append(option); });
@@ -1616,7 +1617,7 @@ function renderMiniAppHtml() {
       var content = $('notice-text').value.trim();
       if (!content) { toast('请输入通知内容。', 'error'); $('notice-text').focus(); return null; }
       if (content.length > 4096) { toast('通知内容不能超过 4096 字。', 'error'); return null; }
-      var chatId = $('notice-target').value; var groups = Array.isArray(state.groups) ? state.groups : [];
+      var chatId = $('notice-target').value; var groups = (Array.isArray(state.groups) ? state.groups : []).filter(function (group) { return !group.search; });
       var targetName = '全部治理群组（' + groups.length + ' 个）';
       if (chatId) { var found = groups.find(function (group) { return String(group.chatId) === chatId; }); targetName = found ? text(found.title, '未命名群组') + ' · ' + chatId : chatId; }
       var silent = $('notice-silent').checked;
@@ -2183,13 +2184,15 @@ async function miniAppGroupList(env, loaded) {
 		chatId: String(id),
 		title: String(envInfos[index]?.title || ''),
 		source: 'env',
-		primary: index === 0
+		primary: index === 0,
+		search: isStatSearchGroup(id)
 	}));
 	for (const row of dynamicRows) {
 		list.push({
 			chatId: String(row.chatId),
 			title: String(row.title || ''),
 			source: 'dynamic',
+			search: isStatSearchGroup(row.chatId),
 			note: String(row.note || ''),
 			addedAt: String(row.addedAt || '')
 		});
@@ -2999,7 +3002,8 @@ async function miniAppSearch(env, payload) {
 // /notice 的后台版：原命令用 copyMessage 搬运主人那条消息（保留任意媒体与排版）；
 // Mini App 里没有「原消息」可搬，改成 sendMessage 纯文本群发。
 // 刻意不带 parse_mode：主人随手写的 <、& 不会被当成标签，也就不会整批失败。
-// chatId 为空 = 发往全部配置群；指定群必须先在治理范围内，杜绝往任意 chat 发公告。
+// chatId 为空 = 发往全部配置群（排除搜索群）；指定群必须先在治理范围内，杜绝往任意 chat 发公告。
+// 指定搜索群同样拒绝：搜索群不收全体通知，单发也不开口子。
 async function miniAppNoticeSend(env, payload) {
 	const text = String(payload?.text || '').trim();
 	if (!text) throw new MiniAppError(400, '请输入通知内容');
@@ -3008,7 +3012,11 @@ async function miniAppNoticeSend(env, payload) {
 	if (!configured.length) throw new MiniAppError(400, '还没有配置治理群组');
 	const target = String(payload?.chatId || '').trim();
 	if (target && !configured.includes(target)) throw new MiniAppError(400, '该群组不在治理范围内');
-	return sendMiniAppNoticeText(target ? [target] : configured, text, payload?.silent === true);
+	if (target && isStatSearchGroup(target)) throw new MiniAppError(400, '该群是搜索群，不收全体通知');
+	const { groups, skippedSearch } = noticeTargetGroups();
+	if (!target && !groups.length) throw new MiniAppError(400, '除搜索群外没有可通知的群组');
+	const result = await sendMiniAppNoticeText(target ? [target] : groups, text, payload?.silent === true);
+	return { ...result, skippedSearch: target ? 0 : skippedSearch };
 }
 
 // 纯文本群发（主人后台与杀手子后台共用）。groups 由调用方按各自范围校验好再传进来。
@@ -8127,7 +8135,9 @@ $('s-next').addEventListener('click', function () { runSearch(state.sPage + 1); 
 function fillNoticeGroups() {
 	var sel = $('n-chat'), keep = sel.value;
 	while (sel.options.length > 1) sel.remove(1);
-	state.groups.forEach(function (g) { sel.appendChild(el('option', { value: g.chatId, text: (g.title || g.chatId) + '（' + g.chatId + '）' })); });
+	// 搜索群不收全体通知，下拉里也不列，免得选了再被接口拒。
+	state.groups.filter(function (g) { return !g.search; }).forEach(function (g) { sel.appendChild(el('option', { value: g.chatId, text: (g.title || g.chatId) + '（' + g.chatId + '）' })); });
+	if (!Array.prototype.some.call(sel.options, function (o) { return o.value === keep; })) keep = '';
 	sel.value = keep;
 }
 $('n-send').addEventListener('click', function () {
@@ -17625,14 +17635,30 @@ async function readNoticeState(env) {
 }
 async function clearNoticeState(env) { await writeAdScanState(env, NOTICE_PENDING_KEY, ''); }
 
+// 搜索群（STAT_SEARCH_GROUPS）只为 /search 留历史才并入治理群，全体通知不发给它们。
+// 判据只认这个环境变量：同一个群既在 GROUP_ID 又在 STAT_SEARCH_GROUPS，也按搜索群排除。
+function isStatSearchGroup(chatId) {
+	return STAT_SEARCH_GROUPS.includes(String(chatId));
+}
+// 全体通知的目标：全部配置群去重后去掉搜索群。/notice 与后台 notice/send 共用这一份口径。
+function noticeTargetGroups() {
+	const all = [...new Set((GROUP_IDS || []).map((g) => String(g)).filter(Boolean))];
+	const groups = all.filter((g) => !isStatSearchGroup(g));
+	return { groups, skippedSearch: all.length - groups.length };
+}
 function noticeConfiguredGroupCount() {
-	return [...new Set((GROUP_IDS || []).map((g) => String(g)).filter(Boolean))].length;
+	return noticeTargetGroups().groups.length;
+}
+// 提示里补一句排除了几个搜索群；没排除就不出现，免得没配搜索群的人看到陌生字眼。
+function noticeSearchSkipNote() {
+	const n = noticeTargetGroups().skippedSearch;
+	return n ? '（已排除 ' + n + ' 个搜索群）' : '';
 }
 
-// 群发到所有配置群（去重）：一律用 copyMessage 原样搬运主人那条内容（文本/图片/视频都支持），
+// 群发到所有配置群（去重、排除搜索群）：一律用 copyMessage 原样搬运主人那条内容（文本/图片/视频都支持），
 // 显示为 bot 自己发的、不带「转发自」抬头。逐群记录成败，失败原因转中文。
 async function broadcastNoticeToGroups(env, pending) {
-	const groups = [...new Set((GROUP_IDS || []).map((g) => String(g)).filter(Boolean))];
+	const { groups } = noticeTargetGroups();
 	const results = await mapWithConcurrency(groups, 5, async (groupId) => {
 		const r = await copyMessageToChat(groupId, pending.srcChatId, pending.srcMsgId);
 		return { groupId, ok: r?.ok === true, error: r?.error || '' };
@@ -17662,7 +17688,7 @@ async function handleNoticeCommand(message, env, ctx) {
 	// 进入「等待内容」态：接下来第一主人在私聊发的下一条非命令消息即为通知内容。
 	await writeAdScanState(env, NOTICE_PENDING_KEY, JSON.stringify({ stage: 'awaiting', at: Date.now() }));
 	await sendTelegramMessage(chatId, [
-		'📢 <b>全体通知</b>（将发往 <b>' + noticeConfiguredGroupCount() + '</b> 个配置群）',
+		'📢 <b>全体通知</b>（将发往 <b>' + noticeConfiguredGroupCount() + '</b> 个配置群）' + noticeSearchSkipNote(),
 		'',
 		'请把要广播的内容<b>作为下一条消息发给我</b>：',
 		'· 文本（支持排版）、图片、视频、文件、语音等任意消息都行',
@@ -17696,7 +17722,7 @@ async function maybeCaptureNoticeContent(message, env) {
 	]] };
 	await sendTelegramMessage(chatId, [
 		'📢 <b>全体通知 · 确认</b>',
-		'将发往 <b>' + noticeConfiguredGroupCount() + '</b> 个配置群，以机器人身份发送。',
+		'将发往 <b>' + noticeConfiguredGroupCount() + '</b> 个配置群' + noticeSearchSkipNote() + '，以机器人身份发送。',
 		'',
 		'<b>内容预览：</b>',
 		previewLine,
