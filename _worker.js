@@ -6496,9 +6496,14 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		sourceChatTitle: message.chat?.title || message.chat?.username || (message.chat?.type === 'private' ? '私聊' : '当前群组'),
 		sourceChatType: message.chat?.type || 'unknown',
 		// 杀手任务：完成通知给发起人本人 + 抄送第一主人（副主人不收）。
+		// 【2026-10-25】/sban 的任务【完成】通知也只给第一主人 —— 建任务那一刻的回执已经收窄了，
+		// 完成通知这条路不一起收，副主人照样会在任务跑完时收到含「/sban」的完整明细。
+		// 判据与 startBulkModerationJobFromCommand 一致：mode='kick' 且不是 local 任务。
 		notifyTargets: options.killer === true
 			? [...new Set([getMessageActorId(message), ...getOwnerNotifyTargets(false)].map(String).filter(Boolean))]
-			: getBulkJobNotifyTargets(message),
+			: (String(options.mode || '') === 'kick' && options.local !== true
+				? getOwnerNotifyTargets(false)
+				: getBulkJobNotifyTargets(message)),
 		// 仅公开管理命令显式开启来源群回执，隐藏连带任务沿用原通知范围。
 		notifySourceChat: options.notifySourceChat === true,
 		userBatchSize: BULK_TASK_USER_BATCH_SIZE,
@@ -7209,6 +7214,11 @@ async function runBulkModerationJob(env, jobId, options = {}) {
 
 async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 	const { action, valid, invalid, note, isInGroup } = options;
+	// 【2026-10-25】/sban 的批量任务回执也只给第一主人（主人定：「其他权限全部都收不到」）。
+	// 这里判不到命令名，用 mode 反推：'kick' 只有 /sban 会传（/ban /spam 传 'human'，
+	// 本群黑名单那条链路传 'kick' 但 action 是 local，见下面的 local 判断）。
+	// executeScopedModeration 的 local 任务不走这个通知口径，它单独调 replyToModerationAdmin。
+	const notifyVice = !(String(options.mode || '') === 'kick' && options.local !== true);
 	// options.groupIds：本次作用的群（独立群本群 / 跳过独立群的全局范围）；不给 = 全部配置群。
 	const scopeGroupIds = Array.isArray(options.groupIds) ? options.groupIds : GROUP_IDS;
 	const budget = shouldUseBulkQueue(valid.length, scopeGroupIds.length, {
@@ -7227,7 +7237,7 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 			groupText: '❌ 批量任务需要绑定 D1',
 			detailText,
 			isInGroup,
-			notifySecondaryOwners: true
+			notifySecondaryOwners: notifyVice
 		});
 		return true;
 	}
@@ -7256,7 +7266,7 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 		groupText: `📦 批量任务已创建 <code>${job.id}</code>\n目标 ${job.totals.users} 个`,
 		detailText,
 		isInGroup,
-		notifySecondaryOwners: true
+		notifySecondaryOwners: notifyVice
 	});
 	const scheduled = autoQueueAvailable ? scheduleBulkJobAutoContinue(job, ctx, options.requestUrl, env) : false;
 	if (scheduled && typeof scheduled.then === 'function') {
@@ -9655,20 +9665,17 @@ function isSbanCommand(text) {
 	return /^\/sban(?:@[^\s]+)?(?:\s|$)/i.test(text.trim());
 }
 
-// /sban 鉴权：第一主人 / 副主人 / 该群 Telegram 群主（creator）。
-// 超管与普通管理员不给 —— 踢人比禁言重，主人定的口子就是这三种身份。
-// 私聊没有群上下文、判不出谁是群主，所以私聊只放第一主人与副主人；群主要踢人得进群发命令。
-async function checkSbanPermission(message, userId) {
+// /sban 鉴权：【只有第一主人】。
+// 【2026-10-25 主人定】原先还放副主人与该群 Telegram 群主，现在全部收回：
+// 主人原话「sban 是第一主人专用，任何权限都不可调用」。副主人、超管、群主、
+// 杀手权限持有者一律不给 —— 要踢人只有第一主人一条路。
+// 不再查 isGroupCreator，也不再写 message.__operatorIsCreator：第一主人在
+// resolveModerationRoute 里直接走 global，那个字段这条链路上没人读。
+// 群内非授权者发 /sban 一律静默忽略（不回提示），私聊同理 —— 主人要求这条命令
+// 不在群里露面，连「权限不足」都不给，免得确认了命令存在。
+function checkSbanPermission(message, userId) {
 	if (isBotOperator(message?.from)) return false;
-	if (isPrimaryOwner(userId) || isSecondaryOwner(userId)) return true;
-	if (message?.chat?.type === 'private') return false;
-	if (!isConfiguredGroup(message?.chat?.id)) return false;
-	// 不复用 checkIfUserIsAdminInGroup：那个把管理员和群主一并放行，/sban 只认 creator。
-	// 不接 AD_ADMIN_CACHE：它存的是 id 列表、没有 status，区分不出群主。
-	const creator = await isGroupCreator(userId, String(message.chat.id));
-	// 记在消息上：加黑附表定身份时直接复用，不再多问一次 Telegram。
-	message.__operatorIsCreator = creator;
-	return creator;
+	return isPrimaryOwner(userId);
 }
 
 // 判断给定 chat_id 是否属于配置的任一群组
@@ -11016,7 +11023,9 @@ function killerScopeGroupIds() {
 }
 
 // 杀手身份能用的命令。不在这里的（/addgroup /dryrun /admins /ad 维护类…）一律落回原有分发，按他的其他身份鉴权。
-const KILLER_COMMANDS = new Set(['/ban', '/sban', '/spam', '/unban', '/rm', '/check', '/profile', '/search', '/stats', '/notice', '/health', '/job', '/jobrun', '/help']);
+// 【2026-10-25】'/sban' 已从这里摘除：主人定「sban 是第一主人专用，任何权限都不可调用」。
+// 杀手持有者现在发 /sban 会落回原分发，在那里被 checkSbanPermission 挡掉并静默忽略。
+const KILLER_COMMANDS = new Set(['/ban', '/spam', '/unban', '/rm', '/check', '/profile', '/search', '/stats', '/notice', '/health', '/job', '/jobrun', '/help']);
 // 私聊里这四条超管本来就有：两份权限都有的人私聊发，走超管身份（行为与改动前逐字节一致）。
 const KILLER_SHARED_SUPER_COMMANDS = new Set(['/ban', '/spam', '/unban', '/check']);
 
@@ -12071,10 +12080,13 @@ function canKillerViewStats(userId, chatId) {
 	return isKillerAdmin(userId) && isKillerModeGroup(chatId);
 }
 
-// 杀手黑名单的 reason：killer_ban / killer_sban / killer_spam（与主黑名单的 manual / spam 分开，/check 一眼分得清）。
+// 杀手黑名单的 reason：killer_ban / killer_spam（与主黑名单的 manual / spam 分开，/check 一眼分得清）。
+// 【2026-10-25】原先还有 killer_sban 这一档，随 /sban 从杀手命令集摘除一起去掉写入侧。
+// 渲染侧（translateBlacklistReason 的 killer_sban）保留：线上可能已有这个 reason 的历史记录，
+// 删了标签 /check 就会把它显示成裸字符串。
 function killerReasonForCommand(commandName) {
 	const head = String(commandName || '').replace(/^\//, '').toLowerCase();
-	return 'killer_' + (head === 'spam' ? 'spam' : head === 'sban' ? 'sban' : 'ban');
+	return 'killer_' + (head === 'spam' ? 'spam' : 'ban');
 }
 
 // 每次封禁 / 解封 / 通知 / 删消息都抄送第一主人（主人定）。只发第一主人，副主人不收。
@@ -12110,7 +12122,7 @@ async function handleKillerAdminCommand(message, env, ctx, requestUrl = '') {
 	if (!head || !resolveKillerCommandIdentity(message, head)) return false;
 	switch (head) {
 		case '/ban':
-		case '/sban':
+			// 【2026-10-25】原先 case '/sban' 与这里共用 handleKillerBan，已摘除（见 KILLER_COMMANDS）。
 			return handleKillerBan(message, env, ctx, { commandName: head, rest, requestUrl });
 		case '/spam':
 			return handleKillerSpam(message, env, ctx, { rest, requestUrl });
@@ -12211,7 +12223,7 @@ async function killerBanIds(message, env, ctx, { ids, invalid, note, commandName
 	}
 	const budget = shouldUseBulkQueue(targets.length, killerScopeGroupIds().length, { probeMembership: targets.length === 1 });
 	if (budget.useQueue) {
-		return startKillerBulkJob(message, env, ctx, { action: commandName === '/spam' ? 'spam' : commandName === '/sban' ? 'sban' : 'ban', ids: targets, invalid, note, requestUrl });
+		return startKillerBulkJob(message, env, ctx, { action: commandName === '/spam' ? 'spam' : 'ban', ids: targets, invalid, note, requestUrl });
 	}
 	const { scope, added, okIds, perUser } = await runKillerBan(env, { ids: targets, note, actorId, commandName });
 	// 群内单条：补删当前群缓存的历史发言（revoke 对已退群的人无效，这条兜底）。只在杀手群里发生。
@@ -12593,7 +12605,6 @@ async function handleKillerHelp(message, ctx) {
 		'',
 		'<b>━━ 封禁与解封 ━━</b>',
 		'/ban TGID [原因]　加杀手黑名单 + 全部杀手群踢出',
-		'/sban TGID [原因]　同上，群里不留回执',
 		'/spam　在杀手群里回复广告：删消息 + 加杀手黑名单 + 踢出（也可 /spam TGID）',
 		'/unban TGID　移出杀手黑名单 + 全部杀手群解封',
 		'　　批量：TGID 用逗号隔开，一次最多 ' + BATCH_LIMIT + ' 个；超过 20 个转成批量任务',
@@ -17094,22 +17105,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 仅真人可写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
 		if (isBotOperator(message.from)) return;
 
-		// /sban 的口子更窄：第一主人 / 副主人 / 该群 Telegram 群主；超管与普通管理员不给。
-		// 私聊判不出群主，所以私聊只放第一主人与副主人 —— 群主要踢人得进群发命令。
+		// /sban 的口子只剩第一主人（2026-10-25 主人定，见 checkSbanPermission）。
 		const isAdmin = isSban
-			? await checkSbanPermission(message, userId)
+			? checkSbanPermission(message, userId)
 			: await checkMessageOperatorCanModerate(message, userId);
 		if (!isAdmin) {
-			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
-			if (!isInGroup) {
-				// 群管理员（含群主）私聊 /sban：与 /ban /spam /unban 同口径收回到群里。
-				if (isSban && await checkIfUserIsAdmin(userId)) {
-					await sendTelegramMessage(chatId, PRIVATE_MODERATION_REDIRECT_TEXT);
-					return;
-				}
-				await sendTelegramMessage(chatId, isSban
-					? '❌ <b>权限不足</b>\n\n/sban 限第一主人、副主人或该群群主使用（私聊仅第一主人与副主人）。'
-					: '❌ <b>权限不足</b>\n\n/ban 仅限配置群的 Telegram 管理员、主人或副主人使用。');
+			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足。
+			// 【/sban 例外】私聊也一律静默：主人要求这条命令不对外露面，回一句「权限不足」
+			// 就等于确认了它存在。原先这里还有一支「群管理员私聊 /sban 收回群里」，
+			// 权限收窄后群管理员在群里也用不了，引导他进群是错的，已删。
+			if (!isInGroup && !isSban) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/ban 仅限配置群的 Telegram 管理员、主人或副主人使用。');
 			}
 			return;
 		}
@@ -17149,10 +17155,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await replyToModerationAdmin(message, ctx, { flashText: REPLY_TARGET_UNRECOGNIZED_TEXT.replace('{cmd}', commandName) });
 			return;
 		}
-		if (replyTarget && isSban && !isPrimaryOwner(operatorId)) {
-			await replyToModerationAdmin(message, ctx, { flashText: '❌ <b>/sban 引用仅限第一主人使用</b>\n\n请改用 <code>/sban 用户ID</code>。' });
-			return;
-		}
+		// 【2026-10-25 已删】原先这里挡「非第一主人引用 /sban」。checkSbanPermission 收成
+		// 只认第一主人之后，能走到这里的 isSban 必然已是第一主人，这个判断恒为 false，
+		// 是死代码。留着会让人误以为还有别的身份能发 /sban。
 		const valid = replyTarget ? [replyTarget.userId] : parsedArgs.valid;
 		const invalid = replyTarget ? [] : parsedArgs.invalid;
 		const note = replyTarget ? String(rawArg || '').trim() : parsedArgs.note;
@@ -17267,7 +17272,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				flashText,
 				detailText: withActionContext(message, lines.join('\n'), note),
 				isInGroup,
-				notifySecondaryOwners: true
+				// 【2026-10-25】/sban 的通知只给第一主人（主人定：「其他权限全部都收不到」）。
+				// /ban 照旧抄送副主人，口径一个字节不变。
+				notifySecondaryOwners: !isSban
 			});
 			return;
 		}
@@ -17317,7 +17324,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			flashText,
 			detailText: withActionContext(message, fullDetail, note),
 			isInGroup,
-			notifySecondaryOwners: true
+			// 同步单条那一支的理由：/sban 只给第一主人，/ban 照旧抄副主人。
+			notifySecondaryOwners: !isSban
 		});
 		return;
 	}
