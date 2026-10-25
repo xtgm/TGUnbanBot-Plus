@@ -376,6 +376,14 @@ export default {
 			if (request.method !== 'GET') return miniAppJson({ success: false, error: '仅支持 GET' }, 405);
 			return miniAppHtmlResponse(renderKillerMiniAppHtml());
 		}
+		// 全站禁止收录（2026-10-25 主人要求「切勿被爬」）；各页面另带 noindex 头作第二道。
+		if (url.pathname === '/robots.txt') {
+			return new Response('User-agent: *\nDisallow: /\n', { headers: { 'Content-Type': 'text/plain; charset=UTF-8', 'Cache-Control': 'public, max-age=86400' } });
+		}
+		// 打开域名 = 后台登录页。只接 GET：POST 根路径是 Telegram webhook，不能动。
+		if (url.pathname === '/' && (request.method === 'GET' || request.method === 'HEAD')) {
+			return new Response(null, { status: 303, headers: { ...EXPORT_PRIVATE_HEADERS, Location: '/admin' } });
+		}
 		const miniAppApi = url.pathname.startsWith('/app/api/');
 
 		try {
@@ -7100,26 +7108,46 @@ async function handlePasswordExport(request, env, url) {
 //   · web/* 是后台专属接口：群模式、本群设置/白名单/黑名单、演练、群统计、导出密码、命令台、退出；
 //   · 命令台 web/exec = 以第一主人私聊身份把命令交给 handleMessage，回执照常发到 Telegram，同时镜像回网页。
 // 接口只收 POST JSON，且必须带同源 Origin（cookie 是 SameSite=Strict，这里再加一道防跨站）。
-const ADMIN_LOGIN_PAGE = { title: '管理后台', heading: '🛠 管理后台', action: '/admin', hint: '第一主人私聊机器人发 /adminpass 领取临时密码。密码只能用一次；关闭浏览器后需要重新登录。' };
-const ADMIN_FIXED_LOGIN_PAGE = { title: '管理后台', heading: '🛠 管理后台', action: '/admin',
-	hint: '输入 Dashboard 环境变量 ADMIN_PASSWORD 里设的密码。关闭浏览器后需要重新登录。',
-	label: '后台密码', placeholder: '', autocomplete: 'current-password', maxlength: 256 };
+// 登录页中性（2026-10-25 主人定）：不写变量名、不写命令、不写密码怎么来 —— 密码只有主人自己知道。
+// 正式密码 / 一次性密码两种模式共用这一页，外人看不出后台用的是哪种。
+const ADMIN_LOGIN_PAGE = { title: '管理后台', heading: '🛠 管理后台', action: '/admin', hint: '请输入密码。',
+	label: '密码', placeholder: '', autocomplete: 'current-password', maxlength: 256 };
+const ADMIN_LOGIN_WRONG = '密码错误。';
 
-// ===== 正式密码（2026-10-25 主人定 A 方案）=====
-// Dashboard 环境变量 ADMIN_PASSWORD = 后台正式密码，可自定义、可反复登录；地址仍是 域名/admin。
-// 三态：off（没设）→ 照旧走 /adminpass 一次性密码；short（< 8 位）→ 拒用正式密码，/adminpass 照旧可用，
-// 不会因为设错把主人锁在门外；on → 只认正式密码，/adminpass 停用。
+// ===== 正式密码（2026-10-25 主人定 A 方案，同日改：不限长短）=====
+// Dashboard 环境变量 ADMIN_PASSWORD = 后台正式密码，可自定义、可反复登录。打开域名根路径直接跳到 域名/admin 登录。
+// 两态：off（没设）→ 照旧走 /adminpass 一次性密码；on（设了，长短不限）→ 只认正式密码，/adminpass 停用。
 // 会话哈希里掺正式密码的指纹：Dashboard 一改密码，旧会话全部对不上 = 立即失效。D1 里不存密码明文。
-// 防爆破：同一 IP 15 分钟内错 5 次 → 锁 15 分钟，锁定期间密码对了也不放行（admin_login_failures 表，只在登录时读写）。
-const ADMIN_PASSWORD_MIN_LENGTH = 8;
+// 防爆破：陌生 IP 15 分钟内错 5 次 → 锁 15 分钟，锁定期间密码对了也不放行（IPv6 按 /64 合并计数，防换地址刷次数）。
+// 主人识别：输对密码 = 主人。登录成功的 IP 记进 admin_login_ips，之后这个 IP 输错不计锁定（照样要输对密码才进）；
+// 每次成功写一条 admin_login_log 并私聊通知第一主人。后台「登录记录」可看、可移除 IP。锁定只拦登录，不碰已有会话。
 const ADMIN_LOGIN_MAX_FAILURES = 5;
 const ADMIN_LOGIN_WINDOW_SECONDS = 15 * 60;
 const ADMIN_LOGIN_LOCK_SECONDS = 15 * 60;
+const ADMIN_LOGIN_LOG_PAGE = 50;
 
 function adminFixedPasswordState(env) {
-	const pw = String(env?.ADMIN_PASSWORD ?? '').trim();
-	if (!pw) return 'off';
-	return [...pw].length < ADMIN_PASSWORD_MIN_LENGTH ? 'short' : 'on';
+	return String(env?.ADMIN_PASSWORD ?? '').trim() ? 'on' : 'off';
+}
+
+// 锁定计数的键：IPv4 用原地址；IPv6 取前 64 位（一台机器能随手换出整段 /64 的地址）。
+function adminLoginLockKey(ip) {
+	if (!ip.includes(':')) return ip;
+	const compressed = ip.includes('::');
+	const [head, tail = ''] = ip.toLowerCase().split('::');
+	const h = head ? head.split(':') : [];
+	const t = compressed && tail ? tail.split(':') : [];
+	const full = compressed ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t] : h;
+	return full.slice(0, 4).map((x) => (x || '0').replace(/^0+(?=.)/, '')).join(':') + '::/64';
+}
+
+// 登录表单只收本站页面提交：Sec-Fetch-Site 不是 same-origin、或 Origin 是别的站 → 拒。
+// 后台响应带 no-referrer，浏览器提交本站表单时 Origin 会是字面量 "null"，所以 null 放行（再由 Sec-Fetch-Site 把关）。
+function adminLoginFromForeignSite(request, url) {
+	const site = request.headers.get('Sec-Fetch-Site');
+	if (site && site !== 'same-origin') return true;
+	const origin = request.headers.get('Origin');
+	return !!origin && origin !== 'null' && origin !== url.origin;
 }
 
 // 会话存库哈希：正式密码模式掺密码指纹，一次性密码模式与旧实现一致（只哈希 token）。
@@ -7145,49 +7173,105 @@ async function adminPasswordMatches(env, input) {
 	return diff === 0;
 }
 
-async function ensureAdminLoginFailuresTable(env) {
-	return runD1SchemaStatement(env, 'admin_login_failures',
-		'CREATE TABLE IF NOT EXISTS admin_login_failures (ip TEXT PRIMARY KEY, count INTEGER NOT NULL, first_at INTEGER NOT NULL, locked_until INTEGER NOT NULL DEFAULT 0)',
-		{ optional: true });
+// 三张表只在登录与「登录记录」分区读写，热路径不碰。admin_login_failures.ip 存的是锁定键（IPv6 为 /64）。
+async function ensureAdminLoginTables(env) {
+	const results = await Promise.all([
+		runD1SchemaStatement(env, 'admin_login_failures',
+			'CREATE TABLE IF NOT EXISTS admin_login_failures (ip TEXT PRIMARY KEY, count INTEGER NOT NULL, first_at INTEGER NOT NULL, locked_until INTEGER NOT NULL DEFAULT 0)',
+			{ optional: true }),
+		runD1SchemaStatement(env, 'admin_login_ips',
+			'CREATE TABLE IF NOT EXISTS admin_login_ips (ip TEXT PRIMARY KEY, ip_key TEXT NOT NULL, country TEXT NOT NULL DEFAULT \'\', first_at INTEGER NOT NULL, last_at INTEGER NOT NULL, count INTEGER NOT NULL DEFAULT 0)',
+			{ optional: true }),
+		runD1SchemaStatement(env, 'admin_login_log',
+			'CREATE TABLE IF NOT EXISTS admin_login_log (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, ip TEXT NOT NULL DEFAULT \'\', country TEXT NOT NULL DEFAULT \'\', ua TEXT NOT NULL DEFAULT \'\', mode TEXT NOT NULL DEFAULT \'\')',
+			{ optional: true })
+	]);
+	return results.every(Boolean);
 }
 
-// 正式密码登录：返回 { token } 或 { error, status }。
-async function redeemAdminFixedPassword(env, request, input) {
-	const ip = String(request.headers.get('CF-Connecting-IP') || 'unknown').slice(0, 64);
+function adminLockedError(seconds) {
+	return { status: 429, error: '密码错误次数过多，已锁定，请 ' + Math.max(1, Math.ceil(seconds / 60)) + ' 分钟后再试。' };
+}
+
+// 后台登录（正式密码 / 一次性密码共用）：返回 { token } 或 { error, status }。
+// 顺序：认出主人 IP → 不是主人 IP 才查锁定 → 核密码 → 错了才计数 → 对了才记录 IP、写日志、通知。
+async function redeemAdminLogin(env, request, input) {
+	const ip = String(request.headers.get('CF-Connecting-IP') || '').trim().slice(0, 64);
+	const key = ip ? adminLoginLockKey(ip) : 'unknown';
 	const now = Math.floor(Date.now() / 1000);
-	const tableOk = await ensureAdminLoginFailuresTable(env);
-	const row = tableOk ? await env.DB.prepare('SELECT count, first_at, locked_until FROM admin_login_failures WHERE ip = ?').bind(ip).first() : null;
-	if (row && Number(row.locked_until) > now) {
-		const mins = Math.max(1, Math.ceil((Number(row.locked_until) - now) / 60));
-		return { status: 429, error: '密码错误次数过多，已锁定，请 ' + mins + ' 分钟后再试。' };
+	const tableOk = await ensureAdminLoginTables(env);
+	const trusted = tableOk && !!ip
+		&& !!(await env.DB.prepare('SELECT 1 AS ok FROM admin_login_ips WHERE ip_key = ? LIMIT 1').bind(key).first());
+	const row = tableOk && !trusted
+		? await env.DB.prepare('SELECT count, first_at, locked_until FROM admin_login_failures WHERE ip = ?').bind(key).first()
+		: null;
+	if (row && Number(row.locked_until) > now) return adminLockedError(Number(row.locked_until) - now);
+
+	const fixed = adminFixedPasswordState(env) === 'on';
+	let token = '';
+	if (fixed) {
+		if (await adminPasswordMatches(env, input)) {
+			if (!(await ensureExportAuthTables(env, 'admin'))) return { status: 503, error: '暂不可用，请稍后重试。' };
+			token = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, '0')).join('');
+			await env.DB.batch([
+				env.DB.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').bind(now),
+				env.DB.prepare('INSERT INTO admin_sessions (hash, created_at, expires_at) VALUES (?, ?, ?)')
+					.bind(await adminSessionHash(env, token), now, now + EXPORT_SESSION_MAX_SECONDS)
+			]);
+		}
+	} else {
+		token = await redeemExportPassword(env, input, 'admin');
 	}
-	if (!(await adminPasswordMatches(env, input))) {
-		if (tableOk) {
+
+	if (!token) {
+		if (tableOk && !trusted) {
 			const fresh = !row || now - Number(row.first_at) > ADMIN_LOGIN_WINDOW_SECONDS;
 			const count = fresh ? 1 : Number(row.count) + 1;
 			const lockedUntil = count >= ADMIN_LOGIN_MAX_FAILURES ? now + ADMIN_LOGIN_LOCK_SECONDS : 0;
 			await env.DB.prepare('INSERT INTO admin_login_failures (ip, count, first_at, locked_until) VALUES (?, ?, ?, ?) '
 				+ 'ON CONFLICT(ip) DO UPDATE SET count = excluded.count, first_at = excluded.first_at, locked_until = excluded.locked_until')
-				.bind(ip, count, fresh ? now : Number(row.first_at), lockedUntil).run();
-			if (lockedUntil) return { status: 429, error: '密码错误次数过多，已锁定，请 ' + Math.ceil(ADMIN_LOGIN_LOCK_SECONDS / 60) + ' 分钟后再试。' };
+				.bind(key, count, fresh ? now : Number(row.first_at), lockedUntil).run();
+			if (lockedUntil) return adminLockedError(ADMIN_LOGIN_LOCK_SECONDS);
 		}
-		return { status: 401, error: '密码错误。' };
+		return { status: 401, error: ADMIN_LOGIN_WRONG };
 	}
-	if (!(await ensureExportAuthTables(env, 'admin'))) return { status: 503, error: '后台暂不可用，请稍后重试。' };
-	const token = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, '0')).join('');
-	const stmts = [
-		env.DB.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').bind(now),
-		env.DB.prepare('INSERT INTO admin_sessions (hash, created_at, expires_at) VALUES (?, ?, ?)')
-			.bind(await adminSessionHash(env, token), now, now + EXPORT_SESSION_MAX_SECONDS)
-	];
+
+	const country = String(request.cf?.country || request.headers.get('CF-IPCountry') || '').slice(0, 8);
+	const ua = String(request.headers.get('User-Agent') || '').slice(0, 200);
+	const mode = fixed ? 'password' : 'onetime';
 	if (tableOk) {
-		stmts.push(env.DB.prepare('DELETE FROM admin_login_failures WHERE ip = ? OR (locked_until < ? AND first_at < ?)')
-			.bind(ip, now, now - ADMIN_LOGIN_WINDOW_SECONDS));
+		const stmts = [
+			env.DB.prepare('INSERT INTO admin_login_log (at, ip, country, ua, mode) VALUES (?, ?, ?, ?, ?)').bind(now, ip, country, ua, mode),
+			env.DB.prepare('DELETE FROM admin_login_failures WHERE ip = ? OR (locked_until < ? AND first_at < ?)')
+				.bind(key, now, now - ADMIN_LOGIN_WINDOW_SECONDS)
+		];
+		// 没有来源 IP（只可能是绕开 Cloudflare 的异常请求）不记成主人 IP。
+		if (ip) {
+			stmts.push(env.DB.prepare('INSERT INTO admin_login_ips (ip, ip_key, country, first_at, last_at, count) VALUES (?, ?, ?, ?, ?, 1) '
+				+ 'ON CONFLICT(ip) DO UPDATE SET last_at = excluded.last_at, country = excluded.country, count = admin_login_ips.count + 1')
+				.bind(ip, key, country, now, now));
+		}
+		try { await env.DB.batch(stmts); } catch (error) { console.error('[后台登录] 记录失败:', error?.message || error); }
 	}
-	await env.DB.batch(stmts);
+	try {
+		await sendTelegramMessage(String(OWNER_IDS[0]), '🔐 <b>后台新登录</b>\n\n'
+			+ 'IP：<code>' + escapeHtml(ip || '未知') + '</code>' + (country ? '（' + escapeHtml(country) + '）' : '') + '\n'
+			+ '方式：' + (fixed ? '正式密码' : '一次性密码') + '\n'
+			+ (trusted ? '' : '⚠️ 这个 IP 第一次登录；不是你本人请立刻改密码，并在后台「登录记录」移除它。'));
+	} catch (error) { console.error('[后台登录] 通知失败:', error?.message || error); }
 	return { token };
 }
-const WEB_ADMIN_ACTIONS = new Set(['web/exec', 'web/groupmode', 'web/localset', 'web/localwl', 'web/localbans', 'web/localunban', 'web/dryrun', 'web/stats', 'web/exportpass', 'web/logout']);
+
+async function webAdminLogins(env) {
+	if (!(await ensureAdminLoginTables(env))) throw new MiniAppError(503, '登录记录暂不可用');
+	const [total, ips, logs] = await Promise.all([
+		env.DB.prepare('SELECT COUNT(*) AS n FROM admin_login_log').first(),
+		env.DB.prepare('SELECT ip, country, first_at, last_at, count FROM admin_login_ips ORDER BY last_at DESC LIMIT 100').all(),
+		env.DB.prepare('SELECT at, ip, country, ua, mode FROM admin_login_log ORDER BY id DESC LIMIT ?').bind(ADMIN_LOGIN_LOG_PAGE).all()
+	]);
+	return { total: Number(total?.n) || 0, ips: ips?.results || [], logs: logs?.results || [] };
+}
+const WEB_ADMIN_ACTIONS = new Set(['web/exec', 'web/groupmode', 'web/localset', 'web/localwl', 'web/localbans', 'web/localunban', 'web/dryrun', 'web/stats', 'web/exportpass', 'web/logins', 'web/loginip-del', 'web/logout']);
 const WEB_ADMIN_REPLY_LIMIT = 30;
 // 命令台回执镜像：执行期间发给第一主人私聊的消息同时记一份文本。
 // Worker 没开 nodejs_compat（没有 AsyncLocalStorage），用模块级变量；同一时刻别的请求恰好也给第一主人
@@ -7217,29 +7301,17 @@ async function handleWebAdmin(request, env, ctx, url) {
 	if (url.pathname !== '/admin') return new Response('Not Found', { status: 404 });
 	if (!env.DB) return new Response('❌ 未绑定 D1 存储空间', { status: 400 });
 	if (!OWNER_IDS.length) return new Response('❌ 未配置 OWNER_IDS，后台无人可用', { status: 503 });
-	const pwState = adminFixedPasswordState(env);
-	const loginPage = pwState === 'on' ? ADMIN_FIXED_LOGIN_PAGE : ADMIN_LOGIN_PAGE;
 	if (request.method === 'POST') {
+		if (adminLoginFromForeignSite(request, url)) return new Response('Forbidden', { status: 403, headers: EXPORT_PRIVATE_HEADERS });
 		let password = '';
 		try { password = String((await request.formData()).get('password') || ''); } catch (_) { password = ''; }
-		let token = '';
-		if (pwState === 'on') {
-			const result = await redeemAdminFixedPassword(env, request, password);
-			if (!result.token) return renderExportLoginPage(result.error, loginPage, result.status);
-			token = result.token;
-		} else {
-			token = await redeemExportPassword(env, password, 'admin');
-			if (!token) {
-				return renderExportLoginPage(pwState === 'short'
-					? '环境变量 ADMIN_PASSWORD 少于 8 位，正式密码未启用，请到 Dashboard 改长一点；在那之前请私聊机器人发 /adminpass 领一次性密码登录。'
-					: '密码错误或已失效（每个密码只能登录一次），请私聊机器人发 /adminpass 重新领取。', loginPage);
-			}
-		}
+		const result = await redeemAdminLogin(env, request, password);
+		if (!result.token) return renderExportLoginPage(result.error, ADMIN_LOGIN_PAGE, result.status);
 		return new Response(null, { status: 303, headers: { ...EXPORT_PRIVATE_HEADERS, Location: '/admin',
-			'Set-Cookie': 'admin_session=' + token + '; Path=/admin; HttpOnly; Secure; SameSite=Strict' } });
+			'Set-Cookie': 'admin_session=' + result.token + '; Path=/admin; HttpOnly; Secure; SameSite=Strict' } });
 	}
 	if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405 });
-	if (!(await adminSessionValid(env, request))) return renderExportLoginPage('', loginPage);
+	if (!(await adminSessionValid(env, request))) return renderExportLoginPage('', ADMIN_LOGIN_PAGE);
 	return webAdminHtmlResponse();
 }
 
@@ -7377,6 +7449,15 @@ async function dispatchWebAdminAction(action, body, env, auth, ctx, url) {
 			if (!password) throw new MiniAppError(503, '生成导出密码失败，请稍后重试');
 			return { password, url: url.origin + '/export', message: '一次性导出密码已生成，转发给可信用户即可（24 小时内有效，登录一次即作废）' };
 		}
+		case 'web/logins': return webAdminLogins(env);
+		case 'web/loginip-del': {
+			const ip = String(payload.ip || '').trim().slice(0, 64);
+			if (!ip) throw new MiniAppError(400, '缺少要移除的 IP');
+			if (!(await ensureAdminLoginTables(env))) throw new MiniAppError(503, '登录记录暂不可用');
+			const res = await env.DB.prepare('DELETE FROM admin_login_ips WHERE ip = ?').bind(ip).run();
+			if (Number(res?.meta?.changes) !== 1) throw new MiniAppError(404, '没有这条登录 IP');
+			return { ip, message: '已移除：这个 IP 之后输错密码会照常计数锁定' };
+		}
 		default: throw new MiniAppError(404, '接口不存在');
 	}
 }
@@ -7485,6 +7566,7 @@ dl.kv dd{margin:0;min-width:0}
 <button type="button" role="tab" data-tab="notice">全体通知</button>
 <button type="button" role="tab" data-tab="admins">管理员</button>
 <button type="button" role="tab" data-tab="export">导出密码</button>
+<button type="button" role="tab" data-tab="logins">登录记录</button>
 <button type="button" role="tab" data-tab="console">命令台</button>
 </nav>
 <main>
@@ -7569,6 +7651,12 @@ dl.kv dd{margin:0;min-width:0}
 <section class="tab" id="tab-export" hidden>
 <div class="card"><h2>导出密码（/exportpass）</h2><p class="hint">生成一次性导出密码，转发给可信用户登录导出页看 / 下载黑名单。导出密码登不进本后台。</p>
 <div class="row"><button class="btn primary" id="e-gen" type="button">生成导出密码</button></div><div id="e-out" class="out"></div></div>
+</section>
+<section class="tab" id="tab-logins" hidden>
+<div class="card"><h2>我的登录 IP</h2><p class="hint">只有输对密码、登录成功才会记进来。这些 IP 输错密码不会被锁，但照样要输对才能进。不认识的 IP 请移除，并到 Dashboard 改密码。</p>
+<div class="row"><button class="btn" id="l-reload" type="button">刷新</button><span id="l-total" class="muted"></span></div>
+<div id="l-ips" class="out"></div></div>
+<div class="card"><h2>登录日志</h2><p class="hint">每次登录成功一条，最近 50 条。</p><div id="l-logs" class="out"></div></div>
 </section>
 <section class="tab" id="tab-console" hidden>
 <div class="card"><h2>命令台</h2><p class="hint">等同于你本人私聊机器人发命令：结果显示在下面，Telegram 私聊里也照常收到一份。按钮类交互（确认 / 翻页）请到 Telegram 里点。</p>
@@ -7761,6 +7849,7 @@ function showTab(name) {
 	if (name === 'groups') loadGroups();
 	else if (name === 'blacklist') loadBlacklist(1);
 	else if (name === 'ads') loadAds(1);
+	else if (name === 'logins') loadLogins();
 }
 $('nav').addEventListener('click', function (e) { var b = e.target.closest('button[data-tab]'); if (b) showTab(b.getAttribute('data-tab')); });
 
@@ -8074,6 +8163,21 @@ $('e-gen').addEventListener('click', function () {
 		put('e-out', kv([['导出页', d.url], ['一次性密码', el('code', { text: d.password })], ['说明', d.message]]));
 	}).catch(function (e) { msg('e-out', e.message, true); });
 });
+// ===== 登录记录 =====
+function loadLogins() {
+	return api('web/logins').then(function (d) {
+		$('l-total').textContent = '累计登录成功 ' + (Number(d.total) || 0) + ' 次';
+		put('l-ips', table(d.ips || [], [['IP', 'ip'], ['地区', 'country'], ['首次', function (r) { return fmtTime(r.first_at); }], ['最近', function (r) { return fmtTime(r.last_at); }], ['次数', 'count'],
+			['', function (r) {
+				return el('button', { cls: 'btn danger', type: 'button', text: '移除', on: { click: function () {
+					if (!confirm('移除 ' + r.ip + '？之后这个 IP 输错密码会照常计数锁定。')) return;
+					busy(this, api('web/loginip-del', { ip: r.ip })).then(function (x) { toast(x.message); loadLogins(); }).catch(function () {});
+				} } });
+			}]]));
+		put('l-logs', table(d.logs || [], [['时间', function (r) { return fmtTime(r.at); }], ['IP', 'ip'], ['地区', 'country'], ['方式', function (r) { return r.mode === 'password' ? '正式密码' : '一次性密码'; }], ['浏览器', 'ua']]));
+	}).catch(function (e) { msg('l-ips', e.message, true); });
+}
+$('l-reload').addEventListener('click', loadLogins);
 // ===== 命令台 =====
 function runCommand() {
 	var cmd = $('c-cmd').value.trim();
@@ -16106,7 +16210,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await sendTelegramMessage(chatId, 'ℹ️ 你已经在网页后台里了，不需要新的后台密码。');
 			return;
 		}
-		// A 方案：设了正式密码 ADMIN_PASSWORD 就停用 /adminpass；没设或太短（< 8 位）照旧发一次性密码当备用。
+		// A 方案：设了正式密码 ADMIN_PASSWORD（长短不限）就停用 /adminpass；没设照旧发一次性密码当备用。
 		if (adminFixedPasswordState(env) === 'on') {
 			await sendTelegramMessage(chatId, 'ℹ️ 后台已改用正式密码登录（Dashboard 环境变量 <code>ADMIN_PASSWORD</code>），不再发一次性密码。\n'
 				+ '忘了密码就去 Dashboard 改这个变量；删掉它则恢复 /adminpass。');

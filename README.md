@@ -226,7 +226,7 @@
 | `BLACKLIST_REASON_LABELS` | 见源码 | 原因字段中文映射（JSON） |
 | `GKY_BANLIST_ENDPOINT` | `https://gkybot.gmeow.cc/banlist` | GKY 封禁查询后端（新后端 HTML 须与 `parseBanlistHTML` 正则兼容） |
 | `FLASH_MESSAGE_TTL_MS` | `5000` | 群内闪屏存活毫秒数（0~60000） |
-| `ADMIN_PASSWORD` | 空 | 网页后台 `域名/admin` 的正式密码（≥ 8 位，类型选「密钥」）。设了就用它登录、`/adminpass` 停用；空或太短则照旧私聊 `/adminpass` 领一次性密码。同 IP 错 5 次锁 15 分钟；改密码即踢掉旧登录 |
+| `ADMIN_PASSWORD` | 空 | 网页后台正式密码（长短不限，类型选「密钥」），打开域名即登录页。设了就用它、`/adminpass` 停用；空则照旧私聊 `/adminpass` 领一次性密码。陌生 IP 错 5 次锁 15 分钟，登录成功过的 IP 不锁；后台「登录记录」可看次数与 IP；改密码即踢掉旧登录 |
 | `MSG_CACHE_SIZE` | `50` | 清扫回看上限（1-500），`/spam` 按它回看当前群近期消息 |
 | `AD_SCORE_THRESHOLD` | `7` | 广告**封禁**阈值（1-100） |
 | `AD_JOIN_SCORE_THRESHOLD` | `0` | **入群专用**封禁线，`0` = 沿用消息线（行为与加它之前一致）。实际取值与消息线取 `max`，配低了也松不过消息线；**结构 / 指纹 / AI 强证据不受它约束** |

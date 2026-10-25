@@ -101,7 +101,7 @@ log('\n=== 1. 未登录：只给登录页 ===');
 	const html = await res.text();
 	check('GET /admin → 200 登录页', res.status === 200 && /text\/html/.test(res.headers.get('Content-Type') || ''), res.status);
 	check('登录页表单提交到 /admin，有密码框', /<form[^>]+method="post"[^>]+action="\/admin"/.test(html) && /type="password"/.test(html), html.slice(0, 300));
-	check('登录页提示用 /adminpass 领密码', html.includes('/adminpass'));
+	check('★ 登录页不提密码怎么来（不出现 /adminpass）', !html.includes('/adminpass'), html);
 	check('登录页零脚本、不缓存、不收录', !/<script/i.test(html) && /no-store/.test(res.headers.get('Cache-Control') || '') && /noindex/.test(res.headers.get('X-Robots-Tag') || ''));
 	check('登录页不含黑名单数据', !html.includes('1001'));
 }
@@ -273,7 +273,7 @@ log('\n=== 10. 正式密码 ADMIN_PASSWORD（A 方案：设了用正式密码，
 	const oldOneTime = pwdOf(await say(OWNER, 'private', '/adminpass', OWNER));
 	env.ADMIN_PASSWORD = PW1;
 	let html = await (await get('/admin')).text();
-	check('★ 设了正式密码 → 登录页提示用正式密码、不再提 /adminpass', html.includes('ADMIN_PASSWORD') && !html.includes('/adminpass'), html.slice(0, 600));
+	check('★ 设了正式密码 → 登录页中性：不提变量名、不提 /adminpass', !html.includes('ADMIN_PASSWORD') && !html.includes('/adminpass') && html.includes('type="password"'), html.slice(0, 600));
 	const before = tableRows('admin_passwords').length;
 	let out = await say(OWNER, 'private', '/adminpass', OWNER);
 	check('★ 设了正式密码 → /adminpass 停用、不生成密码', !pwdOf(out) && out.some((m) => m.text.includes('ADMIN_PASSWORD')) && tableRows('admin_passwords').length === before, JSON.stringify(out));
@@ -312,17 +312,114 @@ log('\n=== 10. 正式密码 ADMIN_PASSWORD（A 方案：设了用正式密码，
 	res = await loginIp(PW2, '198.51.100.3');
 	check('★ 新密码登得进', res.status === 303, res.status);
 
-	env.ADMIN_PASSWORD = 'short';
-	res = await loginIp('short', '198.51.100.4');
-	const shortHtml = await res.text();
-	check('★ 密码少于 8 位 → 拒绝登录并提示去改', res.status === 401 && shortHtml.includes('8 位'), res.status + ' ' + shortHtml.slice(-300));
+	// 【2026-10-25 主人改口径】密码不限长短：设了就用，1 位也认。
+	env.ADMIN_PASSWORD = '7';
+	res = await loginIp('7', '198.51.100.4');
+	check('★ 1 位密码也照常启用（不限长短）', res.status === 303 && !!cookieOf(res, 'admin_session'), res.status);
 	out = await say(OWNER, 'private', '/adminpass', OWNER);
-	check('★ 密码太短时 /adminpass 照旧可用（不把主人锁在门外）', !!pwdOf(out), JSON.stringify(out));
+	check('★ 设了 1 位密码 → /adminpass 同样停用', !pwdOf(out), JSON.stringify(out));
 	delete env.ADMIN_PASSWORD;
 	out = await say(OWNER, 'private', '/adminpass', OWNER);
 	const fallbackPwd = pwdOf(out);
 	res = await loginIp(fallbackPwd, '198.51.100.5');
 	check('★ 没设变量 → /adminpass 一次性密码照旧能登录', !!fallbackPwd && res.status === 303, res.status);
+}
+
+log('\n=== 11. 域名直达登录 + 登录记录 + 只锁陌生 IP ===');
+// 【2026-10-25 主人定】打开域名就是登录页；登录页什么都不透露；密码不限长短。
+// 输对密码 = 认定是主人：这个 IP 记进「我的登录 IP」并写一条登录日志，后台页面可看、可移除。
+// 记录过的 IP 只是「不计锁定」，照样要输密码；陌生 IP 错 5 次锁 15 分钟，锁定不影响已登录的会话。
+{
+	const loginFrom = (password, ip, extra = {}) => handler.fetch(new Request(BASE + '/admin', {
+		method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: BASE, 'CF-Connecting-IP': ip, ...extra },
+		body: new URLSearchParams({ password }).toString(), redirect: 'manual'
+	}), env, ctx);
+	const PW = 'Mock-Admin-Pass-0003';
+	env.ADMIN_PASSWORD = PW;
+
+	let res = await handler.fetch(new Request(BASE + '/', { redirect: 'manual' }), env, ctx);
+	check('★ GET 根路径 → 跳到 /admin 登录页', [302, 303].includes(res.status) && res.headers.get('Location') === '/admin' && /no-store/.test(res.headers.get('Cache-Control') || ''), res.status + ' ' + res.headers.get('Location'));
+	res = await handler.fetch(new Request(BASE + '/', { method: 'POST', body: '{}', headers: { 'Content-Type': 'application/json' } }), env, ctx);
+	check('★ POST 根路径仍是 webhook，不被跳转', ![301, 302, 303].includes(res.status), res.status);
+	res = await get('/robots.txt');
+	const robots = await res.text();
+	check('★ /robots.txt → 全站禁止收录', res.status === 200 && /User-agent:\s*\*/i.test(robots) && /Disallow:\s*\/\s*$/m.test(robots), res.status + ' ' + robots);
+
+	const page = await (await get('/admin')).text();
+	check('★ 登录页不出现变量名 / Dashboard / 任何命令', !/ADMIN_PASSWORD|Dashboard|\/adminpass|\/help|私聊/.test(page), page.slice(0, 800));
+	res = await loginFrom('Mock-Wrong-Pass-1', '203.0.113.20');
+	const wrongFixed = await res.text();
+	delete env.ADMIN_PASSWORD;
+	res = await loginFrom('AAAA-AAAA-AAAA-AAAA', '203.0.113.21');
+	const wrongOneTime = await res.text();
+	env.ADMIN_PASSWORD = PW;
+	const errOf = (h) => ((h.match(/<div class="err"[^>]*>([^<]*)</) || [])[1] || '');
+	check('★ 正式 / 临时两种模式输错，提示一字不差', !!errOf(wrongFixed) && errOf(wrongFixed) === errOf(wrongOneTime), errOf(wrongFixed) + ' | ' + errOf(wrongOneTime));
+	check('★ 错误提示不透露密码来源', !/ADMIN_PASSWORD|adminpass|一次性|私聊/.test(wrongFixed + wrongOneTime), errOf(wrongOneTime));
+
+	const ipsBefore = tableRows('admin_login_ips').length;
+	const logsBefore = tableRows('admin_login_log').length;
+	for (let i = 0; i < 3; i += 1) await loginFrom('Mock-Wrong-Pass-' + i, '203.0.113.30');
+	check('★ 输错不写登录记录', tableRows('admin_login_ips').length === ipsBefore && tableRows('admin_login_log').length === logsBefore && !tableRows('admin_login_ips').some((x) => x.ip === '203.0.113.30'));
+	sent.length = 0;
+	res = await loginFrom(PW, '203.0.113.30');
+	const ownerCookie = cookieOf(res, 'admin_session');
+	check('★ 输对 → 登录成功', res.status === 303 && !!ownerCookie, res.status);
+	check('★ 输对 → IP 记进「我的登录 IP」', tableRows('admin_login_ips').some((x) => x.ip === '203.0.113.30' && Number(x.count) === 1));
+	check('★ 输对 → 登录日志 +1', tableRows('admin_login_log').length === logsBefore + 1 && tableRows('admin_login_log').some((x) => x.ip === '203.0.113.30'));
+	check('★ 输对 → 私聊通知第一主人（含 IP）', sent.some((m) => m.chatId === OWNER && m.text.includes('203.0.113.30') && m.text.includes('登录')), JSON.stringify(sent));
+	check('★ 登录记录不含密码明文', !JSON.stringify(tableRows('admin_login_ips').concat(tableRows('admin_login_log'))).includes(PW));
+	await loginFrom(PW, '203.0.113.30');
+	check('★ 同 IP 再登录 → 次数累加，不重复建行', tableRows('admin_login_ips').filter((x) => x.ip === '203.0.113.30').length === 1 && tableRows('admin_login_ips').some((x) => x.ip === '203.0.113.30' && Number(x.count) === 2));
+
+	for (let i = 0; i < 10; i += 1) res = await loginFrom('Mock-Wrong-Pass-' + i, '203.0.113.30');
+	check('★ 登录成功过的 IP 错 10 次也不锁，但错了照样进不去', res.status === 401 && !res.headers.get('Set-Cookie'), res.status);
+	res = await loginFrom(PW, '203.0.113.30');
+	check('★ 随后输对照常进', res.status === 303, res.status);
+
+	for (let i = 0; i < 5; i += 1) res = await loginFrom('Mock-Wrong-Pass-' + i, '203.0.113.66');
+	check('★ 陌生 IP 错 5 次 → 锁定', res.status === 429, res.status);
+	res = await loginFrom(PW, '203.0.113.66');
+	check('★ 锁定期间该 IP 输对也不放行、不记录', res.status === 429 && !tableRows('admin_login_ips').some((x) => x.ip === '203.0.113.66'), res.status);
+	let r = await api('bootstrap', {}, { cookie: ownerCookie });
+	check('★ 别的 IP 被锁，不影响主人已登录的会话', r.status === 200 && r.json?.success === true, r.status);
+	res = await loginFrom(PW, '203.0.113.30');
+	check('★ 别的 IP 被锁，不影响主人从自己 IP 登录', res.status === 303, res.status);
+
+	res = await handler.fetch(new Request(BASE + '/admin', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': '203.0.113.31' },
+		body: new URLSearchParams({ password: PW }).toString(), redirect: 'manual' }), env, ctx);
+	check('★ 不带 Origin 的非浏览器请求：密码对照常登录（仍要密码）', res.status === 303, res.status);
+	res = await handler.fetch(new Request(BASE + '/admin', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: BASE },
+		body: new URLSearchParams({ password: PW }).toString(), redirect: 'manual' }), env, ctx);
+	check('★ 缺来源 IP 的登录不写进主人 IP', res.status === 303 && !tableRows('admin_login_ips').some((x) => x.ip === 'unknown' || x.ip === ''), res.status);
+	res = await loginFrom(PW, '203.0.113.32', { Origin: 'https://evil.example' });
+	check('★ 外站提交的登录 → 403、不发 cookie、不记录', res.status === 403 && !res.headers.get('Set-Cookie') && !tableRows('admin_login_ips').some((x) => x.ip === '203.0.113.32'), res.status);
+	res = await loginFrom(PW, '203.0.113.33', { Origin: 'null', 'Sec-Fetch-Site': 'cross-site' });
+	check('★ Sec-Fetch-Site=cross-site 的登录 → 403', res.status === 403 && !res.headers.get('Set-Cookie'), res.status);
+	res = await loginFrom(PW, '203.0.113.34', { Origin: 'null', 'Sec-Fetch-Site': 'same-origin' });
+	check('★ 本站页面提交（no-referrer 下 Origin 为 null）照常登录', res.status === 303, res.status);
+
+	for (let i = 0; i < 5; i += 1) await loginFrom('Mock-Wrong-Pass-' + i, '2001:db8:aa:1::' + (i + 1));
+	res = await loginFrom(PW, '2001:db8:aa:1:ffff::9');
+	check('★ IPv6 同一 /64 换地址照样算一处，错满 5 次一起锁', res.status === 429, res.status);
+	res = await loginFrom(PW, '2001:db8:aa:2::1');
+	check('★ 另一个 /64 不受影响', res.status === 303, res.status);
+
+	r = await api('web/logins', {}, { cookie: ownerCookie });
+	const d = r.json?.data || {};
+	check('★ 后台接口给出登录总次数、登录 IP、日志', r.json?.success === true && Number(d.total) === tableRows('admin_login_log').length && Array.isArray(d.ips) && d.ips.some((x) => x.ip === '203.0.113.30') && Array.isArray(d.logs) && d.logs.length > 0, JSON.stringify(r.json).slice(0, 400));
+	check('★ 后台接口不含密码', !JSON.stringify(r.json).includes(PW));
+	r = await api('web/loginip-del', { ip: '203.0.113.30' }, { cookie: ownerCookie });
+	check('★ 移除登录 IP', r.json?.success === true && !tableRows('admin_login_ips').some((x) => x.ip === '203.0.113.30'), JSON.stringify(r.json));
+	check('★ 移除 IP 不删登录日志（次数照算）', tableRows('admin_login_log').some((x) => x.ip === '203.0.113.30'));
+	for (let i = 0; i < 5; i += 1) res = await loginFrom('Mock-Wrong-Pass-' + i, '203.0.113.30');
+	check('★ 移除后该 IP 恢复锁定规则', res.status === 429, res.status);
+	r = await api('web/logins', {}, { cookie: '' });
+	check('★ 未登录读不到登录记录', r.status === 401, r.status);
+
+	const adminHtml = await (await get('/admin', ownerCookie)).text();
+	check('★ 后台页面有「登录记录」分区', adminHtml.includes('登录记录') && adminHtml.includes('data-tab="logins"'));
+	delete env.ADMIN_PASSWORD;
 }
 
 console.log('\n网页管理后台验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
