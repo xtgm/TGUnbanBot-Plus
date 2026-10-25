@@ -25607,10 +25607,16 @@ async function buildAdDigest(env, config) {
 			+ AD_LLM_NO_THINK;
 		const aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
 			messages: [{ role: 'user', content: prompt }],
-			// 【1000 → 4000，2026-10-18】同一个模型、同一种坑：thinking 先吃掉 max_tokens，
-			// 摘要正文还没开始写额度就没了 —— 表现是「空摘要」而不是报错（上一轮 400→1000
-			// 只解决了一半，离线实测 thinking 普遍 1500~2200 字，1000 照样会被截）。
-			max_tokens: 4000,
+			// 【4000 → 512，2026-10-25】4000 是 2026-10-18 为了容纳 thinking 抬上去的
+			//（旧注释说 thinking 普遍写 1500~2200 字）。prompt 末尾加了 AD_LLM_NO_THINK
+			// 之后那个前提就没了，4000 纯属悬空。
+			//
+			// 新值按【输出的结构上界】给，不按实测均值给：摘要正文被
+			// AD_DIGEST_MAX_CHARS(300) 字截断，加上 JSON 外壳 512 绰绰有余。
+			// 【为什么还留着这道上限】/no_think 万一在上游某次更新后失效，
+			// 输出会弹回 500+ token，这时候 max_tokens 就是最后一道成本闸 ——
+			// 删掉它等于把成本上界完全交给模型的心情。
+			max_tokens: 512,
 			temperature: 0.2
 		});
 		const raw = extractAdLLMResponseText(aiResult);
@@ -25701,20 +25707,30 @@ async function judgeAdByLLM(env, config, input, options) {
 				{ role: 'system', content: buildAdLLMSystemPrompt(await loadAdDigest(env)) },
 				{ role: 'user', content: payload }
 			],
-			// 【1000 而不是 200】qwen3-30b-a3b 是 Reasoning 模型（官方标注 Reasoning: Yes），
-			// 思考内容先于正文输出、并且【计入 max_tokens】—— 旧配置给 200，JSON 经常被切在
-			// 半截，第⑥层从上线到 2026-10-11 一次都没真正读到过模型的回答。
-			// 【600 → 1000】修好取值路径后实测仍有约 7% 解析失败（thinking 偶尔写得更长），
-			// 主人拍板买断这一类故障：1000 次调用 ≈ 22,000 Neurons，
-			// 超免费额度 12,000 ≈ $4/月，换来的是「解析失败」不再是随时会放大的坑。
-			// 真实输出只有 100~200 token（一条 JSON 判据），多给的是思考空间不是正文空间。
-			// 【1000 → 4000，2026-10-18】离线实测（30 条真广告 bio × 多轮）：
-			// qwen3-30b-a3b 的 thinking 平均写 1513~2206 字【中文】，1000 token 上限下
-			// 三成调用在思考阶段就把额度用光，正文一个字都没输出 → 解析失败。
-			// 曾经以为「1000 够了，真实输出只有 100~200 token」——那句注释只说对了正文，
-			// 漏算了它前面那一大段思考。4000 下实测解析 30/30、100% 可核验。
-			// 【代价只是上限】Neurons 按实际生成量计费，不按上限；上限抬高只是不再被截断。
-			max_tokens: 4000,
+			// 【沿革：200 → 600 → 1000 → 4000 → 1024】
+			//
+			// 前四次调整都在跟同一件事较劲：qwen3-30b-a3b 是 Reasoning 模型，
+			// 思考内容先于正文输出且【计入 max_tokens】—— 给 200 时 JSON 经常被切在半截，
+			// 第⑥层从上线到 2026-10-11 一次都没真正读到过模型的回答。
+			// 2026-10-18 抬到 4000 的依据是「离线实测 thinking 平均写 1513~2206 字」。
+			//
+			// 【2026-10-25 实测推翻了那个依据】REST API 直连跑 24 个样本：
+			// 一个 <think> 标签都没出现、输出均值只有 529 token。Cloudflare 这边的
+			// chat template 后来改过，当初那个数字已经不成立。而加了 AD_LLM_NO_THINK
+			// 之后输出均值进一步降到 44 token —— 4000 这个上限彻底悬空。
+			//
+			// 【新值按输出的结构上界给，不按实测均值给】
+			// 均值 44 不能当配额：/no_think 万一在上游更新后失效，输出会弹回 500+ token，
+			// 这时候 max_tokens 就是最后一道成本闸。所以按代码自己的结构上界算：
+			//   reason 一句话 + features 最多 AD_LLM_FEATURE_MAX(6) 条
+			//   × AD_LLM_FEATURE_MAX_LEN(120) 字符 ≈ 970 字符 → 1024 够装满配
+			// 这个数字是【从常量推出来的】，常量改大时 test_ad_llm.mjs [14] 会跟着红，
+			// 不会悄悄变成不够用（写死一个拍脑袋的数就没这个保护）。
+			//
+			// 【上限不是配额，别指望靠它省钱】Neurons 按实际生成量计费。
+			// 实测只压上限（4000 → 800）而不关思考：18.48 vs 18.91 Neurons/次，
+			// 几乎一分没省，还多了 1 个误封。真正省钱的是 /no_think，上限只管截断。
+			max_tokens: 1024,
 			temperature: 0.1
 		});
 		// Workers AI 对 chat 模型返回 OpenAI 兼容结构，正文在 choices[0].message.content，
