@@ -25496,10 +25496,79 @@ function normalizeAdLLMFeatureList(raw) {
 	return out;
 }
 
-// 同载荷内存去重：同一条文案在一个 Worker 实例内只判一次。
-// Cloudflare 实例短命、这个 Set 会随实例回收 —— 它只是尽力省额度的兜底，
-// 真正的硬闸是每日上限。刻意不落库：那会往热路径加 SQL，撞「稳定态核心 ≤3 条」的断言。
+// 同载荷去重：同一条文案只判一次。两级 —— 内存 Set 挡近距离重复、D1 挡跨实例重复。
+//
+// 【为什么内存一级不够】Cloudflare 的 Worker isolate 分钟级回收，Set 随之清空。
+// 同一条广告文案在新 isolate 里会被重新送审、重新付钱；一条刷屏的文案能把
+// 同一份钱付几十遍，而 /adstats 上只看得到「调用次数涨了」，看不出是重复的。
+//
+// 【旧注释拦的是一个不存在的约束】原先写「刻意不落库：那会往热路径加 SQL，
+// 撞『稳定态核心 ≤3 条』的断言」。2026-10-25 实测反驳：judgeAdByLLM 一次调用
+// 本来就发 19 条 SQL（额度读写 + 跨天清零 + 摘要读取）—— 它压根不在那条断言
+// 管的路径上，那条断言测的是【稳定态普通消息】，而普通消息走不到第⑥层
+//（要先过 suspectSignal）。加一条去重查询是 19 → 20，边际成本可以忽略。
+//
+// 【为什么复用 ad_scan_state 而不新建表】那张表已经是 key TEXT PRIMARY KEY 的
+// key-value 结构、已经建好、本函数已经在读写它 —— 新建表要多一次 sqlite_master
+// 探测，还得自己管剪枝。复用只需约定一个 key 前缀。
 const adLLMSeen = new Set();
+const AD_LLM_SEEN_PREFIX = 'llm_seen_';
+// 去重键保留期：12 小时。
+// 【为什么不更久】额度本身跨天就清零了，留着比一天更久的去重键没有意义 ——
+// 新的一天预算是新的，同一条文案值得再判一次（广告库、形态摘要都可能已经变了）。
+// 【为什么不更短】刷屏的广告文案往往持续几小时，太短等于没去重。
+const AD_LLM_SEEN_TTL_SECONDS = 12 * 3600;
+// 单次调用顺带剪掉的过期去重键条数。
+// 【为什么不一次清干净】DELETE 不带 LIMIT 会在键堆积时变成一次全表扫描，
+// 而这是判定热路径。每次顺手清一点，摊到调用次数上足够跟上生成速度。
+const AD_LLM_SEEN_PRUNE_BATCH = 20;
+
+// 测试入口：清掉内存那一级，用来模拟 isolate 回收。
+// 【为什么要暴露它】跨 isolate 去重只能这样测 —— 真去重新 vm 加载一遍 _worker.js
+// 要 2 秒以上，而且两个沙箱之间还得手动共享 D1。生产代码不会调它。
+function clearAdLLMSeenMemory() {
+	adLLMSeen.clear();
+}
+
+// 查 D1 里这条载荷今天判过没有。
+// 【失败时返回 false（= 没判过）而不是 true】读不到就当没判过，宁可多花一次钱，
+// 也不能因为一次 D1 抖动把整层静默关掉 —— 后者会让广告直接放行，代价大得多。
+async function hasAdLLMSeenInD1(env, key, nowSeconds) {
+	if (!env?.DB) return false;
+	try {
+		const row = await env.DB.prepare(
+			'SELECT updated_at FROM ad_scan_state WHERE key = ? LIMIT 1')
+			.bind(AD_LLM_SEEN_PREFIX + key).first();
+		if (!row) return false;
+		const at = Number(row.updated_at) || 0;
+		// 过期的当成没判过（剪枝是异步的，不能依赖它已经跑过）
+		return nowSeconds - at < AD_LLM_SEEN_TTL_SECONDS;
+	} catch (error) {
+		console.error('[广告检测·深度判定] 读去重键失败:', error);
+		return false;
+	}
+}
+
+// 记一条去重键，并顺手剪掉一批过期的。
+// 【两件事放一起】剪枝没有独立的触发时机（第⑥层没有自己的 cron），
+// 挂在写入点上最自然：有新键产生，就意味着有旧键该走了。
+async function markAdLLMSeenInD1(env, key, nowSeconds) {
+	if (!env?.DB) return;
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_scan_state (key, value, updated_at) VALUES (?, ?, ?) '
+			+ 'ON CONFLICT(key) DO UPDATE SET updated_at = excluded.updated_at')
+			.bind(AD_LLM_SEEN_PREFIX + key, '1', Number(nowSeconds) || 0).run();
+		await env.DB.prepare(
+			'DELETE FROM ad_scan_state WHERE key IN ('
+			+ 'SELECT key FROM ad_scan_state WHERE key LIKE ? AND updated_at < ? LIMIT ?)')
+			.bind(AD_LLM_SEEN_PREFIX + '%', Number(nowSeconds) - AD_LLM_SEEN_TTL_SECONDS,
+				AD_LLM_SEEN_PRUNE_BATCH).run();
+	} catch (error) {
+		// 写不进去只是失去跨实例去重，判定本身已经做完了 —— 不能因此报错。
+		console.error('[广告检测·深度判定] 写去重键失败:', error);
+	}
+}
 
 // 跑一次深度判定。返回 {ad, confidence, reason} 或 null（未跑 / 失败 / 额度用尽）。
 // 取某一个池的今日上限。config 里没有这个键时回落到代码默认值，【不是回落到 0】——
@@ -25701,6 +25770,13 @@ async function judgeAdByLLM(env, config, input, options) {
 	const key = adTextHash(payload);
 	if (adLLMSeen.has(key)) return null;
 	const nowSeconds = Math.floor(Date.now() / 1000);
+	// D1 那一级去重：挡的是 isolate 回收之后的重复送审。
+	// 【位置在额度闸之前】判过的载荷连额度都不该读 —— 它既不花 Neurons 也不该占配额。
+	if (await hasAdLLMSeenInD1(env, key, nowSeconds)) {
+		// 回写内存一级：这个 isolate 接下来遇到同一条就不用再查 D1 了。
+		adLLMSeen.add(key);
+		return null;
+	}
 	const quota = await readAdLLMQuota(env, nowSeconds);
 	// 两道闸：总池（所有轨共用的天花板）先挡，再挡本轨的分池。
 	// 顺序不能反 —— 总池打满时本池再有余量也不该继续烧，
@@ -25757,6 +25833,8 @@ async function judgeAdByLLM(env, config, input, options) {
 	// 无论判没判出来都记额度与去重键：解析失败同样花了 Neurons，
 	// 不记的话同一条解析不出来的载荷会被反复重试，把当天预算烧在同一个坑上。
 	adLLMSeen.add(key);
+	// 同时落到 D1：这个 isolate 被回收之后，别的实例也知道这条判过了。
+	await markAdLLMSeenInD1(env, key, nowSeconds);
 	await bumpAdLLMQuota(env, pool, nowSeconds);
 	if (!answer) {
 		// 解析不出来要能被看见 —— 理由见 bumpAdLLMParseFail。
