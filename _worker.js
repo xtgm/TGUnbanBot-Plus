@@ -19907,8 +19907,15 @@ const AD_LLM_MODEL = '@cf/qwen/qwen3-30b-a3b-fp8';
 // 【必须自带保底额度】的理由：不能等视觉识别用完再捡剩下的，
 // 那正是旧配置 200 次早早就空转的原因。
 //
-// 【三个池各管一轨】消息路径（闸一 + 闸二）是广告真正出现的地方，给 500 次保底；
-// 入群筛查 300 次；cron bio 扫描 100 次。
+// 【三个池各管一轨：保底 + 共享余量】消息路径（闸一 + 闸二）是广告真正出现的地方，
+// 给 500 次保底；入群筛查 300 次；cron bio 扫描 100 次。
+//
+// 【2026-10-25 从硬上限改成保底】旧口径把这三个数当硬上限、余量不共享，
+// 于是 cron 那一轨一天只跑一两轮、用不满 100 次，剩下的额度谁也用不上 ——
+// 烂在池子里；而 message 轨打满 500 就停判，哪怕总池还剩几百次没花。
+// 现在的口径是：本池保底之内无条件放行（别的轨再怎么烧也抢不走），
+// 超出保底则看公共余量（总额 − 其他池还没用掉的保底），总池打满才全停。
+// 判定逻辑见 canSpendAdLLMQuota；/adstats 的分母也随之改成「保底」语义。
 // 【cron 的 LLM 池给 100，但 AD_SCAN_DAILY_LIMIT 仍是 300，不降】——
 // 那一轨扫 300 个人是靠 getChat + 评分层抓「bio 改成广告的潜伏号」，这条能力
 // 与 LLM 无关：bio 命中业务词 + 交易动词的号，前三层就定罪了，根本走不到第四路。
@@ -25589,6 +25596,42 @@ function adLLMPoolLimit(config, pool) {
 	return Number.isFinite(parsed) ? parsed : fallback[pool];
 }
 
+// 这一次调用该不该放行。返回 true = 可以花钱。
+//
+// 【2026-10-25 从「硬上限」改成「保底 + 共享余量」】
+// 旧口径把池额当硬上限，三池静态切死（500 / 300 / 100），余量不共享。问题是
+// cron 那一轨一天只跑一两轮、用不满 100 次，剩下的额度【谁也用不上】——
+// 烂在池子里。而 message 轨真打满 500 之后就停判，哪怕总池还剩几百次没花。
+// 主人的要求是「额度花在该花的地方，不浪费也不超额」，静态切分做不到前半句。
+//
+// 【新口径三档】
+//   ① 本池用量 < 保底            → 放行。这是保底的意义：别的轨再怎么烧也抢不走。
+//   ② 本池超保底，但【公共余量】有 → 放行。公共余量 = 总额 − 其他池还没用掉的保底。
+//      减掉的是「还没用掉的」而不是「全部保底」—— 别人已经花过的部分不必再替他留。
+//   ③ 公共余量也没了            → 挡下。总闸是「不超额」的保证，一步都不让。
+//
+// 【为什么 0 仍然是关闭】池额 0 的既有语义是「关掉这一路」。如果让 0 池去借公共
+// 余量，那这一路就关不掉了 —— 开关失效比省不下额度严重得多，所以 0 单独早退。
+function canSpendAdLLMQuota(config, quota, pool, daily) {
+	const poolDaily = adLLMPoolLimit(config, pool);
+	// 0 = 这一路被关掉，公共余量也不得绕过
+	if (poolDaily <= 0) return false;
+	const poolUsed = Number(quota?.pools?.[pool]) || 0;
+	// ① 保底之内，无条件放行
+	if (poolUsed < poolDaily) return true;
+	// ② 算公共余量：总额减去【其他池还没用掉的保底】
+	let reservedByOthers = 0;
+	for (const other of AD_LLM_POOLS) {
+		if (other === pool) continue;
+		const otherDaily = adLLMPoolLimit(config, other);
+		if (otherDaily <= 0) continue;
+		const otherUsed = Number(quota?.pools?.[other]) || 0;
+		reservedByOthers += Math.max(0, otherDaily - otherUsed);
+	}
+	const used = Number(quota?.used) || 0;
+	return used < Number(daily) - reservedByOthers;
+}
+
 // 记第⑥层的【解析失败】次数。
 //
 // 【为什么必须单独记】parseAdLLMAnswer 抠不出 JSON 就返回 null（宁可漏判也不能靠猜定罪），
@@ -25778,15 +25821,15 @@ async function judgeAdByLLM(env, config, input, options) {
 		return null;
 	}
 	const quota = await readAdLLMQuota(env, nowSeconds);
-	// 两道闸：总池（所有轨共用的天花板）先挡，再挡本轨的分池。
-	// 顺序不能反 —— 总池打满时本池再有余量也不该继续烧，
-	// 那等于用本轨的额度把视觉识别与其他轨一起拖下水。
 	// 熔断优先于一切额度判断 —— 链路已经坏掉的时候，再花一次钱去验证它坏没坏，
 	// 是纯粹的浪费（这正是 2026-10-11 那轮：276 次调用全部取错字段，一次次白烧）。
 	if (quota.broken) return null;
+	// 总池是所有轨共用的天花板，也是「不超额」的保证 —— 它先挡，一步都不让。
 	if (quota.used >= daily) return null;
-	const poolUsed = Number(quota.pools?.[pool]) || 0;
-	if (poolUsed >= poolDaily) return null;
+	// 再问本轨能不能花：保底之内无条件放行，超出保底则看公共余量。
+	// 【2026-10-25 从硬上限改成保底】旧实现是 `poolUsed >= poolDaily → return null`，
+	// 池额切死、余量不共享，cron 轨用不完的额度谁也用不上。详见 canSpendAdLLMQuota。
+	if (!canSpendAdLLMQuota(config, quota, pool, daily)) return null;
 	let answer = null;
 	let rawText = '';
 	let aiResult = null;
@@ -32246,9 +32289,15 @@ async function handleAdStatsCommand(env, chatId) {
 		// 分池：哪条轨吃了多少额度。旧配置三条轨共用一个 200 次的池，而入群与 cron 两条轨
 		// 没有触发门槛、送进去的 message 恒为空 —— 额度全被普通新用户吃光，
 		// 消息路径（广告真正出现的地方）一次都轮不到。摆出来才看得见分得对不对。
-		'　↳ 分池　消息 <b>' + Number(llmStat.pools?.message || 0) + '</b>/' + config.llmDailyMessage
-			+ '　入群 <b>' + Number(llmStat.pools?.join || 0) + '</b>/' + config.llmDailyJoin
-			+ '　定时扫描 <b>' + Number(llmStat.pools?.cron || 0) + '</b>/' + config.llmDailyCron,
+		//
+		// 【2026-10-25 分母的语义变了】池额从「上限」改成「保底」，所以用量【可以】
+		// 超过分母 —— 超出的部分吃的是公共余量。写成 `3/1` 不是出错，恰恰说明
+		// 余量被回收利用了（旧实现下这一轨会卡死在 1）。
+		// 分母后面加「保」字是为了让这件事在面板上自解释，不用翻代码才看得懂。
+		'　↳ 分池（分母为保底，可借用总池余量）',
+		'　　消息 <b>' + Number(llmStat.pools?.message || 0) + '</b>/' + config.llmDailyMessage + ' 保'
+			+ '　入群 <b>' + Number(llmStat.pools?.join || 0) + '</b>/' + config.llmDailyJoin + ' 保'
+			+ '　定时扫描 <b>' + Number(llmStat.pools?.cron || 0) + '</b>/' + config.llmDailyCron + ' 保',
 		// 熔断状态：连着 AD_LLM_FAIL_BREAK 次取不到模型回答，第⑥层当天自动停。
 		// 这一行回答的是「第⑥层到底还活着吗」—— 2026-10-11 那轮它一直在空转烧钱，
 		// 看板上却只显示「调用 276 次、命中 0 次」，怎么看都像模型保守，
