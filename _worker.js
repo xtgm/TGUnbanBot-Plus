@@ -27557,7 +27557,18 @@ async function drainAdAvatarLearningQueue(env, limit = 30) {
 // 全部 clean，ad 概率 0.037~0.099 —— 0.9369 vs 0.0985 的区分度，阈值 0.5 即可干净分离。
 // 另外它 output_tokens = 0（不收输出费），而 llama 那边每次白烧 512~800 个复读 token。
 const AD_AVATAR_VISION_MODEL = '@cf/cloudflare/clef-flash';
-const AD_AVATAR_VISION_DAILY = 50;
+// 【2026-11 提额：50 → 150，按 clef-flash 的官方实价重算（第三批）】
+// 原来的 50 是按 moondream 的「单张 35~50 Neurons」估的 —— 那是用 $/M token
+// 反推 $11/M Neurons 得来的未验证值，官方从未公布过。
+// clef-flash 官方定价页实数：3,455 Neurons / M input tokens，且 output 不计费。
+// 按官方图片 token 公式（每边取整到 32 的倍数 → tokens = (w/32) × (h/32) + 3 个 marker，
+// 每图封顶 1,024）算 Telegram 最大档 1280×1280 = 964 token，没撞封顶，
+// 即【单张 3.503 Neurons】—— 比旧估值低一个数量级，旧上限因此保守了约 10 倍。
+//   150 张 × 3.503 = 526 Neurons，占免费版每日 10,000 的 5%。
+// 【为什么头像仍然远低于正文图】量级不同：头像是「一个人一张、一辈子换不了几次」，
+// 队列按 file_unique_id 主键去重、判过永久零成本，150 张/天足够覆盖新成员涌入；
+// 正文图是「一个群一天几百张」，两者预算独立，见 AD_IMAGE_VISION_DAILY。
+const AD_AVATAR_VISION_DAILY = 150;
 const AD_AVATAR_VISION_PROMPT = '这是一张社交软件的用户头像图片。判断它是否属于广告用途：'
 	+ '图里若有引流文字（赚钱、代理、代购、招租、微信号、二维码、"看主页/看简介"）、'
 	+ '明显商品推销、联系方式、赌博或灰产图案，即为广告。自拍、风景、宠物、家人、'
@@ -27578,10 +27589,23 @@ const AD_AVATAR_VISION_PROMPT = '这是一张社交软件的用户头像图片�
 // 可用性风险不复存在。默认值仍保留上限，是为了让账单不随群活跃度无界增长 ——
 // 这个上限管的是钱，不是可用性。要关掉整条 L2，设 AD_IMAGE_VISION_DAILY=0。
 //
-// 单张 Neurons 消耗官方仍未公布；按 moondream 的 $0.30/M input、$1.00/M output
-// 与 $11/M Neurons 反推，单张约 35~50 Neurons —— 这是【估算值】，不是官方数。
-// 300 张/天 ≈ 1.5 万 Neurons，仅占免费额度的 1.5 倍量级，超出部分按单价计费。
-const AD_IMAGE_VISION_DAILY = 300;
+// 【2026-11 提额：300 → 800，单价换成官方实数（第三批）】
+// 旧注释按 moondream 的 $/M token 反推出「单张 35~50 Neurons」并据此说
+// 「300 张 ≈ 1.5 万 Neurons、是免费额度的 1.5 倍」—— 那个估值高了一个数量级，
+// 而且模型早在 2026-10-13 就换成了 clef-flash。官方定价页实数是
+// 3,455 Neurons / M input tokens 且 output 不计费（clef 是决策模型，不产出 token）。
+// 按官方图片 token 公式（每边取整到 32 的倍数 → tokens = (w/32) × (h/32) + 3 个 marker，
+// 每图封顶 1,024）算 Telegram 最大档 1280×1280 = 964 token，没撞封顶，
+// 即【单张 3.503 Neurons】。于是：
+//   旧 300 张 × 3.503 =  1,051 Neurons → 免费额度的 11%
+//   新 800 张 × 3.503 =  2,802 Neurons → 免费额度的 28%
+//
+// 【为什么保守是功能损失而不是省钱】视觉轨是四轨里性价比最高的一轨：
+// 判过的图按 file_unique_id 主键永久记账，第二次零成本，还跨用户跨群复用，
+// 所以 800 这个数只会被「当天新出现的图」消耗。300 张打满意味着
+// 当天第 301 张之后的新图一张都不判 —— 该花的钱没花，广告图直接漏过去，
+// 这才是真浪费。按实价算，提到 800 之后这一轨仍只占免费额度 28%。
+const AD_IMAGE_VISION_DAILY = 800;
 
 // ===== 视觉识别失败熔断（2026-10-11，与第⑥层的 AD_LLM_FAIL_BREAK 同一套机制）=====
 //
