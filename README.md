@@ -226,6 +226,7 @@
 | `BLACKLIST_REASON_LABELS` | 见源码 | 原因字段中文映射（JSON） |
 | `GKY_BANLIST_ENDPOINT` | `https://gkybot.gmeow.cc/banlist` | GKY 封禁查询后端（新后端 HTML 须与 `parseBanlistHTML` 正则兼容） |
 | `FLASH_MESSAGE_TTL_MS` | `5000` | 群内闪屏存活毫秒数（0~60000） |
+| `ADMIN_PASSWORD` | 空 | 网页后台 `域名/admin` 的正式密码（≥ 8 位，类型选「密钥」）。设了就用它登录、`/adminpass` 停用；空或太短则照旧私聊 `/adminpass` 领一次性密码。同 IP 错 5 次锁 15 分钟；改密码即踢掉旧登录 |
 | `MSG_CACHE_SIZE` | `50` | 清扫回看上限（1-500），`/spam` 按它回看当前群近期消息 |
 | `AD_SCORE_THRESHOLD` | `7` | 广告**封禁**阈值（1-100） |
 | `AD_JOIN_SCORE_THRESHOLD` | `0` | **入群专用**封禁线，`0` = 沿用消息线（行为与加它之前一致）。实际取值与消息线取 `max`，配低了也松不过消息线；**结构 / 指纹 / AI 强证据不受它约束** |
@@ -328,7 +329,7 @@ wrangler secret put GROUP_ID     # -1001234567890（可逗号分隔多群）
 
 `OWNER_IDS` —— 主人 + 副主人 TGID，**第一个是主人**；不填则不发任何私聊通知。
 
-**可选** —— 解封文案 `SELF_UNBAN_KEYWORD` `START_WELCOME` `SELF_UNBAN_PROMPT` `SELF_UNBAN_APPROVED` `_NOLINK` `SELF_UNBAN_CONTACT_GROUP`；群与权限 `SUPER_ADMIN_IDS` `KILLER_MODE_GROUPS` `KILLER_ADMIN_IDS` `STAT_SEARCH_GROUPS` `PROFILE_LOOKUP_GROUPS` `STATIC_USER_PROFILES`；其它 `BLACKLIST_PAGE_LIMIT` `GKY_BANLIST_ENDPOINT` `FLASH_MESSAGE_TTL_MS` `MSG_CACHE_SIZE` `STATS_TZ_OFFSET`；广告阈值 `AD_*`（含 `AD_JOIN_SCORE_THRESHOLD`）**建议一个都不填**，理由见 [阈值调优与运维](#阈值调优与运维)。默认值见源码顶部 `=可修改=` 区段。
+**可选** —— 解封文案 `SELF_UNBAN_KEYWORD` `START_WELCOME` `SELF_UNBAN_PROMPT` `SELF_UNBAN_APPROVED` `_NOLINK` `SELF_UNBAN_CONTACT_GROUP`；群与权限 `SUPER_ADMIN_IDS` `KILLER_MODE_GROUPS` `KILLER_ADMIN_IDS` `STAT_SEARCH_GROUPS` `PROFILE_LOOKUP_GROUPS` `STATIC_USER_PROFILES`；其它 `ADMIN_PASSWORD` `BLACKLIST_PAGE_LIMIT` `GKY_BANLIST_ENDPOINT` `FLASH_MESSAGE_TTL_MS` `MSG_CACHE_SIZE` `STATS_TZ_OFFSET`；广告阈值 `AD_*`（含 `AD_JOIN_SCORE_THRESHOLD`）**建议一个都不填**，理由见 [阈值调优与运维](#阈值调优与运维)。默认值见源码顶部 `=可修改=` 区段。
 `
 
 #### 6.3 老部署升级需要做什么

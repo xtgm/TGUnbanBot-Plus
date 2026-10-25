@@ -5,6 +5,7 @@
 //   · Telegram 菜单（setMyCommands）只保留 ban / spam / check / unban / stats 五条；
 //     其余命令只是不显示，处理代码照旧，照样能直接发送使用
 //   · 后台只给第一主人：私聊 /adminpass 领一次性密码 → 域名/admin 登录 → 会话 cookie
+//     （同日改 A 方案：Dashboard 设了 ADMIN_PASSWORD 就用正式密码，/adminpass 只作备用，见第 10 节）
 //   · 导出密码与后台密码互不通用（导出给可信用户，后台等同第一主人权限）
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -254,6 +255,74 @@ log('\n=== 9. 菜单只留五条 + /help 指向后台 ===');
 	check('菜单里没有的 /listgroups 照样能用', out.some((m) => m.text.includes(G)), JSON.stringify(out));
 	out = await say(OWNER, 'private', '/admins', OWNER);
 	check('菜单里没有的 /admins 照样能用', out.length > 0 && !out.some((m) => m.text.includes('权限不足')), JSON.stringify(out));
+}
+
+log('\n=== 10. 正式密码 ADMIN_PASSWORD（A 方案：设了用正式密码，没设退回 /adminpass）===');
+// 【2026-10-25 主人定】后台密码改成环境变量 ADMIN_PASSWORD（Dashboard 设，可自定义），地址仍是 域名/admin。
+// /adminpass 保留作备用：没设（或设得太短 < 8 位）时照旧领一次性密码；设了就停用。
+// 防爆破：同一 IP 15 分钟内错 5 次 → 锁 15 分钟，锁定期间密码对了也不放行。改密码 → 旧会话全部失效。
+{
+	const loginIp = (password, ip) => handler.fetch(new Request(BASE + '/admin', {
+		method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: BASE, 'CF-Connecting-IP': ip },
+		body: new URLSearchParams({ password }).toString(), redirect: 'manual'
+	}), env, ctx);
+	// 把沙箱里的 Date.now 拨快 sec 秒（0 = 拨回真实时间），用来验证 15 分钟解锁。
+	const shiftClock = (sec) => vm.runInContext('(() => { const r = Date.__realNow || Date.now; Date.__realNow = r; const off = ' + sec + ' * 1000; Date.now = () => r() + off; })()', W);
+	const PW1 = 'Mock-Admin-Pass-0001';
+	const PW2 = 'Mock-Admin-Pass-0002';
+	const oldOneTime = pwdOf(await say(OWNER, 'private', '/adminpass', OWNER));
+	env.ADMIN_PASSWORD = PW1;
+	let html = await (await get('/admin')).text();
+	check('★ 设了正式密码 → 登录页提示用正式密码、不再提 /adminpass', html.includes('ADMIN_PASSWORD') && !html.includes('/adminpass'), html.slice(0, 600));
+	const before = tableRows('admin_passwords').length;
+	let out = await say(OWNER, 'private', '/adminpass', OWNER);
+	check('★ 设了正式密码 → /adminpass 停用、不生成密码', !pwdOf(out) && out.some((m) => m.text.includes('ADMIN_PASSWORD')) && tableRows('admin_passwords').length === before, JSON.stringify(out));
+	let res = await loginIp(oldOneTime, '198.51.100.1');
+	check('★ 设了正式密码 → 旧的一次性密码登不进', !!oldOneTime && res.status === 401 && !res.headers.get('Set-Cookie'), res.status);
+	res = await loginIp('Mock-Wrong-Pass-9999', '198.51.100.1');
+	check('★ 正式密码错 → 401 不发 cookie', res.status === 401 && !res.headers.get('Set-Cookie'), res.status);
+	res = await loginIp(PW1, '198.51.100.2');
+	const pwCookie = cookieOf(res, 'admin_session');
+	check('★ 正式密码对 → 303 + 会话 cookie', res.status === 303 && !!pwCookie, res.status);
+	let r = await api('bootstrap', {}, { cookie: pwCookie });
+	check('★ 正式密码会话能用后台接口', r.status === 200 && r.json?.success === true, r.status);
+	res = await loginIp(PW1, '198.51.100.2');
+	check('★ 正式密码可反复登录（不是一次性）', res.status === 303 && !!cookieOf(res, 'admin_session'), res.status);
+	check('★ D1 里不存正式密码明文', !JSON.stringify(tableRows('admin_sessions')).includes(PW1) && !JSON.stringify(tableRows('admin_login_failures')).includes(PW1));
+
+	for (let i = 0; i < 5; i += 1) await loginIp('Mock-Wrong-Pass-' + i, '198.51.100.7');
+	res = await loginIp(PW1, '198.51.100.7');
+	const lockedHtml = await res.text();
+	check('★ 同 IP 错 5 次 → 锁定，密码对了也不放行', res.status === 429 && !res.headers.get('Set-Cookie') && lockedHtml.includes('分钟'), res.status);
+	res = await loginIp(PW1, '198.51.100.8');
+	check('★ 锁定只针对那个 IP，别的 IP 照常登录', res.status === 303, res.status);
+	shiftClock(901);
+	res = await loginIp(PW1, '198.51.100.7');
+	check('★ 15 分钟后解锁', res.status === 303, res.status);
+	shiftClock(0);
+	for (let i = 0; i < 4; i += 1) await loginIp('Mock-Wrong-Pass-' + i, '198.51.100.9');
+	res = await loginIp(PW1, '198.51.100.9');
+	check('★ 错 4 次不锁，密码对了照常进，并清零计数', res.status === 303 && !tableRows('admin_login_failures').some((x) => x.ip === '198.51.100.9'), res.status);
+
+	env.ADMIN_PASSWORD = PW2;
+	r = await api('bootstrap', {}, { cookie: pwCookie });
+	check('★ Dashboard 改了密码 → 旧会话立即失效', r.status === 401, r.status);
+	res = await loginIp(PW1, '198.51.100.3');
+	check('★ 改密码后旧密码登不进', res.status === 401, res.status);
+	res = await loginIp(PW2, '198.51.100.3');
+	check('★ 新密码登得进', res.status === 303, res.status);
+
+	env.ADMIN_PASSWORD = 'short';
+	res = await loginIp('short', '198.51.100.4');
+	const shortHtml = await res.text();
+	check('★ 密码少于 8 位 → 拒绝登录并提示去改', res.status === 401 && shortHtml.includes('8 位'), res.status + ' ' + shortHtml.slice(-300));
+	out = await say(OWNER, 'private', '/adminpass', OWNER);
+	check('★ 密码太短时 /adminpass 照旧可用（不把主人锁在门外）', !!pwdOf(out), JSON.stringify(out));
+	delete env.ADMIN_PASSWORD;
+	out = await say(OWNER, 'private', '/adminpass', OWNER);
+	const fallbackPwd = pwdOf(out);
+	res = await loginIp(fallbackPwd, '198.51.100.5');
+	check('★ 没设变量 → /adminpass 一次性密码照旧能登录', !!fallbackPwd && res.status === 303, res.status);
 }
 
 console.log('\n网页管理后台验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
