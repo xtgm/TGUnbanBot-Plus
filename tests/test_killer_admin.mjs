@@ -280,6 +280,7 @@ check('★ 杀手群 /rm 认 external_reply（指向本群）', callsOf('deleteM
 reset();
 await send(groupMsg(K, KA, '/rm', { external_reply: { origin: { type: 'user', date: 1 }, chat: { id: Number(G), type: 'supergroup' }, message_id: 4322 } }));
 check('★ 杀手群 /rm 的 external_reply 指向别的群 → 不删', !callsOf('deleteMessage').some((c) => Number(c.body?.message_id) === 4322));
+check('★ 杀手群 /rm 没认出目标 → 私聊第一主人（含收到的字段）', /没认出回复的是哪条消息/.test(textTo(OWNER)) && /收到的字段/.test(textTo(OWNER)) && /external_reply/.test(textTo(OWNER)), textTo(OWNER).slice(0, 300));
 
 log('\n=== 15. 批量任务：杀手身份的大批量走独立黑名单、只踢杀手群 ===');
 reset();

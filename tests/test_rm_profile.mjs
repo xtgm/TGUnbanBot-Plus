@@ -352,6 +352,10 @@ console.log('\n=== /rm 认 external_reply ===');
 	await rm(OWNER, '/rm', { message_id: 103 });
 	const tip = sent.find((s) => s.text.includes('请<b>回复</b>'));
 	check('★ 两个字段都没有 → 提示里列出收到的字段', Boolean(tip) && tip.text.includes('收到的字段') && tip.text.includes('message_id'), tip && tip.text);
+	const dm = sent.find((s) => s.chatId === String(OWNER) && s.text.includes('没认出回复的是哪条消息'));
+	check('★ 没认出目标 → 私聊第一主人（含群号与收到的字段）', Boolean(dm) && dm.text.includes(GROUP) && dm.text.includes('收到的字段') && dm.text.includes('message_id'),
+		JSON.stringify(sent.map((s) => s.chatId + ' | ' + s.text.slice(0, 80))));
+	check('★ 没认出目标 → 不调删除（只撤回命令本身）', deleted.length === 1 && deleted[0] === GROUP + ':103', deleted.join(' '));
 }
 
 console.log('\n/rm + profile 验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');

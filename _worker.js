@@ -12141,6 +12141,7 @@ async function handleKillerRm(message, env, ctx) {
 	const target = resolveRmTarget(message);
 	if (!target) {
 		await sendFlashMessage(chatId, rmNoTargetText(message), ctx);
+		await notifyPrimaryOwnerOfKillerAction(message, rmNoTargetDetail(message, '🗑 <b>群内消息删除</b>（杀手权限）'));
 		return true;
 	}
 	const del = await deleteMessage(chatId, target.messageId);
@@ -17283,10 +17284,30 @@ function resolveRmTarget(message) {
 	return null;
 }
 
-// 认不出目标时的提示：附上这条更新实际带了哪些字段，下次再失败一眼看出 Telegram 推的是什么。
+// 认不出目标时附上这条更新实际带了哪些字段，下次再失败一眼看出 Telegram 推的是什么。
+// 双下划线开头的是本项目挂在 message 上的内部标记，不是 Telegram 字段，剔掉。
+function rmReceivedFields(message) {
+	const keys = Object.keys(message || {}).filter((k) => k !== 'text' && k !== 'entities' && !k.startsWith('__'));
+	return '收到的字段：<code>' + escapeHtml(keys.join(', ') || '无') + '</code>';
+}
 function rmNoTargetText(message) {
-	const keys = Object.keys(message || {}).filter((k) => k !== 'text' && k !== 'entities');
-	return '❌ 请<b>回复</b>要删除的那条消息，再发 /rm\n收到的字段：<code>' + escapeHtml(keys.join(', ') || '无') + '</code>';
+	return '❌ 请<b>回复</b>要删除的那条消息，再发 /rm\n' + rmReceivedFields(message);
+}
+// 认不出目标时私聊第一主人的明细（与成功 / 失败两种回执同一套「群内消息删除」格式）。
+function rmNoTargetDetail(message, title) {
+	const chat = message?.chat;
+	const groupLabel = chat?.title
+		? escapeHtml(String(chat.title)) + '（<code>' + escapeHtml(String(chat.id)) + '</code>）'
+		: '<code>' + escapeHtml(String(chat?.id ?? '未知')) + '</code>';
+	return [
+		title,
+		'',
+		'群　　' + groupLabel,
+		'操作人　' + formatUserReference(getMessageActorId(message), message?.from),
+		'',
+		'结果　　❌ 没认出回复的是哪条消息，未删除',
+		rmReceivedFields(message),
+	].join('\n');
 }
 
 async function handleRmCommand(message, env, ctx) {
@@ -17307,7 +17328,17 @@ async function handleRmCommand(message, env, ctx) {
 
 	const target = resolveRmTarget(message);
 	if (!target) {
-		await sendFlashMessage(chatId, rmNoTargetText(message), ctx);
+		// 第一主人本人操作：群内照旧闪屏 5 秒，同时私聊明细（含收到的字段）便于定位。
+		// 其他人发的 /rm 本来就用不了，维持只闪屏，不往主人私聊里塞噪音。
+		if (isPrimaryOwner(userId)) {
+			await replyToAdmin(message, ctx, {
+				flashText: rmNoTargetText(message),
+				detailText: rmNoTargetDetail(message, '🗑 <b>群内消息删除</b>'),
+				isInGroup: true,
+			});
+		} else {
+			await sendFlashMessage(chatId, rmNoTargetText(message), ctx);
+		}
 		return;
 	}
 
