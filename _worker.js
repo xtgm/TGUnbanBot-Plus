@@ -264,7 +264,9 @@ let KILLER_MODE_GROUPS = [];
 // 独立模式群 ID 列表（D1 group_mode 表，/groupmode 切换）。全局黑名单在这些群不生效（第一主人封的除外），
 // 由群主自治、写本群黑名单 group_blacklist。每请求由 loadIndependentGroups 从 D1 重新加载。
 let INDEPENDENT_GROUP_IDS = [];
-// 有本群黑名单（group_blacklist）记录的群。超管「拉入本群黑名单」在全局群也可能写入，拦截链路据此决定要不要多查一条。
+// 有本群黑名单（group_blacklist）记录的群。拦截链路据此决定要不要多查一条。
+// 【为什么全局群也可能有】超管的范围选择按钮（已于 2026-10-25 取消）曾能在全局群
+// 写本群名单，那些历史记录还在表里、还要继续生效 —— 所以这个集合不能假定只含独立群。
 let LOCAL_BLACKLIST_CHAT_IDS = [];
 // 杀手权限 TGID 列表（环境变量 KILLER_ADMIN_IDS），见顶部 10.6b。
 let KILLER_ADMIN_IDS = [];
@@ -6811,7 +6813,7 @@ async function performBulkJobD1Mutation(job, env, ids) {
 			continue;
 		}
 		if (job.local === true) {
-			// 本群黑名单任务（独立群的群主 / 管理员 / 副主人，或超管选「拉入本群黑名单」）：
+			// 本群黑名单任务（独立群的群主 / 管理员 / 副主人 / 超管）：
 			// 只写 group_blacklist、只处置 groupIds（就是那一个群）、不学习特征。
 			lastResults = job.action === 'unban'
 				? await checkLocalUnbanEligibility(env, job.sourceChatId, ids, job.createdBy)
@@ -11624,7 +11626,7 @@ async function enforceLocalAdDetection(env, input, evaluation, options, ctx) {
 
 // 拦截判定（发言 / 复入群 / 原生解封封回共用），输入是 checkBlacklist 的结果，返回同形状：
 //   独立群：全局记录只认第一主人封的；其余看本群黑名单。
-//   全局群：全局记录照旧；没命中且该群有本群黑名单记录（超管「拉入本群黑名单」）才多查一条主键。
+//   全局群：全局记录照旧；没命中且该群有本群黑名单记录（见 LOCAL_BLACKLIST_CHAT_IDS）才多查一条主键。
 // 没有独立群、也没有任何本群黑名单记录时原样返回，热路径零额外 SQL。
 async function resolveChatBlacklistCheck(env, chatId, userId, globalCheck) {
 	const independent = isIndependentGroup(chatId);
@@ -11642,12 +11644,10 @@ async function resolveChatBlacklistCheck(env, chatId, userId, globalCheck) {
 
 const PRIVATE_MODERATION_REDIRECT_TEXT = 'ℹ️ <b>请在你的群里发这条命令</b>\n\n私聊的封禁与解封只限主人、副主人和超管；群管理员请到自己管理的群里发。';
 const INDEPENDENT_LOCAL_NOTICE = 'ℹ️ 独立群只封本群，要全局封禁请私聊机器人。';
-const GROUP_SCOPE_BUTTON_PREFIX = 'gmsa:';
 
 // /ban /sban /spam /unban 的分流（鉴权通过之后调用）。返回：
 //   { kind: 'global', groupIds }        → 原有全局流程，只是作用范围按身份收窄
 //   { kind: 'local', groupIds, notice } → 写本群黑名单、只踢本群、不学习
-//   { kind: 'super_choice', allowGlobal } → 超管在群里：弹按钮让他选范围
 //   { kind: 'reject', text }            → 拒绝（私聊收回 / 独立群缺权限）
 // 口径：第一主人在哪都是全局（含独立群）；全局 /unban 一律不碰独立群。
 function resolveModerationRoute(message, operatorId, cmd) {
@@ -11668,9 +11668,15 @@ function resolveModerationRoute(message, operatorId, cmd) {
 			: { kind: 'global', groupIds: globalScope(operatorId) };
 	}
 	if (isSuperAdmin(operatorId)) {
-		// 杀手群不在独立模式范围内（永远不会是独立群），超管在那里照旧直接执行，不弹按钮。
-		if (!isUnban && !isKillerModeGroup(chatId)) return { kind: 'super_choice', allowGlobal: !independent };
-		return independent ? { kind: 'local', groupIds: [chatId] } : { kind: 'global', groupIds: globalScope(operatorId) };
+		// 【2026-10-25 取消范围选择】原先超管在群里发 /ban /spam 会先弹「① 本群 / ② 全域」
+		// 按钮，60 秒内不点就作废 —— 作废的后果不是「封禁失败」而是【从未执行】：
+		// D1 名单没写、人没踢、消息没删、一条日志都没有。线上真实漏过：超管发了命令忘了点，
+		// 而按钮带排他性（只有发令人能点），旁人连接管都做不到。
+		// 现在按群模式自动定范围，与副主人在同一个群里完全一致 —— 封禁的本意是「这个人要封」，
+		// 范围由群模式决定就够了，不值得为了选范围留一个会漏广告的确认闸。
+		return independent
+			? { kind: 'local', groupIds: [chatId], notice: INDEPENDENT_LOCAL_NOTICE }
+			: { kind: 'global', groupIds: globalScope(operatorId) };
 	}
 	if (!independent) return { kind: 'global', groupIds: globalScope(operatorId) };
 	if (isAnonymousAdminMessage(message)) {
@@ -11691,8 +11697,10 @@ function markModerationScope(message, route) {
 	message.__moderationScopeLocal = route.kind === 'local';
 }
 
-// 本群黑名单（local）与超管选「全域」（global）共用的执行器：
+// 本群黑名单（local）的执行器：
 // 写名单 → 只在 groupIds 里踢出并撤回历史发言 → 单目标时清扫当前群缓存消息。一律不学习。
+// 【现在只有 local 走这里】global 分支曾由超管的范围选择按钮用过（2026-10-25 已取消），
+// 保留 local/global 两种形参是因为批量任务 performBulkJobD1Mutation 共用同一套 job 形状。
 async function executeScopedModeration(message, env, ctx, opts) {
 	const { action, ids, invalid = [], note = '', local, groupIds, replyTarget = null, requestUrl = '', notice = '' } = opts;
 	const chatId = String(message.chat.id);
@@ -11749,88 +11757,10 @@ async function executeScopedModeration(message, env, ctx, opts) {
 	});
 }
 
-// 超管在群里发 /ban /spam：先弹范围按钮（60 秒、仅发令人、一次性），点了才执行。
-async function offerSuperAdminScopeChoice(message, env, ctx, opts) {
-	const { action, ids, invalid = [], note = '', allowGlobal, replyTarget = null } = opts;
-	const chatId = String(message.chat.id);
-	const operatorId = getMessageActorId(message);
-	const token = await issueAdConfirmToken(env, 'gmsa', operatorId, {
-		c: chatId, a: action, i: ids, x: invalid, n: String(note || '').slice(0, 200), m: replyTarget?.messageId || null
-	});
-	if (!token) {
-		await sendFlashMessage(chatId, '❌ 签发确认按钮失败，请稍后重试。', ctx);
-		return;
-	}
-	const row = [{ text: '① 拉入本群黑名单并踢出', callback_data: GROUP_SCOPE_BUTTON_PREFIX + 'L:' + token }];
-	if (allowGlobal) row.push({ text: '② 拉入全域黑名单并踢出', callback_data: GROUP_SCOPE_BUTTON_PREFIX + 'G:' + token });
-	const lines = [
-		`🛡️ <b>超管 /${escapeHtml(action)}：请选择封禁范围</b>`,
-		'🎯 目标:' + ids.map((id) => formatBatchUserCompactTarget(id)).join('、'),
-		'两个选项都会踢出并撤回其历史发言。',
-		`⏱ ${AD_CONFIRM_TOKEN_TTL_SECONDS} 秒内有效，只有发令人能点，点一次即失效。`
-	];
-	if (!allowGlobal) lines.push(INDEPENDENT_LOCAL_NOTICE);
-	await sendTelegramMessage(chatId, lines.join('\n'), { inline_keyboard: [row] });
-}
-
-async function handleGroupScopeButtonCallback(callbackQuery, env, ctx) {
-	const data = String(callbackQuery?.data || '');
-	const match = data.slice(GROUP_SCOPE_BUTTON_PREFIX.length).match(/^([LG]):([0-9a-f]+)$/);
-	if (!match) {
-		await answerAdVoteCallback(callbackQuery?.id);
-		return;
-	}
-	const choice = match[1];
-	const token = match[2];
-	const fromId = String(callbackQuery?.from?.id || '');
-	const chat = callbackQuery?.message?.chat;
-	const buttonMessageId = Number(callbackQuery?.message?.message_id) || 0;
-	if (!env?.DB || !(await adDetectionReady(env))) {
-		await answerAdVoteCallback(callbackQuery?.id, '存储未就绪，请稍后重试', true);
-		return;
-	}
-	// 先只读核对发令人：consumeAdConfirmToken 读到就删，别人误点不能把发令人的按钮烧掉。
-	const owner = await env.DB.prepare('SELECT user_id FROM ad_confirm_tokens WHERE token = ?').bind(token).first();
-	if (owner && String(owner.user_id) !== fromId) {
-		await answerAdVoteCallback(callbackQuery?.id, '只有发令人能点这个按钮', true);
-		return;
-	}
-	const consumed = await consumeAdConfirmToken(env, token, 'gmsa', fromId);
-	if (!consumed) {
-		await answerAdVoteCallback(callbackQuery?.id, '按钮已失效（超时或已使用），请重新发命令', true);
-		if (chat?.id && buttonMessageId) await editTelegramMessage(chat.id, buttonMessageId, '⌛ 该封禁选择已失效，请重新发命令。');
-		return;
-	}
-	const p = consumed.payload || {};
-	const chatId = String(p.c || '');
-	const ids = normalizeBatchMutationIds(p.i);
-	if (!chatId || chatId !== String(chat?.id ?? '') || !isConfiguredGroup(chatId) || !ids.length || !isSuperAdmin(fromId)) {
-		await answerAdVoteCallback(callbackQuery?.id, '按钮数据无效', true);
-		return;
-	}
-	// 点击时再判一次：发令后群若被切成独立，「全域」就不能再给。
-	if (choice === 'G' && isIndependentGroup(chatId)) {
-		await answerAdVoteCallback(callbackQuery?.id, INDEPENDENT_LOCAL_NOTICE.replace(/^ℹ️\s*/, ''), true);
-		return;
-	}
-	const local = choice === 'L';
-	await answerAdVoteCallback(callbackQuery?.id, local ? '已选择：本群黑名单' : '已选择：全域黑名单');
-	if (buttonMessageId) {
-		await editTelegramMessage(chatId, buttonMessageId, `🛡️ 已选择：${local ? '① 拉入本群黑名单并踢出' : '② 拉入全域黑名单并踢出'}，执行中…`);
-	}
-	// 队列与回执都要一条「消息」：用按钮所在的群 + 点按钮的人拼一条，身份与发命令时一致。
-	const pseudoMessage = { chat, from: callbackQuery.from, message_id: null, __moderationGroupMode: 'brief' };
-	await executeScopedModeration(pseudoMessage, env, ctx, {
-		action: p.a === 'spam' ? 'spam' : 'ban',
-		ids,
-		invalid: Array.isArray(p.x) ? p.x.map(String) : [],
-		note: String(p.n || ''),
-		local,
-		groupIds: local ? [chatId] : globalScopeGroupIds(fromId),
-		replyTarget: p.m ? { messageId: Number(p.m) || null, text: '' } : null
-	});
-	if (buttonMessageId) await deleteMessage(chatId, buttonMessageId);
-}
+// 【2026-10-25 已删】offerSuperAdminScopeChoice / handleGroupScopeButtonCallback
+// 原先给超管弹「① 本群 / ② 全域」范围按钮，连同 'gmsa:' 前缀与 ad_confirm_tokens 的
+// gmsa 令牌一起移除。理由见 resolveModerationRoute 里超管那一支：不点就等于从未执行。
+// ad_confirm_tokens 这张表本身还在用（/spam 的广告二次确认），不要跟着删。
 
 function parseGroupModeArg(token) {
 	const t = String(token || '').trim().toLowerCase();
@@ -12107,10 +12037,6 @@ async function dispatchNonGlobalModerationRoute(route, message, env, ctx, opts) 
 	if (route.kind === 'reject') {
 		if (message.chat.type === 'private') await sendTelegramMessage(message.chat.id, route.text);
 		else await sendFlashMessage(message.chat.id, route.text, ctx);
-		return true;
-	}
-	if (route.kind === 'super_choice') {
-		await offerSuperAdminScopeChoice(message, env, ctx, { ...opts, allowGlobal: route.allowGlobal });
 		return true;
 	}
 	if (route.kind === 'local') {
@@ -15519,10 +15445,6 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 		await handleAdFixButtonCallback(callbackQuery, env);
 		return;
 	}
-	if (data.startsWith(GROUP_SCOPE_BUTTON_PREFIX)) {
-		await handleGroupScopeButtonCallback(callbackQuery, env, ctx);
-		return;
-	}
 	if (data.startsWith(DRYRUN_BUTTON_PREFIX)) {
 		await handleDryRunButtonCallback(callbackQuery, env);
 		return;
@@ -16025,7 +15947,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		//（目标渲染成可点击昵称 + 可复制 TGID）；完整逐群明细仍私聊第一主人与副主人。
 		// 撤回命令消息、指纹/样本学习、同款连带等原有行为一律不变。
 		message.__moderationGroupMode = 'brief';
-		// 独立模式分流：私聊收回 / 独立群走本群黑名单（/spam 等同 /ban）/ 超管弹范围按钮。
+		// 独立模式分流：私聊收回 / 独立群走本群黑名单（/spam 等同 /ban）/ 其余走全局。
 		const spamRoute = resolveModerationRoute(message, operatorId, 'spam');
 		if (spamRoute.kind === 'reject') {
 			await dispatchNonGlobalModerationRoute(spamRoute, message, env, ctx, {});
@@ -17204,7 +17126,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 退化部署会自动回退成群内发完整结果，避免操作完全零反馈。
 		// 撤回命令消息、副主人通知等原有行为一律不变。
 		message.__moderationGroupMode = isSban ? 'silent' : 'brief';
-		// 独立模式分流：私聊收回 / 独立群走本群黑名单（/ban 在独立群也是踢出）/ 超管弹范围按钮。
+		// 独立模式分流：私聊收回 / 独立群走本群黑名单（/ban 在独立群也是踢出）/ 其余走全局。
 		const banRoute = resolveModerationRoute(message, operatorId, isSban ? 'sban' : 'ban');
 		if (banRoute.kind === 'reject') {
 			await dispatchNonGlobalModerationRoute(banRoute, message, env, ctx, {});
