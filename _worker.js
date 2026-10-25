@@ -17284,6 +17284,75 @@ function resolveRmTarget(message) {
 	return null;
 }
 
+// 私聊 /rm 的消息链接。两种格式：
+//   t.me/c/2443712513/354245   私有群 / 无用户名的群：数字前补 -100 就是群 ID
+//   t.me/ssoadmin/354245       公开群：用户名要 getChat 换成群 ID
+// 话题链接中间多一段话题 ID（t.me/c/群/话题/消息），一律取最后一段作消息 ID；?single 等参数忽略。
+const RM_LINK_RE = /(?:https?:\/\/)?(?:t|telegram)\.me\/(?:c\/(\d+)|([A-Za-z][A-Za-z0-9_]{3,31}))\/(?:\d+\/)?(\d+)/i;
+const RM_LINK_USAGE = '❌ <b>用法</b>\n\n· 群里：回复要删除的那条消息，再发送 <code>/rm</code>\n'
+	+ '· 私聊：<code>/rm 消息链接</code>，例如 <code>/rm https://t.me/c/2443712513/354245</code> 或 <code>/rm https://t.me/群用户名/354245</code>\n'
+	+ '（消息上右键「复制消息链接」即可，私聊删除群里不留任何痕迹）';
+
+function parseRmLink(text) {
+	const m = RM_LINK_RE.exec(String(text || ''));
+	if (!m) return null;
+	return m[1] ? { chatId: '-100' + m[1], username: '', messageId: Number(m[3]) } : { chatId: '', username: m[2], messageId: Number(m[3]) };
+}
+
+// 公开群用户名 → 群 ID。查不到返回 ''。
+async function resolvePublicChatId(username) {
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: '@' + username })
+		});
+		const result = await response.json();
+		return response.ok && result?.ok && result.result?.id ? String(result.result.id) : '';
+	} catch (_) {
+		return '';
+	}
+}
+
+async function handleRmLinkCommand(message, chatId, userId) {
+	if (!isPrimaryOwner(userId)) {
+		await sendTelegramMessage(chatId, '❌ /rm 仅限第一主人使用');
+		return;
+	}
+	const arg = String(message.text || '').replace(/^\/rm(?:@[^\s]+)?\s*/i, '');
+	const link = parseRmLink(arg);
+	if (!link || !link.messageId) {
+		await sendTelegramMessage(chatId, RM_LINK_USAGE);
+		return;
+	}
+	let groupId = link.chatId;
+	if (!groupId) {
+		groupId = await resolvePublicChatId(link.username);
+		if (!groupId) {
+			await sendTelegramMessage(chatId, '❌ 找不到群 <code>@' + escapeHtml(link.username) + '</code>，请检查链接，或改用 <code>t.me/c/…</code> 格式的链接。');
+			return;
+		}
+	}
+	// 只删治理范围内的群：不替别的群当刀，也挡住链接写错删到别处。
+	if (!isConfiguredGroup(groupId)) {
+		await sendTelegramMessage(chatId, '❌ 群 <code>' + escapeHtml(groupId) + '</code> 不在治理范围内，未删除。');
+		return;
+	}
+	const del = await deleteMessage(groupId, link.messageId);
+	const info = await resolveGroupInfoCached(groupId);
+	const groupLabel = info?.title
+		? escapeHtml(String(info.title)) + '（<code>' + escapeHtml(groupId) + '</code>）'
+		: '<code>' + escapeHtml(groupId) + '</code>';
+	await sendTelegramMessage(chatId, [
+		'🗑 <b>群内消息删除</b>（私聊链接）',
+		'',
+		'群　　' + groupLabel,
+		'目标 ID　<code>' + escapeHtml(String(link.messageId)) + '</code>',
+		'',
+		'结果　　' + (del?.ok ? '✅ 已删除' : '❌ 删除失败 —— ' + escapeHtml(toChineseErrorText(del?.error || '未知错误'))),
+	].join('\n'));
+}
+
 // 认不出目标时附上这条更新实际带了哪些字段，下次再失败一眼看出 Telegram 推的是什么。
 // 双下划线开头的是本项目挂在 message 上的内部标记，不是 Telegram 字段，剔掉。
 function rmReceivedFields(message) {
@@ -17315,10 +17384,9 @@ async function handleRmCommand(message, env, ctx) {
 	const chatId = chat?.id;
 	const userId = getMessageActorId(message);
 
-	// 私聊没有「群里的目标消息」，明确告知而不是静默 —— /rm 已在命令菜单明面上，
-	// 静默会让人以为命令坏了。
+	// 私聊：/rm 消息链接（仅第一主人）。群里不留任何痕迹，结果只回私聊。
 	if (chat?.type === 'private') {
-		await sendTelegramMessage(chatId, '❌ <b>请在群里使用 /rm</b>\n\n回复要删除的那条消息，再发送 <code>/rm</code>。');
+		await handleRmLinkCommand(message, chatId, userId);
 		return;
 	}
 	if (!isConfiguredGroup(String(chatId))) return;   // 非配置群：不响应、不动

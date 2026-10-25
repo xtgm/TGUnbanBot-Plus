@@ -12,6 +12,7 @@ const sent = [];
 const deleted = [];
 let adminLists = {};      // 群ID → 成员数组（可按群返回不同权限）
 let memberStatus = 'member';   // getChatMember 返回的状态，测试里切换以验证 6 种身份映射
+const chatByUsername = { fakepublicgrp: '-100111', fakeoutsidegrp: '-100999' };   // 公开群用户名 → 群 ID（假值）
 
 const sandbox = {
 	console: { log(){}, warn(){}, error(){} },
@@ -37,6 +38,10 @@ const sandbox = {
 		} else if (m === 'getChatAdministrators') {
 			const list = adminLists[String(b?.chat_id)] || [];
 			payload = { ok: true, result: list };
+		} else if (m === 'getChat' && String(b?.chat_id || '').startsWith('@')) {
+			// 公开群用户名 → 群 ID（/rm 链接用）；表里没有的按 Telegram 原样报 chat not found
+			const hit = chatByUsername[String(b.chat_id).slice(1).toLowerCase()];
+			payload = hit ? { ok: true, result: { id: Number(hit), type: 'supergroup', title: '公开群', username: String(b.chat_id).slice(1) } } : { ok: false, description: 'Bad Request: chat not found' };
 		} else if (m === 'getChat') {
 			payload = { ok: true, result: { id: Number(b?.chat_id) || 1, first_name: '测试用户', username: 'tester', bio: '这是简介', type: 'supergroup' } };
 		} else if (m === 'getChatMember') {
@@ -159,7 +164,8 @@ console.log('\n=== 2. /rm 参数与场景 ===');
 
 	reset();
 	await drive({ message: { chat: { id: Number(OWNER), type: 'private' }, from: { id: Number(OWNER), is_bot: false }, text: '/rm', message_id: 101 } });
-	check('私聊 /rm → 提示请在群里使用', sent.some((s) => s.text.includes('在群里使用')), JSON.stringify(sent.map((s) => s.text)));
+	// 改口径：私聊 /rm 现在支持消息链接；裸 /rm 回用法（群里回复 + 私聊链接两种）。
+	check('私聊裸 /rm → 提示两种用法', sent.some((s) => s.text.includes('群里：回复') && s.text.includes('私聊：')), JSON.stringify(sent.map((s) => s.text)));
 
 	reset();
 	await rm(OWNER, '/rm@TestBot', { reply_to_message: { message_id: 601, from: { id: 99994, is_bot: false } } });
@@ -356,6 +362,55 @@ console.log('\n=== /rm 认 external_reply ===');
 	check('★ 没认出目标 → 私聊第一主人（含群号与收到的字段）', Boolean(dm) && dm.text.includes(GROUP) && dm.text.includes('收到的字段') && dm.text.includes('message_id'),
 		JSON.stringify(sent.map((s) => s.chatId + ' | ' + s.text.slice(0, 80))));
 	check('★ 没认出目标 → 不调删除（只撤回命令本身）', deleted.length === 1 && deleted[0] === GROUP + ':103', deleted.join(' '));
+}
+
+// 私聊 /rm 消息链接：群里不留任何痕迹，结果只回私聊。
+console.log('\n=== 私聊 /rm 消息链接 ===');
+{
+	failDeletes = false;
+	const dm = (from, text) => drive({ message: { chat: { id: Number(from), type: 'private' }, from: { id: Number(from), is_bot: false }, text, message_id: 300 } });
+	const groupSends = () => sent.filter((s) => s.chatId.startsWith('-'));
+
+	reset();
+	await dm(OWNER, '/rm https://t.me/c/111/354245');
+	check('★ t.me/c/ 私有链接 → 删 -100111:354245', deleted.includes('-100111:354245'), deleted.join(' '));
+	check('★ 结果私聊回第一主人（含消息 ID 与已删除）', sent.some((s) => s.chatId === OWNER && s.text.includes('354245') && s.text.includes('已删除')), JSON.stringify(sent.map((s) => s.chatId + ' | ' + s.text.slice(0, 120))));
+	check('★ 群里一条消息都没发', groupSends().length === 0, JSON.stringify(groupSends()));
+
+	reset();
+	await dm(OWNER, '/rm https://t.me/FakePublicGrp/354246?single');
+	check('★ 公开群用户名链接（带 ?single）→ getChat 解析后删除', deleted.includes('-100111:354246'), deleted.join(' '));
+
+	reset();
+	await dm(OWNER, '/rm t.me/c/111/77/354247');
+	check('★ 话题链接（中间多一段）→ 取最后一段作消息 ID', deleted.includes('-100111:354247'), deleted.join(' '));
+
+	reset();
+	await dm(OWNER, '/rm https://t.me/FakeOutsideGrp/354248');
+	check('★ 公开群不在治理范围 → 不删', deleted.length === 0, deleted.join(' '));
+	check('★ 不在治理范围 → 私聊说明', sent.some((s) => s.chatId === OWNER && s.text.includes('不在治理范围')), JSON.stringify(sent.map((s) => s.text.slice(0, 80))));
+
+	reset();
+	await dm(OWNER, '/rm https://t.me/c/999/354249');
+	check('★ 私有链接群不在治理范围 → 不删', deleted.length === 0, deleted.join(' '));
+
+	reset();
+	await dm(OWNER, '/rm https://t.me/NoSuchGrp/354250');
+	check('★ 用户名查不到 → 不删并私聊说明', deleted.length === 0 && sent.some((s) => s.chatId === OWNER && s.text.includes('找不到')), JSON.stringify(sent.map((s) => s.text.slice(0, 80))));
+
+	reset();
+	await dm(OWNER, '/rm 随便写的');
+	check('★ 链接写错 → 提示用法（含 t.me 示例）', deleted.length === 0 && sent.some((s) => s.chatId === OWNER && s.text.includes('t.me/')), JSON.stringify(sent.map((s) => s.text.slice(0, 80))));
+
+	reset();
+	failDeletes = true;
+	await dm(OWNER, '/rm https://t.me/c/111/354251');
+	check('★ 删除失败 → 私聊带中文原因', sent.some((s) => s.chatId === OWNER && s.text.includes('删除失败')), JSON.stringify(sent.map((s) => s.text.slice(0, 120))));
+	failDeletes = false;
+
+	reset();
+	await dm(DEPUTY, '/rm https://t.me/c/111/354252');
+	check('★ 副主人私聊发链接 → 不删、提示仅限第一主人', deleted.length === 0 && sent.some((s) => s.chatId === DEPUTY && s.text.includes('仅限第一主人')), JSON.stringify(sent.map((s) => s.text.slice(0, 80))));
 }
 
 console.log('\n/rm + profile 验证：通过 ' + pass + ' 项，失败 ' + fail + ' 项');
