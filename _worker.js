@@ -11160,29 +11160,48 @@ function formatGroupModeLabel(chatId) {
 // 完整用法只在私聊发（群里不刷长文）。showModeOf 只在第一主人 / 该群群主时传群 ID ——
 // 用法谁都能看，某个群的当前模式不给外人看。正文刻意不出现「当前模式」字样，那四个字只属于状态行。
 function buildGroupModeGuideText(showModeOf) {
+	// 排版（主人：弄整齐一点）：比例字体不做列对齐，整齐靠结构 —— 命令独占一行，
+	// 说明另起一行用「└ 」，权限单列一行，长解释集中到末尾「注意事项」；每行 ≤ 30 字，手机不折行。
+	const cmd = (code, ...desc) => [`<code>${code}</code>`, ...desc.map((d) => '└ ' + d)];
 	const lines = ['📖 <b>独立群 · 全部功能与用法</b>'];
-	if (showModeOf) lines.push(`群 <code>${escapeHtml(showModeOf)}</code> 当前模式：${formatGroupModeLabel(showModeOf)}`);
+	if (showModeOf) {
+		lines.push(`📍 群 <code>${escapeHtml(showModeOf)}</code>`,
+			`└ 当前模式：${isIndependentGroup(showModeOf) ? '独立模式' : '全局模式（默认）'}`);
+	}
 	lines.push(
 		'',
-		'<b>一、切换模式</b>（第一主人 / 该群群主）',
-		'<code>/groupmode</code> 群里发：看本群模式 + 本说明入口',
-		'<code>/groupmode 独立</code> 切到独立模式（也可写 independent）',
-		'<code>/groupmode 全局</code> 切回全局模式（也可写 global）',
-		'私聊发：<code>/groupmode 群ID 独立|全局</code>',
-		'· 独立 = 群主自治：全局黑名单在本群不生效（第一主人封杀的除外），本群有自己的黑名单与设置。',
-		'· 切到独立后，已经被封的人不会自动解封；全局 /unban 不再作用于本群。',
-		'· 切回全局：恢复全局黑名单与全局封禁；本群黑名单记录保留，但只在独立模式下拦截。',
-		'· 杀手群不能切成独立模式。',
+		'<b>一、切换模式</b>',
+		'权限：第一主人 / 该群群主',
+		...cmd('/groupmode', '群里发：看本群模式 + 说明入口'),
+		...cmd('/groupmode 独立', '切到独立模式（同 independent）'),
+		...cmd('/groupmode 全局', '切回全局模式（同 global）'),
+		...cmd('/groupmode 群ID 独立|全局', '私聊发：切换指定的群'),
 		'',
-		'<b>二、本群黑名单</b>（独立群里发；需要 Telegram「封禁用户」管理员权限）',
-		'<code>/ban 用户ID [原因]</code> 写本群黑名单并踢出本群（也可回复对方消息发 /ban）',
-		'<code>/spam</code> 回复广告：删消息并写本群黑名单',
-		'<code>/sban 用户ID</code> 同 /ban，并撤回其历史发言（第一主人 / 副主人 / 群主）',
-		'<code>/unban 用户ID</code> 解除本群黑名单记录并在本群解封',
-		'<code>/localbans</code> 查看本群黑名单（最近 50 条）',
+		'<b>二、本群黑名单</b>（独立群里发）',
+		'权限：有「封禁用户」权限的管理员',
+		...cmd('/ban 用户ID [原因]', '写本群黑名单并踢出本群', '也可回复对方消息直接发'),
+		...cmd('/spam', '回复广告：删消息 + 写本群黑名单'),
+		...cmd('/sban 用户ID', '同 /ban，并撤回其历史发言', '限第一主人 / 副主人 / 群主'),
+		...cmd('/unban 用户ID', '解除本群记录并在本群解封'),
+		...cmd('/localbans', '查看本群黑名单（最近 50 条）'),
 		'',
-		'<b>三、本群设置</b>（只限独立群；第一主人、群主或有「修改群组信息」权限的管理员；不支持匿名管理员）',
-		LOCALSET_USAGE.replace(/^用法：\n/, '')
+		'<b>三、本群设置</b>（只限独立群）',
+		'权限：第一主人 / 群主',
+		'或有「修改群组信息」权限的管理员',
+		'不支持匿名管理员',
+		...cmd('/localset', '查看本群设置'),
+		...cmd('/localset 检测 开|关', '本群广告自动检测'),
+		...cmd('/localset 演练 开|关', '演练：只记录不处置'),
+		...cmd('/localset 处置 踢出|禁言', '自动检测命中后的处置方式'),
+		...cmd('/localset 白名单 加|删 TGID,TGID', '本群白名单，只免本群自动检测'),
+		'',
+		'<b>注意事项</b>',
+		'· 独立 = 群主自治，本群自有黑名单与设置',
+		'· 全局黑名单在本群不生效（第一主人封的除外）',
+		'· 切到独立后，已封的人不会自动解封',
+		'· 全局 /unban 不再作用于本群',
+		'· 切回全局：本群黑名单保留，只在独立时拦截',
+		'· 杀手群不能切成独立模式'
 	);
 	return lines.join('\n');
 }

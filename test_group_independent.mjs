@@ -194,6 +194,16 @@ check('★ 群主点深链 → 私聊收到独立群全部用法（/localset 五
 	['/localset</code>', '/localset 检测 开|关', '/localset 演练 开|关', '/localset 处置 踢出|禁言', '/localset 白名单 加|删'].every((k) => guideC.includes(k)), guideC);
 check('★ 用法含切换、/localbans、本群 /ban /unban', ['/groupmode 独立', '/groupmode 全局', '/localbans', '/ban', '/unban'].every((k) => guideC.includes(k)), guideC);
 check('★ 群主看到该群当前模式', guideC.includes('当前模式') && guideC.includes(G2), guideC);
+// 【2026-10-25 主人：弄整齐一点】整齐靠结构不靠空格：命令独占一行、说明另起一行以「└ 」开头，
+// 任何一行（去标签后）不超过 30 字，手机上不折行。
+const guideLines = guideC.split('\n').map((l) => l.replace(/<[^>]+>/g, ''));
+const longLines = guideLines.filter((l) => [...l].length > 30);
+check('★ 用法页每行 ≤ 30 字（不折行）', longLines.length === 0, JSON.stringify(longLines));
+const codeLines = guideC.split('\n').filter((l) => /^<code>\//.test(l));
+const badCode = codeLines.filter((l) => !/^<code>[^<]+<\/code>$/.test(l));
+check('★ 命令行只放命令本身，说明另起一行', codeLines.length === 14 && badCode.length === 0, codeLines.length + ' ' + JSON.stringify(badCode));
+const descAfter = guideC.split('\n').every((l, i, arr) => !/^<code>\//.test(l) || /^└ /.test(arr[i + 1] || ''));
+check('★ 每条命令下一行都是「└ 」说明', descAfter);
 reset();
 await send(ADMIN_N, '/start groupmode_' + G2, 'private');
 const guideN = sent.filter((s) => s.chatId === ADMIN_N).map((s) => s.text).join('\n');
