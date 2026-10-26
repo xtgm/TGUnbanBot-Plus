@@ -19630,6 +19630,11 @@ const DEFAULT_AD_OBSERVATION_HOURS = 24;
 //
 // 想要更严的误伤保护时配 AD_JOIN_SCORE_THRESHOLD=9 即可，机制已经就位。
 const DEFAULT_AD_JOIN_SCORE_THRESHOLD = 0;
+// observe 提醒的去重窗口（小时）。同一人在这段时间里多次转入观察只推一条私聊。
+// 【为什么是 6 而不是 24】取观察窗口（AD_OBSERVATION_HOURS，默认 24）的 1/4：
+// 一个人一天最多打扰 4 次，而「隔了几小时又进观察」确实是值得再看一眼的新一轮判定。
+// 想更安静配大、想一条不落配 1，走环境变量 AD_OBSERVE_NOTIFY_HOURS。
+const AD_OBSERVE_NOTIFY_HOURS_DEFAULT = 6;
 const DEFAULT_AD_AI_SIMILARITY_THRESHOLD = 0.78;
 const DEFAULT_AD_FINGERPRINT_MIN_CONFIDENCE = 0.6;
 
@@ -20668,6 +20673,14 @@ async function ensureAdDetectionTables(env) {
 
 			await runD1SchemaStatement(env, 'ad_user_screening', 'CREATE TABLE IF NOT EXISTS ad_user_screening (user_id TEXT PRIMARY KEY, chat_id TEXT, score INTEGER NOT NULL DEFAULT 0, reasons TEXT, snapshot TEXT, layer TEXT, joined_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_user_screening_expires', 'CREATE INDEX IF NOT EXISTS idx_ad_user_screening_expires ON ad_user_screening (expires_at)', { optional: true });
+			// 【observe 提醒的去重列，2026-11】主人口径：「通知是不能漏目前的所有判定的」，
+			// 于是 observe 的 8 类来源全部要推私聊。但 ad_user_screening 是 user_id 主键 upsert、
+			// 窗口 24 小时 —— 一个人连发消息会每条都转一次 observe，不去重私聊就跟着刷屏。
+			// 【为什么把列挂在这张表上】提醒的去重粒度正是「这个人这一轮观察」，与本表同生命周期：
+			// 记录被 prune 删掉 = 这一轮结束 = 下次进观察本就该重新提醒。另建一张表要多一次 D1 往返。
+			// 【为什么不复用 updated_at】那一列每次 upsert 都被刷新，拿它当去重基准等于永不去重。
+			await runD1SchemaStatement(env, 'ad_user_screening.notified_at',
+				'ALTER TABLE ad_user_screening ADD COLUMN notified_at INTEGER NOT NULL DEFAULT 0', { optional: true });
 
 			await runD1SchemaStatement(env, 'ad_sample_embeddings', 'CREATE TABLE IF NOT EXISTS ad_sample_embeddings (id INTEGER PRIMARY KEY AUTOINCREMENT, text_hash TEXT NOT NULL UNIQUE, sample_text TEXT NOT NULL, embedding TEXT, dimension INTEGER, source TEXT, created_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_sample_pending', 'CREATE INDEX IF NOT EXISTS idx_ad_sample_pending ON ad_sample_embeddings (dimension)', { optional: true });
@@ -25475,34 +25488,54 @@ function applyAvatarVerdict(evaluation, avatar) {
 // 「这人头像和广告头像同款」这条信号埋掉了。主人原话：
 // 「负分的命中头像进观察加个额外提醒，这样我就可以手动判断是否漏广告」。
 //
-// 【只在头像命中时触发】其他原因进观察的不打扰 —— 提醒的正是「头像命中了、
-// 但证据不够封」这个矛盾状态，只有它需要人拍板。
-async function notifyAvatarHitObserve(evaluation, userId, chatId) {
+// ===== 2026-11 放宽：observe 的全部来源都要提醒，一条判定都不漏 =====
+//
+// 【主人口径】「通知是不能漏目前的所有判定的。我之所以说怕会漏广告，是因为有些通知
+// 需要手动选择判定。」—— 怕的不是功能漏判，而是漏【提醒】：需要他拍板的那一类判定
+// 如果不推私聊，他就无从得知有东西等着他判。
+//
+// 【旧实现漏了什么】这里原本第三行就是
+//   if (!reasons.some((r) => String(r).includes('头像命中广告图库'))) return;
+// 于是 observe 的 8 类来源里只有【头像】那一类推私聊，另外 7 类静默进观察窗口：
+//   ① 评分到观察线（score ≥ 5 < 7）        ② 结构命中但 structureKill ≠ ban
+//   ③ 观察窗口历史分把 pass 抬成 observe   ④ 第⑥层判不成（10 种 skip 原因）
+//   ⑤ 第⑥层置信度是代码补的（输出被截断） ⑥ 第⑥层命中已知反例
+//   ⑦ 第⑥层证据不够（引文核对未过）       ⑧ 第⑥层低置信（0.6 ~ 0.85）
+// ④ 最该推 —— 它写进 reasons 的原话是「本条消息【没有任何模型结论】，不是『判为正常』」，
+// 这正是「需要人手动判断」的定义，却只进了日志。
+//
+// 【去重】ad_user_screening 是 user_id 主键 upsert、窗口 24 小时，一个人连发消息
+// 会每条都转一次 observe。全推会让广告号刷屏时私聊同步刷屏，所以同一人在
+// AD_OBSERVE_NOTIFY_HOURS（默认 6）小时内只推一条；窗口过了算新一轮判定，重新推。
+// 去重粒度是「人」不是「来源」：同一人换个来源进观察仍属同一轮，不重复打扰。
+async function notifyAdObserveNotice(env, evaluation, userId, chatId) {
 	try {
 		if (!evaluation || evaluation.verdict !== 'observe') return;
 		const reasons = Array.isArray(evaluation.reasons) ? evaluation.reasons : [];
-		if (!reasons.some((r) => String(r).includes('头像命中广告图库'))) return;
 		const ownerId = getOwnerNotifyTargets()[0] || '';
 		if (!ownerId) return;
+		// 去重闸排在渲染之前：被合并掉的那些连文案都不用拼。
+		if (!(await claimAdObserveNotice(env, userId))) return;
 		const snap = (evaluation.snapshot && typeof evaluation.snapshot === 'object') ? evaluation.snapshot : {};
+		const origin = classifyAdObserveOrigin(reasons);
 		const lines = [
-			'👀 <b>头像命中广告图库，但未到封禁线 → 已转入观察</b>',
+			'👀 <b>' + origin.title + '</b>',
 			'',
 			'用户：<code>' + escapeHtml(String(userId)) + '</code>'
 				+ (snap.name ? '　' + escapeHtml(String(snap.name).slice(0, 40)) : '')
 				+ (snap.username ? '　<code>' + escapeHtml(String(snap.username)) + '</code>' : ''),
-			'得分：<b>' + Number(evaluation.score || 0) + '</b>（有正分佐证才会封，本次没有）',
+			'得分：<b>' + Number(evaluation.score || 0) + '</b>' + origin.scoreNote,
 			'正文：' + (snap.text ? '<code>' + escapeHtml(String(snap.text).slice(0, 150)) + '</code>' : '（空）'),
 			(chatId ? '群：<code>' + escapeHtml(String(chatId)) + '</code>' : ''),
 			'',
 			'⚖️ 判据：',
 			...reasons.map((r) => '　· ' + escapeHtml(String(r))),
 			'',
-			'⚠️ 头像疑似广告素材、但本次没有正分佐证，所以没封。',
+			origin.why,
 			'　判断直接点下面的按钮 —— 【不要用引用回复发 /spam】：',
 			'　私聊里能引用的只有机器人自己的消息，那样会把机器人当成目标封掉（2026-10-14 真实事故）。',
 			'　　🔒 确认封 = 全群封禁 + 拉黑 + 学指纹',
-			'　　❌ 不该封 = 这张头像转干净，以后谁用都不再触发，本次观察记录一并清除',
+			'　　❌ 不该封 = ' + origin.noAction,
 			'　观察窗口里的号还可以 /rescreen 重新筛查',
 		];
 		// 按钮而不是「你去手动发 /spam」：主人 2026-10-14 照着提示里的「引用其消息发 /spam」
@@ -25515,20 +25548,151 @@ async function notifyAvatarHitObserve(evaluation, userId, chatId) {
 		// （不该封）直接编进 callback_data，与观察记录的生命周期解耦：通知留多久按钮就能用多久。
 		// callback_data 上限 64 字节；这里只有 ASCII 数字/字母/下划线，length 即字节数。
 		// avatarId 放进去超限时就不带，回退查观察记录（记录还在时照样能用）。
+		//
+		// 【2026-11：avatarId 只在头像来源时带】其他来源的 snapshot 里也可能有 avatarId
+		// （它是资料卡的常规字段），但那张头像【本次并没有被判成广告素材】。带上去会让
+		// 「不该封」顺手把一张从没判过的头像写成 clean —— 那是人工 clean 的安全阀，
+		// 一旦写进去自动学习再也学不回 ad（见 learnAdAvatarOnBan 的安全阀）。
 		const btnUid = String(userId);
 		const btnChat = String(chatId || '');
-		const btnAvatar = String(snap.avatarId || '');
+		const btnAvatar = origin.isAvatarHit ? String(snap.avatarId || '') : '';
 		const okData = ADFIX_BUTTON_PREFIX + 'ok:' + btnUid + (btnChat ? ':' + btnChat : '');
 		let noData = ADFIX_BUTTON_PREFIX + 'no:' + btnUid + (btnChat ? ':' + btnChat : '');
 		if (btnAvatar && (noData + ':' + btnAvatar).length <= 64) noData += ':' + btnAvatar;
 		await sendTelegramMessageChunks(ownerId, lines.filter(Boolean).join('\n'), {
 			inline_keyboard: [[
 				{ text: '🔒 确认封（全群封禁+拉黑）', callback_data: okData },
-				{ text: '❌ 不该封（头像转干净）', callback_data: noData }
+				{ text: origin.isAvatarHit ? '❌ 不该封（头像转干净）' : '❌ 不该封（清观察记录）', callback_data: noData }
 			]]
 		});
 	} catch (error) {
-		console.error('[广告检测] 头像命中观察提醒失败:', error);
+		console.error('[广告检测] 转入观察提醒失败:', error);
+	}
+}
+
+// ===== observe 的来源分类：标题、得分注解、处置说明 =====
+//
+// 【为什么按 reasons 的文本认来源，而不是读 evaluation.layer】layer 记的是「哪一层
+// 算出的分」，与「为什么只进观察而没封」是两回事：第⑥层把 verdict 改成 observe 时
+// layer 仍是前面那一层的值。真正区分来源的信息只写在 reasons 里 —— 那几句话是
+// applyAdLLMToEvaluation 与 applyAvatarVerdict 各自 concat 进去的固定文案。
+//
+// 【判据取文案前缀而不是整句】整句里带动态数字（置信度、hits 次数、反例片段），
+// 对不上就会全部落到兜底档；取各自那段不含变量的前缀，改了数字也认得出。
+// 顺序即优先级：一条判定可能同时写了多句（头像命中 + 第⑥层降级），
+// 先命中的那档决定文案 —— 头像排最前，因为它的「不该封」动作最具体。
+function classifyAdObserveOrigin(reasons) {
+	const all = (Array.isArray(reasons) ? reasons : []).map((r) => String(r)).join('\n');
+	const avatarHit = all.includes('头像命中广告图库');
+	if (avatarHit) {
+		return {
+			isAvatarHit: true,
+			title: '头像命中广告图库，但未到封禁线 → 已转入观察',
+			scoreNote: '（有正分佐证才会封，本次没有）',
+			why: '⚠️ 头像疑似广告素材、但本次没有正分佐证，所以没封。',
+			noAction: '这张头像转干净，以后谁用都不再触发，本次观察记录一并清除'
+		};
+	}
+	const clearRecord = '清除本次观察记录（判据库一个字不动，下次同款形态还会再提醒）';
+	// 第⑥层那几档：产出是「判断」而不是「证据」，所以它只降级、不定罪 ——
+	// 需要人看一眼的恰恰是这几档（模型说是广告，代码没能验出来）。
+	if (all.includes('第⑥层没能判这一条')) {
+		return {
+			isAvatarHit: false,
+			title: '第⑥层没能判这一条 → 已转入观察',
+			scoreNote: '（AI 没给出结论，不是「判为正常」）',
+			why: '⚠️ 这条消息【没有任何模型结论】—— 额度用完、模型异常或输出解析失败。前五层也没够封禁线。',
+			noAction: clearRecord
+		};
+	}
+	if (all.includes('置信度是模型没给')) {
+		return {
+			isAvatarHit: false,
+			title: 'AI 判为广告，但置信度是代码补的 → 已转入观察',
+			scoreNote: '（模型结论可信度未知，不予采信）',
+			why: '⚠️ 模型判了广告且分数够采信线，但那个置信度是输出被截断后由代码补出来的，不是模型自己写的。',
+			noAction: clearRecord
+		};
+	}
+	if (all.includes('主人此前 /ignore 判过误判')) {
+		return {
+			isAvatarHit: false,
+			title: 'AI 判为广告，但形态命中你的反例 → 已转入观察',
+			scoreNote: '（你此前判过这个形态是误判）',
+			why: '⚠️ 模型判了广告，但这个形态你此前 /ignore 过 —— 人给的结论优先于模型，所以只降级。',
+			noAction: clearRecord
+		};
+	}
+	if (all.includes('引文逐字核对没通过') || all.includes('按「单特征不能封」降级为观察')) {
+		return {
+			isAvatarHit: false,
+			title: 'AI 判为广告，但代码验不出硬证据 → 已转入观察',
+			scoreNote: '（够采信线，但缺第二份独立证据）',
+			why: '⚠️ 模型判了广告且够采信线，但引文核对或代码侧硬证据没通过 —— 按「单特征不能封」只降级。',
+			noAction: clearRecord
+		};
+	}
+	if (all.includes('AI 深度判定命中')) {
+		return {
+			isAvatarHit: false,
+			title: 'AI 判为广告，但置信度不到采信线 → 已转入观察',
+			scoreNote: '（模型把握不足，只提观察）',
+			why: '⚠️ 模型说是广告，但置信度在观察线与采信线之间 —— 这个区间误伤代价大于漏判，所以不封。',
+			noAction: clearRecord
+		};
+	}
+	if (all.includes('结构弱命中') || all.includes('结构命中')) {
+		return {
+			isAvatarHit: false,
+			title: '结构命中但本群不封 → 已转入观察',
+			scoreNote: '（结构判据成立，处置档位是观察）',
+			why: '⚠️ 命中了广告的结构形态，但本群的结构处置档位不是封禁，所以只留记录。',
+			noAction: clearRecord
+		};
+	}
+	// 兜底：评分到观察线、历史分抬档，以及将来新增的来源。
+	// 【刻意兜底而不是 return 不发】新增一类 observe 却忘了加分支时，
+	// 最坏结果是文案笼统 —— 而不是这条判定悄悄不推人（那正是本次要治的病）。
+	return {
+		isAvatarHit: false,
+		title: '可疑但未到封禁线 → 已转入观察',
+		scoreNote: '（观察线已过，封禁线未到）',
+		why: '⚠️ 判据够观察线、不够封禁线 —— 按「单特征不能封」没有处置。',
+		noAction: clearRecord
+	};
+}
+
+// observe 提醒的去重闸：同一人在冷却窗口内只推一条。
+//
+// 【一条原子 UPSERT】与 perm_notice_log 同范式：冷却未到期时 WHERE 不成立 →
+// changes=0 → 不发。并发的两条消息只有一条抢到写入，另一条拿 0，不会双推。
+// 【写失败时发还是不发】发。这一闸的目的是防刷屏，不是守门 —— D1 抖一下就把
+// 「不能漏提醒」这条口径破掉，代价远大于偶尔多推一条。
+async function claimAdObserveNotice(env, userId) {
+	if (!env?.DB) return true;
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		// buildAdConfig 里那个 pickInt 是它的局部函数，这里拿不到，就地解析。
+		// 夹在 1~720 小时之间：配 0 等于关掉去重（那是「全推」口径，走不到这一闸），
+		// 配超过 720 比观察窗口上限还长，等于永不重推。
+		const rawHours = Number(env.AD_OBSERVE_NOTIFY_HOURS);
+		const hours = Number.isFinite(rawHours) && rawHours >= 1 && rawHours <= 720
+			? Math.floor(rawHours) : AD_OBSERVE_NOTIFY_HOURS_DEFAULT;
+		const res = await env.DB.prepare(
+			'UPDATE ad_user_screening SET notified_at = ? WHERE user_id = ? AND notified_at < ?'
+		).bind(now, String(userId), now - hours * 3600).run();
+		const changed = res?.meta?.changes ?? res?.changes
+			?? res?.results?.[0]?.meta?.changes ?? 0;
+		if (Number(changed) > 0) return true;
+		// changes=0 有两种可能：冷却未到期（该合并），或这个人还没有观察记录行。
+		// 后者必须照发 —— upsertAdScreening 与本函数的调用顺序在四个入口里并不统一，
+		// 把「还没落行」当成「刚提醒过」会让那几条入口整类静默。
+		const row = await env.DB.prepare('SELECT notified_at FROM ad_user_screening WHERE user_id = ?')
+			.bind(String(userId)).first();
+		return !row;
+	} catch (error) {
+		console.error('[广告检测] 观察提醒去重失败（本次照发）:', error?.message || error);
+		return true;
 	}
 }
 
@@ -30267,14 +30431,28 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 		// 注意：记录可能在 24 小时后已被 prune 删除 —— 那是旧通知失效的原因，
 		// 新通知不依赖它，所以这里的查询只作为回退。
 		const screening = await env.DB
-			.prepare('SELECT chat_id, snapshot FROM ad_user_screening WHERE user_id = ?')
+			.prepare('SELECT chat_id, snapshot, reasons, layer FROM ad_user_screening WHERE user_id = ?')
 			.bind(payloadStr).first();
+		// 【2026-11：来源不再写死成头像】通知放宽到 observe 的全部八类来源之后，
+		// 这对按钮也要跟着走实际来源 —— 否则第⑥层判不成的号被点确认封，案底里会
+		// 写成「头像命中广告图库」，事后 /user 复盘查不到真实原因。
+		// 来源信息塞不进 callback_data（64 字节上限），从观察记录的 reasons 里读；
+		// 记录已过期（prune 删掉）时回退成中性文案，不编一个具体来源。
+		let observeReasons = [];
+		try {
+			const parsed = JSON.parse(String(screening?.reasons || '[]'));
+			if (Array.isArray(parsed)) observeReasons = parsed.map((r) => String(r));
+		} catch (_) { observeReasons = []; }
+		const observeOrigin = classifyAdObserveOrigin(observeReasons);
 		if (action === 'ok') {
 			const targetChatId = buttonChatId || String(screening?.chat_id || '');
 			if (!targetChatId) {
 				await answerAdVoteCallback(callbackQuery?.id, '找不到该用户的观察记录，无法确定要封的群（这条通知是旧格式，重新触发一次即可）', true);
 				return;
 			}
+			// layer 只影响案底上显示的归属层。观察记录在就用它记的那一层，
+			// 过期了退回 'score'（结构化评分）—— 比写死 'avatar' 诚实。
+			const banLayer = observeOrigin.isAvatarHit ? 'avatar' : (String(screening?.layer || '') || 'score');
 			let result = null;
 			try {
 				result = await enforceAdDetection(env, {
@@ -30285,15 +30463,17 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 				}, {
 					verdict: 'ban',
 					score: 0,
-					layer: 'avatar',
+					layer: banLayer,
 					// 判据原样写进 note，事后 /user 查得到「这是主人看过判据后拍板封的」，
 					// 不然回滚时会以为是自动定罪、找不到是谁拍的板。
-					reasons: ['头像命中广告图库（主人点确认封）'],
+					// 把观察时的判据一并带上：没有它，案底里只剩「主人点确认封」，
+					// 看不出他当时是看着什么判的。
+					reasons: [observeOrigin.title + '（主人点确认封）'].concat(observeReasons.slice(0, 6)),
 					threshold: 0,
 					snapshot: {}
 				}, { force: true });
 			} catch (error) {
-				console.error('[头像观察] 主人确认封执行失败:', error);
+				console.error('[观察提醒] 主人确认封执行失败:', error);
 			}
 			if (!result?.banned) {
 				await answerAdVoteCallback(callbackQuery?.id, '封禁未执行：' + (result?.reason || '未知原因'), true);
@@ -30304,25 +30484,28 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 				+ escapeHtml(payloadStr) + '</code>\n全群封禁 + 拉黑 + 学指纹已执行，明细见上一条。');
 			return;
 		}
-		// 不该封：这张头像转干净（防连坐）+ 清观察记录。
+		// 不该封：清观察记录。头像来源另加一步「这张头像转干净」（防连坐）——
 		// 只清观察不清头像的话，下一个用同款头像的人还会被推一遍同样的通知。
-		// avatarId 优先取按钮自带的（观察记录过期后仍能转干净），旧通知才回退解析快照。
-		let avatarId = buttonAvatarId;
-		if (!avatarId) {
-			try {
-				avatarId = String(JSON.parse(String(screening?.snapshot || '{}')).avatarId || '');
-			} catch (_) { avatarId = ''; }
-		}
+		//
+		// 【2026-11：非头像来源只清观察记录，判据库一个字不动】主人定的口径。
+		// avatarId 只认按钮自带的那一份（头像来源才编进 callback_data），
+		// 不再回退解析 snapshot —— snapshot.avatarId 是资料卡的常规字段，
+		// 非头像来源的那张头像【本次并没有被判成广告素材】，把它写成 clean 会触发
+		// 人工 clean 安全阀：自动学习从此再也学不回 ad（见 learnAdAvatarOnBan）。
+		const avatarId = buttonAvatarId;
 		let cleared = false;
 		if (avatarId) cleared = await clearAdAvatarOnIgnore(env, avatarId);
 		try {
 			await env.DB.prepare('DELETE FROM ad_user_screening WHERE user_id = ?').bind(payloadStr).run();
 		} catch (error) {
-			console.error('[头像观察] 清观察记录失败:', error);
+			console.error('[观察提醒] 清观察记录失败:', error);
 		}
 		await answerAdVoteCallback(callbackQuery?.id, cleared ? '已标记为误判，该头像已转干净' : '已清除观察记录');
 		await editTelegramMessage(chatId, messageId, originText + '\n─────\n❌ 已按误判处理　TGID <code>'
-			+ escapeHtml(payloadStr) + '</code>\n头像：' + (cleared ? '已转干净，以后谁用都不再触发' : '无对应头像记录')
+			+ escapeHtml(payloadStr) + '</code>'
+			+ (cleared
+				? '\n头像：已转干净，以后谁用都不再触发'
+				: '\n判据库：一个字未动（下次同款形态还会再提醒）')
 			+ '\n观察记录：已清除');
 		return;
 	}
@@ -31271,8 +31454,8 @@ async function screenAdJoinMember(env, member, options = {}) {
 				snapshot: evaluation.snapshot,
 				layer: evaluation.layer
 			}, config);
-			// 头像命中却没到封禁线 → 单独提醒主人人工复核（可能漏广告）。
-			await notifyAvatarHitObserve(evaluation, userId, chatId);
+			// 转入观察 → 提醒主人人工复核（八类来源一条都不漏，见 notifyAdObserveNotice）。
+			await notifyAdObserveNotice(env, evaluation, userId, chatId);
 			console.log('[广告检测] 入群转入观察 user=' + userId + ' 来源=' + (options.source || 'join')
 				+ ' score=' + evaluation.score + '/' + config.scoreThreshold
 				+ ' 留存行为分=' + (evaluation.retainScore ?? 0));
@@ -31737,8 +31920,8 @@ async function detectAdOnMessage(message, env) {
 				snapshot: decision.snapshot,
 				layer: decision.layer
 			}, config);
-			// 头像命中却没到封禁线 → 单独提醒主人人工复核（可能漏广告）。
-			await notifyAvatarHitObserve(decision, userId, chat.id);
+			// 转入观察 → 提醒主人人工复核（八类来源一条都不漏，见 notifyAdObserveNotice）。
+			await notifyAdObserveNotice(env, decision, userId, chat.id);
 			console.log('[广告检测] 闸一转入观察 user=' + userId + ' score=' + decision.score + '/' + config.scoreThreshold
 				+ ' 留存行为分=' + (decision.retainScore ?? 0));
 		}
@@ -31850,8 +32033,8 @@ async function detectAdOnMessage(message, env) {
 			snapshot: evaluation.snapshot,
 			layer: evaluation.layer
 		}, config);
-		// 头像命中却没到封禁线 → 单独提醒主人人工复核（可能漏广告）。
-		await notifyAvatarHitObserve(evaluation, userId, chat.id);
+		// 转入观察 → 提醒主人人工复核（八类来源一条都不漏，见 notifyAdObserveNotice）。
+		await notifyAdObserveNotice(env, evaluation, userId, chat.id);
 		console.log('[广告检测] 闸二转入观察 user=' + userId + ' score=' + evaluation.score + '/' + config.scoreThreshold
 			+ ' 留存行为分=' + (evaluation.retainScore ?? 0));
 		// 【第2批 · 广告不进搜索库】转入观察 = 已经可疑但还没定罪，这条正文不该留在
@@ -33725,8 +33908,8 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 					snapshot: evaluation.snapshot,
 					layer: evaluation.layer
 				}, config);
-				// 头像命中却没到封禁线 → 单独提醒主人人工复核（可能漏广告）。
-				await notifyAvatarHitObserve(evaluation, userId, targetChatId);
+				// 转入观察 → 提醒主人人工复核（八类来源一条都不漏，见 notifyAdObserveNotice）。
+				await notifyAdObserveNotice(env, evaluation, userId, targetChatId);
 				kept.push(userId + '(' + evaluation.score + ')');
 			} else {
 				await deleteAdScreening(env, userId);
