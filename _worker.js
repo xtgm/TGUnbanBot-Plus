@@ -20751,6 +20751,25 @@ async function ensureAdDetectionTables(env) {
 			// file_id 又只在换图前有效，所以只在视觉识别那一刻用，不参与比对。
 			await runD1SchemaStatement(env, 'ad_avatars', 'CREATE TABLE IF NOT EXISTS ad_avatars (file_unique_id TEXT PRIMARY KEY, verdict TEXT NOT NULL DEFAULT \'pending\', hits INTEGER NOT NULL DEFAULT 0, file_id TEXT, source TEXT, last_user_id TEXT, vision_checked_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_avatars_verdict', 'CREATE INDEX IF NOT EXISTS idx_ad_avatars_verdict ON ad_avatars (verdict)', { optional: true });
+			// 【2026-11】头像跨用户复用：记录「同一张头像在谁身上被定罪过」。
+			//
+			// 【补的是哪个洞】ad_avatars.hits 的语义本该是「用过这张图的人里被定罪的次数」，
+			// 实现却是 learnAdAvatarOnBan 每封一次就 +1 —— 同一个人被反复封，hits 照样涨。
+			// 线上 383555435（@TbagM）的 hits=4 全部来自【他一个人】被误封四次：
+			// 封 → hits+1 → 更稳地满足 hits>=3 → 再封。代码把一个人的四次，
+			// 当成了四份互相独立的证据。这张表让「几个人」与「几次」分开，
+			// 复用佐证档改看去重后的人数（见 countAdAvatarBannedUsers）。
+			//
+			// 【为什么是独立表而不是给 ad_avatars 加列】与 ad_image_senders 同一个理由：
+			// 加列要在建表流程里跑 d1ColumnExists，而那条流程每条群消息都会走，
+			// 直接撞红「稳定态普通群消息核心 D1 SQL 不超过 3 条」那条防退化守卫。
+			//
+			// 【历史数据一个字节不动】hits 列保留原值原语义（继续做 /adstats 的展示口径），
+			// 新判据只读这张表。老头像在这里没有记录 → 去重人数为 0 → 复用佐证档
+			// 对它们暂时不成立，随后续封禁逐步重建。这是刻意的：那一档正是误封的来源，
+			// 冷启动期间 A 档（正分佐证）与 C 档（正文为空）照常工作。
+			await runD1SchemaStatement(env, 'ad_avatar_senders',
+				'CREATE TABLE IF NOT EXISTS ad_avatar_senders (file_unique_id TEXT NOT NULL, user_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (file_unique_id, user_id))');
 
 			// 正文图片指纹库。主键同样是 file_unique_id —— 与头像那张表同源同义，
 			// 但【为什么它在这里更值钱】：头像一个人一张、换得还勤，而广告素材是
@@ -25206,10 +25225,53 @@ async function upsertAdAvatar(env, fileUniqueId, patch = {}) {
 // 定罪即学习：此人被封时，把他的头像记成广告头像，并给该头像的「复用次数」+1。
 // 与指纹库的定罪即学习同一逻辑 —— 头像素材是广告团队批量复用的，
 // 一次定罪就能拦住后面所有用同一张图的号。
+// 【2026-11 新增】这张头像在【几个不同的人】身上被定罪过。
+//
+// 【为什么要和 hits 分开】hits 的文档语义是「用过这个头像的人里被定罪的次数」，
+// 但实现是每封一次 +1 —— 同一个人被反复封，hits 一样涨。线上 383555435（@TbagM）
+// 的 hits=4 全部来自他一个人被误封四次：封 → hits+1 → 更稳地满足 hits>=3 → 再封。
+// 复用佐证档的全部说服力建立在「有几个【独立】的人各自因别的证据被定罪」上，
+// 而被同一个判据连续封同一个人，一份新证据都没有产生。
+// 这个函数回答的就是那个真正的问题：去重后几个人。
+//
+// 查不到 / 查失败返回 0 —— 与 readAdAvatar 同一取向：失败绝不往「更容易封」的方向兜。
+async function countAdAvatarBannedUsers(env, fileUniqueId) {
+	const key = String(fileUniqueId || '');
+	if (!env?.DB || !key) return 0;
+	try {
+		const row = await env.DB.prepare(
+			'SELECT COUNT(*) AS c FROM ad_avatar_senders WHERE file_unique_id = ?').bind(key).first();
+		return Number(row?.c) || 0;
+	} catch (error) {
+		console.error('[广告检测] 统计头像定罪人数失败:', error);
+		return 0;
+	}
+}
+
 async function learnAdAvatarOnBan(env, fileUniqueId, userId) {
 	const key = String(fileUniqueId || '');
 	if (!env?.DB || !key) return false;
 	const now = Math.floor(Date.now() / 1000);
+	// 【先登记「是谁」，再决定 hits 要不要涨】INSERT OR IGNORE 让同一个 file +
+	// 同一个人只留一行 —— 同一个人被封第二次、第三次，changes = 0。
+	// 与 bumpAdImageSender 同一口径（那里治的是单人刷屏把跨用户计数顶上去）。
+	//
+	// 【这一步失败不能挡住学习】写不进去就当成「老头像没有记录」，退回只学 verdict ——
+	// 宁可这张图暂时够不着复用佐证档，也不能因为一张辅助表写失败就不学广告头像。
+	let isNewUser = true;
+	const uid = String(userId || '');
+	if (uid) {
+		try {
+			const inserted = await env.DB.prepare(
+				'INSERT OR IGNORE INTO ad_avatar_senders (file_unique_id, user_id, created_at) VALUES (?, ?, ?)')
+				.bind(key, uid, now).run();
+			const changed = inserted?.meta?.changes ?? inserted?.changes
+				?? inserted?.results?.[0]?.meta?.changes ?? 0;
+			isNewUser = Number(changed) > 0;
+		} catch (error) {
+			console.error('[广告检测] 登记头像定罪用户失败:', error);
+		}
+	}
 	try {
 		// 【2026-10-20 修：人工 clean 不许被自动学习覆盖】
 		// 原来的 ON CONFLICT 无条件把 verdict 改回 'ad' 并 hits +1 —— 主人用 /ignore
@@ -25220,13 +25282,19 @@ async function learnAdAvatarOnBan(env, fileUniqueId, userId) {
 		// 人工判定是安全阀，自动学习的正反馈只能作用在从没被人拍过板的行上。
 		// source 可为 NULL（建表未设默认值），所以用 IFNULL 兜一下，
 		// 否则 NULL <> 'manual' 得到 NULL、条件不成立，自动学习的行会永远学不动。
+		//
+		// 【2026-11 修：hits 只在「新的人」头上涨】原来无条件 +1，于是同一个人被
+		// 反复封就能自己把 hits 顶过佐证档 —— 这正是 @TbagM 四连误封的动力来源。
+		// 现在 isNewUser 为假时 hits 原样保留（verdict / source / 时间戳照常更新，
+		// 因为「这张图是广告素材」这个结论不受影响，变的只是它的证据【数量】）。
 		await env.DB.prepare(
 			'INSERT INTO ad_avatars (file_unique_id, verdict, hits, source, last_user_id, vision_checked_at, created_at, updated_at) '
 			+ 'VALUES (?, \'ad\', 1, \'learned\', ?, 0, ?, ?) '
-			+ 'ON CONFLICT(file_unique_id) DO UPDATE SET verdict = \'ad\', hits = ad_avatars.hits + 1, '
+			+ 'ON CONFLICT(file_unique_id) DO UPDATE SET verdict = \'ad\', '
+			+ 'hits = ad_avatars.hits + ?, '
 			+ 'source = \'learned\', last_user_id = excluded.last_user_id, updated_at = excluded.updated_at '
 			+ 'WHERE IFNULL(ad_avatars.source, \'\') <> \'manual\''
-		).bind(key, String(userId || ''), now, now).run();
+		).bind(key, uid, now, now, isNewUser ? 1 : 0).run();
 		return true;
 	} catch (error) {
 		console.error('[广告检测] 头像定罪学习失败:', error);
@@ -25242,6 +25310,17 @@ async function clearAdAvatarOnIgnore(env, fileUniqueId) {
 	const now = Math.floor(Date.now() / 1000);
 	try {
 		await env.DB.prepare('INSERT INTO ad_avatars (file_unique_id, verdict, hits, source, vision_checked_at, created_at, updated_at) VALUES (?, \'clean\', 0, \'manual\', 0, ?, ?) ON CONFLICT(file_unique_id) DO UPDATE SET verdict = \'clean\', hits = 0, source = \'manual\', updated_at = excluded.updated_at').bind(key, now, now).run();
+		// 【2026-11】去重表要跟着清空 —— 否则 hits 归零了但「谁被封过」的记录还在：
+		// 同一个人下次再被封时 INSERT OR IGNORE 返回 changes=0、被当成「老人」，
+		// hits 永远涨不回来；更糟的是主人 /ignore 判了误封，这张表里却还留着
+		// 把他算成一份证据的那一行。纠错的语义是「这张图的历史证据全部作废」。
+		// 【失败不影响纠错本身】verdict 已经改成 clean，头像层入口那道
+		// `verdict !== 'ad' 直接返回` 已经让这张图再也定不了罪。
+		try {
+			await env.DB.prepare('DELETE FROM ad_avatar_senders WHERE file_unique_id = ?').bind(key).run();
+		} catch (error) {
+			console.error('[广告检测] 清空头像定罪人记录失败:', error);
+		}
 		return true;
 	} catch (error) {
 		console.error('[广告检测] 头像纠错失败:', error);
@@ -25290,8 +25369,55 @@ function applyAvatarVerdict(evaluation, avatar) {
 	//（或撞车）一进来就被封，正文写什么都救不回来。线上 130 个头像正处在这一档。
 	// 现在 hits 只算【一份佐证】，且要达 AD_AVATAR_HITS_CORROBORATION 才算数 ——
 	// 复用次数高确实是批量马甲的强信号，但同样要过佐证这道闸，不能单独定罪。
-	const hasCorroboration = (Number(evaluation.score) || 0) >= 2
-		|| hits >= AD_AVATAR_HITS_CORROBORATION;
+	//
+	// ===== 2026-11 第四轮修：这三道档位全部改判据结构，不调数字 =====
+	//
+	// 【为什么不是再调一次阈值】这是同一个地方第四次误封，前三轮每次都是
+	//「某一层绕过了另一层的否证」，每次的修法都是给 hasCorroboration 换个更严的数字，
+	// 下一个样本换条路又进来。线上两条实证（主人 2026-11 核对）：
+	//   · 9214（383555435）score=1、hits=4 → 走 hits 档。判据链里语义层自己写着
+	//     「降级为 +2 软加分，不直接定罪」，头像层照样封 —— 第三轮修的是 score 那条路，
+	//     它从 hits 那条路原样进来了。
+	//   · 9223（972799274）score=0、净分 -4（两个豁免 -3/-3）、hits=3 → 同样走 hits 档。
+	//     score 闸挡住了，hits 闸没挡。
+	//   · 11223（8610968584）score=2、hits=1 → 走 score 档，而那 2 分来自
+	//     【唯一一条】判据「+2 昵称为机器生成型西方全名」。换个用英文名的正常用户
+	//     照样封 —— 这正是主人永久规则「单特征不能封」要挡的形态。
+	// 三条的共同点：每一档都能【凭一个来源】把 pass 直接提成 ban。
+	//
+	// 所以三档各自补上结构约束 ——【判据的条数与来源，不是分数的大小】：
+	//   A 档（正分佐证）：净分 ≥2 【且】（两条独立正分判据 ‖ 单条判据本身达观察线）
+	//   B 档（复用佐证）：去重【人数】达档 【且】本次至少有一条正分判据
+	//   C 档（正文为空）：同样改读人数 —— hits 的真实语义本来就该是「几个人」
+	//
+	// 【A 档为什么留「单条够强」这条或支】只数条数会把真广告放走：线上真广告
+	// 8916241973 的判据链是「+7 资料卡含私有一次性邀请链接」+「-1 名称无 emoji 且无 Bio」
+	// —— 只有一条正分，但那一条是定罪级的（+7 等于封禁线本身，只因 -1 差一分没封）。
+	// 门槛取观察线 DEFAULT_AD_OBSERVATION_SCORE：单条判据达到它，系统本来就认为
+	// 这条值得盯，不是「昵称像西方全名」那种 +2 的弱形态判据。
+	// 11223 那条唯一判据只有 +2 < 5，照样进不来。
+	//
+	// 【B 档为什么不用「净分不为负」】那个口径实测是假的：score 有下限
+	// AD_SCORE_FLOOR(-3)，且多层叠加后会被压平 —— 线上 9223 的 reasons 里是
+	// 两个 -3 豁免，而 score 字段是【0】，`netScore >= 0` 对它直接成立、一点也拦不住。
+	// 改成「至少有一条正分判据」才是真判据：9223 一条正分都没有（弱相似 0.697
+	// 没达线不计分），而 3 个人复用 + 本次有一条正分 = 两种独立特征，够主人那条
+	//「多种特征合起来达分才封」的线。
+	const reasonList = Array.isArray(evaluation.reasons) ? evaluation.reasons : [];
+	const positiveReasons = reasonList.filter((r) => /^\+[0-9]/.test(String(r).trim()));
+	// 最强的那条单项判据给了多少分（用于 A 档的「单条够强」或支）。
+	const maxSinglePositive = positiveReasons.reduce((max, r) => {
+		const n = Number((String(r).trim().match(/^\+([0-9]+)/) || [])[1]) || 0;
+		return n > max ? n : max;
+	}, 0);
+	const netScore = Number(evaluation.score) || 0;
+	// bannedUsers 由 applyAvatarToEvaluation 查 ad_avatar_senders 传进来。
+	// 【缺省为 0 而不是回落到 hits】拿不到就是「没有独立人数证据」，复用档不成立 ——
+	// 失败绝不往「更容易封」的方向兜（与 readAdAvatar 查失败不当 clean 同一取向）。
+	const bannedUsers = Number(avatar.bannedUsers) || 0;
+	const hasCorroboration =
+		(netScore >= 2 && (positiveReasons.length >= 2 || maxSinglePositive >= DEFAULT_AD_OBSERVATION_SCORE))
+		|| (bannedUsers >= AD_AVATAR_HITS_CORROBORATION && positiveReasons.length >= 1);
 	// 【2026-10-14 二次修正】hits>=2 恢复可单独定罪，但加一道否证 ——
 	// 【正文非空且干净】时不单独定罪：那说明这个人确实在说话、内容一个正分都没拿到，
 	// 头像撞车 / 被盗用的可能性大于「他就是广告号」（线上 130 个头像里正有这种）。
@@ -25299,9 +25425,15 @@ function applyAvatarVerdict(evaluation, avatar) {
 	// 不封就等于整条链路对这类消息彻底失效 —— 19:53 那条真广告就是这样漏掉的：
 	// 广告号引用别人的消息发出来、自己正文为空，头像 hits=2 只进了观察，
 	// 最后是另一个 bot 删的。
+	//
+	// 【2026-11 同步改成读人数】这一档原来是 `hits >= 2`，而 hits 由封禁次数累加 ——
+	// 同一个人被封两次就满足，等于「他自己证明了他自己」。改读去重人数之后，
+	// 它要求的是【两个不同的人】都顶着这张图被定罪过，才算这张图是广告素材。
+	// 救真广告的能力不变：19:53 那条引用体广告的头像本来就被别的号用过。
 	const bodyText = String(evaluation?.snapshot?.text || '').trim();
-	const hitsAloneSufficient = hits >= 2 && !bodyText;
-	const reason = '头像命中广告图库（复用定罪 ' + hits + ' 次）';
+	const hitsAloneSufficient = bannedUsers >= 2 && !bodyText;
+	const reason = '头像命中广告图库（复用定罪 ' + hits + ' 次'
+		+ (bannedUsers ? '，' + bannedUsers + ' 个不同用户' : '') + '）';
 	const reasons = (evaluation.reasons || []).concat([reason]);
 	// 已经是 ban 的不降级（保留原样），免得前一层定了罪却被头像这一层压回去。
 	let verdict = (hasCorroboration || hitsAloneSufficient) ? 'ban'
@@ -25390,7 +25522,15 @@ async function applyAvatarToEvaluation(env, evaluation, profile) {
 	// 退回旧行为的四道闸见 judgeAdAvatarRealtime。
 	const avatar = await judgeAdAvatarRealtime(env, avatarId, profile);
 	if (!avatar) return evaluation;
-	return applyAvatarVerdict(evaluation, avatar);
+	// 【2026-11】复用佐证改看「几个不同的人」而不是「封了几次」，见 countAdAvatarBannedUsers。
+	// 【为什么这里不多付一条热路径 SQL】只有 verdict='ad' 的头像才可能走到复用档，
+	// 其余（clean / pending / 没入库）在 applyAvatarVerdict 入口第一行就原样返回了。
+	// 稳定态的普通群消息不会命中广告头像库，所以这条查询在热路径上一次都不发
+	//（那条「稳定态核心 D1 SQL 不超过 3 条」的防退化守卫因此不受影响）。
+	const bannedUsers = String(avatar.verdict || '') === 'ad'
+		? await countAdAvatarBannedUsers(env, avatarId)
+		: 0;
+	return applyAvatarVerdict(evaluation, Object.assign({}, avatar, { bannedUsers }));
 }
 
 // ===== 同款会员标指纹（L1）=====
@@ -25422,11 +25562,23 @@ async function applyAvatarToEvaluation(env, evaluation, profile) {
 // 那时该封的本来也封了，badge 只是确认了他们同属一批。
 const AD_BADGE_BAN_HITS = 3;
 
-// 头像的「复用佐证档」：复用次数达这个数，【任何情况下】都算一份佐证（正文干净也封）。
-// 【为什么与 AD_BADGE_BAN_HITS 同为 3】两者踩的是同一个坑：hits 由封禁时累加，
-// 同一个人跨群被封几次也能把它顶上去，盗用头像 / 撞车的人会被连坐。
-// 低于这个档的 hits=2【仍可单独定罪】，但有一道否证：正文非空且干净时不单独定罪
-// （详见 applyAvatarVerdict）—— 2026-10-14 二次修正，第一次降档漏掉过一条真广告。
+// 头像的「复用佐证档」：达这个数算一份佐证。
+//
+// 【2026-11 口径改了，数字没改】原来数的是 ad_avatars.hits（封禁次数），现在数的是
+// ad_avatar_senders 里【去重后的人数】—— 同一个人被反复封只记一个。
+// 原注释写「同一个人跨群被封几次也能把它顶上去」，当时只是把阈值从 2 提到 3，
+// 而那条路径一分没堵：线上 383555435 的 hits=4 正是他一个人被误封四次攒出来的，
+// 阈值提到几都挡不住自我喂养。数「几个人」才是这个判据本来想问的问题。
+//
+// 【3 这个数现在真正成立】去重之后，越过 3 意味着有三个【不同的人】各自顶着这张图、
+// 各自因别的证据被定罪 —— 那才是「这张图是广告团队的批量素材」的证据。
+// 同时还加了一道否证：本次判定【至少要有一条正分判据】，这一档才成立 ——
+// 不再让某一层绕过另一层的否证，与 AD_BADGE_BAN_HITS 的安全阀取向一致。
+//
+// 【这道否证为什么不按「净分不为负」写】那个口径实测是假的：score 有下限
+// AD_SCORE_FLOOR(-3) 且多层叠加会被压平 —— 线上 9223 的 reasons 里是两条 -3 豁免，
+// score 字段却是【0】，`netScore >= 0` 对它直接成立、一点也拦不住。
+// 我按净分写的第一版在测试里是绿的（看着像修好了），改成数正分判据条数才真红 → 真绿。
 const AD_AVATAR_HITS_CORROBORATION = 3;
 
 // 读一条会员标指纹。查不到返回 null（= 未入库，既不是 ad 也不是 clean）。
@@ -26196,6 +26348,20 @@ const AD_LLM_FEATURE_STOPWORDS = new Set([
 	'找我', '联系', '私聊', '详聊', '加我', '加v', '加微', '看这里', '看主页', '私信',
 	'点击', '进群', '了解详情', '有意者', '备注', '非诚勿扰', '欢迎咨询', '咨询', '滴滴我'
 ]);
+// 第二独立证据里「同类词堆叠」那一档的门槛（见 collectAdLLMSecondEvidence ③）。
+//
+// 【为什么需要这一档】只认「招揽 ∧ 行业两类同现」会把一类真广告放走 —— 价目表型
+// 广告往往只堆【同一类】词（「日结 秒结 一手」三个交易动词、业务词零个），
+// 评分层的「单类词不计分」也正好对它判 0 分，两头都验不出。
+//
+// 【3 这个数怎么定的】18 条正常样本离线实测（含「我们项目日结算 月结报表 季度结账」
+// 「二手显卡出售 自用一年」「换汇一般去哪个平台靠谱」这些单类词高频的日常句）
+// 同类词最高只到 1 个；三条真广告分别是 3 / 3 / 2 个。取 3 把误伤面留出两格余量，
+// 代价是堆 2 个的那条真广告要靠别的档（它同时满足两类同现）。
+//
+// 【它不改「单类词不计分」】这个常量只在第⑥层、且只在模型引文已逐字核对通过之后
+// 作为第二份证据参与，自己从不加分、从不单独定罪。
+const AD_SECOND_EVIDENCE_SAME_CLASS = 3;
 // 自动转正门槛：同一条特征被【至少 3 次 AI 判定】抽到，且本身够长（≥6 字才可能是话术短语）。
 // 门槛看的是 hits 不看时间 —— hits 只在第⑥层判为广告时 +1，含金量天然高。
 const AD_LLM_FEATURE_PROMOTE_HITS = 3;
@@ -26223,14 +26389,26 @@ function sanitizeAdLLMFeatures(features, input) {
 		if (value.length < AD_LLM_FEATURE_MIN_LEN) continue;
 		// 逐字回原文核对：先原样、再小写（模型可能改了 handle 的大小写，其余必须原样）。
 		if (!raw.includes(value) && !raw.toLowerCase().includes(value.toLowerCase())) continue;
+		// ===== t.me 形态一律拦，不论模型把它标成什么 type（2026-11）=====
+		//
+		// 【补的是哪个旁路】原来这一拦只写在 `type === 'domain'` 分支里，
+		// 于是拦的是【type】而不是【value】—— 离线实测同一个 URL 换个 type 就穿过：
+		//   type=domain  → 被拦
+		//   type=keyword → 过闸 ["keyword:https://t.me/fenfen945?direct"]
+		//   type=phone   → 过闸 ["phone:https://t.me/fenfen945?direct"]
+		// 线上 10164 的误封引文正是 `keyword:https://t.me/fenfen945?direct`：
+		// 一条被专门拦过的东西，换个标签就成了定罪依据。模型标错 type 是常态
+		//（它本来就是生成式的），所以判据必须落在 value 上。
+		//
+		// 【为什么 t.me 要拦】它在本项目是豁免词；真正的私有邀请链接另有
+		// hasAdPrivateInviteLink（形态写死在正则里）与 confirmAdLinkOnBan 两条通道，
+		// 不需要靠模型引文来认，让它进来只会污染。
+		const asHost = value.replace(/^https?:\/\//i, '').split(/[/?#]/)[0].split('[')[0].toLowerCase();
+		if (asHost === 't.me' || asHost === 'telegram.me' || asHost === 't.dog'
+			|| asHost.endsWith('.t.me') || asHost.endsWith('.telegram.me')) continue;
 		if (type === 'domain') {
-			// 域名必须有真域名形态（含点，且不是 t.me / telegram.me 本身）。
-			// 【为什么单独拦 t.me】离线实测 9 条邀请链接被标成 domain；t.me 在本项目是
-			// 豁免词，私有邀请链接另有 confirmAdLinkOnBan 通道 —— 让它进特征库只会污染。
-			const host = value.replace(/^https?:\/\//i, '').split('/')[0].split('[')[0].toLowerCase();
-			if (!host.includes('.')) continue;
-			if (host === 't.me' || host === 'telegram.me'
-				|| host.endsWith('.t.me') || host.endsWith('.telegram.me')) continue;
+			// 域名还要有真域名形态（含点）—— 「找我」这种标成 domain 的直接丢掉。
+			if (!asHost.includes('.')) continue;
 		}
 		if (type === 'keyword' && AD_LLM_FEATURE_STOPWORDS.has(value.toLowerCase())) continue;
 		const normalized = normalizeAdFingerprintValue(value);
@@ -26257,6 +26435,85 @@ function sanitizeAdLLMFeatures(features, input) {
 // 【复用 sanitizeAdLLMFeatures 而不是另写一套】学习路径与判定路径的判据必须完全一致，
 // 否则会出现「学到的特征」和「能定罪的引文」不是一回事。那套五道闸（逐字核对 /
 // 类型 / 长度 / 域名形态 / 通用词）就是 menshen evidence gate 在这里的落点。
+// ===== 第二独立证据（2026-11）=====
+//
+// 【补的是哪个洞】引文逐字核对原本【单独就能定罪】。那道闸只验证「模型没编造」，
+// 不验证「它引的这段话是不是广告特征」—— 于是任意一段原文都能当定罪依据。
+// 离线实测 5 个完全正常的场景，引文全部过闸、全部够定罪：
+//   技术群「这个节点订阅地址失效了」引「节点订阅」、「有没有便宜点的机场推荐」
+//   引「便宜点的机场」、bio 写「工作联系 @sunqi_work」引那个 handle……
+// 实际效果等于「模型达线就封」，与注释里写的「这不是模型说一句就封」正相反。
+//
+// 线上两条误封实证（主人 2026-11 核对，两条的 hardEvidence 都是空）：
+//   · 10164（99288441）模型说「bio 包含私密群邀请链接」，代码一验就穿帮 ——
+//     t.me/fenfen945?direct 是【公开用户名链接】，私有邀请是 t.me/+xxx。
+//     这就是 #6269 原样重演：那次的修法是加 hardEvidence 闸，而 citations 是
+//     「或」支，从旁边绕过去了。净分还是 -3（t.me 本身是豁免词）。
+//   · 10646（8610968584）引文「广州楼凤」。同一条 reasons 里评分层自己写着
+//     「（正文仅业务关键词，单类词不计分：楼凤）」—— 评分层明确判了这不够定罪，
+//     第⑥层拿【同一个词】定了罪。
+//
+// 【这个函数回答的问题】除了「模型引了一段真实存在的话」之外，代码自己还能
+// 独立验出什么广告证据。三项都不依赖模型输出：
+//   ① 招揽 ∧ 行业两类词同现 —— 全项目统一口径（AD_KEYWORD_COMBO_SCORE 那条）。
+//      比 hardEvidence 的「引流出口 ∧ 招揽」宽：不要求有 @handle / 电话，
+//      「高价收U 有的来」这类没留联系方式的正文也算。
+//   ② 指纹库命中 —— 已知广告特征，从 current.reasons 读（matchAdFingerprints
+//      在 evaluateAdRisk 里已经跑过，这里不多付一条 SQL）。
+//   ③ 同一个招揽/行业词复读 ≥3 次 —— 复读是行为特征不是内容特征，
+//      词表盖不住的那一类（「假钞」×5）靠它。
+//
+// 【为什么正常语境不会命中①】弱交易动词（联系 / 咨询 / 有需要 / 详聊）
+// 永不参与同现判定，技术群天天说的节点 / 订阅 / 代理 / 教程全是豁免词不在表里。
+// 实测那 5 条正常场景一条都不成立。
+function collectAdLLMSecondEvidence(input, current) {
+	const profile = input?.profile || {};
+	const text = [profile.firstName, profile.lastName, profile.bio, input?.text]
+		.filter(Boolean).join(' ');
+	const hits = [];
+	if (text.trim()) {
+		// ① 招揽 ∧ 行业同现。单类命中一律不算 —— 10646 的「楼凤」正是单类，
+		// 评分层已经判过「单类词不计分」，这里不能把同一个词再当成证据。
+		const tradeHits = countAdKeywordHits(text, AD_TRADE_VERBS);
+		const businessHits = countAdKeywordHits(text, AD_BUSINESS_KEYWORDS);
+		if (tradeHits.length && businessHits.length) {
+			hits.push('招揽词与行业词同现：' + tradeHits.slice(0, 2).join('/')
+				+ ' × ' + businessHits.slice(0, 2).join('/'));
+		}
+		// ③ 同一类词【堆叠】到 3 个以上（2026-11 补）。
+		//
+		// 【补的是哪个洞】只要「两类同现」会把真广告放走：模型引文命中的典型真广告
+		// 「10U三个月 14U半年 27U一年 会员24小时自动秒开 | 一手货源 日结秒结」
+		// 命中的是【三个交易动词】（日结/秒结/一手）而业务词零个 —— 两类同现不成立、
+		// 评分层也因「单类词不计分」给 0 分，于是这条明摆着的价目表广告两头都验不出。
+		//
+		// 【为什么 3 个不会误伤】单类词不计分这条规则治的是「日结」「发票」「换汇」
+		// 这类在正常语境单独出现的词，而正常人不会把三个同类交易词堆进一句话。
+		// 18 条正常样本离线实测（含「我们项目日结算 月结报表 季度结账」「二手显卡出售
+		// 自用一年」「垃圾回收站的数据怎么恢复」「换汇一般去哪个平台靠谱」这些最容易
+		// 踩雷的）最高只到 1 个，三条真广告全部命中 ——【堆叠数量本身就是形态】。
+		//
+		// 【与「单特征不能封」的关系】这不是把单类词重新计分：它只在模型已经引了原文
+		// 且逐字核对通过之后，作为【第二份独立证据】参与，自己从不加分、从不定罪。
+		const maxSameClass = Math.max(tradeHits.length, businessHits.length);
+		if (!hits.length && maxSameClass >= AD_SECOND_EVIDENCE_SAME_CLASS) {
+			const stacked = (tradeHits.length >= businessHits.length ? tradeHits : businessHits);
+			hits.push('同类广告词堆叠 ' + maxSameClass + ' 个：' + stacked.slice(0, 4).join('/'));
+		}
+		// ④ 招揽/行业词复读。
+		const repeat = findAdRepeatedSolicitWord(text);
+		if (repeat.count >= AD_INVITE_REPEAT_MIN) {
+			hits.push('同一招揽词复读 ' + repeat.count + ' 次（' + repeat.word + '）');
+		}
+	}
+	// ② 指纹库命中。文案见 evaluateAdRisk：'+N 指纹库命中：...'
+	const reasons = Array.isArray(current?.reasons) ? current.reasons : [];
+	if (reasons.some((r) => /^\+[0-9]/.test(String(r).trim()) && String(r).includes('指纹库命中'))) {
+		hits.push('指纹库命中');
+	}
+	return hits;
+}
+
 function collectAdLLMEvidenceCitations(input, features) {
 	const profile = input?.profile || {};
 	// 【username 也要在核对范围内】模型看到的载荷里有 username（buildAdLLMPayload），
@@ -26589,12 +26846,24 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 			});
 		}
 		const hardEvidence = collectAdLLMHardEvidence(input);
-		// 模型自己给出的引文，回原文逐字核对 —— 对得上就说明【那段文字真实存在于原文】，
-		// 与代码硬证据同权，任一成立即落地（2026-10-22，主人定「跟 menshen 一样」）。
+		// 模型自己给出的引文，回原文逐字核对 —— 对得上只说明【那段文字真实存在于原文】。
 		const citations = collectAdLLMEvidenceCitations(input, answer.features);
+		// ===== 2026-11：引文不再单独定罪，要配第二份【代码独立验出的】证据 =====
+		//
+		// 【为什么改】逐字核对验的是「模型没编造」，不是「它引的这段是广告特征」——
+		// 于是任意一段原文都能当定罪依据。离线实测 5 个正常场景（技术群聊节点订阅、
+		// 求推荐机场、bio 写工作联系方式…）引文全部过闸、全部够定罪，
+		// 实际效果就是「模型达线就封」。线上 10164 / 10646 两条误封都走这条路，
+		// 两条的 hardEvidence 都是空。详见 collectAdLLMSecondEvidence。
+		//
+		// 【与主人的永久规则对齐】「单特征不能封，多种特征合起来达分才封」——
+		// 引文是一份特征，第二证据是另一份，两份都由代码独立验出。
+		// 代码硬证据（私有邀请形态 / 引流出口∧招揽 / 名片形态）仍可单独定罪：
+		// 那三项本身就是多要素合取，且一个字都不信模型输出。
+		const secondEvidence = citations.length ? collectAdLLMSecondEvidence(input, current) : [];
 		// 【不能给 reasons 重新赋值】它是 const —— 直接 `reasons = reasons.concat(...)`
 		// 会抛 Assignment to constant variable，整条检测链在 try 里炸掉、返回 result: error。
-		if (hardEvidence.length || citations.length) {
+		if (hardEvidence.length || (citations.length && secondEvidence.length)) {
 			// 【定罪归属】函数入口那道 `verdict === 'ban' 直接返回` 保证走到这里
 			// 必定是本层定的罪，所以标记无条件写。
 			return Object.assign({}, current, {
@@ -26605,15 +26874,29 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 						citations.length
 							? ['（模型引文逐字核对通过：' + citations.slice(0, 3).join('、')
 								+ (citations.length > 3 ? ' 等 ' + citations.length + ' 条' : '') + '）']
+							: [],
+						// 第二证据单独写一行：主人从回执就能看出这条封禁凭的是【两份】
+						// 独立证据，而不是「模型引了一段原文」。
+						(citations.length && secondEvidence.length)
+							? ['（第二独立证据：' + secondEvidence.slice(0, 3).join('、') + '）']
 							: []
 					), 'LLM')
 			});
 		}
+		// 【降级文案要分清是哪一步没过】引文压根没通过，和「引文过了但代码验不出
+		// 第二份证据」是两种完全不同的状态 —— 主人在 /pending 里要靠这行判断
+		// 这条到底是模型在编造，还是确有可疑但证据不足。
+		const blockReason = citations.length
+			? '（已拦下：模型判为广告、引文也在原文里逐字找到了，但【代码独立验不出第二份证据】'
+				+ '—— 引文只证明「这段话真的存在」，不证明「这段话是广告特征」。'
+				+ '招揽∧行业两类词同现、指纹库命中、招揽词复读，一条都不成立。'
+				+ '按「单特征不能封」降级为观察，不封禁）'
+			: '（已拦下：模型判为广告且够采信线，但【引文逐字核对没通过、'
+				+ '代码也算不出硬证据】—— 它说的内容要么原文里找不到，要么只是「找我」这类通用词。'
+				+ '降级为观察，不封禁）';
 		return Object.assign({}, current, {
 			verdict: 'observe',
-			reasons: reasons.concat(['（已拦下：模型判为广告且够采信线，但【引文逐字核对没通过、'
-				+ '代码也算不出硬证据】—— 它说的内容要么原文里找不到，要么只是「找我」这类通用词。'
-				+ '降级为观察，不封禁）'])
+			reasons: reasons.concat([blockReason])
 		});
 	}
 	if (answer.confidence >= AD_LLM_OBSERVE_CONF) {
@@ -28761,15 +29044,21 @@ async function judgeAdAvatarRealtime(env, avatarId, profile) {
 	await writeAdScanState(env, 'avatar_count', String(quota.used + 1), Math.floor(Date.now() / 1000));
 
 	if (verdict === 'pending') return row || null;
-	// 与头像既有门槛保持一致（applyAvatarVerdict：hits≥2 或有佐证才封），
-	// 这里不改门槛 —— 主人的口径是「单特征只针对广告图片跟广告贴图表情包」，
-	// 头像仍按原来的多特征走，实时化只解决「什么时候判」，不放宽「判了怎么用」。
-	try {
-		await env.DB.prepare('UPDATE ad_avatars SET hits = ? WHERE file_unique_id = ? AND hits < ?')
-			.bind(2, key, 2).run();
-	} catch (error) {
-		console.error('[头像实时判定] 抬升 hits 失败:', error);
-	}
+	// 【2026-11 删掉了这里的「把 hits 抬到 2」】原来视觉当场判出 ad 之后会执行
+	// `UPDATE ad_avatars SET hits = 2 WHERE hits < 2`，目的是让这张图够到
+	// applyAvatarVerdict 的 hits>=2 那一档。
+	//
+	// 【为什么必须删】那一档现在读的是【几个不同的人因它被定罪过】
+	//（ad_avatar_senders 去重人数，见 countAdAvatarBannedUsers），不再读 hits ——
+	// 这条 UPDATE 已经影响不了任何裁决，留着只会把一个【凭空捏造的】复用次数
+	// 写进库里：实际 0 个人因它被封，面板和判据文案却显示「复用定罪 2 次」。
+	// hits 的语义本来就是「用过这张图的人里被定罪的次数」，视觉模型判了一次图
+	// 不等于有人被定罪，抬它是在伪造证据数量。
+	//
+	// 【行为变化，如实记录】「视觉当场判 ad + 正文为空」这一路以前能直接封，
+	// 现在要等到有两个不同的人顶着这张图各自因别的证据被定罪。首次出现的广告头像
+	// 会落进观察窗口，notifyAvatarHitObserve 带两个按钮提醒主人拍板 ——
+	// 这是「单特征不能封」在这条路上的代价，与本轮三档改判据同一取向。
 	const finalRow = await readAdAvatar(env, key);
 	return finalRow || (verdict === 'ad'
 		? { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid }
