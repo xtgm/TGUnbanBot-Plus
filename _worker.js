@@ -26165,37 +26165,100 @@ function buildAdLLMSystemPrompt(digest) {
 }
 
 
+// ===== 第⑥层「判不成」的回执（2026-11，主人口径 3乙）=====
+//
+// 【治什么】这个函数原先有 8 个 `return null`，调用方（applyAdLLMToEvaluation）
+// 只能看到一个 null，于是把两类完全不同的状态当成同一件事：
+//   · 【主动不判】—— 没绑 AI、池额配 0（主人自己关的）、这条载荷判过了（去重命中）。
+//     这几种压根不该留痕：功能没开 / 已经判过，本来就没有「待处理」这回事。
+//   · 【判不成】—— 额度用完、链路熔断、调用抛错、输出解析不出来。
+//     这几种的含义是「本该由第⑥层看一眼的消息，这次没人看」。它们原先一声不响
+//     地掉回评分层结论：评分层本来算不出分的（第⑥层存在的理由正是治这类），
+//     于是这条消息直接 pass，没有任何痕迹 —— 额度一用完，当天后面的可疑消息
+//     就全部静默放过，主人在 /pending 和观察窗口里都看不到它们。
+//
+// 【主人口径 3乙】AI 不可用或额度用完 → 进观察窗口，由人工在 /pending 处理。
+// 所以这里把「判不成」的原因带出去，由调用方降级成 observe。
+//
+// 【为什么用一个有 skipped 标记的对象而不是抛异常】调用方对 null 的处理是
+//「原样返回评分层结论」，这条路径在三个接线点都要保持 —— 抛异常会穿透到
+// detectAdOnMessage 外层的 try，把整条检测链变成 result: error。
+// 返回值形状保持兼容：answer.ad 为 undefined，所有既有的 `!answer || !answer.ad`
+// 判断照旧短路，不会把 skipped 对象当成一次真实判定。
+const AD_LLM_SKIP_SILENT = 'silent';
+const AD_LLM_SKIP_DEGRADE = 'degrade';
+// reason → { kind, label }。kind=silent 不留痕、kind=degrade 进观察。
+// 【为什么把分类写成表而不是散在各个 return 处】八个分支里散着写，加一个分支时
+// 漏判成默认值是必然的；而两类的后果相反（一类静默、一类留痕），漏判的方向
+// 不可控。写成表之后，新分支不在表里就会在下面 adLLMSkipKind 处落到 silent，
+// 并由测试 [17] 断言「表里的 reason 与源码里的 return 一一对应」挡住漏登记。
+const AD_LLM_SKIP_KINDS = {
+	// —— 主动不判：不留痕 ——
+	no_ai: { kind: AD_LLM_SKIP_SILENT, label: '未绑定 Workers AI' },
+	disabled: { kind: AD_LLM_SKIP_SILENT, label: '第⑥层总额度配成 0（已关闭）' },
+	pool_disabled: { kind: AD_LLM_SKIP_SILENT, label: '这一路的额度池配成 0（已关闭）' },
+	seen_memory: { kind: AD_LLM_SKIP_SILENT, label: '同一载荷本实例已判过' },
+	seen_d1: { kind: AD_LLM_SKIP_SILENT, label: '同一载荷此前已判过' },
+	// —— 判不成：进观察 ——
+	// 额度与熔断是「今天剩下的时间都判不成」，调用失败与解析失败是「这一条判不成」。
+	// 两者都该留痕，区别只在文案 —— 主人要能从 /pending 上看出是该充额度还是该查链路。
+	quota_total: { kind: AD_LLM_SKIP_DEGRADE, label: '今日总额度已用尽' },
+	quota_pool: { kind: AD_LLM_SKIP_DEGRADE, label: '这一路的额度已用尽（公共余量也没了）' },
+	broken: { kind: AD_LLM_SKIP_DEGRADE, label: '链路已熔断（连续取不到模型回答）' },
+	call_failed: { kind: AD_LLM_SKIP_DEGRADE, label: '调用模型失败' },
+	parse_failed: { kind: AD_LLM_SKIP_DEGRADE, label: '模型输出解析不出来' }
+};
+
+function adLLMSkipKind(reason) {
+	const entry = AD_LLM_SKIP_KINDS[String(reason || '')];
+	// 认不出的 reason 按 silent 处理：宁可漏一次留痕，也不能让一个没登记的
+	// 分支（比如以后新加的早退）把每条正常消息都推进观察窗口。
+	return entry ? entry.kind : AD_LLM_SKIP_SILENT;
+}
+
+function adLLMSkipLabel(reason) {
+	const entry = AD_LLM_SKIP_KINDS[String(reason || '')];
+	return entry ? entry.label : String(reason || '未知原因');
+}
+
+// 构造一次「没判成」的回执。
+// 【ad 恒不写】调用方的既有短路判断是 `!answer || !answer.ad` —— 不写这个字段，
+// 所有既有路径都把它当「没判出广告」处理，一个字都不用改。
+function adLLMSkip(reason) {
+	return { skipped: true, reason: String(reason || ''), kind: adLLMSkipKind(reason) };
+}
+
 async function judgeAdByLLM(env, config, input, options) {
 	// 未绑 Workers AI：与广告检测整体的降级口径一致 —— 跳过而不是报错。
-	if (!(env?.AI && typeof env.AI.run === 'function')) return null;
+	if (!(env?.AI && typeof env.AI.run === 'function')) return adLLMSkip('no_ai');
 	const daily = Number(config?.llmDaily);
-	if (!Number.isFinite(daily) || daily <= 0) return null;
+	if (!Number.isFinite(daily) || daily <= 0) return adLLMSkip('disabled');
 	// 调用方不指名池时按 message 记账 —— 那是「消息路径」的池，
 	// 也是最该拿额度的一路；宁可把来路不明的调用记给主池，也不能记给谁都不算。
 	const pool = AD_LLM_POOLS.includes(String(options?.pool || '')) ? String(options.pool) : 'message';
 	const poolDaily = adLLMPoolLimit(config, pool);
-	if (poolDaily <= 0) return null;
+	if (poolDaily <= 0) return adLLMSkip('pool_disabled');
 	const payload = buildAdLLMPayload(input);
 	const key = adTextHash(payload);
-	if (adLLMSeen.has(key)) return null;
+	if (adLLMSeen.has(key)) return adLLMSkip('seen_memory');
 	const nowSeconds = Math.floor(Date.now() / 1000);
 	// D1 那一级去重：挡的是 isolate 回收之后的重复送审。
 	// 【位置在额度闸之前】判过的载荷连额度都不该读 —— 它既不花 Neurons 也不该占配额。
 	if (await hasAdLLMSeenInD1(env, key, nowSeconds)) {
 		// 回写内存一级：这个 isolate 接下来遇到同一条就不用再查 D1 了。
 		adLLMSeen.add(key);
-		return null;
+		return adLLMSkip('seen_d1');
 	}
 	const quota = await readAdLLMQuota(env, nowSeconds);
 	// 熔断优先于一切额度判断 —— 链路已经坏掉的时候，再花一次钱去验证它坏没坏，
 	// 是纯粹的浪费（这正是 2026-10-11 那轮：276 次调用全部取错字段，一次次白烧）。
-	if (quota.broken) return null;
+	if (quota.broken) return adLLMSkip('broken');
 	// 总池是所有轨共用的天花板，也是「不超额」的保证 —— 它先挡，一步都不让。
-	if (quota.used >= daily) return null;
+	if (quota.used >= daily) return adLLMSkip('quota_total');
 	// 再问本轨能不能花：保底之内无条件放行，超出保底则看公共余量。
 	// 【2026-10-25 从硬上限改成保底】旧实现是 `poolUsed >= poolDaily → return null`，
 	// 池额切死、余量不共享，cron 轨用不完的额度谁也用不上。详见 canSpendAdLLMQuota。
-	if (!canSpendAdLLMQuota(config, quota, pool, daily)) return null;
+	if (!canSpendAdLLMQuota(config, quota, pool, daily)) return adLLMSkip('quota_pool');
 	let answer = null;
 	let rawText = '';
 	let aiResult = null;
@@ -26237,7 +26300,10 @@ async function judgeAdByLLM(env, config, input, options) {
 		answer = parseAdLLMAnswer(rawText);
 	} catch (error) {
 		console.error('[广告检测·深度判定] 调用失败:', error);
-		return null;
+		// 【这一路刻意不记额度、不记去重键】下面那两笔只在走到「模型真返回了」
+		// 之后才记 —— 调用本身抛错（网络 / 503 / 账号额度）既没生成 token，
+		// 也不该让这条载荷被标成「判过了」，否则链路恢复后它永远不会再被看一眼。
+		return adLLMSkip('call_failed');
 	}
 	// 无论判没判出来都记额度与去重键：解析失败同样花了 Neurons，
 	// 不记的话同一条解析不出来的载荷会被反复重试，把当天预算烧在同一个坑上。
@@ -26282,6 +26348,12 @@ async function judgeAdByLLM(env, config, input, options) {
 			await writeAdScanState(env, 'llm_consec_fail', '0', nowSeconds);
 		}
 	}
+	// 解析失败同样要带出去（口径 3乙）：钱已经花了、消息也没人看过，
+	// 这正是最该留痕的一种 —— 否则 /adstats 上只有一个 parseFail 计数，
+	// 却不知道是哪些人的哪条消息被静默放过了。
+	// 【位置在额度与去重记账之后】那两笔必须照旧记：解析失败也烧了 Neurons，
+	// 不记会让同一条载荷被反复重试（见上面那段注释）。
+	if (!answer) return adLLMSkip('parse_failed');
 	return answer;
 }
 
@@ -26829,6 +26901,46 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	if (String(current.verdict) === 'ban') return current;
 	// options 透传给 judgeAdByLLM，唯一被读的键是 pool（这一轨归哪个额度池记账）。
 	const answer = await judgeAdByLLM(env, config, input, options);
+	// ===== 判不成 → 进观察窗口（2026-11，主人口径 3乙）=====
+	//
+	// 【为什么必须留痕】这一层存在的理由正是「评分层算不出分的那类广告」。
+	// 额度用完 / 链路熔断的时候掉回评分层结论，等于当天后面所有可疑消息
+	// 全部静默 pass —— 面板上只有一个额度数字，被放过的人一个都查不到。
+	// 现在它们变成 observe：进 ad_user_screening，/rescreen 能重新筛，
+	// 主人在观察窗口看到就能 /ban。
+	//
+	// 【只降级、绝不升级】这里写的是 observe 不是 ban。「没人看过」不是证据，
+	// 拿它封人正好违反主人的永久规则（单特征不能封）。observe 不删不封不禁言，
+	// 唯一后果是留一条记录。
+	//
+	// 【silent 那几类照旧什么都不做】没绑 AI、池额配 0、载荷判过了 ——
+	// 它们本来就不存在「待处理」，留痕只会把观察窗口灌满。
+	if (answer && answer.skipped === true) {
+		if (answer.kind !== AD_LLM_SKIP_DEGRADE) return current;
+		// 【cron 那一轨不降级】options.degradeToObserve === false 由调用方显式关掉。
+		// 理由在 rescanAdMemberProfile 那一侧：它扫的是【不发言的人】，本来就
+		// 刻意不写观察记录（会把 ad_user_screening 用 300 条/天的扫描结果灌满、
+		// 把真正要盯的新入群用户挤掉）；而它又用 verdict 写 profile 形状缓存，
+		// observe 会让「资料没变就跳过」失效，下一轮把同一批人全部重扫一遍。
+		// 那条轨上降级只有代价没有收益 —— 它扫的人明天还会被扫到。
+		if (options?.degradeToObserve === false) {
+			console.log('[广告检测·深度判定] 判不成（本轨不降级）原因=' + answer.reason
+				+ ' 池=' + String(options?.pool || 'message'));
+			return current;
+		}
+		// 【不覆盖已经有结论的】评分层已经判 observe 的保持原样（只补一行理由），
+		// pass 的才改成 observe —— 否则会把 reasons 里的既有判据顺序打乱。
+		console.log('[广告检测·深度判定] 判不成已转观察 原因=' + answer.reason
+			+ ' 池=' + String(options?.pool || 'message'));
+		return Object.assign({}, current, {
+			verdict: 'observe',
+			reasons: (current.reasons || []).concat([
+				'（⚠️ 第⑥层没能判这一条：' + adLLMSkipLabel(answer.reason)
+				+ ' —— 本条消息【没有任何模型结论】，不是「判为正常」。'
+				+ '按主人口径转入观察窗口等人工处理，可 /rescreen 重新筛查、确认是广告就 /ban）'
+			])
+		});
+	}
 	if (!answer || !answer.ad) return current;
 	const line = Number(config?.llmConf) || AD_LLM_CONF;
 	// 观测：这一层到底有没有在起作用，必须能在 /adstats 上直接看到 ——
@@ -27689,8 +27801,14 @@ async function rescanAdMember(env, row, options = {}) {
 	let evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
 	// 第四路补位：这一轨扫的是「不发言的人」，正文恒空，模型判的就是资料本身 ——
 	// 正对准「改了 bio 的潜伏号」。日限 300 人，LLM 每日上限还绰绰有余。
+	// 【degradeToObserve: false】这一轨「判不成」时不转观察，照旧掉回评分层结论。
+	// 理由与下面那段「不写观察记录」完全同源：这一轨扫的是不发言的人，一天 300 个，
+	// 把它们全推进观察窗口会把真正要盯的新入群用户挤掉；而且它用 verdict 写
+	// profile 形状缓存，observe 会让「资料没变就跳过」失效、下一轮全部重扫。
+	// 漏判的代价也小：同一批人明天还会被扫到，额度恢复后自然补上。
 	evaluation = await applyAdLLMToEvaluation(env, evaluation,
-		options.config || loadAdDetectionConfig(env), { profile, text: '' }, { pool: 'cron' });
+		options.config || loadAdDetectionConfig(env), { profile, text: '' },
+		{ pool: 'cron', degradeToObserve: false });
 	// 写回形状与结论：pass 让下一轮能走门，observe / ban 则让门始终关着。
 	// 不碰 bio_checked_at —— 那个时间戳在判定之前已经推过一次（429 防卡死）。
 	await markAdProfileVerdict(env, userId, shape, evaluation.verdict);
