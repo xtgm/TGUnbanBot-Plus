@@ -25796,6 +25796,9 @@ function parseAdLLMAnswerLoose(text) {
 	return {
 		ad,
 		confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : (ad ? 1 : 0),
+		// 契约标记（口径 1丙）：这个置信度是模型自己写的，还是代码补出来的。
+		// 这一路最容易补：max_tokens 截断时 confidence 往往正好被切掉，而 ad 已经读到了。
+		confidenceGiven: Boolean(confMatch) && Number.isFinite(Number(confMatch[1])),
 		reason: String((reasonMatch && reasonMatch[1]) || '').slice(0, 200),
 		// 兜底分支也要抠 features —— 否则「JSON 被截断」的那些调用答案有了、特征丢了，
 		// 而截断恰恰是最常见的情况（thinking 吃满额度）。抠不全不影响 ad 结论。
@@ -25838,6 +25841,12 @@ function buildAdLLMAnswer(parsed) {
 		// 模型没给 confidence 时：判了广告就按满置信、判了正常就按 0 ——
 		// 缺字段不该把一次有效结论丢掉。
 		confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : (ad ? 1 : 0),
+		// 【契约标记，口径 1丙】上面那个补值【不是模型的结论】，而补出来的 1.0 恰好
+		// 是最高档采信。这个布尔值把「模型自己写的」与「代码补的」分开，由裁决端
+		// 决定前者才配越过采信线（见 applyAdLLMToEvaluation 的契约闸）。
+		// 【为什么不在这里直接把补值改小】这个函数还服务于学习路径与 /adstats 计数，
+		// 改值会牵动那两条链路的既有口径；加一个标记只影响读它的人。
+		confidenceGiven: Number.isFinite(confidence),
 		reason: String(parsed?.reason || '').slice(0, 200),
 		// 模型抽出的广告特征（第⑥层自我学习的原料）。这里只做【结构归一化】：
 		// 去空、去重、限条数、限长度。【真正的形态闸是 sanitizeAdLLMFeatures】——
@@ -26954,6 +26963,39 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	await recordAdLLMCandidates(env, answer.features || [], input);
 	const reason = 'AI 深度判定命中（置信度 ' + answer.confidence.toFixed(2) + '）：' + answer.reason;
 	const reasons = (current.reasons || []).concat([reason]);
+	// ===== 契约闸：置信度必须是模型自己给的（2026-11，主人口径 1丙）=====
+	//
+	// 【治什么】解析端在模型没给 confidence 时会补值：判了广告补 1.0、判了正常补 0。
+	// 补 1.0 恰好是【最高档采信】—— 离线实测（vm 沙箱实跑）三条路径全部中招：
+	//   buildAdLLMAnswer({ad:true,reason:'广告'})            → 1.00
+	//   parseAdLLMAnswer('{"ad":true,"reason":"广告"}')        → 1.00
+	//   parseAdLLMAnswer('<think>…</think> "ad": true 被截断') → 1.00 且 reason 是【空串】
+	// 后一条最常见：max_tokens 把 JSON 切在半截，confidence 正好被切掉而 ad 已读到。
+	// 实测后果：评分层 score=-3（两个豁免词占上风）+ 模型不给置信度 → verdict=ban；
+	// 输出被截断、理由空串 → 同样 ban。这正是 #6269 的形态 —— 代码补出来的数字
+	// 不是证据，却拿到了最高档的采信。
+	//
+	// 【为什么只校置信度来源，不校等级与类别】主人的口径是乙方案「代码自己算等级
+	// 与类别，再与模型的 confidence 对账」。实测过代码侧类别的判别力（10 条真广告
+	// / 14 条正常样本）：真广告只命中 8/10，漏的两条正是线上专门修过的【名片型】
+	//（「注册领取1688彩金1倍可休」「客服小妹 13800138000」在四张词表与金额正则里
+	// 逐词零命中）；正常样本还误报 4/14。拿它当定罪的必要条件会把名片通道打回去、
+	// 还会让「我们项目日结算 月结报表」这类正常话多一份定罪依据。
+	// 所以契约只校验一件【代码能 100% 确定】的事：这个数字是谁写的。
+	//
+	// 【只拦采信线，不拦观察线】下面 AD_LLM_OBSERVE_CONF 那一档照旧 —— 模型确实
+	// 判了 ad=true，这条值得盯；被拦下的只是「最高档采信」，不是整个结论。
+	if (answer.confidence >= line && answer.confidenceGiven === false) {
+		console.log('[广告检测·深度判定] 置信度是代码补的，不予采信 池=' + String(options?.pool || 'message'));
+		return Object.assign({}, current, {
+			verdict: 'observe',
+			reasons: reasons.concat([
+				'（已拦下：模型判为广告，但【置信度是模型没给、由代码补出来的 '
+				+ answer.confidence.toFixed(2) + '】—— 多半是输出被截断把这个字段切掉了。'
+				+ '补出来的数字不是模型的结论，不配越过采信线。降级为观察，不封禁）'
+			])
+		});
+	}
 	if (answer.confidence >= line) {
 		// ===== 达线之后还要看【代码算得出的】硬证据 =====
 		//
