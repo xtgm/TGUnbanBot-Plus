@@ -19947,6 +19947,22 @@ const AD_LLM_DAILY = 1400;
 const AD_LLM_DAILY_MESSAGE = 800;
 const AD_LLM_DAILY_JOIN = 300;
 const AD_LLM_DAILY_CRON = 100;
+// 【2026-11 新增第四池：抽送（sample）】f 路「老用户纯文字确定性抽送」专用。
+//
+// 【为什么必须单独开一池，不能并进 message】这一路的性质与其余三路相反：
+// 其余三路都是【有可疑迹象才送】，花的每一次都有由头；抽送是【没有任何迹象也送一条】，
+// 为的是摸出「词表与形态判据全都看不见」的那类广告。两者混在一个池里，
+// 后果是单向的 —— 抽送没有上界地消耗 message 的保底，真正可疑的消息反而被挤到
+// 借共享余量，而共享余量只有 200。开独立池等于给这条探索路径设一个硬天花板。
+//
+// 【60 这个数怎么定的】它是【探测用量】不是【覆盖用量】，不该按群消息量算：
+//   · 抽送比例 1/32（见 AD_REVIEW_SAMPLE_RATE），60 次 ≈ 覆盖 1,920 条纯文字发言；
+//   · 真要靠它「覆盖全部消息」需要几千次额度，那是免费版 10,000 Neurons 的好几倍
+//     （本项目的优化目标是 Workers 免费版，见主人口径）；
+//   · 它的产出是【样本】—— 抽到真广告就由 /pending 进人工、由 /ban 学成指纹，
+//     此后同类走指纹层零成本命中。所以这一路的价值随额度递减，60 已在收益平台区。
+// 四池保底之和 800 + 300 + 100 + 60 = 1,260，总额 1,400，共享余量仍有 140。
+const AD_LLM_DAILY_SAMPLE = 60;
 
 // 【解析失败熔断】连续这么多次取不到模型回答，当天直接关掉第⑥层，一次都不再调。
 //
@@ -20605,6 +20621,9 @@ function loadAdDetectionConfig(env) {
 		llmDailyMessage: pickInt(env.AD_LLM_DAILY_MESSAGE, AD_LLM_DAILY_MESSAGE, 0, 100000),
 		llmDailyJoin: pickInt(env.AD_LLM_DAILY_JOIN, AD_LLM_DAILY_JOIN, 0, 100000),
 		llmDailyCron: pickInt(env.AD_LLM_DAILY_CRON, AD_LLM_DAILY_CRON, 0, 100000),
+		// 抽送池。配 0 = 彻底关掉 f 路（既不抽送、也不许借公共余量），
+		// 口径与其余三池的 0 完全一致 —— 开关失效比省不下额度严重得多。
+		llmDailySample: pickInt(env.AD_LLM_DAILY_SAMPLE, AD_LLM_DAILY_SAMPLE, 0, 100000),
 		// 采信线：命中且置信度 ≥ 此值才封，低于它只进观察。见 AD_LLM_CONF 说明。
 		llmConf: pickFloat(env.AD_LLM_CONF, AD_LLM_CONF, 0.5, 1),
 		// 换模型只改这个环境变量，不动代码（与 AD_EMBEDDING_MODEL 必须写死在代码里不同：
@@ -25929,12 +25948,14 @@ function adLLMPoolLimit(config, pool) {
 	const fallback = {
 		message: AD_LLM_DAILY_MESSAGE,
 		join: AD_LLM_DAILY_JOIN,
-		cron: AD_LLM_DAILY_CRON
+		cron: AD_LLM_DAILY_CRON,
+		sample: AD_LLM_DAILY_SAMPLE
 	};
 	const raw = ({
 		message: config?.llmDailyMessage,
 		join: config?.llmDailyJoin,
-		cron: config?.llmDailyCron
+		cron: config?.llmDailyCron,
+		sample: config?.llmDailySample
 	})[pool];
 	if (raw === undefined || raw === null) return fallback[pool];
 	const parsed = Number(raw);
@@ -28116,7 +28137,11 @@ function bytesToBase64(bytes) {
 // count 那行）之后，第二天第一次读会把昨天的残留当成今天已用 —— 新轨道不复制这个隐患。
 // 这里不顺手改旧函数：它不在这次任务范围内，改它要连带复验视觉识别的额度行为。
 // 分池记账键。四个调用点各归各的池，谁也挤不掉谁 —— 详见 AD_LLM_DAILY 的说明。
-const AD_LLM_POOLS = ['message', 'join', 'cron'];
+// 'sample' 是 2026-11 新增的抽送池（见 AD_LLM_DAILY_SAMPLE）。
+// 【加进这个数组才算真加了一池】readAdLLMQuota 的跨天清零、bumpAdLLMQuota 的分池记账、
+// canSpendAdLLMQuota 的公共余量计算，三处全靠遍历它 —— 漏了这一行的后果是：
+// 计数只涨不清（凌晨池额直接是满的）、而且算公共余量时不替它预留保底。
+const AD_LLM_POOLS = ['message', 'join', 'cron', 'sample'];
 
 // 一次消耗同时写总计数与分池计数。两笔必须在同一个函数里写完 ——
 // 拆成两个调用点的话，中间任何一步失败都会留下「总池扣了、分池没扣」的账，
@@ -28168,7 +28193,13 @@ async function readAdLLMQuota(env, nowSeconds) {
 			// 清零失败不能把判定链带崩 —— 与 writeAdScanState 同一口径，只记日志。
 			console.error('[广告检测] 跨天清零额度失败:', error);
 		}
-		return { today, used: 0, pools: { message: 0, join: 0, cron: 0 }, broken: false, consecFail: 0, lastShape: '' };
+		// pools 由 AD_LLM_POOLS 推出来，不手写字面量 —— 加池时漏改这一行的后果是
+		// 跨天当天 canSpendAdLLMQuota 读到 undefined，新池的保底被当成 0 用掉。
+		return {
+			today, used: 0,
+			pools: Object.fromEntries(AD_LLM_POOLS.map((pool) => [pool, 0])),
+			broken: false, consecFail: 0, lastShape: ''
+		};
 	}
 	const used = Number(await readAdScanState(env, 'llm_count', '0')) || 0;
 	const pools = {};
@@ -28204,7 +28235,13 @@ async function bumpAdLLMOutcome(env, reachedLine) {
 // 读第 ⑥ 层的今日观测计数。只给 /adstats 用，不在任何判定路径上。
 // 与 readAdLLMQuota 同一把尺：day 不是今天就一律按 0 报，不读昨天的残留。
 async function readAdLLMOutcome(env, nowSeconds) {
-	const empty = { used: 0, hits: 0, bans: 0, parseFail: 0, pools: { message: 0, join: 0, cron: 0 }, broken: false, consecFail: 0, lastShape: '', lastFailSeq: 0, lastSuccessSeq: 0 };
+	// pools 由 AD_LLM_POOLS 推出来而不是手写字面量 —— 加池时漏改这里，
+	// D1 读失败那一路（返回 empty）会让面板上新池永远显示 0，看着像「没用过」。
+	const empty = {
+		used: 0, hits: 0, bans: 0, parseFail: 0,
+		pools: Object.fromEntries(AD_LLM_POOLS.map((pool) => [pool, 0])),
+		broken: false, consecFail: 0, lastShape: '', lastFailSeq: 0, lastSuccessSeq: 0
+	};
 	if (!env?.DB) return empty;
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
 	const day = await readAdScanState(env, 'llm_day', '');
@@ -29345,6 +29382,189 @@ function isAdSuspectSignal(text, reasons, extras = {}) {
 		return true;
 	}
 	return Array.isArray(reasons) && reasons.some((line) => AD_POSITIVE_SIGNAL_RE.test(line));
+}
+
+// ===== AI 送审入口（2026-11，主人口径 2acdef）=====
+//
+// 【它与 isAdSuspectSignal 的分工 —— 为什么必须是两个函数】
+// 上面那个函数身兼两职：除了决定送不送审，它还决定 needBio（把 bio 冷却期从
+// 2 小时压到 10 分钟，见 AD_SUSPECT_BIO_COOLDOWN_SECONDS）。于是扩它一个字，
+// 就等于同时放宽了【热路径 getChat 的发生条件】—— 而「稳态普通聊天零 Telegram
+// 请求」是本项目的硬不变量（三条断言在守它）。送审只花 Workers AI 的额度，
+// 与 Telegram 请求预算是两笔完全不同的账，所以判据另起一个函数，各管一件事。
+// isAdSuspectSignal 本体这一轮【一个字符都没动】，needBio 那一行照旧读它。
+//
+// 【五路判据与池归属】主人口径 2acdef，刻意【不含 b（新人前 N 条）】：
+//   a suspect  现有可疑信号（调用方把 isAdSuspectSignal 的结果传进来，不重算）→ message
+//   c repeat   段落复读 / 同一招揽词复读 ≥ AD_INVITE_REPEAT_MIN              → message
+//   d context  转发 / 引用体 / 非白名单外链                                   → message
+//   e sametext 多账号同文案 或 多账号同联系方式（进程内记账）                  → message
+//   f sample   老用户纯文字确定性抽送                                          → sample
+//
+// 【为什么 e 路用进程内 Map 而不查 moderation_messages.text_hash】
+// 那张表有 idx_moderation_text_hash 索引、等值反查也不贵，现成写法就在
+// findLinkedSpamTargets。但它是【每条普通消息都要发的一次 SQL】，而
+//「稳定态普通群消息核心 D1 SQL 不超过 3 条」是既有防退化守卫
+//（test_kick.mjs「稳定态普通群消息核心 D1 SQL 不超过 3 条」），多一条就撞线。
+// 代价如实记下：isolate 回收后记账清空，跨实例的同文案会漏算一轮 —— 但刷同一段
+// 文案的马甲号通常在几分钟内连发，同一个 isolate 大概率都见得到；而且漏算只是
+//「这一轮没送审」，不是误判，下一轮照样抓得到。
+//
+// 【这个函数不改任何裁决】它只决定「要不要花一次钱问模型」。封不封仍由评分阈值、
+// AD_LLM_CONF 采信线、硬证据闸、第二独立证据闸说了算 —— 送审放宽【不等于】
+// 封禁放宽，这是上一轮刚把误封判据收紧之后必须守住的边界。
+const AD_REVIEW_SAMETEXT_MIN_LEN = 12;
+// 抽送比例：1/32。
+// 【为什么是 1/32 而不是「每条都送」】每条都送的额度需求是几千次/天，而本项目的
+// 优化目标是 Workers 免费版（每日 10,000 Neurons，实测约 18 Neurons/次 → 约 550 次
+// 全部功能共用）。1/32 配 AD_LLM_DAILY_SAMPLE(60) 的保底，每天覆盖约 1,920 条
+// 纯文字发言，够把「词表与形态判据全看不见」的那类广告摸出样本来。
+// 【为什么不更稀】比 1/64 更稀时，一个低频发言的广告号可能几天都抽不到一次，
+// 这条探索路径就等于没有。
+const AD_REVIEW_SAMPLE_RATE = 32;
+// 同文案记账表的条数上限。超了丢掉最早插入的一批（Map 迭代顺序 = 插入顺序）。
+// 【为什么必须有上界】这是模块级 Map，isolate 活多久它就涨多久；不剪枝的话
+// 一个高流量群能把它涨到几十万条，吃掉 Worker 的 128MB 内存预算。
+const AD_REVIEW_SAMETEXT_MAX = 4000;
+const AD_REVIEW_SAMETEXT_PRUNE = 1000;
+// key → 说过这段话（或留过这个联系方式）的 userId 集合。只存 id，不存正文。
+const adReviewSameText = new Map();
+
+// 测试入口：清空记账，用来模拟 isolate 回收 / 隔离各个用例。生产代码不调它。
+function resetAdReviewSameTextMemory() {
+	adReviewSameText.clear();
+}
+function adReviewSameTextSize() {
+	return adReviewSameText.size;
+}
+
+// 同文案记账键。短句一律返回 null —— 「早上好」「收到」这类谁都会说，
+// 进了记账就会把全群拖进送审，那是最贵的一种误伤（花钱还可能误封）。
+// 归一化复用 normalizeAdFingerprintValue：与指纹层同口径，
+//「高价 收 号」与「高价收号」落到同一个键。
+function buildAdReviewTextKey(text) {
+	const norm = normalizeAdFingerprintValue(String(text ?? ''));
+	if (norm.length < AD_REVIEW_SAMETEXT_MIN_LEN) return null;
+	return 't:' + adTextHash(norm);
+}
+
+// 联系方式记账键：正文里的 @handle。
+// 【为什么单独记它】马甲号最常见的换皮方式是【文案天天换、联系方式不换】——
+// 同文案记账对这类完全失效。只取 @handle 不取域名：域名已由 d 路的外链判据覆盖。
+// 【为什么不取 t.me 链接里的名字】那是主人明确定过的豁免形态（正常用户大量使用），
+// 把它当联系方式指纹等于绕开那条豁免。
+function buildAdReviewContactKeys(text) {
+	const source = String(text ?? '');
+	const out = [];
+	const re = /[@＠]([A-Za-z0-9_]{5,32})\b/g;
+	let m;
+	while ((m = re.exec(source)) !== null) {
+		out.push('c:' + m[1].toLowerCase());
+		if (out.length >= 3) break;
+	}
+	return out;
+}
+
+// 记一个人说过这个键，返回【到目前为止说过它的去重人数】。
+function trackAdReviewKey(key, userId) {
+	if (!key) return 0;
+	const uid = String(userId || '');
+	if (!uid) return 0;
+	let users = adReviewSameText.get(key);
+	if (!users) {
+		users = new Set();
+		adReviewSameText.set(key, users);
+	}
+	users.add(uid);
+	if (adReviewSameText.size > AD_REVIEW_SAMETEXT_MAX) {
+		// 丢最早插入的一批。Map 的迭代顺序就是插入顺序，所以 keys() 前面那些
+		// 天然是最老的 —— 不需要额外存时间戳。
+		let dropped = 0;
+		for (const oldKey of adReviewSameText.keys()) {
+			if (oldKey === key) continue;
+			adReviewSameText.delete(oldKey);
+			dropped += 1;
+			if (dropped >= AD_REVIEW_SAMETEXT_PRUNE) break;
+		}
+	}
+	return users.size;
+}
+
+// 返回 { submit, pool, reason }。submit 为 false 时 pool / reason 无意义。
+// 【同步纯函数】刻意不接 env、不发 SQL、不发 Telegram 请求 —— 它在热路径上，
+// 每条消息都要问一次。
+function shouldSubmitAdForReview(input) {
+	const text = String(input?.text ?? '');
+	const contactName = String(input?.contactName ?? '');
+	const body = (text + ' ' + contactName).trim();
+	const quotedText = String(input?.quotedText ?? '');
+	const yes = (pool, reason) => ({ submit: true, pool, reason });
+
+	// a 路：现有可疑信号。调用方传进来，这里不重算 —— 重算一遍等于把
+	// isAdSuspectSignal 的四条路径复制一份，以后一改一漏。
+	if (input?.suspectSignal === true) return yes('message', '可疑信号命中（词表 / 金额招揽 / 名片形态）');
+
+	// c 路：复读。段落复读与招揽词复读是两种独立形态，判据都复用现成件。
+	if (hasAdRepeatedSegment(body)) return yes('message', '正文段落复读');
+	if (body) {
+		const repeat = findAdRepeatedSolicitWord(body);
+		if (repeat.count >= AD_INVITE_REPEAT_MIN) {
+			return yes('message', '同一招揽词复读 ' + repeat.count + ' 次（' + repeat.word + '）');
+		}
+	}
+
+	// d 路：转发 / 引用体 / 非白名单外链。
+	// 引用体【有内容就算】—— 「正文一个字母 + 广告全在引用体里」是线上漏放 50+ 个号
+	// 的共同形态（见 getAdQuotedText 的说明），对它再加条件等于把那类重新放走。
+	if (input?.forwardChat) return yes('message', '转发自频道 / 群');
+	if (quotedText) return yes('message', '带引用体（广告常把正文留空、内容全在引用里）');
+	if (body && hasAdSuspiciousLink(body, input?.whitelist, { businessHit: input?.businessHit === true })) {
+		return yes('message', '含非白名单引流链接 / @bot 提及');
+	}
+
+	// e 路：多账号同文案 / 同联系方式。记账必须【无条件执行】——
+	// 只在前几路不命中时才记，会让「第一个号刚好命中 a 路」的那段文案从此不进记账，
+	// 后面的马甲号反而对不上（记账的目的是攒人数，不是判定本身）。
+	const userId = input?.userId;
+	const textKey = input?.textKey === undefined ? buildAdReviewTextKey(body) : input.textKey;
+	let sameTextUsers = 0;
+	if (textKey) sameTextUsers = trackAdReviewKey(textKey, userId);
+	let sameContactUsers = 0;
+	let sameContactHandle = '';
+	for (const key of buildAdReviewContactKeys(body)) {
+		const n = trackAdReviewKey(key, userId);
+		if (n > sameContactUsers) { sameContactUsers = n; sameContactHandle = key.slice(2); }
+	}
+	if (sameTextUsers >= 2) {
+		return yes('message', '多账号同文案（已有 ' + sameTextUsers + ' 个号发过这段话）');
+	}
+	if (sameContactUsers >= 2) {
+		return yes('message', '多账号同联系方式（@' + sameContactHandle
+			+ ' 已被 ' + sameContactUsers + ' 个号留过）');
+	}
+
+	// f 路：老用户纯文字确定性抽送。
+	// 【三道前置】缺一个都会让这条路径变贵或变没用：
+	//   · sampleEnabled —— 池额配 0 时整条关掉（开关必须有效）
+	//   · 老用户      —— 主人口径不含 b（新人前 N 条）；新人本来就走入群判定那一轨
+	//   · 纯文字      —— 带图 / 带名片的由视觉层与名片通道各自判，抽送只补纯文字这个洞
+	if (input?.sampleEnabled === false) return { submit: false, pool: '', reason: '' };
+	if (input?.media || contactName) return { submit: false, pool: '', reason: '' };
+	const firstSeen = Number(input?.member?.first_seen) || 0;
+	const nowSeconds = Number(input?.nowSeconds) || Math.floor(Date.now() / 1000);
+	// 「老用户」= 名册里有他、且入群超过一天。first_seen 为 0（bot 部署前就在群、
+	// 老数据没这列）按【老用户】算 —— 与 adRescanTierSeconds 对 0 的既有约定一致。
+	const isOldMember = input?.member ? (firstSeen <= 0 || nowSeconds - firstSeen > 86400) : false;
+	if (!isOldMember) return { submit: false, pool: '', reason: '' };
+	if (!text || text.length < AD_REVIEW_SAMETEXT_MIN_LEN) return { submit: false, pool: '', reason: '' };
+	// 【确定性抽样，不用 Math.random】随机抽样在这里有两个实际问题：
+	//   ① 同一条消息在不同 isolate 里结论不同 —— 而 adLLMSeen 去重只挡「已经判过的」，
+	//      没判过的那次钱已经花了，等于对同一条文案重复付费；
+	//   ② 测不了 —— 断言只能统计分布，抽样逻辑写错（比如恒真）也可能碰巧绿。
+	// 按正文哈希取模：同一条文案永远是同一个结论，且在文案空间上均匀。
+	const bucket = parseInt(adTextHash(text).slice(0, 8), 16) % AD_REVIEW_SAMPLE_RATE;
+	if (bucket !== 0) return { submit: false, pool: '', reason: '' };
+	return yes('sample', '老用户纯文字抽送（1/' + AD_REVIEW_SAMPLE_RATE + ' 确定性抽样）');
 }
 
 // ===== 自定义 emoji 的贴纸包名判据（批次 B-2）=====
@@ -31238,6 +31458,22 @@ async function detectAdOnMessage(message, env) {
 	// 现在认中文数额与 `7ooo` 这类字母冒充）。三条路径的合并与边界见 isAdSuspectSignal。
 	const suspectSignal = isAdSuspectSignal(text || contactName, cheap.reasons,
 		{ contactCard: Boolean(contactName) });
+	// ===== 送审判据与 bio 冷却判据在这里分家（2026-11）=====
+	// 上面那个 suspectSignal 继续【只】管 bio 冷却期（下一行的 needBio）——
+	// 它一放宽就等于放宽热路径 getChat，而「稳态普通聊天零 Telegram 请求」是硬不变量。
+	// 要不要花一次 Workers AI 额度，改由 shouldSubmitAdForReview 独立决定，
+	// 它多出 c/d/e/f 四路判据却一个 Telegram 请求、一条 SQL 都不加。
+	// 详见 shouldSubmitAdForReview 的注释。
+	const review = shouldSubmitAdForReview({
+		suspectSignal,
+		text, contactName, quotedText, forwardChat, media,
+		whitelist,
+		// 业务词上下文：有它 hasAdSuspiciousLink 才认「@handle + 行业指向」那一档。
+		// 从闸一已经算好的 reasons 里读，不重扫词表。
+		businessHit: (cheap.reasons || []).some((line) => String(line).includes('业务关键词')),
+		member, userId, nowSeconds,
+		sampleEnabled: adLLMPoolLimit(config, 'sample') > 0
+	});
 	const bioCheckedAt = Number(member?.bio_checked_at) || 0;
 	const needBio = suspectSignal
 		? (bioCheckedAt <= 0 || nowSeconds - bioCheckedAt >= AD_SUSPECT_BIO_COOLDOWN_SECONDS)
@@ -31273,13 +31509,16 @@ async function detectAdOnMessage(message, env) {
 	// 可疑消息才花这一次，另有每日上限与同载荷内存去重两道闸兜着。
 	// 闸一本就有同步的 bge-m3 嵌入调用，这一层不改变它的性质，只是更慢一点。
 	// cheapProfile 没有 bio（闸一是零 getChat 路径），所以这一层判的是昵称 + 正文。
-	let decision = suspectSignal
+	if (review.submit) {
+		console.log('[广告检测·送审] user=' + userId + ' 池=' + review.pool + ' 理由=' + review.reason);
+	}
+	let decision = review.submit
 		? await applyAdLLMToEvaluation(env, cheap, config, {
 			profile: cheapProfile, text: text || contactName,
 			// 名片形态进硬证据闸：这两个字段只在名片消息里非空，普通消息一个字节都不多传。
 			contactCardName: contactName,
 			contactPhone: String(message?.contact?.phone_number || '')
-		}, { pool: 'message' })
+		}, { pool: review.pool })
 		: cheap;
 	let bioVerified = false;
 	if (cheap.verdict === 'ban' && cheap.layer === 'ai' && cheap.score < config.scoreThreshold) {
@@ -32803,7 +33042,11 @@ async function handleAdStatsCommand(env, chatId) {
 		'　↳ 分池（分母为保底，可借用总池余量）',
 		'　　消息 <b>' + Number(llmStat.pools?.message || 0) + '</b>/' + config.llmDailyMessage + ' 保'
 			+ '　入群 <b>' + Number(llmStat.pools?.join || 0) + '</b>/' + config.llmDailyJoin + ' 保'
-			+ '　定时扫描 <b>' + Number(llmStat.pools?.cron || 0) + '</b>/' + config.llmDailyCron + ' 保',
+			+ '　定时扫描 <b>' + Number(llmStat.pools?.cron || 0) + '</b>/' + config.llmDailyCron + ' 保'
+				// 抽送池（2026-11）。单独摆出来是因为它的语义与其余三轨相反：那三轨是
+				//「有可疑迹象才送」，这一轨是「没有迹象也抽一条去探」。看板上分得开，
+				// 才能判断探索花得值不值 —— 用满了却一条都没命中，就该把它调小或关掉。
+				+ '　抽送 <b>' + Number(llmStat.pools?.sample || 0) + '</b>/' + config.llmDailySample + ' 保',
 		// 熔断状态：连着 AD_LLM_FAIL_BREAK 次取不到模型回答，第⑥层当天自动停。
 		// 这一行回答的是「第⑥层到底还活着吗」—— 2026-10-11 那轮它一直在空转烧钱，
 		// 看板上却只显示「调用 276 次、命中 0 次」，怎么看都像模型保守，
