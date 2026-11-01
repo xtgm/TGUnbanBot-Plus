@@ -22444,12 +22444,69 @@ async function resolveAdProfileLinks(env, profile) {
 	for (const handle of handles) {
 		try {
 			const info = await resolveAdLink(env, handle);
-			if (info) out.push(info);
+			if (info) {
+				info.adContent = await inspectAdLinkContent(env, info);
+				out.push(info);
+			}
 		} catch (error) {
 			console.error('[广告检测·链接] 单条解析异常 handle=' + handle + ':', error?.message || error);
 		}
 	}
 	return out;
+}
+
+// ===== 被挂号自己的内容是不是广告（2026-11 主人口径：重点在资料卡挂的东西写了什么）=====
+//
+// 【补的是哪个洞】scoreAdProfileLinks 原来只认一条窄正则（AD_EXEMPT_CANCEL_RE 打 about），
+// 线上 ad_link_cache 里六个被挂号实测只认出 2 个：「新澳门六合彩内幕」「98上门服务一条龙」
+// 这种标题、简介里挂私有邀请链接的，全部 0 分 —— 广告号把广告写在被挂的频道 / bot 上，
+// 自己的 bio 只留一行链接，评分层就只看得到那条链接的 -3 豁免。
+//
+// 【四项任一命中即记一条内容证据】私有邀请链接形态、行业词（单类也算 —— 这是被挂号
+// 自己的标题与简介，不是群聊正文，正常频道不会把「六合彩」「上门服务」写进名字）、
+// 招揽话术正则、与广告样本库的语义相似度达硬阈值。规则项先跑，命中就不再花嵌入。
+//
+// 【它只是证据，不定罪】结果挂在 link.adContent 上，由 scoreAdProfileLinks 给 +2、
+// 由第⑥层当第二证据读 —— 都要配别的特征才可能封，单凭它一条到不了封禁线。
+// 只看频道 / 群 / bot：挂个人号不构成广告位（与 scoreAdProfileLinks 同一口径）。
+async function inspectAdLinkContent(env, link) {
+	const kind = String(link?.kind || '');
+	if (!['channel', 'supergroup', 'group', 'bot'].includes(kind)) return [];
+	const body = [link?.title, link?.about].map((part) => String(part || '').trim()).filter(Boolean).join(' ');
+	if (!body) return [];
+	const found = [];
+	if (hasAdPrivateInviteLink(body)) found.push('私有邀请链接');
+	const businessHits = countAdKeywordHits(body, AD_BUSINESS_KEYWORDS);
+	if (businessHits.length) found.push('行业词 ' + businessHits.slice(0, 3).join('/'));
+	if (AD_EXEMPT_CANCEL_RE.test(body)) found.push('招揽话术');
+	if (found.length) return found;
+	try {
+		const similar = await checkAdAiSimilarity(env, body);
+		if (similar?.isMatch) found.push('与广告样本语义相似 ' + Number(similar.similarity || 0).toFixed(3));
+	} catch (error) {
+		console.error('[广告检测·链接] 被挂号语义比对失败 handle=' + String(link?.handle || '') + ':', error?.message || error);
+	}
+	return found;
+}
+
+// ===== 补查：判定已经落到可疑档，但前置分档没让查链接的人 =====
+//
+// 【补的是哪个洞】isAdProfileElevated 只看资料卡与正文有没有正分 —— 「妍妍个人接
+// t.me/xxx」这类只有一行链接的 bio 一个正分都没有（t.me 还 -3），于是挂的东西从没查过；
+// 可他已经被头像 / 第⑥层 / 评分推进了观察，线上 7 天 100 个观察号全是真广告。
+// 这里只在【本次已经可疑】时补查：observe、第⑥层判了广告、或头像命中广告图库。
+// 正常人走不到这一步（verdict=pass 且没有这两条理由），前置分档的省钱效果原样保住。
+// 返回 null = 不补查 / 查了也没有可计分的东西，调用方据此决定要不要重评。
+async function recheckAdProfileLinks(env, profile, evaluation) {
+	if (!evaluation || String(evaluation.verdict) === 'ban') return null;
+	if (Array.isArray(profile?.adLinks) && profile.adLinks.length) return null;
+	const reasons = Array.isArray(evaluation.reasons) ? evaluation.reasons.map((r) => String(r)) : [];
+	const suspicious = String(evaluation.verdict) === 'observe'
+		|| reasons.some((r) => r.includes('AI 深度判定命中') || r.includes('头像命中广告图库'));
+	if (!suspicious || !extractAdProfileHandles(profile).length) return null;
+	const suspectLinks = await resolveAdProfileLinks(env, profile);
+	if (!(scoreAdProfileLinks(suspectLinks).score > 0)) return null;
+	return suspectLinks;
 }
 
 // ===== 前置分档：先判这个人像不像广告，再决定要不要为他花 getChat 查挂的东西 =====
@@ -22539,8 +22596,17 @@ function scoreAdProfileLinks(links) {
 		// ② 被挂账号【自己写的简介】含招揽：这是攻击者写的引流落地页文案，
 		//    用打 bio 的同一条广告语境正则（金额承诺 / 灰产词 / 强招揽）打它 ——
 		//    判据同源，不新造一套。
-		if (isAdSlot && !confirmed && about && AD_EXEMPT_CANCEL_RE.test(about)) {
+		const aboutSolicit = Boolean(about) && AD_EXEMPT_CANCEL_RE.test(about);
+		if (isAdSlot && !confirmed && aboutSolicit) {
 			add(2, '挂的 @' + handle + '（' + kind + '「' + title.slice(0, 30) + '」）简介含招揽话术');
+			scoredHandles.push(handle);
+		}
+		// ②b 被挂号的标题 / 简介本身就是广告（inspectAdLinkContent 的四项任一命中）。
+		//    与 ② 互斥：② 已经给过 +2 的同一条简介不再算第二遍；已确认案底的只给 +3。
+		const adContent = Array.isArray(link.adContent) ? link.adContent : [];
+		if (isAdSlot && !confirmed && !aboutSolicit && adContent.length) {
+			add(2, '挂的 @' + handle + '（' + kind + '「' + title.slice(0, 30) + '」）内容是广告：'
+				+ adContent.slice(0, 3).join('、'));
 			scoredHandles.push(handle);
 		}
 		// ③ 其余一律不加：kind=unknown（查不到）、about 为空（没设置或抓不到）、
@@ -26778,6 +26844,14 @@ function collectAdLLMSecondEvidence(input, current) {
 	if (reasons.some((r) => /^\+[0-9]/.test(String(r).trim()) && String(r).includes('指纹库命中'))) {
 		hits.push('指纹库命中');
 	}
+	// ⑤ 资料卡挂的频道 / 群 / bot 自己的内容是广告，或已有广告案底（2026-11）。
+	// 这是被挂号【自己写的】标题与简介，由 inspectAdLinkContent 用代码验出，不来自模型。
+	const linked = (Array.isArray(profile.adLinks) ? profile.adLinks : []).filter((link) =>
+		['channel', 'supergroup', 'group', 'bot'].includes(String(link?.kind || ''))
+		&& ((Array.isArray(link.adContent) && link.adContent.length) || link.adKnown === true || link.adConfirmed === true));
+	if (linked.length) {
+		hits.push('挂的 @' + linked.slice(0, 2).map((link) => String(link.handle || '')).join('/@') + ' 内容是广告');
+	}
 	return hits;
 }
 
@@ -27073,8 +27147,15 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	if (!current) return current;
 	// 前三层已经定罪的不再花钱。
 	if (String(current.verdict) === 'ban') return current;
-	// options 透传给 judgeAdByLLM，唯一被读的键是 pool（这一轨归哪个额度池记账）。
-	const answer = await judgeAdByLLM(env, config, input, options);
+	// options 透传给 judgeAdByLLM，被读的键是 pool（这一轨归哪个额度池记账）。
+	// 【llmMemo：同一次判定重评时复用上一轮的模型结论】补查链接后要把整条链重跑一遍
+	//（见 recheckAdProfileLinks），而载荷不含链接、第二次送审必被 adLLMSeen 去重跳过 ——
+	// 跳过即返回 current，上一轮「AI 判了广告」那条结论就丢了，第二证据也无从配上。
+	// 复用时不再记命中统计、不再写候选池：同一个结论只算一次。
+	const memo = options?.llmMemo && typeof options.llmMemo === 'object' ? options.llmMemo : null;
+	const reused = Boolean(memo && memo.done);
+	const answer = reused ? memo.answer : await judgeAdByLLM(env, config, input, options);
+	if (memo && !reused) { memo.done = true; memo.answer = answer; }
 	// ===== 判不成 → 进观察窗口（2026-11，主人口径 3乙）=====
 	//
 	// 【为什么必须留痕】这一层存在的理由正是「评分层算不出分的那类广告」。
@@ -27120,12 +27201,12 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	// 观测：这一层到底有没有在起作用，必须能在 /adstats 上直接看到 ——
 	// 否则「调了但从没命中」与「压根没跑」在线上完全无法区分（上线首日就是这个状态）。
 	// 只在模型真给出 ad 结论时写（低频），也只有 /adstats 读它，热路径不为它多付 SQL。
-	await bumpAdLLMOutcome(env, answer.confidence >= line);
+	if (!reused) await bumpAdLLMOutcome(env, answer.confidence >= line);
 	// 第⑥层自我学习（2026-10-18 乙方案）：把模型抽到的特征写进候选池，并做一次自动转正。
 	// 【为什么放在这里】answer.ad 为 true 才会走到这行 —— 判 false 的调用（绝大多数）
 	// 一个 SQL 都不发；且同一载荷有 adLLMSeen 内存去重，不会对同一条文案重复写。
 	// 【失败绝不影响判定】recordAdLLMCandidates 内部整段 try，只记日志。
-	await recordAdLLMCandidates(env, answer.features || [], input);
+	if (!reused) await recordAdLLMCandidates(env, answer.features || [], input);
 	const reason = 'AI 深度判定命中（置信度 ' + answer.confidence.toFixed(2) + '）：' + answer.reason;
 	const reasons = (current.reasons || []).concat([reason]);
 	// ===== 契约闸：置信度必须是模型自己给的（2026-11，主人口径 1丙）=====
@@ -30454,6 +30535,27 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 			// layer 只影响案底上显示的归属层。观察记录在就用它记的那一层，
 			// 过期了退回 'score'（结构化评分）—— 比写死 'avatar' 诚实。
 			const banLayer = observeOrigin.isAvatarHit ? 'avatar' : (String(screening?.layer || '') || 'score');
+			// 【2026-11 补：观察时的快照要带进定罪】原来这里传 snapshot:{}，于是主人点
+			// 「确认封」之后 confirmAdLinkOnBan 读不到 scoredLinks，被挂的广告频道 / bot
+			// 一个都不会盖成案底 —— 80 次人工确认一次都没学到被挂号。
+			// 快照在 upsertAdScreening 里截到 2000 字符，截断时 JSON 解析会失败 ——
+			// 那就退回只抠 scoredLinks 那一段，抠不到再退回空快照（与改之前一致）。
+			// 【只带 scoredLinks】快照里还有 avatarId / 文本 / 资料形状 —— 整份传进去会让
+			// 确认封顺带学一遍那些特征，那是另一件事，主人没拍板，这里一个都不带。
+			let observeSnapshot = {};
+			const rawSnapshot = String(screening?.snapshot || '');
+			let linkList = [];
+			try {
+				const parsed = JSON.parse(rawSnapshot || '{}');
+				if (Array.isArray(parsed?.scoredLinks)) linkList = parsed.scoredLinks;
+			} catch (_) {
+				try {
+					const linkPart = rawSnapshot.match(/"scoredLinks":(\[[^\]]*\])/);
+					const picked = linkPart ? JSON.parse(linkPart[1]) : [];
+					if (Array.isArray(picked)) linkList = picked;
+				} catch (_) { linkList = []; }
+			}
+			if (linkList.length) observeSnapshot = { scoredLinks: linkList.map((h) => String(h)).slice(0, 5) };
 			let result = null;
 			try {
 				result = await enforceAdDetection(env, {
@@ -30471,7 +30573,7 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 					// 看不出他当时是看着什么判的。
 					reasons: [observeOrigin.title + '（主人点确认封）'].concat(observeReasons.slice(0, 6)),
 					threshold: 0,
-					snapshot: {}
+					snapshot: observeSnapshot
 				}, { force: true });
 			} catch (error) {
 				console.error('[观察提醒] 主人确认封执行失败:', error);
@@ -31385,23 +31487,38 @@ async function screenAdJoinMember(env, member, options = {}) {
 			? config
 			: Object.assign({}, config, { scoreThreshold: joinScore });
 
-		const baseEvaluation = await evaluateAdSuspect(
-			env,
-			{ profile, text: '', forwardChat: null },
-			// getChat 失败时不能扣「无 Bio」那一分 —— 那是「查到了、确实是空」才成立的判据。
-			{ config: joinConfig, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
-		);
-		// 入群即判头像：这是「广告号还没发广告就被拦住」的主通道，
-		// 头像指纹命中时即便正文干净也能进判据（分档见 applyAvatarVerdict）。
-		// 头像与其它强证据一样不走入群线，仍按原样定罪。
-		const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
-		// 同款会员标同位叠加：走到这里已经为这次判定花过 getChat 了，
-		// 会员标就在那一份响应里，查一次库即可，零额外 Telegram 请求。
-		let evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
-		// ===== 第四路补位：前三层都没定罪时交给生成式模型 =====
-		// 入群时正文为空（他还没发过言），载荷里 message 就是空串 —— 提示词
-		// 明写「message 为空不构成怀疑理由」，所以这一路在这里判的纯粹是资料卡。
-		evaluation = await applyAdLLMToEvaluation(env, evaluation, config, { profile, text: '' }, { pool: 'join' });
+		// 整条判定链收进一个闭包：补查链接后要用同一条链原样重评一次（见下方）。
+		// 第⑥层的结论放进 llmMemo，重评时复用 —— 不重复花额度，也不会因载荷去重丢掉结论。
+		const joinLLMMemo = {};
+		const judgeJoinMember = async () => {
+			const baseEvaluation = await evaluateAdSuspect(
+				env,
+				{ profile, text: '', forwardChat: null },
+				// getChat 失败时不能扣「无 Bio」那一分 —— 那是「查到了、确实是空」才成立的判据。
+				{ config: joinConfig, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
+			);
+			// 入群即判头像：这是「广告号还没发广告就被拦住」的主通道，
+			// 头像指纹命中时即便正文干净也能进判据（分档见 applyAvatarVerdict）。
+			// 头像与其它强证据一样不走入群线，仍按原样定罪。
+			const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+			// 同款会员标同位叠加：走到这里已经为这次判定花过 getChat 了，
+			// 会员标就在那一份响应里，查一次库即可，零额外 Telegram 请求。
+			let judged = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+			// ===== 第四路补位：前三层都没定罪时交给生成式模型 =====
+			// 入群时正文为空（他还没发过言），载荷里 message 就是空串 —— 提示词
+			// 明写「message 为空不构成怀疑理由」，所以这一路在这里判的纯粹是资料卡。
+			judged = await applyAdLLMToEvaluation(env, judged, config, { profile, text: '' }, { pool: 'join', llmMemo: joinLLMMemo });
+			return judged;
+		};
+		let evaluation = await judgeJoinMember();
+		// ===== 补查资料卡挂的链接（2026-11）=====
+		// 前置分档没让查、但本次已经可疑（observe / AI 判广告 / 头像命中）的人，
+		// 补查他挂的东西；挂的东西真有广告内容才重评一次，否则判定原样不动。
+		const joinSuspectLinks = await recheckAdProfileLinks(env, profile, evaluation);
+		if (joinSuspectLinks) {
+			profile.adLinks = joinSuspectLinks;
+			evaluation = await judgeJoinMember();
+		}
 
 		// ===== 入群检查流水：任何 verdict 都记 =====
 		// 只记命中的话，看板上对绝大多数新成员是一片空白，管理员分不清
@@ -31974,42 +32091,57 @@ async function detectAdOnMessage(message, env) {
 
 	// 据实传：getChat 成功就正常判定（空 bio 该减分就减），失败则跳过减分。
 	// 两轨用同一个判断依据（profile.bioFetched），阈值与判据完全一致，不另立标准。
-	const baseEvaluation = applyHistory(await evaluateAdSuspect(
-		env,
-		// 与闸一同一口径传名片显示名。漏传这里会造成一种诡异形态：
-		// 名片消息在闸一（无 bio）没定罪 → 走到闸二拉了 bio 本该更容易定罪，
-		// 结果因为 text 又变回空串，反而比闸一更判不出来。
-		{ profile, text: text || contactName, quotedText, forwardChat, media,
-			// 闸二同样带名片手机号 —— 与闸一同源，否则闸二的复评读不到号码指纹。
-			phone: message?.contact?.phone_number },
-		{ config, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
-	));
-	// 闸二已拉到 getChat，头像就在响应里 —— 读指纹零成本，叠加在历史分之后作最终裁决。
-	// 图片判据【必须在这里再叠一次】：闸二的 baseEvaluation 是重新算出来的，
-	// 闸一叠进去的那份并不跟过来。图片是唯一证据、且闸一没定罪时，
-	// 少了这一行就会在这一步漏回放行。
-	// 叠的是闸前已经读好的 imageRow —— 同一行不读第二遍，热路径 SQL 只付一次。
-	// 两者都只改 verdict / reasons 不碰 score，所以叠放顺序只影响 reasons 的排列，
-	// 不影响分值与阈值比较。
-	const avatarEvaluation = await applyAvatarToEvaluation(
-		env,
-		applyImageVerdict(baseEvaluation, imageRow),
-		profile
-	);
-	// 同款会员标叠在最外层：闸一那条零成本路径拿不到会员标（getChat 还没发），
-	// 所以这一层只在闸二及其后（入群线、AI 补查、cron 复查）生效 ——
-	// 与头像完全同位，热路径的 Telegram 请求数一个都不多。
-	let evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
-	// ===== 第四路补位：前三层都没定罪时交给生成式模型 =====
-	// 这是治「样本外话术」的那一处 —— 词表没列到、指纹没学过、bge-m3 样本库里
-	// 没有近似的正文，在这里由模型直接判。载荷口径与上面 evaluateAdSuspect 一致
-	// （text || contactName），两层看到的是同一份内容。
-	evaluation = await applyAdLLMToEvaluation(env, evaluation, config, {
-		profile, text: text || contactName,
-		// 与闸一同口径：名片形态要能作为硬证据，否则闸二判到 0.95 也只能观察。
-		contactCardName: contactName,
-		contactPhone: String(message?.contact?.phone_number || '')
-	}, { pool: 'message' });
+	// 整条判定链收进一个闭包：补查链接后要用同一条链原样重评一次（见下方）。
+	// 第⑥层的结论放进 llmMemo，重评时复用 —— 不重复花额度，也不会因载荷去重丢掉结论。
+	const gate2LLMMemo = {};
+	const judgeGate2 = async () => {
+		const baseEvaluation = applyHistory(await evaluateAdSuspect(
+			env,
+			// 与闸一同一口径传名片显示名。漏传这里会造成一种诡异形态：
+			// 名片消息在闸一（无 bio）没定罪 → 走到闸二拉了 bio 本该更容易定罪，
+			// 结果因为 text 又变回空串，反而比闸一更判不出来。
+			{ profile, text: text || contactName, quotedText, forwardChat, media,
+				// 闸二同样带名片手机号 —— 与闸一同源，否则闸二的复评读不到号码指纹。
+				phone: message?.contact?.phone_number },
+			{ config, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
+		));
+		// 闸二已拉到 getChat，头像就在响应里 —— 读指纹零成本，叠加在历史分之后作最终裁决。
+		// 图片判据【必须在这里再叠一次】：闸二的 baseEvaluation 是重新算出来的，
+		// 闸一叠进去的那份并不跟过来。图片是唯一证据、且闸一没定罪时，
+		// 少了这一行就会在这一步漏回放行。
+		// 叠的是闸前已经读好的 imageRow —— 同一行不读第二遍，热路径 SQL 只付一次。
+		// 两者都只改 verdict / reasons 不碰 score，所以叠放顺序只影响 reasons 的排列，
+		// 不影响分值与阈值比较。
+		const avatarEvaluation = await applyAvatarToEvaluation(
+			env,
+			applyImageVerdict(baseEvaluation, imageRow),
+			profile
+		);
+		// 同款会员标叠在最外层：闸一那条零成本路径拿不到会员标（getChat 还没发），
+		// 所以这一层只在闸二及其后（入群线、AI 补查、cron 复查）生效 ——
+		// 与头像完全同位，热路径的 Telegram 请求数一个都不多。
+		let judged = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+		// ===== 第四路补位：前三层都没定罪时交给生成式模型 =====
+		// 这是治「样本外话术」的那一处 —— 词表没列到、指纹没学过、bge-m3 样本库里
+		// 没有近似的正文，在这里由模型直接判。载荷口径与上面 evaluateAdSuspect 一致
+		// （text || contactName），两层看到的是同一份内容。
+		judged = await applyAdLLMToEvaluation(env, judged, config, {
+			profile, text: text || contactName,
+			// 与闸一同口径：名片形态要能作为硬证据，否则闸二判到 0.95 也只能观察。
+			contactCardName: contactName,
+			contactPhone: String(message?.contact?.phone_number || '')
+		}, { pool: 'message', llmMemo: gate2LLMMemo });
+		return judged;
+	};
+	let evaluation = await judgeGate2();
+	// ===== 补查资料卡挂的链接（2026-11）=====
+	// 前置分档没让查、但本次已经可疑（observe / AI 判广告 / 头像命中）的人，
+	// 补查他挂的东西；挂的东西真有广告内容才重评一次，否则判定原样不动。
+	const gate2SuspectLinks = await recheckAdProfileLinks(env, profile, evaluation);
+	if (gate2SuspectLinks) {
+		profile.adLinks = gate2SuspectLinks;
+		evaluation = await judgeGate2();
+	}
 
 	if (evaluation.verdict === 'ban') {
 		if (await isAdminInAnyConfiguredGroup(userId, chat.id)) {

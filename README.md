@@ -1,5 +1,7 @@
 # CF-Workers-TGUnbanBot-Plus
 
+> 更新日志见 [CHANGELOG.md](CHANGELOG.md)：每次更新改了什么、新增了哪些环境变量、要不要手动操作。
+
 ## 🙏 致敬原作者
 
 | 项目 | 信息 |
