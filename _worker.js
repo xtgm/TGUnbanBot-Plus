@@ -20092,7 +20092,11 @@ const AD_TRADE_VERBS = [
 	// 「七折出17 pro max 看我简介」两条在全部词表里逐词零命中、得 0 分放行。
 	// 这两个是【招揽/促销动作】，单独出现不算证据（「我们店上新了」不会命中），
 	// 必须与 AD_BUSINESS_KEYWORDS 的行业词同现才凑成形态 A，门槛与其它动词完全一致。
-	'上新', '七折'
+	'上新', '七折',
+	// 跑分黑话（2026-11 变体查杀批次 1）：「来码洗米 挣八千」「微信拿码收米」——
+	// 「来码 / 拿码」是要收款码的动作，进交易动词表；「洗米 / 收米」是行业词，进业务词表。
+	// 两张表分开放是刻意的：同一个词进两张表会让它一个词就凑出协同分。
+	'来码', '拿码'
 ];
 
 // 弱交易动词：形态上像招揽，但在正常语境里同样高频，单独出现不构成任何广告证据。
@@ -20155,7 +20159,10 @@ const AD_BUSINESS_KEYWORDS = [
 	'六合彩', '开奖', '内幕', '发票', '增值税', '代开', '普票', '专票', '票粉',
 	// 色情引流补词：清单样本里「假钞嫖娼」「假钞玩妹」逐词实测零命中 ——
 	// 表里有「约炮 / 操逼 / 楼凤」这类黑话，却没有最直白的这两个词。
-	'嫖娼', '玩妹'
+	'嫖娼', '玩妹',
+	// 跑分黑话（2026-11 变体查杀批次 1，与交易动词表的「来码 / 拿码」配对）。
+	// 单独出现不计分：「今天去洗米做饭」只命中业务词这一类，0 分。
+	'洗米', '收米', '码商'
 ];
 
 // 豁免词：命中且无交易动词时整体减分，保护正常用户。
@@ -21601,7 +21608,46 @@ function buildAdMatchTexts(text) {
 	const source = String(text ?? '');
 	if (!source) return [];
 	const deobfuscated = deobfuscateAdCharSplit(source);
-	return deobfuscated && deobfuscated !== source ? [source, deobfuscated] : [source];
+	const texts = deobfuscated && deobfuscated !== source ? [source, deobfuscated] : [source];
+	// 变体还原（2026-11 变体查杀批次 1）：谐音 / 形近字 / 大写数字归一成标准写法后
+	// 再追加一份，让现有全部词表直接认得「来马洗咪 挣捌仟」这类变形。
+	// 原文与去混淆文本仍然在前两项，归一只追加、不替换，命中口径只会变宽不会变窄。
+	for (const item of [...texts]) {
+		const normalized = normalizeAdVariantText(item);
+		if (normalized && !texts.includes(normalized)) texts.push(normalized);
+	}
+	return texts;
+}
+
+// ===== 变体还原（2026-11 主人口径：谐音 / 形近字 / 数字一律还原后再判）=====
+//
+// 【只在广告构词里还原，不做全局替换】「马」「米」「迷」在正常聊天里到处都是，
+// 全局换掉会让「一马当先」「入迷」都变成别的字。所以谐音字只在【跑分黑话的固定搭配】
+// 里还原：前一个字必须是 来/拿/收/接/扫/送/放（码）或 洗/收/赚/搞（米）。
+// 「出马」「跑马拉松」「入迷」刻意不在搭配表里。
+//
+// 【还原后也不会单独定罪】还原只是让词表认得它；「洗米」「收米」进的是业务词表，
+// 「来码」「拿码」进的是交易动词表 —— 两类同现才计分，「今天去洗米做饭」只有业务词，0 分。
+const AD_VARIANT_DIGIT_MAP = {
+	'壹': '一', '贰': '二', '貳': '二', '叁': '三', '參': '三', '肆': '四', '伍': '五',
+	'陆': '六', '陸': '六', '柒': '七', '捌': '八', '玖': '九', '拾': '十',
+	'佰': '百', '仟': '千', '萬': '万', '億': '亿'
+};
+const AD_VARIANT_DIGIT_RE = /[壹贰貳叁參肆伍陆陸柒捌玖拾佰仟萬億]/g;
+const AD_VARIANT_MA_RE = /([来來拿收接扫掃送放])[马馬玛瑪犸蚂螞嘛]/g;
+const AD_VARIANT_MI_RE = /([洗收赚賺搞])[咪迷眯谜謎秘蜜]/g;
+const AD_VARIANT_ZHENG_RE = /[挣掙](?![扎脱開开])/g;
+
+function normalizeAdVariantText(text) {
+	const source = String(text ?? '');
+	if (!source) return '';
+	const result = source
+		.replace(/來/g, '来')
+		.replace(AD_VARIANT_DIGIT_RE, (ch) => AD_VARIANT_DIGIT_MAP[ch] || ch)
+		.replace(AD_VARIANT_ZHENG_RE, '赚')
+		.replace(AD_VARIANT_MA_RE, '$1码')
+		.replace(AD_VARIANT_MI_RE, (whole, head) => (head === '賺' ? '赚' : head) + '米');
+	return result === source ? '' : result;
 }
 
 function countAdKeywordHits(text, keywords) {
@@ -30026,18 +30072,21 @@ const AD_MONEY_AMOUNT_RE = new RegExp(
 	+ '|(?:\\d\\s*[oO]{2,})'
 	, 'i');
 // 收益动作：承诺赚钱、回报、赌博类。
-const AD_MONEY_GAIN_RE = /赚|收益|利润|稳赚|日赚|日结|月结|躺赚|月入|回本|分红|上分|回血|包赢|带单|跟单|带你/;
+// 「挣」不必写进来：变体还原会把它归一成「赚」（见 normalizeAdVariantText）。
+const AD_MONEY_GAIN_RE = /赚|收益|利润|稳赚|日赚|日结|月结|躺赚|月入|日入|回本|分红|上分|回血|包赢|带单|跟单|带你/;
 // 招人 / 收钱动作：拉人入群、代收款、带货销售。
-const AD_MONEY_SOLICIT_RE = /进群|入群|拉群|了解项目|了解详情|加[薇微vV信]|私我|点我|接单|一单|代收|代付|跑分|收款|收钱|出货|批发|低价|七折|折扣|专卖|上新|代购|带货|面交/;
+const AD_MONEY_SOLICIT_RE = /进群|入群|拉群|了解项目|了解详情|加[薇微vV信]|私我|点我|接单|一单|代收|代付|跑分|收款|收钱|出货|批发|低价|七折|折扣|专卖|上新|代购|带货|面交|来码|拿码|收米|洗米/;
 
 // 命中返回 {score, reason}，不命中返回 null（由调用方决定加不加）。
 function scoreAdMoneySolicit(text) {
 	const source = String(text || '');
 	if (!source.trim()) return null;
-	const amount = AD_MONEY_AMOUNT_RE.test(source);
+	// 变体还原后的文本一并看（「挣捌仟」→「赚八千」），口径与词表匹配同一个入口。
+	const variants = buildAdMatchTexts(source);
+	const amount = variants.some((v) => AD_MONEY_AMOUNT_RE.test(v));
 	if (!amount) return null;
-	const gain = AD_MONEY_GAIN_RE.test(source);
-	const solicit = AD_MONEY_SOLICIT_RE.test(source);
+	const gain = variants.some((v) => AD_MONEY_GAIN_RE.test(v));
+	const solicit = variants.some((v) => AD_MONEY_SOLICIT_RE.test(v));
 	// 金额 + 任一动作即成立（两类同现的下限）。两个都没有就只是在报数，不算招揽。
 	if (!gain && !solicit) return null;
 	const labels = [gain ? '收益动作' : '', solicit ? '招人/收钱动作' : ''].filter(Boolean).join(' × ');
@@ -30081,9 +30130,9 @@ function isAdSuspectSignal(text, reasons, extras = {}) {
 	const solicitHits = countAdKeywordHits(source, AD_TRADE_VERBS).length
 		+ countAdKeywordHits(source, AD_BUSINESS_KEYWORDS).length;
 	if (solicitHits > 0) return true;
-	if (AD_MONEY_AMOUNT_RE.test(source)
-		&& (AD_MONEY_GAIN_RE.test(source) || AD_MONEY_SOLICIT_RE.test(source)
-			|| /[@＠][A-Za-z0-9_]{4,}/.test(source))) {
+	if (scoreAdMoneySolicit(source)
+		|| (buildAdMatchTexts(source).some((v) => AD_MONEY_AMOUNT_RE.test(v))
+			&& /[@＠][A-Za-z0-9_]{4,}/.test(source))) {
 		return true;
 	}
 	return Array.isArray(reasons) && reasons.some((line) => AD_POSITIVE_SIGNAL_RE.test(line));
