@@ -19754,6 +19754,8 @@ const AD_BIO_RECHECK_SECONDS = AD_BIO_RECHECK_DAYS * 24 * 3600;
 // 【为什么不直接取消冷却期】0 正分的普通聊天必须原样走原分档，否则「稳态下每条消息
 // 0 个 Telegram 请求」就没了 —— test_kick 的稳定态断言用的正是 0 正分的普通文本。
 const AD_SUSPECT_BIO_COOLDOWN_SECONDS = 10 * 60;
+// 第⑥层判广告被拦时强制拉资料的冷却（见闸一 llmFlaggedObserve）。
+const AD_LLM_FORCE_PROFILE_COOLDOWN_SECONDS = 60;
 // 与前置分档的 AD_REASON_POSITIVE_RE 刻意不同：这里必须排除 +0。评分层的 add 没有
 // delta 保护，分数为 0 的判据照样 push 进 reasons（见 scoreAdForwardChat 的
 // 「来源频道名为随机字母串」，AD_RANDOM_CHANNEL_SCORE = 0），而 0 分不构成「有特征」。
@@ -20784,6 +20786,15 @@ async function ensureAdDetectionTables(env) {
 			// file_id 又只在换图前有效，所以只在视觉识别那一刻用，不参与比对。
 			await runD1SchemaStatement(env, 'ad_avatars', 'CREATE TABLE IF NOT EXISTS ad_avatars (file_unique_id TEXT PRIMARY KEY, verdict TEXT NOT NULL DEFAULT \'pending\', hits INTEGER NOT NULL DEFAULT 0, file_id TEXT, source TEXT, last_user_id TEXT, vision_checked_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_avatars_verdict', 'CREATE INDEX IF NOT EXISTS idx_ad_avatars_verdict ON ad_avatars (verdict)', { optional: true });
+			// 【2026-11-01 头像读字】ocr_at=0 表示这张图还没被读过字（含 clef 判过的老行）——
+			// 下次出现时补读一次。线上实例：头像写着「看我简介」，clef 判成 clean，此后一直按干净命中库。
+			await runD1SchemaStatement(env, 'ad_avatars.ocr_text',
+				'ALTER TABLE ad_avatars ADD COLUMN ocr_text TEXT', { optional: true });
+			await runD1SchemaStatement(env, 'ad_avatars.ocr_at',
+				'ALTER TABLE ad_avatars ADD COLUMN ocr_at INTEGER NOT NULL DEFAULT 0', { optional: true });
+			// 头像文字特征库：只拿头像读出的字来比，不扫昵称 / 简介 / 正文。说明见 AD_AVATAR_TEXT_SEED。
+			await runD1SchemaStatement(env, 'ad_avatar_texts',
+				'CREATE TABLE IF NOT EXISTS ad_avatar_texts (text_key TEXT PRIMARY KEY, value TEXT NOT NULL, source TEXT NOT NULL, hits INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
 			// 【2026-11】头像跨用户复用：记录「同一张头像在谁身上被定罪过」。
 			//
 			// 【补的是哪个洞】ad_avatars.hits 的语义本该是「用过这张图的人里被定罪的次数」，
@@ -20955,6 +20966,17 @@ async function seedAdDetectionData(env) {
 		}
 	} catch (error) {
 		console.error('[广告检测] 指纹种子写入失败:', error);
+	}
+	try {
+		// 头像文字库种子：INSERT OR IGNORE 幂等，每次冷启动跑一次（十几条，不按数量判空 ——
+		// 以后补种子时直接生效，不用手动清表）。
+		const now = Math.floor(Date.now() / 1000);
+		const statements = AD_AVATAR_TEXT_SEED.map((value) => env.DB
+			.prepare('INSERT OR IGNORE INTO ad_avatar_texts (text_key, value, source, hits, created_at, updated_at) VALUES (?, ?, \'seed\', 0, ?, ?)')
+			.bind(normalizeAdAvatarText(value), value, now, now));
+		if (statements.length) await env.DB.batch(statements);
+	} catch (error) {
+		console.error('[广告检测] 头像文字种子写入失败:', error);
 	}
 }
 
@@ -25270,7 +25292,7 @@ async function readAdAvatar(env, fileUniqueId) {
 	const key = String(fileUniqueId || '');
 	if (!env?.DB || !key) return null;
 	try {
-		const row = await env.DB.prepare('SELECT file_unique_id, verdict, hits, source, last_user_id, vision_checked_at, created_at, updated_at FROM ad_avatars WHERE file_unique_id = ?').bind(key).first();
+		const row = await env.DB.prepare('SELECT file_unique_id, verdict, hits, source, last_user_id, vision_checked_at, created_at, updated_at, file_id, ocr_text, ocr_at FROM ad_avatars WHERE file_unique_id = ?').bind(key).first();
 		return row || null;
 	} catch (error) {
 		// 查不到不等于干净：失败按「未入库」处理，下一条消息再试，
@@ -25314,6 +25336,16 @@ async function upsertAdAvatar(env, fileUniqueId, patch = {}) {
 			+ 'vision_checked_at = CASE WHEN excluded.vision_checked_at > 0 THEN excluded.vision_checked_at ELSE ad_avatars.vision_checked_at END, '
 			+ 'updated_at = excluded.updated_at'
 		).bind(key, verdict, fileId, source, lastUserId, visionCheckedAt, now, now).run();
+		if (patch.ocrAt) {
+			// 读字结果单独一条 UPDATE，排在 INSERT 之后（行一定已存在）。
+			// 只在真读过字时才发，其余调用方的 SQL 一个字节不变。
+			try {
+				await env.DB.prepare('UPDATE ad_avatars SET ocr_text = ?, ocr_at = ? WHERE file_unique_id = ?')
+					.bind(String(patch.ocrText || '').slice(0, 200), Number(patch.ocrAt) || 0, key).run();
+			} catch (ocrError) {
+				console.error('[广告检测] 写入头像读字结果失败:', ocrError);
+			}
+		}
 		return true;
 	} catch (error) {
 		console.error('[广告检测] 写入头像指纹失败:', error);
@@ -25407,6 +25439,12 @@ async function clearAdAvatarOnIgnore(env, fileUniqueId) {
 	const key = String(fileUniqueId || '');
 	if (!env?.DB || !key) return false;
 	const now = Math.floor(Date.now() / 1000);
+	// 【2026-11-01】从这张头像学进头像文字库的字一起撤掉（种子永不删，见 forgetAdAvatarText）。
+	// 头像本身转成 manual clean 后已经不会再由字定罪；撤字是防它去连坐【别的】同字头像。
+	try {
+		const old = await readAdAvatar(env, key);
+		if (String(old?.ocr_text || '').trim()) await forgetAdAvatarText(env, old.ocr_text);
+	} catch (_) { /* 撤字失败不影响纠错本身 */ }
 	try {
 		await env.DB.prepare('INSERT INTO ad_avatars (file_unique_id, verdict, hits, source, vision_checked_at, created_at, updated_at) VALUES (?, \'clean\', 0, \'manual\', 0, ?, ?) ON CONFLICT(file_unique_id) DO UPDATE SET verdict = \'clean\', hits = 0, source = \'manual\', updated_at = excluded.updated_at').bind(key, now, now).run();
 		// 【2026-11】去重表要跟着清空 —— 否则 hits 归零了但「谁被封过」的记录还在：
@@ -25439,6 +25477,28 @@ async function clearAdAvatarOnIgnore(env, fileUniqueId) {
 //   clean / pending / 无头像 → 原样返回，一个字节都不改
 function applyAvatarVerdict(evaluation, avatar) {
 	if (!evaluation || !avatar) return evaluation;
+	// ===== 头像文字命中特征库 → 直接定罪（2026-11-01，主人特批的单特征例外）=====
+	//
+	// 主人原话：「头像可以直接杀单特征。但特征的识别是建立在原有的特征上查杀」
+	// 「如果头像带有字，则通过目前的特征库进行匹配。没有匹配到就不封，匹配到了就封杀掉」。
+	// 【为什么它能单独定罪而头像图库不能】图库命中只说明「这张图像某张广告图」，
+	// 头像被盗用、撞车都会命中；而这里命中的是【图上写着的引流语】（点我进群 / 看我简介 /
+	// 果聊…）—— 正常人不会把这些字印在自己头像上。92 张实测样本里 11 张带字的正常头像
+	// 一张都不命中。
+	// 【不看 verdict】模型判 clean 的图照样比字：6101665227 的头像写着「看我简介」，
+	// clef 判成了 clean。人工判过干净的（source='manual'）由调用方挡掉，不会走到这里。
+	const textHit = avatar.textHit && typeof avatar.textHit === 'object' ? avatar.textHit : null;
+	if (textHit) {
+		const ocr = String(avatar.ocr_text || '').trim().slice(0, 60);
+		const line = '头像文字命中特征库：「' + ocr + '」→ 命中「' + String(textHit.value || '').slice(0, 30) + '」（'
+			+ (textHit.from === 'fingerprint' ? '指纹库' : '头像文字库') + '）';
+		const reasons = (evaluation.reasons || []).concat([line]);
+		const already = String(evaluation.verdict) === 'ban';
+		return Object.assign({}, evaluation, {
+			verdict: 'ban',
+			reasons: already ? reasons : markAdConvictLayer(reasons, '文字头像')
+		});
+	}
 	if (String(avatar.verdict || '') !== 'ad') return evaluation;
 	const hits = Number(avatar.hits) || 0;
 	// 【2026-10-14 修：佐证只认【正分】判据】
@@ -25772,6 +25832,17 @@ async function applyAvatarToEvaluation(env, evaluation, profile) {
 	// 退回旧行为的四道闸见 judgeAdAvatarRealtime。
 	const avatar = await judgeAdAvatarRealtime(env, avatarId, profile);
 	if (!avatar) return evaluation;
+	// 头像上读到了字 → 拿特征库比。人工判过干净的头像永不由字定罪（主人拍板的安全阀）。
+	// 没字的头像（绝大多数）这里一条 SQL 都不发；有字的走带缓存的两张库，同样不多发。
+	let textHit = null;
+	if (String(avatar.ocr_text || '').trim() && String(avatar.source || '') !== 'manual') {
+		try {
+			textHit = await matchAdAvatarText(env, avatar.ocr_text);
+		} catch (error) {
+			console.error('[广告检测] 头像文字比对失败:', error);
+		}
+	}
+	if (textHit) return applyAvatarVerdict(evaluation, Object.assign({}, avatar, { textHit }));
 	// 【2026-11】复用佐证改看「几个不同的人」而不是「封了几次」，见 countAdAvatarBannedUsers。
 	// 【为什么这里不多付一条热路径 SQL】只有 verdict='ad' 的头像才可能走到复用档，
 	// 其余（clean / pending / 没入库）在 applyAvatarVerdict 入口第一行就原样返回了。
@@ -27282,8 +27353,27 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 		// 代码硬证据（私有邀请形态 / 引流出口∧招揽 / 名片形态）仍可单独定罪：
 		// 那三项本身就是多要素合取，且一个字都不信模型输出。
 		const secondEvidence = citations.length ? collectAdLLMSecondEvidence(input, current) : [];
+		// ===== 引文没过，但代码自己验出了【有案底】的证据（2026-11-01）=====
+		//
+		// 【补的洞】8635333338：模型说「bio 含私密群邀请链接」（引文核对没过 —— 那是公开链接），
+		// 而代码自己验出「挂的 @nu87y 有广告案底」。原实现第二证据只在引文通过时才算，
+		// 于是一条代码独立验出的硬事实被模型的一句错话连带作废。
+		// 【只认两条与模型无关的】指纹库命中、挂的频道/群/bot 有案底或内容是广告 ——
+		// 都是我方账本或被挂号自己写的东西，一个字都不来自模型。词表类（同现 / 堆叠 / 复读）
+		// 不在此列：没有引文时它们与模型的结论没有对应关系。
+		// 这仍是「模型判断 + 一份代码证据」两份特征，不违背「单特征不能封」。
+		const recordEvidence = citations.length ? [] : collectAdLLMSecondEvidence(input, current)
+			.filter((hit) => hit === '指纹库命中' || hit.startsWith('挂的 @'));
 		// 【不能给 reasons 重新赋值】它是 const —— 直接 `reasons = reasons.concat(...)`
 		// 会抛 Assignment to constant variable，整条检测链在 try 里炸掉、返回 result: error。
+		if (recordEvidence.length) {
+			return Object.assign({}, current, {
+				verdict: 'ban',
+				reasons: markAdConvictLayer(reasons.concat([
+					'（模型引文未通过核对，但代码独立验出：' + recordEvidence.slice(0, 2).join('、') + '）'
+				]), 'LLM')
+			});
+		}
 		if (hardEvidence.length || (citations.length && secondEvidence.length)) {
 			// 【定罪归属】函数入口那道 `verdict === 'ban' 直接返回` 保证走到这里
 			// 必定是本层定的罪，所以标记无条件写。
@@ -28285,7 +28375,27 @@ async function drainAdAvatarLearningQueue(env, limit = 30) {
 // has_text.noul = 0.96；三张非广告图（纯色 / 渐变 / 含大量中文的资料卡截图）
 // 全部 clean，ad 概率 0.037~0.099 —— 0.9369 vs 0.0985 的区分度，阈值 0.5 即可干净分离。
 // 另外它 output_tokens = 0（不收输出费），而 llama 那边每次白烧 512~800 个复读 token。
-const AD_AVATAR_VISION_MODEL = '@cf/cloudflare/clef-flash';
+//
+// 【2026-11-01 头像换模型：clef-flash → gemma-4-26b 读字 + qwen3.8-27b 兜底】
+// 主人口径：「头像带字 → 拿特征库匹配，匹配到就杀并学进头像特征库；没匹配到不封」。
+// clef 只回答「像不像广告」，不读字，这条口径它做不到。用 92 张线上真实头像
+//（人工逐张标注：40 广告 / 52 正常，其中 11 张带字的正常头像）跑 Workers AI 全部多模态模型：
+//   qwen3.8-27b   广告 100%  误判 0%   读字 100%  6.5s/张（P90 16s，最长 48s）27.8 Neurons
+//   gemma-4-26b   广告 100%  误判 2%   读字 98%   2.6s/张（P90 3.5s）          4.0 Neurons
+//   clef-flash    广告 100%  误判 10%  不读字     1.7s/张                      3.5 Neurons
+// gemma 只比 qwen 少对 1 张，却稳 5 倍、便宜 7 倍 → gemma 主读，失败或超时才换 qwen 再读一次。
+// 正文图那条仍用 clef-flash（AD_IMAGE_VISION_MODEL），这次不动。
+const AD_AVATAR_VISION_MODEL = '@cf/google/gemma-4-26b-a4b-it';
+const AD_AVATAR_VISION_FALLBACK_MODEL = '@cf/qwen/qwen3.8-27b';
+// 超时：gemma 实测 92 张里只有 1 张超过 10s；qwen 兜底给宽一些（P90 16s）。
+// 超时只是不再等，不是取消计费 —— 所以兜底只在主模型确实没给出结论时才调。
+const AD_AVATAR_VISION_TIMEOUT_MS = 8000;
+const AD_AVATAR_VISION_FALLBACK_TIMEOUT_MS = 20000;
+const AD_AVATAR_OCR_PROMPT = '这是一张 Telegram 用户头像。只输出一个 JSON，不要任何别的文字：'
+	+ '{"text":"逐字抄录图中所有文字（中文、英文、数字、@用户名、网址、水印），看不清的字用?代替，没有文字填空串",'
+	+ '"ad":true 或 false}。'
+	+ 'ad 的判断标准：图里有引流文字（代发、代理、赚钱、招租、换汇、看简介/看主页、联系方式、@用户名、网址）、'
+	+ '二维码、赌博/色情/灰产图案、商品推销即为 true；自拍、风景、宠物、动漫、普通 logo、纯色图案为 false。';
 // 【2026-11 提额：50 → 150，按 clef-flash 的官方实价重算（第三批）】
 // 原来的 50 是按 moondream 的「单张 35~50 Neurons」估的 —— 那是用 $/M token
 // 反推 $11/M Neurons 得来的未验证值，官方从未公布过。
@@ -28381,7 +28491,8 @@ const AD_VISION_RETRY_COOLDOWN_SEC = 24 * 60 * 60;
 // 配置上限与实际消耗对不上，看板上「当日 x/300」会一直停在 200 以下。
 // 队列靠 vision_checked_at 自平衡，轮与轮之间不会重复取同一条。
 const AD_IMAGE_VISION_BATCH = 150;
-const AD_IMAGE_VISION_MODEL = AD_AVATAR_VISION_MODEL;
+// 【2026-11-01】头像改走 gemma 读字后，正文图仍用 clef-flash —— 不再跟头像共用常量。
+const AD_IMAGE_VISION_MODEL = '@cf/cloudflare/clef-flash';
 // 状态键与头像的 avatar_day / avatar_count 各自独立，两轨互不挤占。
 const AD_IMAGE_VISION_DAY_KEY = 'img_day';
 const AD_IMAGE_VISION_COUNT_KEY = 'img_count';
@@ -28431,7 +28542,7 @@ const CLEF_AD_QUESTION = {
 
 // 返回 { ad, prob, confidence }；拿不到判定返回 null（调用方按失败处理 → stage=ai.run）。
 async function runVisionJudge(env, imageUri, state) {
-	const result = await env.AI.run(AD_AVATAR_VISION_MODEL, {
+	const result = await env.AI.run(AD_IMAGE_VISION_MODEL, {
 		model: 'clef-flash',
 		state,
 		images: [String(imageUri || '')],
@@ -28452,6 +28563,155 @@ async function runVisionJudge(env, imageUri, state) {
 		prob: Number(ans?.probabilities?.ad ?? 0),
 		confidence: Number(ans?.confidence ?? 0)
 	};
+}
+
+// ===== 头像读字（2026-11-01，gemma 主读 + qwen 兜底）=====
+//
+// 返回 { ad, text, model }；两个模型都没给出可解析的结论时抛错（调用方按失败处理）。
+// 【429 要原样抛出】调用方靠 isVisionRateLimited 认出限流：不计熔断、不落库、下次再判。
+// 主模型 429 时照样换兜底模型试 —— 两个模型的限流额度是分开的。
+async function runAvatarOcrJudge(env, imageUri) {
+	const attempts = [
+		{ model: AD_AVATAR_VISION_MODEL, timeoutMs: AD_AVATAR_VISION_TIMEOUT_MS },
+		{ model: AD_AVATAR_VISION_FALLBACK_MODEL, timeoutMs: AD_AVATAR_VISION_FALLBACK_TIMEOUT_MS }
+	];
+	let lastError = null;
+	for (const attempt of attempts) {
+		let timer = null;
+		try {
+			const call = env.AI.run(attempt.model, {
+				messages: [{ role: 'user', content: [
+					{ type: 'text', text: AD_AVATAR_OCR_PROMPT },
+					{ type: 'image_url', image_url: { url: String(imageUri || '') } }
+				] }],
+				max_tokens: 300,
+				temperature: 0,
+				chat_template_kwargs: { enable_thinking: false }
+			});
+			const timeout = new Promise((_, reject) => {
+				timer = setTimeout(() => reject(new Error('头像读字超时 ' + attempt.timeoutMs + 'ms')), attempt.timeoutMs);
+			});
+			const result = await Promise.race([call, timeout]);
+			const raw = result?.choices?.[0]?.message?.content ?? result?.response ?? result?.result?.response ?? '';
+			const parsed = parseAvatarVisionAnswer(typeof raw === 'string' ? raw : JSON.stringify(raw));
+			if (parsed) {
+				return { ad: parsed.ad, text: String(parsed.text || '').trim(), model: attempt.model.split('/').pop() };
+			}
+			lastError = new Error('头像读字未返回可解析的 JSON（' + attempt.model.split('/').pop() + '）');
+		} catch (error) {
+			lastError = error;
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
+	throw lastError || new Error('头像读字失败');
+}
+
+// ===== 头像文字特征库（2026-11-01）=====
+//
+// 主人口径：「头像带字 → 拿特征库匹配，匹配到就封杀，并自动学进头像特征库；没匹配到不封。
+// 正常的图片不会被识别成广告，因为能识别出广告的头像，要么是广告图标，要么带广告文字。」
+//
+// 【为什么另建一张表，不直接用 ad_fingerprints】实测线上指纹库 500 条对真实广告头像上的
+// 8 种典型文字（点我进群 / 看我主页 / 妍妍果聊 / VCC 虚拟卡 / 太阳代发…）【零命中】——
+// 那张库学的是 bio 与正文里的长句，头像上是 4~6 个字的短引流语。
+// 反过来也不能把这些短语塞进 ad_fingerprints：那里命中即定罪、扫的是昵称 + 简介 + 正文，
+// 「点我进群」会变成正文里一出现就秒杀。所以这张库【只拿头像读出来的字比】。
+// ad_fingerprints 仍然一起比（主人原话「通过目前的特征库进行匹配」），只取能单独定罪的那部分。
+//
+// 【种子只放引流动作，不放单个行业词】92 张实测样本里 11 张带字的正常头像
+//（STAY WEIRD / BIBLE / 新电影海报 / 三品王牛肉粉 / Calvin Klein / 少年頭像館…）一张都不命中；
+// 40 张广告头像里带引流字的全部命中。唯一没命中的广告头像（034，图上写「手机拍照」）
+// 字面完全正常，交给原有的头像三档与观察提醒，不靠字去封。
+const AD_AVATAR_TEXT_SEED = [
+	'点我进群', '点我头像', '点我主页', '点我简介', '点我赚钱',
+	'看我主页', '看我简介', '看我头像', '主页赚钱', '赚钱看我', '进群赚钱',
+	'进群', '果聊', '虚拟卡', '代发', '自动发货', '协议号'
+];
+// 学进库的头像文字最短几个字（归一化后）。太短的字（「大明」「NASA」）当特征会误杀。
+const AD_AVATAR_TEXT_MIN_LEARN_LENGTH = 4;
+const AD_AVATAR_TEXT_CACHE = new WeakMap();
+
+// 归一化：小写、去掉空白与常见标点。模型读字时空格断得不稳定 ——
+// 同一张「TAB 点我进群」gemma 读成「TAB 点我 进群」、qwen 读成「TAB 点我进群」。
+function normalizeAdAvatarText(value) {
+	return String(value ?? '')
+		.toLowerCase()
+		.replace(/[\s​-‍﻿·•・,，.。!！?？:：;；、|｜\-_\/\\()（）《》〈〉【】\[\]「」『』"'“”‘’~～*#]+/g, '')
+		.slice(0, 200);
+}
+
+async function loadAdAvatarTexts(env) {
+	if (!env?.DB) return [];
+	try {
+		const value = await loadAdCachedValue(AD_AVATAR_TEXT_CACHE, env.DB, AD_FINGERPRINT_CACHE_TTL_MS, async () => {
+			const { results } = await env.DB.prepare(
+				'SELECT value, source FROM ad_avatar_texts ORDER BY hits DESC LIMIT 1000').all();
+			return (results || []).map((row) => ({
+				value: String(row.value || ''),
+				normalized: normalizeAdAvatarText(row.value),
+				source: String(row.source || '')
+			})).filter((row) => row.normalized);
+		});
+		return Array.isArray(value) ? value : [];
+	} catch (error) {
+		console.error('[广告检测] 读取头像文字库失败:', error);
+		return [];
+	}
+}
+
+// 头像文字 → 命中哪一条特征。返回 { value, from } 或 null。
+// from = 'avatar_text'（头像文字库）/ 'fingerprint'（现有指纹库里能单独定罪的那部分）。
+async function matchAdAvatarText(env, ocrText, options = {}) {
+	const text = normalizeAdAvatarText(ocrText);
+	if (!text) return null;
+	for (const row of await loadAdAvatarTexts(env)) {
+		if (text.includes(row.normalized)) return { value: row.value, from: 'avatar_text' };
+	}
+	const config = options.config || loadAdDetectionConfig(env);
+	for (const row of await loadAdFingerprints(env)) {
+		if (row.type === 'username' || row.type === 'phone' || row.type === 'domain') continue;
+		if (row.singleWord || row.weight < AD_FINGERPRINT_BAN_WEIGHT) continue;
+		if (row.confidence < config.fingerprintMinConfidence) continue;
+		const needle = normalizeAdAvatarText(row.value);
+		if (needle.length < AD_AVATAR_TEXT_MIN_LEARN_LENGTH) continue;
+		if (text.includes(needle)) return { value: row.value, from: 'fingerprint' };
+	}
+	return null;
+}
+
+// 定罪即学习：把这张头像上读到的字学进头像文字库（source='ocr'）。
+// 只学「模型自己也判它是广告」的头像 —— 被别的通道定罪的人，头像上可能只是普通文字。
+async function learnAdAvatarText(env, ocrText) {
+	const value = String(ocrText || '').trim().slice(0, 120);
+	const normalized = normalizeAdAvatarText(value);
+	if (!env?.DB || normalized.length < AD_AVATAR_TEXT_MIN_LEARN_LENGTH) return false;
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		const res = await env.DB.prepare(
+			'INSERT INTO ad_avatar_texts (text_key, value, source, hits, created_at, updated_at) VALUES (?, ?, \'ocr\', 1, ?, ?) '
+			+ 'ON CONFLICT(text_key) DO UPDATE SET hits = ad_avatar_texts.hits + 1, updated_at = excluded.updated_at'
+		).bind(normalized, value, now, now).run();
+		AD_AVATAR_TEXT_CACHE.delete(env.DB);
+		return Boolean(res);
+	} catch (error) {
+		console.error('[广告检测] 学习头像文字失败:', error);
+		return false;
+	}
+}
+
+// /ignore 纠错：撤掉从这张头像学来的字。种子永远不删。
+async function forgetAdAvatarText(env, ocrText) {
+	const normalized = normalizeAdAvatarText(ocrText);
+	if (!env?.DB || !normalized) return false;
+	try {
+		await env.DB.prepare('DELETE FROM ad_avatar_texts WHERE text_key = ? AND source = \'ocr\'').bind(normalized).run();
+		AD_AVATAR_TEXT_CACHE.delete(env.DB);
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 撤销头像文字失败:', error);
+		return false;
+	}
 }
 
 async function runVisionModel(env, model, imageUri, prompt) {
@@ -28945,6 +29205,9 @@ async function runAdAvatarVision(env, options = {}) {
 		// 每轮都被取出来反复烧额度，把当天预算全耗在同一个失败项上。
 		let verdict = 'pending';
 		let note = '';
+		// 头像读字结果（gemma / qwen 读出来的字）。ocrAt=0 表示这次没读成，写库时不覆盖。
+		let ocrText = '';
+		let ocrAt = 0;
 		// 失败定位用。线上真实日志里这个 error 的 message 是【空的】，Workers Logs 只打出了
 		// 裸栈「at runAdImageVision …」—— getFile 401、下载 404、图片超限、AI 调用被拒，
 		// 在看板上长得一模一样。有这个变量才知道挂在哪一步。
@@ -29013,10 +29276,12 @@ async function runAdAvatarVision(env, options = {}) {
 			stage = 'encode';
 			const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
 			stage = 'ai.run';
-			const judge = await runVisionJudge(env, image, CLEF_AVATAR_STATE);
-			if (!judge) throw new Error('clef 未返回判定');
+			const judge = await runAvatarOcrJudge(env, image);
 			verdict = judge.ad ? 'ad' : 'clean';
-			lastNote = '判定=' + (judge.ad ? '广告' : '干净') + ' 概率=' + judge.prob.toFixed(4);
+			ocrText = judge.text;
+			ocrAt = Math.floor(Date.now() / 1000);
+			lastNote = '判定=' + (judge.ad ? '广告' : '干净') + ' 模型=' + judge.model
+				+ (judge.text ? ' 文字=' + judge.text.slice(0, 20) : '');
 		} catch (error) {
 			// 【429 不计入失败、不触发熔断】限流是必然会遇到的临时状态，不是链路故障 ——
 			// Workers AI 对需付费计划的模型限 20 RPM，串行跑几百张【必然】撞上。
@@ -29049,7 +29314,9 @@ async function runAdAvatarVision(env, options = {}) {
 			await upsertAdAvatar(env, row.file_unique_id, {
 				verdict,
 				source: verdict === 'pending' ? null : 'vision',
-				visionCheckedAt: Math.floor(Date.now() / 1000)
+				visionCheckedAt: Math.floor(Date.now() / 1000),
+				ocrText,
+				ocrAt
 			});
 		} catch (error) {
 			console.error('[广告检测·头像] 写回结果失败:', error);
@@ -29402,9 +29669,16 @@ async function judgeAdAvatarRealtime(env, avatarId, profile) {
 
 	// ① 判过的直接命中库，一个 Neurons 都不花。
 	const row = await readAdAvatar(env, key);
+	// 【补读】判过但从没读过字的头像（ocr_at=0），再读一次字，只读一次。
+	// 治的是 6101665227 那一类：头像上明写「看我简介」，clef 判成 clean 后命中库直接返回，
+	// 这张图之后永远不会再被看第二眼。人工判过的（source='manual'）永不补读 ——
+	// 主人拍过板的结论不让模型再改。
+	const isReread = Boolean(row) && String(row.verdict || '') !== 'pending';
 	if (row) {
 		// pending 但没有可下载句柄的，退回旧行为 —— 那种当下判不了，只能先登记着。
-		if (String(row.verdict || '') !== 'pending' || !String(row.file_id || '')) return row;
+		if (!String(row.file_id || '') && !String(profile?.avatarFileId || '')) return row;
+		if (isReread && (Number(row.ocr_at) > 0 || String(row.source || '') === 'manual')) return row;
+		if (!isReread && !String(row.file_id || '')) return row;
 	} else {
 		// 首次见到：登记成 pending。登记本身零成本，实时判定紧接在后面。
 		await registerAdAvatar(env, profile, uid);
@@ -29427,7 +29701,8 @@ async function judgeAdAvatarRealtime(env, avatarId, profile) {
 	let fileId = String(row?.file_id || profile?.avatarFileId || '');
 	if (!fileId) return row || null;
 	let verdict = 'pending';
-	let prob = 0;
+	let ocrText = '';
+	let ocrAt = 0;
 	let skipBump = false;
 	try {
 		const askFile = async (id) => {
@@ -29460,26 +29735,49 @@ async function judgeAdAvatarRealtime(env, avatarId, profile) {
 		if (buffer.byteLength > AD_VISION_MAX_IMAGE_BYTES) return row || null;
 		const mime = sniffImageMime(new Uint8Array(buffer)) || 'image/jpeg';
 		const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
-		const judge = await runVisionJudge(env, image, CLEF_AVATAR_STATE);
-		if (!judge) throw new Error('clef 未返回判定');
+		const judge = await runAvatarOcrJudge(env, image);
 		verdict = judge.ad ? 'ad' : 'clean';
-		prob = Number(judge.prob) || 0;
-		console.log('[头像实时判定] ' + (judge.ad ? '广告' : '干净') + ' 概率=' + prob.toFixed(4)
+		ocrText = judge.text;
+		ocrAt = Math.floor(Date.now() / 1000);
+		console.log('[头像实时判定] ' + (judge.ad ? '广告' : '干净') + ' 模型=' + judge.model
+			+ (isReread ? ' 补读' : '')
+			+ ' 文字=' + (judge.text ? judge.text.slice(0, 30) : '（无）')
 			+ ' 头像=' + key.slice(0, 20) + ' 归属=' + (uid || '未知')
 			+ ' 当日=' + (quota.used + 1) + '/' + dailyLimit);
 	} catch (error) {
 		if (isVisionRateLimited(error)) return row || null;
 		if (isVisionFileMissing(error)) skipBump = true;
 		await logAdVisionFailure(env, '头像·实时', 'ai.run', key, error);
+		// 补读失败也记一次 ocr_at：两个模型都读不了的图，下条消息再读还是一样，
+		// 不能让同一张图每条消息都烧一次额度。
+		if (isReread) ocrAt = Math.floor(Date.now() / 1000);
 	}
 	try {
-		await upsertAdAvatar(env, key, {
-			verdict,
-			source: verdict === 'pending' ? null : 'vision',
-			fileId,
-			lastUserId: uid || null,
-			visionCheckedAt: Math.floor(Date.now() / 1000)
-		});
+		if (isReread) {
+			// 补读【只往更严的方向改】：读出 ad 才把 clean 改成 ad；读出 clean 不动原结论，
+			// source 也只在 clean→ad 时才改成 vision（learned 的行保持 learned）。
+			// 失败时 verdict 仍是 pending —— 绝不能把一张判过的图写回 pending。
+			const oldVerdict = String(row.verdict || '');
+			const upgrade = verdict === 'ad' && oldVerdict !== 'ad';
+			await upsertAdAvatar(env, key, {
+				verdict: upgrade ? 'ad' : oldVerdict,
+				source: upgrade ? 'vision' : null,
+				fileId,
+				lastUserId: uid || null,
+				ocrText,
+				ocrAt
+			});
+		} else {
+			await upsertAdAvatar(env, key, {
+				verdict,
+				source: verdict === 'pending' ? null : 'vision',
+				fileId,
+				lastUserId: uid || null,
+				visionCheckedAt: Math.floor(Date.now() / 1000),
+				ocrText,
+				ocrAt
+			});
+		}
 	} catch (error) {
 		console.error('[头像实时判定] 写回结果失败:', error);
 	}
@@ -29503,9 +29801,10 @@ async function judgeAdAvatarRealtime(env, avatarId, profile) {
 	// 会落进观察窗口，notifyAvatarHitObserve 带两个按钮提醒主人拍板 ——
 	// 这是「单特征不能封」在这条路上的代价，与本轮三档改判据同一取向。
 	const finalRow = await readAdAvatar(env, key);
+	// 回读失败时的兜底行也要带上读到的字 —— 头像文字直杀档只看 ocr_text。
 	return finalRow || (verdict === 'ad'
-		? { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid }
-		: row || null);
+		? { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid, ocr_text: ocrText, ocr_at: ocrAt }
+		: (row ? Object.assign({}, row, { ocr_text: ocrText, ocr_at: ocrAt }) : null));
 }
 
 async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 1000)) {
@@ -30986,6 +31285,19 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 			const convictedByAvatarLayer = (evaluation?.reasons || [])
 				.some((r) => String(r) === AD_CONVICT_MARK + '头像');
 			if (!convictedByAvatarLayer && await learnAdAvatarOnBan(env, immediateAvatar, userId)) avatars += 1;
+			// 头像上读到的字学进头像文字库（主人口径「查杀并自动学习该特征入头像特征库」）。
+			// 只学两种：头像文字层自己定的罪（字已命中特征库，整段原文入库拦同款），
+			// 或模型自己也判这张图是广告（verdict='ad'）—— 被别的通道定罪的人，
+			// 头像上的字可能只是普通文字（店名、海报），不能跟着学。
+			try {
+				const avatarRow = await readAdAvatar(env, immediateAvatar);
+				const ocrText = String(avatarRow?.ocr_text || '').trim();
+				const byAvatarText = (evaluation?.reasons || []).some((r) => String(r) === AD_CONVICT_MARK + '文字头像');
+				if (ocrText && String(avatarRow?.source || '') !== 'manual'
+					&& (byAvatarText || String(avatarRow?.verdict || '') === 'ad')) {
+					await learnAdAvatarText(env, ocrText);
+				}
+			} catch (_) { /* 头像文字学习失败不影响本次处置 */ }
 			// 会员标跟着同一条路径学：两者都来自同一份 getChat 响应，
 			// 要么一起有（闸二 / 入群 / cron 定罪）要么一起空（闸一定罪）。
 			// 【刻意嵌在 if 里】否则「avatar 空 + badge 有」会既立即学一次、
@@ -32025,10 +32337,29 @@ async function detectAdOnMessage(message, env) {
 		return true;
 	}
 
+	// ===== 第⑥层判了广告却被拦下 → 强制进闸二拉资料再判（2026-11-01）=====
+	//
+	// 【治哪一类】9214480007 / 9283758507：正文「可以收款的来 赚3千」「会用微信收款来 赚5k」，
+	// 闸一 +5 金额招揽 + 模型 0.9 以上判广告，但闸一用的是 cheapProfile（没有 bio、没有头像），
+	// 第二证据一条都凑不出 → 降级观察；而 bio 冷却期（10 分钟）又挡住了闸二 ——
+	// 他们 bio 里明写的 t.me/+ 私有邀请链接（+7）、头像上的「点我进群」「点我头像」
+	// 从头到尾没被看到过。
+	// 【只在这一种情况下无视冷却】模型已经判了广告、只差证据 —— 低频，
+	// 反例池拦下的（主人 /ignore 过的形态）不算，那是人给的结论。
+	// 同一个人 60 秒内只强拉一次，防刷屏时每条消息都拉一次 getChat。
+	const decisionReasons = Array.isArray(decision?.reasons) ? decision.reasons : [];
+	const llmFlaggedObserve = !bioVerified && decision?.verdict === 'observe'
+		&& decisionReasons.some((r) => String(r).startsWith('AI 深度判定命中'))
+		&& !decisionReasons.some((r) => String(r).includes('主人此前 /ignore'))
+		&& nowSeconds - bioCheckedAt >= AD_LLM_FORCE_PROFILE_COOLDOWN_SECONDS;
+	if (llmFlaggedObserve) {
+		console.log('[广告检测] 第⑥层判广告被拦，强制拉资料复判 user=' + userId);
+	}
+
 	// 闸一没定罪、且这个人的 bio 在冷却期内 —— 到此结束，本条消息 0 个 Telegram 请求。
 	// 这是稳态下的绝大多数情况（正常聊天），也是「不要每条信息都拉」的落点。
 	// bioVerified 短路：上面补查时已经拉过 bio 并复评过了，再进闸二就是拉第二次。
-	if (!needBio || bioVerified) {
+	if ((!needBio && !llmFlaggedObserve) || bioVerified) {
 		if (decision.verdict === 'observe') {
 			await upsertAdScreening(env, userId, {
 				chatId: chat.id,
@@ -32141,6 +32472,12 @@ async function detectAdOnMessage(message, env) {
 	if (gate2SuspectLinks) {
 		profile.adLinks = gate2SuspectLinks;
 		evaluation = await judgeGate2();
+	}
+	// 强制拉资料是为了【找更多证据】，不是重新判一遍：闸二没找到能定罪的东西时，
+	// 闸一那条「AI 判广告 → 观察」原样保留（闸二的第⑥层载荷变了，常常被去重跳过，
+	// 拿到的反而是「没有模型结论」），绝不能因为多拉了一次资料把观察记录丢掉。
+	if (llmFlaggedObserve && evaluation.verdict !== 'ban' && evaluation.verdict !== 'observe') {
+		evaluation = decision;
 	}
 
 	if (evaluation.verdict === 'ban') {
@@ -33319,6 +33656,9 @@ const AD_CHANNEL_ACCOUNT_ROWS = [
 	{ tag: 'AI 语义', label: 'AI 向量相似度' },
 	{ tag: '同款emoji', label: '同款自定义 emoji' },
 	{ tag: '头像', label: '头像命中广告图' },
+	// 标签刻意叫「文字头像」而不是「头像文字」：对账按 includes(标记 + tag) 计数，
+	// 「头像文字」会被上一行「头像」一起数进去，两行同时 +1。
+	{ tag: '文字头像', label: '头像文字命中特征库' },
 	{ tag: '正文图片', label: '正文图片命中' },
 	{ tag: '资料卡查杀（用户名+简介）', label: '结构查杀·资料卡（用户名+简介）' },
 	{ tag: '正文查杀（简介+正文）', label: '结构查杀·正文（简介+正文）' },
