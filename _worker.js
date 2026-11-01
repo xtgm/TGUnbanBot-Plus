@@ -23706,6 +23706,11 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 				visionCheckedAt: Math.floor(Date.now() / 1000)
 			});
 			if (wrote) out.imageLearned = 1;
+			// 【2026-11-02】贴纸整包学：广告组织换一张同包贴纸就绕过单张指纹，
+			// 主人 /spam 过很多次仍漏的根因之一。人工判定可以覆盖 /ignore 留下的 clean。
+			if (learnMedia.setName && await markAdStickerPack(env, learnMedia.setName, source, { manual: true })) {
+				out.packLearned = String(learnMedia.setName);
+			}
 		}
 
 		// 语义样本：正文太短且不含举报 / 吐槽语义时改用引用块内容。
@@ -23739,6 +23744,7 @@ function renderAdLearnLines(learn, source) {
 	if (!learn) return lines;
 	if (learn.learned > 0) lines.push('🧬 已学习广告指纹:' + learn.learned + ' 条(来源 /' + source + ' 人工判定)');
 	if (learn.imageLearned > 0) lines.push('🖼 已学习广告图片/贴纸: 引用消息里的那张已入库，下次任何人发同一张即命中');
+	if (learn.packLearned) lines.push('📦 已学习广告贴纸包 <code>' + escapeHtml(learn.packLearned) + '</code>: 同包任何一张都秒封');
 	// 三类判据的回执（2026-10-15）：与上面的指纹、图片同一口径 —— 学到了就报，
 	// 一条都没学到就一行都不发，免得每次都刷三条永远为 0 的行。
 	if (learn.avatars > 0) lines.push('🖼 已学习广告头像: 下次任何人用同款头像（含进群申请）即命中');
@@ -27599,7 +27605,10 @@ function extractAdMedia(message) {
 			kind,
 			fileUniqueId,
 			fileId: String(node.file_id || ''),
-			visionFileId
+			visionFileId,
+			// 贴纸包名：同一个广告包里的几十张贴纸 file_unique_id 各不相同，
+			// 只按单张记永远追不上「换一张同包贴纸再发」。非贴纸恒为空串。
+			setName: kind === 'sticker' ? String(node.set_name || '') : ''
 		};
 	};
 	if (Array.isArray(message.photo) && message.photo.length) {
@@ -27709,7 +27718,11 @@ async function learnAdImageOnBan(env, fileUniqueId, userId) {
 			'INSERT INTO ad_images (file_unique_id, verdict, hits, file_id, kind, source, last_user_id, vision_checked_at, created_at, updated_at) '
 			+ 'VALUES (?, \'ad\', 1, \'\', \'\', \'learned\', ?, 0, ?, ?) '
 			+ 'ON CONFLICT(file_unique_id) DO UPDATE SET verdict = \'ad\', hits = ad_images.hits + 1, '
-			+ 'source = \'learned\', last_user_id = excluded.last_user_id, updated_at = excluded.updated_at'
+			// 已是 ad 且来源是识图 / 人工 / 贴纸包的，保留原来源 —— 覆盖成 learned
+			// 会把它降成弱来源（见 AD_IMAGE_WEAK_SOURCES），第二次出现反而不封了。
+			+ 'source = CASE WHEN ad_images.verdict = \'ad\' AND COALESCE(ad_images.source, \'\') NOT IN (\'\', \'learned\', \'cross_user\', \'manual\') '
+			+ 'THEN ad_images.source ELSE \'learned\' END, '
+			+ 'last_user_id = excluded.last_user_id, updated_at = excluded.updated_at'
 		).bind(key, String(userId || ''), now, now).run();
 		return true;
 	} catch (error) {
@@ -27733,6 +27746,64 @@ async function clearAdImageOnIgnore(env, fileUniqueId) {
 	}
 }
 
+// ===== 广告贴纸包（2026-11-02）=====
+//
+// 【治的是哪个洞】广告组织一个贴纸包里有几十张贴纸，每张 file_unique_id 都不同。
+// 原来只按单张记：主人 /spam 一张，下一个号换同包另一张发，库里查不到 → 又得等识图，
+// 识图判对了还要等真实复用满 5 次才封 —— 所以「这类表情包你就没有杀成功过」。
+// 现在包名（sticker.set_name）本身就是指纹：同包任何一张都直接定罪。
+//
+// 存在 ad_scan_state 键值表里（键前缀 adset:），不新建表 —— 包的数量很少，
+// 也不用改 d1AdDetectionTablesExist 那份建表复验清单。
+// value 记来源：spam / ban / sban / owner（人工，owner = 漏判通知上点确认封）、
+// auto（识图定罪后自动学）、clean（/ignore 撤销）。
+// 【clean 是安全阀】主人 /ignore 过的包，自动学习不能再把它翻回广告包；人工命令可以。
+const AD_STICKER_PACK_KEY_PREFIX = 'adset:';
+
+async function readAdStickerPack(env, setName) {
+	const name = String(setName || '');
+	if (!env?.DB || !name) return '';
+	return readAdScanState(env, AD_STICKER_PACK_KEY_PREFIX + name, '');
+}
+
+async function markAdStickerPack(env, setName, source, options = {}) {
+	const name = String(setName || '');
+	if (!env?.DB || !name) return false;
+	try {
+		// 自动学习只填空位：已有记录（人工来源 / clean 安全阀 / 已是 auto）一律不动，
+		// 否则人工判的来源会被随后的定罪学习覆盖成 auto，对账与回执就看不出是谁判的。
+		if (options.manual !== true && (await readAdStickerPack(env, name))) return false;
+		await writeAdScanState(env, AD_STICKER_PACK_KEY_PREFIX + name, String(source || 'auto'));
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 贴纸包学习失败:', error);
+		return false;
+	}
+}
+
+// 正文自定义 emoji 的贴纸包命中已定罪广告包 → 定罪（标签「表情包」）。
+// packs 是 resolveCustomEmojiStickers 的产出 { id → { setName, emoji } }；为空时零 SQL。
+async function applyCustomEmojiPackVerdict(env, evaluation, packs) {
+	if (!evaluation || String(evaluation.verdict) === 'ban') return evaluation;
+	const names = [...new Set(Object.values(packs || {}).map((v) => String(v?.setName || '')).filter(Boolean))].slice(0, 5);
+	for (const name of names) {
+		const pack = await readAdStickerPack(env, name);
+		if (pack && pack !== 'clean') {
+			const reasons = markAdConvictLayer((evaluation.reasons || []).concat(['正文自定义表情属于已定罪的广告贴纸包：' + name]), '表情包');
+			return Object.assign({}, evaluation, { verdict: 'ban', reasons });
+		}
+	}
+	return evaluation;
+}
+
+async function clearAdStickerPack(env, setName) {
+	const name = String(setName || '');
+	if (!env?.DB || !name) return false;
+	if (!(await readAdStickerPack(env, name))) return false;
+	await writeAdScanState(env, AD_STICKER_PACK_KEY_PREFIX + name, 'clean');
+	return true;
+}
+
 // 把图片命中叠加到已有判定结果上（纯函数，不动原对象）。与 applyAvatarVerdict 同位。
 //
 // 分档（【比头像严一档】，这是与头像唯一的实质差异）：
@@ -27753,12 +27824,33 @@ const AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS = 5;
 //
 // 当时取 0.9 的实测依据留档：40 张真实库图跑 clef-flash，广告 0.827~0.9412、
 // 正常毛绒玩具与笑脸表情包 0.0404~0.0458，两簇之间无重叠区。
+// 【2026-11-02 主人拍板：识别到就杀，不观察】
+// 「表情包贴纸 图片广告……识别到就杀它 不需要观察 直接杀」，并确认照片同样直接封、
+// 误封靠 /ignore 与回执按钮纠正。所以【有结论来源】的 ad 一律单证定罪：
+//   · vision —— clef 当场判的（含色情 / 赌博 / 灰产 / 其他广告四类）；
+//   · spam / ban / sban 等人工来源 —— 主人亲手判的；
+//   · pack —— 同一个贴纸包已被定罪为广告包（换一张同包贴纸照样杀）。
+// 仍按旧门槛（真实复用 ≥5 次）的只有两类【没有任何人或模型看过这张图】的来源：
+//   · learned —— 某条消息因正文等【别的】证据被封，顺手学进来的图。那张图可能只是
+//     一张随手配的梗图，让它单证杀下一个人等于连坐；
+//   · cross_user —— 三个人发过同一张没判过的图。普通动态贴纸天天被多人转发，
+//     这条一放开就会成批误封正常人。
+const AD_IMAGE_WEAK_SOURCES = new Set(['learned', 'cross_user']);
 function applyImageVerdict(evaluation, image) {
 	if (!evaluation || !image) return evaluation;
 	if (String(image.verdict || '') !== 'ad') return evaluation;
 	const hits = Number(image.hits) || 0;
-	const reason = '消息图片命中广告素材库（复用定罪 ' + hits + ' 次）';
+	const packHit = String(image.packHit || '');
+	const categoryLabel = AD_IMAGE_CATEGORY_LABELS[String(image.category || '')] || '';
+	const reason = packHit
+		? '贴纸属于已定罪的广告贴纸包：' + packHit
+		: '消息图片命中广告素材库（复用定罪 ' + hits + ' 次）' + (categoryLabel ? ' · 识图判为' + categoryLabel : '');
 	const reasons = (evaluation.reasons || []).concat([reason]);
+	if (packHit || !AD_IMAGE_WEAK_SOURCES.has(String(image.source || ''))) {
+		const convicted = String(evaluation.verdict) !== 'ban';
+		return Object.assign({}, evaluation, { verdict: 'ban',
+			reasons: convicted ? markAdConvictLayer(reasons, packHit ? '表情包' : '正文图片') : reasons });
+	}
 	// 【2026-10-14 改：图片命中不再无条件封禁】
 	// 10-13 拍板的「单特征杀掉」把这里写成恒返回 verdict:'ban'，分数一概不看。
 	// 线上实测误封：8913877802（Geoff Xia）发了一张 workers.dev 默认域名截图，
@@ -27849,7 +27941,7 @@ async function loadAdImageForMessage(env, media, userId) {
 		// 【2026-10-11 跨用户复用】这是图片内容判据（moondream）之外、
 		// 唯一不依赖模型的第一发之后的信号 —— 同一张图被多个【不同】用户发出来。
 		// 只在 verdict 仍是 pending 时累加：已判 clean 的是正常图、已判 ad 的早已入库。
-		if (await bumpAdImageSender(env, media.fileUniqueId, userId, row)) return { ...row, verdict: 'ad' };
+		if (await bumpAdImageSender(env, media.fileUniqueId, userId, row)) return { ...row, verdict: 'ad', source: 'cross_user' };
 		return row;
 	}
 	// 首次见到这张图：登记成 pending，L2 视觉识别才有东西可排队。
@@ -28577,22 +28669,42 @@ const AD_IMAGE_VISION_PROMPT = '这是社交软件聊天记录里的一条【图
 // 图片走 images[]（必须是 data URI，远程 URL 会被拒），模型自己做尺寸自适应。
 const CLEF_AVATAR_STATE = '这是一张 Telegram 用户头像，判断它是否用于广告引流。';
 const CLEF_IMAGE_STATE = '这是一张 Telegram 群消息里的图片或表情包，判断它是否用于广告引流。';
+// 【2026-11-02 补色情】旧 criteria 的 ad 一栏没有「色情」，clean 一栏却写着「动漫」——
+// 色情引流贴纸（动漫画风 + 性暗示）两栏同时沾边，模型常判成 clean。
+// 主人口径：色情是广告类型，表情包 / 贴纸 / 动漫这个载体不豁免。
 const CLEF_AD_QUESTION = {
 	type: 'choice',
 	instructions: '图中是否含有广告引流内容？',
 	criteria: {
-		ad: '有引流或代发类文字、代理兼职赚钱招租、联系方式、@用户名或频道名、二维码、赌博或灰产图案',
-		clean: '自拍、风景、宠物、家人、动漫、纯色背景或不含引流信息的装饰图'
+		ad: '有引流或代发类文字、代理兼职赚钱招租、联系方式、@用户名或频道名、二维码、赌博或灰产图案、色情裸露或性暗示内容（含色情表情包、贴纸、动漫）',
+		clean: '自拍、风景、宠物、家人、不含色情的动漫与普通表情包、纯色背景或不含引流信息的装饰图'
 	}
 };
+// 广告类别（同一次调用里的第二个问题，不多花一次请求）。
+// 用途两个：① 判据里写清是哪一类广告；② 类别本身够确定时补判 ad ——
+// 两个问题的结论不一致（ad 问题说 clean、类别问题高置信说色情）时，以类别为准。
+const CLEF_AD_CATEGORY_QUESTION = {
+	type: 'choice',
+	instructions: '这张图属于哪一类？',
+	criteria: {
+		porn: '色情：裸露、性暗示、约炮、福利、成人视频或色情网站引流（含色情表情包、贴纸、动漫）',
+		gambling: '赌博：博彩、棋牌、彩票、六合彩、体育下注、娱乐城',
+		scam: '灰产诈骗：刷单、兼职赚钱、跑分收款、USDT 换汇、贷款、代办证件',
+		other_ad: '其他广告引流：频道 / 群 / bot 推广、@用户名、二维码、联系方式、商品推销',
+		clean: '不是广告：自拍、风景、宠物、梗图、普通表情包、聊天或文档截图'
+	}
+};
+const AD_IMAGE_CATEGORY_LABELS = { porn: '色情类', gambling: '赌博类', scam: '灰产诈骗类', other_ad: '其他广告类' };
+// 类别问题单独补判 ad 的置信线。
+const AD_IMAGE_CATEGORY_AD_PROB = 0.6;
 
-// 返回 { ad, prob, confidence }；拿不到判定返回 null（调用方按失败处理 → stage=ai.run）。
+// 返回 { ad, prob, confidence, category, categoryProb }；拿不到判定返回 null（调用方按失败处理 → stage=ai.run）。
 async function runVisionJudge(env, imageUri, state) {
 	const result = await env.AI.run(AD_IMAGE_VISION_MODEL, {
 		model: 'clef-flash',
 		state,
 		images: [String(imageUri || '')],
-		questions: { ad: CLEF_AD_QUESTION }
+		questions: { ad: CLEF_AD_QUESTION, category: CLEF_AD_CATEGORY_QUESTION }
 	});
 	const ans = result?.answers?.ad;
 	const choice = String(ans?.choice || '');
@@ -28604,10 +28716,16 @@ async function runVisionJudge(env, imageUri, state) {
 		}));
 		return null;
 	}
+	const cat = result?.answers?.category;
+	const catChoice = String(cat?.choice || '');
+	const category = AD_IMAGE_CATEGORY_LABELS[catChoice] ? catChoice : '';
+	const categoryProb = category ? Number(cat?.probabilities?.[category] ?? 0) : 0;
 	return {
-		ad: choice === 'ad',
+		ad: choice === 'ad' || (Boolean(category) && categoryProb >= AD_IMAGE_CATEGORY_AD_PROB),
 		prob: Number(ans?.probabilities?.ad ?? 0),
-		confidence: Number(ans?.confidence ?? 0)
+		confidence: Number(ans?.confidence ?? 0),
+		category,
+		categoryProb
 	};
 }
 
@@ -29601,10 +29719,15 @@ async function judgeAdMediaRealtime(env, media, userId) {
 	if (row) {
 		// 跨用户复用照旧（不调模型）：同一张图被多个【不同】用户发过 → 标成广告素材。
 		if (await bumpAdImageSender(env, key, uid, row)) {
-			return { ...row, verdict: 'ad', hits: (Number(row.hits) || 0) + 1 };
+			// source 显式标 cross_user：库里这行的 source 可能还是 null / 'vision'（判干净的那次），
+			// 不标的话 applyImageVerdict 会把「几个人发过同一张图」当成强来源单证封。
+			// （bumpAdImageSender 只对 pending 行生效，所以这里一律是弱来源。）
+			return { ...row, verdict: 'ad', source: 'cross_user', hits: (Number(row.hits) || 0) + 1 };
 		}
-		// pending 但没有可下载句柄的，退回旧行为 —— 那种图当下判不了，只能先登记着。
-		if (String(row.verdict || '') !== 'pending' || !String(row.file_id || '')) return row;
+		if (String(row.verdict || '') !== 'pending') return row;
+		// pending 但没有可下载句柄的（动态贴纸没有缩略图）当下判不了 —— 这正是「漏判」：
+		// 绑了 AI 的部署要把它推给主人人工判，没绑 AI 的部署照旧只登记。
+		if (!String(row.file_id || '')) return env.AI ? adImageMiss(row, 'nothumb') : row;
 	} else {
 		// 首次见到：登记成 pending。登记本身零成本，实时判定紧接在后面。
 		await registerAdImage(env, media, uid);
@@ -29618,18 +29741,23 @@ async function judgeAdMediaRealtime(env, media, userId) {
 	// 实时判用掉的额度会记进 cron 的账，两边不会各花各的、把日预算翻倍。
 	const config = loadAdDetectionConfig(env);
 	const dailyLimit = Number(config.imageVisionDaily);
+	// 配成 0 = 主人主动关掉识图，那不叫漏判，不推。
 	if (dailyLimit <= 0) return null;
+	// 以下每一种「没判成」都带上漏判原因返回（adImageMiss）：verdict 仍是 pending /
+	// 原行，applyImageVerdict 照旧原样放过，只是调用方据此给第一主人推一条带按钮的通知。
+	const base = row || { file_unique_id: key, verdict: 'pending', hits: 0, source: null, last_user_id: uid };
 	const nowSeconds = Math.floor(Date.now() / 1000);
 	const quota = await readImageVisionQuota(env, nowSeconds, 'img');
-	if (dailyLimit - quota.used <= 0) return null;
-	if ((await readVisionBreakState(env, nowSeconds)).broken) return null;
+	if (dailyLimit - quota.used <= 0) return adImageMiss(base, 'quota');
+	if ((await readVisionBreakState(env, nowSeconds)).broken) return adImageMiss(base, 'break');
 
 	// ③ 当场判。media.visionFileId 是 extractAdMedia 挑好的「能喂模型的那一份」：
 	// 照片与静态贴纸取本体，动态贴纸 / 视频 / 动图取缩略图。
 	const visionFileId = String(media.visionFileId || '');
-	if (!visionFileId) return null;
+	if (!visionFileId) return adImageMiss(base, 'nothumb');
 	let verdict = 'pending';
 	let prob = 0;
+	let judged = null;
 	let skipBump = false;
 	try {
 		const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
@@ -29645,20 +29773,22 @@ async function judgeAdMediaRealtime(env, media, userId) {
 		if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
 		const buffer = await imageResponse.arrayBuffer();
 		// 尺寸闸与格式闸与 cron 轨完全一致：喂错格式 = 模型抛错 = 白烧一次额度。
-		if (buffer.byteLength > AD_VISION_MAX_IMAGE_BYTES) return null;
+		if (buffer.byteLength > AD_VISION_MAX_IMAGE_BYTES) return adImageMiss(base, 'size');
 		const mime = sniffImageMime(new Uint8Array(buffer));
-		if (!mime) return null;
+		if (!mime) return adImageMiss(base, 'mime');
 		const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
 		const judge = await runVisionJudge(env, image, CLEF_IMAGE_STATE);
 		if (!judge) throw new Error('clef 未返回判定');
+		judged = judge;
 		verdict = judge.ad ? 'ad' : 'clean';
 		prob = Number(judge.prob) || 0;
 		console.log('[图片实时判定] ' + (judge.ad ? '广告' : '干净') + ' 概率=' + prob.toFixed(4)
+			+ (judge.category ? ' 类别=' + judge.category + '/' + Number(judge.categoryProb || 0).toFixed(4) : '')
 			+ ' kind=' + String(media.kind || '') + ' 图=' + key.slice(0, 20)
 			+ ' 当日=' + (quota.used + 1) + '/' + dailyLimit);
 	} catch (error) {
 		// 429 是临时状态不是链路故障：不推熔断、不落库（理由见 runAdImageVision 同名分支）。
-		if (isVisionRateLimited(error)) return null;
+		if (isVisionRateLimited(error)) return adImageMiss(base, 'ratelimit');
 		if (isVisionFileMissing(error)) skipBump = true;
 		await logAdVisionFailure(env, '图片·实时', 'ai.run', key, error);
 	}
@@ -29676,7 +29806,14 @@ async function judgeAdMediaRealtime(env, media, userId) {
 	if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
 	await writeAdScanState(env, 'img_count', String(quota.used + 1), Math.floor(Date.now() / 1000));
 
-	if (verdict !== 'ad') return verdict === 'clean' ? { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid } : null;
+	if (verdict === 'pending') return adImageMiss(base, 'error');
+	if (verdict === 'clean') {
+		const cleanRow = { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid };
+		// 灰区：判了干净，但广告概率（或某个广告类别的概率）够得上 AD_IMAGE_GRAY_MIN。
+		// 明显干净的（实测正常表情包 0.04 上下）不推，否则每张梗图都要主人点一次。
+		const grayProb = Math.max(prob, Number(judged?.categoryProb) || 0);
+		return grayProb >= AD_IMAGE_GRAY_MIN ? adImageMiss(cleanRow, 'gray', grayProb) : cleanRow;
+	}
 	// 【2026-10-14 删：不再把 hits 强写成 AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS】
 	// 原实现在这里执行 `UPDATE ad_images SET hits = 5 WHERE hits < 5`，然后判据拼成
 	// 「消息图片命中广告素材库（复用定罪 5 次）」。那个 5 是常量，不是复用次数。
@@ -29685,8 +29822,196 @@ async function judgeAdMediaRealtime(env, media, userId) {
 	// 再叠上「定罪即学习」的 +1，库里实际显示 6、7 不等，没有一个是真的。
 	// 主人原话：「复用次数肯定得真实性啊」。现在 hits 只由 learnAdImageOnBan 真实累加，
 	// 展示文案与单证门槛（hits >= AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS）读到的都是真数。
+	// 识图判广告的贴纸：整包记为广告包，同包下一张（变体）不再花识图、直接定罪。
+	if (media.setName) await markAdStickerPack(env, String(media.setName), 'auto');
 	const finalRow = await readAdImage(env, key);
-	return finalRow || { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid };
+	return Object.assign({}, finalRow || { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid },
+		{ category: String(judged?.category || '') });
+}
+
+// ===== 识图漏判（2026-11-02）=====
+// 主人口径：「如果有漏 通知第一主人 并内置按钮……漏的才会收到通知，不是检测到就收到通知」。
+// 漏判 = 识图没判成（额度 / 熔断 / 没缩略图 / 尺寸 / 格式 / 限流 / 调用失败）
+//      + 灰区（判了干净但广告概率 ≥ AD_IMAGE_GRAY_MIN）。
+const AD_IMAGE_GRAY_MIN = 0.3;
+const AD_IMAGE_MISS_LABELS = {
+	quota: '识图今日额度已用完',
+	break: '识图连续失败已熔断（今天暂停调用）',
+	nothumb: '动态贴纸 / 视频没有可识图的静态缩略图',
+	size: '图片超过识图尺寸上限',
+	mime: '图片格式认不出（不是 jpg / png / gif / webp）',
+	ratelimit: '识图被限流（429）',
+	error: '识图调用失败（下载或模型异常）',
+	gray: '识图判为干净，但广告概率落在灰区'
+};
+// 只有这几类载体推漏判：document（文件）多半没缩略图，推了等于每个发文件的人都要点一次。
+const AD_IMAGE_MISS_KINDS = new Set(['photo', 'sticker', 'animation', 'video']);
+// 同一个人、同一张图各自冷却这么久（秒），防刷屏。
+const AD_IMAGE_MISS_COOLDOWN_SECONDS = 3600;
+
+function adImageMiss(row, reason, prob = 0) {
+	return Object.assign({}, row, { missReason: String(reason), missProb: Number(prob) || 0 });
+}
+
+// 带贴纸包判定的入口：贴纸属于已定罪的广告包 → 直接定罪，一次识图都不花；
+// 否则走单张实时判定。包名就在 update 里（sticker.set_name），零 Telegram 请求。
+async function judgeAdMediaForMessage(env, media, userId) {
+	if (!media?.fileUniqueId) return null;
+	const setName = String(media.setName || '');
+	if (setName) {
+		const pack = await readAdStickerPack(env, setName);
+		if (pack && pack !== 'clean') {
+			return { file_unique_id: String(media.fileUniqueId), verdict: 'ad', hits: 0, source: 'pack', packHit: setName };
+		}
+	}
+	return judgeAdMediaRealtime(env, media, userId);
+}
+
+// 推一条漏判通知给第一主人：先把原消息复制过去（主人直接看图），再发判据 + 两个按钮。
+// 调用方保证本条消息最终既没封也没进观察（那两种情况各有自己的通知）。
+async function notifyAdImageMiss(env, context) {
+	try {
+		const image = context?.image || {};
+		const media = context?.media || {};
+		const reason = String(image.missReason || '');
+		if (!reason || !AD_IMAGE_MISS_KINDS.has(String(media.kind || ''))) return false;
+		const ownerId = getOwnerNotifyTargets()[0] || '';
+		if (!ownerId || !env?.DB) return false;
+		const uid = String(context.userId || '');
+		const chatId = String(context.chatId || '');
+		const fid = String(media.fileUniqueId || '');
+		const now = Math.floor(Date.now() / 1000);
+		const userKey = 'admiss:u:' + uid;
+		const fileKey = 'admiss:f:' + fid;
+		const lastUser = Number(await readAdScanState(env, userKey, '0')) || 0;
+		if (now - lastUser < AD_IMAGE_MISS_COOLDOWN_SECONDS) return false;
+		let lastFile = 0;
+		try { lastFile = Number(JSON.parse(await readAdScanState(env, fileKey, '{}'))?.at) || 0; } catch (_) { lastFile = 0; }
+		if (now - lastFile < AD_IMAGE_MISS_COOLDOWN_SECONDS) return false;
+		await writeAdScanState(env, userKey, String(now), now);
+		await writeAdScanState(env, fileKey, JSON.stringify({ at: now, setName: String(media.setName || ''), kind: String(media.kind || '') }), now);
+
+		if (chatId && context.messageId) {
+			try { await copyMessageToChat(ownerId, chatId, context.messageId); } catch (_) { /* 复制失败不影响通知 */ }
+		}
+		const kindLabel = { photo: '图片', sticker: '贴纸', animation: '动图', video: '视频' }[String(media.kind)] || String(media.kind || '');
+		const from = context.from || {};
+		const name = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
+		const lines = [
+			'🖼 <b>' + kindLabel + '识图漏判 → 未处置，请你判断</b>',
+			'',
+			'用户：<code>' + escapeHtml(uid) + '</code>'
+				+ (name ? '　' + escapeHtml(name.slice(0, 40)) : '')
+				+ (from.username ? '　<code>@' + escapeHtml(String(from.username)) + '</code>' : ''),
+			chatId ? '群：<code>' + escapeHtml(chatId) + '</code>' : '',
+			'类型：' + kindLabel + (media.setName ? '（贴纸包 <code>' + escapeHtml(String(media.setName)) + '</code>）' : ''),
+			'原因：' + escapeHtml(AD_IMAGE_MISS_LABELS[reason] || reason)
+				+ (reason === 'gray' ? '（' + Number(image.missProb || 0).toFixed(2) + '）' : ''),
+			context.text ? '正文：<code>' + escapeHtml(String(context.text).slice(0, 150)) + '</code>' : '',
+			'',
+			'原消息已复制在上面，判断后直接点按钮：',
+			'　　🔒 确认封 = 全群封禁 + 删他的历史消息 + 拉黑 + 这张图' + (media.setName ? '和整个贴纸包' : '') + '记为广告',
+			'　　❌ 不该封 = 这张图记为干净，以后不再提醒'
+		];
+		const tail = uid + ':' + (chatId || '0');
+		const okData = ADFIX_BUTTON_PREFIX + 'im:' + tail + ((ADFIX_BUTTON_PREFIX + 'im:' + tail + ':' + fid).length <= 64 ? ':' + fid : '');
+		const noData = ADFIX_BUTTON_PREFIX + 'in:' + tail + ((ADFIX_BUTTON_PREFIX + 'in:' + tail + ':' + fid).length <= 64 ? ':' + fid : '');
+		await sendTelegramMessageChunks(ownerId, lines.filter(Boolean).join('\n'), {
+			inline_keyboard: [[
+				{ text: '🔒 确认封（封禁+删历史）', callback_data: okData },
+				{ text: '❌ 不该封（图转干净）', callback_data: noData }
+			]]
+		});
+		console.log('[图片漏判] 已提醒第一主人 user=' + uid + ' 原因=' + reason + ' kind=' + String(media.kind || ''));
+		return true;
+	} catch (error) {
+		console.error('[图片漏判] 提醒失败:', error);
+		return false;
+	}
+}
+
+// 漏判通知上「确认封」：封禁 + 撤回 + 删本群历史消息 + 图与贴纸包记为广告，结果原地回给主人。
+async function confirmAdImageMissBan(env, { userId, chatId, fileUniqueId }) {
+	const uid = String(userId || '');
+	const gid = chatId && chatId !== '0' ? String(chatId) : '';
+	const fid = String(fileUniqueId || '');
+	let setName = '';
+	if (fid) {
+		try { setName = String(JSON.parse(await readAdScanState(env, 'admiss:f:' + fid, '{}'))?.setName || ''); } catch (_) { setName = ''; }
+	}
+	const out = { banned: false, reason: '', banSummary: '', blacklistCode: '', deleted: null, imageMarked: false, packMarked: false };
+	if (!gid) { out.reason = '通知里没有群号'; return out; }
+	if (fid) out.imageMarked = await upsertAdImage(env, fid, { verdict: 'ad', source: 'owner', lastUserId: uid, visionCheckedAt: Math.floor(Date.now() / 1000) });
+	if (setName) out.packMarked = await markAdStickerPack(env, setName, 'owner', { manual: true });
+	const reasons = ['图片识图漏判（主人点确认封）'];
+	if (setName) reasons.push('贴纸包：' + setName);
+	const result = await enforceAdDetection(env, { userId: uid, chatId: gid, chatTitle: '', messageId: null }, {
+		verdict: 'ban', score: 0, layer: 'score', threshold: 0, reasons,
+		payload: { name: '', username: '', bio: '', text: '', domains: [], imageId: fid, stickerSet: setName },
+		snapshot: { imageId: fid, stickerSet: setName }
+	}, { force: true });
+	out.banned = Boolean(result?.banned);
+	out.reason = String(result?.reason || '');
+	out.banSummary = String(result?.banSummary || '');
+	out.blacklistCode = String(result?.blacklistCode || '');
+	out.seq = result?.seq || null;
+	if (out.banned) {
+		try { out.deleted = await cleanupCurrentChatUserMessages(env, gid, uid); } catch (error) {
+			console.error('[图片漏判] 删历史消息失败:', error);
+		}
+	}
+	return out;
+}
+
+function renderAdImageMissBanResult(uid, out) {
+	const bl = out.blacklistCode === 'ADDED' ? '已加入' : out.blacklistCode === 'EXISTS' ? '此前已在' : (out.blacklistCode || '未知');
+	const del = out.deleted
+		? out.deleted.ok + '/' + out.deleted.total + ' 条' + (out.deleted.failed ? '（' + out.deleted.failed + ' 条失败）' : '')
+		: '未执行';
+	return [
+		'🔒 已按主人确认封禁　TGID <code>' + escapeHtml(uid) + '</code>',
+		'全群封禁：' + escapeHtml(out.banSummary || '未知') + '（已撤回他在各群的历史发言）',
+		'删本群历史消息：' + del,
+		'黑名单：' + escapeHtml(bl),
+		'这张图：' + (out.imageMarked ? '已记为广告，下次谁发都秒封' : '未记录（图片标识缺失）')
+			+ (out.packMarked ? '\n贴纸包：整包已记为广告包，同包任何一张都秒封' : ''),
+		'快照：' + (out.seq ? '#' + out.seq + '（误封可 /ignore ' + out.seq + ' 回滚）' : '未分配')
+	].join('\n');
+}
+
+async function handleAdImageMissCallback(callbackQuery, env, { action, userId, chatId, fileUniqueId }) {
+	const fromId = String(callbackQuery?.from?.id || '');
+	if (!isPrimaryOwner(fromId)) {
+		await answerAdVoteCallback(callbackQuery?.id, '这两个按钮只有第一主人能点', true);
+		return;
+	}
+	const noticeChatId = String(callbackQuery?.message?.chat?.id || '');
+	const noticeMessageId = Number(callbackQuery?.message?.message_id) || 0;
+	const originText = String(callbackQuery?.message?.text || '');
+	if (action === 'im') {
+		let out = null;
+		try {
+			out = await confirmAdImageMissBan(env, { userId, chatId, fileUniqueId });
+		} catch (error) {
+			console.error('[图片漏判] 确认封执行失败:', error);
+		}
+		if (!out?.banned) {
+			const why = out?.reason === 'whitelisted' ? '该用户在白名单里' : (out?.reason || '未知原因');
+			await answerAdVoteCallback(callbackQuery?.id, '封禁未执行：' + why, true);
+			return;
+		}
+		await answerAdVoteCallback(callbackQuery?.id, '已确认封禁 ' + userId);
+		await editTelegramMessage(noticeChatId, noticeMessageId, originText + '\n─────\n' + renderAdImageMissBanResult(userId, out));
+		console.log('[图片漏判] 主人确认封 user=' + userId + ' 封禁=' + out.banSummary
+			+ ' 删消息=' + (out.deleted ? out.deleted.ok + '/' + out.deleted.total : '未执行'));
+		return;
+	}
+	// 不该封：这张图记为干净（已是广告的图不会被翻案，见 upsertAdImage），贴纸包不动。
+	let marked = false;
+	if (fileUniqueId) marked = await upsertAdImage(env, fileUniqueId, { verdict: 'clean', source: 'owner', visionCheckedAt: Math.floor(Date.now() / 1000) });
+	await answerAdVoteCallback(callbackQuery?.id, '已忽略');
+	await editTelegramMessage(noticeChatId, noticeMessageId, originText + '\n─────\n❌ 已按不该封处理　TGID <code>' + escapeHtml(userId) + '</code>'
+		+ '\n这张图：' + (marked ? '已记为干净，以后不再提醒' : '未记录（图片标识缺失）'));
 }
 
 // ===== 实时头像判定（2026-10-13）=====
@@ -30441,7 +30766,9 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		// 都要靠它定位 ad_images 的行。同样【不进 domains / semanticText / 指纹学习】。
 		// 没有媒体的调用方（入群线、cron 复查、各种命令路径）不传 media，这里自然是空串，
 		// 那几条链路的行为与改动前逐字节一致。
-		imageId: String(input?.media?.fileUniqueId || '')
+		imageId: String(input?.media?.fileUniqueId || ''),
+		// 贴纸包名：定罪即学习整包、/ignore 撤销整包都靠它。非贴纸为空串。
+		stickerSet: String(input?.media?.setName || '')
 	};
 
 	const fingerprint = await matchAdFingerprints(env, payload, { config });
@@ -30701,6 +31028,7 @@ async function evaluateAdSuspect(env, input, options = {}) {
 			// 正文图片指纹主键：与 avatarId 同一职责，/ignore 回滚时反查 ad_images 那一行。
 			// 没有媒体的消息是空串，回滚端读到空串自动跳过 —— 老快照同样如此。
 			imageId: String(payload.imageId || ''),
+			stickerSet: String(payload.stickerSet || ''),
 			// 资料形状主键：跟着快照进 D1，/ignore 回滚时直接拿它反查要清哪一行。
 			// 【不能让回滚端拿 snapshot.bio 重算】—— bio 在快照里被截到 200 字，
 			// 长简介重算出来的形状与判定时那个对不上，会静默清不掉，
@@ -30819,9 +31147,17 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 	// ig/ub/wl 只有载荷本身；ok/no 自 2026-10-21 起携带 userId[:chatId[:avatarId]] ——
 	// 观察记录 24 小时过期被 prune 删除后，按钮仍能靠自带信息执行。
 	const match = body.match(/^(ig|ub|wl):(\d+)$/)
-		|| body.match(/^(ok|no):(\d+)(?::(-?\d+))?(?::([^:]+))?$/);
+		|| body.match(/^(ok|no):(\d+)(?::(-?\d+))?(?::([^:]+))?$/)
+		|| body.match(/^(im|in):(\d+):(-?\d+)(?::([^:]+))?$/);
 	if (!match) {
 		await answerAdVoteCallback(callbackQuery?.id);
+		return;
+	}
+	// 图片漏判通知的两个按钮（im = 确认封 / in = 不该封）。只有第一主人能点。
+	if (match[1] === 'im' || match[1] === 'in') {
+		await handleAdImageMissCallback(callbackQuery, env, {
+			action: match[1], userId: String(match[2]), chatId: String(match[3]), fileUniqueId: String(match[4] || '')
+		});
 		return;
 	}
 	const action = match[1];
@@ -31074,6 +31410,7 @@ async function revertDryRunLearning(env, evaluation) {
 		try { await clearAdBadgeOnIgnore(env, emojiId); } catch (_) { /* 同上 */ }
 	}
 	try { out.image = await clearAdImageOnIgnore(env, payload.imageId); } catch (_) { /* 同上 */ }
+	try { await clearAdStickerPack(env, payload.stickerSet); } catch (_) { /* 同上 */ }
 	try {
 		out.shape = await markAdProfileShapeFalsePositive(env, evaluation?.snapshot?.profileShape, { purge: true });
 	} catch (_) { /* 同上 */ }
@@ -31366,6 +31703,16 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 	try {
 		const learnedImageId = String(evaluation?.payload?.imageId || '');
 		if (learnedImageId && await learnAdImageOnBan(env, learnedImageId, userId)) images += 1;
+		// 贴纸包：只在【图片本身是定罪依据】时整包学 —— 别的通道定的罪（正文、头像），
+		// 他顺手发的表情包可能是正常包，整包学进去会连坐所有用这个包的人。
+		const stickerSet = String(evaluation?.payload?.stickerSet || '');
+		const convictedByImage = (evaluation?.reasons || []).some((r) => {
+			const s = String(r);
+			return s === AD_CONVICT_MARK + '正文图片' || s === AD_CONVICT_MARK + '表情包'
+				|| s.startsWith('消息图片命中广告素材库') || s.startsWith('贴纸属于已定罪的广告贴纸包')
+				|| s.startsWith('图片识图漏判');
+		});
+		if (stickerSet && convictedByImage) await markAdStickerPack(env, stickerSet, 'auto');
 	} catch (_) { /* 图片学习失败不影响本次处置 */ }
 	// 定罪即学习资料形状：资料模板是批量号的【公开复用资产】，学一次之后同模板的号
 	// 在零 AI 下就能命中（只加分，仍要过原有阈值）。取 snapshot 里存好的形状，
@@ -32206,7 +32553,15 @@ async function detectAdOnMessage(message, env) {
 	// 图片这一路完全不产生判据。实时化之后：没判过的当场调一次 clef 出结论
 	// 并落库，判过的直接命中库（零模型成本），跨用户复用照旧。
 	// 退回旧行为的四道闸（无 AI / 额度跑满 / 熔断 / 不是位图）见函数注释。
-	const imageRow = media ? await judgeAdMediaRealtime(env, media, userId) : null;
+	// 【2026-11-02 改：→ judgeAdMediaForMessage】贴纸先查贴纸包（同包变体零识图直接定罪），
+	// 识图没判成 / 灰区的结果带 missReason —— 本条最终没封也没进观察时推漏判通知。
+	const imageRow = media ? await judgeAdMediaForMessage(env, media, userId) : null;
+	const notifyImageMiss = () => (imageRow?.missReason
+		? notifyAdImageMiss(env, {
+			image: imageRow, media, userId, chatId: chat.id, messageId: message.message_id,
+			from, text: text || contactName
+		})
+		: false);
 	const cheapProfile = {
 		firstName: from.first_name || '',
 		lastName: from.last_name || '',
@@ -32422,6 +32777,9 @@ async function detectAdOnMessage(message, env) {
 			await notifyAdObserveNotice(env, decision, userId, chat.id);
 			console.log('[广告检测] 闸一转入观察 user=' + userId + ' score=' + decision.score + '/' + config.scoreThreshold
 				+ ' 留存行为分=' + (decision.retainScore ?? 0));
+		} else {
+			// 既没封也没观察 = 放行。图片这一路没判成 / 灰区 → 这才是「漏」，推给第一主人。
+			await notifyImageMiss();
 		}
 		return false;
 	}
@@ -32501,6 +32859,8 @@ async function detectAdOnMessage(message, env) {
 		// 所以这一层只在闸二及其后（入群线、AI 补查、cron 复查）生效 ——
 		// 与头像完全同位，热路径的 Telegram 请求数一个都不多。
 		let judged = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+		// 正文自定义 emoji 属于已定罪的广告贴纸包 → 直接封（包名闸二已经拿到，零额外请求）。
+		judged = await applyCustomEmojiPackVerdict(env, judged, profile.customEmojiPacks);
 		// ===== 第四路补位：前三层都没定罪时交给生成式模型 =====
 		// 这是治「样本外话术」的那一处 —— 词表没列到、指纹没学过、bge-m3 样本库里
 		// 没有近似的正文，在这里由模型直接判。载荷口径与上面 evaluateAdSuspect 一致
@@ -32562,6 +32922,8 @@ async function detectAdOnMessage(message, env) {
 		// 在这里返回标记，而不是回头去删：此刻消息还没写进缓存，写入在更后面的 cacheModerationMessage。
 		return 'observe';
 	}
+	// 闸二也放行 → 图片漏判通知（与闸一放行那处互斥：走到闸二的不会在闸一推过）。
+	await notifyImageMiss();
 	return false;
 }
 
@@ -32602,6 +32964,7 @@ function adPayloadFromSnapshot(snapshot) {
 		// 就会「说成功了」却一行都没清，同款图下一个人照样命中。老快照无此字段，
 		// 还原成空串，回滚端读到空串自动跳过。
 		imageId: String(snap.imageId || ''),
+		stickerSet: String(snap.stickerSet || ''),
 		// 本次计了分的被挂 handle。同样是【白名单重建】—— 漏了它，/ignore 就撤不掉
 		// 自举案底，被误封的人挂的那个频道仍挂着「已确认广告位」，下一个人挂同款
 		// 照样 +3。老快照无此字段 → 空数组 → 回滚端循环不执行。
@@ -33029,6 +33392,10 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, options = 
 	// 会被连坐，而且图片比头像更容易被多人正常转发，这个口子必须同时堵上。
 	// 老快照冻结于图片功能上线之前，还原出的 imageId 是空串 → 本步自动跳过。
 	const imageCleared = await clearAdImageOnIgnore(env, payload?.imageId);
+	// 贴纸包同理：误封的号发的包转成 clean（自动学习从此学不回，人工 /spam 仍可）。
+	let packCleared = false;
+	try { packCleared = await clearAdStickerPack(env, payload?.stickerSet); } catch (_) { packCleared = false; }
+	if (packCleared) console.log('[广告检测] /ignore 已把贴纸包转干净 set=' + String(payload?.stickerSet || ''));
 	// 被挂链接的自举案底同步纠错：与头像 / 会员标 / 正文图片完全同一理由 ——
 	// 这个号既然是误封，他挂的那个频道就不能继续挂着「已确认广告位」，否则
 	// 下一个人挂同款照样 +3，连坐持续到缓存被自然覆盖为止。
@@ -33709,6 +34076,7 @@ const AD_CHANNEL_ACCOUNT_ROWS = [
 	// 「头像文字」会被上一行「头像」一起数进去，两行同时 +1。
 	{ tag: '文字头像', label: '头像文字命中特征库' },
 	{ tag: '正文图片', label: '正文图片命中' },
+	{ tag: '表情包', label: '广告贴纸包命中' },
 	{ tag: '资料卡查杀（用户名+简介）', label: '结构查杀·资料卡（用户名+简介）' },
 	{ tag: '正文查杀（简介+正文）', label: '结构查杀·正文（简介+正文）' },
 	{ tag: 'identity', label: '结构查杀·身份类（昵称+简介）' },
