@@ -30104,29 +30104,12 @@ function adImageMiss(row, reason, prob = 0) {
 	return Object.assign({}, row, { missReason: String(reason), missProb: Number(prob) || 0 });
 }
 
-// 带贴纸包判定的入口：贴纸属于已定罪的广告包 → 直接定罪，一次识图都不花；
-// 否则走单张实时判定。包名就在 update 里（sticker.set_name），零 Telegram 请求。
+// 单图实时判定入口：贴纸/自定义 emoji 统一走单张图片识别+指纹连坐。
+// 不再检查包级指纹、不再标题定罪整个包、不再抽样定罪整个包。
 async function judgeAdMediaForMessage(env, media, userId) {
 	if (!media?.fileUniqueId) return null;
-	const setName = String(media.setName || '');
-	const packRow = (detail, category) => ({ file_unique_id: String(media.fileUniqueId), verdict: 'ad', hits: 0,
-		source: 'pack', packHit: setName, packDetail: String(detail || ''), category: String(category || '') });
-	let pack = '';
-	if (setName) {
-		pack = await readAdStickerPack(env, setName);
-		if (pack && pack !== 'clean') return packRow('', '');
-		// 新包首见：先判包标题（一次 getStickerSet，零 Neurons）。/ignore 过的包（clean）主人已判过，不再查。
-		if (pack !== 'clean') {
-			const byTitle = await scanAdStickerPack(env, setName, { titleOnly: true });
-			if (byTitle?.ad) return packRow(byTitle.detail, byTitle.category);
-		}
-	}
-	const row = await judgeAdMediaRealtime(env, media, userId);
-	if (!setName || pack === 'clean' || String(row?.verdict || '') === 'ad') return row;
-	// 单张判干净 / 没判成：标题也判不出时再抽包里的图（每包一辈子只抽一次）。
-	const byImages = await scanAdStickerPack(env, setName, { excludeUniqueId: media.fileUniqueId });
-	if (byImages?.ad) return packRow(byImages.detail, byImages.category);
-	return row;
+	// 直接走单张实时判定：识别这张图的内容，记录这张图的指纹，以后谁发这张图都封。
+	return await judgeAdMediaRealtime(env, media, userId);
 }
 
 // 闸一：只发自定义表情的消息（表情包广告的标准形态）查它出自哪个包，
@@ -33858,7 +33841,8 @@ async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
 			? (r.sampleRemoved.removed > 0 ? 'AI 样本 已删 ' + r.sampleRemoved.removed : 'AI 样本 无对应')
 			: 'AI 样本 删除失败';
 		if (single) {
-			lines.push('用户：<code>' + escapeHtml(r.targetId) + '</code>');
+			const ignoreUid = escapeHtml(r.targetId);
+			lines.push('用户：<code>' + ignoreUid + '</code>　<a href="tg://user?id=' + ignoreUid + '">查看资料</a>');
 			lines.push('黑名单：' + (r.removed.success ? '已移除' : (r.removed.code === 'NOT_FOUND' ? '本就不在黑名单' : '移除失败')));
 			lines.push('解封：' + escapeHtml(r.unbanSummary));
 			lines.push('指纹修正：' + (r.fp.ok ? '已标记 <b>' + (r.fp.affected || 0) + '</b> 条误判，删除 <b>' + (r.fp.retired || 0) + '</b> 条' : '标记失败'));
@@ -35292,9 +35276,10 @@ async function handleAdReplyLearning(message, env, ctx) {
 			await deleteAdScreening(env, targetId);
 		}
 		const skipNote = '⏭️ 未执行（判据回滚仅限第一主人）';
+		const replyUid = escapeHtml(targetId);
 		await sendTelegramMessage(chat.id, [
 			'<b>♻️ 已按误判处理</b>',
-			'用户：<code>' + escapeHtml(targetId) + '</code>',
+			'用户：<code>' + replyUid + '</code>　<a href="tg://user?id=' + replyUid + '">查看资料</a>',
 			'黑名单：' + (removed.success ? '已移除' : (removed.code === 'NOT_FOUND' ? '本就不在黑名单' : '移除失败')),
 			'解封：' + unbanOk + '/' + unbanTotal + ' 个群成功',
 			'指纹修正：' + (canRollback ? (fp.ok ? '标记 ' + (fp.affected || 0) + ' 条误判，删除 ' + (fp.retired || 0) + ' 条' : '标记失败') : skipNote),
