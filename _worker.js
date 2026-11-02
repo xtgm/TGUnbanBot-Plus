@@ -25715,12 +25715,15 @@ async function notifyAdObserveNotice(env, evaluation, userId, chatId) {
 		if (!(await claimAdObserveNotice(env, userId))) return;
 		const snap = (evaluation.snapshot && typeof evaluation.snapshot === 'object') ? evaluation.snapshot : {};
 		const origin = classifyAdObserveOrigin(reasons);
+		// 观察通知要先能点开看人才能手动判：ID 留 <code> 复制，昵称走 tg://user 资料卡，用户名走 t.me。
+		const obsUid = escapeHtml(String(userId));
+		const obsUname = normalizeTelegramUsername(snap.username);
 		const lines = [
 			'👀 <b>' + origin.title + '</b>',
 			'',
-			'用户：<code>' + escapeHtml(String(userId)) + '</code>'
-				+ (snap.name ? '　' + escapeHtml(String(snap.name).slice(0, 40)) : '')
-				+ (snap.username ? '　<code>' + escapeHtml(String(snap.username)) + '</code>' : ''),
+			'用户：<code>' + obsUid + '</code>'
+				+ '　<a href="tg://user?id=' + obsUid + '">' + escapeHtml(String(snap.name || '查看资料').slice(0, 40)) + '</a>'
+				+ (obsUname ? '　<a href="https://t.me/' + obsUname + '">@' + obsUname + '</a>' : ''),
 			'得分：<b>' + Number(evaluation.score || 0) + '</b>' + origin.scoreNote,
 			'正文：' + (snap.text ? '<code>' + escapeHtml(String(snap.text).slice(0, 150)) + '</code>' : '（空）'),
 			(chatId ? '群：<code>' + escapeHtml(String(chatId)) + '</code>' : ''),
