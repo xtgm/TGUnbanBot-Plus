@@ -12739,7 +12739,7 @@ async function ensureAdDryRunLogTable(env) {
 	const init = (async () => {
 		try {
 			await runD1SchemaStatement(env, 'ad_dryrun_log',
-				'CREATE TABLE IF NOT EXISTS ad_dryrun_log (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, user_id TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 0, verdict TEXT NOT NULL DEFAULT \'\', layer TEXT NOT NULL DEFAULT \'\', reasons TEXT NOT NULL DEFAULT \'\', snapshot TEXT NOT NULL DEFAULT \'\', evaluation TEXT NOT NULL DEFAULT \'\', fp INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, learned INTEGER NOT NULL DEFAULT 0, sample INTEGER NOT NULL DEFAULT 0, badges INTEGER NOT NULL DEFAULT 0, avatars INTEGER NOT NULL DEFAULT 0, images INTEGER NOT NULL DEFAULT 0, shapes INTEGER NOT NULL DEFAULT 0, links INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0)');
+				'CREATE TABLE IF NOT EXISTS ad_dryrun_log (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, user_id TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 0, verdict TEXT NOT NULL DEFAULT \'\', layer TEXT NOT NULL DEFAULT \'\', reasons TEXT NOT NULL DEFAULT \'\', snapshot TEXT NOT NULL DEFAULT \'\', evaluation TEXT NOT NULL DEFAULT \'\', fp INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, learned INTEGER NOT NULL DEFAULT 0, sample INTEGER NOT NULL DEFAULT 0, badges INTEGER NOT NULL DEFAULT 0, avatars INTEGER NOT NULL DEFAULT 0, images INTEGER NOT NULL DEFAULT 0, shapes INTEGER NOT NULL DEFAULT 0, links INTEGER NOT NULL DEFAULT 0, packs INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0)');
 			await runD1SchemaStatement(env, 'idx_ad_dryrun_created', 'CREATE INDEX IF NOT EXISTS idx_ad_dryrun_created ON ad_dryrun_log (created_at)', { optional: true });
 			// ===== 按钮十列（存量表迁移）=====
 			// CREATE TABLE IF NOT EXISTS 对已存在的表完全无效，缺了这一步老部署会在
@@ -12752,7 +12752,7 @@ async function ensureAdDryRunLogTable(env) {
 			// （summarizeDryRunLearning），说清这一轮七类各学了多少。
 			if (await d1TableExists(env, 'ad_dryrun_log')) {
 				for (const column of ['evaluation', 'fp', 'done', 'learned', 'sample',
-					'badges', 'avatars', 'images', 'shapes', 'links']) {
+					'badges', 'avatars', 'images', 'shapes', 'links', 'packs']) {
 					try {
 						if (!(await d1ColumnExists(env, 'ad_dryrun_log', column))) {
 							await runD1SchemaStatement(env, 'ad_dryrun_log.' + column,
@@ -12883,7 +12883,8 @@ async function readAdDryRunRow(env, id) {
 	if (!(await ensureAdDryRunLogTable(env))) return null;
 	try {
 		return await env.DB.prepare(
-			'SELECT id, chat_id, user_id, score, threshold, verdict, layer, reasons, evaluation, fp, done, learned, sample, created_at'
+			'SELECT id, chat_id, user_id, score, threshold, verdict, layer, reasons, evaluation, fp, done, learned, sample,'
+			+ ' badges, avatars, images, shapes, links, packs, created_at'
 			+ ' FROM ad_dryrun_log WHERE id = ?'
 		).bind(rowId).first();
 	} catch (error) {
@@ -12926,10 +12927,10 @@ async function markAdDryRunLearned(env, id, tally) {
 	try {
 		const res = await env.DB.prepare(
 			'UPDATE ad_dryrun_log SET learned = ?, sample = ?,'
-			+ ' badges = ?, avatars = ?, images = ?, shapes = ?, links = ? WHERE id = ?'
+			+ ' badges = ?, avatars = ?, images = ?, shapes = ?, links = ?, packs = ? WHERE id = ?'
 		).bind(Number(t.learned) || 0, t.sampleAdded ? 1 : 0,
 			Number(t.badges) || 0, Number(t.avatars) || 0, Number(t.images) || 0,
-			Number(t.shapes) || 0, Number(t.links) || 0, rowId).run();
+			Number(t.shapes) || 0, Number(t.links) || 0, Number(t.packs) || 0, rowId).run();
 		return { ok: Number(res?.meta?.changes || 0) > 0 };
 	} catch (error) {
 		console.error('[演练模式] 记录学习结果失败:', error);
@@ -28664,6 +28665,25 @@ async function queueAdAvatarLearning(env, userId) {
 	}
 }
 
+// 演练「❌ 不该封」用：把这个人从补学队列里拿掉，别人原样留着。不在队列里返回 false，不写库。
+async function dequeueAdAvatarLearning(env, userId) {
+	const uid = String(userId || '');
+	if (!env?.DB || !uid) return false;
+	try {
+		const raw = await readAdScanState(env, 'avatar_learn_queue', '[]');
+		let list = [];
+		try { list = JSON.parse(String(raw || '[]')); } catch (_) { list = []; }
+		if (!Array.isArray(list)) return false;
+		const next = list.map((v) => String(v)).filter((v) => v && v !== uid);
+		if (next.length === list.length) return false;
+		await writeAdScanState(env, 'avatar_learn_queue', JSON.stringify(next), Math.floor(Date.now() / 1000));
+		return true;
+	} catch (error) {
+		console.error('[广告检测·头像] 移出补学队列失败:', error);
+		return false;
+	}
+}
+
 // 消化补学队列：逐个拉资料拿头像，学进指纹库。由 cron 调用。
 // 单轮最多 limit 个（默认 30）—— 每个一次 getChat，不能让一轮 cron 把
 // Telegram 限流打满；没消化完的留在队列里，下一轮继续。
@@ -31659,9 +31679,14 @@ async function pushAdDryRunNotice(env, context) {
 // 封一个同款就会重新学回来。真要精确减一得另写一套计数回退，目前没有这个需求。
 //
 // 任何一步失败都只影响撤销的完整度，不能影响「标为误报」这个标记本身。
-async function revertDryRunLearning(env, evaluation) {
+async function revertDryRunLearning(env, evaluation, options = {}) {
 	const payload = evaluation?.payload || {};
-	const out = { avatar: null, badge: null, image: null, shape: false, fp: null, sample: null };
+	const out = { avatar: null, badge: null, image: null, shape: false, fp: null, sample: null, links: 0, dequeued: false };
+	// 自举案底：学的时候盖的是 snapshot.scoredLinks，撤的时候撤同一份。
+	try { out.links = await clearAdLinkConfirmedOnIgnore(env, evaluation?.snapshot?.scoredLinks); } catch (_) { /* 同下 */ }
+	// 闸一定罪时头像没拿到、只排进了补学队列：payload.avatarId 为空，上面撤头像撤不到，
+	// 不把人移出队列的话 cron 之后照样把他的头像与会员标学进去。
+	try { out.dequeued = await dequeueAdAvatarLearning(env, options.userId); } catch (_) { /* 同下 */ }
 	try { out.avatar = await clearAdAvatarOnIgnore(env, payload.avatarId); } catch (_) { /* 撤销失败只记日志 */ }
 	try { out.badge = await clearAdBadgeOnIgnore(env, payload.badgeId); } catch (_) { /* 同上 */ }
 	// 正文自定义 emoji 逐个撤，跳过与会员标重复的那个 —— 学的时候就是这么跳的，
@@ -31688,7 +31713,7 @@ async function revertDryRunLearning(env, evaluation) {
 // 数据来自 ad_dryrun_log 的记账列（见 markAdDryRunLearned）：演练当场就学，
 // 所以流水里的数字就是真实学到的量，不是「本来会学」。
 async function summarizeDryRunLearning(env, chatId, sinceISO) {
-	const out = { hits: 0, fingerprints: 0, samples: 0, badges: 0, avatars: 0, images: 0, shapes: 0, links: 0 };
+	const out = { hits: 0, fingerprints: 0, samples: 0, badges: 0, avatars: 0, images: 0, shapes: 0, links: 0, packs: 0 };
 	if (!env?.DB) return out;
 	if (!(await ensureAdDryRunLogTable(env))) return out;
 	const since = sinceISO ? Math.floor(Date.parse(sinceISO) / 1000) : 0;
@@ -31698,7 +31723,7 @@ async function summarizeDryRunLearning(env, chatId, sinceISO) {
 			'SELECT COUNT(*) AS hits, COALESCE(SUM(learned),0) AS fingerprints,'
 			+ ' COALESCE(SUM(sample),0) AS samples, COALESCE(SUM(badges),0) AS badges,'
 			+ ' COALESCE(SUM(avatars),0) AS avatars, COALESCE(SUM(images),0) AS images,'
-			+ ' COALESCE(SUM(shapes),0) AS shapes, COALESCE(SUM(links),0) AS links'
+			+ ' COALESCE(SUM(shapes),0) AS shapes, COALESCE(SUM(links),0) AS links, COALESCE(SUM(packs),0) AS packs'
 			+ ' FROM ad_dryrun_log WHERE chat_id = ? AND created_at >= ?'
 		).bind(String(chatId), since).first();
 		if (row) {
@@ -31710,6 +31735,7 @@ async function summarizeDryRunLearning(env, chatId, sinceISO) {
 			out.images = Number(row.images) || 0;
 			out.shapes = Number(row.shapes) || 0;
 			out.links = Number(row.links) || 0;
+			out.packs = Number(row.packs) || 0;
 		}
 	} catch (error) {
 		console.error('[演练模式] 汇总学习成果失败:', error);
@@ -31740,6 +31766,7 @@ function renderDryRunLearnSummary(t) {
 	if (t.badges) bits.push('会员标/贴纸 +' + t.badges + ' 个');
 	if (t.images) bits.push('正文图片 +' + t.images + ' 张');
 	if (t.links) bits.push('自举案底 +' + t.links + ' 个');
+	if (t.packs) bits.push('贴纸包 +' + t.packs + ' 个');
 	if (!bits.length) {
 		return '本轮演练没有学到新特征（命中的要么与库中已有判据重复，要么资料里没有可学素材）。';
 	}
@@ -31793,7 +31820,7 @@ async function handleDryRunButtonCallback(callbackQuery, env) {
 		}
 		if (evaluation && typeof evaluation === 'object' && Array.isArray(evaluation.reasons)) {
 			try {
-				await revertDryRunLearning(env, evaluation);
+				await revertDryRunLearning(env, evaluation, { userId: String(row.user_id || '') });
 			} catch (error) {
 				// 撤销不完整只影响这一条，标记本身已经落库 —— 回执照实说。
 				console.error('[演练模式] 撤销学到的特征失败:', error);
@@ -31803,7 +31830,7 @@ async function handleDryRunButtonCallback(callbackQuery, env) {
 		const fpLine = [
 			'─────',
 			'❌ 已标为误报　流水 #' + rowId + '　得分 ' + (Number(row.score) || 0) + '/' + (Number(row.threshold) || 0),
-			'已撤销本次演练学到的特征（指纹 / 资料形状 / 头像 / 会员标 / 正文图片 / AI 样本）。',
+			'已撤销本次演练学到的特征（指纹 / 资料形状 / 头像 / 会员标 / 正文图片 / 贴纸包 / 自举案底 / AI 样本）。',
 			'只计入 /adstats 的演练统计。看统计：/adstats'
 		];
 		await editTelegramMessage(chatId, messageId, originText + '\n' + fpLine.join('\n'));
@@ -31821,7 +31848,10 @@ async function handleDryRunButtonCallback(callbackQuery, env) {
 	// 演练期已经学过的特征不再学第二次：hits 是 +1 语义，确认封那一次再学一遍会让
 	// 头像与资料形状各 +1，直接顶到封禁档（AD_PROFILE_SHAPE_MIN_HITS=2、头像达佐证档 3），
 	// 等于主人点一次按钮就把安全阀拱开。记账见 markAdDryRunLearned。
-	const alreadyLearned = Number(row.learned) > 0 || Number(row.sample) === 1;
+	// 九列任何一列非零都算学过：只学到头像 / 形状 / 会员标的纯图片号、纯资料号，
+	// 只看指纹与样本两列会被当成「没学过」，确认封再学一遍正好把 hits 拱到封禁档。
+	const alreadyLearned = ['learned', 'badges', 'avatars', 'images', 'shapes', 'links', 'packs']
+		.some((col) => Number(row[col]) > 0) || Number(row.sample) === 1;
 	let result = null;
 	try {
 		result = await enforceAdDetection(env, {
@@ -31875,7 +31905,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 	// 各类计数：关演练时要给一份「这一轮学到什么」的汇总，光靠 learned/sample
 	// 两列说不清七类分别学了多少。布尔型学习函数成功记 1；
 	// confirmAdLinkOnBan 返回的就是本次盖章的 handle 数，直接累加。
-	let badges = 0, avatars = 0, images = 0, shapes = 0, links = 0;
+	let badges = 0, avatars = 0, images = 0, shapes = 0, links = 0, packs = 0;
 
 	// ===== 自举案底：这次定罪把哪几个被挂 handle 坐实了 =====
 	//
@@ -31973,7 +32003,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 				|| s.startsWith('消息图片命中广告素材库') || s.startsWith('贴纸属于已定罪的广告贴纸包')
 				|| s.startsWith('图片识图漏判');
 		});
-		if (stickerSet && convictedByImage) await markAdStickerPack(env, stickerSet, 'auto');
+		if (stickerSet && convictedByImage && await markAdStickerPack(env, stickerSet, 'auto')) packs += 1;
 	} catch (_) { /* 图片学习失败不影响本次处置 */ }
 	// 定罪即学习资料形状：资料模板是批量号的【公开复用资产】，学一次之后同模板的号
 	// 在零 AI 下就能命中（只加分，仍要过原有阈值）。取 snapshot 里存好的形状，
@@ -32047,7 +32077,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 		console.error('[广告检测] 自动学习语义样本失败:', error);
 	}
 
-	return { learned, sampleAdded, badges, avatars, images, shapes, links };
+	return { learned, sampleAdded, badges, avatars, images, shapes, links, packs };
 }
 
 // === 处置执行 ===
@@ -32108,7 +32138,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		// 学特征（演练的核心目的）。与正式处置共用 learnAdFeaturesOnVerdict，
 		// 判据不另写一套。学完把七类结果一并写进流水：确认封时据此跳过重复学习，
 		// 关演练时据此出汇总回执。
-		let tally = { learned: 0, sampleAdded: false, badges: 0, avatars: 0, images: 0, shapes: 0, links: 0 };
+		let tally = { learned: 0, sampleAdded: false, badges: 0, avatars: 0, images: 0, shapes: 0, links: 0, packs: 0 };
 		// 独立群不学：判据库是全部配置群共用的，独立群自治不能反过来改全局判据。
 		if (!localScope) {
 			try {
@@ -32139,7 +32169,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			+ ' layer=' + evaluation?.layer + ' 流水=' + dryRunId
 			+ ' 指纹=' + learnedCount + ' 样本=' + (sampleLearned ? 1 : 0)
 			+ ' 形状=' + tally.shapes + ' 头像=' + tally.avatars
-			+ ' 会员标=' + tally.badges + ' 图片=' + tally.images + ' 案底=' + tally.links);
+			+ ' 会员标=' + tally.badges + ' 图片=' + tally.images + ' 案底=' + tally.links + ' 贴纸包=' + tally.packs);
 		// 返回结构刻意对齐正常处置，只是 banned=false、seq=null：
 		// cron 那条调用点读的是 result?.banned !== false，会正确记成「未封」；
 		// banSummary 给非空值是让 /spam 那条群内闪屏读到时能显示演练字样而不是「未知」。
@@ -35298,7 +35328,7 @@ async function handleAdReplyLearning(message, env, ctx) {
 	await sendFlashMessage(chat.id, enforced?.dryrun
 		? [
 			'🧪 演练命中（未处置）' + targetId,
-			'本来会：加黑 + 全群封禁 + 删消息 + 学指纹',
+			'本来会：加黑 + 全群封禁 + 删消息（特征已照常学入）',
 			'本群不设防中，看完发 /dryrun 关闭'
 		]
 		: [
@@ -35334,8 +35364,9 @@ async function handleAdReplyLearning(message, env, ctx) {
 			'',
 			'<b>处置结果</b>',
 			...(enforced?.dryrun
-				? ['🧪 演练模式：不加黑、不封禁、不删消息、未学入指纹',
-					'本来会：加黑 + 全群封禁 + 删消息 + 学指纹与 AI 样本']
+				? ['🧪 演练模式：不加黑、不封禁、不删消息',
+					'学入指纹：' + (Number(learn?.learned) || 0) + ' 条（演练只挡处置不挡学习，判错点演练通知上的「❌ 不该封」撤销）',
+					'本来会：加黑 + 全群封禁 + 删消息']
 				: ['黑名单：' + (enforced.blacklistCode === 'ADDED' ? '已加入' : enforced.blacklistCode === 'EXISTS' ? '此前已在黑名单' : String(enforced.blacklistCode || '未知')),
 					'全群封禁：' + (enforced.banSummary || '未知'),
 					'学入指纹：' + (Number(learn?.learned) || 0) + ' 条（manual 来源，豁免误报退役）',
