@@ -16169,6 +16169,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			let spamLearned = 0;
 			let spamSampleAdded = 0;
 			let spamEnriched = 0;
+			let spamLearnResult = null;
 			try {
 			// 学习逻辑已抽成 learnAdFromOperatorAction（/spam /ban /sban 三条命令共用），
 			// 这里只传【引用的那条消息】+ source='spam'，三段内容与改动前逐字一致。
@@ -16192,6 +16193,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			spamLearned = spamLearn.learned;
 			spamSampleAdded = spamLearn.sampleAdded;
 			spamEnriched = spamLearn.enriched;
+			spamLearnResult = spamLearn;
 			} catch (error) {
 				// 学习失败绝不能影响 /spam 的本职（加黑 + 全群封禁 + 清扫）—— 那些已经做完了。
 				console.error('[广告检测] /spam 学习指纹失败:', error);
@@ -16199,6 +16201,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			if (spamLearned > 0) lines.push('🧬 已学习广告指纹:' + spamLearned + ' 条(来源 /spam 人工判定)');
 			if (spamSampleAdded > 0) lines.push('🧠 已加 AI 语义样本:' + spamSampleAdded + ' 条(来源 /spam 人工判定)');
 			if (spamEnriched > 0) lines.push('🧠 共性提炼:从新样本自动提炼出 ' + spamEnriched + ' 条指纹(共现 ≥2 次)');
+			// 引用模式此前只报上面三行，图片 / 贴纸包学没学到回执里看不出来。
+			if (spamLearnResult?.imageLearned > 0) lines.push('🖼 已学习广告图片/贴纸: 引用消息里的那张已入库，下次任何人发同一张即命中');
+			if (spamLearnResult?.packLearned) lines.push('📦 已学习广告贴纸包 <code>' + escapeHtml(spamLearnResult.packLearned) + '</code>: 同包任何一张都秒封');
 
 			// ===== 同款广告连带查杀（2026-09-11 主人选定方案一）=====
 			// 反查 24 小时内、全部配置群里发过同款文案的其他账号，一并删消息 + 加黑 + 全群封禁。
@@ -23712,6 +23717,18 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 				out.packLearned = String(learnMedia.setName);
 			}
 		}
+		// 【2026-11-02】正文里的自定义表情（表情包广告单发一个大箭头）也整包学：
+		// 单个 emoji id 进 ad_badges 要 hits≥3 才能单独定罪，主人 /spam 一次等于没学到。
+		// 包名要 getCustomEmojiStickers 现查（6 小时缓存），/spam 是低频手动命令，多一个请求无所谓。
+		if (!out.packLearned && payload.customEmojiIds.length) {
+			const packs = await resolveCustomEmojiStickers(env, payload.customEmojiIds);
+			const names = [...new Set(Object.values(packs).map((v) => String(v?.setName || '')).filter(Boolean))].slice(0, 3);
+			const learnedNames = [];
+			for (const packName of names) {
+				if (await markAdStickerPack(env, packName, source, { manual: true })) learnedNames.push(packName);
+			}
+			if (learnedNames.length) out.packLearned = learnedNames.join(', ');
+		}
 
 		// 语义样本：正文太短且不含举报 / 吐槽语义时改用引用块内容。
 		// 线上漏放 50+ 个号的共同形态正是「正文只有一个字母 c、广告全在引用块里」——
@@ -27804,6 +27821,215 @@ async function clearAdStickerPack(env, setName) {
 	return true;
 }
 
+// ===== 新包首见即判（2026-11-02 主人选 C：先判包标题，判不出再抽图）=====
+// 漏杀实证：粉色箭头贴纸单张没有任何广告证据，证据全在包上 ——
+// 包标题「免费看包射片 @madouzaibot」、包内第 5 张是色情缩略图。update 里只带包的短名，
+// 标题与包内其他贴纸必须 getStickerSet 才拿得到，之前全项目一次都没调过。
+// 每个包只判一次：结论记在 adsetscan:<包名>（不复用 adset:，那里的 clean 是 /ignore 的安全阀，
+// 抽查判干净写进去会挡住之后识图对同包的自动定罪）。判成广告同时写 adset:<包名>=auto，
+// 之后同包任何一张走现成的包命中，零请求。
+const AD_PACK_SCAN_KEY_PREFIX = 'adsetscan:';
+// 每包最多识图几张（含本条消息那一张）。广告包常把引流图放在最后，抽样必含末张。
+const AD_PACK_SCAN_SAMPLE = 5;
+// 包内抽查的定罪线：抽到的是【别的】贴纸，比单张当场判更间接，取实测两簇之间的 0.9。
+const AD_PACK_IMAGE_BAN_PROB = 0.9;
+// 包标题专用色情指向词。包标题不是聊天，没有「看片子」「福利待遇」这类日常语境，
+// 而且只在【同时挂了引流账号或链接】时才定罪（两个特征），单个词不算。
+const AD_STICKER_PACK_TITLE_PORN_WORDS = [
+	'射片', '看片', '黄片', '成人', '色情', '福利', '裸照', '裸体', '偷拍', '自慰', '黑料', '涩图', '色图'
+];
+const AD_STICKER_SET_CACHE = new Map();
+const AD_STICKER_SET_CACHE_TTL_MS = 10 * 60 * 1000;
+
+// 包标题判定（纯函数）：色情 / 硬行业指向 ∧ 引流出口，两个都要有才返回理由。
+function judgeAdStickerPackTitle(title) {
+	const source = String(title || '').trim();
+	if (!source) return '';
+	const subjects = countAdKeywordHits(source, AD_PORN_PATTERNS.concat(AD_STICKER_PACK_TITLE_PORN_WORDS));
+	for (const re of AD_BIZ_PATTERNS) {
+		const m = source.match(re);
+		if (m) subjects.push(m[0]);
+	}
+	const outlet = AD_BOT_MENTION_RE.test(source) || /@[A-Za-z0-9_]{5,32}/.test(source)
+		|| /(https?:\/\/|t\.me\/)/i.test(source);
+	if (!subjects.length || !outlet) return '';
+	return '包标题含「' + [...new Set(subjects)].slice(0, 3).join('/') + '」且挂引流账号/链接';
+}
+
+// 抽样：不超过 limit 张时全取；否则首尾必取、中间均匀取。
+function pickAdPackSamples(stickers, limit) {
+	const list = Array.isArray(stickers) ? stickers : [];
+	const n = Math.max(0, Number(limit) || 0);
+	if (list.length <= n) return list.slice();
+	if (n <= 0) return [];
+	if (n === 1) return [list[list.length - 1]];
+	const seen = new Set();
+	const out = [];
+	for (let i = 0; i < n; i++) {
+		const idx = Math.round(i * (list.length - 1) / (n - 1));
+		if (seen.has(idx)) continue;
+		seen.add(idx);
+		out.push(list[idx]);
+	}
+	return out;
+}
+
+async function fetchAdStickerSet(name) {
+	const hit = AD_STICKER_SET_CACHE.get(name);
+	if (hit && hit.expiresAt > Date.now()) return hit.value;
+	const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getStickerSet', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ name })
+	});
+	const result = await response.json();
+	let value = null;
+	if (result?.ok && result.result && typeof result.result === 'object') {
+		value = { ok: true, title: String(result.result.title || ''), stickers: Array.isArray(result.result.stickers) ? result.result.stickers : [] };
+	} else if (response.status === 400 || /STICKERSET_INVALID|not found/i.test(String(result?.description || ''))) {
+		value = { ok: true, title: '', stickers: [] };
+	} else {
+		return null;
+	}
+	if (AD_STICKER_SET_CACHE.size >= 200) {
+		const oldest = AD_STICKER_SET_CACHE.keys().next();
+		if (!oldest.done) AD_STICKER_SET_CACHE.delete(oldest.value);
+	}
+	AD_STICKER_SET_CACHE.set(name, { value, expiresAt: Date.now() + AD_STICKER_SET_CACHE_TTL_MS });
+	return value;
+}
+
+// 下载一张图并转成 clef 吃的 data URI；尺寸 / 格式不合格返回 { miss }，网络或接口错误抛出。
+async function fetchAdVisionImageUri(fileId) {
+	const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ file_id: String(fileId || '') })
+	});
+	const fileResult = await fileResponse.json();
+	if (!fileResult?.ok) throw new Error(fileResult?.description || 'getFile 失败');
+	const filePath = String(fileResult?.result?.file_path || '');
+	if (!filePath) throw new Error('file_path 为空');
+	const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
+	if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
+	const buffer = await imageResponse.arrayBuffer();
+	if (buffer.byteLength > AD_VISION_MAX_IMAGE_BYTES) return { miss: 'size' };
+	const bytes = new Uint8Array(buffer);
+	const mime = sniffImageMime(bytes);
+	if (!mime) return { miss: 'mime' };
+	return { uri: 'data:' + mime + ';base64,' + bytesToBase64(bytes) };
+}
+
+// 判一个包。返回 { ad:true, detail, category } / { ad:false } / null（这次没判成，下次再来）。
+// options.titleOnly：只判标题、不抽图、判不出也不落结论（给「先判标题」那一步用）。
+// options.excludeUniqueId：本条消息那张已经单独识图过，抽样时跳过它。
+async function scanAdStickerPack(env, setName, options = {}) {
+	const name = String(setName || '');
+	if (!env?.DB || !name || !BOT_TOKEN) return null;
+	const stateKey = AD_PACK_SCAN_KEY_PREFIX + name;
+	const config = loadAdDetectionConfig(env);
+	const dailyLimit = Number(config.imageVisionDaily);
+	const canVision = Boolean(env.AI) && dailyLimit > 0;
+	let prior = null;
+	try { prior = JSON.parse(await readAdScanState(env, stateKey, '') || 'null'); } catch (_) { prior = null; }
+	if (prior?.ad === true) return { ad: true, detail: String(prior.detail || ''), category: String(prior.category || ''), cached: true };
+	if (prior?.ad === false && (options.titleOnly === true || prior.images === true || !canVision)) return { ad: false, cached: true };
+
+	let set = null;
+	try { set = await fetchAdStickerSet(name); } catch (error) {
+		console.error('[广告检测·贴纸包] getStickerSet 失败:', error?.message || error);
+		return null;
+	}
+	if (!set) return null;
+	const nowSeconds = Math.floor(Date.now() / 1000);
+	const save = (value) => writeAdScanState(env, stateKey, JSON.stringify(Object.assign({ at: nowSeconds }, value)), nowSeconds);
+
+	const titleHit = judgeAdStickerPackTitle(set.title);
+	if (titleHit) {
+		const detail = titleHit + '：' + set.title.slice(0, 60);
+		await save({ ad: true, detail });
+		await markAdStickerPack(env, name, 'auto');
+		console.log('[广告检测·贴纸包] 标题定罪 set=' + name);
+		return { ad: true, detail, category: '' };
+	}
+	if (options.titleOnly === true) return { ad: false };
+	if (!canVision) {
+		await save({ ad: false, images: false });
+		return { ad: false };
+	}
+
+	const exclude = String(options.excludeUniqueId || '');
+	const indexed = set.stickers.map((s, i) => ({ s, i }))
+		.filter(({ s }) => String(s?.file_unique_id || '') !== exclude);
+	const picked = pickAdPackSamples(indexed, AD_PACK_SCAN_SAMPLE - (exclude ? 1 : 0))
+		.map(({ s, i }) => ({ i, fileId: (!s?.is_animated && !s?.is_video) ? String(s?.file_id || '') : String(s?.thumbnail?.file_id || s?.thumb?.file_id || '') }))
+		.filter((x) => x.fileId);
+	if (!picked.length) {
+		await save({ ad: false, images: true });
+		return { ad: false };
+	}
+	const quota = await readImageVisionQuota(env, nowSeconds, 'img');
+	const remaining = Math.max(0, dailyLimit - quota.used);
+	if ((await readVisionBreakState(env, nowSeconds)).broken || remaining <= 0) return null;
+	const take = picked.slice(0, remaining);
+	let called = 0;
+	const results = await Promise.all(take.map(async ({ i, fileId }) => {
+		try {
+			const img = await fetchAdVisionImageUri(fileId);
+			if (img.miss) return { done: true, i };
+			called += 1;
+			const judge = await runVisionJudge(env, img.uri, CLEF_IMAGE_STATE);
+			if (!judge) return { done: false, failed: true, i };
+			return { done: true, judge, i };
+		} catch (error) {
+			if (isVisionRateLimited(error)) return { done: false, i };
+			await logAdVisionFailure(env, '贴纸包·抽查', 'ai.run', name, error);
+			return { done: false, failed: true, i };
+		}
+	}));
+	if (called) await writeAdScanState(env, 'img_count', String(quota.used + called), nowSeconds);
+	const okCount = results.filter((r) => r.judge).length;
+	if (okCount) await bumpVisionBreakState(env, true, nowSeconds);
+	else if (results.some((r) => r.failed)) await bumpVisionBreakState(env, false, nowSeconds);
+
+	let best = null;
+	for (const r of results) {
+		if (!r.judge?.ad) continue;
+		const p = Math.max(Number(r.judge.prob) || 0, Number(r.judge.categoryProb) || 0);
+		if (p >= AD_PACK_IMAGE_BAN_PROB && (!best || p > best.p)) best = { p, i: r.i, category: String(r.judge.category || '') };
+	}
+	if (best) {
+		const label = AD_IMAGE_CATEGORY_LABELS[best.category] || '广告';
+		const detail = '包内第 ' + (best.i + 1) + ' 张识图判为' + label + '（' + best.p.toFixed(2) + '）';
+		await save({ ad: true, detail, category: best.category });
+		await markAdStickerPack(env, name, 'auto');
+		console.log('[广告检测·贴纸包] 抽图定罪 set=' + name + ' ' + detail);
+		return { ad: true, detail, category: best.category };
+	}
+	const complete = take.length === picked.length && results.every((r) => r.done);
+	if (complete) await save({ ad: false, images: true });
+	return complete ? { ad: false } : null;
+}
+
+// 消息是不是「只有自定义表情」：去掉所有 custom_emoji 实体与空白后一个字都不剩。
+// 这正是表情包广告的形态（单发一个箭头大表情）；正文里夹一个装饰表情的普通发言不算。
+function isAdCustomEmojiOnlyMessage(message) {
+	const text = String(message?.text ?? message?.caption ?? '');
+	const entities = message?.entities || message?.caption_entities;
+	if (!text || !Array.isArray(entities)) return false;
+	const marks = entities.filter((e) => e?.type === 'custom_emoji');
+	if (!marks.length) return false;
+	const keep = new Array(text.length).fill(true);
+	for (const e of marks) {
+		const start = Math.max(0, Number(e.offset) || 0);
+		const end = Math.min(text.length, start + (Number(e.length) || 0));
+		for (let k = start; k < end; k++) keep[k] = false;
+	}
+	let rest = '';
+	for (let k = 0; k < text.length; k++) if (keep[k]) rest += text[k];
+	return rest.replace(/\s+/g, '') === '';
+}
+
 // 把图片命中叠加到已有判定结果上（纯函数，不动原对象）。与 applyAvatarVerdict 同位。
 //
 // 分档（【比头像严一档】，这是与头像唯一的实质差异）：
@@ -27843,8 +28069,9 @@ function applyImageVerdict(evaluation, image) {
 	const packHit = String(image.packHit || '');
 	const categoryLabel = AD_IMAGE_CATEGORY_LABELS[String(image.category || '')] || '';
 	const reason = packHit
-		? '贴纸属于已定罪的广告贴纸包：' + packHit
-		: '消息图片命中广告素材库（复用定罪 ' + hits + ' 次）' + (categoryLabel ? ' · 识图判为' + categoryLabel : '');
+		? '贴纸属于已定罪的广告贴纸包：' + packHit + (image.packDetail ? '（' + image.packDetail + '）' : '')
+			+ (categoryLabel ? ' · 识图判为' + categoryLabel : '')
+		:'消息图片命中广告素材库（复用定罪 ' + hits + ' 次）' + (categoryLabel ? ' · 识图判为' + categoryLabel : '');
 	const reasons = (evaluation.reasons || []).concat([reason]);
 	if (packHit || !AD_IMAGE_WEAK_SOURCES.has(String(image.source || ''))) {
 		const convicted = String(evaluation.verdict) !== 'ban';
@@ -29858,13 +30085,47 @@ function adImageMiss(row, reason, prob = 0) {
 async function judgeAdMediaForMessage(env, media, userId) {
 	if (!media?.fileUniqueId) return null;
 	const setName = String(media.setName || '');
+	const packRow = (detail, category) => ({ file_unique_id: String(media.fileUniqueId), verdict: 'ad', hits: 0,
+		source: 'pack', packHit: setName, packDetail: String(detail || ''), category: String(category || '') });
+	let pack = '';
 	if (setName) {
-		const pack = await readAdStickerPack(env, setName);
-		if (pack && pack !== 'clean') {
-			return { file_unique_id: String(media.fileUniqueId), verdict: 'ad', hits: 0, source: 'pack', packHit: setName };
+		pack = await readAdStickerPack(env, setName);
+		if (pack && pack !== 'clean') return packRow('', '');
+		// 新包首见：先判包标题（一次 getStickerSet，零 Neurons）。/ignore 过的包（clean）主人已判过，不再查。
+		if (pack !== 'clean') {
+			const byTitle = await scanAdStickerPack(env, setName, { titleOnly: true });
+			if (byTitle?.ad) return packRow(byTitle.detail, byTitle.category);
 		}
 	}
-	return judgeAdMediaRealtime(env, media, userId);
+	const row = await judgeAdMediaRealtime(env, media, userId);
+	if (!setName || pack === 'clean' || String(row?.verdict || '') === 'ad') return row;
+	// 单张判干净 / 没判成：标题也判不出时再抽包里的图（每包一辈子只抽一次）。
+	const byImages = await scanAdStickerPack(env, setName, { excludeUniqueId: media.fileUniqueId });
+	if (byImages?.ad) return packRow(byImages.detail, byImages.category);
+	return row;
+}
+
+// 闸一：只发自定义表情的消息（表情包广告的标准形态）查它出自哪个包，
+// 包已定罪或首见判成广告 → 定罪。不是纯表情消息一个请求都不发，「闸一零 Telegram 请求」对普通发言照旧成立。
+async function applyCustomEmojiOnlyPackScan(env, evaluation, message) {
+	if (!evaluation || String(evaluation.verdict) === 'ban') return evaluation;
+	if (!isAdCustomEmojiOnlyMessage(message)) return evaluation;
+	const ids = extractCustomEmojiIds(message);
+	if (!ids.length) return evaluation;
+	const packs = await resolveCustomEmojiStickers(env, ids);
+	const judged = await applyCustomEmojiPackVerdict(env, evaluation, packs);
+	if (String(judged.verdict) === 'ban') return judged;
+	const names = [...new Set(Object.values(packs || {}).map((v) => String(v?.setName || '')).filter(Boolean))].slice(0, 2);
+	for (const name of names) {
+		if ((await readAdStickerPack(env, name)) === 'clean') continue;
+		const scan = await scanAdStickerPack(env, name);
+		if (scan?.ad) {
+			const reasons = markAdConvictLayer((judged.reasons || []).concat(['自定义表情出自广告贴纸包：' + name + (scan.detail ? '（' + scan.detail + '）' : '')]), '表情包');
+			return Object.assign({}, judged, { verdict: 'ban', reasons,
+				payload: Object.assign({}, judged.payload || {}, { stickerSet: name }) });
+		}
+	}
+	return judged;
 }
 
 // 推一条漏判通知给第一主人：先把原消息复制过去（主人直接看图），再发判据 + 两个按钮。
@@ -32589,6 +32850,7 @@ async function detectAdOnMessage(message, env) {
 	// 所以「图片是唯一证据」时闸一就能封，不必为一次图片判据多花一个 Telegram 请求。
 	// imageRow 为 null（无媒体 / 尚未入库）时 applyImageVerdict 原样返回，一个字节不改。
 	cheap = applyImageVerdict(cheap, imageRow);
+	cheap = await applyCustomEmojiOnlyPackScan(env, cheap, message);
 
 	// ===== 同款自定义 emoji 叠判（批次 B-2 的正文一半）=====
 	// 【为什么闸一也要叠】批次 C 时闸一没有这个调用点，因为 cheapProfile 拿不到
