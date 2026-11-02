@@ -30178,14 +30178,13 @@ async function notifyAdImageMiss(env, context) {
 		lines.push(userLine);
 		if (chatId) lines.push('群：<code>' + escapeHtml(chatId) + '</code>');
 		lines.push('类型：' + kindLabel + (media.setName ? '（贴纸包 <code>' + escapeHtml(String(media.setName)) + '</code>）' : ''));
-			'原因：' + escapeHtml(AD_IMAGE_MISS_LABELS[reason] || reason)
-				+ (reason === 'gray' ? '（' + Number(image.missProb || 0).toFixed(2) + '）' : ''),
-			context.text ? '正文：<code>' + escapeHtml(String(context.text).slice(0, 150)) + '</code>' : '',
-			'',
-			'原消息已复制在上面，判断后直接点按钮：',
-			'　　🔒 确认封 = 全群封禁 + 删他的历史消息 + 拉黑 + 这张图' + (media.setName ? '和整个贴纸包' : '') + '记为广告',
-			'　　❌ 不该封 = 这张图记为干净，以后不再提醒'
-		];
+		lines.push('原因：' + escapeHtml(AD_IMAGE_MISS_LABELS[reason] || reason)
+			+ (reason === 'gray' ? '（' + Number(image.missProb || 0).toFixed(2) + '）' : ''));
+		lines.push(context.text ? '正文：<code>' + escapeHtml(String(context.text).slice(0, 150)) + '</code>' : '');
+		lines.push('');
+		lines.push('原消息已复制在上面，判断后直接点按钮：');
+		lines.push('　　🔒 确认封 = 全群封禁 + 删他的历史消息 + 拉黑 + 这张图' + (media.setName ? '和整个贴纸包' : '') + '记为广告');
+		lines.push('　　❌ 不该封 = 这张图记为干净，以后不再提醒');
 		const tail = uid + ':' + (chatId || '0');
 		const okData = ADFIX_BUTTON_PREFIX + 'im:' + tail + ((ADFIX_BUTTON_PREFIX + 'im:' + tail + ':' + fid).length <= 64 ? ':' + fid : '');
 		const noData = ADFIX_BUTTON_PREFIX + 'in:' + tail + ((ADFIX_BUTTON_PREFIX + 'in:' + tail + ':' + fid).length <= 64 ? ':' + fid : '');
