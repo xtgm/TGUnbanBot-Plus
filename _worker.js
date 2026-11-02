@@ -889,7 +889,7 @@ class MiniAppError extends Error {
 	}
 }
 
-const MINI_APP_ACTIONS = new Set(['bootstrap', 'groups/list', 'groups/add', 'groups/remove', 'groups/leave', 'blacklist/list', 'blacklist/unban', 'ads/summary', 'ads/pending', 'ads/ignore', 'ads/fingerprints', 'ads/samples', 'ads/observing', 'ads/llm', 'ads/dryrun', 'ads/whitelist', 'ads/whitelist/add', 'ads/whitelist/remove', 'groups/detail', 'users/query', 'health', 'admins/list', 'search', 'notice/send']);
+const MINI_APP_ACTIONS = new Set(['bootstrap', 'groups/list', 'groups/add', 'groups/remove', 'groups/leave', 'blacklist/list', 'blacklist/unban', 'ads/summary', 'ads/pending', 'ads/ignore', 'ads/fingerprints', 'ads/samples', 'ads/observing', 'ads/llm', 'ads/dryrun', 'ads/whitelist', 'ads/whitelist/add', 'ads/whitelist/remove', 'ads/exempt-keywords', 'groups/detail', 'users/query', 'health', 'admins/list', 'search', 'notice/send']);
 // 杀手子后台的接口（与主后台同一个 /app/api/ 前缀，按身份分流；杀手身份调主后台独有的接口一律 404）。
 const KILLER_MINI_APP_ACTIONS = new Set(['killer/bootstrap', 'killer/groups', 'killer/health', 'killer/blacklist/list', 'killer/blacklist/ban', 'killer/blacklist/unban', 'killer/users/query', 'killer/search', 'killer/notice/send', 'killer/stats', 'killer/stats/members']);
 const MINI_APP_BODY_LIMIT = 32768;
@@ -1577,16 +1577,8 @@ function renderMiniAppHtml() {
       (data.items || []).forEach(function (r) { var card = drillCard(personTitle(r), personSub(r), '白名单', 'accent'); card.append(detailList([['备注', text(r.note)], ['操作人', text(r.by), true], ['加入时间', date(r.at)]])); var actions = element('div', 'card-actions'); var remove = makeButton('移出白名单', 'small danger', function (button) { return removeWhitelist(button, r.userId, personTitle(r), function () { return loadAdsDrill(data.page || 1); }); }); stopBubble(remove); actions.append(remove); card.append(actions); clickable(card, '查询用户 ' + text(r.userId), function () { return openUser(r.userId); }); list.append(card); });
     }
     function renderDrillExempt(list, data) {
-      var categories = [
-        { name: '通用技术术语', words: ['双向', '机器人', 'bot', '开源', 'github', 'gitlab', '助手', '工具', '客服', '通知', '订阅', '备份', '监控', '签到', '翻译', '下载', '论坛', '博客', '文档'] },
-        { name: '代理传输协议', words: ['vless', 'vmess', 'trojan', 'shadowsocks', 'ss节点', 'ssr', 'hysteria', 'tuic', 'naive', 'wireguard', 'openvpn', 'anytls', 'reality', 'xhttp', 'xtls', 'mkcp', 'grpc', 'httpupgrade', 'splithttp', 'websocket', 'ws路径', 'quic', 'h2', 'h3', 'xray', 'sing-box', 'singbox', 'clash', 'mihomo', 'v2ray', 'v2fly', 'hiddify'] },
-        { name: '反代与路径', words: ['反代', '反向代理', '回源', '中转', '落地', '分流', '路由规则', 'cdn', 'path路径', '伪装路径', 'workers', 'pages', 'argo', 'tunnel', 'nginx', 'caddy', '负载均衡', '优选ip', '优选域名', 'ip优选', '节点订阅', '订阅链接', '订阅转换'] },
-        { name: '传输层安全 TLS', words: ['tls', 'utls', 'mtls', 'sni', '证书', 'acme', 'ssl', '握手', '加密套件', 'alpn', 'esni', 'ech', '前置代理', '域前置'] },
-        { name: '浏览器/代理指纹', words: ['指纹', '浏览器指纹', 'ja3', 'ja4', 'tls指纹', 'client hello', 'chrome指纹', 'ua伪装', 'fingerprint', '特征识别', '流量特征', '主动探测', '抗封锁'] },
-        { name: '通用技术语境', words: ['延迟', '丢包', '带宽', '限速', '端口', '协议', '内核', '配置文件', '教程', '部署', '自建', '搭建', '编译', '调试', '抓包', '日志', 'api', 'json', 'yaml'] },
-        { name: '主人指定（2026-09-08）', words: ['私聊', '代理', '官方中文', 't.me'] }
-      ];
-      var intro = element('p', 'form-hint', '含这些词的消息触发 -3 分减分（不完全豁免），防止合法技术讨论误判。共 ' + categories.reduce(function(sum, cat) { return sum + cat.words.length; }, 0) + ' 个豁免词。');
+      var categories = Array.isArray(data.categories) ? data.categories : [];
+      var intro = element('p', 'form-hint', '共 ' + count(data.total) + ' 个豁免词，' + categories.length + ' 类。' + text(data.note, ''));
       list.append(intro);
       categories.forEach(function(cat) {
         var card = element('article', 'card');
@@ -2622,6 +2614,16 @@ async function miniAppAdDryRun(env, payload) {
 	}
 }
 
+function miniAppAdExemptKeywords() {
+	return {
+		total: AD_EXEMPT_KEYWORDS.length,
+		categories: AD_EXEMPT_KEYWORD_CATEGORIES.map(({ name, words }) => ({ name, words: [...words] })),
+		note: '仅供查看。按现有规则，无交易动词时减 ' + Math.abs(AD_EXEMPT_PENALTY)
+			+ ' 分，含交易动词时减 ' + Math.abs(AD_EXEMPT_PENALTY_WITH_TRADE)
+			+ ' 分；广告语境下部分词不减分，命中豁免词不保证放行。'
+	};
+}
+
 async function miniAppAdWhitelist(env, payload) {
 	const result = await listAdUserWhitelist(env);
 	if (!result.ok) throw new MiniAppError(503, '白名单读取失败，请稍后重试');
@@ -3131,7 +3133,7 @@ async function dispatchMiniAppAction(action, body, env, auth, ctx) {
 		case 'ads/whitelist': return miniAppAdWhitelist(env, payload);
 		case 'ads/whitelist/add': return miniAppAdWhitelistAdd(env, payload, auth?.userId);
 		case 'ads/whitelist/remove': return miniAppAdWhitelistRemove(env, payload);
-		case 'ads/exempt-keywords': return { success: true, result: {} };
+		case 'ads/exempt-keywords': return miniAppAdExemptKeywords();
 		case 'groups/detail': return miniAppGroupDetail(env, payload);
 		case 'users/query': return miniAppUserQuery(env, payload);
 		case 'health': return miniAppHealth(env);
@@ -7963,6 +7965,7 @@ section.tab[hidden]{display:none}
 .muted{color:var(--muted)}
 .hint{color:var(--muted);font-size:12px;margin:4px 0 8px}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.row[hidden]{display:none}
 input,select,textarea{font:inherit;padding:6px 9px;border:1px solid #d1d5db;border-radius:6px;background:#fff;color:inherit}
 input[type="checkbox"]{padding:0}
 textarea{width:100%;min-height:90px}
@@ -8068,6 +8071,7 @@ dl.kv dd{margin:0;min-width:0}
 <button class="btn" type="button" data-ads="llm">LLM 用量</button>
 <button class="btn" type="button" data-ads="dryrun">演练流水</button>
 <button class="btn" type="button" data-ads="whitelist">用户白名单</button>
+<button class="btn" type="button" data-ads="exempt">豁免词</button>
 </div>
 <div class="row" id="ads-tools"><input id="ads-q" placeholder="指纹关键词（仅指纹库）" aria-label="指纹关键词"><button class="btn" id="ads-reload" type="button">刷新</button></div>
 <div class="row" id="ads-ignore-row" hidden><input id="ads-seq" placeholder="序号，如 3" aria-label="待复核序号"><button class="btn danger" id="ads-ignore" type="button">判错回滚（/ignore）</button></div>
@@ -8502,6 +8506,18 @@ var ADS = {
 	} },
 	whitelist: { action: 'ads/whitelist', paged: true, render: function (d) {
 		return table(d.items || [], [['TGID', 'userId'], ['名称', function (r) { return (r.name || '') + (r.username ? ' @' + r.username : ''); }], ['操作人', 'by'], ['时间', 'at'], ['备注', 'note']]);
+	} },
+	exempt: { action: 'ads/exempt-keywords', paged: false, render: function (d) {
+		var categories = d.categories || [];
+		var box = el('div');
+		box.appendChild(el('p', { cls: 'muted', text: '当前共 ' + (d.total || 0) + ' 个豁免词，分 ' + categories.length + ' 类。' }));
+		if (d.note) box.appendChild(el('p', { cls: 'hint', text: d.note }));
+		categories.forEach(function (category) {
+			var words = category.words || [];
+			box.appendChild(el('h3', { text: category.name + '（' + words.length + ' 个）' }));
+			box.appendChild(el('p', { text: words.join('、') }));
+		});
+		return box;
 	} }
 };
 function loadAds(page) {
@@ -20209,28 +20225,42 @@ const AD_BUSINESS_KEYWORDS = [
 // 若一律减 3，「收购 vless 账号 USDT 日结」= 2+2+2-3 = 3 分会被放行；打折后为 5 分，
 // 正好进观察窗口。而纯技术讨论本就不含交易动词，或只含「一单 / 日结」却无业务词、
 // 不触发协同分，打折分支对它们没有影响 —— 两头都能兼顾。
-const AD_EXEMPT_KEYWORDS = [
+// 两个后台共用分类数据；检测词表按原顺序展开，避免展示内容与实际规则不一致。
+const AD_EXEMPT_KEYWORD_CATEGORIES = [
+	{ name: '通用技术术语', words: [
 	'双向', '机器人', 'bot', '开源', 'github', 'gitlab', '助手', '工具', '客服',
 	'通知', '订阅', '备份', '监控', '签到', '翻译', '下载', '论坛', '博客', '文档',
+	] },
 	// —— 代理传输协议 ——
+	{ name: '代理传输协议', words: [
 	'vless', 'vmess', 'trojan', 'shadowsocks', 'ss节点', 'ssr', 'hysteria', 'tuic',
 	'naive', 'wireguard', 'openvpn', 'anytls', 'reality', 'xhttp', 'xtls', 'mkcp',
 	'grpc', 'httpupgrade', 'splithttp', 'websocket', 'ws路径', 'quic', 'h2', 'h3',
 	'xray', 'sing-box', 'singbox', 'clash', 'mihomo', 'v2ray', 'v2fly', 'hiddify',
+	] },
 	// —— 反代与路径 ——
+	{ name: '反代与路径', words: [
 	'反代', '反向代理', '回源', '中转', '落地', '分流', '路由规则', 'cdn',
 	'path路径', '伪装路径', 'workers', 'pages', 'argo', 'tunnel', 'nginx', 'caddy',
 	'负载均衡', '优选ip', '优选域名', 'ip优选', '节点订阅', '订阅链接', '订阅转换',
+	] },
 	// —— 传输层安全 TLS ——
+	{ name: '传输层安全 TLS', words: [
 	'tls', 'utls', 'mtls', 'sni', '证书', 'acme', 'ssl', '握手', '加密套件',
 	'alpn', 'esni', 'ech', '前置代理', '域前置',
+	] },
 	// —— 浏览器 / 代理指纹 ——
+	{ name: '浏览器 / 代理指纹', words: [
 	'指纹', '浏览器指纹', 'ja3', 'ja4', 'tls指纹', 'client hello', 'chrome指纹',
 	'ua伪装', 'fingerprint', '特征识别', '流量特征', '主动探测', '抗封锁',
+	] },
 	// —— 通用技术语境 ——
+	{ name: '通用技术语境', words: [
 	'延迟', '丢包', '带宽', '限速', '端口', '协议', '内核', '配置文件', '教程',
 	'部署', '自建', '搭建', '编译', '调试', '抓包', '日志', 'api', 'json', 'yaml',
+	] },
 	// —— 2026-09-08 主人指定追加 ——
+	{ name: '主人指定（2026-09-08）', words: [
 	// '私聊'：从 AD_WEAK_TRADE_VERBS 移过来。「私信请走频道」「加好友请先私聊」是
 	//   标准的联系方式说明，2026-09-07 误封事故（「西嗨~ 私聊请通过」被封）的直接词源。
 	// '代理' / '官方中文'：线上自动学习学出了 `[keyword] 代理 官方中文` 这条坑词
@@ -20241,7 +20271,9 @@ const AD_EXEMPT_KEYWORDS = [
 	//   只有广告用户或者个别用户会直接 @bot 简介 @bot，所以 t.me 加封禁词只会误封更多」。
 	//   同样注意：hasAdSuspiciousLink 里那条独立的 t.me 判据已一并删除，加词只是双保险。
 	'私聊', '代理', '官方中文', 't.me'
+	] }
 ];
+const AD_EXEMPT_KEYWORDS = AD_EXEMPT_KEYWORD_CATEGORIES.flatMap(({ words }) => words);
 
 // ===== 广告语境下失效的豁免词 =====
 //
