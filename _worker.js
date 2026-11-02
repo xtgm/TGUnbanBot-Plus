@@ -1535,7 +1535,7 @@ function renderMiniAppHtml() {
     }
     async function unban(button, record) { var confirmed = await confirmAction({ title: '解除此用户的封禁？', description: '从黑名单移除该用户，并尝试解除各治理群组中的封禁。', object: '用户 ID ' + text(record.id), warning: '部分群组可能因权限或网络原因未能完成解封。', label: '确认解封', danger: true }); if (!confirmed) return false; var completed = false; await actionButton(button, 'unban:' + record.id, async function () { var data = await api('blacklist/unban', { userId: String(record.id) }); completed = true; var results = data && Array.isArray(data.results) ? data.results : []; var failed = results.filter(function (row) { return !row.ok; }); var removed = data && data.removed === false ? '用户未从黑名单移除。' : '已移除黑名单记录。'; toast(data && data.message ? data.message : removed + (results.length ? ' 群组解封 ' + (results.length - failed.length) + '/' + results.length + ' 成功。' : ''), failed.length || data && data.complete === false ? 'error' : 'success'); if (failed.length) { await showResult({ title: '部分群组未能解封', description: failed.map(function (row) { return text(row.groupId) + '：' + text(row.error, '操作未完成'); }).join('\n'), object: '用户 ID ' + text(record.id) }); } state.loaded.blacklist = false; state.loaded.users = false; if (state.active === 'blacklist') await loadBlacklist(state.blacklistPage); }); return completed; }
     async function loadAdsSummary() { var seq = begin('ads-summary'); loading($('ads-summary'), '正在读取广告概况…'); try { var data = await api('ads/summary'); if (!current('ads-summary', seq)) return; renderAdsSummary(data || {}); } catch (err) { if (err.auth || !current('ads-summary', seq)) return; empty($('ads-summary'), '概况加载失败', err.message, loadAdsSummary); } }
-    function renderAdsSummary(data) { var container = $('ads-summary'); container.replaceChildren(); var counts = data.counts || {}; var config = data.config || {}; var grid = element('div', 'stat-grid'); [['指纹', counts.fingerprints, 'fingerprints'], ['广告样本', counts.samples, 'samples'], ['观察中', counts.observing, 'observing'], ['待复核', counts.pending]].forEach(function (pair, i) { var stat = element('div', 'stat' + (i === 3 ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(pair[1])), element('div', 'stat-label', pair[0])); if (i === 3) clickable(stat, '待复核 ' + count(pair[1]) + ' 条，点击跳到待复核记录', function () { jumpTo($('ads-pending-label')); }); else { stat.setAttribute('data-drill', pair[2]); clickable(stat, pair[0] + ' ' + count(pair[1]) + '，点击展开明细', function () { return toggleAdsDrill(pair[2]); }); } grid.append(stat); }); var links = element('div', 'drill-links'); ['llm', 'dryrun', 'whitelist'].forEach(function (key) { var b = makeButton(ADS_DRILL[key].label, 'small', function () { return toggleAdsDrill(key); }); b.setAttribute('data-drill', key); links.append(b); }); var card = element('div', 'card'); var row = element('div', 'config-row'); [['封禁阈值', text(config.scoreThreshold)], ['观察阈值', text(config.observationScore)], ['AI 识别', config.aiEnabled === true ? '已启用' : config.aiEnabled === false ? '未启用' : '—'], ['AI 日额度', displayValue(config.llmDaily)]].forEach(function (pair) { var span = element('span', '', pair[0]); span.append(element('strong', '', pair[1])); row.append(span); }); card.append(row); if (data.visionModel) card.append(element('div', 'subtle', '图像识别 · ' + text(data.visionModel))); card.append(links); container.append(grid, card); syncAdsDrill(); }
+    function renderAdsSummary(data) { var container = $('ads-summary'); container.replaceChildren(); var counts = data.counts || {}; var config = data.config || {}; var grid = element('div', 'stat-grid'); [['指纹', counts.fingerprints, 'fingerprints'], ['广告样本', counts.samples, 'samples'], ['观察中', counts.observing, 'observing'], ['待复核', counts.pending]].forEach(function (pair, i) { var stat = element('div', 'stat' + (i === 3 ? ' emphasis' : '')); stat.append(element('div', 'stat-value', count(pair[1])), element('div', 'stat-label', pair[0])); if (i === 3) clickable(stat, '待复核 ' + count(pair[1]) + ' 条，点击跳到待复核记录', function () { jumpTo($('ads-pending-label')); }); else { stat.setAttribute('data-drill', pair[2]); clickable(stat, pair[0] + ' ' + count(pair[1]) + '，点击展开明细', function () { return toggleAdsDrill(pair[2]); }); } grid.append(stat); }); var links = element('div', 'drill-links'); ['llm', 'dryrun', 'whitelist', 'exempt'].forEach(function (key) { var b = makeButton(ADS_DRILL[key].label, 'small', function () { return toggleAdsDrill(key); }); b.setAttribute('data-drill', key); links.append(b); }); var card = element('div', 'card'); var row = element('div', 'config-row'); [['封禁阈值', text(config.scoreThreshold)], ['观察阈值', text(config.observationScore)], ['AI 识别', config.aiEnabled === true ? '已启用' : config.aiEnabled === false ? '未启用' : '—'], ['AI 日额度', displayValue(config.llmDaily)]].forEach(function (pair) { var span = element('span', '', pair[0]); span.append(element('strong', '', pair[1])); row.append(span); }); card.append(row); if (data.visionModel) card.append(element('div', 'subtle', '图像识别 · ' + text(data.visionModel))); card.append(links); container.append(grid, card); syncAdsDrill(); }
     // 广告页下钻（批次 2）：概况里的数字 / 入口点开，在 #ads-drill 里列明细；再点同一个收起。
     // 一次只展开一个；原文（指纹值、样本、原因）一律 textContent，不渲染成链接。
     var ADS_DRILL = {
@@ -1544,7 +1544,8 @@ function renderMiniAppHtml() {
       observing: { label: '观察中', action: 'ads/observing', render: renderDrillObserving },
       llm: { label: 'AI 今日用量', action: 'ads/llm', render: renderDrillLLM },
       dryrun: { label: '演练流水', action: 'ads/dryrun', render: renderDrillDryRun },
-      whitelist: { label: '白名单', action: 'ads/whitelist', render: renderDrillWhitelist }
+      whitelist: { label: '白名单', action: 'ads/whitelist', render: renderDrillWhitelist },
+      exempt: { label: '豁免词', action: 'ads/exempt-keywords', render: renderDrillExempt }
     };
     function syncAdsDrill() { document.querySelectorAll('#ads-summary [data-drill]').forEach(function (el) { var on = el.getAttribute('data-drill') === state.adsDrill; el.setAttribute('aria-expanded', on ? 'true' : 'false'); el.classList.toggle('active', on); }); }
     function toggleAdsDrill(key) { var box = $('ads-drill'); if (state.adsDrill === key) { state.adsDrill = ''; begin('ads-drill'); box.replaceChildren(); syncAdsDrill(); return; } state.adsDrill = key; state.adsDrillQuery = ''; syncAdsDrill(); return loadAdsDrill(1); }
@@ -1574,6 +1575,29 @@ function renderMiniAppHtml() {
       var form = element('form', 'search-form whitelist-add'); var input = element('input', 'input'); input.type = 'text'; input.inputMode = 'numeric'; input.maxLength = 1100; input.placeholder = '输入 TGID，多个用空格或逗号隔开'; input.setAttribute('aria-label', '要加入白名单的 TGID'); var go = element('button', 'button primary', '加入白名单'); go.type = 'submit'; form.append(input, go);
       form.addEventListener('submit', function (event) { event.preventDefault(); addWhitelist(go, input.value).catch(function (err) { toast(err.message || '操作失败，请稍后重试。', 'error'); }); }); list.append(form);
       (data.items || []).forEach(function (r) { var card = drillCard(personTitle(r), personSub(r), '白名单', 'accent'); card.append(detailList([['备注', text(r.note)], ['操作人', text(r.by), true], ['加入时间', date(r.at)]])); var actions = element('div', 'card-actions'); var remove = makeButton('移出白名单', 'small danger', function (button) { return removeWhitelist(button, r.userId, personTitle(r), function () { return loadAdsDrill(data.page || 1); }); }); stopBubble(remove); actions.append(remove); card.append(actions); clickable(card, '查询用户 ' + text(r.userId), function () { return openUser(r.userId); }); list.append(card); });
+    }
+    function renderDrillExempt(list, data) {
+      var categories = [
+        { name: '通用技术术语', words: ['双向', '机器人', 'bot', '开源', 'github', 'gitlab', '助手', '工具', '客服', '通知', '订阅', '备份', '监控', '签到', '翻译', '下载', '论坛', '博客', '文档'] },
+        { name: '代理传输协议', words: ['vless', 'vmess', 'trojan', 'shadowsocks', 'ss节点', 'ssr', 'hysteria', 'tuic', 'naive', 'wireguard', 'openvpn', 'anytls', 'reality', 'xhttp', 'xtls', 'mkcp', 'grpc', 'httpupgrade', 'splithttp', 'websocket', 'ws路径', 'quic', 'h2', 'h3', 'xray', 'sing-box', 'singbox', 'clash', 'mihomo', 'v2ray', 'v2fly', 'hiddify'] },
+        { name: '反代与路径', words: ['反代', '反向代理', '回源', '中转', '落地', '分流', '路由规则', 'cdn', 'path路径', '伪装路径', 'workers', 'pages', 'argo', 'tunnel', 'nginx', 'caddy', '负载均衡', '优选ip', '优选域名', 'ip优选', '节点订阅', '订阅链接', '订阅转换'] },
+        { name: '传输层安全 TLS', words: ['tls', 'utls', 'mtls', 'sni', '证书', 'acme', 'ssl', '握手', '加密套件', 'alpn', 'esni', 'ech', '前置代理', '域前置'] },
+        { name: '浏览器/代理指纹', words: ['指纹', '浏览器指纹', 'ja3', 'ja4', 'tls指纹', 'client hello', 'chrome指纹', 'ua伪装', 'fingerprint', '特征识别', '流量特征', '主动探测', '抗封锁'] },
+        { name: '通用技术语境', words: ['延迟', '丢包', '带宽', '限速', '端口', '协议', '内核', '配置文件', '教程', '部署', '自建', '搭建', '编译', '调试', '抓包', '日志', 'api', 'json', 'yaml'] },
+        { name: '主人指定（2026-09-08）', words: ['私聊', '代理', '官方中文', 't.me'] }
+      ];
+      var intro = element('p', 'form-hint', '含这些词的消息触发 -3 分减分（不完全豁免），防止合法技术讨论误判。共 ' + categories.reduce(function(sum, cat) { return sum + cat.words.length; }, 0) + ' 个豁免词。');
+      list.append(intro);
+      categories.forEach(function(cat) {
+        var card = element('article', 'card');
+        var head = element('div', 'card-heading');
+        head.append(element('h3', 'card-title', cat.name), element('span', 'badge', cat.words.length + ' 个'));
+        card.append(head);
+        var wordList = element('div', 'evidence-text');
+        wordList.textContent = cat.words.join('、');
+        card.append(wordList);
+        list.append(card);
+      });
     }
     function stopBubble(el) { el.addEventListener('click', function (event) { event.stopPropagation(); }); el.addEventListener('keydown', function (event) { event.stopPropagation(); }); return el; }
     async function addWhitelist(button, raw, after) {
@@ -3107,6 +3131,7 @@ async function dispatchMiniAppAction(action, body, env, auth, ctx) {
 		case 'ads/whitelist': return miniAppAdWhitelist(env, payload);
 		case 'ads/whitelist/add': return miniAppAdWhitelistAdd(env, payload, auth?.userId);
 		case 'ads/whitelist/remove': return miniAppAdWhitelistRemove(env, payload);
+		case 'ads/exempt-keywords': return { success: true, result: {} };
 		case 'groups/detail': return miniAppGroupDetail(env, payload);
 		case 'users/query': return miniAppUserQuery(env, payload);
 		case 'health': return miniAppHealth(env);
