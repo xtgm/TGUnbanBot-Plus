@@ -30185,11 +30185,16 @@ async function notifyAdImageMiss(env, context) {
 		const lines = [
 			'🖼 <b>' + kindLabel + '识图漏判 → 未处置，请你判断</b>',
 			'',
-			'用户：<code>' + escapeHtml(uid) + '</code>'
-				+ (name ? '　' + escapeHtml(name.slice(0, 40)) : '')
-				+ (from.username ? '　<code>@' + escapeHtml(String(from.username)) + '</code>' : ''),
-			chatId ? '群：<code>' + escapeHtml(chatId) + '</code>' : '',
-			'类型：' + kindLabel + (media.setName ? '（贴纸包 <code>' + escapeHtml(String(media.setName)) + '</code>）' : ''),
+		];
+		const obsUid = escapeHtml(uid);
+		const obsUname = normalizeTelegramUsername(from.username);
+		const userLine = '用户：<code>' + obsUid + '</code>'
+			+ '　<a href="tg://user?id=' + obsUid + '">' + escapeHtml((name || '查看资料').slice(0, 40)) + '</a>'
+			+ (obsUname ? '　<a href="https://t.me/' + obsUname + '">@' + obsUname + '</a>'
+				: (from.username ? '　<code>@' + escapeHtml(String(from.username).trim().replace(/^@/, '')) + '</code>' : ''));
+		lines.push(userLine);
+		if (chatId) lines.push('群：<code>' + escapeHtml(chatId) + '</code>');
+		lines.push('类型：' + kindLabel + (media.setName ? '（贴纸包 <code>' + escapeHtml(String(media.setName)) + '</code>）' : ''));
 			'原因：' + escapeHtml(AD_IMAGE_MISS_LABELS[reason] || reason)
 				+ (reason === 'gray' ? '（' + Number(image.missProb || 0).toFixed(2) + '）' : ''),
 			context.text ? '正文：<code>' + escapeHtml(String(context.text).slice(0, 150)) + '</code>' : '',
@@ -30286,7 +30291,15 @@ async function handleAdImageMissCallback(callbackQuery, env, { action, userId, c
 			return;
 		}
 		await answerAdVoteCallback(callbackQuery?.id, '已确认封禁 ' + userId);
-		await editTelegramMessage(noticeChatId, noticeMessageId, originText + '\n─────\n' + renderAdImageMissBanResult(userId, out));
+		const uid = escapeHtml(userId);
+		const resultLines = [
+			'🔒 已按主人确认封禁',
+			'用户：<code>' + uid + '</code>　<a href="tg://user?id=' + uid + '">查看资料</a>',
+			'封禁：' + escapeHtml(out.banSummary),
+			'删消息：' + (out.deleted ? escapeHtml(String(out.deleted.ok)) + '/' + escapeHtml(String(out.deleted.total)) : '未执行'),
+			'图片：' + (out.imageMarked?.ok ? '已记为广告' : '未记录（标识缺失）')
+		];
+		await editTelegramMessage(noticeChatId, noticeMessageId, resultLines.join('\n'));
 		console.log('[图片漏判] 主人确认封 user=' + userId + ' 封禁=' + out.banSummary
 			+ ' 删消息=' + (out.deleted ? out.deleted.ok + '/' + out.deleted.total : '未执行'));
 		return;
@@ -30295,8 +30308,13 @@ async function handleAdImageMissCallback(callbackQuery, env, { action, userId, c
 	let marked = false;
 	if (fileUniqueId) marked = await upsertAdImage(env, fileUniqueId, { verdict: 'clean', source: 'owner', visionCheckedAt: Math.floor(Date.now() / 1000) });
 	await answerAdVoteCallback(callbackQuery?.id, '已忽略');
-	await editTelegramMessage(noticeChatId, noticeMessageId, originText + '\n─────\n❌ 已按不该封处理　TGID <code>' + escapeHtml(userId) + '</code>'
-		+ '\n这张图：' + (marked ? '已记为干净，以后不再提醒' : '未记录（图片标识缺失）'));
+	const uid = escapeHtml(userId);
+	const resultLines = [
+		'❌ 已按不该封处理',
+		'用户：<code>' + uid + '</code>　<a href="tg://user?id=' + uid + '">查看资料</a>',
+		'这张图：' + (marked ? '已记为干净，以后不再提醒' : '未记录（图片标识缺失）')
+	];
+	await editTelegramMessage(noticeChatId, noticeMessageId, resultLines.join('\n'));
 }
 
 // ===== 实时头像判定（2026-10-13）=====
@@ -31348,14 +31366,25 @@ function renderAdDetectionNotice(evaluation, context) {
 		lines.push('<b>🚫 广告号自动封禁</b>');
 	}
 	if (context?.seq) lines.push('快照序号：<b>#' + context.seq + '</b>');
-	lines.push('用户：<code>' + escapeHtml(String(context?.userId || '')) + '</code>');
-	if (evaluation.snapshot.name) lines.push('名称：' + escapeHtml(evaluation.snapshot.name));
-	if (evaluation.snapshot.username) lines.push('用户名：' + escapeHtml(evaluation.snapshot.username));
+	const userId = String(context?.userId || '');
+	const obsUid = escapeHtml(userId);
+	const obsUname = normalizeTelegramUsername(evaluation.snapshot.username);
+	const displayName = evaluation.snapshot.name || '查看资料';
+	const userLine = '用户：<code>' + obsUid + '</code>'
+		+ '　<a href="tg://user?id=' + obsUid + '">' + escapeHtml(displayName.slice(0, 40)) + '</a>'
+		+ (obsUname ? '　<a href="https://t.me/' + obsUname + '">@' + obsUname + '</a>'
+			: (evaluation.snapshot.username ? '　<code>@' + escapeHtml(String(evaluation.snapshot.username).trim().replace(/^@/, '')) + '</code>' : ''));
+	lines.push(userLine);
 	// 简介三态，缺一不可：有内容 / 查过但为空 / 本次没查。
 	// 旧写法只在有内容时显示，后两种都渲染成「没有这一行」—— 主人无法判断
 	// 「这个号确实没写简介」还是「简介根本没看过」，而这直接影响他要不要发 /ignore 回滚。
 	if (evaluation.snapshot.bio) lines.push('简介：' + escapeHtml(evaluation.snapshot.bio));
-	else if (evaluation.bioChecked === false) lines.push('简介：（本次未查询 —— 昵称/正文/转发已够封禁线，无需再拉资料）');
+	else if (evaluation.bioChecked === false) {
+		const config = loadAdDetectionConfig(env);
+		const threshold = Number(config.scoreThreshold) || 7;
+		const enoughScore = (evaluation.score || 0) >= threshold;
+		lines.push('简介：（本次未查询 —— ' + (enoughScore ? '昵称/正文/转发已够封禁线' : '其他证据已足够定罪') + '，无需再拉资料）');
+	}
 	else lines.push('简介：（空）');
 	if (evaluation.snapshot.text) lines.push('消息：' + escapeHtml(evaluation.snapshot.text));
 	if (evaluation.snapshot.forwardTitle) lines.push('转发来源：' + escapeHtml(evaluation.snapshot.forwardTitle));
