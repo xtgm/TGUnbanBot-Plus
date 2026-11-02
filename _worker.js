@@ -25723,7 +25723,8 @@ async function notifyAdObserveNotice(env, evaluation, userId, chatId) {
 			'',
 			'用户：<code>' + obsUid + '</code>'
 				+ '　<a href="tg://user?id=' + obsUid + '">' + escapeHtml(String(snap.name || '查看资料').slice(0, 40)) + '</a>'
-				+ (obsUname ? '　<a href="https://t.me/' + obsUname + '">@' + obsUname + '</a>' : ''),
+				+ (obsUname ? '　<a href="https://t.me/' + obsUname + '">@' + obsUname + '</a>'
+					: (String(snap.username || '').trim() ? '　<code>@' + escapeHtml(String(snap.username).trim().replace(/^@/, '')) + '</code>' : '')),
 			'得分：<b>' + Number(evaluation.score || 0) + '</b>' + origin.scoreNote,
 			'正文：' + (snap.text ? '<code>' + escapeHtml(String(snap.text).slice(0, 150)) + '</code>' : '（空）'),
 			(chatId ? '群：<code>' + escapeHtml(String(chatId)) + '</code>' : ''),
