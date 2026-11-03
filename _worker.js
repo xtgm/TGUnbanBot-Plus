@@ -536,7 +536,7 @@ export default {
 			const body = message.body || {};
 			if (body.type === 'drill_close') {
 				try {
-					const result = await runAdDryRunCloseJob(env, Number(body.sessionId), { limit: 8 });
+					const result = await runAdDryRunCloseJob(env, Number(body.sessionId), { limit: 20 });
 					if ((result.busy || (!result.complete && !result.partial && !result.queued && !result.needsManualRetry)) && typeof message.retry === 'function') message.retry({ delaySeconds: 30 });
 				} catch (error) {
 					console.error('[演练收尾] 作业 #' + Number(body.sessionId) + ' 执行中断: ' + formatD1SchemaError(error));
@@ -7676,6 +7676,7 @@ const WEB_ADMIN_REPLY_LIMIT = 30;
 // Worker 没开 nodejs_compat（没有 AsyncLocalStorage），用模块级变量；同一时刻别的请求恰好也给第一主人
 // 发了消息会被一起镜像进来 —— 那本来就是发给第一主人的内容，不泄漏给第三人。
 let WEB_ADMIN_CAPTURE = null;
+const WEB_ADMIN_COMMAND_AUTH = Symbol('verified-primary-web-command');
 
 function captureWebAdminReply(chatId, text) {
 	if (!WEB_ADMIN_CAPTURE || String(chatId) !== WEB_ADMIN_CAPTURE.chatId) return;
@@ -7828,7 +7829,7 @@ async function dispatchWebAdminAction(action, body, env, auth, ctx, url) {
 				message: '本群解封 ' + users.length + ' 人' + (failed.length ? '，失败 ' + failed.length + ' 人' : '') };
 		}
 		case 'web/dryrun': {
-			throw new MiniAppError(403, '演练只允许第一主人在 Telegram 私聊中使用 /dryrun on 或 /dryrun off 控制');
+			throw new MiniAppError(403, '演练不支持单群开关；请由第一主人在 Telegram 私聊或后台命令台使用 /dryrun on、/dryrun off 控制');
 		}
 		case 'web/stats': {
 			const chatId = webAdminGroupArg(payload);
@@ -7938,6 +7939,7 @@ async function webAdminFedList(env, payload) {
 // 命令台：网页里输入的 / 命令以「第一主人私聊机器人」的身份执行，与在 Telegram 里直接发完全同一条代码路径。
 // 回执照常发到 Telegram 私聊，同时镜像成纯文本返回给网页（只镜像本次执行期间发给第一主人的消息）。
 async function webAdminExec(env, ctx, url, payload, auth) {
+	if (!auth?.primaryOwner || !isPrimaryOwner(String(auth.userId || ''))) throw new MiniAppError(403, '后台命令台仅限已登录的全局第一主人');
 	const command = String(payload?.command || '').trim();
 	if (!command.startsWith('/')) throw new MiniAppError(400, '命令必须以 / 开头');
 	if (command.length > 4000) throw new MiniAppError(400, '命令太长');
@@ -7950,6 +7952,7 @@ async function webAdminExec(env, ctx, url, payload, auth) {
 		text: command,
 		__webAdmin: true
 	};
+	message[WEB_ADMIN_COMMAND_AUTH] = String(auth.userId);
 	const previous = WEB_ADMIN_CAPTURE;
 	const capture = { chatId: String(ownerId), replies: [] };
 	WEB_ADMIN_CAPTURE = capture;
@@ -8068,8 +8071,8 @@ dl.kv dd{margin:0;min-width:0}
 <div class="row"><button class="btn" id="g-lb-load" type="button">读取本群黑名单</button><input id="g-lb-ids" placeholder="要解封的 TGID" aria-label="本群解封 TGID"><button class="btn" id="g-lb-unban" type="button">本群解封</button></div>
 <div id="g-lb-out" class="out"></div>
 </div>
-<h3>全局演练（/dryrun）</h3><p class="hint">默认关闭。第一主人在 Telegram 私聊开启后，全部配置群和杀手群只采集、学习、记流水，不执行新的自动广告处罚。</p>
-<p class="hint">演练为全局开关，仅第一主人在 Telegram 私聊发送 /dryrun on、/dryrun off 控制。</p><div class="row" hidden><span id="g-dry-state" class="muted"></span><button class="btn" id="g-dry-on" type="button" disabled>开启演练</button><button class="btn" id="g-dry-off" type="button" disabled>关闭演练</button></div>
+<h3>全局演练（/dryrun）</h3><p class="hint">默认关闭。第一主人开启后，全部配置群和杀手群只采集、学习、记流水，不执行新的自动广告处罚。</p>
+<p class="hint">演练为全局开关；第一主人可在 Telegram 私聊或已登录的后台命令台发送 /dryrun on、/dryrun off 控制。</p><div class="row" hidden><span id="g-dry-state" class="muted"></span><button class="btn" id="g-dry-on" type="button" disabled>开启演练</button><button class="btn" id="g-dry-off" type="button" disabled>关闭演练</button></div>
 <h3>群统计（/stats）</h3>
 <div class="row"><button class="btn" type="button" data-stats="day">今日</button><button class="btn" type="button" data-stats="week">本周</button><button class="btn" type="button" data-stats="month">本月</button></div>
 <div id="g-stats-out" class="out"></div>
@@ -8191,15 +8194,15 @@ var MANUAL = [
 ['/groupmode -100群ID global', '把指定群切回全局模式'],
 ['/localbans', '看本群黑名单（群里发）'],
 ['/localset 检测 开|关', '本群设置：广告检测开关（群里发）'],
-['/dryrun on|off', '演练仅第一主人在 Telegram 私聊全局控制，本群设置不能切换'],
+['/dryrun on|off', '第一主人私聊或已登录后台命令台全局控制，本群设置不能切换'],
 ['/localset 处置 踢出|禁言', '本群设置：处置方式（群里发）'],
 ['/localset 白名单 加|删 TGID', '本群设置：本群白名单（群里发）']]],
 ['演练模式（仅第一主人 · 任意配置群）', [
-['/dryrun', '第一主人 Telegram 私聊查看全局状态，群里与网页不支持开关'],
+['/dryrun', '第一主人私聊或已登录后台命令台查看全局状态，群内不支持开关'],
 ['/dryrun on', '第一主人私聊开启全局演练：完整采集已确认广告证据，自动不处置，写流水并私聊通知'],
 ['/dryrun off', '私聊关闭全局演练，恢复正常本群自动处置'],
 ['/dryrun status', '第一主人私聊查看全局状态'],
-['', '演练结束请在第一主人私聊发送 /dryrun off；群内与网页均不能切换']]],
+['', '演练结束请由第一主人在私聊或后台命令台发送 /dryrun off；群内不能切换']]],
 ['全体通知（仅第一主人私聊）', [
 ['/notice', '发起全体通知，随后按提示发一条内容（文本/图片/视频/文件均可），确认后群发'],
 ['/notice cancel', '取消本次通知']]],
@@ -13082,8 +13085,17 @@ function isTelegramOwnerPrivateInvocation(message) {
 		&& String(message.chat.id) === actor && isPrimaryOwner(actor) && message.from.is_bot !== true;
 }
 
+function isPrimaryOwnerDryRunInvocation(message) {
+	// 权限只对应 OWNER_IDS[0]；群主、普通管理员或独立群身份不能代替全局第一主人。
+	if (isTelegramOwnerPrivateInvocation(message)) return true;
+	const actor = String(message?.from?.id || '');
+	return message?.__webAdmin === true && message[WEB_ADMIN_COMMAND_AUTH] === actor
+		&& message?.chat?.type === 'private' && String(message.chat.id) === actor
+		&& isPrimaryOwner(actor) && message.from.is_bot !== true;
+}
+
 async function setGlobalDryRun(env, on, message) {
-	if (!isTelegramOwnerPrivateInvocation(message)) return { ok: false, error: '演练只能由第一主人在 Telegram 私聊中开关' };
+	if (!isPrimaryOwnerDryRunInvocation(message)) return { ok: false, error: '演练仅限第一主人私聊或已验证后台命令台控制' };
 	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
 	if (!(await ensureDryRunTable(env))) return { ok: false, error: 'D1 演练模式表初始化失败' };
 	try {
@@ -28904,7 +28916,7 @@ async function initializeAdDryRunCloseTargets(env, sessionId) {
 }
 
 async function closeGlobalDryRun(env, message, state, session) {
-	if (!isTelegramOwnerPrivateInvocation(message)) return { ok: false, error: '仅第一主人本人私聊可关闭' };
+	if (!isPrimaryOwnerDryRunInvocation(message)) return { ok: false, error: '仅第一主人本人私聊或已验证后台命令台可关闭' };
 	if (!session || !['open','closing','processing','partial'].includes(session.status)) {
 		if (!state.on) {
 			if (session && !Number(session.report_sent)) await sendAdDryRunCloseReport(env, session.id);
@@ -28936,7 +28948,7 @@ async function closeGlobalDryRun(env, message, state, session) {
 }
 
 async function retryAdDryRunCloseSession(env, sessionId, message) {
-	if (!isTelegramOwnerPrivateInvocation(message)) return {ok:false,error:'仅第一主人本人私聊可重试'};
+	if (!isPrimaryOwnerDryRunInvocation(message)) return {ok:false,error:'仅第一主人本人私聊或已验证后台命令台可重试'};
 	await ensureAdDryRunCloseTables(env);
 	const session = await env.DB.prepare('SELECT * FROM ad_dryrun_sessions WHERE id=?').bind(Number(sessionId)).first();
 	if (!session) return {ok:false,error:'本轮记录不存在'};
@@ -29122,6 +29134,7 @@ async function runAdDryRunCloseJob(env, sessionId, options = {}) {
 		let banBudget = limit;
 		const ads = (await env.DB.prepare("SELECT l.*,c.ban_done,c.delete_done,c.target_group_ids,c.ban_policy FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND l.fp=0 AND c.status='pending' ORDER BY l.id LIMIT ?").bind(id,limit).all()).results || [];
 		for (const row of ads) {
+			if (banBudget < 1) break;
 			await renew();
 			let evaluation = {}; try { evaluation = JSON.parse(row.evaluation || '{}'); } catch (_) {}
 			const normal = await env.DB.prepare('SELECT l.id FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND l.fp=1 AND l.user_id=? LIMIT 1').bind(id,String(row.user_id)).first();
@@ -29140,51 +29153,68 @@ async function runAdDryRunCloseJob(env, sessionId, options = {}) {
 				await env.DB.batch(targets.map(target=>env.DB.prepare("INSERT OR IGNORE INTO ad_dryrun_close_bans(session_id,user_id,target_chat_id,source_row_id,status,automatic_case_id) VALUES(?,?,?,?,?,?)")
 					.bind(id,String(row.user_id),target,Number(row.id),Number(row.ban_done)?'done':'pending',caseId)));
 				let normalFeedback=false;
-				for(const target of targets){
-					const saved=await env.DB.prepare('SELECT * FROM ad_dryrun_close_bans WHERE session_id=? AND user_id=? AND target_chat_id=?').bind(id,String(row.user_id),target).first();
-					if(!saved)throw new Error('冻结目标记账缺失，保留待重试');
-					if(saved.status!=='pending'||banBudget<1)continue;
-					banBudget--;
+				const savedTargets=(await env.DB.prepare('SELECT * FROM ad_dryrun_close_bans WHERE session_id=? AND user_id=? AND target_chat_id IN (SELECT value FROM json_each(?))')
+					.bind(id,String(row.user_id),JSON.stringify(targets)).all()).results||[];
+				if(savedTargets.length!==targets.length)throw new Error('冻结目标记账缺失，保留待重试');
+				const savedByGroup=new Map(savedTargets.map(saved=>[String(saved.target_chat_id),saved]));
+				const selected=targets.map(target=>savedByGroup.get(target)).filter(saved=>saved.status==='pending').slice(0,banBudget);
+				banBudget-=selected.length;
+				const byCase=new Map();
+				for(const saved of selected){const key=String(saved.automatic_case_id);if(!byCase.has(key))byCase.set(key,[]);byCase.get(key).push(saved);}
+				const failTarget=async(saved,error)=>{
 					await renew();
-					try{
-						// Telegram 已成功但本轮账本写失败时，核验同一个处罚现场后恢复进度。
-						// 请求可能在封禁成功后被中断，尚未来得及记录 error；待处理目标也须复验。
-						{
-							const priorTargets=await loadAutomaticAdCaseTargets(env,saved.automatic_case_id,String(row.user_id),['independent_local','legacy_local'].includes(row.ban_policy)?'local':'global');
-							const prior=priorTargets.find(item=>String(item.chat_id)===target);
+					const failed=await env.DB.prepare("UPDATE ad_dryrun_close_bans SET status='failed',error=? WHERE session_id=? AND user_id=? AND target_chat_id=?")
+						.bind(String(error?.message||error),id,String(row.user_id),String(saved.target_chat_id)).run();
+					if(failed?.success===false)throw new Error('目标失败进度记账未完成，保留待重试');
+				};
+				// 同一处罚现场只准备一次判定与配置，由既有群执行器在上限内并发处理本批目标。
+				for(const [automaticCaseId,batch] of byCase){
+					await renew();
+					const priorTargets=await loadAutomaticAdCaseTargets(env,automaticCaseId,String(row.user_id),['independent_local','legacy_local'].includes(row.ban_policy)?'local':'global');
+					const scope=priorTargets.length?await resolveAutomaticAdTargets(env,String(row.chat_id),{autoTargetGroupIds:batch.map(saved=>String(saved.target_chat_id)),automaticPolicy:row.ban_policy,drillCloseReplay:true}):null;
+					const remaining=[];
+					for(const saved of batch){
+						const target=String(saved.target_chat_id),prior=priorTargets.find(item=>String(item.chat_id)===target);
+						try{
 							if(prior){
-								const currentScope=await resolveAutomaticAdTargets(env,String(row.chat_id),{autoTargetGroupIds:[target],automaticPolicy:row.ban_policy,drillCloseReplay:true});
-								const entry=currentScope.groupIds.includes(target)?await readGroupBlacklistEntry(env,target,String(row.user_id)):null;
-								const member=entry?.autoCaseId===saved.automatic_case_id?await checkUserStatus(String(row.user_id),target):null;
+								const entry=scope.groupIds.includes(target)?await readGroupBlacklistEntry(env,target,String(row.user_id)):null;
+								const member=entry?.autoCaseId===automaticCaseId?await checkUserStatus(String(row.user_id),target):null;
 								if(member?.ok===true&&member.result?.status==='kicked'){
+									await renew();
 									const restored=await env.DB.prepare("UPDATE ad_dryrun_close_bans SET status='done',error='' WHERE session_id=? AND user_id=? AND target_chat_id=?").bind(id,String(row.user_id),target).run();
 									if(restored?.success===false)throw new Error('已成功目标恢复记账失败，保留待重试');
 									continue;
 								}
 							}
-						}
-						const result=await enforceAdDetection(env,{userId:String(row.user_id),chatId:String(row.chat_id),messageId:null},evaluation,
-							{autoTargetGroupIds:[target],automaticCaseId:saved.automatic_case_id,automaticPolicy:row.ban_policy,drillCloseReplay:true,skipLearning:true,probeMembership:false,config:loadAdDetectionConfig(env),whitelist:await loadAdDomainWhitelist(env)});
-						if(result?.normalFeedback||result?.reason==='confirmed_normal_context'){
-							normalFeedback=true;
-							await env.DB.prepare("DELETE FROM ad_dryrun_close_bans WHERE session_id=? AND user_id=? AND source_row_id=? AND status IN ('pending','failed')").bind(id,String(row.user_id),Number(row.id)).run();
-							await env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='skipped_normal',normal_done=1,error='已命中主人确认的正常现场反例，未执行封删' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();
-							break;
-							}
-						const targetResult=result?.banResults?.find(item=>String(item.groupId)===target);
-						if(result.complete!==true||targetResult?.ok!==true)throw new Error(targetResult?.error||result?.reason||result?.banSummary||'目标群封禁未完成');
-						const retained=targetResult.skipped==='manual_punishment_retained';
-						const skipped=Boolean(targetResult.skipped)&&!retained;
-						const skipReason=({independent_mode:'目标已切为独立模式，跳过全局联动',not_configured:'目标不再属于治理群，合法跳过',outside_local_source:'目标不属于冻结的本群范围，合法跳过',not_in_group:'用户当前不在目标群，保留自动名单'})[targetResult.skipped]||String(targetResult.skipped||'');
-						if(['independent_mode','not_configured','outside_local_source'].includes(targetResult.skipped))await skipAutomaticAdCaseTarget(env,{caseId:saved.automatic_case_id,userId:String(row.user_id),chatId:target,reason:targetResult.skipped});
-						await renew();
-						const recorded=await env.DB.prepare('UPDATE ad_dryrun_close_bans SET status=?,error=? WHERE session_id=? AND user_id=? AND target_chat_id=?')
-							.bind(skipped?'skipped':retained?'retained':'done',skipped?skipReason:retained?'保留现有人工或其他处罚，不重复自动封禁':'',id,String(row.user_id),target).run();
-						if(recorded?.success===false)throw new Error('目标封禁成功步骤记账失败，保留重试核验');
-					}catch(error){
-						await renew();
-						await env.DB.prepare("UPDATE ad_dryrun_close_bans SET status='failed',error=? WHERE session_id=? AND user_id=? AND target_chat_id=?")
-							.bind(String(error?.message||error),id,String(row.user_id),target).run();
+							remaining.push(saved);
+						}catch(error){await failTarget(saved,error);}
+					}
+					if(!remaining.length)continue;
+					let result,executionError;
+					try{
+						result=await enforceAdDetection(env,{userId:String(row.user_id),chatId:String(row.chat_id),messageId:null},evaluation,
+							{autoTargetGroupIds:remaining.map(saved=>String(saved.target_chat_id)),automaticCaseId,automaticPolicy:row.ban_policy,drillCloseReplay:true,skipLearning:true,probeMembership:false,config:loadAdDetectionConfig(env),whitelist:await loadAdDomainWhitelist(env)});
+					}catch(error){executionError=error;}
+					await renew();
+					if(result?.normalFeedback||result?.reason==='confirmed_normal_context'){
+						normalFeedback=true;
+						await env.DB.prepare("DELETE FROM ad_dryrun_close_bans WHERE session_id=? AND user_id=? AND source_row_id=? AND status IN ('pending','failed')").bind(id,String(row.user_id),Number(row.id)).run();
+						await env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='skipped_normal',normal_done=1,error='已命中主人确认的正常现场反例，未执行封删' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();
+						break;
+					}
+					for(const saved of remaining){
+						const target=String(saved.target_chat_id);
+						try{
+							if(executionError)throw executionError;
+							const targetResult=result?.banResults?.find(item=>String(item.groupId)===target);
+							if(targetResult?.ok!==true)throw new Error(targetResult?.error||result?.reason||result?.banSummary||'目标群封禁未完成');
+							const retained=targetResult.skipped==='manual_punishment_retained',skipped=Boolean(targetResult.skipped)&&!retained;
+							const skipReason=({independent_mode:'目标已切为独立模式，跳过全局联动',not_configured:'目标不再属于治理群，合法跳过',outside_local_source:'目标不属于冻结的本群范围，合法跳过',not_in_group:'用户当前不在目标群，保留自动名单'})[targetResult.skipped]||String(targetResult.skipped||'');
+							if(['independent_mode','not_configured','outside_local_source'].includes(targetResult.skipped))await skipAutomaticAdCaseTarget(env,{caseId:automaticCaseId,userId:String(row.user_id),chatId:target,reason:targetResult.skipped});
+							const recorded=await env.DB.prepare('UPDATE ad_dryrun_close_bans SET status=?,error=? WHERE session_id=? AND user_id=? AND target_chat_id=?')
+								.bind(skipped?'skipped':retained?'retained':'done',skipped?skipReason:retained?'保留现有人工或其他处罚，不重复自动封禁':'',id,String(row.user_id),target).run();
+							if(recorded?.success===false)throw new Error('目标封禁成功步骤记账失败，保留重试核验');
+						}catch(error){await failTarget(saved,error);}
 					}
 				}
 				if(normalFeedback)continue;
@@ -39473,8 +39503,8 @@ async function pushDryRunDetail(chatId, text) {
 
 async function handleDryRunCommand(message, env) {
 	const chatId = String(message?.chat?.id || '');
-	if (!isTelegramOwnerPrivateInvocation(message)) {
-		if (isPrimaryOwner(getMessageActorId(message))) await sendTelegramMessage(chatId, '🧪 全局演练仅能由第一主人在 Telegram 私聊中控制：/dryrun on、/dryrun off、/dryrun status。');
+	if (!isPrimaryOwnerDryRunInvocation(message)) {
+		if (isPrimaryOwner(getMessageActorId(message))) await sendTelegramMessage(chatId, '🧪 全局演练仅能由第一主人私聊或已验证的后台命令台控制：/dryrun on、/dryrun off、/dryrun status。');
 		return true;
 	}
 	const arg = String(message.text || '').replace(/^\/dryrun(?:@[^\s]+)?\s*/i, '').trim().toLowerCase();
