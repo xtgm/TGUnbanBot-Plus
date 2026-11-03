@@ -34879,15 +34879,6 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		blacklistCode = 'ERROR';
 	}
 
-	// 处罚可能撤掉源消息；先静默保留真实内容，结果通知再回复到该证据上供误封纠错。
-	let evidenceMessageId = null;
-	const evidenceOwnerId = getOwnerNotifyTargets()[0] || '';
-	if (automatic && evidenceOwnerId && Number(input?.messageId) > 0) {
-		try {
-			const copied = await copyMessageToChat(evidenceOwnerId, chatId, input.messageId, { disableNotification: true });
-			if (copied?.ok) evidenceMessageId = Number(copied.result?.message_id) || null;
-		} catch (_) { /* 无法复制时仍保留冻结现场，不编造原消息链接 */ }
-	}
 	let banResults = [];
 	try {
 		const banOptions = {
@@ -35074,7 +35065,6 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		const punishmentMarker = { automatic, punishmentScope: automatic && localScope ? 'local' : 'global', punishmentChatId: chatId,
 			autoCaseId,groupAdContextKey,...(automatic?{punishmentTargets:automaticTargets.map(row=>({chatId:row.chatId,autoCaseId:row.autoCaseId}))}:{}) };
 		evaluation.snapshot = Object.assign({ ...punishmentMarker }, evaluation.snapshot || {}, punishmentMarker);
-		if (evidenceMessageId) evaluation.snapshot.evidenceMessageId = evidenceMessageId;
 		seq = await allocateAdPendingSnapshot(env, ownerId, {
 			userId,
 			chatId,
@@ -35104,7 +35094,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			const groupLabel = input?.chatTitle ? '<a href="https://t.me/c/' + escapeHtml(chatId.replace(/^-100/, '')) + '">' + escapeHtml(input.chatTitle) + '</a> ' : '';
 			const scopeLine = automatic ? localScope ? '\n范围：独立群本群自动治理（' + groupLabel + '<code>' + escapeHtml(chatId) + '</code>）'
 				: '\n范围：联动 '+automaticScopeGroupIds.length+' 个非独立治理群；独立群不参与，逐群记录自动处罚归属' : '';
-			await sendTelegramMessageChunks(ownerId, notice + scopeLine, buildAdNoticeKeyboard(seq, userId, { automatic }), evidenceMessageId);
+			await sendTelegramMessageChunks(ownerId, notice + scopeLine, buildAdNoticeKeyboard(seq, userId, { automatic }));
 		} catch (error) {
 			console.error('[广告检测] 推送判定通知失败:', error);
 		}
