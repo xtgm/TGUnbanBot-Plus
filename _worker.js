@@ -29202,7 +29202,7 @@ async function runAdDryRunCloseJob(env, sessionId, options = {}) {
 						await env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='skipped_normal',normal_done=1,error='已命中主人确认的正常现场反例，未执行封删' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();
 						break;
 					}
-					for(const saved of remaining){
+					await mapWithConcurrency(remaining, BAN_ALL_GROUPS_CONCURRENCY, async saved => {
 						const target=String(saved.target_chat_id);
 						try{
 							if(executionError)throw executionError;
@@ -29215,7 +29215,7 @@ async function runAdDryRunCloseJob(env, sessionId, options = {}) {
 								.bind(skipped?'skipped':retained?'retained':'done',skipped?skipReason:retained?'保留现有人工或其他处罚，不重复自动封禁':'',id,String(row.user_id),target).run();
 							if(recorded?.success===false)throw new Error('目标封禁成功步骤记账失败，保留重试核验');
 						}catch(error){await failTarget(saved,error);}
-					}
+					});
 				}
 				if(normalFeedback)continue;
 				const targetStates=(await env.DB.prepare('SELECT target_chat_id,status,error FROM ad_dryrun_close_bans WHERE session_id=? AND user_id=? AND target_chat_id IN (SELECT value FROM json_each(?))')
@@ -34881,16 +34881,24 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		let added;
 		if (automatic) {
 			await ensureAutomaticAdTargetTable(env);
-			for (const gid of automaticScopeGroupIds) {
+			await mapWithConcurrency(automaticScopeGroupIds, options.drillCloseReplay === true ? BAN_ALL_GROUPS_CONCURRENCY : 1, async gid => {
+				let target;
+				try {
 				await saveAutomaticAdTarget(env,autoCaseId,gid,userId,chatId,localScope?'local':'global');
 				const localAdded = await addToGroupBlacklist(env,gid,[userId],{reason:'ad_auto',by:'system',note,autoCaseId});
 				const current = await readGroupBlacklistEntry(env,gid,userId);
 				const owned = current?.autoCaseId === autoCaseId;
 				const state = localAdded.failed.length ? 'failed' : owned ? 'pending' : 'skipped';
-				const target = {chatId:gid,autoCaseId,owned,state}; automaticTargets.push(target);
+				target = {chatId:gid,autoCaseId,owned,state}; automaticTargets.push(target);
 				await saveAutomaticAdTarget(env,autoCaseId,gid,userId,chatId,localScope?'local':'global',
 					{owned,state,result:owned?{}:{reason:localAdded.failed.length?'blacklist_write_failed':'manual_punishment_retained'}});
-			}
+				} catch (error) {
+					if (options.drillCloseReplay !== true) throw error;
+					if (!target) { target = {chatId:gid,autoCaseId,owned:false,state:'failed'}; automaticTargets.push(target); }
+					target.state = 'failed'; target.owned = false;
+					console.error('[演练收尾] 目标准备失败: ' + formatD1SchemaError(error));
+				}
+			});
 			for (const gid of automaticRoute.skipped) await skipAutomaticAdCaseTarget(env,{caseId:autoCaseId,userId,chatId:gid,reason:automaticRoute.skipReasons[gid]});
 			added = {code:automaticTargets.some(row=>row.state==='failed')?'ERROR':automaticTargets.some(row=>row.owned)?'ADDED':'EXISTS'};
 		} else added = await addToBlacklist(userId, env, {
@@ -34964,14 +34972,14 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 				} catch (_) { return {groupId:gid,ok:false,automaticNotExecuted:true,error:'自动处罚群模式读取失败，未执行该群处罚'}; }
 			};
 			banResults = await banUserFromAllGroups(userId,banOptions);
-			for (const result of banResults) {
+			await mapWithConcurrency(banResults, options.drillCloseReplay === true ? BAN_ALL_GROUPS_CONCURRENCY : 1, async result => {
 				const target = automaticTargets.find(row=>row.chatId===String(result.groupId));
-				if (!target || !target.owned || result.skipped==='independent_mode') continue;
+				if (!target || !target.owned || result.skipped==='independent_mode') return;
 				try { await saveAutomaticAdTarget(env,autoCaseId,result.groupId,userId,chatId,localScope?'local':'global',
 					{owned:1,state:result.skipped?'skipped':result.ok?'done':'failed',result:{ok:result.ok,skipped:result.skipped||'',error:result.error||'',
 						attempted:result.automaticNotExecuted!==true&&!result.skipped,priorState:result.automaticPriorState||result.memberProbe?.state||'unobserved'}}); }
 				catch (_) { result.ok=false; result.error='自动处罚结果记账失败，保留重试'; }
-			}
+			});
 			if (Array.isArray(options.autoTargetGroupIds)) for (const gid of automaticRoute.skipped) banResults.push({groupId:gid,ok:true,skipped:automaticRoute.skipReasons[gid]||'out_of_scope'});
 		} else banResults = await banUserFromAllGroups(userId,banOptions);
 	} catch (error) {
