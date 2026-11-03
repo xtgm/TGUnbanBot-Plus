@@ -12961,16 +12961,30 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	let profile;
 	try { profile = await fetchAdUserProfile(userId, message?.from || {}); }
 	catch (_) { profile = { firstName: message?.from?.first_name || '', lastName: message?.from?.last_name || '', username: message?.from?.username || '', bio: '' }; }
+	const profileFetched = profile.bioFetched === true;
+	// 消息中的基础姓名可实时更新；重查历史缓存仍使用当前查询资料，不倒灌旧姓名。
+	if (profile.profileSource === 'profile_cache' && options.source !== 'rescreen' && typeof message?.from?.is_bot === 'boolean'
+		&& Number(message.date) >= Math.floor(Number(profile.profileFetchedAt || 0) / 1000)) {
+		profile = { ...profile, firstName: String(message.from.first_name ?? profile.firstName ?? ''),
+			lastName: String(message.from.last_name ?? ''), username: String(message.from.username ?? '') };
+	}
 	const media = extractAdMedia(message);
 	const image = media ? await judgeAdMediaForMessage(env, media, userId, { requireContent: true }) : null;
 	const emojiIds = extractCustomEmojiIds(message);
-	const emojiRows = await readAdCustomEmojiMediaRows(env, emojiIds, userId);
+	const emojiRows = await readAdCustomEmojiMediaRows(env, emojiIds, userId, { complete: true });
 	const badgeId = String(profile.badgeId || '');
 	const badgeItem = emojiRows.find((item) => item.id === badgeId)
-		|| (badgeId ? (await readAdCustomEmojiMediaRows(env, [badgeId], userId))[0] : null);
-	const avatar = profile.avatarId ? await judgeAdAvatarRealtime(env, profile.avatarId, profile) : null;
-	const avatarAd = avatar?.verdict === 'ad' && avatar.ocr_verdict === 'ad'
-		&& avatar.source === 'vision' && Number(avatar.ocr_at) > 0;
+		|| (badgeId ? (await readAdCustomEmojiMediaRows(env, [badgeId], userId, { complete: true }))[0] : null);
+	let avatar = profile.avatarId ? await judgeAdAvatarRealtime(env, profile.avatarId, profile) : null;
+	const avatarOwnerClean = avatar?.verdict === 'clean' && ['owner', 'manual'].includes(String(avatar.source || ''));
+	if (avatar && !avatarOwnerClean && String(avatar.ocr_text || '').trim()) {
+		try {
+			const textHit = await matchAdAvatarText(env, avatar.ocr_text);
+			if (textHit) avatar = { ...avatar, textHit };
+		} catch (_) { avatar = { ...avatar, textMatchFailed: true }; }
+	}
+	const avatarAd = !avatarOwnerClean && Boolean(avatar?.textHit || (avatar?.verdict === 'ad'
+		&& (['owner', 'manual'].includes(String(avatar.source || '')) || avatar.ocr_verdict === 'ad' && Number(avatar.ocr_at) > 0)));
 	const verifiedEmojiIds = emojiRows.filter((item) => item.verifiedAd).map((item) => item.id);
 	const evaluationProfile = { ...profile, status: '',
 		avatarId: avatarAd ? profile.avatarId : '',
@@ -12993,14 +13007,45 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	}
 	evaluation = rejudgeAdPositionEvidence(evaluation);
 	const drillIncomplete = [];
+	const materialComplete = (row, verifiedAd) => Boolean(row && !row.missReason
+		&& (row.verdict === 'clean' || row.verdict === 'ad' && verifiedAd));
+	const inspectionOf = (item) => !item?.visionFileId ? 'unavailable'
+		: item.fileId && String(item.visionFileId) !== String(item.fileId) ? 'thumbnail' : 'bitmap_body';
+	const avatarComplete = !profile.avatarId ? profileFetched : Boolean(avatar && !avatar.textMatchFailed
+		&& (avatarAd || avatarOwnerClean || avatar.verdict === 'clean' && avatar.ocr_verdict === 'clean' && Number(avatar.ocr_at) > 0));
+	const badgeInspection = badgeId ? inspectionOf(badgeItem) : 'none';
+	const badgeComplete = !badgeId ? profileFetched : materialComplete(badgeItem?.row, badgeItem?.verifiedAd) && badgeInspection === 'bitmap_body';
+	const imageRequired = Boolean(media && (['photo', 'sticker', 'video', 'animation'].includes(media.kind) || media.visionFileId));
+	const imageComplete = !imageRequired || materialComplete(image, isVerifiedAdMediaRow(image));
+	const imageInspection = !media ? 'none' : !media.visionFileId ? 'unavailable'
+		: String(media.visionFileId) === String(media.fileId) ? 'bitmap_body' : 'thumbnail';
+	const fullImageComplete = imageComplete && (!media || imageInspection === 'bitmap_body');
+	const emojiById = new Map(emojiRows.map((item) => [String(item.id), item]));
+	const emojiMissingIds = emojiIds.filter((id) => !materialComplete(emojiById.get(String(id))?.row, emojiById.get(String(id))?.verifiedAd)
+		|| inspectionOf(emojiById.get(String(id))) !== 'bitmap_body');
+	const profileSource = profile.profileSource || (profileFetched ? 'telegram_getChat' : 'message_fallback');
+	const completeness = {
+		profile: { complete: profileFetched, source: profileSource, fetchedAt: Number(profile.profileFetchedAt) || null },
+		nickname: { complete: profileFetched || typeof message?.from?.first_name === 'string', source: profileFetched ? profileSource : 'message_from', value: [profile.firstName, profile.lastName].filter(Boolean).join(' ') },
+		username: { complete: profileFetched || typeof message?.from?.username === 'string', source: profileFetched ? profileSource : 'message_from', value: String(profile.username || '') },
+		bio: { complete: profileFetched, source: profileSource, present: Boolean(profile.bio) },
+		avatar: { complete: avatarComplete, present: Boolean(profile.avatarId), id: String(profile.avatarId || ''), verdict: avatar?.verdict || (profileFetched ? 'absent' : 'unknown'), source: String(avatar?.source || ''), verifiedAd: avatarAd, inspection: 'profile_photo_bitmap' },
+		badge: { complete: badgeComplete, present: Boolean(badgeId), id: badgeId, verdict: badgeItem?.row?.verdict || (profileFetched && !badgeId ? 'absent' : 'unknown'), missingReason: String(badgeItem?.missingReason || ''), verifiedAd: badgeItem?.verifiedAd === true, isPremium: typeof profile.isPremium === 'boolean' ? profile.isPremium : null, inspection: badgeInspection },
+		image: { complete: fullImageComplete, representativeChecked: imageComplete, inspection: imageInspection, present: Boolean(media), verdict: image?.verdict || (media ? 'unknown' : 'absent') },
+		emoji: { complete: emojiMissingIds.length === 0, total: emojiIds.length, returned: emojiRows.length, evaluated: emojiIds.length - emojiMissingIds.length, missingIds: emojiMissingIds }
+	};
+	if (!profileFetched) drillIncomplete.push('资料查询未完成：简介、头像和会员标无法确认为已获取；保留消息基础姓名/用户名');
+	if (profile.avatarId && !avatarComplete) drillIncomplete.push('头像内容或文字尚未核实：' + String(avatar?.missReason || (avatar ? avatar.ocr_verdict || avatar.verdict : 'missing_result')));
+	if (badgeId && !badgeComplete) drillIncomplete.push('会员标素材尚未核实：' + String(badgeItem?.missingReason || badgeItem?.row?.missReason || badgeItem?.row?.verdict || 'missing_result'));
+	if (imageInspection === 'thumbnail') drillIncomplete.push('正文动态或非位图素材仅核验缩略图，未逐帧或完整核验原文件');
+	if (media && imageInspection === 'unavailable') drillIncomplete.push('正文素材没有可核验的图片或缩略图，未完整核验原文件');
+	if (badgeInspection === 'thumbnail') drillIncomplete.push('会员标仅核验缩略图，未逐帧完整核验');
+	if (emojiMissingIds.some((id) => inspectionOf(emojiById.get(String(id))) === 'thumbnail')) drillIncomplete.push('正文自定义表情仅核验缩略图，未逐帧完整核验');
 	if (media && (['photo', 'sticker', 'video', 'animation'].includes(media.kind) || media.visionFileId)
 		&& (!image || image.verdict === 'pending' || image.verdict === 'ad' && !isVerifiedAdMediaRow(image))) {
 		drillIncomplete.push('正文素材尚未核实：' + String(image?.missReason || 'pending'));
 	}
-	if (avatar?.verdict === 'pending' || avatar?.ocr_verdict === 'error') drillIncomplete.push('头像内容或文字尚未核实');
-	if (emojiRows.some((item) => !item.row || item.row.verdict === 'pending' || item.row.verdict === 'ad' && !item.verifiedAd)) {
-		drillIncomplete.push('正文自定义素材尚未核实');
-	}
+	if (emojiMissingIds.length) drillIncomplete.push('正文自定义素材尚未核实：' + emojiMissingIds.join(','));
 	evaluation.drillIncomplete = drillIncomplete;
 	// 演练与正式检测共用补判链；复评保留已核验的模型答复，仍用完整现场重新核对证据。
 	const llmMemo = options.llmMemo || (prior?._adLlmMemo?.answer?.ad === true ? prior._adLlmMemo : { done: false });
@@ -13021,8 +13066,10 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 				{ pool: review.pool || 'message', llmMemo, forceReview: options.source === 'rescreen' });
 		}
 	}
-	evaluation.globalDrill = { scope: 'all-configured-killer', collected: true, collectedAt: Math.floor(Date.now() / 1000),
-		emojiTotal: emojiIds.length, emojiEvaluated: emojiRows.length };
+	const fullyCollected = drillIncomplete.length === 0;
+	evaluation.globalDrill = { scope: 'all-configured-killer', attempted: true, collected: fullyCollected, complete: fullyCollected,
+		completeness, collectedAt: Math.floor(Date.now() / 1000), emojiTotal: emojiIds.length,
+		emojiReturned: emojiRows.length, emojiEvaluated: emojiIds.length - emojiMissingIds.length };
 	evaluation.globalDrillAssets = { avatarAd, imageAd: isVerifiedAdMediaRow(image), badgeIds: [...new Set(verifiedEmojiIds.concat(badgeItem?.verifiedAd ? [badgeId] : []))] };
 	if (badgeItem && !emojiRows.some((item) => item.id === badgeId)) {
 		const badgeMaterial = { id: badgeId, fileUniqueId: badgeItem.fileUniqueId, visionFileId: badgeItem.visionFileId,
@@ -13058,23 +13105,24 @@ function isAdDrillPendingEvaluation(evaluation, memo = null) {
 function freezeAdDrillPendingMessage(message, includeReply = true) {
 	const pick = (value, keys) => value && typeof value === 'object'
 		? Object.fromEntries(keys.filter((key) => value[key] !== undefined).map((key) => [key, value[key]])) : null;
-	const user = (value) => pick(value, ['id', 'is_bot', 'first_name', 'last_name', 'username']);
+	const user = (value) => pick(value, ['id', 'is_bot', 'first_name', 'last_name', 'username', 'is_premium']);
 	const chat = (value) => pick(value, ['id', 'type', 'title', 'username']);
 	const media = (value) => {
-		const selected = pick(value, ['file_id', 'file_unique_id', 'width', 'height', 'set_name', 'emoji', 'type', 'is_animated', 'is_video']);
+		const selected = pick(value, ['file_id', 'file_unique_id', 'file_size', 'width', 'height', 'duration', 'mime_type', 'file_name', 'set_name', 'emoji', 'type', 'is_animated', 'is_video']);
 		const thumb = pick(value?.thumbnail || value?.thumb, ['file_id', 'file_unique_id', 'width', 'height']);
 		return selected ? { ...selected, ...(thumb ? { thumbnail: thumb } : {}) } : null;
 	};
-	const entities = (values) => (Array.isArray(values) ? values : []).filter((value) =>
-		['custom_emoji', 'text_link', 'mention', 'url', 'blockquote', 'expandable_blockquote', 'code', 'pre'].includes(value?.type))
-		.map((value) => pick(value, ['type', 'offset', 'length', 'url', 'custom_emoji_id', 'language']));
-	const out = { ...pick(message, ['message_id', 'date', 'text', 'caption', 'forward_sender_name']),
+	const entities = (values) => (Array.isArray(values) ? values : []).map((value) =>
+		pick(value, ['type', 'offset', 'length', 'url', 'custom_emoji_id', 'language', 'user'])).filter(Boolean);
+	const out = { ...pick(message, ['message_id', 'date', 'edit_date', 'media_group_id', 'text', 'caption', 'forward_sender_name']),
 		from: user(message?.from), chat: chat(message?.chat) };
 	for (const field of ['entities', 'caption_entities']) if (Array.isArray(message?.[field])) out[field] = entities(message[field]);
 	if (Array.isArray(message?.photo) && message.photo.length) out.photo = [media(message.photo[message.photo.length - 1])];
 	for (const field of ['sticker', 'animation', 'video', 'document']) if (message?.[field]) out[field] = media(message[field]);
 	if (message?.quote) out.quote = { ...pick(message.quote, ['text', 'position', 'is_manual']), entities: entities(message.quote.entities) };
 	if (includeReply && message?.reply_to_message) out.reply_to_message = freezeAdDrillPendingMessage(message.reply_to_message, false);
+	if (message?.reply_markup?.inline_keyboard) out.reply_markup = { inline_keyboard: message.reply_markup.inline_keyboard };
+	if (message?.external_reply) out.external_reply = freezeAdDrillPendingMessage(message.external_reply, false);
 	if (message?.forward_from) out.forward_from = user(message.forward_from);
 	if (message?.forward_from_chat) out.forward_from_chat = chat(message.forward_from_chat);
 	if (message?.forward_origin) out.forward_origin = { ...pick(message.forward_origin, ['type', 'date', 'sender_user_name', 'message_id', 'author_signature']),
@@ -13239,43 +13287,21 @@ function safeJsonStringify(value) {
 // 【写失败绝不影响调用方】：演练本来就什么都不做，流水少一条只影响复盘，
 // 不能因为一次 D1 抖动让处置链的返回结构变样、进而让调用方的回执分支走错。
 function serializeAdDryRunEvaluation(evaluation) {
-	const bounded = JSON.parse(serializeAdReviewValue(evaluation));
-	for (const key of ['payload', 'snapshot', 'learningPayload', 'learningSnapshot']) {
-		if (!evaluation?.[key] || typeof evaluation[key] !== 'object') continue;
-		bounded[key] = { ...(bounded[key] || {}) };
-		for (const field of ['text', 'bio', 'quoted', 'quotedText', 'name', 'username', 'imageId', 'avatarId', 'badgeId', 'profileShape']) {
-			if (typeof evaluation[key][field] === 'string') bounded[key][field] = evaluation[key][field].slice(0, 4096);
-		}
-		for (const field of ['customEmojiIds', 'verifiedCustomEmojiIds', 'customEmojiMedia', 'scoredLinks']) {
-			if (Array.isArray(evaluation[key][field])) bounded[key][field] = evaluation[key][field].slice(0, 24);
-		}
-		for(const field of ['automatic','punishmentScope','punishmentChatId','autoCaseId','groupAdContextKey','dryRunMessageId','dryRunChatId','dryRunSessionId','dryRunNoOriginalMessage','imageVerifiedAd']) {
-			if(['string','number','boolean'].includes(typeof evaluation[key][field])) bounded[key][field]=evaluation[key][field];
-		}
-		if (key === 'snapshot' && evaluation[key].pendingMessage) bounded[key].pendingMessage = JSON.parse(JSON.stringify(evaluation[key].pendingMessage));
-	}
-	bounded.globalDrill = evaluation.globalDrill || bounded.globalDrill;
+	// 演练保存完整现场；不能沿用通知用的文本/数组裁剪器，把数字、字符或后半段素材丢掉。
+	const bounded = JSON.parse(JSON.stringify(evaluation));
+	const maxBytes = 900000;
 	let text = safeJsonStringify(bounded);
-	if (text.length > 32768) {
-		for (const field of ['positionInputs', 'structure', 'aiAnswer', 'llmAnswer', 'raw', 'profile', 'reasons']) delete bounded[field];
+	if (new TextEncoder().encode(text).length > maxBytes) {
+		// 只去掉可由 payload 还原的完全相同副本，不裁剪任何字段内容。
 		for (const key of ['snapshot', 'learningSnapshot']) {
 			if (!bounded[key]) continue;
-			delete bounded[key].learningPayload; delete bounded[key].positionEvidence; delete bounded[key].globalDrill;
-			for (const field of ['text', 'bio', 'name', 'username', 'quoted', 'quotedText', 'customEmojiIds', 'customEmojiMedia']) {
+			for (const field of Object.keys(bounded[key])) {
 				if (JSON.stringify(bounded[key][field]) === JSON.stringify(bounded.payload?.[field])) delete bounded[key][field];
 			}
 		}
-		if (bounded.payload?.quoted === bounded.payload?.quotedText) delete bounded.payload.quotedText;
-		for (const field of ['quoted', 'quotedText']) if (bounded.learningPayload?.[field] === bounded.learningPayload?.text) delete bounded.learningPayload[field];
 		text = safeJsonStringify(bounded);
 	}
-	if (text.length > 32768) {
-		for (const field of Object.keys(bounded)) {
-			if (!['payload', 'snapshot', 'learningPayload', 'learningSnapshot', 'bodySkeleton', 'globalDrill', 'verdict', 'score', 'threshold', 'layer'].includes(field)) delete bounded[field];
-		}
-		text = safeJsonStringify(bounded);
-	}
-	if(text.length>32768)throw new Error('演练完整现场超过安全存储大小，未写入或学习截断现场');
+	if (new TextEncoder().encode(text).length > maxBytes) throw new Error('演练完整现场超过安全存储大小，未写入或学习截断现场');
 	return text;
 }
 
@@ -13289,6 +13315,7 @@ async function recordAdDryRun(env, input) {
 		if (raw.snapshot?.automatic === true && activeSession && activeSession.status !== 'open') return null;
 		const originalMessageId = Number(input?.input?.messageId || input?.input?.message?.message_id) || 0;
 		const evaluation = { ...raw, snapshot: { ...(raw.snapshot || {}),
+			...(input?.input?.message ? { sourceMessage: freezeAdDrillPendingMessage(input.input.message) } : {}),
 			dryRunMessageId: originalMessageId,
 			dryRunNoOriginalMessage: !originalMessageId && input?.input?.messageId === null,
 			dryRunChatId: String(input?.chatId || ''), dryRunSessionId:Number(activeSession?.id)||0, dryRunChatTitle: String(input?.input?.chatTitle || '') } };
@@ -26362,7 +26389,10 @@ async function fetchAdUserProfile(userId, fallback = {}) {
 		// bioFetched：这次到底有没有真的从 Telegram 拿到资料。
 		// 调用方靠它决定要不要施加「无 emoji 且无 Bio」的减分 ——
 		// 抓取失败时 bio 是空串，但含义是「不知道」，拿它减分会把真广告的分压下去。
-		bioFetched: false
+		bioFetched: false,
+		profileSource: 'message_fallback',
+		profileFetchedAt: 0,
+		isPremium: typeof fallback.is_premium === 'boolean' ? fallback.is_premium : null
 	};
 	if (!BOT_TOKEN || !userId) return profile;
 	const cached = readAdProfileCache(userId);
@@ -26371,6 +26401,8 @@ async function fetchAdUserProfile(userId, fallback = {}) {
 	if (cached) {
 		cached.status = '';
 		cached.bioFetched = true;
+		cached.profileSource = 'profile_cache';
+		if (typeof fallback.is_premium === 'boolean') cached.isPremium = fallback.is_premium;
 		return cached;
 	}
 	try {
@@ -26409,6 +26441,9 @@ async function fetchAdUserProfile(userId, fallback = {}) {
 			// 若官方标不走这个字段）—— 见 ad_badges 表注释里对蓝星的处理。
 			profile.badgeId = String(data.emoji_status_custom_emoji_id || '');
 			profile.bioFetched = true;
+			profile.profileSource = 'telegram_getChat';
+			profile.profileFetchedAt = Date.now();
+			if (typeof data.is_premium === 'boolean') profile.isPremium = data.is_premium;
 			// 【写缓存必须在这个 if 内】。原先它在外面，于是 API 返回 ok:false
 			// （最常见的就是 429 Too Many Requests）也会把一个空 bio 缓存 5 分钟 ——
 			// 与上一行注释宣称的「失败不写缓存」自相矛盾，实际效果是撞限流之后
@@ -28571,7 +28606,7 @@ async function sendAdDryRunCloseReport(env, sessionId, options = {}) {
 	if (!session) return false;
 	const rows=[];let after=0;
 	while(true){
-		const page=(await env.DB.prepare("SELECT l.id,l.chat_id,l.user_id,l.verdict,l.fp,l.fp_revert_pending,l.done,l.learned,l.sample,l.badges,l.avatars,l.images,l.shapes,l.links,l.packs,l.skeletons,c.status AS close_status,c.ban_done,c.delete_done,c.normal_done,c.normal_anchor,c.revert_done,c.normal_tally,c.delete_state,c.error,CASE WHEN json_valid(l.evaluation) THEN COALESCE(json_extract(l.evaluation,'$.snapshot.name'),json_extract(l.evaluation,'$.payload.name'),'') ELSE '' END AS display_name,CASE WHEN json_valid(l.evaluation) THEN COALESCE(json_extract(l.evaluation,'$.snapshot.dryRunChatTitle'),'') ELSE '' END AS chat_title FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND l.id>? ORDER BY l.id LIMIT 200")
+		const page=(await env.DB.prepare("SELECT l.id,l.chat_id,l.user_id,l.verdict,l.fp,l.fp_revert_pending,l.done,l.learned,l.sample,l.badges,l.avatars,l.images,l.shapes,l.links,l.packs,l.skeletons,c.status AS close_status,c.ban_done,c.delete_done,c.normal_done,c.normal_anchor,c.revert_done,c.normal_tally,c.delete_state,c.error,CASE WHEN json_valid(l.evaluation) THEN COALESCE(json_extract(l.evaluation,'$.snapshot.name'),json_extract(l.evaluation,'$.payload.name'),'') ELSE '' END AS display_name,CASE WHEN json_valid(l.evaluation) THEN COALESCE(json_extract(l.evaluation,'$.snapshot.dryRunChatTitle'),'') ELSE '' END AS chat_title,CASE WHEN json_valid(l.evaluation) THEN json_extract(l.evaluation,'$.globalDrill.complete') END AS collection_complete,CASE WHEN json_valid(l.evaluation) THEN json_extract(l.evaluation,'$.drillIncomplete') END AS collection_missing FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND l.id>? ORDER BY l.id LIMIT 200")
 			.bind(Number(sessionId),after).all()).results||[];
 		rows.push(...page);if(page.length<200)break;after=Number(page[page.length-1].id);
 	}
@@ -28589,6 +28624,7 @@ async function sendAdDryRunCloseReport(env, sessionId, options = {}) {
 		'边界依据：' + escapeHtml(session.boundary_note || '按持久流水ID边界处理'),
 		'当前全局范围 ' + globalDryRunScopeGroupIds().length + ' 群；本轮有记录 ' + groups.size + ' 群。',
 		'流水边界：#' + session.start_row_id + ' 至 #' + session.cutoff_row_id + '；' + rows.length + ' 条，去重用户 ' + users.size,
+		'现场完整性：已完整采集/核验 ' + rows.filter(row=>row.collection_complete===1).length + ' 条；仍有缺失/未核 ' + rows.filter(row=>row.collection_complete===0).length + ' 条；旧记录未标记 ' + rows.filter(row=>row.collection_complete!==0&&row.collection_complete!==1).length + ' 条。完整性与是否已确认广告分别报告。',
 		'未核记录：' + rows.filter(row=>row.verdict==='pending').length + ' 条；未完成可靠判定、未学习、未处罚，不计入正常反例。第一主人可私聊 /rescreen user 用户ID 重新核验。',
 		'本轮曾学习：指纹 ' + totals.learned + '，AI样本 ' + totals.sample + '，正文骨架 ' + totals.skeletons,
 		'素材学习：图片 ' + totals.images + '，头像 ' + totals.avatars + '，会员标/贴纸 ' + totals.badges + '，贴纸包 ' + totals.packs + '，资料形状 ' + totals.shapes + '，挂号案底 ' + totals.links,
@@ -28604,6 +28640,7 @@ async function sendAdDryRunCloseReport(env, sessionId, options = {}) {
 		lines.push('<b>流水 #' + row.id + '</b>　' + formatUserReference(row.user_id, { first_name: name }));
 		lines.push('来源群：'+escapeHtml(row.chat_title||'')+' <code>' + escapeHtml(row.chat_id) + '</code>；' + (Number(row.fp)===1 ? '原手动误判，撤错学后入池' : row.normal_anchor ? '本轮正常用户归并，依据原标注流水 #'+row.normal_anchor+'；撤错学后入池' : row.close_status==='skipped_normal'?'已确认正常现场反例，不执行封删':'自动学习广告，本群封禁+原消息删除'));
 		lines.push('结果：' + escapeHtml(stateNames[row.close_status]||row.close_status) + '；封禁 ' + (row.ban_done ? '完成' : '未执行/未完成') + '；删除 ' + escapeHtml(({deleted:'完成',gone:'已不存在',none:'无原消息，无需删除',missing:'缺原消息ID',failed:'失败'})[row.delete_state] || '未执行') + '；正常反例 ' + (row.normal_done ? '完成' : '未录入'));
+		if (row.collection_complete === 0) lines.push('待补核现场：' + escapeHtml(String(row.collection_missing || '资料或素材尚未完整核验')));
 		if (row.error) lines.push('原因/归并：' + escapeHtml(toChineseErrorText(row.error)));
 		lines.push('');
 	}
@@ -29041,8 +29078,8 @@ const AD_CUSTOM_EMOJI_CACHE_MAX = 2000;
 // 【429 / 5xx 不缓存】否则一次限流会把这条链路按死 6 小时，
 // 与 resolveAdLink 的 cacheable 处理同一口径。
 async function resolveCustomEmojiStickers(env, ids, options = {}) {
-	const wanted = (Array.isArray(ids) ? ids : [])
-		.map((id) => String(id || '')).filter(Boolean);
+	const wanted = [...new Set((Array.isArray(ids) ? ids : [])
+		.map((id) => String(id || '')).filter(Boolean))];
 	const out = {};
 	if (!wanted.length || !BOT_TOKEN) return out;
 	const now = Date.now();
@@ -29054,15 +29091,17 @@ async function resolveCustomEmojiStickers(env, ids, options = {}) {
 		else pending.push(id);
 	}
 	if (!pending.length) return out;
+	for (let offset = 0; offset < pending.length; offset += 200) {
 	try {
 		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getCustomEmojiStickers', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ custom_emoji_ids: pending.slice(0, 200) })
+			body: JSON.stringify({ custom_emoji_ids: pending.slice(offset, offset + 200) })
 		});
 		const result = await response.json();
 		const cacheable = response.status !== 429 && response.status < 500
 			&& !/429|too many requests|internal server|timeout/i.test(String(result?.description || ''));
+		if (!result?.ok) break;
 		if (result?.ok && Array.isArray(result.result)) {
 			for (const sticker of result.result) {
 				const id = String(sticker?.custom_emoji_id || '');
@@ -29088,6 +29127,8 @@ async function resolveCustomEmojiStickers(env, ids, options = {}) {
 		}
 	} catch (error) {
 		console.error('[广告检测·自定义emoji] 解析失败:', error?.message || error);
+		break;
+	}
 	}
 	return out;
 }
@@ -29133,7 +29174,8 @@ function extractAdMedia(message) {
 		let bodyIsBitmap = false;
 		if (kind === 'photo') bodyIsBitmap = true;
 		else if (kind === 'sticker') bodyIsBitmap = !node.is_animated && !node.is_video;
-		// animation 是 GIF/H.264、video 是容器、document 格式未知 —— 一律不取本体。
+		else if (kind === 'document') bodyIsBitmap = /^image\/(?:png|jpeg|webp)$/i.test(String(node.mime_type || ''));
+		// 动态媒体取可识别缩略图；明确为静态图片的 document 也核验本体字节。
 		const visionFileId = bodyIsBitmap ? String(node.file_id || '') : thumbFileId;
 		return {
 			kind,
@@ -29157,7 +29199,7 @@ function extractAdMedia(message) {
 		// 这里不读它，视觉判定与图片指纹对整类消息全瞎：色情图不进 ad_images、
 		// 不走识图，主人 /spam 也学不到那张图（线上实测 ad_images 零新增）。
 		// kind 记 'photo'：预览图是静态位图，AD_IMAGE_VISION_KINDS 里已有它。
-		|| pick(message?.web_page?.photo, 'photo');
+		|| pick(Array.isArray(message?.web_page?.photo) ? message.web_page.photo[message.web_page.photo.length - 1] : message?.web_page?.photo, 'photo');
 }
 
 // 按字节头猜图片 MIME。比「按 kind 猜」可靠得多 —— kind 只说明载体类型，
@@ -29331,15 +29373,27 @@ function isVerifiedAdMediaRow(row) {
 }
 
 async function readAdCustomEmojiMediaRows(env, ids, userId = '', options = {}) {
-	const wanted = [...new Set((Array.isArray(ids) ? ids : []).map(String))].slice(0, 5);
+	const allIds = [...new Set((Array.isArray(ids) ? ids : []).map(String).filter(Boolean))];
+	const wanted = options.complete === true ? allIds : allIds.slice(0, 5);
 	const mapping = await resolveCustomEmojiStickers(env, wanted, { requireMedia: true });
 	const rows = [];
 	for (const id of wanted) {
-		if (await hasGroupAdFeedback(env, options.scopeChatId, 'emoji', id)) continue;
+		if (await hasGroupAdFeedback(env, options.scopeChatId, 'emoji', id)) {
+			if (options.complete === true) rows.push({ id, row: { verdict: 'clean', source: 'group_feedback' }, verifiedAd: false });
+			continue;
+		}
 		const media = mapping[id]?.media;
-		if (!media?.fileUniqueId) continue;
-		const row = await judgeAdMediaForMessage(env, media, userId, { requireContent: true, scopeChatId: options.scopeChatId });
-		rows.push({ id, ...media, row, verifiedAd: isVerifiedAdMediaRow(row) });
+		if (!media?.fileUniqueId) {
+			if (options.complete === true) rows.push({ id, row: null, verifiedAd: false, missingReason: 'custom_emoji_media_unavailable' });
+			continue;
+		}
+		try {
+			const row = await judgeAdMediaForMessage(env, media, userId, { requireContent: true, scopeChatId: options.scopeChatId });
+			rows.push({ id, ...media, row, verifiedAd: isVerifiedAdMediaRow(row) });
+		} catch (error) {
+			if (options.complete !== true) throw error;
+			rows.push({ id, ...media, row: null, verifiedAd: false, missingReason: 'custom_emoji_judge_failed' });
+		}
 	}
 	return rows;
 }
@@ -33552,7 +33606,7 @@ async function pushAdDryRunNotice(env, context) {
 			chatTitle: context?.input?.chatTitle || '',
 			seq: null,
 			dryrun: true,
-			banResultLine: '演练命中，处置未执行（不加黑 / 不封禁 / 不删消息），但本次特征已学入判据库'
+			banResultLine: '演练命中，处置未执行（不加黑 / 不封禁 / 不删消息）；广告特征按实际核验与学习结果记录'
 		});
 		const learnedCount = Number(context?.learnedCount) || 0;
 		const sampleLearned = context?.sampleLearned === true;
@@ -33567,6 +33621,8 @@ async function pushAdDryRunNotice(env, context) {
 		const tail = [
 			'',
 			learnLine,
+			evaluation.globalDrill?.complete === true ? '现场：资料与本次素材已完整采集/核验' : '现场：仍有缺失或未核部分，不能视作全部学习完成',
+			Array.isArray(evaluation.drillIncomplete) && evaluation.drillIncomplete.length ? '待补核：' + escapeHtml(evaluation.drillIncomplete.join('；')) : '',
 			'本来会执行但没做：本群处罚 + 删消息',
 			'流水号：' + (context?.dryRunId ? '#' + context.dryRunId : '（未写入，D1 写失败）'),
 			'',
@@ -35656,7 +35712,13 @@ function renderTgidTraceRow(source, row) {
 	if (source === 'punishments') lines.push(Number(row.expires_at) === 0 ? '复核状态：已复核 / 已撤销（历史仍保留）' : '复核状态：待纠错');
 	if (source === 'cache') lines.push('缓存是收到过的消息，缓存记录和 is_ad 标记不等于已确认违规；未保存的原图或截断文字不补造。');
 	const evaluation = parseTgidTraceJson(row.evaluation), snapshot = parseTgidTraceJson(row.snapshot);
+	if (evaluation.globalDrill) lines.push('演练现场完整性：' + (evaluation.globalDrill.complete === true ? '完整采集/核验' : '仍有缺失或未核部分'));
+	if (evaluation.drillIncomplete?.length) lines.push('待补核内容：' + escapeHtml(evaluation.drillIncomplete.join('；')));
 	const full = { ...(evaluation.payload || {}), ...snapshot, ...(evaluation.snapshot || {}) };
+	const original = full.sourceMessage || full.pendingMessage;
+	if (original?.text !== undefined && original.text !== full.text) lines.push('原始正文（保留数字、字符及空白）：' + escapeHtml(String(original.text)));
+	if (original?.caption !== undefined && original.caption !== full.text) lines.push('原始媒体说明：' + escapeHtml(String(original.caption)));
+	if (original?.entities?.length || original?.caption_entities?.length) lines.push('原始表情与格式位置：' + escapeHtml(JSON.stringify({ entities: original.entities || [], caption_entities: original.caption_entities || [] })));
 	const learning = evaluation.learningPayload || full.learningPayload || {};
 	for (const [key,label] of [['name','当时昵称'],['username','当时用户名'],['bio','已保存简介'],['text','已保存正文'],['quotedText','已保存引用'],['quoted','已保存引用内容'],
 		['imageId','正文图片指纹'],['avatarId','头像指纹'],['badgeId','会员标指纹'],['stickerSet','贴纸包'],['textSkeleton','正文骨架键'],['matchedTextSkeleton','命中骨架键'],
