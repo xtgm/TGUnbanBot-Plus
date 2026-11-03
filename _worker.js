@@ -11264,6 +11264,53 @@ function isIndependentGroup(chatId) {
 	return INDEPENDENT_GROUP_IDS.length > 0 && INDEPENDENT_GROUP_IDS.includes(String(chatId ?? ''));
 }
 
+// 群主的反例只在本群独立模式生效；读取不建表，也不修改任何共享判据。
+async function hasGroupAdFeedback(env, chatId, kind, key) {
+	const gid = String(chatId || ''), value = String(key || '');
+	if (!env?.DB || !gid || !value || !isIndependentGroup(gid) || !isConfiguredGroup(gid)) return false;
+	if (!['context', 'image', 'avatar', 'badge', 'emoji'].includes(String(kind))) return false;
+	try {
+		const schema = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('group_ad_feedback', 'dryrun_groups')").all();
+		const tables = new Set((schema.results || []).map((row) => row.name));
+		if (!tables.has('group_ad_feedback')) return false;
+		const mode = await env.DB.prepare('SELECT mode FROM group_mode WHERE chat_id = ?').bind(gid).first();
+		if (mode?.mode !== 'independent') return false;
+		if (tables.has('dryrun_groups')) {
+			const drill = await env.DB.prepare('SELECT enabled, by_user FROM dryrun_groups WHERE chat_id = ?').bind('__global__').first();
+			if (Number(drill?.enabled) === 1 && isPrimaryOwner(drill?.by_user)) return false;
+		}
+		return Boolean(await env.DB.prepare('SELECT 1 AS found FROM group_ad_feedback WHERE chat_id = ? AND kind = ? AND feedback_key = ?')
+			.bind(gid, String(kind), value).first());
+	} catch (_) { return false; }
+}
+
+// 完整现场的精确摘要：不使用截断指纹、用户 ID、得分或消息时间。
+async function buildGroupAdContextKey(input, evaluation) {
+	const payload = evaluation?.payload || {}, frozen = evaluation?.snapshot || {};
+	const message = input?.message || null;
+	const media = message ? extractAdMedia(message) : null;
+	const forward = message?.forward_from_chat || message?.forward_origin?.chat || input?.forwardChat || null;
+	const ids = message ? extractCustomEmojiIds(message) : payload.customEmojiIds || frozen.customEmojiIds || [];
+	const text = message ? [String(message.text ?? message.caption ?? extractAdChecklistText(message)), extractAdWebPageText(message)].filter(Boolean).join(' ') : String(payload.text ?? frozen.text ?? input?.text ?? '');
+	const contact = message?.contact || input?.contactCard || null;
+	const forwardAuthor = message?.forward_from || message?.forward_origin?.sender_user || null;
+	const context = {
+		version: 1, name: String(payload.name ?? frozen.name ?? ''), username: String(payload.username ?? frozen.username ?? '').replace(/^@/, ''),
+		bio: String(payload.bio ?? frozen.bio ?? ''), text,
+		quoted: message ? getAdQuotedText(message) : String(payload.quoted ?? payload.quotedText ?? frozen.quotedText ?? input?.quotedText ?? ''),
+		contact: contact ? { name: String(contact.name || [contact.first_name, contact.last_name].filter(Boolean).join(' ')),
+			phone: String(contact.phone_number ?? contact.phone ?? ''), vcard: String(contact.vcard || '') } : null,
+		forward: forward ? { id: String(forward.id || ''), type: String(forward.type || ''), title: String(forward.title || ''), username: String(forward.username || '') } : null,
+		forwardAuthor: forwardAuthor ? { name: [forwardAuthor.first_name, forwardAuthor.last_name].filter(Boolean).join(' '), username: String(forwardAuthor.username || '') }
+			: String(message?.forward_sender_name || message?.forward_origin?.sender_user_name || ''),
+		image: message ? String(media?.fileUniqueId || '') : String(payload.imageId || frozen.imageId || ''),
+		mediaKind: String(media?.kind || ''), avatar: String(payload.avatarId || frozen.avatarId || ''), badge: String(payload.badgeId || frozen.badgeId || ''),
+		emoji: [...new Set((Array.isArray(ids) ? ids : []).map(String))].sort()
+	};
+	try { return await exportSha256Hex(JSON.stringify(context)); }
+	catch (_) { return ''; } // 无法取得完整摘要时不生成可放行的反例键。
+}
+
 function hasGroupLocalBlacklist(chatId) {
 	return LOCAL_BLACKLIST_CHAT_IDS.length > 0 && LOCAL_BLACKLIST_CHAT_IDS.includes(String(chatId ?? ''));
 }
@@ -14067,19 +14114,28 @@ async function recordHandledAdText(env, rawText) {
 }
 
 // 主人判定正常的正文不能继续留在同款直封或重发删除名单中。
-async function clearAdTextReuseOnIgnore(env, rawText) {
+async function clearAdTextReuseOnIgnore(env, rawText, options = {}) {
 	if (!env?.DB) return false;
 	try {
 		const key = buildModerationTextKey({ text: String(rawText || '') });
-		if (key && await ensureAdSpamTextsTable(env)) {
-			await env.DB.prepare('DELETE FROM ad_spam_texts WHERE text_hash = ?').bind(key.hash).run();
+		if (key) {
+			const ready = await ensureAdSpamTextsTable(env);
+			if (!ready && options.strict) throw new Error('正文复用存储未就绪');
+			if (ready) {
+				const result = await env.DB.prepare('DELETE FROM ad_spam_texts WHERE text_hash = ?').bind(key.hash).run();
+				if (options.strict && result?.success === false) throw new Error('正文复用记录清理失败');
+			}
 		}
 		const norm = normalizeAdFingerprintValue(rawText);
 		if (norm) {
-			const current = await loadHandledAdTexts(env);
+			// 严格纠错必须读当前库值，缓存或读取失败的空数组不能当作已清理。
+			const current = options.strict
+				? JSON.parse(await readAdScanState(env, AD_HANDLED_TEXTS_KEY, '[]', { strict: true }))
+				: await loadHandledAdTexts(env);
+			if (!Array.isArray(current)) throw new Error('正文复用记录格式错误');
 			const kept = current.filter((row) => row?.t !== norm);
 			if (kept.length !== current.length) {
-				await writeAdScanState(env, AD_HANDLED_TEXTS_KEY, JSON.stringify(kept));
+				await writeAdScanState(env, AD_HANDLED_TEXTS_KEY, JSON.stringify(kept), Math.floor(Date.now() / 1000), { strict: options.strict === true });
 				primeHandledAdTexts(env, kept);
 			}
 		}
@@ -14877,6 +14933,7 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 			seq = row?.seq || null;
 		} catch (_) { /* 旧或未写成的快照不生成伪回滚按钮 */ }
 		await sendTelegramMessageChunks(OWNER_IDS[0], lines.join('\n'), buildAdNoticeKeyboard(seq, targetId, { automatic: true }));
+		await notifyIndependentGroupCreatorAdCase(env, String(chat.id), seq, targetId, lines.join('\n'));
 	} else await notifyAllOwners(lines.join('\n'), null);
 }
 
@@ -24170,14 +24227,22 @@ function computeAdFingerprintConfidence(matchCount, falsePositiveCount) {
 }
 
 // 读取全部指纹（60 秒缓存）。条数上限 500，防止指纹库被刷爆后每条消息都全表扫描。
-async function loadAdFingerprints(env) {
-	if (!env?.DB) return [];
+async function loadAdFingerprints(env, options = {}) {
+	if (!env?.DB) {
+		if (options.strict) throw new Error('指纹纠错存储未就绪');
+		return [];
+	}
 	try {
-		const value = await loadAdCachedValue(AD_FINGERPRINT_CACHE, env.DB, AD_FINGERPRINT_CACHE_TTL_MS, async () => {
-			if (!(await adDetectionReady(env))) return [];
-			const { results } = await env.DB.prepare(
+		const loader = async () => {
+			if (!(await adDetectionReady(env))) {
+				if (options.strict) throw new Error('指纹纠错存储未就绪');
+				return [];
+			}
+			const response = await env.DB.prepare(
 				'SELECT fingerprint, type, value, weight, match_count, false_positive_count, confidence, source FROM ad_fingerprints ORDER BY confidence DESC, match_count DESC LIMIT 500'
 			).all();
+			if (options.strict && (response?.success === false || !Array.isArray(response?.results))) throw new Error('指纹纠错记录读取失败');
+			const results = response?.results;
 			return (results || []).map((row) => ({
 				fingerprint: String(row.fingerprint || ''),
 				type: String(row.type || 'keyword'),
@@ -24192,10 +24257,13 @@ async function loadAdFingerprints(env) {
 				// 命中只计分、不单独构成封禁（见 evaluateAdSuspect 的 fingerprintBan）。
 				singleWord: isSingleBusinessWordFingerprint(normalizeAdFingerprintValue(row.value))
 			})).filter((row) => row.normalized);
-		});
+		};
+		const value = options.strict ? await loader()
+			: await loadAdCachedValue(AD_FINGERPRINT_CACHE, env.DB, AD_FINGERPRINT_CACHE_TTL_MS, loader);
 		return Array.isArray(value) ? value : [];
 	} catch (error) {
 		console.error('[广告检测] 读取指纹库失败:', error);
+		if (options.strict) throw error;
 		return [];
 	}
 }
@@ -24869,7 +24937,12 @@ async function bulkDeleteAdFingerprints(env, filter) {
 async function markAdFingerprintFalsePositive(env, payload, options = {}) {
 	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
 	const purge = options.purge === true;
-	const fingerprints = await loadAdFingerprints(env);
+	let fingerprints;
+	try { fingerprints = await loadAdFingerprints(env, { strict: options.strict === true }); }
+	catch (error) {
+		console.error('[广告检测] 读取待纠错指纹失败:', error);
+		return { ok: false, reason: 'error' };
+	}
 	if (!fingerprints.length) return { ok: true, affected: 0, retired: 0 };
 
 	const haystack = normalizeAdFingerprintValue([
@@ -26214,9 +26287,12 @@ async function readAdGroupMember(env, userId) {
 // 这一层不花任何 Telegram 请求 —— 头像是 getChat 顺带返回的字段。
 
 // 读一条头像指纹。查不到返回 null（= 未入库，既不是 ad 也不是 clean）。
-async function readAdAvatar(env, fileUniqueId) {
+async function readAdAvatar(env, fileUniqueId, options = {}) {
 	const key = String(fileUniqueId || '');
-	if (!env?.DB || !key) return null;
+	if (!env?.DB || !key) {
+		if (options.strict && !env?.DB) throw new Error('头像纠错存储未就绪');
+		return null;
+	}
 	try {
 		const row = await env.DB.prepare('SELECT file_unique_id, verdict, hits, source, last_user_id, vision_checked_at, created_at, updated_at, file_id, ocr_text, ocr_at, ocr_verdict FROM ad_avatars WHERE file_unique_id = ?').bind(key).first();
 		return row || null;
@@ -26224,6 +26300,7 @@ async function readAdAvatar(env, fileUniqueId) {
 		// 查不到不等于干净：失败按「未入库」处理，下一条消息再试，
 		// 绝不把查询失败当成 clean 去放行。
 		console.error('[广告检测] 读取头像指纹失败:', error);
+		if (options.strict) throw error;
 		return null;
 	}
 }
@@ -26371,7 +26448,7 @@ async function learnAdAvatarOnBan(env, fileUniqueId, userId) {
 
 // 误封纠错（/ignore 走这条路）：把该用户的头像转成 clean，
 // 防止「同头像的人全被连坐」—— 头像会被盗用，这是头像判据唯一的安全阀。
-async function clearAdAvatarOnIgnore(env, fileUniqueId) {
+async function clearAdAvatarOnIgnore(env, fileUniqueId, options = {}) {
 	const key = String(fileUniqueId || '');
 	if (!env?.DB || !key) return false;
 	const now = Math.floor(Date.now() / 1000);
@@ -26379,9 +26456,12 @@ async function clearAdAvatarOnIgnore(env, fileUniqueId) {
 	// 头像本身转成 manual clean 后已经不会再由字定罪；撤字是防它去连坐【别的】同字头像。
 	let textCleared = true;
 	try {
-		const old = await readAdAvatar(env, key);
+		const old = await readAdAvatar(env, key, { strict: options.strict === true });
 		if (String(old?.ocr_text || '').trim()) textCleared = await forgetAdAvatarText(env, old.ocr_text);
-	} catch (_) { textCleared = false; }
+	} catch (_) {
+		if (options.strict) return false;
+		textCleared = false;
+	}
 	try {
 		await env.DB.prepare('INSERT INTO ad_avatars (file_unique_id, verdict, hits, source, vision_checked_at, created_at, updated_at) VALUES (?, \'clean\', 0, \'manual\', 0, ?, ?) ON CONFLICT(file_unique_id) DO UPDATE SET verdict = \'clean\', hits = 0, source = \'manual\', updated_at = excluded.updated_at').bind(key, now, now).run();
 		// 【2026-11】去重表要跟着清空 —— 否则 hits 归零了但「谁被封过」的记录还在：
@@ -26737,9 +26817,10 @@ async function claimAdObserveNotice(env, userId) {
 	}
 }
 
-async function applyAvatarToEvaluation(env, evaluation, profile) {
+async function applyAvatarToEvaluation(env, evaluation, profile, options = {}) {
 	const avatarId = String(profile?.avatarId || '');
 	if (!evaluation || !avatarId) return evaluation;
+	if (await hasGroupAdFeedback(env, options.scopeChatId, 'avatar', avatarId)) return evaluation;
 	// 【2026-10-13 改：读库叠判 → 实时判定】原来首次见到只登记 pending 就返回，
 	// 等 cron 判完还要等【下一次】有人发消息才命中 —— 广告号顶着广告头像出现时
 	// 这一路是瞎的。现在没判过的当场调一次 clef 出结论并落库，判过的直接命中库。
@@ -26902,12 +26983,12 @@ function applyBadgeVerdict(evaluation, badge) {
 // 两者同源（都是 custom emoji、同一个数字 id 体系）、同表（ad_badges）、同阀
 // （AD_BADGE_BAN_HITS + 必须有佐证），所以合成一个入口 —— 5 个调用点一个都不用改，
 // 只要调用方把 profile.customEmojiIds 挂上即可。
-async function applyBadgeToEvaluation(env, evaluation, profile) {
+async function applyBadgeToEvaluation(env, evaluation, profile, options = {}) {
 	let current = evaluation;
 	if (!current) return current;
 	// ① 昵称旁的会员标（批次 C）：id 在 getChat 的 ChatFullInfo 里。
 	const badgeId = String(profile?.badgeId || '');
-	if (badgeId) {
+	if (badgeId && !(await hasGroupAdFeedback(env, options.scopeChatId, 'badge', badgeId))) {
 		const badge = await readAdBadge(env, badgeId);
 		if (badge) current = applyBadgeVerdict(current, badge);
 	}
@@ -26916,6 +26997,7 @@ async function applyBadgeToEvaluation(env, evaluation, profile) {
 	const ids = Array.isArray(profile?.customEmojiIds) ? profile.customEmojiIds : [];
 	for (const id of ids) {
 		if (!id || id === badgeId) continue;
+		if (await hasGroupAdFeedback(env, options.scopeChatId, 'emoji', id)) continue;
 		const badge = await readAdBadge(env, id);
 		if (badge) current = applyBadgeVerdict(current, Object.assign({}, badge, { position: 'sticker' }));
 	}
@@ -28660,10 +28742,10 @@ async function clearAdImageOnIgnore(env, fileUniqueId) {
 // 【clean 是安全阀】主人 /ignore 过的包，自动学习不能再把它翻回广告包；人工命令可以。
 const AD_STICKER_PACK_KEY_PREFIX = 'adset:';
 
-async function readAdStickerPack(env, setName) {
+async function readAdStickerPack(env, setName, options = {}) {
 	const name = String(setName || '');
 	if (!env?.DB || !name) return '';
-	return readAdScanState(env, AD_STICKER_PACK_KEY_PREFIX + name, '');
+	return readAdScanState(env, AD_STICKER_PACK_KEY_PREFIX + name, '', options);
 }
 
 async function markAdStickerPack(env, setName, source, options = {}) {
@@ -28688,14 +28770,15 @@ function isVerifiedAdMediaRow(row) {
 		|| (row.ownerSimilarity?.exact === true && row.ownerSimilarity?.verdict === 'ad'));
 }
 
-async function readAdCustomEmojiMediaRows(env, ids, userId = '') {
+async function readAdCustomEmojiMediaRows(env, ids, userId = '', options = {}) {
 	const wanted = [...new Set((Array.isArray(ids) ? ids : []).map(String))].slice(0, 5);
 	const mapping = await resolveCustomEmojiStickers(env, wanted, { requireMedia: true });
 	const rows = [];
 	for (const id of wanted) {
+		if (await hasGroupAdFeedback(env, options.scopeChatId, 'emoji', id)) continue;
 		const media = mapping[id]?.media;
 		if (!media?.fileUniqueId) continue;
-		const row = await judgeAdMediaForMessage(env, media, userId, { requireContent: true });
+		const row = await judgeAdMediaForMessage(env, media, userId, { requireContent: true, scopeChatId: options.scopeChatId });
 		rows.push({ id, ...media, row, verifiedAd: isVerifiedAdMediaRow(row) });
 	}
 	return rows;
@@ -28724,11 +28807,11 @@ function applyCustomEmojiMaterialVerdicts(evaluation, rows) {
 	return result;
 }
 
-async function clearAdStickerPack(env, setName) {
+async function clearAdStickerPack(env, setName, options = {}) {
 	const name = String(setName || '');
 	if (!env?.DB || !name) return false;
-	if (!(await readAdStickerPack(env, name))) return false;
-	await writeAdScanState(env, AD_STICKER_PACK_KEY_PREFIX + name, 'clean');
+	if (!(await readAdStickerPack(env, name, options))) return false;
+	await writeAdScanState(env, AD_STICKER_PACK_KEY_PREFIX + name, 'clean', Math.floor(Date.now() / 1000), options);
 	return true;
 }
 
@@ -29290,26 +29373,35 @@ async function isProtectedFromAutoModeration(userId, skipChatId = '') {
 // 因此「部署后从未发过一句话的潜伏号」任何方案都枚举不到 —— 这是 API 的边界，
 // 不是本方案的缺口，换任何实现都一样。名册覆盖的是「发言过的所有人」。
 
-async function readAdScanState(env, key, fallback = '') {
-	if (!env?.DB) return fallback;
+async function readAdScanState(env, key, fallback = '', options = {}) {
+	if (!env?.DB) {
+		if (options.strict) throw new Error('未绑定 D1 扫描状态存储');
+		return fallback;
+	}
 	try {
 		const row = await env.DB.prepare('SELECT value FROM ad_scan_state WHERE key = ?').bind(String(key)).first();
 		return row?.value != null ? String(row.value) : fallback;
 	} catch (error) {
 		console.error('[广告检测] 读取扫描状态失败:', error);
+		if (options.strict) throw error;
 		return fallback;
 	}
 }
 
-async function writeAdScanState(env, key, value, nowSeconds = Math.floor(Date.now() / 1000)) {
-	if (!env?.DB) return;
+async function writeAdScanState(env, key, value, nowSeconds = Math.floor(Date.now() / 1000), options = {}) {
+	if (!env?.DB) {
+		if (options.strict) throw new Error('未绑定 D1 扫描状态存储');
+		return;
+	}
 	try {
-		await env.DB.prepare(
+		const result = await env.DB.prepare(
 			'INSERT INTO ad_scan_state (key, value, updated_at) VALUES (?, ?, ?) '
 			+ 'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
 		).bind(String(key), String(value), Number(nowSeconds) || 0).run();
+		if (options.strict && result?.success === false) throw new Error('扫描状态写入失败');
 	} catch (error) {
 		console.error('[广告检测] 写入扫描状态失败:', error);
+		if (options.strict) throw error;
 	}
 }
 
@@ -29481,10 +29573,10 @@ async function rescanAdMember(env, row, options = {}) {
 		{ config: options.config, whitelist: options.whitelist, skipMissingBioPenalty: false }
 	);
 	// 头像指纹叠加（无头像则原样返回，本轨零额外开销）
-	const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+	const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile, { scopeChatId: chatId });
 	// 同款会员标叠加（无标则原样返回）：与头像同一层位、同一零开销条件，
 	// 排在头像之后 —— 两层都只加 reasons 不改 score，先后不影响分数。
-	let evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+	let evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile, { scopeChatId: chatId });
 	// 第四路补位：这一轨扫的是「不发言的人」，正文恒空，模型判的就是资料本身 ——
 	// 正对准「改了 bio 的潜伏号」。日限 300 人，LLM 每日上限还绰绰有余。
 	// 【degradeToObserve: false】这一轨「判不成」时不转观察，照旧掉回评分层结论。
@@ -29608,20 +29700,25 @@ async function queueAdAvatarLearning(env, userId) {
 }
 
 // 演练「❌ 不该封」用：把这个人从补学队列里拿掉，别人原样留着。不在队列里返回 false，不写库。
-async function dequeueAdAvatarLearning(env, userId) {
+async function dequeueAdAvatarLearning(env, userId, options = {}) {
 	const uid = String(userId || '');
 	if (!env?.DB || !uid) return false;
 	try {
-		const raw = await readAdScanState(env, 'avatar_learn_queue', '[]');
+		const raw = await readAdScanState(env, 'avatar_learn_queue', '[]', options);
 		let list = [];
-		try { list = JSON.parse(String(raw || '[]')); } catch (_) { list = []; }
-		if (!Array.isArray(list)) return false;
+		try { list = JSON.parse(String(raw || '[]')); }
+		catch (error) { if (options.strict) throw error; list = []; }
+		if (!Array.isArray(list)) {
+			if (options.strict) throw new Error('补学队列格式无效');
+			return false;
+		}
 		const next = list.map((v) => String(v)).filter((v) => v && v !== uid);
 		if (next.length === list.length) return false;
-		await writeAdScanState(env, 'avatar_learn_queue', JSON.stringify(next), Math.floor(Date.now() / 1000));
+		await writeAdScanState(env, 'avatar_learn_queue', JSON.stringify(next), Math.floor(Date.now() / 1000), options);
 		return true;
 	} catch (error) {
 		console.error('[广告检测·头像] 移出补学队列失败:', error);
+		if (options.strict) throw error;
 		return false;
 	}
 }
@@ -30903,6 +31000,9 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	if (!env?.DB) return null;
 	const key = String(media.fileUniqueId);
 	const uid = String(userId || '');
+	if (await hasGroupAdFeedback(env, options.scopeChatId, 'image', key)) {
+		return { file_unique_id: key, kind: String(media.kind || ''), verdict: 'clean', source: 'group_feedback', hits: 0 };
+	}
 
 	// ① 已判过的图：直接用库里的结论，一个 Neurons 都不花。
 	let row = await readAdImage(env, key);
@@ -31087,7 +31187,7 @@ async function applyCustomEmojiOnlyPackScan(env, evaluation, message) {
 	if (!isAdCustomEmojiOnlyMessage(message)) return evaluation;
 	const ids = extractCustomEmojiIds(message);
 	if (!ids.length) return evaluation;
-	return applyCustomEmojiMaterialVerdicts(evaluation, await readAdCustomEmojiMediaRows(env, ids, message.from?.id || ''));
+	return applyCustomEmojiMaterialVerdicts(evaluation, await readAdCustomEmojiMediaRows(env, ids, message.from?.id || '', { scopeChatId: message.chat?.id }));
 }
 
 // 推一条漏判通知给第一主人：先把原消息复制过去（主人直接看图），再发判据 + 两个按钮。
@@ -31268,10 +31368,13 @@ async function handleAdImageMissCallback(callbackQuery, env, { action, userId, c
 // 【退回旧行为的四道闸】与图片那侧一致，任一拦下都与实时化之前完全一致：
 // 没绑 AI（登记照做只是不判）、每日上限 AD_AVATAR_VISION_DAILY 跑满、
 // 连续失败熔断、超尺寸。429 不推熔断不落库。与 cron 轨共用同一个额度池。
-async function judgeAdAvatarRealtime(env, avatarId, profile) {
+async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 	if (!env?.DB) return null;
 	const key = String(avatarId || '');
 	if (!key) return null;
+	if (await hasGroupAdFeedback(env, options.scopeChatId, 'avatar', key)) {
+		return { file_unique_id: key, verdict: 'clean', source: 'group_feedback', hits: 0 };
+	}
 	const uid = String(profile?.userId || '');
 
 	// ① 判过的直接命中库，一个 Neurons 都不花。
@@ -31462,7 +31565,7 @@ function serializeAdReviewValue(value) {
 	if (Array.isArray(bounded)) {
 		while (bounded.length && text.length > 32768) { bounded.pop(); text = JSON.stringify(bounded); }
 	} else {
-		const immutableScope = new Set(['automatic', 'punishmentScope', 'punishmentChatId', 'autoCaseId']);
+		const immutableScope = new Set(['automatic', 'punishmentScope', 'punishmentChatId', 'autoCaseId', 'groupAdContextKey']);
 		const critical = new Set([...immutableScope, 'learningPayload', 'payload', 'textSkeleton', 'matchedTextSkeleton', 'imageId', 'avatarId', 'badgeId', 'customEmojiIds', 'profileShape', 'scoredLinks', 'name', 'username', 'bio', 'text']);
 		const removable = Object.keys(bounded).reverse().filter((key) => !critical.has(key));
 		for (const key of removable) {
@@ -32598,7 +32701,7 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 	const buttonChatId = String(match[3] || '');
 	const buttonAvatarId = String(match[4] || '');
 	const fromId = String(callbackQuery?.from?.id || '');
-	if (!isPrimaryOwner(fromId)) {
+	if (!isPrimaryOwner(fromId) && action !== 'ig') {
 		await answerAdVoteCallback(callbackQuery?.id, '这三个按钮只有第一主人能点', true);
 		return;
 	}
@@ -32607,12 +32710,18 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 	const originText = String(callbackQuery?.message?.text || '');
 
 	if (action === 'ig') {
-		// 复用 /ignore 全链路：序号不存在、已复核过这两种情况它自己会回执，
-		// 不在这里预判 —— 预判与命令侧的口径迟早分叉，主人会看到两套说法。
+		const result = await handleAdIgnoreCommand(env, chatId, fromId, String(payload), {
+			kind: 'callback', chatId, chatType: callbackQuery?.message?.chat?.type,
+			actorIsBot: callbackQuery?.from?.is_bot === true, anonymous: false
+		});
+		if (!result?.complete) {
+			await answerAdVoteCallback(callbackQuery?.id, '回滚未完成：' + (result?.results?.[0]?.errors?.join('；') || '请稍后重试'), true);
+			return;
+		}
 		await answerAdVoteCallback(callbackQuery?.id, '已按误判回滚 #' + payload);
-		await handleAdIgnoreCommand(env, chatId, fromId, String(payload));
+		const local = Boolean(result.results?.[0]?.localFeedback);
 		await editTelegramMessage(chatId, messageId, originText + '\n─────\n↩️ 已按误判回滚　快照 #' + payload
-			+ '\n解封 + 指纹/形状/AI 样本修正已执行，明细在上一条消息。');
+			+ (local ? '\n本群自动现场已纠正，并已记录本群误判反馈，明细在上一条消息。' : '\n解封 + 指纹/形状/AI 样本修正已执行，明细在上一条消息。'));
 		return;
 	}
 
@@ -33428,6 +33537,24 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// 已并入 learnAdFeaturesOnVerdict：它与头像 / 指纹 / 资料形状那批一样是【判据
 	// 学习】，正式处置与演练两条路共用一份，见该函数里这段的说明。
 
+	let contextEvaluation = evaluation;
+	let contextReady = true;
+	if (automatic && localScope && evaluation.bioChecked === false) {
+		// 本群整份现场纠错不能把「尚未查询的简介」当成空简介；只在独立群补齐摘要取材。
+		try {
+			const profile = await fetchAdUserProfile(userId, input.message?.from || {});
+			contextReady = profile.bioFetched === true;
+			if (contextReady) contextEvaluation = { ...evaluation, payload: { ...(evaluation.payload || {}),
+				name: [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim(), username: profile.username || '',
+				bio: profile.bio || '', avatarId: profile.avatarId || '', badgeId: profile.badgeId || '' } };
+		} catch (_) { contextReady = false; }
+	}
+	const groupAdContextKey = automatic && contextReady ? await buildGroupAdContextKey(input, contextEvaluation) : '';
+	if (automatic && await hasGroupAdFeedback(env, chatId, 'context', groupAdContextKey)) {
+		evaluation.verdict = 'pass';
+		return { banned: false, seq: null, groupFeedback: true, reason: 'group_context_feedback' };
+	}
+
 	const noteParts = [
 		'广告自动判定',
 		AD_LAYER_LABELS[evaluation.layer] || evaluation.layer,
@@ -33613,7 +33740,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	let seq = null;
 	if (ownerId) {
 		// 归属字段排在最前并以本次值覆盖：即便超长现场被限长，也不能丢标记而回退成全局回滚。
-		const punishmentMarker = { automatic, punishmentScope: automatic ? 'local' : 'global', punishmentChatId: chatId, autoCaseId };
+		const punishmentMarker = { automatic, punishmentScope: automatic ? 'local' : 'global', punishmentChatId: chatId, autoCaseId, groupAdContextKey };
 		evaluation.snapshot = Object.assign({ ...punishmentMarker }, evaluation.snapshot || {}, punishmentMarker);
 		if (evidenceMessageId) evaluation.snapshot.evidenceMessageId = evidenceMessageId;
 		seq = await allocateAdPendingSnapshot(env, ownerId, {
@@ -33648,6 +33775,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		} catch (error) {
 			console.error('[广告检测] 推送判定通知失败:', error);
 		}
+		if (automatic) await notifyIndependentGroupCreatorAdCase(env, chatId, seq, userId, notice + '\n范围：本群自动封禁（<code>' + escapeHtml(chatId) + '</code>）');
 	}
 
 	await deleteAdScreening(env, userId);
@@ -33780,10 +33908,10 @@ async function screenAdJoinMember(env, member, options = {}) {
 			// 入群即判头像：这是「广告号还没发广告就被拦住」的主通道，
 			// 头像指纹命中时即便正文干净也能进判据（分档见 applyAvatarVerdict）。
 			// 头像与其它强证据一样不走入群线，仍按原样定罪。
-			const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile);
+			const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile, { scopeChatId: chatId });
 			// 同款会员标同位叠加：走到这里已经为这次判定花过 getChat 了，
 			// 会员标就在那一份响应里，查一次库即可，零额外 Telegram 请求。
-			let judged = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+			let judged = await applyBadgeToEvaluation(env, avatarEvaluation, profile, { scopeChatId: chatId });
 			// ===== 第四路补位：前三层都没定罪时交给生成式模型 =====
 			// 入群时正文为空（他还没发过言），载荷里 message 就是空串 —— 提示词
 			// 明写「message 为空不构成怀疑理由」，所以这一路在这里判的纯粹是资料卡。
@@ -33840,6 +33968,7 @@ async function screenAdJoinMember(env, member, options = {}) {
 			// 演练命中不记 newcomer：风控这一格的口径是【真被处置过的新人】，
 			// 演练一个都没动，记进去会让面板的治理数据虚高。
 			if (result?.dryrun) return 'dryrun';
+			if (result?.groupFeedback) return 'clean';
 			await recordStatAction(env, chatId, 'newcomer');
 			return 'banned';
 		}
@@ -34116,8 +34245,8 @@ async function detectAdOnMessage(message, env) {
 	// 退回旧行为的四道闸（无 AI / 额度跑满 / 熔断 / 不是位图）见函数注释。
 	// 【2026-11-02 改：→ judgeAdMediaForMessage】贴纸先查贴纸包（同包变体零识图直接定罪），
 	// 识图没判成 / 灰区的结果带 missReason —— 本条最终没封也没进观察时推漏判通知。
-	const imageRow = media ? await judgeAdMediaForMessage(env, media, userId, { requireContent: true }) : null;
-	const bodyEmojiRows = await readAdCustomEmojiMediaRows(env, extractCustomEmojiIds(message), userId);
+	const imageRow = media ? await judgeAdMediaForMessage(env, media, userId, { requireContent: true, scopeChatId: chat.id }) : null;
+	const bodyEmojiRows = await readAdCustomEmojiMediaRows(env, extractCustomEmojiIds(message), userId, { scopeChatId: chat.id });
 	const notifyImageMiss = () => (imageRow?.missReason
 		? notifyAdImageMiss(env, {
 			image: imageRow, media, userId, chatId: chat.id, messageId: message.message_id,
@@ -34162,7 +34291,7 @@ async function detectAdOnMessage(message, env) {
 	// 【成本】customEmojiIds 为空时函数立即返回，一个 D1 都不发；
 	// 有 id 时也只是查 ad_badges（D1），仍然零 Telegram 请求，
 	// 所以「闸一零 getChat」那条不变量原样保住。
-	cheap = await applyBadgeToEvaluation(env, cheap, cheapProfile);
+	cheap = await applyBadgeToEvaluation(env, cheap, cheapProfile, { scopeChatId: chat.id });
 
 	// ===== 名片广告专用定罪（2026-10-11）=====
 	// 与头像、会员标同一层位：message.contact 在 update 里现成带着，
@@ -34281,8 +34410,8 @@ async function detectAdOnMessage(message, env) {
 				// 这次是【据实传】：bio 真查到了，空简介该减分就减分。
 				{ config, whitelist }
 			));
-			const verifyAvatarEvaluation = await applyAvatarToEvaluation(env, verifyEvaluation, verifyProfile);
-			decision = await applyBadgeToEvaluation(env, verifyAvatarEvaluation, verifyProfile);
+			const verifyAvatarEvaluation = await applyAvatarToEvaluation(env, verifyEvaluation, verifyProfile, { scopeChatId: chat.id });
+			decision = await applyBadgeToEvaluation(env, verifyAvatarEvaluation, verifyProfile, { scopeChatId: chat.id });
 			console.log('[广告检测] AI 单独定罪已补查 bio 复评 user=' + userId
 				+ ' 闸一=' + cheap.verdict + '/' + cheap.score
 				+ ' 复评=' + decision.verdict + '/' + decision.score);
@@ -34297,13 +34426,13 @@ async function detectAdOnMessage(message, env) {
 			console.log('[广告检测] user=' + userId + ' 是其他配置群的管理员，豁免不封');
 			return false;
 		}
-		await enforceAdDetection(env, {
+		const enforced = await enforceAdDetection(env, {
 			userId,
 			chatId: chat.id,
 			chatTitle: chat.title || '',
 			messageId: message.message_id, message
 		}, decision, { config, whitelist });
-		return true;
+		return enforced?.groupFeedback !== true;
 	}
 
 	// ===== 第⑥层判了广告却被拦下 → 强制进闸二拉资料再判（2026-11-01）=====
@@ -34404,12 +34533,13 @@ async function detectAdOnMessage(message, env) {
 		const avatarEvaluation = await applyAvatarToEvaluation(
 			env,
 			applyImageVerdict(baseEvaluation, imageRow),
-			profile
+			profile,
+			{ scopeChatId: chat.id }
 		);
 		// 同款会员标叠在最外层：闸一那条零成本路径拿不到会员标（getChat 还没发），
 		// 所以这一层只在闸二及其后（入群线、AI 补查、cron 复查）生效 ——
 		// 与头像完全同位，热路径的 Telegram 请求数一个都不多。
-		let judged = await applyBadgeToEvaluation(env, avatarEvaluation, profile);
+		let judged = await applyBadgeToEvaluation(env, avatarEvaluation, profile, { scopeChatId: chat.id });
 		// 正文自定义 emoji 属于已定罪的广告贴纸包 → 直接封（包名闸二已经拿到，零额外请求）。
 		judged = applyCustomEmojiMaterialVerdicts(judged, bodyEmojiRows);
 		judged.payload.customEmojiIds = extractCustomEmojiIds(message);
@@ -34445,13 +34575,13 @@ async function detectAdOnMessage(message, env) {
 			console.log('[广告检测] user=' + userId + ' 是其他配置群的管理员，豁免不封');
 			return false;
 		}
-		await enforceAdDetection(env, {
+		const enforced = await enforceAdDetection(env, {
 			userId,
 			chatId: chat.id,
 			chatTitle: chat.title || '',
 			messageId: message.message_id, message
 		}, evaluation, { config, whitelist });
-		return true;
+		return enforced?.groupFeedback !== true;
 	}
 
 
@@ -34527,6 +34657,14 @@ async function handleAdDetectionCommands(message, env, ctx) {
 	// 指纹库与样本库直接决定自动封禁行为，权限外泄等于把封禁开关交出去 → 只给第一主人。
 	// 群内一律只撤回命令、不回权限提示，避免向群成员暴露这些命令的存在。
 	if (!isPrimaryOwner(userId)) {
+		// 只有 /ignore 进入本群纠错鉴权，其余管理命令仍保留第一主人门槛。
+		if (command === 'ignore') {
+			await handleAdIgnoreCommand(env, chatId, userId, raw.replace(AD_COMMAND_RE, '').trim(), {
+				kind: 'command', chatId, chatType: message.chat.type,
+				actorIsBot: message?.from?.is_bot === true, anonymous: isAnonymousAdminMessage(message)
+			});
+			return true;
+		}
 		if (!isInGroup) {
 			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告检测管理命令仅限第一主人私聊使用。');
 		}
@@ -34553,7 +34691,10 @@ async function handleAdDetectionCommands(message, env, ctx) {
 		switch (command) {
 			case 'pending': await handleAdPendingCommand(env, chatId, ownerId, arg); break;
 			case 'user': await handleAdUserCommand(env, chatId, ownerId, arg); break;
-			case 'ignore': await handleAdIgnoreCommand(env, chatId, ownerId, arg); break;
+			case 'ignore': await handleAdIgnoreCommand(env, chatId, ownerId, arg, {
+				kind: 'command', chatId, chatType: message.chat.type,
+				actorIsBot: message?.from?.is_bot === true, anonymous: isAnonymousAdminMessage(message)
+			}); break;
 			case 'addword': await handleAdAddWordCommand(env, chatId, ownerId, arg); break;
 			case 'delword': await handleAdDelWordCommand(env, chatId, ownerId, arg); break;
 			case 'words': await handleAdWordsCommand(env, chatId, arg); break;
@@ -34893,6 +35034,133 @@ async function handleAdPendingCommand(env, chatId, ownerId, arg) {
 
 // 单条误判回滚：移出黑名单 → 全群解封 → 指纹记误报并即删 → 删掉对应 AI 样本 → 标记快照已复核。
 // 抽出来给 /ignore 的单条与批量两种用法共用，保证两条路径的副作用完全一致。
+// 纠错权限单独核验：群主自治只用于独立群的完整自动处罚现场。
+async function readFreshAdIgnoreGroupMode(env, chatId) {
+	if (!env?.DB) return false;
+	try {
+		const row = await env.DB.prepare('SELECT mode FROM group_mode WHERE chat_id = ?').bind(String(chatId)).first();
+		return row?.mode === 'independent';
+	} catch (_) { return false; }
+}
+
+async function resolveAdIgnoreAccess(env, actorId, seq, origin = {}) {
+	const uid = String(actorId || ''), ownerId = String(OWNER_IDS[0] || '');
+	const chatId = String(origin.chatId || ''), chatType = String(origin.chatType || '');
+	const denied = (code, message = '权限不足：仅第一主人私聊，或独立模式本群当前群主可纠正本群自动处罚。') => ({ ok: false, code, message });
+	if (!ownerId || !/^\d+$/.test(uid) || origin.actorIsBot === true || origin.anonymous === true
+		|| !['command', 'callback'].includes(origin.kind)) return denied('FORBIDDEN');
+	const privateSelf = chatType === 'private' && chatId === uid;
+	const inGroup = ['group', 'supergroup'].includes(chatType) && /^-\d+$/.test(chatId);
+	if (!privateSelf && !inGroup) return denied('INVALID_ORIGIN');
+	if (isPrimaryOwner(uid) && !privateSelf) return denied('PRIVATE_ONLY', '广告检测管理命令请在第一主人私聊中使用。');
+	const snapshot = await readAdPendingSnapshot(env, ownerId, seq);
+	if (!snapshot) return denied('SNAPSHOT_NOT_FOUND', '序号不存在或已复核过，请查看当前待复核记录。');
+	if (isPrimaryOwner(uid)) return { ok: true, role: 'primaryOwner', ownerId, actorId: uid, seq, snapshot, chatId: snapshot.chatId, origin };
+	const frozen = snapshot.snapshot || {};
+	const punishmentChatId = String(frozen.punishmentChatId || '');
+	if (frozen.automatic !== true || frozen.punishmentScope !== 'local' || !String(frozen.autoCaseId || '').trim()
+		|| !/^-\d+$/.test(punishmentChatId) || snapshot.chatId !== punishmentChatId || !/^\d+$/.test(snapshot.userId)
+		|| !isConfiguredGroup(punishmentChatId) || (inGroup && chatId !== punishmentChatId)) return denied('INVALID_CASE');
+	if (!(await readFreshAdIgnoreGroupMode(env, punishmentChatId))) return denied('NOT_INDEPENDENT');
+	try {
+		// checkUserStatus 直接调用 getChatMember，不使用管理员名单或身份缓存。
+		const result = await checkUserStatus(uid, punishmentChatId);
+		const member = result?.result;
+		if (result?.ok !== true || member?.status !== 'creator' || String(member?.user?.id || '') !== uid
+			|| member?.user?.is_bot === true) return denied('NOT_CREATOR');
+	} catch (_) { return denied('IDENTITY_UNAVAILABLE', '无法确认当前群主身份，未执行纠错，请稍后重试。'); }
+	if (!(await readFreshAdIgnoreGroupMode(env, punishmentChatId))) return denied('MODE_CHANGED', '群模式已变化，未执行纠错。');
+	return { ok: true, role: 'independentCreator', ownerId, actorId: uid, seq, snapshot, chatId: punishmentChatId, origin };
+}
+
+const D1_GROUP_AD_FEEDBACK_WRITE_INIT = new WeakMap();
+async function writeGroupAdFeedbackForCase(env, chatId, actorId, seq, snapshot) {
+	const frozen = snapshot?.snapshot || {};
+	const gid = String(chatId || ''), creatorId = String(actorId || ''), caseId = String(frozen.autoCaseId || '');
+	if (!env?.DB || snapshot?.chatId !== gid || frozen.punishmentChatId !== gid || frozen.automatic !== true
+		|| frozen.punishmentScope !== 'local' || !caseId || !/^\d+$/.test(creatorId)) return { ok: false, written: 0 };
+	const learning = frozen.learningPayload && typeof frozen.learningPayload === 'object' ? frozen.learningPayload : {};
+	const keys = new Map();
+	const add = (kind, key) => { const value = String(key || '').trim(); if (value) keys.set(kind + ':' + value, [kind, value]); };
+	// 后处理补入的现场素材不能被旧学习载荷的空字段遮掉。
+	for (const assets of [frozen, learning]) {
+		add('image', assets.imageId); add('avatar', assets.avatarId); add('badge', assets.badgeId);
+		for (const id of (Array.isArray(assets.customEmojiIds) ? assets.customEmojiIds : [])) add('emoji', id);
+		for (const media of (Array.isArray(assets.customEmojiMedia) ? assets.customEmojiMedia : [])) add('image', media?.fileUniqueId);
+	}
+	// 完整现场键只认冻结字段；旧快照不能从截断正文补算。
+	if (/^[a-f0-9]{64}$/.test(String(frozen.groupAdContextKey || ''))) add('context', frozen.groupAdContextKey);
+	try {
+		if (!(await readFreshAdIgnoreGroupMode(env, gid))) return { ok: false, written: 0 };
+		let init = D1_GROUP_AD_FEEDBACK_WRITE_INIT.get(env.DB);
+		if (!init) {
+			init = env.DB.prepare('CREATE TABLE IF NOT EXISTS group_ad_feedback (chat_id TEXT NOT NULL, kind TEXT NOT NULL, feedback_key TEXT NOT NULL, case_id TEXT NOT NULL, creator_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (chat_id, kind, feedback_key))').run();
+			D1_GROUP_AD_FEEDBACK_WRITE_INIT.set(env.DB, init);
+		}
+		await init;
+		const now = Math.floor(Date.now() / 1000);
+		const statements = [...keys.values()].map(([kind, key]) => env.DB.prepare("INSERT INTO group_ad_feedback (chat_id, kind, feedback_key, case_id, creator_id, at) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM group_mode WHERE chat_id = ? AND mode = 'independent') ON CONFLICT(chat_id, kind, feedback_key) DO UPDATE SET case_id = excluded.case_id, creator_id = excluded.creator_id, at = excluded.at")
+			.bind(gid, kind, key, caseId, creatorId, now, gid));
+		if (statements.length) {
+			const results = env.DB.batch ? await env.DB.batch(statements) : await Promise.all(statements.map((statement) => statement.run()));
+			if (results.some((result) => result?.success === false || Number(result?.meta?.changes ?? result?.changes ?? result?.results?.[0]?.meta?.changes ?? 0) < 1)) throw new Error('本群反馈写入失败或群模式已变化');
+		}
+		return { ok: true, written: keys.size, seq: Number(seq), caseId };
+	} catch (error) {
+		D1_GROUP_AD_FEEDBACK_WRITE_INIT.delete(env.DB);
+		console.error('[本群广告纠错] 反馈写入失败:', error);
+		return { ok: false, written: 0 };
+	}
+}
+
+// 同一第一主人序号只副送当前真实群主；私聊不可达时不向群内回退资料。
+async function notifyIndependentGroupCreatorAdCase(env, chatId, seq, userId, text) {
+	if (!seq || !(await readFreshAdIgnoreGroupMode(env, chatId))) return;
+	try {
+		const members = await fetchGroupAdminsOnce(chatId);
+		const creators = (members || []).filter((member) => member?.status === 'creator' && member?.user?.is_bot !== true && /^\d+$/.test(String(member?.user?.id || '')));
+		if (creators.length !== 1) return;
+		const creatorId = String(creators[0].user.id);
+		if (creatorId === String(OWNER_IDS[0] || '') || !(await readFreshAdIgnoreGroupMode(env, chatId))) return;
+		const keyboard = { inline_keyboard: [[{ text: '↩️ 误封解除（本群纠错）', callback_data: ADFIX_BUTTON_PREFIX + 'ig:' + Number(seq) }]] };
+		await sendTelegramMessageChunks(creatorId, text + '\n本群纠错：/ignore ' + seq + '（仅撤本次自动处罚并记录本群误判反馈）', keyboard);
+	} catch (error) { console.error('[本群广告纠错] 群主私聊通知失败:', error); }
+}
+
+async function rollbackIndependentAdPendingSnapshot(env, access) {
+	const { snapshot, ownerId, actorId, seq, chatId } = access;
+	const targetId = snapshot.userId;
+	const result = { targetId, unbanResults: [], unbanSummary: '未执行', snapshotProcessed: false, complete: false, errors: [] };
+	try {
+		if (access.ok !== true || access.role !== 'independentCreator' || !(await readFreshAdIgnoreGroupMode(env, chatId))) throw new Error('群模式已变化');
+		result.removed = await removeAutomaticGroupBan(env, chatId, targetId, snapshot.snapshot.autoCaseId);
+		if (!result.removed.success && result.removed.code !== 'NOT_FOUND') throw new Error('本群自动处罚移除失败');
+		const remaining = await readGroupBlacklistEntry(env, chatId, targetId);
+		// 独立群的全局记录只有第一主人所封者生效；只读原表，不建或改全局库。
+		const shared = await env.DB.prepare('SELECT by_user FROM blacklist WHERE id = ? LIMIT 1').bind(String(targetId)).first();
+		if (!(await readFreshAdIgnoreGroupMode(env, chatId))) throw new Error('群模式已变化');
+		result.punishmentRetained = Boolean(remaining || (shared && isPrimaryOwner(shared.by_user)));
+		if (result.punishmentRetained) result.unbanSummary = '本次自动现场已撤销；其他有效处罚仍保留';
+		else {
+			result.unbanResults = await unbanUserFromAllGroups(targetId, [chatId]);
+			result.unbanSummary = result.unbanResults.filter((row) => row.unbanned && row.unmuted).length + '/' + result.unbanResults.length + ' 个群成功';
+			if (!result.unbanResults.length || result.unbanResults.some((row) => !row.unbanned || !row.unmuted)) throw new Error('本群解除禁言或封禁未完成');
+		}
+		if (!(await readFreshAdIgnoreGroupMode(env, chatId))) throw new Error('群模式已变化');
+		result.localFeedback = await writeGroupAdFeedbackForCase(env, chatId, actorId, seq, snapshot);
+		if (!result.localFeedback.ok) throw new Error('本群误判反馈写入失败');
+		if (!(await readFreshAdIgnoreGroupMode(env, chatId))) throw new Error('群模式已变化');
+		const processed = await env.DB.prepare("UPDATE ad_pending_snapshots SET expires_at = 0 WHERE owner_id = ? AND seq = ? AND expires_at > 0 AND EXISTS (SELECT 1 FROM group_mode WHERE chat_id = ? AND mode = 'independent')")
+			.bind(String(ownerId), Number(seq), String(chatId)).run();
+		result.snapshotProcessed = Number(processed?.meta?.changes ?? processed?.changes ?? processed?.results?.[0]?.meta?.changes ?? 0) > 0;
+		if (!result.snapshotProcessed) throw new Error('待复核记录状态更新失败');
+		result.complete = true;
+	} catch (error) {
+		result.errors.push(String(error?.message || error));
+	}
+	return result;
+}
+
 async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, options = {}) {
 	const targetId = snapshot.userId;
 	const frozen = snapshot?.snapshot || {};
@@ -34936,12 +35204,12 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, options = 
 
 	const payload = adPayloadFromSnapshot(snapshot);
 	// 误判后同步撤销未执行的补学任务，避免 cron 再把刚清掉的特征学回来。
-	await dequeueAdAvatarLearning(env, targetId);
-	const textReuseCleared = await clearAdTextReuseOnIgnore(env, payload.text);
+	await dequeueAdAvatarLearning(env, targetId, options);
+	const textReuseCleared = await clearAdTextReuseOnIgnore(env, payload.text, options);
 	// 头像同步纠错：既然这个号是误封，他的头像就不能继续挂着「广告头像」标签，
 	// 否则同用这张图（自拍、风景、家人照被盗用）的正常用户会被连坐。
 	// 老快照冻结于头像功能上线之前，还原出的 avatarId 是空串 → 本步自动跳过。
-	const avatarCleared = await clearAdAvatarOnIgnore(env, payload?.avatarId);
+	const avatarCleared = await clearAdAvatarOnIgnore(env, payload?.avatarId, options);
 	// 会员标同步纠错：与头像同一理由，但更必须 —— 会员标是【一个数字串】，
 	// 一旦挂上「广告标」标签，挂同款的每个人都会命中；而标又很少换，
 	// 连坐的持续时间比头像长得多。误封一个就把它清掉，安全阀才有第二道。
@@ -34962,7 +35230,8 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, options = 
 	const imageCleared = await clearAdImageOnIgnore(env, payload?.imageId);
 	// 贴纸包同理：误封的号发的包转成 clean（自动学习从此学不回，人工 /spam 仍可）。
 	let packCleared = false;
-	try { packCleared = await clearAdStickerPack(env, payload?.stickerSet); } catch (_) { packCleared = false; }
+	try { packCleared = await clearAdStickerPack(env, payload?.stickerSet, options); }
+	catch (error) { if (options.strict) throw error; packCleared = false; }
 	if (packCleared) console.log('[广告检测] /ignore 已把贴纸包转干净 set=' + String(payload?.stickerSet || ''));
 	// 被挂链接的自举案底同步纠错：与头像 / 会员标 / 正文图片完全同一理由 ——
 	// 这个号既然是误封，他挂的那个频道就不能继续挂着「已确认广告位」，否则
@@ -34971,7 +35240,7 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, options = 
 	const linkConfirmedCleared = await clearAdLinkConfirmedOnIgnore(env, payload?.scoredLinks, options);
 	// purge: true —— 主人已明确说这是误判，命中的指纹当次即删，不再攒 3 次误报。
 	// 同批改动拆掉了自动学习的强动词闸门，指纹写入变宽，纠错端必须同步变快。
-	const fp = await markAdFingerprintFalsePositive(env, payload, { purge: true });
+	const fp = await markAdFingerprintFalsePositive(env, payload, { purge: true, strict: options.strict === true });
 		// 资料形状同步纠错：同一份 bio 判成误封时，它的形状也必须跟着撤 ——
 		// 否则下一个人只是碰巧用了同一套模板，就会被这条错形状再加一次分。
 		const shapeCleared = await markAdProfileShapeFalsePositive(env, payload?.profileShape, { purge: true });
@@ -35040,7 +35309,7 @@ function parseAdSeqList(arg) {
 // /ignore <序号...>：判定错误 → 移出黑名单 + 全群解封 + 删掉学到的指纹与 AI 样本。
 // 这是唯一的回滚入口，必须做到「一条命令彻底恢复」，否则自动封禁不敢开。
 // 支持批量是因为主人的原话：「我觉得指令可以支持批量删除，可以通过现有的指令库来执行批量删除号。」
-async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
+async function handleAdIgnoreCommand(env, chatId, ownerId, arg, origin = { kind: 'command', chatId, chatType: 'private' }) {
 	const parsed = parseAdSeqList(arg);
 	if (!parsed.ok) {
 		await sendTelegramMessage(chatId, [
@@ -35048,27 +35317,39 @@ async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
 			'批量：<code>/ignore 3 5 7</code>　区间：<code>/ignore 3-8</code>',
 			'序号来自 /pending 列表，单次最多 ' + AD_IGNORE_BATCH_MAX + ' 个。'
 		].join('\n'));
-		return;
+		return { complete: false, rolled: 0, missed: 0, results: [], code: 'INVALID_SEQS' };
 	}
 	const single = parsed.seqs.length === 1;
 	const lines = [];
+	const results = [];
 	let rolled = 0;
 	let missed = 0;
 	for (const seq of parsed.seqs) {
-		const snapshot = await readAdPendingSnapshot(env, ownerId, seq);
-		if (!snapshot) {
+		const access = await resolveAdIgnoreAccess(env, ownerId, seq, origin);
+		if (!access.ok) {
 			missed += 1;
-			// 单序号时给完整指引：主人手上那条通知可能已经复核过了，直接说清楚下一步查哪里。
-			// 【不能沿用批量那行简短提示】否则回执标题仍是「已按误判回滚」而实际一个号都没解 ——
-			// 主人会以为解封成功了，那个号还在黑名单里继续被拦。
-			if (single) {
-				await sendTelegramMessage(chatId, '⚠️ 序号 <b>#' + seq + '</b> 不存在或已复核过（快照长期保留，复核过的会从 /pending 列表移除）。\n用 /pending 查看当前待复核序号。');
-				return;
-			}
-			lines.push('<b>#' + seq + '</b>　⚠️ 序号不存在或已复核过');
+			results.push({ seq, complete: false, code: access.code, errors: [access.message] });
+			lines.push('<b>#' + seq + '</b>　⚠️ ' + escapeHtml(access.message));
 			continue;
 		}
-		const r = await rollbackAdPendingSnapshot(env, ownerId, seq, snapshot);
+		const snapshot = access.snapshot;
+		let r;
+		try {
+			r = access.role === 'independentCreator' ? await rollbackIndependentAdPendingSnapshot(env, access)
+				: await rollbackAdPendingSnapshot(env, access.ownerId, seq, snapshot, { strict: true });
+		} catch (error) { r = { complete: false, errors: [String(error?.message || error)], snapshotProcessed: false }; }
+		results.push({ seq, ...r });
+		if (!r.complete) {
+			missed += 1;
+			lines.push('<b>#' + seq + '</b>　⚠️ 回滚未完成：' + escapeHtml((r.errors || []).join('；') || '请稍后重试') + '；待复核记录已保留');
+			continue;
+		}
+		if (access.role === 'independentCreator') {
+			rolled += 1;
+			lines.push('<b>#' + seq + '</b>　<code>' + escapeHtml(r.targetId) + '</code>　' + escapeHtml(r.unbanSummary));
+			lines.push('本群误判反馈：已记录 <b>' + r.localFeedback.written + '</b> 项');
+			continue;
+		}
 
 			// ===== 记反例（/ignore 的「不白判」那一半）=====
 			// 回滚只是【删掉特征】—— 删完之后模型下次看到同类内容还会再判一次，
@@ -35125,12 +35406,13 @@ async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
 		}
 	}
 	const header = single
-		? ['<b>♻️ 已按误判回滚</b>', '序号：<b>#' + parsed.seqs[0] + '</b>']
+		? (rolled === 0 ? ['<b>⚠️ 误判回滚未完成</b>'] : ['<b>♻️ 已按误判回滚</b>', '序号：<b>#' + parsed.seqs[0] + '</b>'])
 		: ['<b>♻️ 批量误判回滚</b>', '已回滚 <b>' + rolled + '</b> 个，跳过 <b>' + missed + '</b> 个', ''];
 	if (parsed.truncated) {
 		header.push('⚠️ 序号超过单次上限 ' + AD_IGNORE_BATCH_MAX + ' 个，只处理了前 ' + parsed.seqs.length + ' 个，其余请再发一次。');
 	}
 	await sendTelegramMessageChunks(chatId, header.concat(lines).join('\n'));
+	return { complete: results.length > 0 && results.every((result) => result.complete === true), rolled, missed, results };
 }
 
 // /addword <值> [类型]：手动加指纹。类型缺省按值形态推断（@ → username，域名 → domain，其余 keyword）。
