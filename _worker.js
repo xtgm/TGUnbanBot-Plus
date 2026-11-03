@@ -12933,6 +12933,7 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null) {
 	evaluation.payload = { ...(evaluation.payload || {}), avatarId: String(profile.avatarId || ''), badgeId,
 		customEmojiIds: emojiIds, verifiedCustomEmojiIds: verifiedEmojiIds, quotedText: getAdQuotedText(message),
 		imageId: String(media?.fileUniqueId || evaluation.payload?.imageId || ''),
+		imageVerifiedAd: isVerifiedAdMediaRow(image),
 		globalDrill: evaluation.globalDrill };
 	evaluation.snapshot = { ...(evaluation.snapshot || {}), ...evaluation.payload,
 		name: [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim(), bio: String(profile.bio || ''),
@@ -15932,8 +15933,9 @@ const AD_IMAGE_CONTENT_SIGNATURE_PROMPT = '分析这张 Telegram 图片、贴纸
 	+ '只输出一个 JSON：{"ocr_text":"逐字抄录可见文字，最多260字符，无则空串",'
 	+ '"caption":"最多160字符具体描述画面中的人物、物体、动作和广告内容，不要泛泛地说一张图片",'
 	+ '"layout":"poster|screenshot|photo|illustration|sticker|mixed|unknown 中的一项",'
-	+ '"ad":true或false,"confidence":0到1的数字}。'
-	+ '广告是色情招揽、赌博、灰产、商品推销或有明确招揽目的的引流。正常技术配置截图、教程、普通聊天、动漫和表情不因出现代理、机器人、网址等词自动算广告。'
+	+ '"ad":true或false,"confidence":0到1的数字,"promotion":true或false,"ad_evidence":["逐字抄录可见招揽语或具体描述色情赌博画面；没有则空数组"]}。'
+	+ '广告必须有实际可见的色情、赌博、诈骗推广、商品购买行动或明确招揽引流。代理所有技术与服务内容、API token、正常和官方域名、技术配置、教程、软件界面、报错、聊天截图属于正常内容；不能仅因网址、二维码、联系方式、代理或token等词判广告。'
+	+ 'promotion只在图中确有招揽推广行动时为true。ad_evidence不能抄普通域名、token提示、菜单或联系方式冒充招揽证据，不得编造看不见的文字。独立明确色情、博彩或诈骗画面不被无关技术词遮蔽。'
 	+ 'ad判断须基于整张图片，不能只看抄录的前260字符。看不清、不能确定时不要伪造内容，降低confidence。';
 
 function adImageContentSignature(value) {
@@ -15946,7 +15948,9 @@ function adImageContentSignature(value) {
 			|| signature.caption.trim().length < 4
 			|| !['poster', 'screenshot', 'photo', 'illustration', 'sticker', 'mixed', 'unknown'].includes(signature.layout)) return null;
 		return { ocr_text: signature.ocr_text.trim().slice(0, 600), caption: signature.caption.trim().slice(0, 400),
-			layout: signature.layout, ad: signature.ad, confidence: signature.confidence, vision_model: String(signature.vision_model || '') };
+			layout: signature.layout, ad: signature.ad, confidence: signature.confidence, vision_model: String(signature.vision_model || ''),
+			promotion: signature.promotion === true,
+			ad_evidence: Array.isArray(signature.ad_evidence) ? signature.ad_evidence.filter((item) => typeof item === 'string' && item.trim()).slice(0, 6).map((item) => item.trim().slice(0, 160)) : [] };
 	} catch (_) { return null; }
 }
 
@@ -16242,9 +16246,9 @@ async function lookupAdImageOwnerSimilarity(env, media, image = null, retry = 0)
 				if (anchor.owner_verdict === 'clean') clean = found; else ad = found;
 			}
 		}
-		const currentAdVerified = extracted.signature.ad && extracted.signature.confidence >= 0.90;
+		const currentAdVerified = isReliableAdImageContentSignature(extracted.signature);
 		const stableCleanOcr = adImageStableOcrMatch(extracted.signature, clean.signature);
-		const stableAdOcr = adImageStableOcrMatch(extracted.signature, ad.signature) && isAdBearingText(extracted.signature.ocr_text);
+		const stableAdOcr = adImageStableOcrMatch(extracted.signature, ad.signature) && currentAdVerified;
 		const cleanContentVerified = stableCleanOcr || (!extracted.signature.ad && extracted.signature.confidence >= 0.90
 			&& extracted.signature.layout !== 'unknown' && extracted.signature.layout === clean.signature?.layout);
 		const conflict = (clean.score >= 0.94 && ad.score >= 0.94)
@@ -21127,6 +21131,8 @@ const AD_EXEMPT_KEYWORD_CATEGORIES = [
 	{ name: '通用技术语境', words: [
 	'延迟', '丢包', '带宽', '限速', '端口', '协议', '内核', '配置文件', '教程',
 	'部署', '自建', '搭建', '编译', '调试', '抓包', '日志', 'api', 'json', 'yaml',
+	'token', 'access token', 'api key', '令牌', 'proxy', 'socks', 'socks5', 'socks4',
+	'http代理', 'https代理', '代理ip', '代理池', '代理服务器', '正向代理',
 	] },
 	// —— 2026-09-08 主人指定追加 ——
 	{ name: '主人指定（2026-09-08）', words: [
@@ -21144,6 +21150,40 @@ const AD_EXEMPT_KEYWORD_CATEGORIES = [
 ];
 const AD_EXEMPT_KEYWORDS = AD_EXEMPT_KEYWORD_CATEGORIES.flatMap(({ words }) => words);
 
+// 技术豁免与独立广告证据分开判断，文字、OCR 与图片描述复用同一口径。
+// 域名、令牌、网络代理和价格本身都不能证明招揽推广；明确有害内容仍独立判断。
+function hasAdIndependentHarmfulContent(text) {
+	const source = String(text || '');
+	const recruiting = /招代理|招募|招聘|兼职/i.test(source)
+		&& /佣金|无需经验|日入\d|一天\d|稳赚|躺赚/i.test(source)
+		&& /加微|加v|联系|详聊|报名|加入/i.test(source);
+	return recruiting || /色情|裸体|裸聊|约炮|成人视频|性交易|裸露生殖器|博彩|赌博|赌场|六合彩|下注|包赢|洗钱|假钞|假币|盗刷|卡料|跑分收款|刷单返利|贩卖个人信息|贩卖身份证/i.test(source);
+}
+
+function hasAdProtectedTechnicalContext(text) {
+	const source = String(text || '');
+	if (!source) return false;
+	if (/代理|反代|回源|分流|节点|订阅转换|订阅链接|优选(?:ip|域名)|令牌|访问密钥|接口密钥/i.test(source)
+		|| /(?:^|[^a-z0-9_])(?:token|proxy|socks[45]?|vless|vmess|trojan|shadowsocks|ssr|hysteria[2]?|tuic|wireguard|openvpn|anytls|reality|xhttp|xtls|xray|sing[- ]?box|clash|mihomo|v2ray|v2fly|hiddify|cloudflare|nginx|caddy|tls|utls|sni|ech|grpc|quic)(?=$|[^a-z0-9_])/i.test(source)) return true;
+	const domains = extractAdDomains(source);
+	if (!domains.some((domain) => isAdDomainWhitelisted(domain, new Set(AD_DOMAIN_WHITELIST_SEED)))) return false;
+	// 官方链接可正常分享；有实际推销文本时只豁免链接本身，不把整段推广变干净。
+	const prose = source.replace(/(?:https?:\/\/)?(?:[A-Za-z0-9_-]+\.)+[A-Za-z]{2,}(?:\/[^\s]*)?/g, '').trim();
+	if (!prose.replace(/[\s\p{P}\p{S}]+/gu, '')) return true;
+	return /网站|网页|域名|地址|官方|文档|教程|登录|配置|错误|访问|链接|打不开/i.test(prose)
+		&& !AD_STRUCT_MATCH(AD_SOLICIT_PATTERNS, prose)
+		&& countAdKeywordHits(prose, AD_TRADE_VERBS).length === 0;
+}
+
+function adTechnicalExemptPayload(payload) {
+	const filtered = { ...(payload || {}) };
+	for (const key of ['name', 'username', 'bio', 'text']) {
+		if (hasAdProtectedTechnicalContext(filtered[key]) && !hasAdIndependentHarmfulContent(filtered[key])) filtered[key] = '';
+	}
+	filtered.domains = extractAdDomains([filtered.name, filtered.username, filtered.bio, filtered.text].filter(Boolean).join('\n'));
+	return filtered;
+}
+
 // ===== 广告语境下失效的豁免词 =====
 //
 // 主人 2026-09-08 加 't.me' / '代理' 进豁免的理由成立且继续有效：正常人分享 Telegram
@@ -21159,7 +21199,7 @@ const AD_EXEMPT_KEYWORDS = AD_EXEMPT_KEYWORD_CATEGORIES.flatMap(({ words }) => w
 // 只有当文案里同时出现明确的招揽特征时，这两条豁免才算数失效，
 // 纯技术讨论一个字都不受影响。而且失效只是【不再减分】——
 // 定罪仍要过原有的形态门槛（招揽×业务同现 / 总分撞线），不会变成单词封禁。
-const AD_EXEMPT_CANCEL_WORDS = new Set(['t.me', '代理']);// 广告语境：邀请链接形态 + 招揽动词 + 金额话术 + 灰产行业词，命中任一即认为
+const AD_EXEMPT_CANCEL_WORDS = new Set(['t.me']);// 网络代理不因交易或定价词取消技术豁免。
 // 「这里不是单纯的技术讨论」。刻意写得保守 —— 漏一个词只是继续豁免（漏放），
 // 误命中一个只会取消 -3 减分（仍需其它证据才定罪），两个方向的代价都不对称。
 // 广告语境：只认【强信号】，刻意【不含任何链接形态，也不含「进群」这类普通词】。
@@ -21175,7 +21215,6 @@ const AD_EXEMPT_CANCEL_WORDS = new Set(['t.me', '代理']);// 广告语境：邀
 // 「招代理 一天5000」靠「招代理」命中 —— 去掉普通词后样本照样全中。
 const AD_EXEMPT_CANCEL_RE = new RegExp(
 	'一天\\d|日入\\d|月入\\d|日赚\\d|赚\\d|赚一万|稳赚|躺赚|暴富|躺平赚'
-	+ '|招代理|做代理|收代理|代理价|一级代理'
 	+ '|带单|跟单|上分|回血|包赢|包赢包赔'
 	+ '|假钞|假币|洗钱|跑分|代收|代付|过机|卡料|上分平台'
 	, 'i');
@@ -21196,6 +21235,7 @@ const AD_EXEMPT_CANCEL_RE = new RegExp(
 function dropAdContextExempt(exemptHits, source, reasons) {
 	if (!Array.isArray(exemptHits) || !exemptHits.length) return exemptHits;
 	const text = String(source || '');
+	if (hasAdProtectedTechnicalContext(text) && !hasAdIndependentHarmfulContent(text)) return exemptHits;
 	if (!AD_EXEMPT_CANCEL_RE.test(text)) return exemptHits;
 	if (Array.isArray(reasons)) {
 		reasons.push('（广告语境，豁免词整体失效：' + exemptHits.slice(0, 3).join('/') + ' 不再减免，仅撤销减分不加分）');
@@ -21389,7 +21429,7 @@ const AD_DOMAIN_WHITELIST_SEED = [
 	'github.com', 'gitlab.com', 'gitee.com', 'npmjs.com', 'pypi.org', 'stackoverflow.com',
 	'anthropic.com', 'claude.ai', 'openai.com', 'chatgpt.com', 'gemini.google.com',
 	'huggingface.co', 'deepseek.com', 'moonshot.cn', 'bigmodel.cn', 'aliyun.com',
-	'cloudflare.com', 'workers.dev', 'seeck.cn', 'google.com', 'microsoft.com', 'apple.com',
+	'cloudflare.com', 'workers.dev', 'pages.dev', 'seeck.cn', 'google.com', 'microsoft.com', 'apple.com',
 	'amazon.com', 'mozilla.org', 'baidu.com', 'qq.com', 'taobao.com', 'jd.com',
 	'163.com', 'sina.com.cn', 'zhihu.com', 'juejin.cn', 'csdn.net', 'cnblogs.com',
 	'youtube.com', 'youtu.be', 'bilibili.com', 'b23.tv', 'douyin.com', 'vimeo.com',
@@ -22633,12 +22673,15 @@ function hasAdRepeatedSegment(text) {
 function hasAdSuspiciousLink(text, whitelistSet, options = {}) {
 	const source = String(text ?? '');
 	if (!source) return false;
+	if (hasAdProtectedTechnicalContext(source) && !hasAdIndependentHarmfulContent(source)) return false;
 	if (AD_BOT_MENTION_RE.test(source)) return true;
 	// @handle 只在同现业务关键词时才算引流出口，详见上表。
 	if (options.businessHit === true && /@[A-Za-z0-9_]{5,}/.test(source)) return true;
 	for (const domain of extractAdDomains(source)) {
 		if (isAdPlatformDomain(domain)) continue;			// 平台裸域名不再重复计分（t.me 亦在此列）
-		if (!isAdDomainWhitelisted(domain, whitelistSet)) return true;
+		if (!isAdDomainWhitelisted(domain, whitelistSet)
+			&& (hasAdIndependentHarmfulContent(source) || (options.businessHit === true
+				&& (AD_STRUCT_MATCH(AD_SOLICIT_PATTERNS, source) || countAdKeywordHits(source, AD_TRADE_VERBS).length > 0)))) return true;
 	}
 	return false;
 }
@@ -24572,8 +24615,8 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 		const mediaSource = quoted;
 		const manualEmojiIds = extractCustomEmojiIds(mediaSource);
 		const manualEmojiRows = await readAdCustomEmojiMediaRows(env, manualEmojiIds, targetUserId);
-		const explicitlyQuotedSingleEmoji = manualEmojiIds.length === 1 && isAdCustomEmojiOnlyMessage(mediaSource);
-		const learnedEmojiRows = manualEmojiRows.filter((item) => item.verifiedAd || explicitlyQuotedSingleEmoji);
+		// 真实第一主人引用即是人工标注，完整记录其引用素材，不再让概率模型缩减标注内容。
+		const learnedEmojiRows = manualEmojiRows.filter((item) => item.fileUniqueId && item.visionFileId);
 		const payload = {
 			name,
 			username: profile.username ? '@' + String(profile.username).replace(/^@/, '') : '',
@@ -24582,7 +24625,7 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 			domains: extractAdDomains([name, profile.bio, text].filter(Boolean).join('\n')),
 			// 正文里的自定义 emoji（点⚔️查 这类贴纸 emoji）id 就在被引用消息的 entities 里，
 			// 与资料无关，必须从媒体源现取 —— fetchAdUserProfile 的响应里没有它。
-			customEmojiIds: learnedEmojiRows.map((item) => item.id),
+			customEmojiIds: manualEmojiIds,
 			customEmojiMedia: learnedEmojiRows.map((item) => ({ id: item.id, fileUniqueId: item.fileUniqueId, visionFileId: item.visionFileId, kind: item.kind, verifiedAd: true }))
 		};
 		const learn = await learnAdFingerprints(env, payload, { source, createdBy });
@@ -28766,7 +28809,7 @@ async function markAdStickerPack(env, setName, source, options = {}) {
 // 正文自定义 emoji 的贴纸包命中已定罪广告包 → 定罪（标签「表情包」）。
 // packs 是 resolveCustomEmojiStickers 的产出 { id → { setName, emoji } }；为空时零 SQL。
 function isVerifiedAdMediaRow(row) {
-	return row?.verdict === 'ad' && (row.source === 'vision' || row.ownerSimilarity?.strongMatch === true
+	return row?.verdict === 'ad' && (isReliableAdImageSource(row) || row.ownerSimilarity?.strongMatch === true
 		|| (row.ownerSimilarity?.exact === true && row.ownerSimilarity?.verdict === 'ad'));
 }
 
@@ -29056,6 +29099,10 @@ const AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS = 5;
 //   · cross_user —— 三个人发过同一张没判过的图。普通动态贴纸天天被多人转发，
 //     这条一放开就会成批误封正常人。
 const AD_IMAGE_WEAK_SOURCES = new Set(['learned', 'cross_user']);
+const AD_IMAGE_VERIFIED_SOURCE = 'vision_content_v1';
+function isReliableAdImageSource(image) {
+	return image?.verdict === 'ad' && [AD_IMAGE_VERIFIED_SOURCE, 'owner', 'manual', 'spam', 'ban', 'sban'].includes(String(image.source || ''));
+}
 function applyImageVerdict(evaluation, image) {
 	evaluation = finalizeAdAutomaticDecision(evaluation);
 	if (!evaluation || !image) return evaluation;
@@ -29078,6 +29125,11 @@ function applyImageVerdict(evaluation, image) {
 		return rejudgeAdPositionEvidence(evaluation);
 	}
 	if (String(image.verdict || '') !== 'ad') return evaluation;
+	// 概率分类、旧素材标签和复用次数不能代替实际内容证据，也不能凑成图片6+AI3。
+	if (!isReliableAdImageSource(image) && ownerSimilarity?.strongMatch !== true) {
+		const judged = Object.assign({}, evaluation, { reasons: (evaluation.reasons || []).concat(['图片广告标签尚无可靠内容证据，不参与自动封禁']) });
+		return evaluation.positionEvidence ? rejudgeAdPositionEvidence(judged) : judged;
+	}
 	const hits = Number(image.hits) || 0;
 	const packHit = String(image.packHit || '');
 	const categoryLabel = AD_IMAGE_CATEGORY_LABELS[String(image.category || '')] || '';
@@ -29087,8 +29139,7 @@ function applyImageVerdict(evaluation, image) {
 		:'消息图片命中广告素材库（复用定罪 ' + hits + ' 次）' + (categoryLabel ? ' · 识图判为' + categoryLabel : '');
 	const reasons = (evaluation.reasons || []).concat([reason]);
 	if (evaluation.positionEvidence) {
-		const hardBan = ownerSimilarity?.verdict === 'ad' ? ownerSimilarity.strongMatch === true
-			: Boolean(packHit) || !AD_IMAGE_WEAK_SOURCES.has(String(image.source || '')) || hits >= AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS;
+		const hardBan = ownerSimilarity?.verdict === 'ad' ? ownerSimilarity.strongMatch === true : isReliableAdImageSource(image);
 		const judged = Object.assign({}, evaluation, { reasons });
 		addAdPositionEvidence(judged, image.kind === 'sticker' ? 'sticker' : 'image', hardBan ? 10 : 6, reason);
 		if (hardBan) {
@@ -29098,7 +29149,7 @@ function applyImageVerdict(evaluation, image) {
 		}
 		return rejudgeAdPositionEvidence(judged);
 	}
-	if (packHit || !AD_IMAGE_WEAK_SOURCES.has(String(image.source || ''))) {
+	if (isReliableAdImageSource(image) || ownerSimilarity?.strongMatch === true) {
 		const convicted = String(evaluation.verdict) !== 'ban';
 		return Object.assign({}, evaluation, { verdict: 'ban',
 			reasons: convicted ? markAdConvictLayer(reasons, packHit ? '表情包' : '正文图片') : reasons });
@@ -29954,7 +30005,7 @@ const AD_IMAGE_VISION_PROMPT = '这是社交软件聊天记录里的一条【图
 // 不需要解析、不会复读、output_tokens 恒为 0（不收输出费）。
 // 图片走 images[]（必须是 data URI，远程 URL 会被拒），模型自己做尺寸自适应。
 const CLEF_AVATAR_STATE = '这是一张 Telegram 用户头像，判断它是否用于广告引流。';
-const CLEF_IMAGE_STATE = '这是一张 Telegram 群消息里的图片或表情包，判断它是否用于广告引流。';
+const CLEF_IMAGE_STATE = '这是一张 Telegram 群消息里的图片或表情包。只判断实际可见的广告招揽；代理、API token、正常和官方域名、软件或网站报错界面与技术截图本身不是广告。';
 // 【2026-11-02 补色情】旧 criteria 的 ad 一栏没有「色情」，clean 一栏却写着「动漫」——
 // 色情引流贴纸（动漫画风 + 性暗示）两栏同时沾边，模型常判成 clean。
 // 主人口径：色情是广告类型，表情包 / 贴纸 / 动漫这个载体不豁免。
@@ -29962,8 +30013,8 @@ const CLEF_AD_QUESTION = {
 	type: 'choice',
 	instructions: '图中是否含有广告引流内容？',
 	criteria: {
-		ad: '有引流或代发类文字、代理兼职赚钱招租、联系方式、@用户名或频道名、二维码、赌博或灰产图案、色情裸露或性暗示内容（含色情表情包、贴纸、动漫）',
-		clean: '自拍、风景、宠物、家人、不含色情的动漫与普通表情包、纯色背景或不含引流信息的装饰图'
+		ad: '图中实际可见明确招揽推广或购买行动、博彩下注、诈骗服务、色情裸露或性行为；联系方式、用户名、二维码只有与真实招揽同时出现才有意义',
+		clean: '代理的技术与服务内容、API token、正常或官方域名、文档代码教程、网站软件界面、配置报错、普通聊天截图，以及自拍风景宠物和普通表情；域名、二维码、联系方式本身不是广告'
 	}
 };
 // 广告类别（同一次调用里的第二个问题，不多花一次请求）。
@@ -29975,9 +30026,9 @@ const CLEF_AD_CATEGORY_QUESTION = {
 	criteria: {
 		porn: '色情：裸露、性暗示、约炮、福利、成人视频或色情网站引流（含色情表情包、贴纸、动漫）',
 		gambling: '赌博：博彩、棋牌、彩票、六合彩、体育下注、娱乐城',
-		scam: '灰产诈骗：刷单、兼职赚钱、跑分收款、USDT 换汇、贷款、代办证件',
-		other_ad: '其他广告引流：频道 / 群 / bot 推广、@用户名、二维码、联系方式、商品推销',
-		clean: '不是广告：自拍、风景、宠物、梗图、普通表情包、聊天或文档截图'
+		scam: '实际推广诈骗或灰产服务：假钞、洗钱、非法卡料、诈骗刷单等；正常USDT金额或代理服务不属于诈骗',
+		other_ad: '实际可见明确商品购买行动或频道群bot招揽推广；只有用户名、二维码、联系方式或网址不属于此类',
+		clean: '不是广告：技术代理服务、API token、正常或官方域名、网站软件配置报错界面、文档代码聊天截图、自拍风景和普通表情'
 	}
 };
 const AD_IMAGE_CATEGORY_LABELS = { porn: '色情类', gambling: '赌博类', scam: '灰产诈骗类', other_ad: '其他广告类' };
@@ -30006,13 +30057,57 @@ async function runVisionJudge(env, imageUri, state) {
 	const catChoice = String(cat?.choice || '');
 	const category = AD_IMAGE_CATEGORY_LABELS[catChoice] ? catChoice : '';
 	const categoryProb = category ? Number(cat?.probabilities?.[category] ?? 0) : 0;
+	const prob = Number(ans?.probabilities?.ad);
 	return {
-		ad: choice === 'ad' || (Boolean(category) && categoryProb >= AD_IMAGE_CATEGORY_AD_PROB),
-		prob: Number(ans?.probabilities?.ad ?? 0),
+		// 类别只作诊断，不能反转主问题的正常结论；分类概率本身仍非图片硬证据。
+		ad: choice === 'ad' && Number.isFinite(prob) && prob >= 0.75 && prob <= 1 && catChoice !== 'clean',
+		prob: Number.isFinite(prob) && prob >= 0 && prob <= 1 ? prob : 0,
 		confidence: Number(ans?.confidence ?? 0),
 		category,
 		categoryProb
 	};
+}
+
+function isReliableAdImageContentSignature(signature) {
+	if (!signature?.ad || Number(signature.confidence) < 0.90 || !Array.isArray(signature.ad_evidence)
+		|| !signature.ad_evidence.length) return false;
+	const visible = [signature.ocr_text || '', signature.caption || ''].join(' ');
+	const evidence = signature.ad_evidence.filter((phrase) => visible.includes(String(phrase))).join(' ');
+	if (!evidence || /(?:不是|并非|不含|没有|禁止|举报|防范|误判|风险提示).{0,16}(?:色情|赌博|博彩|诈骗|裸露)/i.test(evidence)) return false;
+	const independent = hasAdIndependentHarmfulContent(evidence) || /性行为|成年人裸露/i.test(evidence);
+	if (hasAdProtectedTechnicalContext(visible) && !independent) return false;
+	if (independent) {
+		const visual = /性行为|(?:成人|成年|人物).{0,8}(?:裸露|裸体)|裸露生殖器/i.test(evidence);
+		const gambling = /博彩|赌博|赌场|娱乐城|下注|投注/i.test(evidence) && /下注|投注|充值|赢现金|包赢/i.test(evidence);
+		const harmfulOffer = /洗钱|假钞|假币|盗刷|卡料|刷单返利|贩卖个人信息/i.test(evidence) && /出售|提供|联系|购买|下单|招募/i.test(evidence);
+		return visual || (signature.promotion === true && (gambling || harmfulOffer));
+	}
+	if (signature.promotion !== true) return false;
+	// 实际抄录的文字须同时包含招揽行动与购买/联系入口；孤立域名、价格、token均不算。
+	const ocr = String(signature.ocr_text || '');
+	const action = /立即购买|下单购买|扫码购买|扫码下单|联系.{0,8}(?:购买|下单)|(?:出售|批发|收购|招募|免费领取|免费观看|点我|点击|进群).{0,40}(?:联系|购买|下单|扫码|加微|加v|私聊|https?:\/\/|t\.me\/|@[a-z0-9_]+)/i.test(ocr);
+	const outlet = /@[a-z0-9_]{5,}|https?:\/\/|t\.me\/|二维码|扫码|加微|加v|联系|下单|购买/i.test(ocr);
+	return action && outlet && signature.ad_evidence.some((phrase) => ocr.includes(String(phrase)));
+}
+
+// 低成本分类只找候选；使用现有内容模型抄录实际证据并缓存，旧分类缓存不授予封禁权限。
+async function verifyAdImageVisibleContent(env, media, encoded, judge) {
+	const key = 'image_content_v1:' + String(media?.fileUniqueId || '');
+	try {
+		const saved = JSON.parse(await readAdScanState(env, key, 'null'));
+		if (saved?.version === 1 && ['ad', 'clean'].includes(saved.verdict) && adImageContentSignature(saved.signature)) return saved;
+	} catch (_) { /* 缺失或损坏的核验记录重新取实际内容。 */ }
+	const described = await describeAdImageSimilarityContent(env, encoded);
+	if (!described.ok) return { verdict: 'pending', reason: described.reason, contentVerified: false };
+	const signature = described.signature;
+	const protectedContent = hasAdProtectedTechnicalContext([signature.ocr_text, signature.caption].join(' '))
+		&& !hasAdIndependentHarmfulContent([signature.ocr_text, signature.caption].join(' '));
+	const reliable = judge?.ad === true && !protectedContent && isReliableAdImageContentSignature(signature);
+	const verdict = reliable ? 'ad' : (protectedContent || (signature.ad === false && signature.confidence >= 0.85)) ? 'clean' : 'pending';
+	const result = { version: 1, verdict, contentVerified: reliable, signature, category: judge?.category || '',
+		reason: protectedContent ? 'technical_content_exempt' : reliable ? 'visible_ad_evidence' : 'no_reliable_ad_evidence' };
+	if (verdict !== 'pending') await writeAdScanState(env, key, JSON.stringify(result));
+	return result;
 }
 
 // ===== 头像读字（2026-11-01，gemma 主读 + qwen 兜底）=====
@@ -30113,6 +30208,7 @@ async function loadAdAvatarTexts(env) {
 // 头像文字 → 命中哪一条特征。返回 { value, from } 或 null。
 // from = 'avatar_text'（头像文字库）/ 'fingerprint'（现有指纹库里能单独定罪的那部分）。
 async function matchAdAvatarText(env, ocrText, options = {}) {
+	if (hasAdProtectedTechnicalContext(ocrText) && !hasAdIndependentHarmfulContent(ocrText)) return null;
 	const text = normalizeAdAvatarText(ocrText);
 	if (!text) return null;
 	for (const row of await loadAdAvatarTexts(env)) {
@@ -30133,6 +30229,7 @@ async function matchAdAvatarText(env, ocrText, options = {}) {
 // 定罪即学习：把这张头像上读到的字学进头像文字库（source='ocr'）。
 // 只学「模型自己也判它是广告」的头像 —— 被别的通道定罪的人，头像上可能只是普通文字。
 async function learnAdAvatarText(env, ocrText) {
+	if (hasAdProtectedTechnicalContext(ocrText) && !hasAdIndependentHarmfulContent(ocrText)) return false;
 	const value = String(ocrText || '').trim().slice(0, 120);
 	const normalized = normalizeAdAvatarText(value);
 	if (!env?.DB || normalized.length < AD_AVATAR_TEXT_MIN_LEARN_LENGTH) return false;
@@ -31018,7 +31115,7 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 		return adImageMiss({ ...(row || {}), file_unique_id: key, verdict: 'pending', source: 'owner_conflict',
 			hits: 0, similarityConflict: true, ownerSimilarity }, 'similarity_conflict');
 	}
-	const recheckWeak = options.requireContent === true && row?.verdict === 'ad' && row.source !== 'vision';
+	const recheckWeak = row?.verdict === 'ad' && !isReliableAdImageSource(row);
 	if (recheckWeak) row = { ...row, verdict: 'pending', source: 'unverified', hits: 0,
 		file_id: String(media.visionFileId || row.file_id || '') };
 	if (row) {
@@ -31063,6 +31160,7 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	let verdict = 'pending';
 	let prob = 0;
 	let judged = null;
+	let contentResult = null;
 	let skipBump = false;
 	try {
 		const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
@@ -31086,6 +31184,10 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 		if (!judge) throw new Error('clef 未返回判定');
 		judged = judge;
 		verdict = judge.ad ? 'ad' : 'clean';
+		if (judge.ad) {
+			contentResult = await verifyAdImageVisibleContent(env, media, bytesToBase64(new Uint8Array(buffer)), judge);
+			verdict = contentResult.verdict;
+		}
 		prob = Number(judge.prob) || 0;
 		console.log('[图片实时判定] ' + (judge.ad ? '广告' : '干净') + ' 概率=' + prob.toFixed(4)
 			+ (judge.category ? ' 类别=' + judge.category + '/' + Number(judge.categoryProb || 0).toFixed(4) : '')
@@ -31099,15 +31201,15 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	}
 	try {
 		if (recheckWeak && verdict !== 'pending') {
-			await env.DB.prepare('UPDATE ad_images SET verdict = ?, source = \'vision\', hits = 0, '
+			await env.DB.prepare('UPDATE ad_images SET verdict = ?, source = ?, hits = 0, '
 				+ 'file_id = ?, kind = ?, vision_checked_at = ?, updated_at = ? WHERE file_unique_id = ? '
-				+ 'AND COALESCE(source, \'\') != \'vision\' '
+				+ 'AND COALESCE(source, \'\') NOT IN (\'owner\', \'manual\', \'spam\', \'ban\', \'sban\') '
 				+ 'AND NOT (verdict = \'clean\' AND source IN (\'owner\', \'manual\')) '
 				+ 'AND NOT EXISTS (SELECT 1 FROM ad_image_similarity WHERE file_unique_id = ? AND owner_verdict IN (\'ad\', \'clean\'))')
-				.bind(verdict, visionFileId, String(media.kind || ''), Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000), key, key).run();
+				.bind(verdict, contentResult?.contentVerified ? AD_IMAGE_VERIFIED_SOURCE : 'vision', visionFileId, String(media.kind || ''), Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000), key, key).run();
 		} else await upsertAdImage(env, key, {
 			verdict,
-			source: verdict === 'pending' ? null : 'vision',
+			source: verdict === 'pending' ? null : contentResult?.contentVerified ? AD_IMAGE_VERIFIED_SOURCE : 'vision',
 			kind: String(media.kind || ''),
 			lastUserId: uid || null,
 			visionCheckedAt: Math.floor(Date.now() / 1000)
@@ -31118,13 +31220,14 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
 	await writeAdScanState(env, 'img_count', String(quota.used + 1), Math.floor(Date.now() / 1000));
 
-	if (verdict === 'pending') return adImageMiss(base, 'error');
 	const latestRow = await readAdImage(env, key);
 	let latestOwner = null;
 	try { latestOwner = await env.DB.prepare('SELECT owner_verdict, decision_at FROM ad_image_similarity WHERE file_unique_id = ?').bind(key).first(); } catch (_) { /* 兼容辅助表初始化失败 */ }
 	if (latestOwner?.owner_verdict) return { ...(latestRow || {}), file_unique_id: key, verdict: latestOwner.owner_verdict, source: 'owner',
 		ownerSimilarity: { verdict: latestOwner.owner_verdict, exact: true, strongMatch: latestOwner.owner_verdict === 'ad', revision: Number(latestOwner.decision_at) || 0 } };
 	if (latestRow?.verdict === 'clean' && ['owner', 'manual'].includes(String(latestRow.source || ''))) return latestRow;
+	if (isReliableAdImageSource(latestRow)) return { ...latestRow, category: judged?.category || '', contentVerified: true };
+	if (verdict === 'pending') return adImageMiss(base, 'error');
 	if (verdict === 'clean') {
 		const cleanRow = { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid };
 		// 灰区：判了干净，但广告概率（或某个广告类别的概率）够得上 AD_IMAGE_GRAY_MIN。
@@ -32088,6 +32191,9 @@ function clearAdPositionHardBan(evaluation, key) {
 function adPositionExemptHits(text) {
 	const source = String(text || '');
 	let hits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
+	if (hasAdProtectedTechnicalContext(source) && !hasAdIndependentHarmfulContent(source)) {
+		return hits.length ? hits : ['技术或官方链接语境'];
+	}
 	if (hasAdPrivateInviteLink(source) && !hasAdPublicTelegramLink(source)) {
 		hits = hits.filter((word) => !AD_TELEGRAM_LINK_EXEMPT_WORDS.has(String(word).toLowerCase()));
 	}
@@ -32276,7 +32382,9 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		stickerSet: String(input?.media?.setName || '')
 	};
 
-	const fingerprint = await matchAdFingerprints(env, payload, { config });
+	// 只在自动检测输入中去掉已豁免字段，冻结现场与其它独立位置保持完整。
+	const detectionPayload = adTechnicalExemptPayload(payload);
+	const fingerprint = await matchAdFingerprints(env, detectionPayload, { config });
 	if (fingerprint.hits.length) {
 		score += fingerprint.score;
 		layer = 'fingerprint';
@@ -32319,7 +32427,7 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	// payload 的 name / bio / text 与 buildAdSampleText 取的三个字段完全对应，
 	// 换成函数调用后行为与改动前唯一的差别就是「URL 被换成语义占位符」，
 	// 这也正是要的效果 —— 比对时剥链接、学习时也剥链接，两边看到的是同一种文本。
-	const semanticText = buildAdSampleText(payload);
+	const semanticText = buildAdSampleText(detectionPayload);
 	if (config.aiEnabled && semanticText.length >= 6) {
 		ai = await checkAdAiSimilarity(env, semanticText, { config });
 		// ===== 豁免词否证优先于 AI 硬命中（2026-09-12 线上误封 #1615）=====
@@ -32346,7 +32454,7 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		// 评分层撞阈值、指纹层命中、四通道结构查杀这三条定罪路径完全不经过这里，
 		// 一行都没被碰到 —— 这是「现有功能不受影响」的落点。
 		if (ai.isMatch && !aiExemptVeto) {
-			const bodyCore = adSampleBodyCoreLength(payload);
+			const bodyCore = adSampleBodyCoreLength(detectionPayload);
 			if (bodyCore < AD_SAMPLE_MIN_CORE_LENGTH) {
 				// 剥掉昵称就没剩下实质话术 —— 相似度是昵称独占贡献的，不必再跑一次推理。
 				// 【这一步不花任何额外开销】checkAdAiSimilarity 对 < 4 字的文本本来就直接返回 0，
@@ -32359,7 +32467,7 @@ async function evaluateAdSuspect(env, input, options = {}) {
 			} else {
 				// 还有实质话术 → 老老实实再嵌入一次比对。真广告号走的就是这条路，
 				// 而它们的话术本来就在 bio / 正文里，剥掉昵称照样命中，结论不变。
-				const recheck = await checkAdAiSimilarity(env, buildAdSampleTextWithoutName(payload), { config });
+				const recheck = await checkAdAiSimilarity(env, buildAdSampleTextWithoutName(detectionPayload), { config });
 				if (!recheck.isMatch) {
 					aiNameStripVeto = true;
 					aiNameStripNote = '剥离昵称后相似度降至 ' + Number(recheck.similarity || 0).toFixed(3)
@@ -32419,20 +32527,20 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	// 而且门槛最特殊（要求本人正文近乎为空），前三条任一命中就没必要再看引用体。
 	let structure = { guilty: false, channel: '', form: '', reasons: [] };
 	if (config.structureKill !== 'off') {
-		const card = judgeAdProfileCard(payload);
+		const card = judgeAdProfileCard(detectionPayload);
 		if (card.guilty) {
 			structure = card;
 		} else {
-			const identity = judgeAdIdentityKill(payload);
+			const identity = judgeAdIdentityKill(detectionPayload);
 			if (identity.guilty) {
 				structure = identity;
 			} else {
-				const body = judgeAdBodyWithBio(payload);
+				const body = judgeAdBodyWithBio(detectionPayload);
 				// 弱档（形态 B 弱档，guilty=false 但 weak=true）必须一并带出来：
 				// 旧写法只在 body.guilty 时取 body，弱档会被 judgeAdQuotedKill 的结果
 				// 覆盖，weak 标记与 reasons 就此丢失 —— 上层既看不到也加不上分。
 				if (body.guilty || body.weak) structure = body;
-				else structure = judgeAdQuotedKill(payload);
+				else structure = judgeAdQuotedKill(detectionPayload);
 				// 引用体查杀被门槛二 / 豁免词放行时留一行记录 —— 主人复核时要能看出
 				// 「引用的确实是广告，但本人是在举报」，否则这条放行路径完全不可观测。
 				if (!structure.guilty && structure.reasons.length) reasons.push(...structure.reasons);
@@ -33211,6 +33319,19 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 	if (options.globalDryRunCollect) evaluation = { ...evaluation,
 		payload: evaluation.learningPayload || globalDryRunLearningView(evaluation).payload,
 		snapshot: evaluation.learningSnapshot || globalDryRunLearningView(evaluation).snapshot };
+	// 自动处罚只学习自身有广告证据的文字位置，图片定罪不能污染正常正文/资料。
+	const textLearningPayload = options.ownerConfirmed ? { ...(evaluation?.payload || {}) }
+		: adTechnicalExemptPayload(evaluation?.payload || {});
+	if (evaluation?.positionEvidence && !options.ownerConfirmed) {
+		for (const [field, position] of [['name', 'name'], ['username', 'name'], ['bio', 'bio'], ['text', 'text']]) {
+			const slot = evaluation.positionEvidence[position];
+			const ownStructure = evaluation.structure?.guilty === true
+				&& ((position === 'text' && evaluation.structure.channel === 'body') || (position === 'bio' && evaluation.structure.channel === 'card'));
+			if (!ownStructure && (slot?.exempt || Number(slot?.grade || 0) < 3)) textLearningPayload[field] = '';
+		}
+		textLearningPayload.domains = extractAdDomains([textLearningPayload.name, textLearningPayload.username,
+			textLearningPayload.bio, textLearningPayload.text].filter(Boolean).join('\n'));
+	}
 	const userId = String(options.userId || '');
 	let learned = 0;
 	let sampleAdded = false;
@@ -33306,7 +33427,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 	// 闸一就取得到 —— payload.imageId 在闸一定罪时已经非空，没有「恒为空」这个缺口。
 	try {
 		const learnedImageId = String(evaluation?.payload?.imageId || '');
-		if (learnedImageId && evaluation.payload.imageVerifiedAd !== false && await learnAdImageOnBan(env, learnedImageId, userId)) images += 1;
+		if (learnedImageId && (options.ownerConfirmed || evaluation.payload.imageVerifiedAd === true) && await learnAdImageOnBan(env, learnedImageId, userId)) images += 1;
 		for (const media of evaluation.payload.customEmojiMedia || []) {
 			if (!media.verifiedAd || !media.fileUniqueId || media.fileUniqueId === learnedImageId) continue;
 			if (await learnAdImageOnBan(env, media.fileUniqueId, userId)) images += 1;
@@ -33335,7 +33456,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 		// 那道闸门是 source='auto' 唯一的前置条件，而本函数是 source='auto' 的唯一调用点，
 		// 且只在已定罪时走到这里 —— 主人的口径是「已经确定并执行封禁的就自动学习指纹」，
 		// 定罪本身就是学习凭据，不需要再问一遍「结构层同不同意」。
-		const learn = await learnAdFingerprints(env, evaluation.payload, {
+		const learn = await learnAdFingerprints(env, textLearningPayload, {
 			source: options.ownerConfirmed ? 'manual' : 'auto',
 			createdBy: options.ownerConfirmed ? String(OWNER_IDS[0] || 'system') : 'system',
 			whitelist: options.whitelist
@@ -33365,7 +33486,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 		const sampleOverridden = options.sampleText != null;
 		const sampleText = sampleOverridden
 			? String(options.sampleText).trim()
-			: buildAdSampleText(evaluation.payload);
+			: buildAdSampleText({ ...textLearningPayload, name: evaluation?.payload?.name || '' });
 		// ===== 剥昵称复检：断掉「误封 → 学样本 → 下次更容易误封」的闭环（2026-09-22）=====
 		//
 		// 这是 @svipultra 连环误封的第 ④ 环，也是让相似度单调爬升的那一环：
@@ -33382,7 +33503,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 		// 【/spam 回复学习不受此闸约束】options.sampleText 覆盖时取材的是引用体正文，
 		// 那段文本本来就不含昵称，再套一次剥昵称检查等于凭空多一道无关门槛。
 		const sampleSubstantial = sampleOverridden
-			|| adSampleBodyCoreLength(evaluation.payload) >= AD_SAMPLE_MIN_CORE_LENGTH;
+			|| adSampleBodyCoreLength(textLearningPayload) >= AD_SAMPLE_MIN_CORE_LENGTH;
 		// 长度门槛与 addAdSample 内部一致（< 4 字符直接拒），这里先判一次是为了少一次 D1 往返。
 		// 引用体形态的号（本人正文只有一个字母）在这里拼出来的通常只有昵称，
 		// 短到 4 字符以下就跳过 —— 那种样本语义太稀薄，进库只会拉高误判面。
