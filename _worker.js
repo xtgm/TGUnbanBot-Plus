@@ -470,6 +470,7 @@ export default {
 			// 如果是 Telegram Webhook 请求
 			if (path === '') {
 				const update = await request.json();
+				if (isIgnoredBotUpdate(update)) return new Response('OK');
 				console.log('[Telegram更新] 收到更新:', JSON.stringify({
 					更新ID: update.update_id,
 					包含字段: Object.keys(update),
@@ -5022,9 +5023,9 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 		// 没有探测结果时照旧尝试，行为与改动前逐字节一致（那条路的风险由乙的
 		// actorIsSelfBot 兜住：就算把人拉回来，也不会再被判成「复入群」刷通知）。
 		// 注意与 ban 分支的差异：踢出有「预封」能力，人不在群照样封得住；禁言没有。
-		const memberProbe = options.probeMembership
+		const memberProbe = options.precheckedMemberProbe || (options.probeMembership
 			? await probeTargetMemberBeforeBan(groupId, userId)
-			: null;
+			: null);
 		const notInGroup = Boolean(memberProbe)
 			&& (memberProbe.state === 'not_in_group' || memberProbe.state === 'already_banned');
 		if (notInGroup) {
@@ -5068,9 +5069,9 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 			memberProbe
 		};
 	}
-	const memberProbe = options.probeMembership
+	const memberProbe = options.precheckedMemberProbe || (options.probeMembership
 		? await probeTargetMemberBeforeBan(groupId, userId)
-		: null;
+		: null);
 	const r = await banUserFromGroup(groupId, userId, { revokeMessages: options.revokeMessages !== false });
 	return {
 		groupId,
@@ -5099,14 +5100,23 @@ const BAN_ALL_GROUPS_CONCURRENCY = 5;
 // 让杀手群不被这三个功能波及。
 async function banUserFromAllGroups(userId, options = {}) {
 	const scope = Array.isArray(options.groupIds) ? options.groupIds : GROUP_IDS;
-	const primary = String(options.primaryGroupId || '');
+	const requestedPrimary = String(options.primaryGroupId || '');
+	const primary = scope.map(String).includes(requestedPrimary) ? requestedPrimary : '';
 	const rest = scope.filter((groupId) => String(groupId) !== primary);
 	const results = [];
+	const execute = async groupId => {
+		if (typeof options.beforeGroup === 'function') {
+			const skipped = await options.beforeGroup(String(groupId));
+			if (skipped) return skipped;
+		}
+		const groupOptions = typeof options.perGroupOptions === 'function' ? options.perGroupOptions(String(groupId)) : options;
+		return applyGroupModeration(groupId,userId,groupOptions.mode,groupOptions);
+	};
 	if (primary) {
-		results.push(await applyGroupModeration(primary, userId, options.mode, options));
+		results.push(await execute(primary));
 	}
 	await mapWithConcurrency(rest, BAN_ALL_GROUPS_CONCURRENCY, async (groupId) => {
-		const r = await applyGroupModeration(groupId, userId, options.mode, options);
+		const r = await execute(groupId);
 		// push 在 worker 里是安全的：JS 单线程，数组追加不会与别的 worker 交错。
 		results.push(r);
 		return r;
@@ -5666,13 +5676,25 @@ function parseAdTrustedBots(raw) {
 //   1) 自己 —— 否则 bot 的回执（含广告原文的判定详情）会被自己判成广告；
 //   2) GroupAnonymousBot —— 那是真人以匿名管理员身份发言，本就不该按 bot 处置；
 //   3) 白名单协作 bot —— 它们的回执原样引用广告文本，误删会破坏群治理。
+function isExternalBotMessage(message) {
+	if (message?.from?.is_bot !== true) return false;
+	// Telegram 的匿名管理员代理代表真人管理员，既有手动权限不因代理身份改变。
+	return !(String(message.from.id) === String(ANON_ADMIN_BOT_ID) && isAnonymousAdminMessage(message));
+}
+
+function isIgnoredBotUpdate(update) {
+	const message = update?.message || update?.edited_message || update?.channel_post || update?.edited_channel_post;
+	if (isExternalBotMessage(message) || update?.callback_query?.from?.is_bot === true || update?.chat_join_request?.from?.is_bot === true) return true;
+	const member = update?.chat_member;
+	if (member?.from?.is_bot === true || member?.new_chat_member?.user?.is_bot === true || member?.old_chat_member?.user?.is_bot === true) {
+		if (member?.chat?.id && member.old_chat_member?.status !== member.new_chat_member?.status) invalidateAdAdminCache(member.chat.id);
+		return true;
+	}
+	return false;
+}
+
 function isAdExemptBot(user) {
-	if (!user?.is_bot) return false;
-	const idStr = String(user.id || '');
-	if (BOT_ID && idStr === String(BOT_ID)) return true;
-	if (idStr === ANON_ADMIN_BOT_ID) return true;
-	const uname = String(user.username || '').replace(/^@+/, '').toLowerCase();
-	return Boolean(uname) && AD_TRUSTED_BOTS.includes(uname);
+	return user?.is_bot === true;
 }
 
 function isAnonymousAdminMessage(message) {
@@ -10580,6 +10602,7 @@ async function handleNewChatMemberBots(message) {
 // 移黑：从 kicked → 任意其它状态
 async function handleChatMemberUpdate(chatMember, env) {
 	if (!chatMember || (!env.DB)) return;
+	if (isIgnoredBotUpdate({ chat_member: chatMember })) return;
 
 	const chat = chatMember.chat;
 	const oldMember = chatMember.old_chat_member;
@@ -11342,10 +11365,146 @@ function globalScopeGroupIds(operatorId, base = GROUP_IDS) {
 	return list.filter((groupId) => !isIndependentGroup(groupId));
 }
 
-// 自动检测只处罚事发群；人工确认保留原有的处置范围。
-function autoDetectionScopeGroupIds(eventChatId) {
+// 全局自动检测联动治理群；独立群继续只治理本群。执行前另从 D1 严格复核模式。
+function automaticAdConfiguredGroups() {
+	return [...new Set([...GROUP_IDS, ...(Array.isArray(KILLER_MODE_GROUPS) ? KILLER_MODE_GROUPS : [])].map(String).filter(Boolean))];
+}
+
+function getAutomaticAdTargetGroups(eventChatId) {
 	const eventId = String(eventChatId ?? '');
-	return eventId && (isConfiguredGroup(eventId) || isKillerModeGroup(eventId)) ? [eventId] : [];
+	const configured = automaticAdConfiguredGroups();
+	if (!eventId || (!configured.includes(eventId) && !isGlobalDryRunScopeGroup(eventId))) return [];
+	if (isIndependentGroup(eventId)) return [eventId];
+	return configured.filter(id => !isIndependentGroup(id));
+}
+
+function autoDetectionScopeGroupIds(eventChatId) {
+	const source = String(eventChatId || '');
+	if (!isConfiguredGroup(source) && !isKillerModeGroup(source)) return [];
+	return getAutomaticAdTargetGroups(eventChatId);
+}
+
+const AUTOMATIC_AD_TARGET_TABLE_READY = new WeakSet();
+async function ensureAutomaticAdTargetTable(env) {
+	if (!env?.DB) throw new Error('自动处罚目标账本未绑定');
+	if (AUTOMATIC_AD_TARGET_TABLE_READY.has(env.DB)) return;
+	const created = await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_automatic_case_targets (case_id TEXT NOT NULL,chat_id TEXT NOT NULL,user_id TEXT NOT NULL,source_chat_id TEXT NOT NULL,scope_type TEXT NOT NULL,owned INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'pending',result TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,PRIMARY KEY(case_id,chat_id))").run();
+	if(created?.success===false)throw new Error('自动处罚目标账本初始化失败');
+	AUTOMATIC_AD_TARGET_TABLE_READY.add(env.DB);
+}
+
+async function readStrictAutomaticAdModes(env, ids) {
+	if (!env?.DB) throw new Error('无法核对自动处罚群模式');
+	const table = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='group_mode'").first();
+	if (!table) return new Map();
+	const result = await env.DB.prepare('SELECT chat_id,mode FROM group_mode WHERE chat_id IN (SELECT value FROM json_each(?))')
+		.bind(JSON.stringify([...new Set(ids.map(String))])).all();
+	if (!result || result.success===false || !Array.isArray(result.results)) throw new Error('群模式查询未成功，未猜测全局范围');
+	return new Map((result.results || []).map(row => [String(row.chat_id), row.mode]));
+}
+
+async function resolveAutomaticAdTargets(env, sourceChatId, options = {}) {
+	const source = String(sourceChatId || ''), configured = automaticAdConfiguredGroups();
+	const explicit = Array.isArray(options.autoTargetGroupIds);
+	const requested = explicit ? [...new Set(options.autoTargetGroupIds.map(String))] : configured;
+	const modes = await readStrictAutomaticAdModes(env, [...configured, source, ...requested]);
+	const independent = id => !isKillerModeGroup(id) && modes.get(id) === 'independent';
+	const policy = String(options.automaticPolicy || options.autoScopePolicy || (independent(source) ? 'independent_local' : 'global_non_independent'));
+	const local = ['independent_local', 'legacy_local', 'auxiliary_local'].includes(policy);
+	const candidates = explicit ? requested : local ? [source] : configured;
+	const allowed = [], skipped = [], skipReasons = {};
+	for (const id of candidates) {
+		if (local ? id !== source || (!configured.includes(id) && !(options.drillCloseReplay && isGlobalDryRunScopeGroup(id)))
+			: !configured.includes(id) || independent(id)) {
+			skipped.push(id); skipReasons[id] = !configured.includes(id) ? 'not_configured' : independent(id) ? 'independent_mode' : 'outside_local_source';
+		}
+		else allowed.push(id);
+	}
+	return { groupIds: allowed, skipped, skipReasons, local, policy,
+		independentIds: configured.filter(id => independent(id)) };
+}
+
+async function saveAutomaticAdTarget(env, caseId, chatId, userId, sourceChatId, scope, patch = {}) {
+	await ensureAutomaticAdTargetTable(env);
+	const result = await env.DB.prepare("INSERT INTO ad_automatic_case_targets(case_id,chat_id,user_id,source_chat_id,scope_type,owned,state,result,created_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(case_id,chat_id) DO UPDATE SET owned=excluded.owned,state=excluded.state,result=CASE WHEN json_valid(ad_automatic_case_targets.result) THEN json_patch(excluded.result,json_object('priorState',COALESCE(json_extract(ad_automatic_case_targets.result,'$.priorState'),json_extract(excluded.result,'$.priorState')),'attempted',MAX(COALESCE(json_extract(ad_automatic_case_targets.result,'$.attempted'),0),COALESCE(json_extract(excluded.result,'$.attempted'),0)))) ELSE excluded.result END")
+		.bind(String(caseId),String(chatId),String(userId),String(sourceChatId),scope,Number(patch.owned)||0,
+			String(patch.state || 'pending'),JSON.stringify(patch.result || {}),Math.floor(Date.now()/1000)).run();
+	if (result?.success === false) throw new Error('自动处罚目标记账失败');
+}
+
+async function skipAutomaticAdCaseTarget(env, { caseId, userId, chatId, reason = 'independent_mode' }) {
+	await ensureAutomaticAdTargetTable(env);
+	const row = await env.DB.prepare('SELECT scope_type FROM ad_automatic_case_targets WHERE case_id=? AND chat_id=? AND user_id=?')
+		.bind(String(caseId),String(chatId),String(userId)).first();
+	if (row?.scope_type === 'local') return { retained: true };
+	await removeAutomaticGroupBan(env,chatId,userId,caseId);
+	const result = await env.DB.prepare("UPDATE ad_automatic_case_targets SET state='skipped',owned=0,result=? WHERE case_id=? AND chat_id=? AND user_id=?")
+		.bind(JSON.stringify({ reason }),String(caseId),String(chatId),String(userId)).run();
+	if (result?.success === false) throw new Error('自动处罚跳过状态记账失败');
+	return { skipped: true };
+}
+
+async function loadAutomaticAdCaseTargets(env, caseId, userId, scope) {
+	if (!env?.DB || !caseId) return [];
+	const table = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='ad_automatic_case_targets'").first();
+	if (!table) return [];
+	const result = await env.DB.prepare('SELECT chat_id,owned,state,result FROM ad_automatic_case_targets WHERE case_id=? AND user_id=? AND scope_type=? ORDER BY chat_id')
+		.bind(String(caseId),String(userId),scope).all();
+	if(!result||result.success===false||!Array.isArray(result.results))throw new Error('自动处罚归属账本读取失败');
+	return result.results;
+}
+
+async function rollbackAutomaticAdCaseTargets(env, snapshot) {
+	const frozen = snapshot.snapshot || {}, scope = frozen.punishmentScope === 'global' ? 'global' : 'local';
+	const uid = String(snapshot.userId), caseId = String(frozen.autoCaseId || '');
+	let targets = await loadAutomaticAdCaseTargets(env,caseId,uid,scope);
+	if (!targets.length && scope === 'local') targets = [{chat_id:String(frozen.punishmentChatId||snapshot.chatId||''),owned:1,state:'legacy'}];
+	if (!targets.length) throw new Error('没有可核对的冻结自动处罚目标，未猜测解封范围');
+	const modes = await readStrictAutomaticAdModes(env,targets.map(row=>String(row.chat_id)));
+	const unbanResults = [], errors = []; let retained = false;
+	for (const target of targets) {
+		const gid = String(target.chat_id);
+		if (!gid || target.state === 'rolled_back') continue;
+		try {
+		const removed = await removeAutomaticGroupBan(env,gid,uid,caseId);
+		const remaining = await readGroupBlacklistEntry(env,gid,uid);
+		const shared = await readD1BlacklistOrFederatedEntry(env,uid);
+		const independent = !isKillerModeGroup(gid) && modes.get(gid)==='independent';
+		const applies = Boolean(shared) && (!independent || isPrimaryOwner(shared.by));
+		if (remaining || applies) {
+			retained=true;
+			if(target.state!=='legacy') {
+				const saved=await env.DB.prepare("UPDATE ad_automatic_case_targets SET state='superseded',owned=0 WHERE case_id=? AND chat_id=? AND user_id=?")
+					.bind(caseId,gid,uid).run();
+				if(saved?.success===false)throw new Error('保留后续处罚结果记账失败');
+			}
+			continue;
+		}
+		if (scope === 'global' && independent) {
+			await skipAutomaticAdCaseTarget(env,{caseId,userId:uid,chatId:gid,reason:'independent_mode_rollback'});
+			continue;
+		}
+		let previous = {}; try { previous=JSON.parse(target.result||'{}'); } catch (_) {}
+		if (previous.priorState==='already_banned' || (previous.attempted!==undefined && Number(previous.attempted)!==1)) {
+			retained = retained || previous.priorState==='already_banned';
+			const saved = await env.DB.prepare("UPDATE ad_automatic_case_targets SET state='rolled_back',owned=0 WHERE case_id=? AND chat_id=? AND user_id=?")
+				.bind(caseId,gid,uid).run();
+			if(saved?.success===false)throw new Error('原有处罚保留结果记账失败');
+			continue;
+		}
+		if (!Number(target.owned) && removed.code !== 'REMOVED') continue;
+		const results = await unbanUserFromAllGroups(uid,[gid]);
+		unbanResults.push(...results);
+		if (results.some(row=>!row.unbanned||!row.unmuted)) {
+			errors.push('群 '+gid+' 解除封禁或禁言未完成');
+		} else if (target.state !== 'legacy') {
+			const saved = await env.DB.prepare("UPDATE ad_automatic_case_targets SET state='rolled_back',owned=0 WHERE case_id=? AND chat_id=? AND user_id=?")
+				.bind(caseId,gid,uid).run();
+			if(saved?.success===false)errors.push('群 '+gid+' 解封结果记账失败');
+		}
+		} catch (_) { errors.push('群 '+gid+' 自动处罚撤销或解封记账失败，保留重试'); }
+	}
+	return { removed:{success:true,code:'REMOVED',local:scope==='local'},retained,unbanResults,errors,complete:!errors.length };
 }
 
 function manualAdDetectionScopeGroupIds(eventChatId) {
@@ -11530,6 +11689,7 @@ async function removeAutomaticGroupBan(env, chatId, userId, autoCaseId) {
 	if (caseId) {
 		const removed = await env.DB.prepare('DELETE FROM group_blacklist WHERE chat_id = ? AND user_id = ? AND auto_case_id = ? RETURNING user_id')
 			.bind(gid, uid, caseId).all();
+		if(removed?.success===false)throw new Error('自动处罚名单撤销失败');
 		if (removed.results?.length) {
 			await refreshGroupModeState(env);
 			return { success: true, code: 'REMOVED', local: true };
@@ -11784,6 +11944,18 @@ async function resolveChatBlacklistCheck(env, chatId, userId, globalCheck) {
 	}
 	const local = await readGroupBlacklistEntrySafe(env, chatId, userId);
 	if (local) {
+		if (local.autoCaseId) {
+			try {
+				const table = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='ad_automatic_case_targets'").first();
+				const origin = table ? await env.DB.prepare('SELECT scope_type FROM ad_automatic_case_targets WHERE case_id=? AND chat_id=? AND user_id=?')
+					.bind(local.autoCaseId,String(chatId),String(userId)).first() : null;
+				if (origin?.scope_type === 'global') {
+					const modes = await readStrictAutomaticAdModes(env,[String(chatId)]);
+					if (!isKillerModeGroup(chatId) && modes.get(String(chatId))==='independent')
+						return { isBlacklisted:false,message:null,automaticGlobalRecordHeld:true };
+				}
+			} catch (_) { return {isBlacklisted:false,message:null,automaticGlobalRecordHeld:true}; }
+		}
 		// 演练保留名单数据，但不重新施加自动处罚；人工或旧来源记录仍按原规则维持。
 		if (local.autoCaseId && await isDryRunGroup(env, chatId)) return { isBlacklisted: false, message: null, automaticRecordHeld: true };
 		return { isBlacklisted: true, message: '❌ 您在本群黑名单中，请联系本群管理员。', entry: local, localSource: 'local' };
@@ -12822,9 +12994,12 @@ async function ensureAdDryRunCloseTables(env) {
 	await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_dryrun_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, start_row_id INTEGER NOT NULL, cutoff_row_id INTEGER NOT NULL DEFAULT 0, opened_at TEXT NOT NULL, closed_at TEXT NOT NULL DEFAULT '', owner_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', lease_until INTEGER NOT NULL DEFAULT 0, lease_token TEXT NOT NULL DEFAULT '', report_sent INTEGER NOT NULL DEFAULT 0, report TEXT NOT NULL DEFAULT '', boundary_note TEXT NOT NULL DEFAULT '')").run();
 	if (!(await d1ColumnExists(env,'ad_dryrun_sessions','boundary_note'))) await env.DB.prepare("ALTER TABLE ad_dryrun_sessions ADD COLUMN boundary_note TEXT NOT NULL DEFAULT ''").run();
 	if (!(await d1ColumnExists(env,'ad_dryrun_sessions','normal_attempts'))) await env.DB.prepare('ALTER TABLE ad_dryrun_sessions ADD COLUMN normal_attempts INTEGER NOT NULL DEFAULT 0').run();
+	if (!(await d1ColumnExists(env,'ad_dryrun_sessions','ban_scope_snapshot'))) await env.DB.prepare("ALTER TABLE ad_dryrun_sessions ADD COLUMN ban_scope_snapshot TEXT NOT NULL DEFAULT ''").run();
 	await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_dryrun_close_cases (session_id INTEGER NOT NULL, row_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', ban_done INTEGER NOT NULL DEFAULT 0, delete_done INTEGER NOT NULL DEFAULT 0, normal_done INTEGER NOT NULL DEFAULT 0, normal_anchor INTEGER NOT NULL DEFAULT 0, revert_done INTEGER NOT NULL DEFAULT 0, normal_tally TEXT NOT NULL DEFAULT '', delete_state TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', PRIMARY KEY(session_id,row_id))").run();
 	if (!(await d1ColumnExists(env,'ad_dryrun_close_cases','normal_tally'))) await env.DB.prepare("ALTER TABLE ad_dryrun_close_cases ADD COLUMN normal_tally TEXT NOT NULL DEFAULT ''").run();
 	for(const column of ['normal_anchor','revert_done'])if(!(await d1ColumnExists(env,'ad_dryrun_close_cases',column)))await env.DB.prepare('ALTER TABLE ad_dryrun_close_cases ADD COLUMN '+column+' INTEGER NOT NULL DEFAULT 0').run();
+	for(const column of ['target_group_ids','ban_policy'])if(!(await d1ColumnExists(env,'ad_dryrun_close_cases',column)))await env.DB.prepare("ALTER TABLE ad_dryrun_close_cases ADD COLUMN "+column+" TEXT NOT NULL DEFAULT ''").run();
+	await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_dryrun_close_bans (session_id INTEGER NOT NULL,user_id TEXT NOT NULL,target_chat_id TEXT NOT NULL,source_row_id INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',error TEXT NOT NULL DEFAULT '',automatic_case_id TEXT NOT NULL,PRIMARY KEY(session_id,user_id,target_chat_id))").run();
 	return true;
 	})();D1_AD_DRYRUN_CLOSE_INIT.set(env.DB,work);
 	try{return await work;}catch(error){D1_AD_DRYRUN_CLOSE_INIT.delete(env.DB);throw error;}
@@ -12941,6 +13116,7 @@ function globalDryRunLearningView(evaluation) {
 		if (!(Number(positions.name?.grade) >= 6) && !['card','identity'].includes(hardChannel)) { payload.name = ''; payload.username = ''; }
 		if (!(Number(positions.bio?.grade) >= 6) && !['card','identity'].includes(hardChannel)) { payload.bio = ''; snapshot.profileShape = ''; }
 		if (!(Number(positions.text?.grade) >= 6) && hardChannel !== 'body') payload.text = Number(positions.quoted?.grade) >= 6 || hardChannel === 'quoted' ? String(payload.quotedText || payload.quoted || snapshot.quotedText || '') : '';
+		for(const [field,position] of [['avatarText','avatar'],['badgeText','badge'],['customEmojiText','sticker']])if(Number(positions[position]?.grade)<6)payload[field]='';
 		payload.domains = extractAdDomains([payload.name, payload.bio, payload.text].filter(Boolean).join('\n'));
 	}
 	if (!assets.avatarAd) payload.avatarId = '';
@@ -12953,9 +13129,71 @@ function globalDryRunLearningView(evaluation) {
 	return { ...evaluation, payload, snapshot };
 }
 
+function adCollectedMaterialText(row, avatar = false) {
+	if (!row || row.verdict === 'clean' && ['owner','manual','group_feedback'].includes(String(row.source || ''))) return '';
+	if (avatar) return Number(row.ocr_at)>0 && ['ad','clean'].includes(String(row.ocr_verdict || '')) ? String(row.ocr_text || '').trim() : '';
+	const signature=adImageContentSignature(row.contentSignature);
+	return signature && Number(signature.confidence)>=0.85 ? signature.ocr_text : '';
+}
+
+const AD_COLLECTED_PROFILE_ROLE_RE=/集团招商|全球出款|全网招商|(?:唯一|指定|专属|官方)财务|(?:一级|总代|高级)代理|上分客服|下分客服/;
+
+function isAdNeutralCollectedProfileText(text) {
+	const source=String(text||'').trim();
+	if(!source)return false;
+	const remaining=source.replace(/@[A-Za-z0-9_]{5,32}\b|\b[A-Za-z][A-Za-z0-9_]{1,10}\d{5,12}\b|[+\d][\d\s-]{8,}/g,'').replace(/[\s\p{P}\p{S}]+/gu,'');
+	return !remaining||/^(?:全天在线|24小时在线|全天候在线|官方认证|认证|官方客服|普通客服|在线客服|客服|联系方式|微信|联系)+$/.test(remaining);
+}
+
+// 联系入口只作组合线索；没有可见推广内容时，普通用户名、微信疑似ID和业务身份均不独立封禁。
+function applyAdCollectedProfileText(evaluation, profile, text, materialTexts, message) {
+	const sources={name:[profile.firstName,profile.lastName,profile.username].filter(Boolean).join(' '),bio:String(profile.bio||''),text:String(text||''),...materialTexts};
+	const contactHints=[];
+	for(const key of ['name','bio','text']){
+		const source=sources[key];
+		if(adPositionExemptHits(source).length)continue;
+		if(/@[A-Za-z0-9_]{5,32}\b/.test(source)||key==='name'&&String(profile.username||'').length>=5)contactHints.push({position:key,type:'telegram'});
+		const candidates=source.match(/\b[A-Za-z][A-Za-z0-9_]{1,10}\d{5,12}\b/g)||[];
+		if(candidates.some(id=>source.trim()===id||/(?:微信|薇信|微号|[vVwW][xX]|加[微薇vV]|联系)[\s:：号]*[A-Za-z0-9_]+/.test(source)))contactHints.push({position:key,type:'wechat_candidate'});
+		if(/(?:联系|电话|手机|加微|加v).{0,8}[+\d][\d\s-]{8,}/i.test(source))contactHints.push({position:key,type:'phone'});
+	}
+	if(message?.contact?.phone_number)contactHints.push({position:'text',type:'contact_card'});
+	const role=AD_COLLECTED_PROFILE_ROLE_RE;
+	const promotion=/集团招商|全网招商|全球出款|(?:招募|招收|诚招).{0,12}(?:代理|客户|下级)|(?:提供|承接).{0,12}(?:出款|上分|下分|跑分|洗钱)/;
+	const promotional = source => !adPositionExemptHits(source).length && (promotion.test(source)
+		|| countAdKeywordHits(source,AD_TRADE_VERBS).length>0&&countAdKeywordHits(source,AD_BUSINESS_KEYWORDS).length>0
+		|| Boolean(scoreAdMoneySolicit(source)));
+	const hasPromotion=Object.values(sources).some(promotional);
+	for(const [key,source] of Object.entries(materialTexts)){
+		if(!source)continue;
+		const slot=evaluation.positionEvidence?.[key];
+		if(!slot)continue;
+		const exempt=adPositionExemptHits(source);
+		if(exempt.length){slot.exempt=true;slot.grade=0;slot.reasons.push('实际素材文字命中豁免语境：'+exempt.slice(0,3).join('/'));continue;}
+		const trade=countAdKeywordHits(source,AD_TRADE_VERBS),business=countAdKeywordHits(source,AD_BUSINESS_KEYWORDS);
+		if(trade.length||business.length||role.test(source))addAdPositionEvidence(evaluation,key,3,'实际素材文字含业务线索');
+		if(trade.length&&business.length||scoreAdMoneySolicit(source))addAdPositionEvidence(evaluation,key,6,'实际素材文字含招揽与业务证据');
+		if(role.test(source)&&hasPromotion&&contactHints.length){
+			addAdPositionEvidence(evaluation,key,6,'实际素材业务身份与可见推广、联系入口同现：'+source.slice(0,80));
+			for(const hint of contactHints)addAdPositionEvidence(evaluation,hint.position,3,'与业务推广同现的联系入口（单独不定罪）');
+		}
+	}
+	evaluation.contactHints=contactHints;
+	return rejudgeAdPositionEvidence(evaluation);
+}
+
+function hasAdMessageContent(message) {
+	return Boolean(getAdDetectionBodyText(message) || getAdQuotedText(message) || extractAdMedia(message)
+		|| message?.forward_origin || message?.forward_from_chat || message?.voice || message?.video_note
+		|| message?.poll || message?.location || message?.venue || message?.live_photo);
+}
+
 async function collectGlobalDryRunEvaluation(env, message, prior = null, options = {}) {
 	const userId = String(message?.from?.id || '');
-	const text = [String(message?.text ?? message?.caption ?? extractAdChecklistText(message)).trim(), extractAdWebPageText(message)].filter(Boolean).join(' ');
+	const scopeChatId=options.normalDetection===true?String(options.scopeChatId||message?.chat?.id||''):'';
+	const ownText = String(message.text ?? message.caption ?? '').trim()
+		|| extractAdChecklistText(message);
+	const text = [ownText, extractAdWebPageText(message)].filter(Boolean).join(' ').trim();
 	const config = loadAdDetectionConfig(env);
 	const whitelist = await loadAdDomainWhitelist(env);
 	let profile;
@@ -12969,28 +13207,37 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 			lastName: String(message.from.last_name ?? ''), username: String(message.from.username ?? '') };
 	}
 	const media = extractAdMedia(message);
-	const image = media ? await judgeAdMediaForMessage(env, media, userId, { requireContent: true }) : null;
+	const image = media ? await judgeAdMediaForMessage(env, media, userId, { requireContent: true, scopeChatId }) : null;
 	const emojiIds = extractCustomEmojiIds(message);
-	const emojiRows = await readAdCustomEmojiMediaRows(env, emojiIds, userId, { complete: true });
+	const emojiRows = await readAdCustomEmojiMediaRows(env, emojiIds, userId, { complete: true, scopeChatId });
 	const badgeId = String(profile.badgeId || '');
-	const badgeItem = emojiRows.find((item) => item.id === badgeId)
-		|| (badgeId ? (await readAdCustomEmojiMediaRows(env, [badgeId], userId, { complete: true }))[0] : null);
-	let avatar = profile.avatarId ? await judgeAdAvatarRealtime(env, profile.avatarId, profile) : null;
-	const avatarOwnerClean = avatar?.verdict === 'clean' && ['owner', 'manual'].includes(String(avatar.source || ''));
+	const badgeLocalClean=badgeId&&await hasGroupAdFeedback(env,scopeChatId,'badge',badgeId);
+	const badgeItem = badgeLocalClean?{id:badgeId,row:{verdict:'clean',source:'group_feedback'},verifiedAd:false}:emojiRows.find((item) => item.id === badgeId)
+		|| (badgeId ? (await readAdCustomEmojiMediaRows(env, [badgeId], userId, { complete: true, scopeChatId }))[0] : null);
+	let avatar = profile.avatarId ? await judgeAdAvatarRealtime(env, profile.avatarId, profile, {scopeChatId}) : null;
+	const avatarOwnerClean = avatar?.verdict === 'clean' && ['owner', 'manual','group_feedback'].includes(String(avatar.source || ''));
 	if (avatar && !avatarOwnerClean && String(avatar.ocr_text || '').trim()) {
 		try {
 			const textHit = await matchAdAvatarText(env, avatar.ocr_text);
 			if (textHit) avatar = { ...avatar, textHit };
 		} catch (_) { avatar = { ...avatar, textMatchFailed: true }; }
 	}
-	const avatarAd = !avatarOwnerClean && Boolean(avatar?.textHit || (avatar?.verdict === 'ad'
-		&& (['owner', 'manual'].includes(String(avatar.source || '')) || avatar.ocr_verdict === 'ad' && Number(avatar.ocr_at) > 0)));
+	const avatarVisibleText=adCollectedMaterialText(avatar,true);
+	const avatarTextOnlyRole=isAdNeutralCollectedProfileText(avatarVisibleText)||AD_COLLECTED_PROFILE_ROLE_RE.test(avatarVisibleText)&&!hasAdIndependentHarmfulContent(avatarVisibleText);
+	const avatarOwnerAd = avatar?.verdict === 'ad' && ['owner','manual'].includes(String(avatar.source || ''));
+	const avatarTechnical = hasAdProtectedTechnicalContext(avatarVisibleText) && !hasAdIndependentHarmfulContent(avatarVisibleText);
+	const avatarAd = !avatarOwnerClean && (avatarOwnerAd || !avatarTextOnlyRole && !avatarTechnical
+		&& Boolean(avatar?.textHit || avatar?.verdict === 'ad' && avatar.ocr_verdict === 'ad' && Number(avatar.ocr_at) > 0));
 	const verifiedEmojiIds = emojiRows.filter((item) => item.verifiedAd).map((item) => item.id);
+	const avatarText=adCollectedMaterialText(avatar,true),badgeText=adCollectedMaterialText(badgeItem?.row);
+	const customEmojiText=emojiRows.map(item=>adCollectedMaterialText(item.row)).filter(Boolean).join('\n');
 	const evaluationProfile = { ...profile, status: '',
+		avatarText,badgeText,customEmojiText,
 		avatarId: avatarAd ? profile.avatarId : '',
 		badgeId: badgeItem?.verifiedAd && !emojiIds.includes(badgeId) ? badgeId : '',
 		customEmojiIds: verifiedEmojiIds };
 	try { evaluationProfile.adLinks = await resolveAdProfileLinksElevated(env, evaluationProfile, { whitelist, text }); } catch (_) { /* 保留已有资料 */ }
+	const judgeCollectedContent = async () => {
 	let evaluation = await evaluateAdSuspect(env, {
 		profile: evaluationProfile, text, quotedText: getAdQuotedText(message),
 		forwardChat: message?.forward_from_chat || message?.forward_origin?.chat || null, media,
@@ -13005,7 +13252,10 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 		evaluation.positionHardBan = true; evaluation.verdict = 'ban';
 		evaluation.reasons = markAdConvictLayer(evaluation.reasons.concat(['会员标的实际图片内容已确认广告']), '会员标');
 	}
-	evaluation = rejudgeAdPositionEvidence(evaluation);
+	evaluation = applyAdCollectedProfileText(evaluation,evaluationProfile,text,{avatar:avatarText,badge:badgeText,sticker:customEmojiText},message);
+	return evaluation;
+	};
+	let evaluation = await judgeCollectedContent();
 	const drillIncomplete = [];
 	const materialComplete = (row, verifiedAd) => Boolean(row && !row.missReason
 		&& (row.verdict === 'clean' || row.verdict === 'ad' && verifiedAd));
@@ -13014,15 +13264,15 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	const avatarComplete = !profile.avatarId ? profileFetched : Boolean(avatar && !avatar.textMatchFailed
 		&& (avatarAd || avatarOwnerClean || avatar.verdict === 'clean' && avatar.ocr_verdict === 'clean' && Number(avatar.ocr_at) > 0));
 	const badgeInspection = badgeId ? inspectionOf(badgeItem) : 'none';
-	const badgeComplete = !badgeId ? profileFetched : materialComplete(badgeItem?.row, badgeItem?.verifiedAd) && badgeInspection === 'bitmap_body';
+	const badgeComplete = !badgeId ? profileFetched : badgeLocalClean || materialComplete(badgeItem?.row, badgeItem?.verifiedAd) && badgeInspection === 'bitmap_body';
 	const imageRequired = Boolean(media && (['photo', 'sticker', 'video', 'animation'].includes(media.kind) || media.visionFileId));
 	const imageComplete = !imageRequired || materialComplete(image, isVerifiedAdMediaRow(image));
 	const imageInspection = !media ? 'none' : !media.visionFileId ? 'unavailable'
 		: String(media.visionFileId) === String(media.fileId) ? 'bitmap_body' : 'thumbnail';
 	const fullImageComplete = imageComplete && (!media || imageInspection === 'bitmap_body');
 	const emojiById = new Map(emojiRows.map((item) => [String(item.id), item]));
-	const emojiMissingIds = emojiIds.filter((id) => !materialComplete(emojiById.get(String(id))?.row, emojiById.get(String(id))?.verifiedAd)
-		|| inspectionOf(emojiById.get(String(id))) !== 'bitmap_body');
+	const emojiMissingIds = emojiIds.filter((id) => emojiById.get(String(id))?.row?.source!=='group_feedback'&&(!materialComplete(emojiById.get(String(id))?.row, emojiById.get(String(id))?.verifiedAd)
+		|| inspectionOf(emojiById.get(String(id))) !== 'bitmap_body'));
 	const profileSource = profile.profileSource || (profileFetched ? 'telegram_getChat' : 'message_fallback');
 	const completeness = {
 		profile: { complete: profileFetched, source: profileSource, fetchedAt: Number(profile.profileFetchedAt) || null },
@@ -13049,22 +13299,36 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	evaluation.drillIncomplete = drillIncomplete;
 	// 演练与正式检测共用补判链；复评保留已核验的模型答复，仍用完整现场重新核对证据。
 	const llmMemo = options.llmMemo || (prior?._adLlmMemo?.answer?.ad === true ? prior._adLlmMemo : { done: false });
+	let reviewInput = null, reviewOptions = null;
 	if (evaluation.verdict !== 'ban') {
 		const filtered = adTechnicalExemptPayload({ name: [profile.firstName, profile.lastName].filter(Boolean).join(' '),
 			username: profile.username || '', bio: profile.bio || '', text });
-		const reviewProfile = { ...evaluationProfile, firstName: filtered.name, lastName: '', username: filtered.username, bio: filtered.bio };
-		const contactName = message.contact ? [message.contact.first_name, message.contact.last_name].filter(Boolean).join(' ') : '';
+		const bioProse = String(profile.bio || '').replace(/(?:https?:\/\/)?t\.me\/\S+|@[A-Za-z0-9_]+/gi, '');
+		const linkCandidate = extractAdProfileHandles(profile).length > 0 && !hasAdProtectedTechnicalContext(bioProse);
+		if (!filtered.bio && linkCandidate) filtered.bio = String(profile.bio || '');
+		const reviewProfile = { ...evaluationProfile, firstName: filtered.name, lastName: '', username: filtered.username, bio: filtered.bio,
+			...Object.fromEntries(['avatarText','badgeText','customEmojiText'].map(key=>[key,adPositionExemptHits(evaluationProfile[key]).length?'':evaluationProfile[key]])) };
+		const contactDisplay = message.contact ? [message.contact.first_name, message.contact.last_name].filter(Boolean).join(' ') : '';
+		const contactName = looksLikePersonName(contactDisplay) ? '' : contactDisplay;
 		const signals = (evaluation.reasons || []).filter((line) => !/机器生成|数字前缀|随机字符/.test(String(line)));
 		const review = shouldSubmitAdForReview({ text: filtered.text, contactName, quotedText: getAdQuotedText(message),
 			forwardChat: message?.forward_from_chat || message?.forward_origin?.chat || null, media, whitelist,
 			suspectSignal: isAdSuspectSignal(filtered.text || contactName, signals, { contactCard: Boolean(contactName) })
-				|| isAdSuspectSignal(filtered.bio, [], {}), businessHit: countAdKeywordHits(filtered.text, AD_BUSINESS_KEYWORDS).length > 0,
+				|| linkCandidate || isAdSuspectSignal(filtered.bio, [], {})||isAdSuspectSignal([reviewProfile.avatarText,reviewProfile.badgeText,reviewProfile.customEmojiText].join(' '),[],{}), businessHit: countAdKeywordHits(filtered.text, AD_BUSINESS_KEYWORDS).length > 0,
 			userId, nowSeconds: Math.floor(Date.now() / 1000), sampleEnabled: adLLMPoolLimit(config, 'sample') > 0 });
 		if (review.submit || llmMemo.done && llmMemo.answer?.ad === true) {
-			evaluation = await applyAdLLMToEvaluation(env, evaluation, config, { profile: reviewProfile, text: filtered.text,
-				contactCardName: contactName, contactPhone: String(message.contact?.phone_number || '') },
-				{ pool: review.pool || 'message', llmMemo, forceReview: options.source === 'rescreen' });
+			reviewInput = { profile: reviewProfile, text: filtered.text, contactCardName: contactName, contactPhone: String(message.contact?.phone_number || '') };
+			reviewOptions = { pool: review.pool || 'message', llmMemo, forceReview: options.source === 'rescreen' };
+			evaluation = await applyAdLLMToEvaluation(env, evaluation, config, reviewInput, reviewOptions);
 		}
+	}
+	const recheckedLinks = await recheckAdProfileLinks(env, evaluationProfile,
+		llmMemo.answer?.ad === true ? { ...evaluation, positionNeedsReview: true } : evaluation);
+	if (recheckedLinks) {
+		evaluationProfile.adLinks = recheckedLinks;
+		evaluation = await judgeCollectedContent();
+		if (reviewInput) { reviewInput.profile.adLinks = recheckedLinks; evaluation = await applyAdLLMToEvaluation(env, evaluation, config, reviewInput, reviewOptions); }
+		evaluation.drillIncomplete = drillIncomplete;
 	}
 	const fullyCollected = drillIncomplete.length === 0;
 	evaluation.globalDrill = { scope: 'all-configured-killer', attempted: true, collected: fullyCollected, complete: fullyCollected,
@@ -13077,6 +13341,7 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 		evaluation.payload.customEmojiMedia = (evaluation.payload.customEmojiMedia || []).concat(badgeMaterial);
 	}
 	evaluation.payload = { ...(evaluation.payload || {}), avatarId: String(profile.avatarId || ''), badgeId,
+		avatarText,badgeText,customEmojiText,contactHints:evaluation.contactHints||[],
 		customEmojiIds: emojiIds, verifiedCustomEmojiIds: verifiedEmojiIds, quotedText: getAdQuotedText(message),
 		imageId: String(media?.fileUniqueId || evaluation.payload?.imageId || ''),
 		imageVerifiedAd: isVerifiedAdMediaRow(image),
@@ -13177,7 +13442,7 @@ async function recordAdDrillPendingMessage(env, message, evaluation, options = {
 async function handleGlobalDryRunMessage(message, env) {
 	const chatId = String(message?.chat?.id || '');
 	if (!message?.from || message.chat?.type === 'private' || !isGlobalDryRunScopeGroup(chatId)
-		|| isTelegramServiceMessage(message) || isTelegramSlashCommand(message.text)
+		|| isTelegramServiceMessage(message) || !hasAdMessageContent(message) || isTelegramSlashCommand(message.text)
 		|| classifyAdReplyIntent(message.text) || String(message.text || '').trim() === SELF_UNBAN_KEYWORD) return false;
 	if (!(await isDryRunGroup(env, chatId))) return false;
 	if (await isAdDryRunClosing(env)) return true;
@@ -16564,6 +16829,7 @@ async function handleBulkJobPaginationCallback(callbackQuery, env) {
 }
 
 async function handleAdCallbackQuery(callbackQuery, env, ctx) {
+	if (callbackQuery?.from?.is_bot === true) return;
 	const data = String(callbackQuery?.data || '');
 	// 三分支分流。必须排在 adv: 校验【之前】：投票分支开头那道 isConfiguredGroup
 	// 会把私聊来的回调全部挡掉，而 /words 本来就只在私聊里用。
@@ -16772,6 +17038,7 @@ function isChannelAutoForward(message) {
 }
 
 async function handleMessage(message, env, ctx, requestUrl = '') {
+	if (isExternalBotMessage(message)) return;
 	// 频道关联群自动转发帖直接放行:不删、不缓存、不当命令。
 	// 放在最顶部,先于一切治理逻辑,保证任意频道内容(不只是像广告的)都不被误删误取消置顶。
 	if (isChannelAutoForward(message)) {
@@ -24823,6 +25090,7 @@ function operatorQuotedLearningMessage(invocation, actorId, targetUserId) {
 		|| String(getMessageActorId(invocation)) !== String(actorId) || Number(invocation.message_id) <= 0) return null;
 	const quoted = invocation.reply_to_message;
 	if (!quoted || Number(quoted.message_id) <= 0 || !quoted.from?.id) return null;
+	if (quoted.from.is_bot === true) return null;
 	if (String(quoted.from.id) !== String(targetUserId)) return null;
 	return quoted;
 }
@@ -27325,7 +27593,10 @@ function buildAdLLMPayload(input) {
 		first_name: String(profile.firstName ?? profile.first_name ?? ''),
 		last_name: String(profile.lastName ?? profile.last_name ?? ''),
 		bio: String(profile.bio || ''),
-		message: String(input?.text || '').slice(0, 600)
+		message: String(input?.text || '').slice(0, 600),
+		...(profile.avatarText?{avatar_text:String(profile.avatarText).slice(0,600)}:{}),
+		...(profile.badgeText?{badge_text:String(profile.badgeText).slice(0,600)}:{}),
+		...(profile.customEmojiText?{message_emoji_text:String(profile.customEmojiText).slice(0,600)}:{})
 	});
 }
 
@@ -28002,7 +28273,7 @@ async function judgeAdByLLM(env, config, input, options) {
 // 三个字段都由调用处从 message.contact 取出，这里再验一遍形态，不信任模型输出。
 function collectAdLLMHardEvidence(input) {
 	const profile = input?.profile || {};
-	const text = [profile.firstName, profile.lastName, profile.bio, input?.text]
+	const text = [profile.firstName, profile.lastName, profile.bio,profile.avatarText,profile.badgeText,profile.customEmojiText, input?.text]
 		.filter(Boolean).join(' ');
 	if (!text.trim()) return [];
 	const hits = [];
@@ -28570,6 +28841,41 @@ async function queueAdDryRunClose(env, sessionId) {
 	} catch (_) { return false; }
 }
 
+function adDryRunAutomaticCaseId(sessionId, userId, sourceChatId, policy) {
+	const prefix = 'dryrun:' + sessionId + ':';
+	if (policy === 'independent_local') return prefix + 'local:' + sourceChatId + ':' + userId;
+	if (policy === 'legacy_local') return prefix + 'legacy:' + sourceChatId + ':' + userId;
+	return prefix + 'global:' + userId;
+}
+
+async function freezeAdDryRunCloseScope(env, session, cutoffRowId) {
+	const sources = (await env.DB.prepare('SELECT DISTINCT chat_id FROM ad_dryrun_log WHERE id>=? AND id<=?')
+		.bind(Number(session.start_row_id),Number(cutoffRowId)).all()).results || [];
+	const configured=automaticAdConfiguredGroups();
+	const modes=await readStrictAutomaticAdModes(env,[...configured,...sources.map(row=>String(row.chat_id))]);
+	const independent=id=>configured.includes(id)&&!isKillerModeGroup(id)&&modes.get(id)==='independent';
+	const globalTargets=configured.filter(id=>!independent(id));
+	const scopes = {};
+	for (const row of sources) {
+		const source = String(row.chat_id);
+		const configuredSource=configured.includes(source);
+		if(!configuredSource&&!isGlobalDryRunScopeGroup(source)){
+			scopes[source]={targets:[],policy:'global_auxiliary_source'};continue;
+		}
+		const policy = independent(source) ? 'independent_local' : configuredSource ? 'global_non_independent' : 'global_auxiliary_source';
+		scopes[source] = { targets: independent(source)?[source]:globalTargets, policy };
+	}
+	return JSON.stringify(scopes);
+}
+
+// 首次关闭冻结的快照也是未执行记录的上限；旧收尾作业继续原本的本群策略。
+async function initializeAdDryRunCloseTargets(env, sessionId) {
+	await env.DB.prepare("UPDATE ad_dryrun_close_cases SET target_group_ids=COALESCE((SELECT json_extract(s.ban_scope_snapshot,'$.\"' || l.chat_id || '\".targets') FROM ad_dryrun_sessions s JOIN ad_dryrun_log l ON l.id=ad_dryrun_close_cases.row_id WHERE s.id=ad_dryrun_close_cases.session_id AND json_valid(s.ban_scope_snapshot)),(SELECT json_array(l.chat_id) FROM ad_dryrun_log l WHERE l.id=ad_dryrun_close_cases.row_id)),ban_policy=COALESCE((SELECT json_extract(s.ban_scope_snapshot,'$.\"' || l.chat_id || '\".policy') FROM ad_dryrun_sessions s JOIN ad_dryrun_log l ON l.id=ad_dryrun_close_cases.row_id WHERE s.id=ad_dryrun_close_cases.session_id AND json_valid(s.ban_scope_snapshot)),'legacy_local') WHERE session_id=? AND target_group_ids=''")
+		.bind(Number(sessionId)).run();
+	await env.DB.prepare("INSERT OR IGNORE INTO ad_dryrun_close_bans(session_id,user_id,target_chat_id,source_row_id,status,automatic_case_id) SELECT c.session_id,l.user_id,j.value,l.id,'done','dryrun:' || c.session_id || CASE c.ban_policy WHEN 'independent_local' THEN ':local:' || l.chat_id WHEN 'legacy_local' THEN ':legacy:' || l.chat_id ELSE ':global' END || ':' || l.user_id FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id JOIN json_each(c.target_group_ids) j WHERE c.session_id=? AND c.ban_done=1 AND l.fp=0 AND c.normal_anchor=0 AND l.verdict='ban'")
+		.bind(Number(sessionId)).run();
+}
+
 async function closeGlobalDryRun(env, message, state, session) {
 	if (!isTelegramOwnerPrivateInvocation(message)) return { ok: false, error: '仅第一主人本人私聊可关闭' };
 	if (!session || !['open','closing','processing','partial'].includes(session.status)) {
@@ -28581,16 +28887,18 @@ async function closeGlobalDryRun(env, message, state, session) {
 	}
 	if (session.status === 'open') {
 		const last = await env.DB.prepare('SELECT COALESCE(MAX(id),0) AS id FROM ad_dryrun_log').first();
+		const scopeSnapshot = await freezeAdDryRunCloseScope(env,session,Number(last.id));
 		await env.DB.batch([
-			env.DB.prepare("UPDATE ad_dryrun_sessions SET cutoff_row_id=?,closed_at=?,status='closing',report_sent=0 WHERE id=? AND status='open'")
-				.bind(Number(last.id), new Date().toISOString(), Number(session.id)),
+			env.DB.prepare("UPDATE ad_dryrun_sessions SET cutoff_row_id=?,closed_at=?,ban_scope_snapshot=?,status='closing',report_sent=0 WHERE id=? AND status='open'")
+				.bind(Number(last.id), new Date().toISOString(),scopeSnapshot,Number(session.id)),
 			env.DB.prepare("INSERT OR IGNORE INTO ad_dryrun_close_cases(session_id,row_id) SELECT s.id,l.id FROM ad_dryrun_sessions s JOIN ad_dryrun_log l ON l.id >= s.start_row_id AND l.id <= s.cutoff_row_id WHERE s.id=?")
 				.bind(Number(session.id))
 		]);
 	} else if (session.status === 'partial') {
 		await env.DB.batch([
 			env.DB.prepare("UPDATE ad_dryrun_sessions SET status='processing',report_sent=0 WHERE id=?").bind(Number(session.id)),
-			env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='pending' WHERE session_id=? AND status='failed'").bind(Number(session.id))
+			env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='pending' WHERE session_id=? AND status='failed'").bind(Number(session.id)),
+			env.DB.prepare("UPDATE ad_dryrun_close_bans SET status='pending' WHERE session_id=? AND status='failed'").bind(Number(session.id))
 		]);
 	}
 	if(session.status==='closing')await env.DB.prepare('UPDATE ad_dryrun_sessions SET normal_attempts=0,report_sent=0 WHERE id=?').bind(Number(session.id)).run();
@@ -28608,7 +28916,8 @@ async function retryAdDryRunCloseSession(env, sessionId, message) {
 	if(session.status==='closing')await env.DB.prepare('UPDATE ad_dryrun_sessions SET normal_attempts=0,report_sent=0 WHERE id=?').bind(Number(session.id)).run();
 	if(session.status==='partial')await env.DB.batch([
 		env.DB.prepare("UPDATE ad_dryrun_sessions SET status='processing',report_sent=0 WHERE id=?").bind(Number(session.id)),
-		env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='pending' WHERE session_id=? AND status='failed'").bind(Number(session.id))
+		env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='pending' WHERE session_id=? AND status='failed'").bind(Number(session.id)),
+		env.DB.prepare("UPDATE ad_dryrun_close_bans SET status='pending' WHERE session_id=? AND status='failed'").bind(Number(session.id))
 	]);
 	return {ok:true,...await runAdDryRunCloseJob(env,session.id,{limit:8})};
 }
@@ -28616,9 +28925,10 @@ async function retryAdDryRunCloseSession(env, sessionId, message) {
 async function sendAdDryRunCloseReport(env, sessionId, options = {}) {
 	const session = await env.DB.prepare('SELECT * FROM ad_dryrun_sessions WHERE id=?').bind(Number(sessionId)).first();
 	if (!session) return false;
+	await initializeAdDryRunCloseTargets(env,sessionId);
 	const rows=[];let after=0;
 	while(true){
-		const page=(await env.DB.prepare("SELECT l.id,l.chat_id,l.user_id,l.verdict,l.fp,l.fp_revert_pending,l.done,l.learned,l.sample,l.badges,l.avatars,l.images,l.shapes,l.links,l.packs,l.skeletons,c.status AS close_status,c.ban_done,c.delete_done,c.normal_done,c.normal_anchor,c.revert_done,c.normal_tally,c.delete_state,c.error,CASE WHEN json_valid(l.evaluation) THEN COALESCE(json_extract(l.evaluation,'$.snapshot.name'),json_extract(l.evaluation,'$.payload.name'),'') ELSE '' END AS display_name,CASE WHEN json_valid(l.evaluation) THEN COALESCE(json_extract(l.evaluation,'$.snapshot.dryRunChatTitle'),'') ELSE '' END AS chat_title,CASE WHEN json_valid(l.evaluation) THEN json_extract(l.evaluation,'$.globalDrill.complete') END AS collection_complete,CASE WHEN json_valid(l.evaluation) THEN json_extract(l.evaluation,'$.drillIncomplete') END AS collection_missing FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND l.id>? ORDER BY l.id LIMIT 200")
+		const page=(await env.DB.prepare("SELECT l.id,l.chat_id,l.user_id,l.verdict,l.fp,l.fp_revert_pending,l.done,l.learned,l.sample,l.badges,l.avatars,l.images,l.shapes,l.links,l.packs,l.skeletons,c.status AS close_status,c.ban_done,c.delete_done,c.normal_done,c.normal_anchor,c.revert_done,c.normal_tally,c.delete_state,c.error,c.target_group_ids,c.ban_policy,CASE WHEN json_valid(l.evaluation) THEN COALESCE(json_extract(l.evaluation,'$.snapshot.name'),json_extract(l.evaluation,'$.payload.name'),'') ELSE '' END AS display_name,CASE WHEN json_valid(l.evaluation) THEN COALESCE(json_extract(l.evaluation,'$.snapshot.dryRunChatTitle'),'') ELSE '' END AS chat_title,CASE WHEN json_valid(l.evaluation) THEN json_extract(l.evaluation,'$.globalDrill.complete') END AS collection_complete,CASE WHEN json_valid(l.evaluation) THEN json_extract(l.evaluation,'$.drillIncomplete') END AS collection_missing FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND l.id>? ORDER BY l.id LIMIT 200")
 			.bind(Number(sessionId),after).all()).results||[];
 		rows.push(...page);if(page.length<200)break;after=Number(page[page.length-1].id);
 	}
@@ -28631,9 +28941,12 @@ async function sendAdDryRunCloseReport(env, sessionId, options = {}) {
 	const normalTally = {text:0,context:0,materials:0};
 	const reverted = {...totals}; for(const key of Object.keys(reverted))reverted[key]=fp.filter(row=>row.fp&&!row.fp_revert_pending||row.revert_done).reduce((sum,row)=>sum+(Number(row[key])||0),0);
 	for(const row of fp){let tally={};try{tally=JSON.parse(row.normal_tally||'{}');}catch(_){}for(const key of Object.keys(normalTally))normalTally[key]+=Number(tally[key])||0;}
-	const banPairs = new Set(ads.filter(row=>row.ban_done).map(row=>row.chat_id+':'+row.user_id));
+	const banTargets=(await env.DB.prepare('SELECT user_id,target_chat_id,source_row_id,status,error FROM ad_dryrun_close_bans WHERE session_id=? ORDER BY user_id,target_chat_id').bind(Number(sessionId)).all()).results||[];
+	const targetResults=new Map(banTargets.map(target=>[String(target.user_id)+':'+String(target.target_chat_id),target]));
+	const policyNames={global_non_independent:'全局联动（不含独立群）',global_auxiliary_source:'辅助来源，联动非独立治理群',independent_local:'独立本群',legacy_local:'旧作业本群策略'};
 	const stateNames = {done:'完成',failed:'失败',skipped:'跳过/归并',skipped_normal:'正常现场反例，跳过封删',pending:'待处理',open:'开启',closing:'正常反例处理中',processing:'广告封删处理中',partial:'已关闭，部分封删待重试',closed:'已关闭并完成'};
 	const lines = ['<b>🧪 本轮演练关闭完整结果 #' + session.id + '</b>',
+		'Telegram 超群/频道原生封禁会自动撤回该用户历史消息，平台不返回清理条数；下方消息删除计数只核验原群原消息。',
 		'起止：' + escapeHtml(session.opened_at) + ' → ' + escapeHtml(session.closed_at),
 		'边界依据：' + escapeHtml(session.boundary_note || '按持久流水ID边界处理'),
 		'当前全局范围 ' + globalDryRunScopeGroupIds().length + ' 群；本轮有记录 ' + groups.size + ' 群。',
@@ -28645,16 +28958,24 @@ async function sendAdDryRunCloseReport(env, sessionId, options = {}) {
 		'素材学习：图片 ' + totals.images + '，头像 ' + totals.avatars + '，会员标/贴纸 ' + totals.badges + '，贴纸包 ' + totals.packs + '，资料形状 ' + totals.shapes + '，挂号案底 ' + totals.links,
 		'误判已撤销的原学习记账：指纹 ' + reverted.learned + '，AI样本 ' + reverted.sample + '，骨架 ' + reverted.skeletons + '，图片 ' + reverted.images + '，头像 ' + reverted.avatars + '，会员标/贴纸 ' + reverted.badges + '，形状 ' + reverted.shapes + '；这些是本轮记账，不冒充共享库净变化。',
 		'保留广告记录的原学习记账：指纹 ' + (totals.learned-reverted.learned) + '，AI样本 ' + (totals.sample-reverted.sample) + '，骨架 ' + (totals.skeletons-reverted.skeletons),
-		'广告：去重用户+来源群封禁成功 ' + banPairs.size + '；归并记录 ' + Math.max(0,ads.filter(row=>row.ban_done).length-banPairs.size) + '；失败流水 ' + ads.filter(row=>row.close_status==='failed').length + '；跳过 ' + ads.filter(row=>row.close_status==='skipped').length,
-		'原消息：删除成功 ' + ads.filter(row=>row.delete_state==='deleted').length + '；已不存在 ' + ads.filter(row=>row.delete_state==='gone').length + '；无原消息无需删除 ' + ads.filter(row=>row.delete_state==='none').length + '；缺原ID ' + ads.filter(row=>row.delete_state==='missing').length + '；其他失败 ' + ads.filter(row=>row.delete_state==='failed').length,
+		'广告：去重用户×目标群封禁成功 ' + banTargets.filter(target=>target.status==='done').length + '；现有其他处罚保留、未重复封禁 ' + banTargets.filter(target=>target.status==='retained').length + '；目标失败 ' + banTargets.filter(target=>target.status==='failed').length + '；目标待处理 ' + banTargets.filter(target=>target.status==='pending').length + '；目标合法跳过 ' + banTargets.filter(target=>target.status==='skipped').length + '；失败流水 ' + ads.filter(row=>row.close_status==='failed').length + '；非广告/历史记录跳过 ' + rows.filter(row=>row.close_status==='skipped').length,
+		'原消息：仅在原来源群删除；成功 ' + ads.filter(row=>row.delete_state==='deleted').length + '；已不存在 ' + ads.filter(row=>row.delete_state==='gone').length + '；无原消息无需删除 ' + ads.filter(row=>row.delete_state==='none').length + '；来源已切独立合法跳过 ' + ads.filter(row=>row.delete_state==='independent').length + '；缺原ID ' + ads.filter(row=>row.delete_state==='missing').length + '；其他失败 ' + ads.filter(row=>row.delete_state==='failed').length,
 		'正常记录：' + fp.length + ' 条（原手动误判标注 ' + rows.filter(row=>row.fp).length + '，同用户本轮归并 ' + fp.filter(row=>!row.fp).length + '），去重正常用户 ' + new Set(fp.map(row=>row.user_id)).size + '；文字反例写入/刷新 ' + normalTally.text + '，完整现场反例写入/刷新 ' + normalTally.context + '，已保存素材正常对照 ' + normalTally.materials + '；未完成 ' + fp.filter(row=>!row.normal_done).length,
 		'误判按钮已即时撤销错误学习；本轮关闭只统一记录正常内容/资料/素材反例，不添加用户永久白名单。',
 		'状态：' + escapeHtml(stateNames[session.status]||session.status) + '。本轮重试/补发：第一主人私聊 <code>/dryrun retry ' + session.id + '</code>；已成功步骤不会再次执行。', ''];
 	for (const row of rows) {
 		const name = String(row.display_name || row.user_id).slice(0,120);
 		lines.push('<b>流水 #' + row.id + '</b>　' + formatUserReference(row.user_id, { first_name: name }));
-		lines.push('来源群：'+escapeHtml(row.chat_title||'')+' <code>' + escapeHtml(row.chat_id) + '</code>；' + (Number(row.fp)===1 ? '原手动误判，撤错学后入池' : row.normal_anchor ? '本轮正常用户归并，依据原标注流水 #'+row.normal_anchor+'；撤错学后入池' : row.close_status==='skipped_normal'?'已确认正常现场反例，不执行封删':row.verdict==='pending'?'未核记录，仅归档待复查，不封不删、不计正常反例':row.verdict!=='ban'?'非广告或已归档记录，不执行封删':'自动学习广告，本群封禁+原消息删除'));
-		lines.push('结果：' + escapeHtml(stateNames[row.close_status]||row.close_status) + '；封禁 ' + (row.ban_done ? '完成' : '未执行/未完成') + '；删除 ' + escapeHtml(({deleted:'完成',gone:'已不存在',none:'无原消息，无需删除',missing:'缺原消息ID',failed:'失败'})[row.delete_state] || '未执行') + '；正常反例 ' + (row.normal_done ? '完成' : '未录入'));
+		lines.push('来源群：'+escapeHtml(row.chat_title||'')+' <code>' + escapeHtml(row.chat_id) + '</code>；' + (Number(row.fp)===1 ? '原手动误判，撤错学后入池' : row.normal_anchor ? '本轮正常用户归并，依据原标注流水 #'+row.normal_anchor+'；撤错学后入池' : row.close_status==='skipped_normal'?'已确认正常现场反例，不执行封删':row.verdict==='pending'?'未核记录，仅归档待复查，不封不删、不计正常反例':row.verdict!=='ban'?'非广告或已归档记录，不执行封删':'自动学习广告，按冻结范围封禁+原群原消息删除'));
+		lines.push('结果：' + escapeHtml(stateNames[row.close_status]||row.close_status) + '；目标处理 ' + (row.ban_done ? '完成/合法跳过' : '未执行/未完成') + '；删除 ' + escapeHtml(({deleted:'完成',gone:'已不存在',none:'无原消息，无需删除',independent:'来源已切独立，跳过全局联动删除',missing:'缺原消息ID',failed:'失败'})[row.delete_state] || '未执行') + '；正常反例 ' + (row.normal_done ? '完成' : '未录入'));
+		if(!isNormalRecord(row)&&row.verdict==='ban'){
+			let targets=[];try{targets=JSON.parse(row.target_group_ids||'[]');}catch(_){}
+			lines.push('冻结范围：'+escapeHtml(policyNames[row.ban_policy]||row.ban_policy||'未初始化')+'；'+targets.length+' 个目标。');
+			for(const target of targets){
+				const result=targetResults.get(String(row.user_id)+':'+String(target));
+				lines.push('目标 <code>'+escapeHtml(target)+'</code>：'+escapeHtml(({done:'封禁成功',retained:'保留现有其他处罚，未重复封禁',failed:'失败',pending:'待处理',skipped:'合法跳过'})[result?.status]||'未执行')+(result&&Number(result.source_row_id)!==Number(row.id)?'；归并依据流水 #'+result.source_row_id:'')+(result?.error?'；'+escapeHtml(toChineseErrorText(result.error)):''));
+			}
+		}
 		if (row.collection_complete === 0) lines.push('待补核现场：' + escapeHtml(String(row.collection_missing || '资料或素材尚未完整核验')));
 		if (row.error) lines.push('原因/归并：' + escapeHtml(toChineseErrorText(row.error)));
 		lines.push('');
@@ -28686,6 +29007,7 @@ async function runAdDryRunCloseJob(env, sessionId, options = {}) {
 		};
 		const limit = Math.max(1,Math.min(Number(options.limit)||8,20));
 		let session = await env.DB.prepare('SELECT * FROM ad_dryrun_sessions WHERE id=?').bind(id).first();
+		await initializeAdDryRunCloseTargets(env,id);
 		if(session.status==='closing'&&Number(session.normal_attempts)>=3)return {complete:false,normalPending:true,needsManualRetry:true};
 		if (session.status === 'closing') {
 			let normalFailure=false;
@@ -28727,7 +29049,8 @@ async function runAdDryRunCloseJob(env, sessionId, options = {}) {
 				env.DB.prepare('UPDATE dryrun_groups SET enabled=0')
 			]);
 		}
-		const ads = (await env.DB.prepare("SELECT l.*,c.ban_done,c.delete_done FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND l.fp=0 AND c.status='pending' ORDER BY l.id LIMIT ?").bind(id,limit).all()).results || [];
+		let banBudget = limit;
+		const ads = (await env.DB.prepare("SELECT l.*,c.ban_done,c.delete_done,c.target_group_ids,c.ban_policy FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND l.fp=0 AND c.status='pending' ORDER BY l.id LIMIT ?").bind(id,limit).all()).results || [];
 		for (const row of ads) {
 			await renew();
 			let evaluation = {}; try { evaluation = JSON.parse(row.evaluation || '{}'); } catch (_) {}
@@ -28740,26 +29063,77 @@ async function runAdDryRunCloseJob(env, sessionId, options = {}) {
 				for (const field of ['punishmentChatId','dryRunChatId']) {
 					if (evaluation?.snapshot?.[field] && String(evaluation.snapshot[field]) !== String(row.chat_id)) throw new Error('冻结处罚归属与流水群不一致，未执行封删');
 				}
-				const previous = await env.DB.prepare('SELECT l.id FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND c.ban_done=1 AND l.user_id=? AND l.chat_id=? LIMIT 1').bind(id,String(row.user_id),String(row.chat_id)).first();
-				if (!Number(row.ban_done) && !previous) {
-					const entry=await readGroupBlacklistEntry(env,String(row.chat_id),String(row.user_id));
-					const member=entry?await checkUserStatus(String(row.user_id),String(row.chat_id)):null;
-					if(!(member?.ok===true&&member.result?.status==='kicked')){
-						const result = await enforceAdDetection(env,{userId:String(row.user_id),chatId:String(row.chat_id),messageId:null},evaluation,
-							{drillCloseReplay:true,skipLearning:true,probeMembership:false,config:loadAdDetectionConfig(env),whitelist:await loadAdDomainWhitelist(env)});
-						if(result?.normalFeedback||result?.reason==='confirmed_normal_context'){
-							await env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='skipped_normal',normal_done=1,error='已命中主人确认的正常现场反例，未执行封删' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();continue;
+				let targets; try { targets=JSON.parse(row.target_group_ids); } catch (_) { throw new Error('本轮冻结目标记录损坏，未执行封删'); }
+				if(!Array.isArray(targets)||!targets.length)throw new Error('关闭时未找到合法治理目标群，未执行封删');
+				targets=[...new Set(targets.map(String))];
+				const caseId=adDryRunAutomaticCaseId(id,row.user_id,row.chat_id,row.ban_policy);
+				await env.DB.batch(targets.map(target=>env.DB.prepare("INSERT OR IGNORE INTO ad_dryrun_close_bans(session_id,user_id,target_chat_id,source_row_id,status,automatic_case_id) VALUES(?,?,?,?,?,?)")
+					.bind(id,String(row.user_id),target,Number(row.id),Number(row.ban_done)?'done':'pending',caseId)));
+				let normalFeedback=false;
+				for(const target of targets){
+					const saved=await env.DB.prepare('SELECT * FROM ad_dryrun_close_bans WHERE session_id=? AND user_id=? AND target_chat_id=?').bind(id,String(row.user_id),target).first();
+					if(!saved)throw new Error('冻结目标记账缺失，保留待重试');
+					if(saved.status!=='pending'||banBudget<1)continue;
+					banBudget--;
+					await renew();
+					try{
+						// Telegram 已成功但本轮账本写失败时，核验同一个处罚现场后恢复进度。
+						if(saved.error){
+							const priorTargets=await loadAutomaticAdCaseTargets(env,saved.automatic_case_id,String(row.user_id),['independent_local','legacy_local'].includes(row.ban_policy)?'local':'global');
+							const prior=priorTargets.find(item=>String(item.chat_id)===target);
+							if(prior){
+								const currentScope=await resolveAutomaticAdTargets(env,String(row.chat_id),{autoTargetGroupIds:[target],automaticPolicy:row.ban_policy,drillCloseReplay:true});
+								const entry=currentScope.groupIds.includes(target)?await readGroupBlacklistEntry(env,target,String(row.user_id)):null;
+								const member=entry?.autoCaseId===saved.automatic_case_id?await checkUserStatus(String(row.user_id),target):null;
+								if(member?.ok===true&&member.result?.status==='kicked'){
+									const restored=await env.DB.prepare("UPDATE ad_dryrun_close_bans SET status='done',error='' WHERE session_id=? AND user_id=? AND target_chat_id=?").bind(id,String(row.user_id),target).run();
+									if(restored?.success===false)throw new Error('已成功目标恢复记账失败，保留待重试');
+									continue;
+								}
+							}
 						}
-						if (!result?.banned || result.complete !== true) throw new Error(result?.reason || result?.banSummary || '本群封禁未完成');
+						const result=await enforceAdDetection(env,{userId:String(row.user_id),chatId:String(row.chat_id),messageId:null},evaluation,
+							{autoTargetGroupIds:[target],automaticCaseId:saved.automatic_case_id,automaticPolicy:row.ban_policy,drillCloseReplay:true,skipLearning:true,probeMembership:false,config:loadAdDetectionConfig(env),whitelist:await loadAdDomainWhitelist(env)});
+						if(result?.normalFeedback||result?.reason==='confirmed_normal_context'){
+							normalFeedback=true;
+							await env.DB.prepare("DELETE FROM ad_dryrun_close_bans WHERE session_id=? AND user_id=? AND source_row_id=? AND status IN ('pending','failed')").bind(id,String(row.user_id),Number(row.id)).run();
+							await env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='skipped_normal',normal_done=1,error='已命中主人确认的正常现场反例，未执行封删' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();
+							break;
+							}
+						const targetResult=result?.banResults?.find(item=>String(item.groupId)===target);
+						if(result.complete!==true||targetResult?.ok!==true)throw new Error(targetResult?.error||result?.reason||result?.banSummary||'目标群封禁未完成');
+						const retained=targetResult.skipped==='manual_punishment_retained';
+						const skipped=Boolean(targetResult.skipped)&&!retained;
+						const skipReason=({independent_mode:'目标已切为独立模式，跳过全局联动',not_configured:'目标不再属于治理群，合法跳过',outside_local_source:'目标不属于冻结的本群范围，合法跳过',not_in_group:'用户当前不在目标群，保留自动名单'})[targetResult.skipped]||String(targetResult.skipped||'');
+						if(['independent_mode','not_configured','outside_local_source'].includes(targetResult.skipped))await skipAutomaticAdCaseTarget(env,{caseId:saved.automatic_case_id,userId:String(row.user_id),chatId:target,reason:targetResult.skipped});
+						await renew();
+						const recorded=await env.DB.prepare('UPDATE ad_dryrun_close_bans SET status=?,error=? WHERE session_id=? AND user_id=? AND target_chat_id=?')
+							.bind(skipped?'skipped':retained?'retained':'done',skipped?skipReason:retained?'保留现有人工或其他处罚，不重复自动封禁':'',id,String(row.user_id),target).run();
+						if(recorded?.success===false)throw new Error('目标封禁成功步骤记账失败，保留重试核验');
+					}catch(error){
+						await renew();
+						await env.DB.prepare("UPDATE ad_dryrun_close_bans SET status='failed',error=? WHERE session_id=? AND user_id=? AND target_chat_id=?")
+							.bind(String(error?.message||error),id,String(row.user_id),target).run();
 					}
 				}
+				if(normalFeedback)continue;
+				const targetStates=(await env.DB.prepare('SELECT target_chat_id,status,error FROM ad_dryrun_close_bans WHERE session_id=? AND user_id=? AND target_chat_id IN (SELECT value FROM json_each(?))')
+					.bind(id,String(row.user_id),JSON.stringify(targets)).all()).results||[];
+				if(targetStates.some(target=>target.status==='pending'))continue;
+				const failedTargets=targetStates.filter(target=>target.status==='failed');
+				if(failedTargets.length)throw new Error(failedTargets.map(target=>target.target_chat_id+'：'+target.error).join('；'));
+				if(targetStates.length!==targets.length)throw new Error('冻结目标状态不完整，保留待重试');
 				await renew();
 				const banSaved=await env.DB.prepare('UPDATE ad_dryrun_close_cases SET ban_done=1,error=? WHERE session_id=? AND row_id=?')
-					.bind(previous?'本群同用户封禁已由流水 #'+previous.id+' 完成':'',id,Number(row.id)).run();
+					.bind(targetStates.some(target=>target.status==='skipped')?'部分目标已合法跳过，具体原因见逐目标结果':'',id,Number(row.id)).run();
 				if(banSaved?.success===false)throw new Error('封禁成功步骤记账失败，保留重试核验');
 				if (!Number(row.delete_done)) {
 					const messageId = Number(evaluation?.snapshot?.dryRunMessageId) || 0;
-					if (!messageId && evaluation?.snapshot?.dryRunNoOriginalMessage === true) {
+					const sourceModes=await readStrictAutomaticAdModes(env,[String(row.chat_id)]);
+					const sourceBecameIndependent=String(row.ban_policy).startsWith('global_')&&automaticAdConfiguredGroups().includes(String(row.chat_id))&&!isKillerModeGroup(row.chat_id)&&sourceModes.get(String(row.chat_id))==='independent';
+					if(sourceBecameIndependent){
+						await env.DB.prepare("UPDATE ad_dryrun_close_cases SET delete_done=1,delete_state='independent' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();
+					} else if (!messageId && evaluation?.snapshot?.dryRunNoOriginalMessage === true) {
 						const noMessageSaved = await env.DB.prepare("UPDATE ad_dryrun_close_cases SET delete_done=1,delete_state='none' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();
 						if (noMessageSaved?.success === false) throw new Error('无需删除的消息状态记账失败');
 					} else {
@@ -30695,7 +31069,7 @@ async function verifyAdImageVisibleContent(env, media, encoded, judge) {
 	const key = 'image_content_v2:' + String(media?.fileUniqueId || '');
 	try {
 		const saved = JSON.parse(await readAdScanState(env, key, 'null'));
-		if (saved?.version === 2 && ['ad', 'clean'].includes(saved.verdict) && adImageContentSignature(saved.signature)) return saved;
+		if (saved?.version === 2 && ['ad', 'clean','pending'].includes(saved.verdict) && adImageContentSignature(saved.signature)) return saved;
 	} catch (_) { /* 缺失或损坏的核验记录重新取实际内容。 */ }
 	const described = await describeAdImageSimilarityContent(env, encoded);
 	if (!described.ok) return { verdict: 'pending', reason: described.reason, contentVerified: false };
@@ -30708,7 +31082,7 @@ async function verifyAdImageVisibleContent(env, media, encoded, judge) {
 	const verdict = reliable ? 'ad' : (protectedContent || (signature.ad === false && signature.confidence >= 0.85)) ? 'clean' : 'pending';
 	const result = { version: 2, verdict, contentVerified: reliable, signature, category: judge?.category || '',
 		reason: protectedContent ? 'technical_content_exempt' : reliable ? 'visible_ad_evidence' : 'no_reliable_ad_evidence' };
-	if (verdict !== 'pending') await writeAdScanState(env, key, JSON.stringify(result));
+	await writeAdScanState(env, key, JSON.stringify(result));
 	return result;
 }
 
@@ -31719,12 +32093,19 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	}
 	const staticContent = media.kind === 'photo' || ['sticker', 'document'].includes(media.kind)
 		&& String(media.visionFileId || '') === String(media.fileId || '') && Boolean(media.visionFileId);
+	let savedContent=null;
+	if(options.requireContent===true){
+		try{const saved=JSON.parse(await readAdScanState(env,'image_content_v2:'+key,'null'));
+			if(saved?.version===2&&['ad','clean','pending'].includes(saved.verdict)&&adImageContentSignature(saved.signature))savedContent=saved;
+		}catch(_){/* 未核实的旧缓存不提供OCR内容证据。 */}
+	}
+	const withContent=(value,content=savedContent)=>{
+		const signature=adImageContentSignature(content?.signature);
+		return signature&&value?{...value,contentSignature:signature,contentInspection:staticContent?'bitmap_body':'thumbnail'}:value;
+	};
 	let recheckClean = false;
 	if (options.requireContent === true && staticContent && row?.verdict === 'clean') {
-		try {
-			const saved = JSON.parse(await readAdScanState(env, 'image_content_v2:' + key, 'null'));
-			if (saved?.version === 2 && saved.verdict === 'clean' && adImageContentSignature(saved.signature)) return row;
-		} catch (_) { /* 旧分类正常缓存没有实际内容核验，重新核验一次 */ }
+		if(savedContent?.verdict==='clean')return withContent(row);
 		recheckClean = true;
 	}
 	const recheckWeak = recheckClean || row?.verdict === 'ad' && !isReliableAdImageSource(row);
@@ -31738,7 +32119,8 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 			// （bumpAdImageSender 只对 pending 行生效，所以这里一律是弱来源。）
 			return { ...row, verdict: 'ad', source: 'cross_user', hits: (Number(row.hits) || 0) + 1 };
 		}
-		if (String(row.verdict || '') !== 'pending') return row;
+		if (String(row.verdict || '') !== 'pending') return withContent(row);
+		if(savedContent)return withContent(row);
 		// pending 但没有可下载句柄的（动态贴纸没有缩略图）当下判不了 —— 这正是「漏判」：
 		// 绑了 AI 的部署要把它推给主人人工判，没绑 AI 的部署照旧只登记。
 		if (!String(row.file_id || media.visionFileId || '')) return env.AI ? adImageMiss(row, 'nothumb') : row;
@@ -31838,14 +32220,14 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	if (latestOwner?.owner_verdict) return { ...(latestRow || {}), file_unique_id: key, verdict: latestOwner.owner_verdict, source: 'owner',
 		ownerSimilarity: { verdict: latestOwner.owner_verdict, exact: true, strongMatch: latestOwner.owner_verdict === 'ad', revision: Number(latestOwner.decision_at) || 0 } };
 	if (latestRow?.verdict === 'clean' && ['owner', 'manual'].includes(String(latestRow.source || ''))) return latestRow;
-	if (isReliableAdImageSource(latestRow)) return { ...latestRow, category: judged?.category || '', contentVerified: true };
-	if (verdict === 'pending') return adImageMiss(base, 'error');
+	if (isReliableAdImageSource(latestRow)) return withContent({ ...latestRow, category: judged?.category || '', contentVerified: true },contentResult);
+	if (verdict === 'pending') return withContent(adImageMiss(base,contentResult?.signature?'no_reliable_ad_evidence':'error'),contentResult);
 	if (verdict === 'clean') {
 		const cleanRow = { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid };
 		// 灰区：判了干净，但广告概率（或某个广告类别的概率）够得上 AD_IMAGE_GRAY_MIN。
 		// 明显干净的（实测正常表情包 0.04 上下）不推，否则每张梗图都要主人点一次。
 		const grayProb = Math.max(prob, Number(judged?.categoryProb) || 0);
-		return grayProb >= AD_IMAGE_GRAY_MIN ? adImageMiss(cleanRow, 'gray', grayProb) : cleanRow;
+		return withContent(grayProb >= AD_IMAGE_GRAY_MIN ? adImageMiss(cleanRow, 'gray', grayProb) : cleanRow,contentResult);
 	}
 	// 【2026-10-14 删：不再把 hits 强写成 AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS】
 	// 原实现在这里执行 `UPDATE ad_images SET hits = 5 WHERE hits < 5`，然后判据拼成
@@ -31858,8 +32240,8 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	// 识图判广告的贴纸：整包记为广告包，同包下一张（变体）不再花识图、直接定罪。
 	if (media.setName) await markAdStickerPack(env, String(media.setName), 'auto');
 	const finalRow = latestRow;
-	return Object.assign({}, finalRow || { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid },
-		{ category: String(judged?.category || '') });
+	return withContent(Object.assign({}, finalRow || { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid },
+		{ category: String(judged?.category || '') }),contentResult);
 }
 
 // ===== 识图漏判（2026-11-02）=====
@@ -32275,12 +32657,15 @@ function serializeAdReviewValue(value) {
 		return result;
 	};
 	const bounded = trim(value) || {};
+	if (!Array.isArray(bounded) && Array.isArray(value?.punishmentTargets)) {
+		bounded.punishmentTargets = value.punishmentTargets.map(row=>({chatId:String(row.chatId||''),autoCaseId:String(row.autoCaseId||'')}));
+	}
 	let text = JSON.stringify(bounded);
 	if (text.length <= 32768) return text;
 	if (Array.isArray(bounded)) {
 		while (bounded.length && text.length > 32768) { bounded.pop(); text = JSON.stringify(bounded); }
 	} else {
-		const immutableScope = new Set(['automatic', 'punishmentScope', 'punishmentChatId', 'autoCaseId', 'groupAdContextKey', 'dryRunMessageId', 'dryRunChatId', 'dryRunSessionId', 'dryRunNoOriginalMessage']);
+		const immutableScope = new Set(['automatic', 'punishmentScope', 'punishmentChatId', 'punishmentTargets', 'autoCaseId', 'groupAdContextKey', 'dryRunMessageId', 'dryRunChatId', 'dryRunSessionId', 'dryRunNoOriginalMessage']);
 		const critical = new Set([...immutableScope, 'learningPayload', 'payload', 'textSkeleton', 'matchedTextSkeleton', 'imageId', 'avatarId', 'badgeId', 'customEmojiIds', 'profileShape', 'scoredLinks', 'name', 'username', 'bio', 'text']);
 		const removable = Object.keys(bounded).reverse().filter((key) => !critical.has(key));
 		for (const key of removable) {
@@ -34210,7 +34595,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		}
 	}
 	// 独立群的本群白名单同理（只在独立群读，全局群零额外 SQL）。
-	const localScope = Boolean(chatId) && isIndependentGroup(chatId);
+	let localScope = Boolean(chatId) && isIndependentGroup(chatId);
 	if (localScope && (await resolveLocalAdDetectionSkip(env, chatId, userId)) === 'whitelisted') {
 		return { banned: false, seq: null, reason: 'whitelisted' };
 	}
@@ -34339,6 +34724,16 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	if (auxiliaryDrillGroup && options.drillCloseReplay !== true) {
 		return { banned: false, dryrun: true, seq: null, reason: 'auxiliary_drill_finished', learned: 0, sampleAdded: false };
 	}
+	let automaticRoute = null;
+	if (automatic) {
+		try {
+			automaticRoute = await resolveAutomaticAdTargets(env,chatId,options);
+			automaticScopeGroupIds = automaticRoute.groupIds;
+			localScope = automaticRoute.local;
+			INDEPENDENT_GROUP_IDS = automaticRoute.independentIds;
+			if (localScope && (await resolveLocalAdDetectionSkip(env,chatId,userId)) === 'whitelisted') return { banned:false,seq:null,reason:'whitelisted' };
+		} catch (_) { return {banned:false,seq:null,complete:false,reason:'自动处罚群模式读取失败，未猜测全局范围'}; }
+	}
 
 	let contextEvaluation = evaluation;
 	let contextReady = true;
@@ -34379,14 +34774,24 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	}
 
 	let blacklistCode = 'SKIPPED';
-	let autoCaseId = automatic ? newAutomaticAdCaseId() : '';
+	let autoCaseId = automatic ? String(options.automaticCaseId || newAutomaticAdCaseId()) : '';
+	const automaticTargets = [];
 	try {
 		let added;
 		if (automatic) {
-			const localAdded = await addToGroupBlacklist(env, chatId, [userId], { reason: 'ad_auto', by: 'system', note, autoCaseId });
-			added = { code: localAdded.success.length ? 'ADDED' : localAdded.exists.length ? 'EXISTS' : 'ERROR' };
-			const current = await readGroupBlacklistEntry(env, chatId, userId);
-			if (current?.autoCaseId !== autoCaseId) autoCaseId = '';
+			await ensureAutomaticAdTargetTable(env);
+			for (const gid of automaticScopeGroupIds) {
+				await saveAutomaticAdTarget(env,autoCaseId,gid,userId,chatId,localScope?'local':'global');
+				const localAdded = await addToGroupBlacklist(env,gid,[userId],{reason:'ad_auto',by:'system',note,autoCaseId});
+				const current = await readGroupBlacklistEntry(env,gid,userId);
+				const owned = current?.autoCaseId === autoCaseId;
+				const state = localAdded.failed.length ? 'failed' : owned ? 'pending' : 'skipped';
+				const target = {chatId:gid,autoCaseId,owned,state}; automaticTargets.push(target);
+				await saveAutomaticAdTarget(env,autoCaseId,gid,userId,chatId,localScope?'local':'global',
+					{owned,state,result:owned?{}:{reason:localAdded.failed.length?'blacklist_write_failed':'manual_punishment_retained'}});
+			}
+			for (const gid of automaticRoute.skipped) await skipAutomaticAdCaseTarget(env,{caseId:autoCaseId,userId,chatId:gid,reason:automaticRoute.skipReasons[gid]});
+			added = {code:automaticTargets.some(row=>row.state==='failed')?'ERROR':automaticTargets.some(row=>row.owned)?'ADDED':'EXISTS'};
 		} else added = await addToBlacklist(userId, env, {
 			reason: 'ad_auto', by: 'system', note,
 			// 自动定罪的现场：所在群、消息、原文、逐条判据（与 /pending 案底同一份 reasons）。
@@ -34414,7 +34819,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	}
 	let banResults = [];
 	try {
-		banResults = await banUserFromAllGroups(userId, {
+		const banOptions = {
 			// 入群路径会传 primaryGroupId：事发群【同步】先封，其余群并发补上。
 			// 改动前是 for 串行遍历全部群，每个群 2 次 HTTP（探测 + 封禁）依次排队 ——
 			// 20 个群就是 40 次串行往返，人进群后要好几秒才被请出去。见 banUserFromAllGroups。
@@ -34430,7 +34835,53 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			// 自动检测记的是 system，不是第一主人：扇出跳过独立群，但事发群本身照封（批次 2 再细分独立群口径）。
 			mode: options.drillCloseReplay === true ? 'kick' : localScope ? (await loadGroupLocalSettings(env, chatId)).action : undefined,
 			groupIds: automatic ? automaticScopeGroupIds : manualAdDetectionScopeGroupIds(chatId)
-		});
+		};
+		if (automatic) {
+			const probes = new Map();
+			banOptions.perGroupOptions = gid => probes.has(gid) ? {...banOptions,precheckedMemberProbe:probes.get(gid),probeMembership:false} : banOptions;
+			banOptions.beforeGroup = async gid => {
+				const target = automaticTargets.find(row=>row.chatId===gid);
+				try {
+					const fresh = await resolveAutomaticAdTargets(env,chatId,{...options,automaticPolicy:automaticRoute.policy,autoTargetGroupIds:[gid]});
+					if (!fresh.groupIds.includes(gid)) {
+						const reason = fresh.skipReasons[gid] || 'out_of_scope';
+						await skipAutomaticAdCaseTarget(env,{caseId:autoCaseId,userId,chatId:gid,reason});
+						return {groupId:gid,ok:true,skipped:reason};
+					}
+					if (!target || target.state==='failed') return {groupId:gid,ok:false,error:'自动目标名单或账本未完成'};
+					if (!target.owned) return {groupId:gid,ok:true,skipped:'manual_punishment_retained'};
+					if (options.drillCloseReplay === true || gid !== chatId || options.probeMembership !== false) {
+						const probe = await probeTargetMemberBeforeBan(gid,userId); probes.set(gid,probe);
+						if (probe.state==='unknown') return {groupId:gid,ok:false,automaticNotExecuted:true,error:'无法核对该群原有处置，未执行自动封禁'};
+						const old = await env.DB.prepare('SELECT result FROM ad_automatic_case_targets WHERE case_id=? AND chat_id=? AND user_id=?')
+							.bind(autoCaseId,gid,userId).first();
+						let previous={};try{previous=JSON.parse(old?.result||'{}');}catch(_){}
+						if (probe.state==='already_banned') return {groupId:gid,ok:true,memberProbe:probe,
+							skipped:Number(previous.attempted)===1&&previous.priorState!=='already_banned'?'already_banned':'preexisting_native_ban',
+							automaticNotExecuted:true,automaticPriorState:previous.priorState||'already_banned'};
+					}
+					await saveAutomaticAdTarget(env,autoCaseId,gid,userId,chatId,localScope?'local':'global',
+						{owned:1,state:'executing',result:{attempted:true,priorState:probes.get(gid)?.state||'unobserved'}});
+					const last = await resolveAutomaticAdTargets(env,chatId,{...options,automaticPolicy:automaticRoute.policy,autoTargetGroupIds:[gid]});
+					if (!last.groupIds.includes(gid)) {
+						const reason=last.skipReasons[gid]||'out_of_scope';
+						await skipAutomaticAdCaseTarget(env,{caseId:autoCaseId,userId,chatId:gid,reason});
+						return {groupId:gid,ok:true,automaticNotExecuted:true,skipped:reason};
+					}
+					return null;
+				} catch (_) { return {groupId:gid,ok:false,automaticNotExecuted:true,error:'自动处罚群模式读取失败，未执行该群处罚'}; }
+			};
+			banResults = await banUserFromAllGroups(userId,banOptions);
+			for (const result of banResults) {
+				const target = automaticTargets.find(row=>row.chatId===String(result.groupId));
+				if (!target || !target.owned || result.skipped==='independent_mode') continue;
+				try { await saveAutomaticAdTarget(env,autoCaseId,result.groupId,userId,chatId,localScope?'local':'global',
+					{owned:1,state:result.skipped?'skipped':result.ok?'done':'failed',result:{ok:result.ok,skipped:result.skipped||'',error:result.error||'',
+						attempted:result.automaticNotExecuted!==true&&!result.skipped,priorState:result.automaticPriorState||result.memberProbe?.state||'unobserved'}}); }
+				catch (_) { result.ok=false; result.error='自动处罚结果记账失败，保留重试'; }
+			}
+			if (Array.isArray(options.autoTargetGroupIds)) for (const gid of automaticRoute.skipped) banResults.push({groupId:gid,ok:true,skipped:automaticRoute.skipReasons[gid]||'out_of_scope'});
+		} else banResults = await banUserFromAllGroups(userId,banOptions);
 	} catch (error) {
 		console.error('[广告检测] 全群封禁失败:', error);
 	}
@@ -34514,6 +34965,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		({ learned, sampleAdded, skeletons = 0 } = await learnAdFeaturesOnVerdict(env, evaluation, {
 			userId,
 			ownerConfirmed: options.ownerConfirmed,
+			globalDryRunCollect: options.fullEvaluationCollected === true || Boolean(evaluation.learningPayload && evaluation.globalDrillAssets),
 			whitelist: options.whitelist,
 			sampleText: options.sampleText,
 			sampleSource: options.sampleSource
@@ -34548,7 +35000,8 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	let seq = null;
 	if (ownerId) {
 		// 归属字段排在最前并以本次值覆盖：即便超长现场被限长，也不能丢标记而回退成全局回滚。
-		const punishmentMarker = { automatic, punishmentScope: automatic ? 'local' : 'global', punishmentChatId: chatId, autoCaseId, groupAdContextKey };
+		const punishmentMarker = { automatic, punishmentScope: automatic && localScope ? 'local' : 'global', punishmentChatId: chatId,
+			autoCaseId,groupAdContextKey,...(automatic?{punishmentTargets:automaticTargets.map(row=>({chatId:row.chatId,autoCaseId:row.autoCaseId}))}:{}) };
 		evaluation.snapshot = Object.assign({ ...punishmentMarker }, evaluation.snapshot || {}, punishmentMarker);
 		if (evidenceMessageId) evaluation.snapshot.evidenceMessageId = evidenceMessageId;
 		seq = await allocateAdPendingSnapshot(env, ownerId, {
@@ -34578,12 +35031,13 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			// 回执底部挂两档纠错按钮：主人不用手打 /ignore <序号>（他手上未必有那个号），
 			// 也不用去查 /unban 的黑名单硬闸门 —— 看完判据当场就能点。见 buildAdNoticeKeyboard。
 			const groupLabel = input?.chatTitle ? '<a href="https://t.me/c/' + escapeHtml(chatId.replace(/^-100/, '')) + '">' + escapeHtml(input.chatTitle) + '</a> ' : '';
-			const scopeLine = automatic ? '\n范围：本群自动封禁（' + groupLabel + '<code>' + escapeHtml(chatId) + '</code>），未加入全局黑名单' : '';
+			const scopeLine = automatic ? localScope ? '\n范围：独立群本群自动治理（' + groupLabel + '<code>' + escapeHtml(chatId) + '</code>）'
+				: '\n范围：联动 '+automaticScopeGroupIds.length+' 个非独立治理群；独立群不参与，逐群记录自动处罚归属' : '';
 			await sendTelegramMessageChunks(ownerId, notice + scopeLine, buildAdNoticeKeyboard(seq, userId, { automatic }), evidenceMessageId);
 		} catch (error) {
 			console.error('[广告检测] 推送判定通知失败:', error);
 		}
-		if (automatic) await notifyIndependentGroupCreatorAdCase(env, chatId, seq, userId, notice + '\n范围：本群自动封禁（<code>' + escapeHtml(chatId) + '</code>）');
+		if (automatic && localScope) await notifyIndependentGroupCreatorAdCase(env, chatId, seq, userId, notice + '\n范围：本群自动封禁（<code>' + escapeHtml(chatId) + '</code>）');
 	}
 
 	await deleteAdScreening(env, userId);
@@ -34593,7 +35047,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		+ ' 黑名单=' + blacklistCode + ' 封禁=' + banSummary
 		+ ' 指纹=' + learned + ' AI样本=' + (sampleAdded ? 1 : 0)
 	);
-	return { banned: true, seq, blacklistCode, banSummary, learned, sampleAdded, skeletons, local: automatic, automatic, autoCaseId,
+	return { banned: true, seq, blacklistCode, banSummary, learned, sampleAdded, skeletons, local: automatic && localScope, automatic, autoCaseId,
 		complete: options.drillCloseReplay === true ? blacklistCode !== 'ERROR' && banResults.length > 0 && banResults.every(row => row.ok === true) : undefined,
 		banResults: options.drillCloseReplay === true ? banResults : undefined };
 }
@@ -34835,571 +35289,32 @@ async function detectAdOnJoin(message, env, ctx) {
 // 返回 true 表示已处置（调用方应立即 return）；'observe' 表示转入观察（调用方继续走后续逻辑，
 // 但不把这条正文写进 moderation_messages —— 那是 /search 的检索源）；false 表示放行。
 async function detectAdOnMessage(message, env) {
-	if (!env?.DB) return false;
-	const chat = message?.chat;
-	const from = message?.from;
-	if (!chat || !from) return false;
-	// 用户白名单：整条判定链不进 —— 闸一、闸二、评分、AI、头像、图片、指纹全跳过。
-	// 放在最前面而不是各层内部：豁免要的是「一个字节都不判」，
-	// 在层里逐个加豁免条件迟早漏一处，漏的那处照样会写观察记录、照样会推通知。
-	if (await isAdUserWhitelisted(env, from.id)) return false;
-	// 【2026-09-21 bot 消息不再整体免检】原来这里是 `from.is_bot` 直接 return false，
-	// 于是【任何 bot 发的消息都不进广告检测】。线上被这样利用：
-	// 广告号艾特若干 @xxxbot 后自行删除原消息，那些 bot 并不在群里，
-	// 而是由一个常驻 bot 账号把广告正文带引用重新发出来（引用的还是主人自己的
-	// /ban / /spam 命令消息）—— 主人处置一次，广告就被重发一次，且重发的那条一律免检。
-	// 现在只豁免三类（自己 / 匿名管理员 / 白名单协作 bot），其余 bot 走完整检测。
-	// 换 handle 无效：判据是 analyzeAdOutlets 的「多个 bot 结尾 handle 同现」等结构特征，
-	// 不依赖任何具体 handle 名单（快照 #1961 正是靠「引流出口×3(含bot)」命中的）。
-	if (isAdExemptBot(from)) return false;
-	if (!isConfiguredGroup(chat.id)) return false;
-	// 独立群：本群白名单 / 本群关了检测 → 整条判定链不进（全局群直接返回 ''，不读表）。
-	if (await resolveLocalAdDetectionSkip(env, chat.id, from.id)) return false;
-
-	// 临时诊断开关：环境变量 AD_DEBUG_DUMP_UPDATE=1 时，把本群每条消息的 update 原文打进日志。
-	// 刻意放在【所有豁免检查之前】—— 主人 / 管理员会在下面几行直接 return，
-	// 若放在后面，主人自己转发一条同款广告做取样时一行日志都不会打。
-	//
-	// 用途：2026-09 线上漏放 50+ 广告号，那批号的正文只有一个字母（v/z/n/x），
-	// 广告词疑似在转发体里，而 getAdDetectionBodyText 只读 text/caption。
-	// 需要真实 update JSON 才能确定 Telegram 把转发原文放在哪个字段。
-	//
-	// ⚠️ 取样完成后必须删掉这段：它会把群内消息全文打进 Worker 日志，属于隐私泄露面。
-	if (String(env.AD_DEBUG_DUMP_UPDATE || '') === '1') {
-		try {
-			console.log('[广告检测·DEBUG] update dump = ' + JSON.stringify({
-				text: message.text ?? null,
-				caption: message.caption ?? null,
-				forward_origin: message.forward_origin ?? null,
-				forward_from_chat: message.forward_from_chat ?? null,
-				forward_from: message.forward_from ?? null,
-				forward_sender_name: message.forward_sender_name ?? null,
-				quote: message.quote ?? null,
-				external_reply: message.external_reply ?? null,
-				reply_to_message: message.reply_to_message
-					? { text: message.reply_to_message.text ?? null, caption: message.reply_to_message.caption ?? null }
-					: null,
-				entities: message.entities ?? null,
-				caption_entities: message.caption_entities ?? null,
-				via_bot: message.via_bot?.username ?? null,
-				sender_chat: message.sender_chat ?? null,
-				from: { id: from.id, first_name: from.first_name ?? null, last_name: from.last_name ?? null, username: from.username ?? null },
-				__bodyTextNow: getAdDetectionBodyText(message)
-			}));
-		} catch (error) {
-			console.error('[广告检测·DEBUG] dump 失败:', error);
-		}
-	}
-	if (Array.isArray(message.new_chat_members) && message.new_chat_members.length) return false;
-
-	const userId = from.id;
-	if (isAdDetectionExemptUser(userId)) return false;
-
-	// checklist 消息的 text / caption 恒为 undefined（官方：checklist 与它互斥），
-	// 所以这里用短路回退 —— 有 text/caption 时行为与改动前逐字节一致，
-	// 只有 checklist 消息才会落到 checklist 那一支。这一处改完，下面的
-	// 早退闸门、闸一/闸二/AI 补查三处 payload.text、指纹、AI 语义、四通道
-	// 【全部自动看到 checklist 的文字】，不必逐处接线。
-	//
-	// 【2026-10-15 补：链接预览卡（web_page）—— 同一个道理，同样只改这一处】
-	// 线上漏放一整类广告：群里每隔 8 分钟发一次「正文两个字 + 预览卡」，
-	// 色情语全在预览卡的标题与描述里，引流链接在 web_page.url 上。
-	// 【为什么必须改这里，改 getAdDetectionBodyText 没用】那个函数在这个入口里
-	// 只出现在 DEBUG 日志那一行，全文件另一个调用点是通知里的 messagePreview ——
-	// 它压根不参与判定。真正喂给下面四条通道的是这个局部 text。
-	// 端到端实测过这个坑：形态 C 判据已经 guilty=true，而 detectAdOnMessage 照旧
-	// 返回 false，就是因为判据层拿到的 payload.text 仍是那两个字。
-	// 预览卡文案并进来之后，早退闸门、闸一/闸二/AI 补查、指纹、AI 语义、四通道
-	// 与 checklist 那次一样【全部自动看到】，不必逐处接线。
-	const ownText = String(message.text ?? message.caption ?? '').trim()
-		|| extractAdChecklistText(message);
-	const text = [ownText, extractAdWebPageText(message)].filter(Boolean).join(' ').trim();
-	if (isTelegramSlashCommand(text)) return false;
-	const forwardChat = message.forward_from_chat || message.forward_origin?.chat || null;
-	// 引用体正文：这条消息引用/回复的那条【别人的】消息里的文字。
-	// 必须参与早退判断 —— 「正文为空 + 只引用一条广告」是漏放形态的极端版，
-	// 只看 text 与 forwardChat 会在这里就 return，后面四条通道一条都跑不到。
-	const quotedText = getAdQuotedText(message);
-	// 分享名片（contact）的显示名。名片消息的 text / caption 【恒为空】，
-	// 广告内容全写在名片显示名里（实例：昵称「假钞玩妹交流群🔥快递面交都可」+ 电话 +98 993 238 8241），
-	// 所以不取它 → 下面那道早退闸门会把整条消息当「空消息」return，四条通道一条都跑不到。
-	// getContactText（:5107）从一开始就定义好了，却只被快照预览引用，从没接进评分链 —— 这才是漏检真因。
-	//
-	// 【只取显示名，不取 phone_number / vcard】按主人口径「昵称带广告就杀，无需管国内外号」：
-	//   · phone_number 是纯数字，进 AI 语义层只会稀释广告词权重，且号码国别几乎零区分力
-	//     （旧代码实测：广告名片外国号占比 17%、正常名片 20%，拿它当判据反而漏杀）；
-	//   · vcard 是原始格式串（FN: / TEL: 字段名），字段名进语义层是纯噪声，
-	//     而它承载的显示名内容与这里取的完全重复。
-	// 判据本体【一个新正则都不加】，直接复用现有 judgeAdStructure 的「招揽 ∧ 行业两类同现」。
-	// 2026-09-09 离线实测【纠正】此处原先写的验算：上例那句在四张词表与两组正则里
-	// 逐词零命中，形态 A 并不成立 —— 通路通了也定不了罪，同一句话发在正文里一样杀不掉。
-	// 补词后才真正成立：「面交」进 AD_TRADE_VERBS → solicit；「假钞」进 AD_BUSINESS_KEYWORDS → biz。
-	// 所以名片显示名的误封门槛与普通正文查杀完全同档，不是旧代码那种单词命中即杀。
-	//
-	// looksLikePersonName 是【反向白名单】（旧代码 :6632 移植）：显示名像人名就整条不看，
-	// 把「张三 / 妈妈 / 快递小哥 / John Smith」这类正常名片在进判据之前就摘出去。
-	// 它只减误封、对漏检零影响 —— 广告名片必须把广告写进显示名，写了就一定不像人名。
-	const contactDisplayName = message?.contact
-		? [message.contact.first_name, message.contact.last_name].filter(Boolean).join(' ').trim()
-		: '';
-	const contactName = looksLikePersonName(contactDisplayName) ? '' : contactDisplayName;
-	// ===== 正文图片（裸图片消息此前在这里被整体丢弃）=====
-	//
-	// 下面这道闸门原先只认 text / 转发 / 引用体 / 名片显示名四样。一条
-	// 【caption 为空的图片消息】这四样全空 —— 于是整条消息在这里就 return，
-	// 后面的名册、评分、四条通道、头像判据一条都跑不到。而引流图的全部话术
-	// 都写在图片像素里，caption 恒为空（线上样本：同款引流图连发三条）。
-	//
-	// 提取是纯函数、零成本；真正花 D1 的是后面的 loadAdImageForMessage，
-	// 那一步同样被 media 为空挡在纯文本消息之外 —— 「稳定态核心 SQL ≤ 3 条」
-	// 那条断言测的正是纯文本消息，不会因此变红。
-	const media = extractAdMedia(message);
-	if (!text && !forwardChat && !quotedText && !contactName && !media) return false;
+	if (!env?.DB || !message?.chat || !message?.from || isAdExemptBot(message.from)) return false;
+	const chat = message.chat, from = message.from, userId = from.id;
+	if (chat.type === 'private' || !isConfiguredGroup(chat.id) && !isKillerModeGroup(chat.id) || isTelegramServiceMessage(message) || !hasAdMessageContent(message)
+		|| isTelegramSlashCommand(message.text) || classifyAdReplyIntent(message.text)) return false;
+	if (isAdDetectionExemptUser(userId) || await isAdUserWhitelisted(env, userId)
+		|| await resolveLocalAdDetectionSkip(env, chat.id, userId)) return false;
 	if (!(await adDetectionReady(env))) return false;
+	if (await isAdminForAdDetection(chat.id, userId) || await isConfiguredGroupAdmin(env, userId)) return false;
 
-	const config = loadAdDetectionConfig(env);
-	const whitelist = await loadAdDomainWhitelist(env);
-
-	// 管理员豁免。零成本的确定性排除，放在最前面 —— 也因此管理员【不进名册】，
-	// 不占用定时扫描的每日配额。代价是「曾以普通成员身份发言、后来升管理员」的人
-	// 会留在名册里被 cron 扫到，那一轨自己也做一次豁免检查兜底。
-	// 这里用 isAdminForAdDetection 而不是 checkIfUserIsAdminInGroup：
-	// 前者带 5 分钟按群缓存（同群所有人共用一份列表），后者是 /ban 的鉴权入口不能缓存。
-	if (await isAdminForAdDetection(chat.id, userId)) return false;
-	// 任意配置群的管理员同样整条链不进（主人 2026-10-15 口径）：在 A 群是管理员的人，
-	// 在 B 群（他也是配置群）只是普通成员时发广告，一样一个字节都不判。
-	// 与上一行分工：上一行管【本群】且走实时 API（刚被提权那一刻最及时），
-	// 这一行管【其他配置群】且读同步表（零 Telegram 请求，429 也照常生效）。两句都要。
-	if (await isConfiguredGroupAdmin(env, userId)) return false;
-
-	const nowSeconds = Math.floor(Date.now() / 1000);
-	// 先读名册再 upsert —— 顺序不能颠倒：upsert 会把 last_seen 推到现在，
-	// 而我们要的是【本次发言之前】的 bio_checked_at。颠倒后 member 永远是刚写的那行，
-	// 但 bio_checked_at 不被 upsert 覆盖，所以实际仍能读对；保持这个顺序只是为了让
-	// 「首次发言」能明确地表现为 member === null，语义清晰。
-	const member = await readAdGroupMember(env, userId);
-	await upsertAdGroupMember(env, userId, chat.id, from, nowSeconds);
-
-	// 观察窗口历史分。作用是：入群时够可疑但没到封禁线的人，窗口期内再发广告消息即合并裁决。
-	// readAdScreening 是一次 D1 主键查询，本来就在这条路径上。
-	const screening = await readAdScreening(env, userId);
-	const historyScore = screening ? screening.score : 0;
-
-	// 历史分累加。抽成闭包是因为下面两道闸各要用一次，而累加必须【只做一次】——
-	// 闸一累加过、闸二再累加一遍会把历史分算两遍，凭空多出几分。
-	//
-	// 准入条件【本次这条消息必须自己拿出新证据】（2026-09-07 第二起误封事故后补）：
-	//
-	// 历史分取自 ad_user_screening.score，那是【上一次评分的总分】，里面本来就含了
-	// bio 链接 / username / 昵称这些恒定不变的静态资料分。而这次评分又会把同一个 bio、
-	// 同一个 username 从头算一遍 —— 同一份证据算了两次（double counting）。
-	// 再叠上 upsertAdScreening 的 score = MAX(旧, 新)（历史分只涨不跌）与每次 upsert
-	// 都刷新 expires_at（窗口无限续期），一个人一旦被判过一次 observe 就很难再降下来。
-	//
-	// 事故形态：观察线 5 与封禁线 7 只差 2 分，而「bio 含非白名单引流链接」恰好是
-	// 恒定的 +2 —— 于是【任何 bio 里放了链接又被判过一次 observe 的人，下一条消息
-	// 必被封，无论他说什么】。被误封用户 @MiLov1900 触发封禁的那条消息是
-	// 「要beta版才能用 那要等了」，behaviorScore 实测 0；8 分里 5 分是历史分，
-	// 另外 3 分正是与历史分重复的同一份静态资料（bio 链接 +2、username +1）。
-	//
-	// 所以要求 behaviorScore > 0 才让历史分参与裁决：历史分的设计语义是「累积多次
-	// 可疑*行为*」，「又干了一次」的真实含义就是本次消息自身有正文 / 上下文 / 转发证据，
-	// 而不是「同一份资料卡又被重算了一遍」。
-	//
-	// 这道闸不会放过真广告：资料已经明显到该封的号，静态分自身就够阈值，
-	// evaluateAdSuspect 里就判成 ban 了，进不到这里的分支；指纹硬命中与 AI 命中同理。
-	// 真广告号要投放就必须发正文或转发，那一刻 behaviorScore > 0，历史分【全额】参与
-	// —— 刻意不封顶：实测「正文首尾对称 emoji（+3）+ 历史 4 分 = 7」这类真广告
-	// 正好卡在封禁线上，任何封顶都会把它放过去。
-	// 被挡下的只有「资料分卡在观察线、却始终没发过任何广告内容」这一类 —— 那正是误封池。
-	//
-	// double counting 已于 2026-09-08 根治：观察记录改为【只存行为分】
-	// （upsertAdScreening 的 score 来自 evaluation.retainScore，不再是总分），
-	// 所以 historyScore 里再也不含 bio / username / 昵称这些恒定项。
-	// 本闸门（behaviorScore > 0）作为第二道保险保留：即使历史分是干净的行为分，
-	// 也只在「本次又干了一次」时才允许累加，语义才自洽。
-	const applyHistory = (evaluation) => {
-		if (historyScore <= 0) return evaluation;
-		if (evaluation.positionEvidence) {
-			evaluation.reasons.push('观察历史仅作记录，不作为新的独立位置证据');
-			return rejudgeAdPositionEvidence(evaluation);
-		}
-
-		if (!(Number(evaluation.behaviorScore) > 0)) {
-			evaluation.reasons.push(
-				'观察窗口历史分 ' + historyScore + ' 未参与裁决（本次消息无新增行为证据）'
-			);
-			return evaluation;
-		}
-
-		evaluation.score += historyScore;
-		evaluation.reasons.push(
-			'+' + historyScore + ' 观察窗口历史分（'
-			+ (AD_LAYER_LABELS[screening.layer] || screening.layer || '结构化评分') + '）'
-		);
-		if (evaluation.verdict !== 'ban' && evaluation.score >= config.scoreThreshold) evaluation.verdict = 'ban';
-		else
-		return evaluation;
-	};
-
-	// ============ 闸一 · 零成本判定（0 个 Telegram 请求）============
-	// 昵称、用户名、正文、转发来源全都在 update 里现成带着，一个字节都不用额外拉。
-	// 实测 9 个真广告样本里有 7 个仅凭这些就够封禁线 —— 广告号要让人看见广告，
-	// 就必须把广告写在别人看得见的地方，而最显眼的地方恰好都是免费的。
-	// 这一闸【完整走三层】（结构分 + 指纹库 + AI 语义）：指纹和 AI 只花 D1 与 Workers AI，
-	// 不花 Telegram 请求，而它们正是自动学习与 /spam 学习成果的落地点，压后到 3 天一次会白费。
-	// 图片指纹【一条消息只读这一次】，闸一闸二共用同一份结果（理由见 loadAdImageForMessage）。
-	// media 为空（纯文本消息）时本行一个 D1 都不发，热路径预算与改动前完全一致。
-	// 【2026-10-13 改：loadAdImageForMessage → judgeAdMediaRealtime】
-	// 原来这张图如果是第一次出现，只会被登记成 pending 就返回 null —— 等 cron
-	// （一天两班）来判，判完还要等【下一次】有人发才命中，等于第一次出现时
-	// 图片这一路完全不产生判据。实时化之后：没判过的当场调一次 clef 出结论
-	// 并落库，判过的直接命中库（零模型成本），跨用户复用照旧。
-	// 退回旧行为的四道闸（无 AI / 额度跑满 / 熔断 / 不是位图）见函数注释。
-	// 【2026-11-02 改：→ judgeAdMediaForMessage】贴纸先查贴纸包（同包变体零识图直接定罪），
-	// 识图没判成 / 灰区的结果带 missReason —— 本条最终没封也没进观察时推漏判通知。
-	const imageRow = media ? await judgeAdMediaForMessage(env, media, userId, { requireContent: true, scopeChatId: chat.id }) : null;
-	const bodyEmojiRows = await readAdCustomEmojiMediaRows(env, extractCustomEmojiIds(message), userId, { scopeChatId: chat.id });
-	const notifyImageMiss = () => (imageRow?.missReason
-		? notifyAdImageMiss(env, {
-			image: imageRow, media, userId, chatId: chat.id, messageId: message.message_id,
-			from, text: text || contactName
-		})
-		: false);
-	const cheapProfile = {
-		firstName: from.first_name || '',
-		lastName: from.last_name || '',
-		username: from.username || '',
-		bio: '',
-		status: '',
-		// 正文里的自定义贴纸 emoji（批次 B-2）。ids 就在 update 的 entities 里现成带着，
-		// 不需要 getChat —— 这是本闸唯一新增的判据来源，且仍然一个 Telegram 请求都不发。
-		customEmojiIds: bodyEmojiRows.filter((item) => item.verifiedAd).map((item) => item.id)
-	};
-	let cheap = applyHistory(await evaluateAdSuspect(
-		env,
-		// text || contactName：名片消息的 text 恒为空，所以不存在覆盖正文的情况。
-		// 用「短路取值」而非拼接，是为了让名片显示名走进 payload.text 后，
-		// 结构评分 / 指纹库 / AI 语义 / 四通道结构查杀【四层全都能看到它】。
-		{ profile: cheapProfile, text: text || contactName, quotedText, forwardChat, media,
-				// 名片消息的手机号（已归一成纯数字）。零 Telegram 请求 —— 就在 update 里。
-				// 只用于指纹复用键，不参与评分，理由见 payload.phone 的说明。
-				phone: message?.contact?.phone_number },
-		// skipMissingBioPenalty：这一闸的 bio 是「没查」而不是「没有」，不能拿它减分。
-		{ config, whitelist, skipMissingBioPenalty: true }
-	));
-	// 正文图片指纹：与头像同位（叠在 applyHistory 之后 = 最终裁决位），
-	// 而且排在闸一 —— 媒体在 update 里现成带着，不需要等 getChat，
-	// 所以「图片是唯一证据」时闸一就能封，不必为一次图片判据多花一个 Telegram 请求。
-	// imageRow 为 null（无媒体 / 尚未入库）时 applyImageVerdict 原样返回，一个字节不改。
-	cheap = applyImageVerdict(cheap, imageRow);
-	cheap = applyCustomEmojiMaterialVerdicts(cheap, bodyEmojiRows);
-	cheap.payload.customEmojiIds = extractCustomEmojiIds(message);
-	cheap.payload.imageVerifiedAd = isVerifiedAdMediaRow(imageRow);
-
-	// ===== 同款自定义 emoji 叠判（批次 B-2 的正文一半）=====
-	// 【为什么闸一也要叠】批次 C 时闸一没有这个调用点，因为 cheapProfile 拿不到
-	// badgeId（那要 getChat）。但正文里的自定义 emoji id 就在 update 的 entities 里，
-	// 闸一现成就有 —— 不叠等于这一层在最常用的那道闸上完全失效。
-	// 【成本】customEmojiIds 为空时函数立即返回，一个 D1 都不发；
-	// 有 id 时也只是查 ad_badges（D1），仍然零 Telegram 请求，
-	// 所以「闸一零 getChat」那条不变量原样保住。
-	cheap = await applyBadgeToEvaluation(env, cheap, cheapProfile, { scopeChatId: chat.id });
-
-	// ===== 名片广告专用定罪（2026-10-11）=====
-	// 与头像、会员标同一层位：message.contact 在 update 里现成带着，
-	// 零 Telegram 请求、零 D1 查询 —— 「闸一零 getChat」的不变量原样保住。
-	// 纯函数，非名片消息一次判定都不做（contact 为空直接原样返回）。
-	// 排在 applyBadgeToEvaluation 之后：名片定罪会覆盖 layer，放在前面会被会员标的
-	// reasons 顺序弄乱（/pending 复核要能一眼看出是哪一层定的罪）。
-	cheap = applyContactCardVerdict(cheap, message);
-
-	// ===== 可疑信号把 bio 冷却期压到 10 分钟（见 AD_SUSPECT_BIO_COOLDOWN_SECONDS）=====
-	// 闸一真拿到正分判据 → 不再让入群那次「bio 还是空的」查询把接下来两小时都挡在深判外；
-	// 0 正分的普通聊天照旧走原分档，稳态零 Telegram 请求的不变量对它原样成立。
-	//
-	// ===== 2026-10-11：新增第二条触发路径（业务词 / 交易动词命中，不论分正负）=====
-	//
-	// 【补的是哪个洞】原判据只认「本次真拿到正分」，而线上漏放的两类样本恰恰拿不到正分：
-	//   · checklist 广告正文只有行业词（「假钞」×5、约炮）→ 掉进「单类词不计分」，
-	//     reasons 里一行以 + 开头的都没有，suspectSignal 恒为 false；
-	//   · 名片广告显示名（「新澳🔥六合彩内幕发布群」）四张词表逐词零命中，同理。
-	// 于是第⑥层生成式判定 —— 它存在的理由正是「词表外话术」—— 对这两类永远够不着。
-	// 这是设计上的自相矛盾：越是词表抓不住的东西越需要它，而它偏偏被关在门外。
-	//
-	// 【为什么这个条件安全】触发之后只做两件事：① bio 冷却期压到 10 分钟（多一次 getChat）；
-	// ② 送一次 LLM（有 AD_LLM_DAILY 每日上限 + 同载荷内存去重兜着）。
-	// 封不禁人仍然由原有评分阈值与 LLM 的 0.85 采信线说了算，这一行【不改任何裁决】。
-	// 技术群里天天说的「代理 / 订阅 / 节点 / 教程」全是豁免词，不在下面这两张表里，
-	// 普通技术讨论一条都不会被它拉起来 —— 这两行的命中者，本来就已经在 reasons 里
-	// 留下了「仅业务关键词」「仅交易动词」的记录，它们只是此前没资格往下走而已。
-	//
-	// ===== 2026-10-19：再加第三条路径（形态 E 单边命中）=====
-	// 上面那两条补完之后仍有两类漏放（主人截图实证，离线沙箱实跑确认两条都是 0 分放行）：
-	// 「能稳定收米的来洗米 一天八千 @hxdalao」与「支付宝微信帮我收款一天7ooo」——
-	// 前者「收米 / 洗米 / 八千」四张表零命中，后者「收款」只活在形态 E 的正则里、
-	// 不在上面那两张触发表中。同一轮也补了形态 E 自己的判据（AD_MONEY_AMOUNT_RE
-	// 现在认中文数额与 `7ooo` 这类字母冒充）。三条路径的合并与边界见 isAdSuspectSignal。
-	const suspectSignal = isAdSuspectSignal(text || contactName, cheap.reasons,
-		{ contactCard: Boolean(contactName) });
-	// ===== 送审判据与 bio 冷却判据在这里分家（2026-11）=====
-	// 上面那个 suspectSignal 继续【只】管 bio 冷却期（下一行的 needBio）——
-	// 它一放宽就等于放宽热路径 getChat，而「稳态普通聊天零 Telegram 请求」是硬不变量。
-	// 要不要花一次 Workers AI 额度，改由 shouldSubmitAdForReview 独立决定，
-	// 它多出 c/d/e/f 四路判据却一个 Telegram 请求、一条 SQL 都不加。
-	// 详见 shouldSubmitAdForReview 的注释。
-	const review = shouldSubmitAdForReview({
-		suspectSignal,
-		text, contactName, quotedText, forwardChat, media,
-		whitelist,
-		// 业务词上下文：有它 hasAdSuspiciousLink 才认「@handle + 行业指向」那一档。
-		// 从闸一已经算好的 reasons 里读，不重扫词表。
-		businessHit: (cheap.reasons || []).some((line) => String(line).includes('业务关键词')),
-		member, userId, nowSeconds,
-		sampleEnabled: adLLMPoolLimit(config, 'sample') > 0
+	// 日常与演练共用完整判定；资料和素材沿既有缓存复用，不再由旧分数或 bio 冷却提前否决。
+	await upsertAdGroupMember(env, userId, chat.id, from, Math.floor(Date.now() / 1000));
+	const result = await collectGlobalDryRunEvaluation(env, message, null, {
+		normalDetection: true, scopeChatId: String(chat.id)
 	});
-	const bioCheckedAt = Number(member?.bio_checked_at) || 0;
-	const needBio = suspectSignal
-		? (bioCheckedAt <= 0 || nowSeconds - bioCheckedAt >= AD_SUSPECT_BIO_COOLDOWN_SECONDS)
-		: shouldCheckAdBio(member, nowSeconds);
-
-	// ===== AI 层单独定罪 → 强制补查 bio 再复评（2026-09-22）=====
-	//
-	// 这是 @svipultra 连环误封的第 ①② 环：闸一的 bio 写死为空 + ban 就地返回，
-	// 于是他简介里的「私聊」「Bot」两个豁免词【从头到尾没被读到过】，得分停在 0；
-	// 而 #1615 那道豁免否证的条件是 score < 0，0 < 0 为假，那道闸也跟着失效。
-	// 查一次 bio 就能同时解决这两环 —— 豁免词一进来分就是负的，现成的 aiExemptVeto 自动生效。
-	//
-	// 【触发条件刻意收到最窄】必须同时满足：
-	//   · verdict 是 ban（不是 ban 的本来就要往下走闸二，不归这里管）
-	//   · layer === 'ai'（AI 层定的罪）
-	//   · score < 封禁线（评分层自己没撞线 —— 撞了线就不是「AI 单独定罪」）
-	// 所以评分层撞阈值、指纹层命中、四通道结构查杀这三种定罪【照旧就地处置，
-	// 一次 getChat 都不会多花】。只有「四层里唯独 AI 说有罪」这一种最弱的证据形态才补查。
-	//
-	// 【为什么无视 bio 冷却期】shouldCheckAdBio 是给稳态聊天做节流的，而这里是一次
-	// 即将发生的封禁。@svipultra 早就有 bio_checked_at 了，尊重冷却期等于第 2 次之后
-	// 永远查不到他的简介 —— 那正是他连中 5 次的原因。AI 单独定罪本身是低频事件，
-	// 为它多花一个 Telegram 请求，换的是把误封挡在发生之前。
-	// ===== 可疑但不够封时，闸一同步跑第⑥层 =====
-	//
-	// 【为什么闸一是唯一还够得着的位置】闸二要等 bio 冷却到期，而入群那次查询
-	// 常常查到的是空 bio 却把之后两小时都挡在外面 —— 线上 11/15 人工封的号正是
-	// 这个形态（闸一 score 1 或 −1、闸二没进、观察窗口也没有）。冷却已由上面那步
-	// 压到 10 分钟，但 10 分钟内的广告消息仍然只有这一层够得着。
-	//
-	// 【成本为什么可以接受】触发条件是 suspectSignal —— 闸一本次真拿到了正分判据。
-	// 0 正分的普通聊天一个调用都不发（占绝大多数），「稳态零额外开销」不变；
-	// 可疑消息才花这一次，另有每日上限与同载荷内存去重两道闸兜着。
-	// 闸一本就有同步的 bge-m3 嵌入调用，这一层不改变它的性质，只是更慢一点。
-	// cheapProfile 没有 bio（闸一是零 getChat 路径），所以这一层判的是昵称 + 正文。
-	if (review.submit) {
-		console.log('[广告检测·送审] user=' + userId + ' 池=' + review.pool + ' 理由=' + review.reason);
+	const evaluation = result.evaluation;
+	if (evaluation.bioChecked === true || evaluation.globalDrill?.completeness?.bio?.complete === true) {
+		await markAdBioChecked(env, userId, Math.floor(Date.now() / 1000));
 	}
-	let decision = review.submit
-		? await applyAdLLMToEvaluation(env, cheap, config, {
-			profile: cheapProfile, text: text || contactName,
-			// 名片形态进硬证据闸：这两个字段只在名片消息里非空，普通消息一个字节都不多传。
-			contactCardName: contactName,
-			contactPhone: String(message?.contact?.phone_number || '')
-		}, { pool: review.pool })
-		: cheap;
-	let bioVerified = false;
-	if (cheap.verdict === 'ban' && cheap.layer === 'ai' && cheap.score < config.scoreThreshold) {
-		const verifyProfile = await fetchAdUserProfile(userId, from);
-		// 与闸二同口径：不查 getChatMember，status 留空由 formatAdMemberStatus 渲染成「未查询」。
-		verifyProfile.status = '';
-		await markAdBioChecked(env, userId, nowSeconds);
-		// 只在真拿到 bio 时才改判。getChat 失败（多半是 429）时维持闸一结论 ——
-		// 拿不到证据不等于证据不利，但也不能让一次网络抖动把该封的号放过去。
-		if (verifyProfile.bioFetched === true) {
-			bioVerified = true;
-			const verifyEvaluation = applyHistory(await evaluateAdSuspect(
-				env,
-				{ profile: verifyProfile, text: text || contactName, quotedText, forwardChat,
-				// 名片手机号同样带进复评：复评是换 bio 重跑整条判据链，
-				// 漏了它会让同一个人的号码指纹在这条路上查不到。
-				phone: message?.contact?.phone_number },
-				// 这次是【据实传】：bio 真查到了，空简介该减分就减分。
-				{ config, whitelist }
-			));
-			const verifyAvatarEvaluation = await applyAvatarToEvaluation(env, verifyEvaluation, verifyProfile, { scopeChatId: chat.id });
-			decision = await applyBadgeToEvaluation(env, verifyAvatarEvaluation, verifyProfile, { scopeChatId: chat.id });
-			console.log('[广告检测] AI 单独定罪已补查 bio 复评 user=' + userId
-				+ ' 闸一=' + cheap.verdict + '/' + cheap.score
-				+ ' 复评=' + decision.verdict + '/' + decision.score);
-		}
-	}
-
-	// 闸一够封禁线就地处置，不再花 getChat —— 已经确定要封的人，bio 是什么无关紧要。
-	// （唯一的例外是上面那段 AI 单独定罪的补查，它已经把 decision 换成复评结论了。）
-	if (decision.verdict === 'ban') {
-		// 任意配置群的群主/管理员全群豁免：定罪后才查（低频），当前群入口处已查过。
-		if (await isAdminInAnyConfiguredGroup(userId, chat.id)) {
-			console.log('[广告检测] user=' + userId + ' 是其他配置群的管理员，豁免不封');
-			return false;
-		}
-		const enforced = await enforceAdDetection(env, {
-			userId,
-			chatId: chat.id,
-			chatTitle: chat.title || '',
-			messageId: message.message_id, message
-		}, decision, { config, whitelist });
-		return enforced?.groupFeedback !== true;
-	}
-
-	// ===== 第⑥层判了广告却被拦下 → 强制进闸二拉资料再判（2026-11-01）=====
-	//
-	// 【治哪一类】9214480007 / 9283758507：正文「可以收款的来 赚3千」「会用微信收款来 赚5k」，
-	// 闸一 +5 金额招揽 + 模型 0.9 以上判广告，但闸一用的是 cheapProfile（没有 bio、没有头像），
-	// 第二证据一条都凑不出 → 降级观察；而 bio 冷却期（10 分钟）又挡住了闸二 ——
-	// 他们 bio 里明写的 t.me/+ 私有邀请链接（+7）、头像上的「点我进群」「点我头像」
-	// 从头到尾没被看到过。
-	// 【只在这一种情况下无视冷却】模型已经判了广告、只差证据 —— 低频，
-	// 反例池拦下的（主人 /ignore 过的形态）不算，那是人给的结论。
-	// 同一个人 60 秒内只强拉一次，防刷屏时每条消息都拉一次 getChat。
-	const decisionReasons = Array.isArray(decision?.reasons) ? decision.reasons : [];
-	const llmNeedsProfile = !bioVerified && decision?.positionNeedsReview === true
-		&& decisionReasons.some((r) => String(r).startsWith('AI 深度判定命中'))
-		&& !decisionReasons.some((r) => String(r).includes('主人此前 /ignore'))
-		&& nowSeconds - bioCheckedAt >= AD_LLM_FORCE_PROFILE_COOLDOWN_SECONDS;
-	const positionNeedsProfile = !bioVerified && decision?.positionDecision?.needsProfile === true
-		&& nowSeconds - bioCheckedAt >= AD_LLM_FORCE_PROFILE_COOLDOWN_SECONDS;
-	if (llmNeedsProfile) {
-		console.log('[广告检测] 第⑥层判广告被拦，强制拉资料复判 user=' + userId);
-	}
-
-	// 闸一没定罪、且这个人的 bio 在冷却期内 —— 到此结束，本条消息 0 个 Telegram 请求。
-	// 这是稳态下的绝大多数情况（正常聊天），也是「不要每条信息都拉」的落点。
-	// bioVerified 短路：上面补查时已经拉过 bio 并复评过了，再进闸二就是拉第二次。
-	if ((!needBio && !llmNeedsProfile && !positionNeedsProfile) || bioVerified) {
-
-		return false;
-	}
-
-	// ============ 闸二 · 查一次 bio（1 个 Telegram 请求）============
-	// 触发条件：首次发言，或距上次查 bio 已超过 AD_BIO_RECHECK_DAYS 天。
-	// 专治闸一抓不到的那一类 —— 昵称「【出租账号】」正文「详情见简介」、
-	// 昵称「小李」正文「在吗」：零成本信号全 0 分，广告【只写在 bio 里】。
-	// 无论 getChat 成功与否都记下时间戳：失败多半是 429，立刻重试只会继续撞墙，
-	// 而 cron 那一轨会按 bio_checked_at ASC 把他重新排上来，不会永久漏掉。
-	const profile = await fetchAdUserProfile(userId, from);
-	// 【热路径不查 getChatMember】。它原本只为拿 restricted 状态，而 restricted 已归零
-	// 不计分（AD_RESTRICTED_STATUS_SCORE = 0），返回值仅用于通知文案里的「群内身份」一行。
-	// 为一行展示文案给每条消息加一个 Telegram 请求不值得，故留空，
-	// 由 formatAdMemberStatus 渲染成「未查询」。
-	profile.status = '';
-	await markAdBioChecked(env, userId, nowSeconds);
-
-	// ===== 正文里的自定义贴纸 emoji（批次 B-2）=====
-	// 【为什么闸二可以花这个钱】与链接解析同一个理由：走到这里 = needBio 为真，
-	// 本来就已经为这次判定花了一个 getChat；形态闸兜底 —— 正文没有 custom_emoji
-	// 实体时 ids 是空数组，下面连一个请求都不发（绝大多数消息走不到这一步）。
-	// 闸一只查库（id 在 update 的 entities 里现成），不碰这一步，
-	// 「闸一定罪零 getChat」那三条断言原样不受影响。
-	profile.customEmojiIds = bodyEmojiRows.filter((item) => item.verifiedAd).map((item) => item.id);
-	if (profile.customEmojiIds.length) {
-		// 拿贴纸包名（set_name）—— 它是这里唯一有判据价值的产出：广告组织的包名
-		// 往往直接写着广告内容，与「资料挂的频道简介含招揽」同一个打法。
-		// 结果按 id 进程内缓存 6 小时，同一个包第二次起零请求。
-		profile.customEmojiPacks = await resolveCustomEmojiStickers(env, profile.customEmojiIds);
-	}
-
-	// ===== 解析资料里挂的频道 / 群 / bot（对齐 menshen resolveLink）=====
-	// 【为什么闸二可以花这个钱】走到这里 = needBio 为真（首次发言或 bio 复查期已到），
-	// 本来就已经为这次判定花了一个 getChat；链接解析再花 0~5 个，且结果按 handle
-	// 缓存 6 小时 —— 群里十个人挂同一个频道只查第一次。形态闸同样兜底：
-	// bio 里没有链接形态，这一步连一个请求都不发。
-	// 闸一不走这里，「闸一定罪零 getChat」三条断言不受影响。
-	// 【先判人，再查链接】与入群线同一道前置。闸二这边必须把正文一起传进去 ——
-	// 资料卡干净但正文在发广告的人要靠 textScore 抬进高档，漏传就会把这类人
-	// 挡在解析之外，白丢掉他挂的链接那 2~3 分。口径与下面 evaluateAdSuspect
-	// 那次的 `text || contactName` 完全一致，两处算的是同一份证据。
-	profile.adLinks = await resolveAdProfileLinksElevated(env, profile, {
-		whitelist,
-		text: text || contactName
+	if (evaluation.verdict !== 'ban') return false;
+	if (await isAdminInAnyConfiguredGroup(userId, chat.id)) return false;
+	const enforced = await enforceAdDetection(env, {
+		userId, chatId: chat.id, chatTitle: chat.title || '', messageId: message.message_id, message
+	}, evaluation, {
+		config: result.config, whitelist: result.whitelist, fullEvaluationCollected: true
 	});
-
-	// 据实传：getChat 成功就正常判定（空 bio 该减分就减），失败则跳过减分。
-	// 两轨用同一个判断依据（profile.bioFetched），阈值与判据完全一致，不另立标准。
-	// 整条判定链收进一个闭包：补查链接后要用同一条链原样重评一次（见下方）。
-	// 第⑥层的结论放进 llmMemo，重评时复用 —— 不重复花额度，也不会因载荷去重丢掉结论。
-	const gate2LLMMemo = {};
-	const judgeGate2 = async () => {
-		const baseEvaluation = applyHistory(await evaluateAdSuspect(
-			env,
-			// 与闸一同一口径传名片显示名。漏传这里会造成一种诡异形态：
-			// 名片消息在闸一（无 bio）没定罪 → 走到闸二拉了 bio 本该更容易定罪，
-			// 结果因为 text 又变回空串，反而比闸一更判不出来。
-			{ profile, text: text || contactName, quotedText, forwardChat, media,
-				// 闸二同样带名片手机号 —— 与闸一同源，否则闸二的复评读不到号码指纹。
-				phone: message?.contact?.phone_number },
-			{ config, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
-		));
-		// 闸二已拉到 getChat，头像就在响应里 —— 读指纹零成本，叠加在历史分之后作最终裁决。
-		// 图片判据【必须在这里再叠一次】：闸二的 baseEvaluation 是重新算出来的，
-		// 闸一叠进去的那份并不跟过来。图片是唯一证据、且闸一没定罪时，
-		// 少了这一行就会在这一步漏回放行。
-		// 叠的是闸前已经读好的 imageRow —— 同一行不读第二遍，热路径 SQL 只付一次。
-		// 两者都只改 verdict / reasons 不碰 score，所以叠放顺序只影响 reasons 的排列，
-		// 不影响分值与阈值比较。
-		const avatarEvaluation = await applyAvatarToEvaluation(
-			env,
-			applyImageVerdict(baseEvaluation, imageRow),
-			profile,
-			{ scopeChatId: chat.id }
-		);
-		// 同款会员标叠在最外层：闸一那条零成本路径拿不到会员标（getChat 还没发），
-		// 所以这一层只在闸二及其后（入群线、AI 补查、cron 复查）生效 ——
-		// 与头像完全同位，热路径的 Telegram 请求数一个都不多。
-		let judged = await applyBadgeToEvaluation(env, avatarEvaluation, profile, { scopeChatId: chat.id });
-		// 正文自定义 emoji 属于已定罪的广告贴纸包 → 直接封（包名闸二已经拿到，零额外请求）。
-		judged = applyCustomEmojiMaterialVerdicts(judged, bodyEmojiRows);
-		judged.payload.customEmojiIds = extractCustomEmojiIds(message);
-		judged.payload.imageVerifiedAd = isVerifiedAdMediaRow(imageRow);
-		// ===== 第四路补位：前三层都没定罪时交给生成式模型 =====
-		// 这是治「样本外话术」的那一处 —— 词表没列到、指纹没学过、bge-m3 样本库里
-		// 没有近似的正文，在这里由模型直接判。载荷口径与上面 evaluateAdSuspect 一致
-		// （text || contactName），两层看到的是同一份内容。
-		judged = await applyAdLLMToEvaluation(env, judged, config, {
-			profile, text: text || contactName,
-			// 与闸一同口径：名片形态要能作为硬证据，否则闸二判到 0.95 也只能观察。
-			contactCardName: contactName,
-			contactPhone: String(message?.contact?.phone_number || '')
-		}, { pool: 'message', llmMemo: gate2LLMMemo });
-		return judged;
-	};
-	let evaluation = await judgeGate2();
-	// ===== 补查资料卡挂的链接（2026-11）=====
-	// 前置分档没让查、但本次已经可疑（observe / AI 判广告 / 头像命中）的人，
-	// 补查他挂的东西；挂的东西真有广告内容才重评一次，否则判定原样不动。
-	const gate2SuspectLinks = await recheckAdProfileLinks(env, profile, evaluation);
-	if (gate2SuspectLinks) {
-		profile.adLinks = gate2SuspectLinks;
-		evaluation = await judgeGate2();
-	}
-	// 强制拉资料是为了【找更多证据】，不是重新判一遍：闸二没找到能定罪的东西时，
-	// 闸一那条「AI 判广告 → 观察」原样保留（闸二的第⑥层载荷变了，常常被去重跳过，
-	// 拿到的反而是「没有模型结论」），绝不能因为多拉了一次资料把观察记录丢掉。
-
-
-	if (evaluation.verdict === 'ban') {
-		if (await isAdminInAnyConfiguredGroup(userId, chat.id)) {
-			console.log('[广告检测] user=' + userId + ' 是其他配置群的管理员，豁免不封');
-			return false;
-		}
-		const enforced = await enforceAdDetection(env, {
-			userId,
-			chatId: chat.id,
-			chatTitle: chat.title || '',
-			messageId: message.message_id, message
-		}, evaluation, { config, whitelist });
-		return enforced?.groupFeedback !== true;
-	}
-
-
-	// 闸二也放行 → 图片漏判通知（与闸一放行那处互斥：走到闸二的不会在闸一推过）。
-	return false;
+	return enforced?.groupFeedback !== true;
 }
 
 // === 命令层 ===
@@ -35734,6 +35649,7 @@ function parseTgidTraceJson(value) {
 
 function renderTgidTraceRow(source, row) {
 	const labels = { id:'记录',seq:'处罚序号',owner_id:'快照归属',session_id:'演练轮次',row_id:'演练流水',chat_id:'来源群',mid:'消息编号',
+		case_id:'自动处罚现场',source_chat_id:'发现来源群',scope_type:'自动作用范围',owned:'本次名单归属',state:'逐群执行状态',result:'逐群执行结果',
 		created_at:'记录时间',at:'发生时间',first_seen:'首次记录',last_seen:'最后记录',opened_at:'开启时间',closed_at:'关闭时间',
 		score:'诊断分',threshold:'兼容阈值',verdict:'判定',layer:'判定层',reason:'原因',note:'备注',by_user:'操作人',actor_id:'观察到的操作人',kind:'事件/素材类型',
 		status:'收尾状态',session_status:'轮次状态',fp:'人工误判标记',done:'记录已处理',fp_revert_pending:'正常回滚待完成',ban_done:'封禁步骤完成',delete_done:'删除步骤完成',
@@ -35753,7 +35669,7 @@ function renderTgidTraceRow(source, row) {
 	if (source === 'punishments') lines.push(Number(row.expires_at) === 0 ? '复核状态：已复核 / 已撤销（历史仍保留）' : '复核状态：待纠错');
 	if (source === 'cache') lines.push('缓存是收到过的消息，缓存记录和 is_ad 标记不等于已确认违规；未保存的原图或截断文字不补造。');
 	const evaluation = parseTgidTraceJson(row.evaluation), snapshot = parseTgidTraceJson(row.snapshot);
-	if (evaluation.globalDrill) lines.push('演练现场完整性：' + (evaluation.globalDrill.complete === true ? '完整采集/核验' : '仍有缺失或未核部分'));
+	if (evaluation.globalDrill) lines.push('检测现场完整性：' + (evaluation.globalDrill.complete === true ? '完整采集/核验' : '仍有缺失或未核部分'));
 	if (evaluation.drillIncomplete?.length) lines.push('待补核内容：' + escapeHtml(evaluation.drillIncomplete.join('；')));
 	const full = { ...(evaluation.payload || {}), ...snapshot, ...(evaluation.snapshot || {}) };
 	const original = full.sourceMessage || full.pendingMessage;
@@ -35816,6 +35732,7 @@ async function handleAdUserTracesCommand(env, chatId, actorId, arg, origin = { k
 		['blacklist','当前全局黑名单','blacklist','id','at'],
 		['blacklist_detail','已保存封禁详情','blacklist_detail','id','at'],
 		['group_blacklist','当前本群黑名单','group_blacklist','user_id','at'],
+		['automatic_targets','自动处罚逐群执行记录','ad_automatic_case_targets','user_id','created_at'],
 		['killer_blacklist','当前杀手黑名单','killer_blacklist','id','at'],
 		['federated_blacklist','联合名单记录','federated_blacklist','id','at'],
 		['members','最新成员资料（不是全部群历史）','ad_group_members','user_id','last_seen'],
@@ -36194,11 +36111,20 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, options = 
 	const targetId = snapshot.userId;
 	const frozen = snapshot?.snapshot || {};
 	const localAutomatic = frozen.automatic === true && frozen.punishmentScope === 'local';
+	const ownedAutomatic = frozen.automatic === true && Boolean(frozen.autoCaseId)
+		&& ['local','global'].includes(frozen.punishmentScope);
 	const punishmentChatId = String(frozen.punishmentChatId || snapshot.chatId || '');
 	let removed;
 	let retainedPunishment = false;
+	let automaticRollback = null;
 	try {
-		if (localAutomatic) {
+		if (ownedAutomatic) {
+			automaticRollback = await rollbackAutomaticAdCaseTargets(env,snapshot);
+			removed = automaticRollback.removed;
+			retainedPunishment = automaticRollback.retained;
+			if (!automaticRollback.complete) return {targetId,removed,unbanSummary:'部分群解除未完成',unbanResults:automaticRollback.unbanResults,
+				snapshotProcessed:false,complete:false,errors:automaticRollback.errors};
+		} else if (localAutomatic) {
 			if (!punishmentChatId) throw new Error('自动快照缺少事发群');
 			removed = await removeAutomaticGroupBan(env, punishmentChatId, targetId, frozen.autoCaseId);
 			const localRemaining = await readGroupBlacklistEntry(env, punishmentChatId, targetId);
@@ -36212,11 +36138,13 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, options = 
 	}
 	// 必须先确认黑名单已清（或本就不在），再解 Telegram 封禁，避免解完又被兜底拦截重新踢掉。
 	let unbanSummary = retainedPunishment ? '本群自动现场已撤销；其它有效处罚仍保留' : '未执行';
-	let unbanResults = [];
+	let unbanResults = automaticRollback?.unbanResults || [];
+	if (automaticRollback) unbanSummary = unbanResults.filter(row=>row.ok).length+'/'+unbanResults.length+' 个实际处罚群已解除'
+		+ (retainedPunishment?'；其它有效处罚仍保留':'');
 	if (options.strict && !removed.success && removed.code !== 'NOT_FOUND') {
 		return { targetId, removed, unbanSummary, unbanResults, snapshotProcessed: false, complete: false, errors: ['移除黑名单失败，未执行解封和学习纠错，待复核记录已保留'] };
 	}
-	if (!retainedPunishment && (removed.success || removed.code === 'NOT_FOUND')) {
+	if (!automaticRollback && !retainedPunishment && (removed.success || removed.code === 'NOT_FOUND')) {
 		const results = await unbanUserFromAllGroups(targetId,
 			localAutomatic ? [punishmentChatId] : globalUnbanScopeGroupIds(options.groupIds || GROUP_IDS));
 		unbanResults = results;
