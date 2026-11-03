@@ -35369,6 +35369,13 @@ async function handleAdDetectionCommands(message, env, ctx) {
 	const chatId = message.chat.id;
 	const userId = getMessageActorId(message);
 	const isInGroup = message.chat.type !== 'private';
+	const traceMatch = command === 'ignore' ? raw.replace(AD_COMMAND_RE, '').trim().match(/^user\s+(.+)$/i) : null;
+	if (command === 'user' || traceMatch) {
+		await handleAdUserTracesCommand(env,chatId,userId,traceMatch ? traceMatch[1] : raw.replace(AD_COMMAND_RE, '').trim(),
+			{kind:message.__webAdmin ? 'web' : 'command',chatId,chatType:message.chat.type,actorIsBot:message?.from?.is_bot === true,
+				anonymous:isAnonymousAdminMessage(message),webSynthetic:message.__webAdmin === true});
+		return true;
+	}
 
 	// 指纹库与样本库直接决定自动封禁行为，权限外泄等于把封禁开关交出去 → 只给第一主人。
 	// 群内一律只撤回命令、不回权限提示，避免向群成员暴露这些命令的存在。
@@ -35616,7 +35623,210 @@ async function handleAdLearnLastCommand(env, chatId, ownerId, arg) {
 // 就是他在本 bot 手上留下的全部内容。
 //
 // 【只读】一条 SELECT + 一次黑名单计数，不改数据、不影响封禁状态、不花模型额度。
-async function handleAdUserCommand(env, chatId, ownerId, arg) {
+const TGID_TRACE_PAGE_SIZE = 20;
+
+function parseTgidTraceRequest(arg) {
+	const match = String(arg || '').trim().match(/^([1-9]\d{0,19})(?:\s+([1-9]\d{0,5}))?$/);
+	return match ? { userId: match[1], page: Number(match[2] || 1) } : null;
+}
+
+function parseTgidTraceJson(value) {
+	if (value && typeof value === 'object') return value;
+	try { return JSON.parse(String(value || '{}')); } catch (_) { return {}; }
+}
+
+function renderTgidTraceRow(source, row) {
+	const labels = { id:'记录',seq:'处罚序号',owner_id:'快照归属',session_id:'演练轮次',row_id:'演练流水',chat_id:'来源群',mid:'消息编号',
+		created_at:'记录时间',at:'发生时间',first_seen:'首次记录',last_seen:'最后记录',opened_at:'开启时间',closed_at:'关闭时间',
+		score:'诊断分',threshold:'兼容阈值',verdict:'判定',layer:'判定层',reason:'原因',note:'备注',by_user:'操作人',actor_id:'观察到的操作人',kind:'事件/素材类型',
+		status:'收尾状态',session_status:'轮次状态',fp:'人工误判标记',done:'记录已处理',fp_revert_pending:'正常回滚待完成',ban_done:'封禁步骤完成',delete_done:'删除步骤完成',
+		delete_state:'消息删除状态',normal_done:'正常反例步骤完成',normal_anchor:'正常归并来源',revert_done:'撤错学完成',error:'未完成原因',
+		learned:'指纹学习',sample:'AI样本学习',badges:'会员标/表情学习',avatars:'头像学习',images:'图片学习',shapes:'资料形状学习',links:'挂载案底学习',packs:'贴纸包学习',skeletons:'骨架学习',
+		file_unique_id:'素材指纹',badge_id:'会员标指纹',fingerprint:'文本指纹键',type:'条目类型',value:'共享条目值',weight:'权重',confidence:'置信记录',false_positive_count:'误报记录数',text_hash:'样本摘要键',sample_text:'已保存样本文字',skeleton:'正文骨架键',shape:'资料形状键',active:'条目有效状态',corrections:'纠错计数',source:'条目来源',last_user_id:'最后关联用户',hits:'复用记录数',text_norm:'缓存规范化正文',text:'已保存说明正文',detail:'已保存说明详情',msg_id:'原消息编号',is_ad:'缓存广告标记',day:'统计日期',msg_count:'发言计数',last_msg_id:'最后消息编号',
+		first_name:'已保存名字',last_name:'已保存姓氏',username:'已保存用户名',display_name:'已保存昵称',bio_checked_at:'资料检查时间',last_verdict:'最后记录判定',profile_hash:'资料摘要',auto_case_id:'本群处罚现场ID' };
+	const lines = [];
+	for (const [field,label] of Object.entries(labels)) {
+		if (row[field] === undefined || row[field] === null || row[field] === '') continue;
+		let value = row[field];
+		if (['created_at','at','first_seen','last_seen','bio_checked_at'].includes(field) && typeof value === 'number' && value > 0) {
+			value = new Date(value > 1e12 ? value : value * 1000).toISOString();
+		}
+		lines.push(label + '：' + escapeHtml(String(value)));
+	}
+	if (source === 'punishments') lines.push(Number(row.expires_at) === 0 ? '复核状态：已复核 / 已撤销（历史仍保留）' : '复核状态：待纠错');
+	if (source === 'cache') lines.push('缓存是收到过的消息，缓存记录和 is_ad 标记不等于已确认违规；未保存的原图或截断文字不补造。');
+	const evaluation = parseTgidTraceJson(row.evaluation), snapshot = parseTgidTraceJson(row.snapshot);
+	const full = { ...(evaluation.payload || {}), ...snapshot, ...(evaluation.snapshot || {}) };
+	const learning = evaluation.learningPayload || full.learningPayload || {};
+	for (const [key,label] of [['name','当时昵称'],['username','当时用户名'],['bio','已保存简介'],['text','已保存正文'],['quotedText','已保存引用'],['quoted','已保存引用内容'],
+		['imageId','正文图片指纹'],['avatarId','头像指纹'],['badgeId','会员标指纹'],['stickerSet','贴纸包'],['textSkeleton','正文骨架键'],['matchedTextSkeleton','命中骨架键'],
+		['profileShape','资料形状键'],['autoCaseId','自动处罚现场ID'],['punishmentScope','处罚范围'],['punishmentChatId','处罚群'],['dryRunMessageId','原消息编号'],['groupAdContextKey','完整现场摘要']]) {
+		let value = full[key];
+		if (key === 'text' && typeof learning.text === 'string' && learning.text.startsWith(String(value || '')) && learning.text.length > String(value || '').length) value = learning.text;
+		if (value !== undefined && value !== null && String(value) !== '') lines.push(label + '：' + escapeHtml(String(value)));
+	}
+	if (learning.text && learning.text !== full.text) lines.push('实际学习文本：' + escapeHtml(String(learning.text)));
+	for (const [key,label] of [['customEmojiIds','正文表情指纹'],['customEmojiMedia','已保存表情素材'],['scoredLinks','当时挂载链接'],['positionEvidence','位置判据']]) {
+		if (full[key] && (Array.isArray(full[key]) ? full[key].length : Object.keys(full[key]).length)) lines.push(label + '：' + escapeHtml(JSON.stringify(full[key])));
+	}
+	const reasons = parseTgidTraceJson(row.reasons || evaluation.reasons || '[]');
+	if (Array.isArray(reasons) && reasons.length) lines.push('判据：\n' + reasons.map(value=>'　· '+escapeHtml(String(value))).join('\n'));
+	return lines.join('\n');
+}
+
+// 只读查询：不初始化业务表、不运行模型，不把 TGID 查询误作 /ignore 处罚回滚。
+async function handleAdUserTracesCommand(env, chatId, actorId, arg, origin = { kind:'command',chatId,chatType:'private' }) {
+	const uid = String(actorId || '');
+	if (!isPrimaryOwner(uid) || String(chatId) !== uid || origin.chatType !== 'private' || origin.kind !== 'command'
+		|| origin.actorIsBot === true || origin.anonymous === true || origin.webSynthetic === true) {
+		await sendTelegramMessage(chatId,'痕迹查询仅限第一主人本人私聊使用，不执行任何撤销或封禁。');
+		return {ok:false,code:'FORBIDDEN'};
+	}
+	const request = parseTgidTraceRequest(arg);
+	if (!request) { await sendTelegramMessage(chatId,'用法：<code>/ignore user TGID [页码]</code>。这只查询；<code>/ignore 处罚序号</code>才执行回滚。'); return {ok:false,code:'INVALID'}; }
+	if (!env?.DB) { await sendTelegramMessage(chatId,'未绑定记录数据库，无法查询痕迹。'); return {ok:false,code:'NO_DB'}; }
+	const {userId,page} = request, offset = (page-1)*TGID_TRACE_PAGE_SIZE, sources = {}, rowsBySource = {}, columns = new Map();
+	let tables;
+	try { tables = new Set(((await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()).results || []).map(row=>String(row.name))); }
+	catch (_) { await sendTelegramMessage(chatId,'记录数据库暂时读取失败，未改变任何数据。'); return {ok:false,code:'READ_FAILED'}; }
+	const cols = async(table) => {
+		if (!tables.has(table)) return new Set();
+		if (!columns.has(table)) columns.set(table,new Set(((await env.DB.prepare('PRAGMA table_info('+table+')').all()).results || []).map(row=>String(row.name))));
+		return columns.get(table);
+	};
+	const read = async(key,title,table,field,order='') => {
+		const source = sources[key] = {title,table,total:0,shown:0,missing:false,error:false};
+		try {
+			const available = await cols(table);
+			if (!available.has(field)) { source.missing=true;return; }
+			const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM '+table+' WHERE '+field+'=?').bind(userId).first();
+			source.total=Number(count?.n)||0;
+			const sorting = available.has(order) ? ' ORDER BY '+order+' DESC' : '';
+			const data = await env.DB.prepare('SELECT * FROM '+table+' WHERE '+field+'=?'+sorting+' LIMIT ? OFFSET ?').bind(userId,TGID_TRACE_PAGE_SIZE,offset).all();
+			rowsBySource[key]=data.results || [];source.shown=rowsBySource[key].length;
+		} catch (_) { source.error=true; }
+	};
+	for (const spec of [
+		['punishments','正式处罚快照（含已复核）','ad_pending_snapshots','user_id','created_at'],
+		['drill','演练、待核及误判流水','ad_dryrun_log','user_id','id'],
+		['cache','消息接收缓存','moderation_messages','from_id','id'],
+		['blacklist','当前全局黑名单','blacklist','id','at'],
+		['blacklist_detail','已保存封禁详情','blacklist_detail','id','at'],
+		['group_blacklist','当前本群黑名单','group_blacklist','user_id','at'],
+		['killer_blacklist','当前杀手黑名单','killer_blacklist','id','at'],
+		['federated_blacklist','联合名单记录','federated_blacklist','id','at'],
+		['members','最新成员资料（不是全部群历史）','ad_group_members','user_id','last_seen'],
+		['events','进退群及群中观察到的操作','stat_member_events','user_id','at'],
+		['screening','旧观察及复查记录','ad_user_screening','user_id','updated_at'],
+		['join_checks','入群广告检查记录','ad_join_checks','user_id','created_at'],
+		['whitelist','人工白名单状态（不是违规记录）','ad_user_whitelist','user_id','at'],
+		['speech','已保存群发言统计（不是违规记录）','stat_speech','user_id','updated_at']
+	]) await read(...spec);
+	const closeSource = sources.close_cases = {title:'演练关闭逐项结果',total:0,shown:0,missing:false,error:false};
+	if (!['ad_dryrun_close_cases','ad_dryrun_log','ad_dryrun_sessions'].every(table=>tables.has(table))) closeSource.missing=true;
+	else try {
+		const from = ' FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id LEFT JOIN ad_dryrun_sessions s ON s.id=c.session_id WHERE l.user_id=?';
+		closeSource.total=Number((await env.DB.prepare('SELECT COUNT(*) AS n'+from).bind(userId).first())?.n)||0;
+		rowsBySource.close_cases=(await env.DB.prepare('SELECT c.*,l.chat_id,s.opened_at,s.closed_at,s.status AS session_status'+from+' ORDER BY c.row_id DESC LIMIT ? OFFSET ?').bind(userId,TGID_TRACE_PAGE_SIZE,offset).all()).results || [];
+		closeSource.shown=rowsBySource.close_cases.length;
+	} catch (_) {closeSource.error=true;}
+	// 全部 UID 快照的素材主键在数据库中反查；sender 表表示使用关联，last_user_id 仅表示最后关联。
+	const manifest = async(keys,prefix='') => {
+		const parts=[],params=[];
+		for (const [table,column] of [['ad_pending_snapshots','snapshot'],['ad_dryrun_log','snapshot'],['ad_dryrun_log','evaluation']]) {
+			const available=await cols(table);if(!available.has('user_id')||!available.has(column))continue;
+			parts.push("SELECT '"+prefix+"'||CAST(j.atom AS TEXT) FROM "+table+' t,json_tree(CASE WHEN json_valid(t.'+column+') THEN t.'+column+" ELSE '{}' END) j WHERE t.user_id=? AND ("+keys+") AND j.atom IS NOT NULL");params.push(userId);
+		}
+		return {sql:parts.join(' UNION '),params};
+	};
+	for (const [key,title,table,idField,sender,keyFilter] of [
+		['images','关联图片/贴纸素材（共享）','ad_images','file_unique_id','ad_image_senders',"j.key='imageId' OR (j.key IN ('fileUniqueId','file_unique_id') AND j.path LIKE '%customEmojiMedia%')"],
+		['avatars','关联头像素材（共享）','ad_avatars','file_unique_id','ad_avatar_senders',"j.key='avatarId'"],
+		['badges','关联会员标/表情素材（共享）','ad_badges','badge_id','',"j.key IN ('badgeId','customEmojiId') OR j.path LIKE '%customEmojiIds%' OR j.path LIKE '%verifiedCustomEmojiIds%'"]
+	]) {
+		const source=sources[key]={title,total:0,shown:0,missing:false,error:false};
+		try {
+			const available=await cols(table);if(!available.has(idField)){source.missing=true;continue;}
+			const conditions=[],params=[];
+			if(available.has('last_user_id')){conditions.push('i.last_user_id=?');params.push(userId);}
+			if(sender&&tables.has(sender)){conditions.push('i.'+idField+' IN (SELECT file_unique_id FROM '+sender+' WHERE user_id=?)');params.push(userId);}
+			const saved=await manifest(keyFilter);if(saved.sql){conditions.push('i.'+idField+' IN ('+saved.sql+')');params.push(...saved.params);}
+			if(!conditions.length){source.missing=true;continue;}
+			const where=' FROM '+table+' i WHERE '+conditions.join(' OR ');
+			source.total=Number((await env.DB.prepare('SELECT COUNT(*) AS n'+where).bind(...params).first())?.n)||0;
+			rowsBySource[key]=(await env.DB.prepare('SELECT i.*'+where+' ORDER BY i.'+idField+' LIMIT ? OFFSET ?').bind(...params,TGID_TRACE_PAGE_SIZE,offset).all()).results || [];source.shown=rowsBySource[key].length;
+		}catch(_){source.error=true;}
+	}
+	for(const [key,title,table,idField,keyFilter,prefix] of [
+		['fingerprints','保存键关联的文本指纹（共享）','ad_fingerprints','fingerprint',"j.key IN ('fingerprint','fingerprintKey')",''],
+		['skeletons','保存键关联的正文骨架（共享）','ad_text_skeletons','skeleton',"j.key IN ('textSkeleton','matchedTextSkeleton')",''],
+		['profile_shapes','保存键关联的资料形状（共享）','ad_profile_shapes','shape',"j.key='profileShape'",''],
+		['normal_context','完整现场关联的正常反例（共享）','ad_false_positives','value',"j.key='groupAdContextKey'",'ctx:']
+	]){
+		const source=sources[key]={title,table,total:0,shown:0,missing:false,error:false};
+		try{
+			if(!(await cols(table)).has(idField)){source.missing=true;continue;}
+			const saved=await manifest(keyFilter,prefix);if(!saved.sql)continue;
+			const where=' FROM '+table+' WHERE '+idField+' IN ('+saved.sql+')';
+			source.total=Number((await env.DB.prepare('SELECT COUNT(*) AS n'+where).bind(...saved.params).first())?.n)||0;
+			rowsBySource[key]=(await env.DB.prepare('SELECT *'+where+' ORDER BY '+idField+' LIMIT ? OFFSET ?').bind(...saved.params,TGID_TRACE_PAGE_SIZE,offset).all()).results||[];
+			source.shown=rowsBySource[key].length;
+		}catch(_){source.error=true;}
+	}
+	// 样本只从本页冻结文字重建候选键；显示这个限定，不把匹配视作用户独占归属。
+	const sampleSource=sources.samples={title:'本页冻结文字关联的AI样本候选（共享，全部列出）',table:'ad_sample_embeddings',total:0,shown:0,missing:false,error:false,dependent:true};
+	try{
+		if(!(await cols('ad_sample_embeddings')).has('text_hash'))sampleSource.missing=true;
+		else{
+			const sampleKeys=new Set();
+			for(const row of [...(rowsBySource.punishments||[]),...(rowsBySource.drill||[])]){
+				const evaluation=parseTgidTraceJson(row.evaluation),snapshot=parseTgidTraceJson(row.snapshot);
+				const full={...(evaluation.payload||{}),...snapshot,...(evaluation.snapshot||{})};
+				for(const payload of [full,full.learningPayload,evaluation.learningPayload].filter(Boolean)){
+					const text=buildAdSampleText(payload);if(text.length>=4){sampleKeys.add(adTextHash(text));sampleKeys.add(adTextHash(normalizeAdSemanticText(text)));}
+				}
+			}
+			if(sampleKeys.size){
+				const values=[...sampleKeys],where=' FROM ad_sample_embeddings WHERE text_hash IN ('+values.map(()=>'?').join(',')+')';
+				sampleSource.total=Number((await env.DB.prepare('SELECT COUNT(*) AS n'+where).bind(...values).first())?.n)||0;
+				rowsBySource.samples=(await env.DB.prepare('SELECT id,text_hash,sample_text,source,created_at'+where+' ORDER BY id DESC').bind(...values).all()).results||[];
+				sampleSource.shown=rowsBySource.samples.length;
+			}
+		}
+	}catch(_){sampleSource.error=true;}
+	const lines=['<b>🔎 TGID 痕迹查询 <code>'+escapeHtml(userId)+'</code></b>','只读查询；未解封、未删除消息、未撤销学习，也未调用模型。',
+		'各独立来源分别分页：第 '+page+' 页，每类最多 '+TGID_TRACE_PAGE_SIZE+' 条；本页文字派生的共享样本全部列出。'];
+	for(const [key,source] of Object.entries(sources)) {
+		lines.push('', '<b>'+escapeHtml(source.title)+'</b>');
+		if(source.missing){lines.push('来源 '+escapeHtml(source.table||key)+' 的表/字段尚未保存或不存在，未初始化新表。');continue;}
+		if(source.error){lines.push('此来源读取失败，其它来源继续显示；不能据此认定没有痕迹。');continue;}
+		lines.push('总 '+source.total+' 条，本页 '+source.shown+' 条。');
+		for(const row of rowsBySource[key] || []) lines.push('─────',renderTgidTraceRow(key,row));
+	}
+	lines.push('','<b>共享学习条目的归属说明</b>',
+		'图片、头像、会员标是共享素材；使用记录、last_user_id和快照素材键只说明关联，不代表该用户独占或全部由他创建。',
+		'指纹、AI样本、正文骨架、资料形状和正常反例没有完整的目标TGID外键。只能按已保存正文/素材/摘要键进一步核对，不能凭TGID猜出或一键撤销全部共享条目。',
+		'未接收、已过期、已删除且没有保存的原图/原文无法补造。');
+	const hasMore=Object.values(sources).some(source=>!source.dependent && source.total>offset+TGID_TRACE_PAGE_SIZE);
+	if(hasMore)lines.push('下一页：<code>/ignore user '+escapeHtml(userId)+' '+(page+1)+'</code>');
+	if(page>1)lines.push('上一页：<code>/ignore user '+escapeHtml(userId)+' '+(page-1)+'</code>');
+	lines.push('确认误判后，按对应处罚序号使用 <code>/ignore 处罚序号</code>；查询本身不会执行。');
+	// 优先按完整行分块，短记录不会被按字符拆断；长正文仍交既有安全HTML分块器。
+	let buffer='';
+	for(const line of lines){
+		if(buffer && buffer.length+line.length+1>3500){await sendTelegramMessageChunks(chatId,buffer);buffer='';}
+		if(line.length>3500){await sendTelegramMessageChunks(chatId,line);continue;}
+		buffer+=(buffer?'\n':'')+line;
+	}
+	if(buffer)await sendTelegramMessageChunks(chatId,buffer);
+	return {ok:true,userId,page,pageSize:TGID_TRACE_PAGE_SIZE,sources,totalRecords:Object.values(sources).reduce((sum,source)=>sum+source.total,0)};
+}
+
+async function handleAdUserCommand(env, chatId, ownerId, arg, origin = {kind:'command',chatId,chatType:'private'}) {
+	return handleAdUserTracesCommand(env,chatId,ownerId,arg,origin);
+}
+
+async function handleAdUserCommandLegacy(env, chatId, ownerId, arg) {
 	const uid = String(arg || '').trim();
 	if (!/^-?\d+$/.test(uid)) {
 		await sendTelegramMessage(chatId,
@@ -36026,6 +36236,8 @@ function parseAdSeqList(arg) {
 // 这是唯一的回滚入口，必须做到「一条命令彻底恢复」，否则自动封禁不敢开。
 // 支持批量是因为主人的原话：「我觉得指令可以支持批量删除，可以通过现有的指令库来执行批量删除号。」
 async function handleAdIgnoreCommand(env, chatId, ownerId, arg, origin = { kind: 'command', chatId, chatType: 'private' }) {
+	const traceMatch = String(arg || '').trim().match(/^user\s+(.+)$/i);
+	if (traceMatch) return handleAdUserTracesCommand(env,chatId,ownerId,traceMatch[1],origin);
 	const parsed = parseAdSeqList(arg);
 	if (!parsed.ok) {
 		await sendTelegramMessage(chatId, [
