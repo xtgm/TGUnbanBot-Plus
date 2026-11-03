@@ -28625,7 +28625,9 @@ async function sendAdDryRunCloseReport(env, sessionId, options = {}) {
 	const totals = { learned:0,sample:0,badges:0,avatars:0,images:0,shapes:0,links:0,packs:0,skeletons:0 };
 	for (const row of rows) for (const key of Object.keys(totals)) totals[key] += Number(row[key]) || 0;
 	const groups = new Set(rows.map(row=>row.chat_id)), users = new Set(rows.map(row=>row.user_id));
-	const fp = rows.filter(row=>Number(row.fp)===1||Number(row.normal_anchor)>0||row.close_status==='skipped_normal'), ads = rows.filter(row=>Number(row.fp)!==1&&!Number(row.normal_anchor)&&row.close_status!=='skipped_normal');
+	const isNormalRecord = row => Number(row.fp)===1||Number(row.normal_anchor)>0||row.close_status==='skipped_normal';
+	const fp = rows.filter(isNormalRecord), ads = rows.filter(row=>!isNormalRecord(row)&&row.verdict==='ban');
+	const unconfirmed = rows.filter(row=>!isNormalRecord(row)&&row.verdict==='pending');
 	const normalTally = {text:0,context:0,materials:0};
 	const reverted = {...totals}; for(const key of Object.keys(reverted))reverted[key]=fp.filter(row=>row.fp&&!row.fp_revert_pending||row.revert_done).reduce((sum,row)=>sum+(Number(row[key])||0),0);
 	for(const row of fp){let tally={};try{tally=JSON.parse(row.normal_tally||'{}');}catch(_){}for(const key of Object.keys(normalTally))normalTally[key]+=Number(tally[key])||0;}
@@ -28636,8 +28638,9 @@ async function sendAdDryRunCloseReport(env, sessionId, options = {}) {
 		'边界依据：' + escapeHtml(session.boundary_note || '按持久流水ID边界处理'),
 		'当前全局范围 ' + globalDryRunScopeGroupIds().length + ' 群；本轮有记录 ' + groups.size + ' 群。',
 		'流水边界：#' + session.start_row_id + ' 至 #' + session.cutoff_row_id + '；' + rows.length + ' 条，去重用户 ' + users.size,
+		'记录分类：已确认广告 ' + ads.length + ' 条；人工正常/误判 ' + fp.length + ' 条；未核 ' + unconfirmed.length + ' 条；其他非广告/已归档 ' + (rows.length-ads.length-fp.length-unconfirmed.length) + ' 条。',
 		'现场完整性：已完整采集/核验 ' + rows.filter(row=>row.collection_complete===1).length + ' 条；仍有缺失/未核 ' + rows.filter(row=>row.collection_complete===0).length + ' 条；旧记录未标记 ' + rows.filter(row=>row.collection_complete!==0&&row.collection_complete!==1).length + ' 条。完整性与是否已确认广告分别报告。',
-		'未核记录：' + rows.filter(row=>row.verdict==='pending').length + ' 条；未完成可靠判定、未学习、未处罚，不计入正常反例。第一主人可私聊 /rescreen user 用户ID 重新核验。',
+		'未核记录：' + unconfirmed.length + ' 条；未完成可靠判定、未学习、未处罚，不计入正常反例。第一主人可私聊 /rescreen user 用户ID 重新核验。',
 		'本轮曾学习：指纹 ' + totals.learned + '，AI样本 ' + totals.sample + '，正文骨架 ' + totals.skeletons,
 		'素材学习：图片 ' + totals.images + '，头像 ' + totals.avatars + '，会员标/贴纸 ' + totals.badges + '，贴纸包 ' + totals.packs + '，资料形状 ' + totals.shapes + '，挂号案底 ' + totals.links,
 		'误判已撤销的原学习记账：指纹 ' + reverted.learned + '，AI样本 ' + reverted.sample + '，骨架 ' + reverted.skeletons + '，图片 ' + reverted.images + '，头像 ' + reverted.avatars + '，会员标/贴纸 ' + reverted.badges + '，形状 ' + reverted.shapes + '；这些是本轮记账，不冒充共享库净变化。',
@@ -28650,7 +28653,7 @@ async function sendAdDryRunCloseReport(env, sessionId, options = {}) {
 	for (const row of rows) {
 		const name = String(row.display_name || row.user_id).slice(0,120);
 		lines.push('<b>流水 #' + row.id + '</b>　' + formatUserReference(row.user_id, { first_name: name }));
-		lines.push('来源群：'+escapeHtml(row.chat_title||'')+' <code>' + escapeHtml(row.chat_id) + '</code>；' + (Number(row.fp)===1 ? '原手动误判，撤错学后入池' : row.normal_anchor ? '本轮正常用户归并，依据原标注流水 #'+row.normal_anchor+'；撤错学后入池' : row.close_status==='skipped_normal'?'已确认正常现场反例，不执行封删':'自动学习广告，本群封禁+原消息删除'));
+		lines.push('来源群：'+escapeHtml(row.chat_title||'')+' <code>' + escapeHtml(row.chat_id) + '</code>；' + (Number(row.fp)===1 ? '原手动误判，撤错学后入池' : row.normal_anchor ? '本轮正常用户归并，依据原标注流水 #'+row.normal_anchor+'；撤错学后入池' : row.close_status==='skipped_normal'?'已确认正常现场反例，不执行封删':row.verdict==='pending'?'未核记录，仅归档待复查，不封不删、不计正常反例':row.verdict!=='ban'?'非广告或已归档记录，不执行封删':'自动学习广告，本群封禁+原消息删除'));
 		lines.push('结果：' + escapeHtml(stateNames[row.close_status]||row.close_status) + '；封禁 ' + (row.ban_done ? '完成' : '未执行/未完成') + '；删除 ' + escapeHtml(({deleted:'完成',gone:'已不存在',none:'无原消息，无需删除',missing:'缺原消息ID',failed:'失败'})[row.delete_state] || '未执行') + '；正常反例 ' + (row.normal_done ? '完成' : '未录入'));
 		if (row.collection_complete === 0) lines.push('待补核现场：' + escapeHtml(String(row.collection_missing || '资料或素材尚未完整核验')));
 		if (row.error) lines.push('原因/归并：' + escapeHtml(toChineseErrorText(row.error)));
