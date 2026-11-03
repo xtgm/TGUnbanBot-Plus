@@ -533,6 +533,11 @@ export default {
 
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
+			if (body.type === 'drill_close') {
+				const result = await runAdDryRunCloseJob(env, Number(body.sessionId), { limit: 8 });
+				if ((result.busy || (!result.complete && !result.partial && !result.queued && !result.needsManualRetry)) && typeof message.retry === 'function') message.retry({ delaySeconds: 30 });
+				continue;
+			}
 			const jobId = String(body.id || body.jobId || '').trim();
 			if (!jobId) {
 				console.error('[批量任务] Queue 消息缺少 job id:', body);
@@ -10616,8 +10621,17 @@ async function handleChatMemberUpdate(chatMember, env) {
 		}
 	}
 
-	// 必须是配置群组
-	if (!isConfiguredGroup(chat.id)) return;
+	// 辅助群仅在全局演练中观察新入群成员，不进入常规手动管理分支。
+	if (!isConfiguredGroup(chat.id)) {
+		const incoming = newMember.user || oldMember.user;
+		if (isGlobalDryRunScopeGroup(chat.id) && (await isDryRunGroup(env, chat.id)) && incoming?.id && !incoming.is_bot
+			&& !['member', 'restricted', 'administrator', 'creator'].includes(oldMember.status)
+			&& ['member', 'restricted'].includes(newMember.status)) {
+			await screenAdJoinMember(env, incoming, { chatId: String(chat.id), chatTitle: chat.title || '',
+				messageId: null, skipBlacklistCheck: true, source: 'chat_member' });
+		}
+		return;
+	}
 
 	const targetUser = newMember.user || oldMember.user;
 	if (!targetUser?.id) return;
@@ -12799,18 +12813,67 @@ async function ensureDryRunTable(env) {
 }
 
 const GLOBAL_DRYRUN_CHAT_ID = '__global__';
+const D1_AD_DRYRUN_CLOSE_INIT = new WeakMap();
 
-function isGlobalDryRunScopeGroup(chatId) {
-	return isConfiguredGroup(chatId) || isKillerModeGroup(chatId);
+async function ensureAdDryRunCloseTables(env) {
+	if (!env?.DB || !(await ensureAdDryRunLogTable(env))) return false;
+	const cached=D1_AD_DRYRUN_CLOSE_INIT.get(env.DB); if(cached)return cached;
+	const work=(async()=>{
+	await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_dryrun_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, start_row_id INTEGER NOT NULL, cutoff_row_id INTEGER NOT NULL DEFAULT 0, opened_at TEXT NOT NULL, closed_at TEXT NOT NULL DEFAULT '', owner_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', lease_until INTEGER NOT NULL DEFAULT 0, lease_token TEXT NOT NULL DEFAULT '', report_sent INTEGER NOT NULL DEFAULT 0, report TEXT NOT NULL DEFAULT '', boundary_note TEXT NOT NULL DEFAULT '')").run();
+	if (!(await d1ColumnExists(env,'ad_dryrun_sessions','boundary_note'))) await env.DB.prepare("ALTER TABLE ad_dryrun_sessions ADD COLUMN boundary_note TEXT NOT NULL DEFAULT ''").run();
+	if (!(await d1ColumnExists(env,'ad_dryrun_sessions','normal_attempts'))) await env.DB.prepare('ALTER TABLE ad_dryrun_sessions ADD COLUMN normal_attempts INTEGER NOT NULL DEFAULT 0').run();
+	await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_dryrun_close_cases (session_id INTEGER NOT NULL, row_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', ban_done INTEGER NOT NULL DEFAULT 0, delete_done INTEGER NOT NULL DEFAULT 0, normal_done INTEGER NOT NULL DEFAULT 0, normal_anchor INTEGER NOT NULL DEFAULT 0, revert_done INTEGER NOT NULL DEFAULT 0, normal_tally TEXT NOT NULL DEFAULT '', delete_state TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', PRIMARY KEY(session_id,row_id))").run();
+	if (!(await d1ColumnExists(env,'ad_dryrun_close_cases','normal_tally'))) await env.DB.prepare("ALTER TABLE ad_dryrun_close_cases ADD COLUMN normal_tally TEXT NOT NULL DEFAULT ''").run();
+	for(const column of ['normal_anchor','revert_done'])if(!(await d1ColumnExists(env,'ad_dryrun_close_cases',column)))await env.DB.prepare('ALTER TABLE ad_dryrun_close_cases ADD COLUMN '+column+' INTEGER NOT NULL DEFAULT 0').run();
+	return true;
+	})();D1_AD_DRYRUN_CLOSE_INIT.set(env.DB,work);
+	try{return await work;}catch(error){D1_AD_DRYRUN_CLOSE_INIT.delete(env.DB);throw error;}
 }
 
-async function readGlobalDryRunState(env) {
-	if (!env?.DB || !(await ensureDryRunTable(env))) return { on: false, at: '' };
+async function readAdDryRunSession(env, strict = false) {
+	try { return await env.DB.prepare('SELECT * FROM ad_dryrun_sessions ORDER BY id DESC LIMIT 1').first(); }
+	catch (error) { if(strict)throw error; return null; }
+}
+
+async function isAdDryRunClosing(env) {
+	const session = await readAdDryRunSession(env);
+	return session?.status === 'closing';
+}
+
+async function startAdDryRunSession(env, at, legacy = false) {
+	if (!(await ensureAdDryRunCloseTables(env))) throw new Error('演练会话存储未就绪');
+	const current = await readAdDryRunSession(env,true);
+	if (current && ['open','closing','processing'].includes(current.status)) return current;
+	let first, boundaryNote = '新开启按流水ID建立精确边界';
+	if (legacy) {
+		const timestamp = Date.parse(at), seconds = Math.floor(timestamp / 1000);
+		if (!Number.isFinite(seconds) || seconds <= 0) throw new Error('旧演练缺少可靠开启时间，未扫描历史流水');
+		const ambiguous = timestamp%1000 ? await env.DB.prepare('SELECT COUNT(*) AS n,GROUP_CONCAT(id) AS ids FROM ad_dryrun_log WHERE created_at=?').bind(seconds).first() : {n:0};
+		first = await env.DB.prepare('SELECT COALESCE(MIN(id),(SELECT COALESCE(MAX(id),0)+1 FROM ad_dryrun_log)) AS id FROM ad_dryrun_log WHERE created_at >= ?').bind(Math.ceil(timestamp/1000)).first();
+		boundaryNote = '旧演练依现有全局开启时间恢复；流水只有秒级时间，无法复原此前已清理的记录。'
+			+ (Number(ambiguous.n)?'开启同秒有 '+ambiguous.n+' 条无法证明属于本轮，未自动处理，流水ID：'+ambiguous.ids:'');
+	} else first = await env.DB.prepare('SELECT COALESCE(MAX(id),0)+1 AS id FROM ad_dryrun_log').first();
+	await env.DB.prepare("INSERT INTO ad_dryrun_sessions(start_row_id,opened_at,owner_id,boundary_note) SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM ad_dryrun_sessions WHERE status IN ('open','closing','processing'))")
+		.bind(Number(first.id), String(at), String(OWNER_IDS[0] || ''),boundaryNote).run();
+	return await readAdDryRunSession(env,true);
+}
+
+function globalDryRunScopeGroupIds() {
+	return [...new Set([...GROUP_IDS, ...KILLER_MODE_GROUPS, ...STAT_SEARCH_GROUPS, ...PROFILE_LOOKUP_GROUPS,
+		String(SELF_UNBAN_CONTACT_GROUP || '')].map((id) => String(id || '').trim()).filter((id) => /^-\d+$/.test(id)))];
+}
+
+function isGlobalDryRunScopeGroup(chatId) {
+	return globalDryRunScopeGroupIds().includes(String(chatId || ''));
+}
+
+async function readGlobalDryRunState(env, options = {}) {
+	if (!env?.DB || !(await ensureDryRunTable(env))) { if(options.strict)throw new Error('演练状态存储不可读取'); return { on: false, at: '' }; }
 	try {
 		const row = await env.DB.prepare('SELECT enabled, by_user, at FROM dryrun_groups WHERE chat_id = ?')
 			.bind(GLOBAL_DRYRUN_CHAT_ID).first();
 		return { on: Number(row?.enabled) === 1 && isPrimaryOwner(row?.by_user), at: String(row?.at || '') };
-	} catch (_) { return { on: false, at: '' }; }
+	} catch (error) { if(options.strict)throw error; return { on: false, at: '' }; }
 }
 
 // 全局开关不缓存：主人私聊开关后，所有 isolate 与群立即读取同一条状态。
@@ -12834,13 +12897,20 @@ async function setGlobalDryRun(env, on, message) {
 	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
 	if (!(await ensureDryRunTable(env))) return { ok: false, error: 'D1 演练模式表初始化失败' };
 	try {
+		await ensureAdDryRunCloseTables(env);
+		const existing = await readGlobalDryRunState(env,{strict:true});
+		let session = await readAdDryRunSession(env,true);
+		if (!on) return await closeGlobalDryRun(env, message, existing, session);
+		if (session && ['closing','processing'].includes(session.status)) return { ok: false, error: '本轮演练仍在收尾，请先查看 /dryrun status' };
+		if (existing.on) { session = await startAdDryRunSession(env, existing.at, true); return { ok: true, on: true, sessionId: session.id }; }
 		const at = new Date().toISOString();
+		session = await startAdDryRunSession(env, at);
 		await env.DB.batch([
 			env.DB.prepare('UPDATE dryrun_groups SET enabled = 0'),
 			env.DB.prepare('INSERT OR REPLACE INTO dryrun_groups (chat_id, enabled, by_user, at) VALUES (?, ?, ?, ?)')
 				.bind(GLOBAL_DRYRUN_CHAT_ID, on ? 1 : 0, String(message.from.id), at)
 		]);
-		return { ok: true, on: !!on };
+		return { ok: true, on: true, sessionId: session.id };
 	} catch (error) {
 		console.error('[演练模式] 写入开关失败:', error);
 		return { ok: false, error: error.message || String(error) };
@@ -12856,7 +12926,7 @@ async function setDryRun(env, chatId, on, byUser, invocation = null) {
 async function readDryRunStateMap(env) {
 	const map = new Map();
 	if ((await readGlobalDryRunState(env)).on) {
-		for (const id of new Set([...GROUP_IDS, ...KILLER_MODE_GROUPS])) map.set(String(id), 1);
+		for (const id of globalDryRunScopeGroupIds()) map.set(String(id), 1);
 	}
 	return map;
 }
@@ -12938,6 +13008,7 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null) {
 	evaluation.snapshot = { ...(evaluation.snapshot || {}), ...evaluation.payload,
 		name: [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim(), bio: String(profile.bio || ''),
 		text, badgeMedia: badgeItem ? { id: badgeItem.id, fileUniqueId: badgeItem.fileUniqueId, visionFileId: badgeItem.visionFileId, kind: badgeItem.kind } : null };
+	if (profile.bioFetched === true) evaluation.snapshot.groupAdContextKey = await buildGroupAdContextKey({ message }, evaluation);
 	const learning = globalDryRunLearningView(evaluation);
 	evaluation.learningPayload = learning.payload;
 	evaluation.learningSnapshot = learning.snapshot;
@@ -12950,6 +13021,9 @@ async function handleGlobalDryRunMessage(message, env) {
 		|| isTelegramServiceMessage(message) || isTelegramSlashCommand(message.text)
 		|| classifyAdReplyIntent(message.text) || String(message.text || '').trim() === SELF_UNBAN_KEYWORD) return false;
 	if (!(await isDryRunGroup(env, chatId))) return false;
+	if (await isAdDryRunClosing(env)) return true;
+	const captureSession=await readAdDryRunSession(env);
+	const captureState=await readGlobalDryRunState(env);
 	if (isAdExemptBot(message.from) || isAdDetectionExemptUser(message.from.id)
 		|| await isAdUserWhitelisted(env, message.from.id)
 		|| (await resolveLocalAdDetectionSkip(env, chatId, message.from.id)) === 'whitelisted'
@@ -12959,7 +13033,8 @@ async function handleGlobalDryRunMessage(message, env) {
 	const ad = result.evaluation.verdict === 'ban';
 	if (ad) await enforceAdDetection(env, { userId: String(message.from.id), chatId,
 		chatTitle: message.chat.title || '', messageId: message.message_id, message }, result.evaluation,
-		{ config: result.config, whitelist: result.whitelist, globalDrillCollected: true });
+		{ config: result.config, whitelist: result.whitelist, globalDrillCollected: true,
+			globalDrillSessionId:Number(captureSession?.id)||0,globalDrillStartedAt:captureState.at });
 	else await tryRecordSpeechStat(message, env, chatId, { waitUntil() {} });
 	await cacheModerationMessage(env, message, { isAd: ad });
 	return true;
@@ -12999,7 +13074,7 @@ async function ensureAdDryRunLogTable(env) {
 			// 说清这一轮实际学了多少；新增列默认 0，不给历史流水编造数量。
 			if (await d1TableExists(env, 'ad_dryrun_log')) {
 				for (const column of ['evaluation', 'fp', 'done', 'learned', 'sample',
-					'badges', 'avatars', 'images', 'shapes', 'links', 'packs', 'skeletons']) {
+					'badges', 'avatars', 'images', 'shapes', 'links', 'packs', 'skeletons','fp_revert_pending','fp_revert_claim_until']) {
 					try {
 						if (!(await d1ColumnExists(env, 'ad_dryrun_log', column))) {
 							await runD1SchemaStatement(env, 'ad_dryrun_log.' + column,
@@ -13050,6 +13125,9 @@ function serializeAdDryRunEvaluation(evaluation) {
 		for (const field of ['customEmojiIds', 'verifiedCustomEmojiIds', 'customEmojiMedia', 'scoredLinks']) {
 			if (Array.isArray(evaluation[key][field])) bounded[key][field] = evaluation[key][field].slice(0, 24);
 		}
+		for(const field of ['automatic','punishmentScope','punishmentChatId','autoCaseId','groupAdContextKey','dryRunMessageId','dryRunChatId','dryRunSessionId','dryRunNoOriginalMessage','imageVerifiedAd']) {
+			if(['string','number','boolean'].includes(typeof evaluation[key][field])) bounded[key][field]=evaluation[key][field];
+		}
 	}
 	bounded.globalDrill = evaluation.globalDrill || bounded.globalDrill;
 	let text = safeJsonStringify(bounded);
@@ -13072,6 +13150,7 @@ function serializeAdDryRunEvaluation(evaluation) {
 		}
 		text = safeJsonStringify(bounded);
 	}
+	if(text.length>32768)throw new Error('演练完整现场超过安全存储大小，未写入或学习截断现场');
 	return text;
 }
 
@@ -13079,14 +13158,22 @@ async function recordAdDryRun(env, input) {
 	if (!env?.DB) return null;
 	if (!(await ensureAdDryRunLogTable(env))) return null;
 	try {
-		const evaluation = input?.evaluation || {};
+		if (!(await ensureAdDryRunCloseTables(env))) return null;
+		const raw = input?.evaluation || {};
+		const activeSession = await readAdDryRunSession(env,true);
+		if (raw.snapshot?.automatic === true && activeSession && activeSession.status !== 'open') return null;
+		const originalMessageId = Number(input?.input?.messageId || input?.input?.message?.message_id) || 0;
+		const evaluation = { ...raw, snapshot: { ...(raw.snapshot || {}),
+			dryRunMessageId: originalMessageId,
+			dryRunNoOriginalMessage: !originalMessageId && input?.input?.messageId === null,
+			dryRunChatId: String(input?.chatId || ''), dryRunSessionId:Number(activeSession?.id)||0, dryRunChatTitle: String(input?.input?.chatTitle || '') } };
 		const evaluationJson = serializeAdDryRunEvaluation(evaluation);
 		const savedEvaluation = JSON.parse(evaluationJson);
 		const evaluationSnapshot = { ...(savedEvaluation.payload || {}), ...(savedEvaluation.snapshot || {}) };
 		const nowSeconds = Math.floor(Date.now() / 1000);
 		const res = await env.DB.prepare(
 			'INSERT INTO ad_dryrun_log (chat_id, user_id, score, threshold, verdict, layer, reasons, snapshot, evaluation, created_at)'
-			+ ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+			+ " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (?=0 OR NOT EXISTS (SELECT 1 FROM ad_dryrun_sessions) OR EXISTS (SELECT 1 FROM ad_dryrun_sessions WHERE id=? AND status='open'))"
 		).bind(
 			String(input?.chatId || ''),
 			String(input?.userId || ''),
@@ -13100,10 +13187,10 @@ async function recordAdDryRun(env, input) {
 			// 只存判据与快照的话，payload / structure / behaviorScore 这些它要用的
 			// 字段都还原不出来 —— 学指纹、学样本、清观察那一串会拿错数据。
 			evaluationJson,
-			nowSeconds
+			nowSeconds, raw.snapshot?.automatic === true ? 1 : 0, Number(activeSession?.id)||0
 		).run();
-		await env.DB.prepare('DELETE FROM ad_dryrun_log WHERE created_at < ?')
-			.bind(nowSeconds - Math.floor(AD_DRYRUN_LOG_TTL_MS / 1000)).run();
+		if (Number(res?.meta?.changes) === 0) return null;
+		// 流水保留供本轮关闭收尾和后续审计，不自动删除尚未处理的旧记录。
 		// 三写法兜底，与 pruneAutoincrementCacheTable 取自增主键的口径一致。
 		return Number(res?.meta?.last_row_id ?? res?.meta?.lastRowId ?? res?.meta?.last_rowid) || null;
 	} catch (error) {
@@ -13170,7 +13257,7 @@ async function readAdDryRunRow(env, id) {
 	try {
 		return await env.DB.prepare(
 			'SELECT id, chat_id, user_id, score, threshold, verdict, layer, reasons, evaluation, fp, done, learned, sample,'
-			+ ' badges, avatars, images, shapes, links, packs, skeletons, created_at'
+			+ ' badges, avatars, images, shapes, links, packs, skeletons, fp_revert_pending, fp_revert_claim_until, created_at'
 			+ ' FROM ad_dryrun_log WHERE id = ?'
 		).bind(rowId).first();
 	} catch (error) {
@@ -13187,11 +13274,13 @@ async function markAdDryRunVerdict(env, id, field) {
 	if (!env?.DB || !rowId || !column) return { ok: false, reason: 'bad_arg' };
 	if (!(await ensureAdDryRunLogTable(env))) return { ok: false, reason: 'no_table' };
 	try {
+		if(column==='fp'&&!(await ensureAdDryRunCloseTables(env)))return {ok:false,reason:'no_table'};
 		const res = await env.DB.prepare(
 			'UPDATE ad_dryrun_log SET ' + column + ' = 1 WHERE id = ? AND ' + column + ' = 0'
+			+ (column==='fp'?" AND NOT EXISTS (SELECT 1 FROM ad_dryrun_close_cases c JOIN ad_dryrun_sessions s ON s.id=c.session_id WHERE c.row_id=ad_dryrun_log.id AND s.status!='open')":'')
 		).bind(rowId).run();
 		const changed = Number(res?.meta?.changes || 0);
-		return { ok: changed > 0, changed };
+		return { ok: changed > 0, changed, reason:changed>0?'':'关闭归档已开始或记录已处理，未接受此次标注；请查看报告或实际处罚误封解除' };
 	} catch (error) {
 		console.error('[演练模式] 写入结论失败:', error);
 		return { ok: false, reason: 'error', error: error.message || String(error) };
@@ -28239,6 +28328,293 @@ async function addAdFalsePositive(env, rawText, profile) {
 	}
 }
 
+// 第一主人确认正常的完整现场反例，只接受冻结的完整SHA，不从旧截断快照猜测。
+async function recordAdNormalContextFeedback(env, contextKey) {
+	const key = String(contextKey || '');
+	if (!env?.DB || !/^[a-f0-9]{64}$/.test(key) || !(await ensureAdFalsePositivesTable(env))) return false;
+	try {
+		const result = await env.DB.prepare("INSERT INTO ad_false_positives (value, source, at) VALUES (?, 'normal_context', ?) ON CONFLICT(value) DO UPDATE SET source = excluded.source, at = excluded.at")
+			.bind('ctx:' + key, Date.now()).run();
+		if (result?.success === false) return false;
+		return await hasAdNormalContextFeedback(env, key);
+	} catch (_) { return false; }
+}
+
+// 读取是精确完整现场匹配，不以用户ID或一段常见文字放行整个人；不在读取侧建表。
+async function hasAdNormalContextFeedback(env, contextKey) {
+	const key = String(contextKey || '');
+	if (!env?.DB || !/^[a-f0-9]{64}$/.test(key)) return false;
+	try {
+		return Boolean(await env.DB.prepare("SELECT value FROM ad_false_positives WHERE value = ? AND source = 'normal_context' LIMIT 1")
+			.bind('ctx:' + key).first());
+	} catch (_) { return false; }
+}
+
+// 旧快照仅有短文字时，用完整bio+正文精确匹配；长文本绝不按200字前缀放行。
+async function hasAdNormalTextFeedback(env, bio, text) {
+	const value = [String(bio || ''), String(text || '')].filter(Boolean).join(' ')
+		.replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+	if (!env?.DB || value.length < 4 || value.length > AD_FALSE_POSITIVE_CLIP) return false;
+	try {
+		return Boolean(await env.DB.prepare("SELECT value FROM ad_false_positives WHERE value = ? AND source != 'normal_context' LIMIT 1")
+			.bind(value).first());
+	} catch (_) { return false; }
+}
+
+async function recordAdDryRunNormalFeedback(env, evaluation) {
+	const payload = { ...(evaluation?.snapshot || {}), ...(evaluation?.payload || {}) };
+	const tally = { text:0,context:0,materials:0 };
+	const profile = { bio: String(payload.bio || '') }, text = String(payload.text || '');
+	const value = adFalsePositiveText({ profile, text }, AD_FALSE_POSITIVE_CLIP);
+	if (value.length >= 4) {
+		if (!(await addAdFalsePositive(env, text, profile))) return {ok:false,tally};
+		if (!(await matchAdFalsePositive(env, { profile, text }))) return {ok:false,tally};
+		tally.text = 1;
+	}
+	const key = String(evaluation?.snapshot?.groupAdContextKey || '');
+	if (/^[a-f0-9]{64}$/.test(key)) {
+		if (!(await recordAdNormalContextFeedback(env,key))) return {ok:false,tally};
+		tally.context = 1;
+	}
+	const assets = new Map();
+	const imageIds = [payload.imageId,...(payload.customEmojiMedia || []).map(item=>item.fileUniqueId)].filter(Boolean);
+	for (const imageId of new Set(imageIds)) {
+		const row = await readAdImage(env,imageId); if (row?.verdict==='clean' && ['manual','owner'].includes(row.source)) assets.set('image:'+imageId,1);
+	}
+	if (payload.avatarId) { const row=await readAdAvatar(env,payload.avatarId); if(row?.verdict==='clean'&&['manual','owner'].includes(row.source))assets.set('avatar:'+payload.avatarId,1); }
+	for (const badgeId of new Set([payload.badgeId,...(payload.customEmojiIds || [])].filter(Boolean))) {
+		const row=await readAdBadge(env,badgeId); if(row?.verdict==='clean'&&['manual','owner'].includes(row.source))assets.set('badge:'+badgeId,1);
+	}
+	tally.materials = assets.size;
+	return {ok:true,tally};
+}
+
+async function queueAdDryRunClose(env, sessionId) {
+	try {
+		const queue = getBulkQueue(env);
+		if (!queue) return false;
+		await queue.send({ type: 'drill_close', sessionId: Number(sessionId) }, { delaySeconds: 10 });
+		return true;
+	} catch (_) { return false; }
+}
+
+async function closeGlobalDryRun(env, message, state, session) {
+	if (!isTelegramOwnerPrivateInvocation(message)) return { ok: false, error: '仅第一主人本人私聊可关闭' };
+	if (!session || !['open','closing','processing','partial'].includes(session.status)) {
+		if (!state.on) {
+			if (session && !Number(session.report_sent)) await sendAdDryRunCloseReport(env, session.id);
+			return { ok: true, on: false, complete: true, reportSent:!session||Number(session.report_sent)===1, sessionId: session?.id || null };
+		}
+		session = await startAdDryRunSession(env, state.at, true);
+	}
+	if (session.status === 'open') {
+		const last = await env.DB.prepare('SELECT COALESCE(MAX(id),0) AS id FROM ad_dryrun_log').first();
+		await env.DB.batch([
+			env.DB.prepare("UPDATE ad_dryrun_sessions SET cutoff_row_id=?,closed_at=?,status='closing',report_sent=0 WHERE id=? AND status='open'")
+				.bind(Number(last.id), new Date().toISOString(), Number(session.id)),
+			env.DB.prepare("INSERT OR IGNORE INTO ad_dryrun_close_cases(session_id,row_id) SELECT s.id,l.id FROM ad_dryrun_sessions s JOIN ad_dryrun_log l ON l.id >= s.start_row_id AND l.id <= s.cutoff_row_id WHERE s.id=?")
+				.bind(Number(session.id))
+		]);
+	} else if (session.status === 'partial') {
+		await env.DB.batch([
+			env.DB.prepare("UPDATE ad_dryrun_sessions SET status='processing',report_sent=0 WHERE id=?").bind(Number(session.id)),
+			env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='pending' WHERE session_id=? AND status='failed'").bind(Number(session.id))
+		]);
+	}
+	if(session.status==='closing')await env.DB.prepare('UPDATE ad_dryrun_sessions SET normal_attempts=0,report_sent=0 WHERE id=?').bind(Number(session.id)).run();
+	const result = await runAdDryRunCloseJob(env, session.id, { limit: 8 });
+	return { ok: true, on: false, sessionId: session.id, ...result };
+}
+
+async function retryAdDryRunCloseSession(env, sessionId, message) {
+	if (!isTelegramOwnerPrivateInvocation(message)) return {ok:false,error:'仅第一主人本人私聊可重试'};
+	await ensureAdDryRunCloseTables(env);
+	const session = await env.DB.prepare('SELECT * FROM ad_dryrun_sessions WHERE id=?').bind(Number(sessionId)).first();
+	if (!session) return {ok:false,error:'本轮记录不存在'};
+	if(session.status==='closed')return {ok:true,complete:true,reportSent:await sendAdDryRunCloseReport(env,session.id,{force:true})};
+	if(session.status==='open')return {ok:false,error:'这一轮仍开启，请使用 /dryrun off'};
+	if(session.status==='closing')await env.DB.prepare('UPDATE ad_dryrun_sessions SET normal_attempts=0,report_sent=0 WHERE id=?').bind(Number(session.id)).run();
+	if(session.status==='partial')await env.DB.batch([
+		env.DB.prepare("UPDATE ad_dryrun_sessions SET status='processing',report_sent=0 WHERE id=?").bind(Number(session.id)),
+		env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='pending' WHERE session_id=? AND status='failed'").bind(Number(session.id))
+	]);
+	return {ok:true,...await runAdDryRunCloseJob(env,session.id,{limit:8})};
+}
+
+async function sendAdDryRunCloseReport(env, sessionId, options = {}) {
+	const session = await env.DB.prepare('SELECT * FROM ad_dryrun_sessions WHERE id=?').bind(Number(sessionId)).first();
+	if (!session) return false;
+	const rows=[];let after=0;
+	while(true){
+		const page=(await env.DB.prepare("SELECT l.id,l.chat_id,l.user_id,l.fp,l.fp_revert_pending,l.done,l.learned,l.sample,l.badges,l.avatars,l.images,l.shapes,l.links,l.packs,l.skeletons,c.status AS close_status,c.ban_done,c.delete_done,c.normal_done,c.normal_anchor,c.revert_done,c.normal_tally,c.delete_state,c.error,CASE WHEN json_valid(l.evaluation) THEN COALESCE(json_extract(l.evaluation,'$.snapshot.name'),json_extract(l.evaluation,'$.payload.name'),'') ELSE '' END AS display_name,CASE WHEN json_valid(l.evaluation) THEN COALESCE(json_extract(l.evaluation,'$.snapshot.dryRunChatTitle'),'') ELSE '' END AS chat_title FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND l.id>? ORDER BY l.id LIMIT 200")
+			.bind(Number(sessionId),after).all()).results||[];
+		rows.push(...page);if(page.length<200)break;after=Number(page[page.length-1].id);
+	}
+	const totals = { learned:0,sample:0,badges:0,avatars:0,images:0,shapes:0,links:0,packs:0,skeletons:0 };
+	for (const row of rows) for (const key of Object.keys(totals)) totals[key] += Number(row[key]) || 0;
+	const groups = new Set(rows.map(row=>row.chat_id)), users = new Set(rows.map(row=>row.user_id));
+	const fp = rows.filter(row=>Number(row.fp)===1||Number(row.normal_anchor)>0||row.close_status==='skipped_normal'), ads = rows.filter(row=>Number(row.fp)!==1&&!Number(row.normal_anchor)&&row.close_status!=='skipped_normal');
+	const normalTally = {text:0,context:0,materials:0};
+	const reverted = {...totals}; for(const key of Object.keys(reverted))reverted[key]=fp.filter(row=>row.fp&&!row.fp_revert_pending||row.revert_done).reduce((sum,row)=>sum+(Number(row[key])||0),0);
+	for(const row of fp){let tally={};try{tally=JSON.parse(row.normal_tally||'{}');}catch(_){}for(const key of Object.keys(normalTally))normalTally[key]+=Number(tally[key])||0;}
+	const banPairs = new Set(ads.filter(row=>row.ban_done).map(row=>row.chat_id+':'+row.user_id));
+	const stateNames = {done:'完成',failed:'失败',skipped:'跳过/归并',skipped_normal:'正常现场反例，跳过封删',pending:'待处理',open:'开启',closing:'正常反例处理中',processing:'广告封删处理中',partial:'已关闭，部分封删待重试',closed:'已关闭并完成'};
+	const lines = ['<b>🧪 本轮演练关闭完整结果 #' + session.id + '</b>',
+		'起止：' + escapeHtml(session.opened_at) + ' → ' + escapeHtml(session.closed_at),
+		'边界依据：' + escapeHtml(session.boundary_note || '按持久流水ID边界处理'),
+		'当前全局范围 ' + globalDryRunScopeGroupIds().length + ' 群；本轮有记录 ' + groups.size + ' 群。',
+		'流水边界：#' + session.start_row_id + ' 至 #' + session.cutoff_row_id + '；' + rows.length + ' 条，去重用户 ' + users.size,
+		'本轮曾学习：指纹 ' + totals.learned + '，AI样本 ' + totals.sample + '，正文骨架 ' + totals.skeletons,
+		'素材学习：图片 ' + totals.images + '，头像 ' + totals.avatars + '，会员标/贴纸 ' + totals.badges + '，贴纸包 ' + totals.packs + '，资料形状 ' + totals.shapes + '，挂号案底 ' + totals.links,
+		'误判已撤销的原学习记账：指纹 ' + reverted.learned + '，AI样本 ' + reverted.sample + '，骨架 ' + reverted.skeletons + '，图片 ' + reverted.images + '，头像 ' + reverted.avatars + '，会员标/贴纸 ' + reverted.badges + '，形状 ' + reverted.shapes + '；这些是本轮记账，不冒充共享库净变化。',
+		'保留广告记录的原学习记账：指纹 ' + (totals.learned-reverted.learned) + '，AI样本 ' + (totals.sample-reverted.sample) + '，骨架 ' + (totals.skeletons-reverted.skeletons),
+		'广告：去重用户+来源群封禁成功 ' + banPairs.size + '；归并记录 ' + Math.max(0,ads.filter(row=>row.ban_done).length-banPairs.size) + '；失败流水 ' + ads.filter(row=>row.close_status==='failed').length + '；跳过 ' + ads.filter(row=>row.close_status==='skipped').length,
+		'原消息：删除成功 ' + ads.filter(row=>row.delete_state==='deleted').length + '；已不存在 ' + ads.filter(row=>row.delete_state==='gone').length + '；无原消息无需删除 ' + ads.filter(row=>row.delete_state==='none').length + '；缺原ID ' + ads.filter(row=>row.delete_state==='missing').length + '；其他失败 ' + ads.filter(row=>row.delete_state==='failed').length,
+		'正常记录：' + fp.length + ' 条（原手动误判标注 ' + rows.filter(row=>row.fp).length + '，同用户本轮归并 ' + fp.filter(row=>!row.fp).length + '），去重正常用户 ' + new Set(fp.map(row=>row.user_id)).size + '；文字反例写入/刷新 ' + normalTally.text + '，完整现场反例写入/刷新 ' + normalTally.context + '，已保存素材正常对照 ' + normalTally.materials + '；未完成 ' + fp.filter(row=>!row.normal_done).length,
+		'误判按钮已即时撤销错误学习；本轮关闭只统一记录正常内容/资料/素材反例，不添加用户永久白名单。',
+		'状态：' + escapeHtml(stateNames[session.status]||session.status) + '。本轮重试/补发：第一主人私聊 <code>/dryrun retry ' + session.id + '</code>；已成功步骤不会再次执行。', ''];
+	for (const row of rows) {
+		const name = String(row.display_name || row.user_id).slice(0,120);
+		lines.push('<b>流水 #' + row.id + '</b>　' + formatUserReference(row.user_id, { first_name: name }));
+		lines.push('来源群：'+escapeHtml(row.chat_title||'')+' <code>' + escapeHtml(row.chat_id) + '</code>；' + (Number(row.fp)===1 ? '原手动误判，撤错学后入池' : row.normal_anchor ? '本轮正常用户归并，依据原标注流水 #'+row.normal_anchor+'；撤错学后入池' : row.close_status==='skipped_normal'?'已确认正常现场反例，不执行封删':'自动学习广告，本群封禁+原消息删除'));
+		lines.push('结果：' + escapeHtml(stateNames[row.close_status]||row.close_status) + '；封禁 ' + (row.ban_done ? '完成' : '未执行/未完成') + '；删除 ' + escapeHtml(({deleted:'完成',gone:'已不存在',none:'无原消息，无需删除',missing:'缺原消息ID',failed:'失败'})[row.delete_state] || '未执行') + '；正常反例 ' + (row.normal_done ? '完成' : '未录入'));
+		if (row.error) lines.push('原因/归并：' + escapeHtml(toChineseErrorText(row.error)));
+		lines.push('');
+	}
+	const report = lines.join('\n');
+	if(!options.force&&session.report===report&&Number(session.report_sent)===1)return true;
+	await env.DB.prepare('UPDATE ad_dryrun_sessions SET report=? WHERE id=?').bind(report, Number(sessionId)).run();
+	const currentOwner=String(OWNER_IDS[0]||'');
+	if(!currentOwner||!isPrimaryOwner(currentOwner))return false;
+	const sent = await sendTelegramMessageChunks(currentOwner, report);
+	if (sent?.ok) await env.DB.prepare('UPDATE ad_dryrun_sessions SET report_sent=1 WHERE id=?').bind(Number(sessionId)).run();
+	return sent?.ok === true;
+}
+
+async function runAdDryRunCloseJob(env, sessionId, options = {}) {
+	if (!(await ensureAdDryRunCloseTables(env))) return { complete:false,error:'收尾存储未就绪' };
+	const id = Number(sessionId), now = Math.floor(Date.now()/1000), token = String(Date.now()) + ':' + Math.random();
+	const leased = await env.DB.prepare("UPDATE ad_dryrun_sessions SET lease_until=?,lease_token=? WHERE id=? AND status IN ('closing','processing') AND lease_until <= ? RETURNING id")
+		.bind(now+300,token,id,now).first();
+	if (!leased) {
+		const saved = await env.DB.prepare('SELECT status FROM ad_dryrun_sessions WHERE id=?').bind(id).first();
+		return { complete:saved?.status==='closed',partial:saved?.status==='partial',busy:['closing','processing'].includes(saved?.status) };
+	}
+	try {
+		const renew = async () => {
+			const result=await env.DB.prepare("UPDATE ad_dryrun_sessions SET lease_until=? WHERE id=? AND lease_token=? AND status IN ('closing','processing')")
+				.bind(Math.floor(Date.now()/1000)+300,id,token).run();
+			if(Number(result?.meta?.changes || 0)<1)throw new Error('收尾作业租约已变化，停止旧执行器');
+		};
+		const limit = Math.max(1,Math.min(Number(options.limit)||8,20));
+		let session = await env.DB.prepare('SELECT * FROM ad_dryrun_sessions WHERE id=?').bind(id).first();
+		if(session.status==='closing'&&Number(session.normal_attempts)>=3)return {complete:false,normalPending:true,needsManualRetry:true};
+		if (session.status === 'closing') {
+			let normalFailure=false;
+			const normal = (await env.DB.prepare("SELECT l.*,c.revert_done,(SELECT MIN(f.id) FROM ad_dryrun_close_cases fc JOIN ad_dryrun_log f ON f.id=fc.row_id WHERE fc.session_id=c.session_id AND f.fp=1 AND f.user_id=l.user_id) AS anchor FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND c.normal_done=0 AND EXISTS (SELECT 1 FROM ad_dryrun_close_cases fc JOIN ad_dryrun_log f ON f.id=fc.row_id WHERE fc.session_id=c.session_id AND f.fp=1 AND f.user_id=l.user_id) ORDER BY l.id LIMIT ?").bind(id,limit).all()).results || [];
+			for (const row of normal) {
+				await renew();
+				let evaluation = {}; try { evaluation = JSON.parse(row.evaluation || '{}'); } catch (_) {}
+				await env.DB.prepare('UPDATE ad_dryrun_close_cases SET normal_anchor=? WHERE session_id=? AND row_id=?').bind(Number(row.anchor),id,Number(row.id)).run();
+				if(row.fp_revert_pending&&Number(row.fp_revert_claim_until)>Math.floor(Date.now()/1000)){
+					await env.DB.prepare("UPDATE ad_dryrun_close_cases SET error='正常标注已登记，原回滚仍在执行，未补封' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();continue;
+				}
+				if(!row.revert_done){
+					if(!row.fp||row.fp_revert_pending){
+						const reverted=await revertDryRunLearning(env,evaluation,{userId:String(row.user_id),eventKey:row.fp?'dryrun:'+row.id:'dryrun-close:'+id+':'+row.id});
+						if(reverted.errors?.length){normalFailure=true;await env.DB.prepare("UPDATE ad_dryrun_close_cases SET error=? WHERE session_id=? AND row_id=?").bind('正常归并撤错学未完成：'+reverted.errors.join('、'),id,Number(row.id)).run();continue;}
+						if(row.fp)await env.DB.prepare('UPDATE ad_dryrun_log SET fp_revert_pending=0,fp_revert_claim_until=0 WHERE id=? AND fp=1').bind(Number(row.id)).run();
+					}
+					await renew();
+					const saved=await env.DB.prepare('UPDATE ad_dryrun_close_cases SET revert_done=1 WHERE session_id=? AND row_id=?').bind(id,Number(row.id)).run();
+					if(saved?.success===false)throw new Error('正常撤错学记账失败，保留待重试');
+				}
+				const normalResult = await recordAdDryRunNormalFeedback(env,evaluation), ok = normalResult.ok;
+				if(!ok)normalFailure=true;
+				await renew();
+				await env.DB.prepare("UPDATE ad_dryrun_close_cases SET normal_done=?,normal_tally=?,status=?,error=? WHERE session_id=? AND row_id=?")
+					.bind(ok?1:0,JSON.stringify(normalResult.tally),ok?'done':'pending',ok?(row.fp?'原手动误判':'本轮正常用户归并，依据流水 #'+row.anchor):'正常反例写入失败，保留待重试',id,Number(row.id)).run();
+			}
+			const remaining = await env.DB.prepare('SELECT COUNT(*) AS n FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND c.normal_done=0 AND EXISTS (SELECT 1 FROM ad_dryrun_close_cases fc JOIN ad_dryrun_log f ON f.id=fc.row_id WHERE fc.session_id=c.session_id AND f.fp=1 AND f.user_id=l.user_id)').bind(id).first();
+			if (Number(remaining.n)>0) {
+				if(normalFailure)await env.DB.prepare('UPDATE ad_dryrun_sessions SET normal_attempts=normal_attempts+1 WHERE id=?').bind(id).run();
+				const attempts=await env.DB.prepare('SELECT normal_attempts FROM ad_dryrun_sessions WHERE id=?').bind(id).first();
+				const needsManualRetry=Number(attempts.normal_attempts)>=3;
+				const queued=!needsManualRetry&&await queueAdDryRunClose(env,id); await sendAdDryRunCloseReport(env,id);
+				return { complete:false,queued,normalPending:true,needsManualRetry };
+			}
+			// 所有正常反例安全落库后才恢复常规自动处理；广告失败留在本轮作业，不让全群永久卡住。
+			await env.DB.batch([
+				env.DB.prepare("UPDATE ad_dryrun_sessions SET status='processing' WHERE id=? AND lease_token=?").bind(id,token),
+				env.DB.prepare('UPDATE dryrun_groups SET enabled=0')
+			]);
+		}
+		const ads = (await env.DB.prepare("SELECT l.*,c.ban_done,c.delete_done FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND l.fp=0 AND c.status='pending' ORDER BY l.id LIMIT ?").bind(id,limit).all()).results || [];
+		for (const row of ads) {
+			await renew();
+			let evaluation = {}; try { evaluation = JSON.parse(row.evaluation || '{}'); } catch (_) {}
+			const normal = await env.DB.prepare('SELECT l.id FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND l.fp=1 AND l.user_id=? LIMIT 1').bind(id,String(row.user_id)).first();
+			if (normal || Number(row.done)===1 || row.verdict !== 'ban') {
+				await env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='skipped',error=? WHERE session_id=? AND row_id=?")
+					.bind(normal?'本轮用户已标正常，全部来源群归并流水 #'+normal.id:Number(row.done)===1?'历史已完成记录，不重复处罚':'不是广告判定，不处罚',id,Number(row.id)).run(); continue;
+			}
+			try {
+				for (const field of ['punishmentChatId','dryRunChatId']) {
+					if (evaluation?.snapshot?.[field] && String(evaluation.snapshot[field]) !== String(row.chat_id)) throw new Error('冻结处罚归属与流水群不一致，未执行封删');
+				}
+				const previous = await env.DB.prepare('SELECT l.id FROM ad_dryrun_close_cases c JOIN ad_dryrun_log l ON l.id=c.row_id WHERE c.session_id=? AND c.ban_done=1 AND l.user_id=? AND l.chat_id=? LIMIT 1').bind(id,String(row.user_id),String(row.chat_id)).first();
+				if (!Number(row.ban_done) && !previous) {
+					const entry=await readGroupBlacklistEntry(env,String(row.chat_id),String(row.user_id));
+					const member=entry?await checkUserStatus(String(row.user_id),String(row.chat_id)):null;
+					if(!(member?.ok===true&&member.result?.status==='kicked')){
+						const result = await enforceAdDetection(env,{userId:String(row.user_id),chatId:String(row.chat_id),messageId:null},evaluation,
+							{drillCloseReplay:true,skipLearning:true,probeMembership:false,config:loadAdDetectionConfig(env),whitelist:await loadAdDomainWhitelist(env)});
+						if(result?.normalFeedback||result?.reason==='confirmed_normal_context'){
+							await env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='skipped_normal',normal_done=1,error='已命中主人确认的正常现场反例，未执行封删' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();continue;
+						}
+						if (!result?.banned || result.complete !== true) throw new Error(result?.reason || result?.banSummary || '本群封禁未完成');
+					}
+				}
+				await renew();
+				const banSaved=await env.DB.prepare('UPDATE ad_dryrun_close_cases SET ban_done=1,error=? WHERE session_id=? AND row_id=?')
+					.bind(previous?'本群同用户封禁已由流水 #'+previous.id+' 完成':'',id,Number(row.id)).run();
+				if(banSaved?.success===false)throw new Error('封禁成功步骤记账失败，保留重试核验');
+				if (!Number(row.delete_done)) {
+					const messageId = Number(evaluation?.snapshot?.dryRunMessageId) || 0;
+					if (!messageId && evaluation?.snapshot?.dryRunNoOriginalMessage === true) {
+						const noMessageSaved = await env.DB.prepare("UPDATE ad_dryrun_close_cases SET delete_done=1,delete_state='none' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();
+						if (noMessageSaved?.success === false) throw new Error('无需删除的消息状态记账失败');
+					} else {
+					if (!messageId) {
+						await env.DB.prepare("UPDATE ad_dryrun_close_cases SET delete_state='missing' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();
+						throw new Error('旧流水未保存原消息ID；未猜测或删除其它消息');
+					}
+					const deleted = await deleteMessage(String(row.chat_id),messageId);
+					await renew();
+					const gone = !deleted?.ok && /message to delete not found|message not found/i.test(String(deleted?.error || ''));
+					if (!deleted?.ok && !gone) {
+						await env.DB.prepare("UPDATE ad_dryrun_close_cases SET delete_state='failed' WHERE session_id=? AND row_id=?").bind(id,Number(row.id)).run();
+						throw new Error(deleted?.error || '删除原消息失败');
+					}
+					const deleteSaved=await env.DB.prepare('UPDATE ad_dryrun_close_cases SET delete_done=1,delete_state=? WHERE session_id=? AND row_id=?').bind(gone?'gone':'deleted',id,Number(row.id)).run();
+					if(deleteSaved?.success===false)throw new Error('删除成功步骤记账失败，保留重试核验');
+					}
+				}
+				await env.DB.batch([
+					env.DB.prepare('UPDATE ad_dryrun_log SET done=1 WHERE id=? AND fp=0').bind(Number(row.id)),
+					env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='done' WHERE session_id=? AND row_id=?").bind(id,Number(row.id))
+				]);
+			} catch (error) { await renew(); await env.DB.prepare("UPDATE ad_dryrun_close_cases SET status='failed',error=? WHERE session_id=? AND row_id=?").bind(String(error?.message || error),id,Number(row.id)).run(); }
+		}
+		const pending = await env.DB.prepare("SELECT COUNT(*) AS n FROM ad_dryrun_close_cases WHERE session_id=? AND status='pending'").bind(id).first();
+		if (Number(pending.n)>0) { const queued = await queueAdDryRunClose(env,id); return { complete:false,queued }; }
+		const failed = await env.DB.prepare("SELECT COUNT(*) AS n FROM ad_dryrun_close_cases WHERE session_id=? AND status='failed'").bind(id).first();
+		await env.DB.prepare('UPDATE ad_dryrun_sessions SET status=?,report_sent=0 WHERE id=? AND lease_token=?').bind(Number(failed.n)?'partial':'closed',id,token).run();
+		const reportSent = await sendAdDryRunCloseReport(env,id);
+		return { complete:Number(failed.n)===0,partial:Number(failed.n)>0,reportSent };
+	} finally { await env.DB.prepare('UPDATE ad_dryrun_sessions SET lease_until=0,lease_token=\'\' WHERE id=? AND lease_token=?').bind(id,token).run(); }
+}
+
 // 达线之后先问一句反例池：主人确认过的形态，模型再判也只降级。
 async function matchAdFalsePositive(env, input) {
 	if (!env?.DB) return null;
@@ -31668,7 +32044,7 @@ function serializeAdReviewValue(value) {
 	if (Array.isArray(bounded)) {
 		while (bounded.length && text.length > 32768) { bounded.pop(); text = JSON.stringify(bounded); }
 	} else {
-		const immutableScope = new Set(['automatic', 'punishmentScope', 'punishmentChatId', 'autoCaseId', 'groupAdContextKey']);
+		const immutableScope = new Set(['automatic', 'punishmentScope', 'punishmentChatId', 'autoCaseId', 'groupAdContextKey', 'dryRunMessageId', 'dryRunChatId', 'dryRunSessionId', 'dryRunNoOriginalMessage']);
 		const critical = new Set([...immutableScope, 'learningPayload', 'payload', 'textSkeleton', 'matchedTextSkeleton', 'imageId', 'avatarId', 'badgeId', 'customEmojiIds', 'profileShape', 'scoredLinks', 'name', 'username', 'bio', 'text']);
 		const removable = Object.keys(bounded).reverse().filter((key) => !critical.has(key));
 		for (const key of removable) {
@@ -32384,6 +32760,12 @@ async function evaluateAdSuspect(env, input, options = {}) {
 
 	// 只在自动检测输入中去掉已豁免字段，冻结现场与其它独立位置保持完整。
 	const detectionPayload = adTechnicalExemptPayload(payload);
+	const normalTextFeedback = await hasAdNormalTextFeedback(env, payload.bio, payload.text);
+	if (normalTextFeedback) {
+		detectionPayload.bio = ''; detectionPayload.text = '';
+		detectionPayload.domains = extractAdDomains(String(detectionPayload.name || ''));
+		reasons.push('正文与简介完整命中主人确认的正常反例，仅否证这两个文字位置');
+	}
 	const fingerprint = await matchAdFingerprints(env, detectionPayload, { config });
 	if (fingerprint.hits.length) {
 		score += fingerprint.score;
@@ -32428,7 +32810,7 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	// 换成函数调用后行为与改动前唯一的差别就是「URL 被换成语义占位符」，
 	// 这也正是要的效果 —— 比对时剥链接、学习时也剥链接，两边看到的是同一种文本。
 	const semanticText = buildAdSampleText(detectionPayload);
-	if (config.aiEnabled && semanticText.length >= 6) {
+	if (!normalTextFeedback && config.aiEnabled && semanticText.length >= 6) {
 		ai = await checkAdAiSimilarity(env, semanticText, { config });
 		// ===== 豁免词否证优先于 AI 硬命中（2026-09-12 线上误封 #1615）=====
 		// 线上误封：正常用户简介写「我的频道 https://t.me/xxx 私聊机器人 @xxx_bot」、
@@ -32540,7 +32922,7 @@ async function evaluateAdSuspect(env, input, options = {}) {
 				// 旧写法只在 body.guilty 时取 body，弱档会被 judgeAdQuotedKill 的结果
 				// 覆盖，weak 标记与 reasons 就此丢失 —— 上层既看不到也加不上分。
 				if (body.guilty || body.weak) structure = body;
-				else structure = judgeAdQuotedKill(detectionPayload);
+				else structure = judgeAdQuotedKill(normalTextFeedback ? { ...detectionPayload, text: payload.text } : detectionPayload);
 				// 引用体查杀被门槛二 / 豁免词放行时留一行记录 —— 主人复核时要能看出
 				// 「引用的确实是广告，但本人是在举报」，否则这条放行路径完全不可观测。
 				if (!structure.guilty && structure.reasons.length) reasons.push(...structure.reasons);
@@ -32667,6 +33049,13 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		}
 	};
 	evaluation.positionEvidence = collectAdPositionEvidence(input, { whitelist, fingerprint, ai, structure });
+	if (normalTextFeedback) {
+		for (const key of ['bio', 'text']) {
+			evaluation.positionEvidence[key].grade = 0;
+			evaluation.positionEvidence[key].exempt = true;
+			evaluation.positionEvidence[key].reasons.push('完整正常反例否证本位置');
+		}
+	}
 	if (evaluation.bodySkeleton?.matched) addAdPositionEvidence(evaluation, 'text', 6, '已学正文骨架命中');
 	return rejudgeAdPositionEvidence(evaluation);
 }
@@ -33201,8 +33590,10 @@ async function handleDryRunButtonCallback(callbackQuery, env) {
 	const action = match[1];
 	const rowId = Number(match[2]);
 	const fromId = String(callbackQuery?.from?.id || '');
-	if (!isPrimaryOwner(fromId)) {
-		await answerAdVoteCallback(callbackQuery?.id, '这两个按钮只有第一主人能点', true);
+	if (!isPrimaryOwner(fromId) || !isTelegramOwnerPrivateInvocation({ from: callbackQuery?.from,
+		chat: callbackQuery?.message?.chat, message_id: callbackQuery?.message?.message_id,
+		__webAdmin: callbackQuery?.__webAdmin || callbackQuery?.message?.__webAdmin })) {
+		await answerAdVoteCallback(callbackQuery?.id, '演练误判按钮仅限第一主人本人在 Telegram 私聊中使用', true);
 		return;
 	}
 
@@ -33211,9 +33602,17 @@ async function handleDryRunButtonCallback(callbackQuery, env) {
 		await answerAdVoteCallback(callbackQuery?.id, '这条流水不存在或已清理', true);
 		return;
 	}
-	if (Number(row.fp) === 1 || Number(row.done) === 1) {
+	if (Number(row.fp) === 1&&!Number(row.fp_revert_pending) || Number(row.done) === 1) {
 		await answerAdVoteCallback(callbackQuery?.id, '这条已经处理过了', true);
 		return;
+	}
+	if(!(await ensureAdDryRunCloseTables(env))){await answerAdVoteCallback(callbackQuery?.id,'无法核对本轮归档状态，未执行纠错',true);return;}
+	const archived=await env.DB.prepare("SELECT s.status FROM ad_dryrun_close_cases c JOIN ad_dryrun_sessions s ON s.id=c.session_id WHERE c.row_id=? AND s.status!='open' LIMIT 1").bind(rowId).first();
+	if(archived){await answerAdVoteCallback(callbackQuery?.id,'这条已进入本轮关闭归档，未接受新的标注；请查看本轮报告或对新的实际处罚使用误封纠错',true);return;}
+	const closeSession = await readAdDryRunSession(env);
+	if (closeSession && ['closing','processing'].includes(closeSession.status)
+		&& rowId >= Number(closeSession.start_row_id) && rowId <= Number(closeSession.cutoff_row_id)) {
+		await answerAdVoteCallback(callbackQuery?.id, '本轮正在收尾，请先查看关闭结果，未重复修改学习', true); return;
 	}
 
 	const chatId = String(callbackQuery?.message?.chat?.id || '');
@@ -33235,20 +33634,26 @@ async function handleDryRunButtonCallback(callbackQuery, env) {
 		if (!evaluation || typeof evaluation !== 'object' || !(evaluation.payload || evaluation.learningPayload)) {
 			await answerAdVoteCallback(callbackQuery?.id, '流水缺少完整学习现场，未标记完成', true); return;
 		}
+		const now=Math.floor(Date.now()/1000);
+		const reserved=await env.DB.prepare("UPDATE ad_dryrun_log SET fp=1,fp_revert_pending=1,fp_revert_claim_until=? WHERE id=? AND done=0 AND (fp=0 OR (fp_revert_pending=1 AND fp_revert_claim_until<=?)) AND NOT EXISTS (SELECT 1 FROM ad_dryrun_close_cases c JOIN ad_dryrun_sessions s ON s.id=c.session_id WHERE c.row_id=ad_dryrun_log.id AND s.status!='open')")
+			.bind(now+300,rowId,now).run();
+		if(reserved?.success===false||Number(reserved?.meta?.changes||0)<1){await answerAdVoteCallback(callbackQuery?.id,'标注未接受：本轮已冻结或正在回滚，请查看关闭结果',true);return;}
 		let reverted;
 		try { reverted = await revertDryRunLearning(env, evaluation, { userId: String(row.user_id || ''), eventKey: 'dryrun:' + rowId }); }
 		catch (_) { reverted = { errors: ['撤销学习失败'] }; }
 		if (reverted.errors?.length) {
-			await answerAdVoteCallback(callbackQuery?.id, '部分学习尚未撤销，按钮已保留，请重试', true); return;
+			await env.DB.prepare('UPDATE ad_dryrun_log SET fp_revert_claim_until=0 WHERE id=? AND fp_revert_pending=1').bind(rowId).run();
+			await answerAdVoteCallback(callbackQuery?.id, '已登记正常标注，部分学习尚未撤销；按钮已保留，重试或关闭本轮继续处理', true); return;
 		}
-		const marked = await markAdDryRunVerdict(env, rowId, 'fp');
-		if (!marked.ok) { await answerAdVoteCallback(callbackQuery?.id, '标记失败：' + (marked.reason || '未知'), true); return; }
+		// 误判当时撤销错误学习，正常反例在本轮关闭时统一落库。
+		const finished=await env.DB.prepare('UPDATE ad_dryrun_log SET fp_revert_pending=0,fp_revert_claim_until=0 WHERE id=? AND fp=1 AND fp_revert_pending=1').bind(rowId).run();
+		if(finished?.success===false||Number(finished?.meta?.changes||0)<1){await env.DB.prepare('UPDATE ad_dryrun_log SET fp_revert_claim_until=0 WHERE id=? AND fp_revert_pending=1').bind(rowId).run();await answerAdVoteCallback(callbackQuery?.id,'正常标注已登记，但回滚完成记账未完成；本轮关闭会继续核对',true);return;}
 		await answerAdVoteCallback(callbackQuery?.id, '已标为误报，并撤销本次学到的特征');
 		const fpLine = [
 			'─────',
 			'❌ 已标为误报　流水 #' + rowId + '　得分 ' + (Number(row.score) || 0) + '/' + (Number(row.threshold) || 0),
 			'已撤销本次演练学到的特征（指纹 / 正文骨架 / 资料形状 / 头像 / 会员标 / 正文图片 / 贴纸包 / 自举案底 / AI 样本）。',
-			'只计入 /adstats 的演练统计。看统计：/adstats'
+			'本次错误学习已撤销；关闭本轮演练时统一进入正常反例池，不加入永久用户白名单。看统计：/adstats'
 		];
 		await editTelegramMessage(chatId, messageId, originText + '\n' + fpLine.join('\n'));
 		return;
@@ -33537,7 +33942,18 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	const chatId = input?.chatId != null ? String(input.chatId) : '';
 	if (!userId) return { banned: false, seq: null, reason: 'no_user' };
 	const automatic = options.ownerConfirmed !== true && options.manualAction !== true;
-	if (automatic && !autoDetectionScopeGroupIds(chatId).length) return { banned: false, seq: null, reason: 'no_current_group' };
+	if(automatic&&options.globalDrillCollected===true){
+		const state=await readGlobalDryRunState(env),session=await readAdDryRunSession(env);
+		if(!state.on||state.at!==options.globalDrillStartedAt&&options.globalDrillStartedAt
+			||Number(options.globalDrillSessionId)&&Number(options.globalDrillSessionId)!==Number(session?.id))
+			return {banned:false,dryrun:true,reason:'closed_before_collect_finished',learned:0,sampleAdded:false};
+	}
+	let automaticScopeGroupIds = autoDetectionScopeGroupIds(chatId);
+	const auxiliaryDrillGroup = automatic && !isConfiguredGroup(chatId) && isGlobalDryRunScopeGroup(chatId);
+	if (auxiliaryDrillGroup && (options.drillCloseReplay === true || (await isDryRunGroup(env, chatId)))) {
+		automaticScopeGroupIds = [chatId];
+	}
+	if (automatic && !automaticScopeGroupIds.length) return { banned: false, seq: null, reason: 'no_current_group' };
 	// 用户白名单：封禁执行口的兜底闸。
 	// 前面两个入口挡住了自动检测，但仍有几条路会绕过它们直接走到这里 ——
 	// 同款连带（findLinkedSpamTargets 按文本 hash 连人，只看 hash 不看人）、
@@ -33545,10 +33961,25 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// 所以这里无条件拦，【不看 options.force】：force 的语义只是「跳过阈值裁决」，
 	// 不是「跳过白名单」—— 主人手动点确认时若目标在白名单，回执会写明原因而不是静默失败。
 	if (await isAdUserWhitelisted(env, userId)) return { banned: false, seq: null, reason: 'whitelisted' };
+	if (auxiliaryDrillGroup) {
+		const originMember = await checkUserStatus(userId, chatId);
+		if (['creator', 'administrator'].includes(String(originMember?.result?.status || ''))) {
+			return { banned: false, seq: null, reason: 'protected_user' };
+		}
+	}
 	// 独立群的本群白名单同理（只在独立群读，全局群零额外 SQL）。
 	const localScope = Boolean(chatId) && isIndependentGroup(chatId);
 	if (localScope && (await resolveLocalAdDetectionSkip(env, chatId, userId)) === 'whitelisted') {
 		return { banned: false, seq: null, reason: 'whitelisted' };
+	}
+	// 第一主人确认过的完整正常现场只否证该内容，不给用户 ID 永久豁免。
+	if (automatic && evaluation?.bioChecked !== false) {
+		const normalKey = /^[a-f0-9]{64}$/.test(String(evaluation?.snapshot?.groupAdContextKey || ''))
+			? evaluation.snapshot.groupAdContextKey : await buildGroupAdContextKey(input, evaluation);
+		if (await hasAdNormalContextFeedback(env, normalKey)) {
+			evaluation.verdict = 'pass';
+			return { banned: false, seq: null, normalFeedback: true, groupFeedback: true, reason: 'confirmed_normal_context' };
+		}
 	}
 	// 主人的正向确认把图片提升为长期人工样本；独立群不写共享判据库。
 	const ownerImageId = String(evaluation?.payload?.imageId || '');
@@ -33577,7 +34008,8 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// 【读开关失败也不演练】见 isDryRunGroup：一次 D1 抖动不能把整个群静默变成不设防。
 	// options.force：主人在演练通知上点「✅ 确认封」时用 —— 那一刻他已经在
 	// 看完完整判据后拍过板，不能再被演练开关挡回来（否则按钮点了没反应）。
-	if (automatic && chatId && (await isDryRunGroup(env, chatId))) {
+	if (automatic && options.drillCloseReplay !== true && chatId && (await isDryRunGroup(env, chatId))) {
+		if (await isAdDryRunClosing(env)) return { banned: false, dryrun: true, reason: 'closing', learned: 0, sampleAdded: false };
 		if (!options.globalDrillCollected) {
 			const raw = input.message || { from: { id: Number(userId), first_name: evaluation?.snapshot?.name || '' },
 				chat: { id: Number(chatId), type: 'supergroup' }, text: evaluation?.payload?.text || evaluation?.snapshot?.text || '' };
@@ -33587,10 +34019,12 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		}
 		let dryRunId = null;
 		try {
+			evaluation.snapshot = { ...(evaluation.snapshot || {}), automatic: true, punishmentScope: 'local', punishmentChatId: String(chatId) };
 			dryRunId = await recordAdDryRun(env, { userId, chatId, evaluation, input });
 		} catch (error) {
 			console.error('[广告检测·演练] 记录流水失败:', error);
 		}
+		if (!dryRunId) return { banned:false,dryrun:true,reason:'record_not_available',learned:0,sampleAdded:false };
 		// 演练只挡处置，不挡「同款」触发：先把这条文案记进重发只删名单。
 		// 演练不删消息，广告正文还留在群里，bot / 带引用体重发同一段时必须照样删得掉 ——
 		// 否则演练一开，主人连「这条广告被重发了几次」都观察不到。
@@ -33605,6 +34039,8 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		// 判据不另写一套。学完把七类结果一并写进流水：确认封时据此跳过重复学习，
 		// 关演练时据此出汇总回执。
 		let tally = { learned: 0, sampleAdded: false, badges: 0, avatars: 0, images: 0, shapes: 0, links: 0, packs: 0, skeletons: 0 };
+		const learningSession = await readAdDryRunSession(env);
+		if (learningSession && learningSession.status !== 'open') return { banned:false,dryrun:true,reason:'closing',dryRunId,learned:0,sampleAdded:false };
 		// 第一主人已私聊授权全局演练，包含独立群和杀手群的完整采集。
 		{
 			try {
@@ -33657,6 +34093,10 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// ===== 自举案底：这次定罪把哪几个被挂 handle 坐实了 =====
 	// 已并入 learnAdFeaturesOnVerdict：它与头像 / 指纹 / 资料形状那批一样是【判据
 	// 学习】，正式处置与演练两条路共用一份，见该函数里这段的说明。
+	// 辅助群只参与演练及其收尾；关闭在途请求不得变成辅助群的常规治理。
+	if (auxiliaryDrillGroup && options.drillCloseReplay !== true) {
+		return { banned: false, dryrun: true, seq: null, reason: 'auxiliary_drill_finished', learned: 0, sampleAdded: false };
+	}
 
 	let contextEvaluation = evaluation;
 	let contextReady = true;
@@ -33674,6 +34114,11 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	if (automatic && await hasGroupAdFeedback(env, chatId, 'context', groupAdContextKey)) {
 		evaluation.verdict = 'pass';
 		return { banned: false, seq: null, groupFeedback: true, reason: 'group_context_feedback' };
+	}
+	if (automatic && contextReady && (evaluation.bioChecked !== false || localScope)
+		&& await hasAdNormalContextFeedback(env, groupAdContextKey)) {
+		evaluation.verdict = 'pass';
+		return { banned: false, seq: null, normalFeedback: true, groupFeedback: true, reason: 'confirmed_normal_context' };
 	}
 
 	const noteParts = [
@@ -33741,8 +34186,8 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			probeMembership: options.probeMembership !== false,
 			revokeMessages: true,
 			// 自动检测记的是 system，不是第一主人：扇出跳过独立群，但事发群本身照封（批次 2 再细分独立群口径）。
-			mode: localScope ? (await loadGroupLocalSettings(env, chatId)).action : undefined,
-			groupIds: automatic ? autoDetectionScopeGroupIds(chatId) : manualAdDetectionScopeGroupIds(chatId)
+			mode: options.drillCloseReplay === true ? 'kick' : localScope ? (await loadGroupLocalSettings(env, chatId)).action : undefined,
+			groupIds: automatic ? automaticScopeGroupIds : manualAdDetectionScopeGroupIds(chatId)
 		});
 	} catch (error) {
 		console.error('[广告检测] 全群封禁失败:', error);
@@ -33906,7 +34351,9 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		+ ' 黑名单=' + blacklistCode + ' 封禁=' + banSummary
 		+ ' 指纹=' + learned + ' AI样本=' + (sampleAdded ? 1 : 0)
 	);
-	return { banned: true, seq, blacklistCode, banSummary, learned, sampleAdded, skeletons, local: automatic, automatic, autoCaseId };
+	return { banned: true, seq, blacklistCode, banSummary, learned, sampleAdded, skeletons, local: automatic, automatic, autoCaseId,
+		complete: options.drillCloseReplay === true ? blacklistCode !== 'ERROR' && banResults.length > 0 && banResults.every(row => row.ok === true) : undefined,
+		banResults: options.drillCloseReplay === true ? banResults : undefined };
 }
 
 // === 单个入群成员的广告筛查（两条入群路径共用）===
@@ -33947,6 +34394,8 @@ async function screenAdJoinMember(env, member, options = {}) {
 	const chatId = String(options.chatId ?? '');
 	if (!chatId) return 'skipped';
 	if (!env?.DB) return 'skipped';
+	const configuredMemberGroup = isConfiguredGroup(chatId);
+	if (!configuredMemberGroup && !(isGlobalDryRunScopeGroup(chatId) && await isDryRunGroup(env, chatId))) return 'skipped';
 	// 独立群：本群白名单整体不查；本群关了检测也整体不查（全局群不读这两张表）。
 	const localSkip = await resolveLocalAdDetectionSkip(env, chatId, userId);
 	if (localSkip === 'whitelisted') return 'whitelisted';
@@ -33966,11 +34415,11 @@ async function screenAdJoinMember(env, member, options = {}) {
 
 		const nowSeconds = Math.floor(Date.now() / 1000);
 		// 先读后写：要的是【本次入群之前】的 bio_checked_at。
-		const existing = await readAdGroupMember(env, userId);
+		const existing = configuredMemberGroup ? await readAdGroupMember(env, userId) : null;
 		// 【方案 C 的第二个修复】入群即进名册。原先名册只在 detectAdOnMessage 里写，
 		// 也就是只有发言过的人才在册 —— 一个入群时 bio 干净、之后改成广告且从不发言的号，
 		// 连闸三 cron 都扫不到他，因为他根本不在扫描源里。入群写册把这个口子堵上。
-		await upsertAdGroupMember(env, userId, chatId, member, nowSeconds);
+		if (configuredMemberGroup) await upsertAdGroupMember(env, userId, chatId, member, nowSeconds);
 
 		// 去重：被别人拉进群时 ① ② 两种 update 都会到，同一个人会进来两次。
 		// 复用闸二那把三天冷却锁即可，不需要新机制。
@@ -33985,7 +34434,7 @@ async function screenAdJoinMember(env, member, options = {}) {
 		// 不查 getChatMember：restricted 已归零不计分，入群时状态必然是 member，
 		// 拉一次纯属浪费配额。留空后通知文案会显示「未查询」。
 		profile.status = '';
-		await markAdBioChecked(env, userId, nowSeconds);
+		if (configuredMemberGroup) await markAdBioChecked(env, userId, nowSeconds);
 
 		// config / whitelist 必须先于链接解析拿到：前置分档要用同一份白名单算资料卡分，
 		// 与下面 evaluateAdSuspect 里那次保持同源。两行都是幂等读取，提前不改语义。
@@ -34090,6 +34539,7 @@ async function screenAdJoinMember(env, member, options = {}) {
 			// 演练一个都没动，记进去会让面板的治理数据虚高。
 			if (result?.dryrun) return 'dryrun';
 			if (result?.groupFeedback) return 'clean';
+			if (result?.banned === false) return 'clean';
 			await recordStatAction(env, chatId, 'newcomer');
 			return 'banned';
 		}
@@ -34109,7 +34559,7 @@ async function detectAdOnJoin(message, env, ctx) {
 	const newMembers = message?.new_chat_members;
 	if (!Array.isArray(newMembers) || !newMembers.length) return false;
 	const chat = message.chat;
-	if (!chat || !isConfiguredGroup(chat.id)) return false;
+	if (!chat || (!isConfiguredGroup(chat.id) && !(isGlobalDryRunScopeGroup(chat.id) && await isDryRunGroup(env, chat.id)))) return false;
 	if (!env?.DB) return false;
 	if (!(await adDetectionReady(env))) return false;
 
@@ -38466,13 +38916,19 @@ async function handleDryRunCommand(message, env) {
 		return true;
 	}
 	const arg = String(message.text || '').replace(/^\/dryrun(?:@[^\s]+)?\s*/i, '').trim().toLowerCase();
-	const state = await readGlobalDryRunState(env);
+	const retry = arg.match(/^retry\s+(\d+)$/);
+	if(retry){const result=await retryAdDryRunCloseSession(env,Number(retry[1]),message);await sendTelegramMessage(chatId,result.ok?'本轮重试已执行；请查看完整私聊结果。':'重试未执行：'+escapeHtml(result.error));return true;}
+	let state;
+	try { state = await readGlobalDryRunState(env,{strict:true}); }
+	catch (_) { await sendTelegramMessage(chatId,'无法读取演练状态，本次未切换，请稍后重试。'); return true; }
 	if (!arg || /^(status|状态|all status|all)$/.test(arg)) {
-		const groups = [...new Set([...GROUP_IDS, ...KILLER_MODE_GROUPS])];
+		const groups = globalDryRunScopeGroupIds();
 		await sendTelegramMessage(chatId, '🧪 <b>全局演练：' + (state.on ? '开启' : '关闭') + '</b>\n'
-			+ '覆盖 ' + groups.length + ' 个配置/杀手群。\n'
+			+ '覆盖环境变量的全部群（含独立、杀手及辅助群），去重 ' + groups.length + ' 群。\n'
 			+ (state.on ? '自动检测只采集、学习和记录，不执行新的广告处罚。' : '未开启演练，自动检测按正常本群规则处置。')
 			+ '\n开启：<code>/dryrun on</code>　关闭：<code>/dryrun off</code>');
+		const session = await readAdDryRunSession(env);
+		if (session && session.status !== 'open') await sendAdDryRunCloseReport(env, session.id,{force:true});
 		return true;
 	}
 	let on;
@@ -38481,13 +38937,20 @@ async function handleDryRunCommand(message, env) {
 	else { await sendTelegramMessage(chatId, '用法：<code>/dryrun on</code>、<code>/dryrun off</code>、<code>/dryrun status</code>。'); return true; }
 	const saved = await setGlobalDryRun(env, on, message);
 	if (!saved.ok) { await sendTelegramMessage(chatId, '❌ 演练切换失败：' + escapeHtml(saved.error || '未知错误')); return true; }
+	if (!on) {
+		await sendTelegramMessage(chatId, saved.complete
+			? saved.reportSent===false ? '✅ 本轮演练已关闭并完成收尾；完整报告送达失败但已保存，/dryrun status 可重发。' : '✅ 本轮演练已关闭并完成收尾；完整结果已私聊发送。'
+			: saved.partial ? '⚠️ 正常反例已安全处理，演练已关闭；部分封删失败已记录在完整结果中，私聊 /dryrun off 可重试。'
+			: '⏳ 本轮演练正在统一收尾，任务已持久保存。尚未完成；请用 /dryrun status 查看，未启用队列时再次 /dryrun off 继续。');
+		return true;
+	}
 	let summary = '';
 	if (!on && state.on && state.at) {
 		const tally = await summarizeDryRunLearning(env, '', state.at);
 		summary = '\n\n' + renderDryRunLearnSummary(tally);
 	}
 	await sendTelegramMessage(chatId, on
-		? '🧪 <b>全局演练已开启</b>\n所有配置群和杀手群自动判定只采集、学习、记流水，不执行新的广告处罚。\n只学习已确认的广告证据，正常素材和主人已判干净的素材不会盲学。\n结束后在此私聊发 <code>/dryrun off</code>。'
+		? '🧪 <b>全局演练已开启</b>\n覆盖环境变量全部群（含独立、杀手及辅助群），去重 ' + globalDryRunScopeGroupIds().length + ' 群。\n自动判定只采集、学习、记流水，不执行新的广告处罚。\n只学习已确认的广告证据，正常素材和主人已判干净的素材不会盲学。\n结束后在此私聊发 <code>/dryrun off</code>。'
 		: '✅ <b>全局演练已关闭</b>\n全部群已退出演练，恢复正常本群自动处理。' + summary);
 	return true;
 }
