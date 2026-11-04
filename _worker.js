@@ -16707,7 +16707,6 @@ async function editAdPagedMessage(chatId, messageId, text, keyboard) {
 // /words 翻页回调。data 形如 adwords:<页码>:<base64url 关键词>，或 adwords:noop。
 async function handleAdWordsPaginationCallback(callbackQuery, env) {
 	const data = String(callbackQuery?.data || '');
-	if(data.startsWith('review:'))return handleAdContentReviewCallback(callbackQuery,env);
 	const clickerId = String(callbackQuery?.from?.id || '');
 	// 指纹库能直接决定自动封禁，权限口径必须与 /words 命令本身完全一致 —— 只给第一主人。
 	// 否则任何人只要拿到一条带按钮的转发消息就能翻看整个指纹库。
@@ -17264,6 +17263,10 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 	}
 	if (data.startsWith(DRYRUN_BUTTON_PREFIX)) {
 		await handleDryRunButtonCallback(callbackQuery, env);
+		return;
+	}
+	if (data.startsWith('review:')) {
+		await handleAdContentReviewCallback(callbackQuery, env);
 		return;
 	}
 	if (!data.startsWith(AD_VOTE_BUTTON_PREFIX)) return;
