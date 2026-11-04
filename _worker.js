@@ -445,8 +445,11 @@ export default {
 
 		// 必须在任何路由分发之前合并 /addgroup 动态群：isConfiguredGroup 及其 26 个调用点
 		// 都依赖 GROUP_IDS，晚于分发会导致动态群被当成"非配置群"直接忽略。
-		await mergeDynamicGroupsFromD1(env);
-		await loadIndependentGroups(env);
+		try { await prepareGovernanceScope(env); }
+		catch (error) {
+			console.error('[治理配置] 请求暂缓: ' + formatD1SchemaError(error));
+			return new Response('治理群配置暂不可用，请稍后重试', { status: 503, headers: { 'Retry-After': '5' } });
+		}
 
 		if (request.method === 'GET' && path === `${TOKEN}/export`) {
 			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
@@ -529,11 +532,15 @@ export default {
 		// 与 fetch 入口同样必须合并：getBulkJobConfiguredGroupIds 会用 isConfiguredGroup
 		// 重新校验任务里存的 groupIds，此处不合并会把动态群静默丢弃 ——
 		// 任务回执显示成功，但那些群实际没有执行封禁。
-		await mergeDynamicGroupsFromD1(env);
-		await loadIndependentGroups(env);
+		await prepareGovernanceScope(env);
 
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
+			if (body.type === 'ad_content_review') {
+				const result = await runAdContentReview(env, String(body.reviewId || ''));
+				if (result.retryAfter && typeof message.retry === 'function') message.retry({ delaySeconds: result.retryAfter });
+				continue;
+			}
 			if (body.type === 'drill_close') {
 				try {
 					const result = await runAdDryRunCloseJob(env, Number(body.sessionId), { limit: 20 });
@@ -577,6 +584,8 @@ export default {
 		// 10 分钟那条只做联合封杀同步：bio 复查、识图、剪枝都有日预算 / 天节拍，跟着跑 144 次会白烧额度。
 		// 没填订阅变量时 runFederationSync 第一行就返回，零 SQL、零外呼。
 		if (controller?.cron === FED_SYNC_CRON) {
+			try { await resumeAdContentReviews(env); }
+			catch (error) { console.error('[内容待核] 恢复失败: ' + formatD1SchemaError(error)); }
 			try { await resumeAdDryRunCloseJobs(env); }
 			catch (error) { console.error('[演练收尾] 恢复待处理作业失败: ' + formatD1SchemaError(error)); }
 			try {
@@ -588,8 +597,7 @@ export default {
 			return;
 		}
 		try {
-			await mergeDynamicGroupsFromD1(env);
-			await loadIndependentGroups(env);
+			await prepareGovernanceScope(env);
 			const summary = await runAdBioRescan(env);
 			// 头像视觉识别独立一轨：与 bio 复查共用 cron 节拍，但各自有日预算，
 			// 互不挤占（bio 扫描看 ad_scan_state 的 scan_*，这里看 avatar_*）。
@@ -2218,6 +2226,7 @@ async function miniAppRefreshGroups(env) {
 	}
 	DYNAMIC_GROUP_IDS = extra;
 	GROUP_IDS = [...ENV_GROUP_IDS, ...extra];
+	DYNAMIC_GROUPS_READY = Array.isArray(rows);
 	return { rows: list, readable: Array.isArray(rows) };
 }
 
@@ -3102,6 +3111,7 @@ async function dispatchMiniAppAction(action, body, env, auth, ctx) {
 	// Mini App 在 mergeDynamicGroupsFromD1 之前就鉴权返回，运行期的群组变量可能还是
 	// 上一个请求留下的快照。这里按当前请求重建一次，与 / 命令路径吃的是同一份数据。
 	const loaded = await miniAppRefreshGroups(env);
+	if (env?.DB && !loaded.readable) throw new MiniAppError(503, '治理群配置暂不可用，请稍后重试');
 	// 群模式跟着群列表一起重建：小程序的解封同样不碰独立群。
 	await loadIndependentGroups(env);
 	const payload = body && typeof body === 'object' ? body : {};
@@ -3793,9 +3803,10 @@ function withActionContext(message, detailText, actionNote) {
 async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 	if (message?.chat?.type === 'private') return;
 	if (message.__authorizedGroupCommandDeleted) return;
-	message.__authorizedGroupCommandDeleted = true;
 	const result = await deleteMessage(message.chat.id, message.message_id);
-	if (!result.ok) {
+	if (result.ok) {
+		message.__authorizedGroupCommandDeleted = true;
+	} else {
 		console.error(`[${commandName}] 删除群内命令消息失败:${result.error || '未知错误'}`);
 	}
 }
@@ -3820,6 +3831,13 @@ const D1_INIT_PROMISES = new WeakMap();
 const D1_AD_VOTE_INIT_PROMISES = new WeakMap();
 const D1_DYNAMIC_GROUPS_CACHE = new WeakMap();
 
+// 建表过程的 Promise 同样属于当前请求，只共享已经验证成功的结果。
+async function rememberD1Initialization(cache, key, work) {
+	const ready = await work;
+	if (ready && ready.success !== false) cache.set(key, ready);
+	return ready;
+}
+
 function cloneD1RuntimeValue(value) {
 	if (value === null || value === undefined) return value;
 	return JSON.parse(JSON.stringify(value));
@@ -3837,21 +3855,23 @@ function setD1RuntimeCache(cache, db, value) {
 async function loadD1RuntimeCachedValue(env, cache, loader) {
 	if (!env.DB) return null;
 	const cached = cache.get(env.DB);
-	if (cached?.promise) {
-		return cloneD1RuntimeValue(await cached.promise);
-	}
 	if (cached && cached.expiresAt > Date.now()) {
 		return cloneD1RuntimeValue(cached.value);
 	}
 
-	const promise = Promise.resolve().then(() => loader(env));
-	cache.set(env.DB, { value: null, expiresAt: 0, promise });
+	// 跨请求仅共享已完成的数据；未完成的 I/O Promise 属于创建它的请求上下文。
+	const loading = { value: null, expiresAt: 0, loading: true };
+	cache.set(env.DB, loading);
 	try {
-		const value = await promise;
-		setD1RuntimeCache(cache, env.DB, value);
-		return cloneD1RuntimeValue(value);
+		const value = await retryD1Read(() => loader(env));
+		if (cache.get(env.DB) === loading) {
+			if (value !== null) setD1RuntimeCache(cache, env.DB, value);
+			else cache.delete(env.DB);
+		}
+		const latest = cache.get(env.DB);
+		return cloneD1RuntimeValue(latest?.expiresAt > Date.now() ? latest.value : value);
 	} catch (error) {
-		cache.delete(env.DB);
+		if (cache.get(env.DB) === loading) cache.delete(env.DB);
 		throw error;
 	}
 }
@@ -3913,7 +3933,20 @@ function isTransientD1SchemaError(error) {
 		|| detail.includes('database is locked')
 		|| detail.includes('database table is locked')
 		|| detail.includes('temporarily unavailable')
+		|| detail.includes('currently processing a long-running export')
+		|| detail.includes('network connection lost')
 		|| (!message && detail.includes('cloudflare-internal:d1-api'));
+}
+
+// 仅用于读取或幂等结构操作；网络结果不确定时不能重放非幂等业务写入。
+async function retryD1Read(loader) {
+	for (let attempt = 1; ; attempt++) {
+		try { return await loader(); }
+		catch (error) {
+			if (attempt >= 3 || !isTransientD1SchemaError(error)) throw error;
+			await new Promise(resolve => setTimeout(resolve, 50 * attempt));
+		}
+	}
 }
 
 async function runD1SchemaStatement(env, label, sql, options = {}) {
@@ -4060,9 +4093,7 @@ async function ensureD1Table(env) {
 			return false;
 		}
 	})();
-	D1_INIT_PROMISES.set(env.DB, initPromise);
-	const initialized = await initPromise;
-	if (!initialized) D1_INIT_PROMISES.delete(env.DB);
+	const initialized = await rememberD1Initialization(D1_INIT_PROMISES, env.DB, initPromise);
 	return initialized;
 }
 
@@ -4108,9 +4139,7 @@ async function ensureAdVoteTables(env) {
 			return false;
 		}
 	})();
-	D1_AD_VOTE_INIT_PROMISES.set(env.DB, initPromise);
-	const initialized = await initPromise;
-	if (!initialized) D1_AD_VOTE_INIT_PROMISES.delete(env.DB);
+	const initialized = await rememberD1Initialization(D1_AD_VOTE_INIT_PROMISES, env.DB, initPromise);
 	return initialized;
 }
 // ===== 动态群组（/addgroup 加入，存 D1，与 GROUP_ID 环境变量分离）=====
@@ -4126,9 +4155,9 @@ async function loadDynamicGroupsFromD1(env) {
 	if (!env.DB) return [];
 	try {
 		if (!(await ensureD1Table(env))) return null;
-		const { results } = await env.DB
+		const { results } = await retryD1Read(() => env.DB
 			.prepare('SELECT chat_id, title, added_by, added_at, note FROM dynamic_groups ORDER BY added_at ASC, chat_id ASC')
-			.all();
+			.all());
 		// 严格校验 chat_id 格式：只接受 -100 开头的超级群组 ID。
 		// 任何脏数据（手工改库、schema 漂移、误写）都不得进入 GROUP_IDS ——
 		// 那会让全群封禁对一个不存在的 chat 反复报错，且污染"配置群"语义。
@@ -4142,7 +4171,7 @@ async function loadDynamicGroupsFromD1(env) {
 				note: row.note ?? null,
 			}));
 	} catch (error) {
-		console.error('[动态群组] 读 D1 失败:', error);
+		console.error('[动态群组] 读 D1 失败: ' + formatD1SchemaError(error));
 		return null;
 	}
 }
@@ -4158,6 +4187,12 @@ async function loadDynamicGroupsCachedFromD1(env) {
 // 把 D1 动态群并入运行期 GROUP_IDS。必须在路由分发之前调用（fetch 与 queue 两个入口都要），
 // 否则 getBulkJobConfiguredGroupIds 会用 isConfiguredGroup 把动态群静默过滤掉，
 // 造成批量任务显示成功但那些群实际未执行。
+async function prepareGovernanceScope(env) {
+	await mergeDynamicGroupsFromD1(env);
+	if (env?.DB && !DYNAMIC_GROUPS_READY) throw new MiniAppError(503, '动态治理群读取失败，本次治理未执行');
+	await loadIndependentGroups(env);
+}
+
 async function mergeDynamicGroupsFromD1(env) {
 	if (!env?.DB) return;
 	// 环境变量群基线由 applyRuntimeConfig 每请求重置，这里只做追加。
@@ -4420,7 +4455,7 @@ async function checkBlacklist(userId, env, options = {}) {
 
 		return { isBlacklisted: false, message: null };
 	} catch (error) {
-		console.error('检查黑名单时出错:', error);
+		console.error('检查黑名单时出错: ' + formatD1SchemaError(error));
 		if (options.strict) {
 			return {
 				isBlacklisted: true,
@@ -4510,9 +4545,7 @@ async function ensureBlacklistDetailTable(env) {
 			return false;
 		}
 	})();
-	D1_BLACKLIST_DETAIL_INIT.set(env.DB, init);
-	const ok = await init;
-	if (!ok) D1_BLACKLIST_DETAIL_INIT.delete(env.DB);   // 失败不缓存，下次再试
+	const ok = await rememberD1Initialization(D1_BLACKLIST_DETAIL_INIT, env.DB, init);
 	return ok;
 }
 
@@ -4649,9 +4682,7 @@ async function ensureFedTables(env, cache, label, statements, afterCreate = null
 			return false;
 		}
 	})();
-	cache.set(env.DB, init);
-	const ok = await init;
-	if (!ok) cache.delete(env.DB);   // 失败不缓存，下次再试
+	const ok = await rememberD1Initialization(cache, env.DB, init);
 	return ok;
 }
 
@@ -5072,7 +5103,7 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 				skipped: alreadyBanned ? 'already_banned' : 'not_in_group'
 			};
 		}
-		const r = await muteUserInGroup(groupId, userId);
+		const r = await muteUserInGroup(groupId, userId, options);
 		return {
 			groupId,
 			userId: String(userId),
@@ -5087,7 +5118,7 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 	const memberProbe = options.precheckedMemberProbe || (options.probeMembership
 		? await probeTargetMemberBeforeBan(groupId, userId)
 		: null);
-	const r = await banUserFromGroup(groupId, userId, { revokeMessages: options.revokeMessages !== false });
+	const r = await banUserFromGroup(groupId, userId, { revokeMessages: options.revokeMessages !== false,reviewGuard:options.reviewGuard });
 	return {
 		groupId,
 		userId: String(userId),
@@ -5247,6 +5278,7 @@ function translateTelegramError(description, options = {}) {
 	const desc = String(description);
 	const lower = desc.toLowerCase();
 	const isUnbanAction = options.action === 'unban';
+	if (lower === 'preexisting_native_ban') return { 中文:'本群已存在封禁，保留原有处罚', 建议:'' };
 
 	// 更具体的错误码先匹配（Telegram 有时同时携带多个特征）
 	if (lower.includes('chat_admin_required')) {
@@ -7019,9 +7051,7 @@ function getBulkJobOperationTask(job, operationIndex) {
 // 消息确实没了，不该算删除失败。判据与 classifyAdDeleteOutcome 保持一致，避免两处口径分叉。
 function isEffectivelyDeletedError(error) {
 	const lower = String(error || '').toLowerCase();
-	return lower.includes('message to delete not found')
-		|| lower.includes('message identifier is not specified')
-		|| lower.includes("message can't be deleted");
+	return lower.includes('message to delete not found');
 }
 
 async function processBulkJobOperationSlice(job, env) {
@@ -7395,9 +7425,7 @@ async function ensureExportAuthTables(env, kind = 'export') {
 			return false;
 		}
 	})();
-	perDb.set(kind, init);
-	const ok = await init;
-	if (!ok) perDb.delete(kind);
+	const ok = await rememberD1Initialization(perDb, kind, init);
 	return ok;
 }
 
@@ -7775,6 +7803,7 @@ async function dispatchWebAdminAction(action, body, env, auth, ctx, url) {
 	// 其余接口与小程序同口径用 miniAppRefreshGroups。两者只能二选一：先后各跑一次会把动态群当成环境变量群。
 	if (action === 'web/exec') await mergeDynamicGroupsFromD1(env);
 	else await miniAppRefreshGroups(env);
+	if (env?.DB && !DYNAMIC_GROUPS_READY) throw new MiniAppError(503, '治理群配置暂不可用，请稍后重试');
 	await loadIndependentGroups(env);
 	const payload = body && typeof body === 'object' ? body : {};
 	const owner = auth.userId;
@@ -11136,11 +11165,9 @@ async function ensureKillerBlacklistTable(env) {
 		return true;
 	})().catch((error) => {
 		// 建表失败不缓存，下次请求重试
-		D1_KILLER_BLACKLIST_INIT.delete(env.DB);
 		throw error;
 	});
-	D1_KILLER_BLACKLIST_INIT.set(env.DB, initPromise);
-	return initPromise;
+	return rememberD1Initialization(D1_KILLER_BLACKLIST_INIT, env.DB, initPromise);
 }
 
 async function readKillerBlacklistEntry(env, userId) {
@@ -11273,11 +11300,9 @@ async function ensureGroupModeTable(env) {
 		await env.DB.prepare('CREATE TABLE IF NOT EXISTS group_mode (chat_id TEXT PRIMARY KEY, mode TEXT NOT NULL, set_by TEXT, set_at TEXT)').run();
 		return true;
 	})().catch((error) => {
-		D1_GROUP_MODE_INIT.delete(env.DB);
 		throw error;
 	});
-	D1_GROUP_MODE_INIT.set(env.DB, initPromise);
-	return initPromise;
+	return rememberD1Initialization(D1_GROUP_MODE_INIT, env.DB, initPromise);
 }
 
 // 一次读两样：独立群列表 + 「有本群黑名单记录的群」列表（拦截热路径只对后者多查一条主键）。
@@ -11295,7 +11320,7 @@ async function loadGroupModeStateFromD1(env) {
 	return state;
 }
 
-// 每请求入口调用。读失败一律当空集 = 全部按全局处理（不因 D1 抖动放松全局黑名单）。
+// 每请求入口调用。无法确认群模式时停止本次治理，不能把独立群当成全局群。
 async function loadIndependentGroups(env) {
 	INDEPENDENT_GROUP_IDS = [];
 	LOCAL_BLACKLIST_CHAT_IDS = [];
@@ -11309,9 +11334,10 @@ async function loadIndependentGroups(env) {
 		LOCAL_BLACKLIST_CHAT_IDS = (Array.isArray(state?.localChats) ? state.localChats : [])
 			.filter((id) => automaticAdConfiguredGroups().includes(id));
 	} catch (error) {
-		console.error('[群模式] 读取失败，全部按全局处理:', error);
+		console.error('[群模式] 读取失败，本次治理已停止: ' + formatD1SchemaError(error));
 		INDEPENDENT_GROUP_IDS = [];
 		LOCAL_BLACKLIST_CHAT_IDS = [];
+		throw new MiniAppError(503, '群模式暂不可用，本次治理未执行，请稍后重试');
 	}
 }
 
@@ -11607,11 +11633,9 @@ async function ensureGroupBlacklistTable(env) {
 		}
 		return true;
 	})().catch((error) => {
-		D1_GROUP_BLACKLIST_INIT.delete(env.DB);
 		throw error;
 	});
-	D1_GROUP_BLACKLIST_INIT.set(env.DB, initPromise);
-	return initPromise;
+	return rememberD1Initialization(D1_GROUP_BLACKLIST_INIT, env.DB, initPromise);
 }
 
 async function readGroupBlacklistEntry(env, chatId, userId) {
@@ -11811,11 +11835,9 @@ async function ensureGroupLocalTables(env) {
 		await env.DB.prepare('CREATE TABLE IF NOT EXISTS group_whitelist (chat_id TEXT NOT NULL, user_id TEXT NOT NULL, by_user TEXT, at TEXT, PRIMARY KEY (chat_id, user_id))').run();
 		return true;
 	})().catch((error) => {
-		D1_GROUP_LOCAL_INIT.delete(env.DB);
 		throw error;
 	});
-	D1_GROUP_LOCAL_INIT.set(env.DB, initPromise);
-	return initPromise;
+	return rememberD1Initialization(D1_GROUP_LOCAL_INIT, env.DB, initPromise);
 }
 
 // 一次读全部群的设置与白名单（只有独立群会走到这里，量很小）。表不存在时只有 sqlite_master 探测。
@@ -13000,9 +13022,7 @@ async function ensureDryRunTable(env) {
 			return false;
 		}
 	})();
-	D1_DRYRUN_INIT_PROMISES.set(env.DB, initPromise);
-	const initialized = await initPromise;
-	if (!initialized) D1_DRYRUN_INIT_PROMISES.delete(env.DB);
+	const initialized = await rememberD1Initialization(D1_DRYRUN_INIT_PROMISES, env.DB, initPromise);
 	return initialized;
 }
 
@@ -13023,8 +13043,8 @@ async function ensureAdDryRunCloseTables(env) {
 	for(const column of ['target_group_ids','ban_policy'])if(!(await d1ColumnExists(env,'ad_dryrun_close_cases',column)))await env.DB.prepare("ALTER TABLE ad_dryrun_close_cases ADD COLUMN "+column+" TEXT NOT NULL DEFAULT ''").run();
 	await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_dryrun_close_bans (session_id INTEGER NOT NULL,user_id TEXT NOT NULL,target_chat_id TEXT NOT NULL,source_row_id INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',error TEXT NOT NULL DEFAULT '',automatic_case_id TEXT NOT NULL,PRIMARY KEY(session_id,user_id,target_chat_id))").run();
 	return true;
-	})();D1_AD_DRYRUN_CLOSE_INIT.set(env.DB,work);
-	try{return await work;}catch(error){D1_AD_DRYRUN_CLOSE_INIT.delete(env.DB);throw error;}
+	})();
+	return rememberD1Initialization(D1_AD_DRYRUN_CLOSE_INIT,env.DB,work);
 }
 
 async function readAdDryRunSession(env, strict = false) {
@@ -13225,10 +13245,10 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	const ownText = String(message.text ?? message.caption ?? '').trim()
 		|| extractAdChecklistText(message);
 	const text = [ownText, extractAdWebPageText(message)].filter(Boolean).join(' ').trim();
-	const config = loadAdDetectionConfig(env);
-	const whitelist = await loadAdDomainWhitelist(env);
+	const config = options.config || loadAdDetectionConfig(env);
+	const whitelist = options.whitelist instanceof Set ? options.whitelist : await loadAdDomainWhitelist(env);
 	let profile;
-	try { profile = await fetchAdUserProfile(userId, message?.from || {}); }
+	try { profile = options.profile || await fetchAdUserProfile(userId, message?.from || {}, { forceRefresh:options.refreshProfile === true }); }
 	catch (_) { profile = { firstName: message?.from?.first_name || '', lastName: message?.from?.last_name || '', username: message?.from?.username || '', bio: '' }; }
 	const profileFetched = profile.bioFetched === true;
 	// 消息中的基础姓名可实时更新；重查历史缓存仍使用当前查询资料，不倒灌旧姓名。
@@ -13257,8 +13277,7 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	const avatarTextOnlyRole=isAdNeutralCollectedProfileText(avatarVisibleText)||AD_COLLECTED_PROFILE_ROLE_RE.test(avatarVisibleText)&&!hasAdIndependentHarmfulContent(avatarVisibleText);
 	const avatarOwnerAd = avatar?.verdict === 'ad' && ['owner','manual'].includes(String(avatar.source || ''));
 	const avatarTechnical = hasAdProtectedTechnicalContext(avatarVisibleText) && !hasAdIndependentHarmfulContent(avatarVisibleText);
-	const avatarAd = !avatarOwnerClean && (avatarOwnerAd || !avatarTextOnlyRole && !avatarTechnical
-		&& Boolean(avatar?.textHit || avatar?.verdict === 'ad' && avatar.ocr_verdict === 'ad' && Number(avatar.ocr_at) > 0));
+	const avatarAd = !avatarOwnerClean && (avatarOwnerAd || !avatarTextOnlyRole && !avatarTechnical && isVerifiedAdAvatarRow(avatar));
 	const verifiedEmojiIds = emojiRows.filter((item) => item.verifiedAd).map((item) => item.id);
 	const avatarText=adCollectedMaterialText(avatar,true),badgeText=adCollectedMaterialText(badgeItem?.row);
 	const customEmojiText=emojiRows.map(item=>adCollectedMaterialText(item.row)).filter(Boolean).join('\n');
@@ -13331,7 +13350,7 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	// 演练与正式检测共用补判链；复评保留已核验的模型答复，仍用完整现场重新核对证据。
 	const llmMemo = options.llmMemo || (prior?._adLlmMemo?.answer?.ad === true ? prior._adLlmMemo : { done: false });
 	let reviewInput = null, reviewOptions = null;
-	if (evaluation.verdict !== 'ban') {
+	if (evaluation.verdict !== 'ban' && options.skipTextReview !== true) {
 		const filtered = adTechnicalExemptPayload({ name: [profile.firstName, profile.lastName].filter(Boolean).join(' '),
 			username: profile.username || '', bio: profile.bio || '', text });
 		const bioProse = String(profile.bio || '').replace(/(?:https?:\/\/)?t\.me\/\S+|@[A-Za-z0-9_]+/gi, '');
@@ -13347,9 +13366,9 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 			suspectSignal: isAdSuspectSignal(filtered.text || contactName, signals, { contactCard: Boolean(contactName) })
 				|| linkCandidate || isAdSuspectSignal(filtered.bio, [], {})||isAdSuspectSignal([reviewProfile.avatarText,reviewProfile.badgeText,reviewProfile.customEmojiText].join(' '),[],{}), businessHit: countAdKeywordHits(filtered.text, AD_BUSINESS_KEYWORDS).length > 0,
 			userId, nowSeconds: Math.floor(Date.now() / 1000), sampleEnabled: adLLMPoolLimit(config, 'sample') > 0 });
-		if (review.submit || llmMemo.done && llmMemo.answer?.ad === true) {
+		if (review.submit || options.forceReview === true || llmMemo.done && llmMemo.answer?.ad === true) {
 			reviewInput = { profile: reviewProfile, text: filtered.text, contactCardName: contactName, contactPhone: String(message.contact?.phone_number || '') };
-			reviewOptions = { pool: review.pool || 'message', llmMemo, forceReview: options.source === 'rescreen' };
+			reviewOptions = { pool: options.reviewPool || review.pool || 'message', llmMemo, forceReview: options.source === 'rescreen' || options.forceReview === true };
 			evaluation = await applyAdLLMToEvaluation(env, evaluation, config, reviewInput, reviewOptions);
 		}
 	}
@@ -13379,12 +13398,365 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 		globalDrill: evaluation.globalDrill };
 	evaluation.snapshot = { ...(evaluation.snapshot || {}), ...evaluation.payload,
 		name: [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim(), bio: String(profile.bio || ''),
+		originalProfile:{ firstName:profile.firstName||'',lastName:profile.lastName||'',username:profile.username||'',bio:profile.bio||'',
+			avatarId:profile.avatarId||'',avatarFileId:profile.avatarFileId||'',badgeId:profile.badgeId||'',isPremium:profile.isPremium,
+			fetched:profileFetched,fetchedAt:Number(profile.profileFetchedAt)||0 },
+		originalMedia:media?{...media}:null,
 		text, badgeMedia: badgeItem ? { id: badgeItem.id, fileUniqueId: badgeItem.fileUniqueId, visionFileId: badgeItem.visionFileId, kind: badgeItem.kind } : null };
 	if (profile.bioFetched === true) evaluation.snapshot.groupAdContextKey = await buildGroupAdContextKey({ message }, evaluation);
 	const learning = globalDryRunLearningView(evaluation);
 	evaluation.learningPayload = learning.payload;
 	evaluation.learningSnapshot = learning.snapshot;
-	return { evaluation, config, whitelist, llmMemo };
+	return { evaluation, config, whitelist, llmMemo, profile, materials:{avatar,image,emojiRows,badgeItem} };
+}
+
+function adProfileInspectionMessage(user, chatId, title = '') {
+	return { from:{ ...user, id:Number(user.id || user.user_id), is_bot:false },
+		chat:{ id:String(chatId), type:'supergroup', title:String(title) }, text:'' };
+}
+
+const D1_AD_CONTENT_REVIEW_INIT = new WeakMap();
+async function ensureAdContentReviewTable(env) {
+	if (!env?.DB) return false;
+	if (D1_AD_CONTENT_REVIEW_INIT.get(env.DB)) return true;
+	const work = (async () => {
+		await runD1SchemaStatement(env,'ad_content_reviews', 'CREATE TABLE IF NOT EXISTS ad_content_reviews (seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,user_id TEXT NOT NULL,chat_id TEXT NOT NULL,source TEXT NOT NULL,message_json TEXT NOT NULL,evaluation TEXT NOT NULL,status TEXT NOT NULL,decision TEXT NOT NULL DEFAULT \'\',decision_by TEXT NOT NULL DEFAULT \'\',review_sources TEXT NOT NULL DEFAULT \'[]\',notified INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL,lease_until INTEGER NOT NULL DEFAULT 0,lease_token TEXT NOT NULL DEFAULT \'\',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,expires_at INTEGER NOT NULL)');
+		await runD1SchemaStatement(env,'idx_ad_content_reviews_due','CREATE INDEX IF NOT EXISTS idx_ad_content_reviews_due ON ad_content_reviews (status,next_at)',{optional:true});
+		return true;
+	})();
+	return rememberD1Initialization(D1_AD_CONTENT_REVIEW_INIT,env.DB,work);
+}
+
+const D1_AD_REVIEW_ASSET_INIT = new WeakMap();
+async function ensureAdReviewAssetTables(env) {
+	if(D1_AD_REVIEW_ASSET_INIT.get(env.DB))return true;
+	return rememberD1Initialization(D1_AD_REVIEW_ASSET_INIT,env.DB,(async()=>{
+		await runD1SchemaStatement(env,'ad_review_assets','CREATE TABLE IF NOT EXISTS ad_review_assets (asset_key TEXT PRIMARY KEY,mime TEXT NOT NULL,file_name TEXT NOT NULL,inspection TEXT NOT NULL,parts INTEGER NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL)');
+		await runD1SchemaStatement(env,'ad_review_asset_chunks','CREATE TABLE IF NOT EXISTS ad_review_asset_chunks (asset_key TEXT NOT NULL,part INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(asset_key,part))');
+		return true;
+	})());
+}
+
+async function cacheAdReviewAsset(env,kind,key,uri,inspection='body') {
+	if(!env?.DB||!key||typeof uri!=='string')return false;
+	const match=/^data:([^;]+);base64,([A-Za-z0-9+/=]+)$/.exec(uri);
+	if(!match||match[2].length>Math.ceil(AD_VISION_MAX_IMAGE_BYTES/3)*4)return false;
+	try {
+		await ensureAdReviewAssetTables(env);
+		const assetKey=inspection+':'+kind+':'+String(key),now=Math.floor(Date.now()/1000),parts=[];
+		for(let start=0;start<match[2].length;start+=65536)parts.push(match[2].slice(start,start+65536));
+		const ext=({'image/jpeg':'jpg','image/png':'png','image/webp':'webp','image/gif':'gif','video/webm':'webm','application/x-tgsticker':'tgs'})[match[1]]||'bin';
+		await env.DB.batch([
+			env.DB.prepare('INSERT INTO ad_review_assets (asset_key,mime,file_name,inspection,parts,created_at,expires_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(asset_key) DO UPDATE SET mime=excluded.mime,file_name=excluded.file_name,inspection=excluded.inspection,parts=excluded.parts,expires_at=excluded.expires_at')
+				.bind(assetKey,match[1],'original.'+ext,inspection,parts.length,now,now+7*86400),
+			env.DB.prepare('DELETE FROM ad_review_asset_chunks WHERE asset_key=?').bind(assetKey),
+			...parts.map((data,part)=>env.DB.prepare('INSERT INTO ad_review_asset_chunks (asset_key,part,data) VALUES (?,?,?)').bind(assetKey,part,data))
+		]);return true;
+	}catch(error){console.error('[待核素材] 原材料保存未完成: '+formatD1SchemaError(error));return false;}
+}
+
+async function readAdReviewAsset(env,kind,key,inspection='body') {
+	await ensureAdReviewAssetTables(env);
+	const assetKey=inspection+':'+kind+':'+String(key),row=await env.DB.prepare('SELECT * FROM ad_review_assets WHERE asset_key=? AND expires_at>?').bind(assetKey,Math.floor(Date.now()/1000)).first();
+	if(!row)return null;
+	const parts=(await env.DB.prepare('SELECT part,data FROM ad_review_asset_chunks WHERE asset_key=? ORDER BY part').bind(assetKey).all()).results||[];
+	if(parts.length!==Number(row.parts)||parts.some((part,index)=>Number(part.part)!==index))throw new Error('原素材备份分片不完整');
+	const decoded=atob(parts.map(part=>part.data).join(''));
+	return {...row,bytes:Uint8Array.from(decoded,char=>char.charCodeAt(0))};
+}
+
+const AD_REVIEW_ALERT_CACHE = new WeakMap();
+async function adContentReviewAccess(env,actorId,row) {
+	const primary=isPrimaryOwner(actorId),local=isIndependentGroup(row.chat_id);
+	const creator=local&&await isGroupCreator(actorId,row.chat_id);
+	return {read:primary||creator,write:local?creator:primary,local};
+}
+
+async function notifyAdContentReviewPending(env,id) {
+	const row=await env.DB.prepare('SELECT seq,chat_id,notified FROM ad_content_reviews WHERE id=?').bind(id).first();
+	if(!row||row.notified)return;
+	let owner=String(OWNER_IDS[0]||'');
+	if(isIndependentGroup(row.chat_id)){
+		const admins=await fetchGroupAdminsOnce(row.chat_id);
+		owner=String((Array.isArray(admins)?admins:[]).find(member=>member.status==='creator')?.user?.id||'');
+		if(!owner)return;
+	}
+	let cache=AD_REVIEW_ALERT_CACHE.get(env.DB);if(!cache){cache=new Map();AD_REVIEW_ALERT_CACHE.set(env.DB,cache);}
+	const now=Date.now();if(Number(cache.get(owner)||0)>now){await env.DB.prepare('UPDATE ad_content_reviews SET notified=1 WHERE id=?').bind(id).run();return;}
+	const sent=await sendTelegramMessage(owner,'🔎 有内容尚未完成可靠核验，现场已保留。\n自动补查会继续；你可以分页查看完整资料与原素材，再判断正常或广告。\n入口：/review',
+		{inline_keyboard:[[{text:'分页查看待核现场',callback_data:'review:list:1'}]]});
+	if(sent?.ok){cache.set(owner,now+300000);await env.DB.prepare('UPDATE ad_content_reviews SET notified=1 WHERE id=?').bind(id).run();}
+}
+
+function adReviewSources(row) {
+	const evaluation=JSON.parse(row.evaluation||'{}'),s=evaluation.snapshot||{},m=JSON.parse(row.message_json||'{}');
+	const result=[];const add=(key,label,value)=>{if(value)result.push({key,label,value});};
+	add('name','昵称/用户名',[s.name,s.username].filter(Boolean).join(' '));add('bio','简介',s.bio);add('text','正文',s.text);
+	add('avatar','头像',s.avatarId);add('badge','会员标',s.badgeId);add(m.sticker?'sticker':'image',m.sticker?'贴纸':'图片',s.imageId);
+	for(const [index,item]of (s.customEmojiMedia||[]).entries())add('emoji'+index,'正文表情 '+(index+1),item.fileUniqueId);
+	return result;
+}
+
+async function showAdContentReviewList(env,actorId,page=1) {
+	await ensureAdContentReviewTable(env);page=Math.max(1,Number(page)||1);
+	let groups=[];if(!isPrimaryOwner(actorId)){for(const gid of INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length){await sendTelegramMessage(actorId,'仅第一主人或独立群群主可查看待核内容。');return;}}
+	const scope=isPrimaryOwner(actorId)?'':' AND chat_id IN (SELECT value FROM json_each(?))',args=isPrimaryOwner(actorId)?[]:[JSON.stringify(groups)];
+	const where="status IN ('pending','waiting','processing','viewing','normal_intent','sample') AND expires_at>?"+scope;
+	const now=Math.floor(Date.now()/1000),count=await env.DB.prepare('SELECT COUNT(*) AS n FROM ad_content_reviews WHERE '+where).bind(now,...args).first();
+	const total=Number(count?.n||0),pages=Math.max(1,Math.ceil(total/10));page=Math.min(page,pages);
+	const rows=(await env.DB.prepare('SELECT seq,chat_id,user_id,status,evaluation FROM ad_content_reviews WHERE '+where+' ORDER BY seq DESC LIMIT 10 OFFSET ?').bind(now,...args,(page-1)*10).all()).results||[];
+	const lines=['<b>待核与待确认现场</b> · 第 '+page+'/'+pages+' 页，共 '+total+' 条','点击条目查看完整现场；查看素材由你主动点击。'];
+	const keyboard=[];
+	for(const row of rows){const s=JSON.parse(row.evaluation||'{}').snapshot||{};const label='#'+row.seq+' '+String(s.name||'用户')+' · '+(isIndependentGroup(row.chat_id)?'独立本群':'全局群');
+		lines.push(escapeHtml(label));keyboard.push([{text:label.slice(0,60),callback_data:'review:open:'+row.seq}]);}
+	const navigation=[];if(page>1)navigation.push({text:'上一页',callback_data:'review:list:'+(page-1)});if(page<pages)navigation.push({text:'下一页',callback_data:'review:list:'+(page+1)});if(navigation.length)keyboard.push(navigation);
+	await sendTelegramMessage(actorId,lines.join('\n'),{inline_keyboard:keyboard});
+}
+
+async function showAdContentReview(env,actorId,row) {
+	const access=await adContentReviewAccess(env,actorId,row);if(!access.read)throw new Error('无权查看该现场');
+	const e=JSON.parse(row.evaluation||'{}'),s=e.snapshot||{},m=JSON.parse(row.message_json||'{}'),p=s.originalProfile||{};
+	if(access.write&&!row.decision)await env.DB.prepare("UPDATE ad_content_reviews SET status='viewing',lease_token='',lease_until=0 WHERE id=? AND decision='' AND status IN ('pending','waiting','processing','sample')").bind(row.id).run();
+	const lines=['<b>完整现场 #'+row.seq+'</b>','目标：'+formatUserMention({id:Number(row.user_id),first_name:s.name||'用户'}),'来源群：<code>'+escapeHtml(row.chat_id)+'</code>',
+		'处理范围：'+(access.local?'仅独立原群':'全局非独立治理群'),'',
+		'<b>检测时资料</b>','昵称：'+escapeHtml(s.name||'未获取'),'用户名：'+escapeHtml(s.username||'未获取'),
+		'简介：'+escapeHtml(s.bio||(p.fetched?'无简介':'尚未获取，不能当作没有简介')), '头像：'+(s.avatarId?'已记录原素材标识':'尚未获取或未设置'),
+		'会员标：'+(s.badgeId?'已记录原素材标识':'未发现或尚未获取'),'', '<b>原正文</b>',escapeHtml(s.text||getAdDetectionBodyText(m)||'无文字，查看原素材'),'',
+		'<b>核验过程</b>',...(e.drillIncomplete||[]).map(escapeHtml),escapeHtml(e.pendingReason||''),
+		'头像读取文字：'+escapeHtml(s.avatarText||s.rawAvatarText||'未读取或未核实'),'图片/表情读取文字：'+escapeHtml(s.customEmojiText||'见原素材'),
+		...(e.reasons||[]).map(reason=>escapeHtml(String(reason)))];
+	const keyboard=[];
+	if(Number(m.message_id)>0)keyboard.push([{text:'查看原消息（含原图/原贴纸）',callback_data:'review:original:'+row.seq}]);
+	for(const source of adReviewSources(row).filter(source=>['avatar','badge','image','sticker'].includes(source.key)||source.key.startsWith('emoji')))
+		keyboard.push([{text:'查看'+source.label,callback_data:'review:asset:'+row.seq+':'+source.key}]);
+	if(access.write&&row.source!=='operator'){
+		const selected=JSON.parse(row.review_sources||'[]');
+		lines.push('','先勾选你确认正常或广告的具体位置，再按对应按钮。不勾素材确认正常只记录该完整场景反例，避免改变未判断的素材。');
+		for(const source of adReviewSources(row))keyboard.push([{text:(selected.includes(source.key)?'✅ ':'☐ ')+source.label,callback_data:'review:pick:'+row.seq+':'+source.key}]);
+		keyboard.push([{text:'确认正常 · 写入反例',callback_data:'review:normal:'+row.seq},{text:'确认勾选位置是广告',callback_data:'review:ad:'+row.seq}]);
+		keyboard.push([{text:'交回自动核验',callback_data:'review:auto:'+row.seq}]);
+	}else if(!access.write)lines.push('','该独立群由原群群主判断，本页仅供你查看。');
+	keyboard.push([{text:'返回分页列表',callback_data:'review:list:1'}]);
+	await sendTelegramMessageChunks(actorId,lines.join('\n'),{inline_keyboard:keyboard});
+}
+
+async function sendAdReviewMaterial(env,actorId,row,key) {
+	const source=adReviewSources(row).find(source=>source.key===key);if(!source)throw new Error('没有该位置的原素材');
+	const e=JSON.parse(row.evaluation),s=e.snapshot||{},m=JSON.parse(row.message_json),media=extractAdMedia(m);
+	const kind=key==='avatar'?'avatar':'image',asset=await readAdReviewAsset(env,kind,source.value);
+	const method=key==='avatar'?'sendPhoto':key==='badge'||key.startsWith('emoji')||m.sticker?'sendSticker':media?.kind==='video'?'sendVideo':media?.kind==='animation'?'sendAnimation':'sendPhoto';
+	let fileId=key==='avatar'?s.originalProfile?.avatarFileId:key==='badge'?s.badgeMedia?.fileId||s.badgeMedia?.visionFileId:key.startsWith('emoji')?s.customEmojiMedia?.[Number(key.slice(5))]?.fileId||s.customEmojiMedia?.[Number(key.slice(5))]?.visionFileId:media?.fileId;
+	const field=method==='sendSticker'?'sticker':method==='sendVideo'?'video':method==='sendAnimation'?'animation':'photo';
+	let response;
+	if(asset){const body=new FormData();body.append('chat_id',String(actorId));body.append(field,new Blob([asset.bytes],{type:asset.mime}),asset.file_name);response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/'+method,{method:'POST',body});}
+	else {if(!fileId)throw new Error('原始素材未能取得，不能把当前素材当作原图');response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/'+method,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:actorId,[field]:fileId})});}
+	const result=await response.json();if(!response.ok||!result.ok)throw new Error('原素材显示未完成：'+String(result.description||response.status));
+	await sendTelegramMessage(actorId,(asset?'检测时保存的原材料：':'原材料文件：')+source.label);
+}
+
+async function handleAdContentReviewCommand(message,env) {
+	if(message.chat?.type!=='private'||message.from?.is_bot)return;
+	const actor=String(getMessageActorId(message)),args=String(message.text||'').replace(/^\/review(?:@\S+)?\s*/i,'').trim();
+	if(/^open\s+\d+$/.test(args)){
+		await ensureAdContentReviewTable(env);const row=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE seq=?').bind(Number(args.split(/\s+/)[1])).first();
+		if(row)await showAdContentReview(env,actor,row);else await sendTelegramMessage(actor,'该现场不存在或已过期');
+	}else await showAdContentReviewList(env,actor,Number(args)||1);
+}
+
+async function handleAdContentReviewCallback(callback,env) {
+	const actor=String(callback.from?.id||''),chat=callback.message?.chat;
+	if(callback.from?.is_bot||chat?.type!=='private'||String(chat.id)!==actor)return;
+	const [,action,number,key]=String(callback.data||'').split(':');
+	if(action==='list'){await answerAdVoteCallback(callback.id);await showAdContentReviewList(env,actor,Number(number)||1);return;}
+	await ensureAdContentReviewTable(env);const row=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE seq=?').bind(Number(number)||0).first();
+	if(!row){await answerAdVoteCallback(callback.id,'现场不存在或已过期',true);return;}
+	const access=await adContentReviewAccess(env,actor,row);if(!access.read){await answerAdVoteCallback(callback.id,'权限不足',true);return;}
+	try {
+		if(action==='open'){await answerAdVoteCallback(callback.id);await showAdContentReview(env,actor,row);return;}
+		if(action==='asset'){await answerAdVoteCallback(callback.id);await sendAdReviewMaterial(env,actor,row,key);return;}
+		if(action==='original'){
+			const m=JSON.parse(row.message_json);const copied=await copyMessageToChat(actor,row.chat_id,Number(m.message_id),{disableNotification:true});
+			await answerAdVoteCallback(callback.id,copied?.ok?'原消息已显示':'原消息已不可取，请用逐项素材按钮',!copied?.ok);return;
+		}
+		if(!access.write){await answerAdVoteCallback(callback.id,'独立群只允许原群群主判断',true);return;}
+		if(action==='pick'){
+			if(row.decision||!adReviewSources(row).some(source=>source.key===key))throw new Error('该位置不能修改');
+			const selected=JSON.parse(row.review_sources||'[]'),next=selected.includes(key)?selected.filter(item=>item!==key):selected.concat(key);
+			await env.DB.prepare("UPDATE ad_content_reviews SET review_sources=? WHERE id=? AND decision=''").bind(JSON.stringify(next),row.id).run();
+			await answerAdVoteCallback(callback.id,'已'+(next.includes(key)?'勾选':'取消')+'广告位置');await showAdContentReview(env,actor,{...row,review_sources:JSON.stringify(next)});return;
+		}
+		if(action==='auto'){await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',next_at=?,lease_until=0,lease_token='' WHERE id=? AND decision=''").bind(Math.floor(Date.now()/1000),row.id).run();await queueAdContentReview(env,row.id,1);await answerAdVoteCallback(callback.id,'已交回自动核验');return;}
+		if(action==='ad'&&!JSON.parse(row.review_sources||'[]').length)throw new Error('先勾选实际含广告的位置');
+		if(!['ad','normal'].includes(action))return;
+		if(row.decision){await answerAdVoteCallback(callback.id,'该现场已确认，无需重复点击');return;}
+		const e=JSON.parse(row.evaluation);e.snapshot={...e.snapshot,reviewScope:access.local?'local':'global'};
+		await env.DB.prepare("UPDATE ad_content_reviews SET decision=?,decision_by=?,status=?,evaluation=?,next_at=?,lease_token='',lease_until=0 WHERE id=? AND decision=''")
+			.bind(action,actor,action==='normal'?'normal_intent':'pending',serializeAdDryRunEvaluation(e),Math.floor(Date.now()/1000),row.id).run();
+		await answerAdVoteCallback(callback.id,action==='normal'?'正常判断已登记，正在保存反例':'广告位置已确认，正在按原范围处理');
+		if(action==='normal')await finishAdNormalReview(env,{...row,decision:'normal',decision_by:actor,evaluation:serializeAdDryRunEvaluation(e)});
+		else await queueAdContentReview(env,row.id,1);
+	}catch(error){await sendTelegramMessage(actor,'本次确认未完成：'+String(error?.message||error));}
+}
+
+async function finishAdNormalReview(env,row) {
+	const access=await adContentReviewAccess(env,row.decision_by,row);if(!access.write)throw new Error('判断权限或群模式已变化，未扩展原处理范围');
+	const evaluation=JSON.parse(row.evaluation||'{}'),snapshot=evaluation.snapshot||{},message=JSON.parse(row.message_json||'{}');
+	const key=snapshot.groupAdContextKey||await buildGroupAdContextKey({message},evaluation);
+	const selected=JSON.parse(row.review_sources||'[]'),caseId='content:'+row.id;
+	if(access.local){
+		const localSnapshot={...snapshot,automatic:true,punishmentScope:'local',punishmentChatId:row.chat_id,autoCaseId:caseId,groupAdContextKey:key,
+			imageId:selected.some(item=>['image','sticker'].includes(item))?snapshot.imageId:'',avatarId:selected.includes('avatar')?snapshot.avatarId:'',
+			badgeId:selected.includes('badge')?snapshot.badgeId:'',customEmojiIds:[],customEmojiMedia:[],learningPayload:{}};
+		for(const source of selected.filter(item=>item.startsWith('emoji'))){const item=snapshot.customEmojiMedia?.[Number(source.slice(5))];if(item)localSnapshot.customEmojiMedia.push(item);}
+		const result=await writeGroupAdFeedbackForCase(env,row.chat_id,row.decision_by,row.seq,{chatId:row.chat_id,snapshot:localSnapshot});
+		if(!result.ok)throw new Error('本群正常反例尚未写入');
+	}else {
+		if(!await recordAdNormalContextFeedback(env,key))throw new Error('正常现场反例尚未写入');
+		if(selected.includes('avatar')&&snapshot.avatarId&&!await clearAdAvatarOnIgnore(env,snapshot.avatarId,{strict:true}))throw new Error('正常头像反馈未完成');
+		const imageKeys=selected.filter(item=>['image','sticker'].includes(item)).map(()=>snapshot.imageId).filter(Boolean);
+		for(const item of selected.filter(value=>value.startsWith('emoji'))){const material=snapshot.customEmojiMedia?.[Number(item.slice(5))];if(material?.fileUniqueId)imageKeys.push(material.fileUniqueId);}
+		for(const id of new Set(imageKeys))if(!await clearAdImageOnIgnore(env,id))throw new Error('正常图片或贴纸反馈未完成');
+		if(selected.includes('badge')&&snapshot.badgeId)await upsertAdBadge(env,snapshot.badgeId,{verdict:'clean',source:'manual',hits:0});
+	}
+	if(await d1TableExists(env,'ad_automatic_case_targets')){
+		const targets=(await env.DB.prepare('SELECT chat_id,scope_type FROM ad_automatic_case_targets WHERE case_id=?').bind(caseId).all()).results||[];
+		if(targets.length){const result=await rollbackAutomaticAdCaseTargets(env,{chatId:row.chat_id,userId:row.user_id,snapshot:{...snapshot,automatic:true,
+			autoCaseId:caseId,punishmentChatId:row.chat_id,punishmentScope:targets[0].scope_type,punishmentTargets:targets.map(target=>({chatId:target.chat_id,autoCaseId:caseId}))}});
+			if(!result.complete)throw new Error('该现场的自动处置撤销尚未完成，已保留正常判断');}
+	}
+	await env.DB.prepare("UPDATE ad_content_reviews SET status='normal',evaluation=?,lease_until=0,lease_token='' WHERE id=? AND decision='normal'")
+		.bind(serializeAdDryRunEvaluation({...evaluation,normalFeedback:true}),row.id).run();
+	await sendTelegramMessage(row.decision_by,'✅ 该完整场景已确认正常并写入对应反例。\n'+(selected.length?'已按勾选位置撤销素材误判。':'未改变未勾选的素材分类。')+'新内容和新资料仍按正常检测流程检查。');
+}
+
+async function buildHumanAdReview(env,row) {
+	const access=await adContentReviewAccess(env,row.decision_by,row);if(!access.write)throw new Error('判断权限或群模式已变化');
+	const evaluation=JSON.parse(row.evaluation||'{}'),snapshot=evaluation.snapshot||{},selected=JSON.parse(row.review_sources||'[]');
+	if(!selected.length||selected.some(key=>!adReviewSources(row).some(source=>source.key===key)))throw new Error('广告位置缺少实际现场');
+	const learning={...snapshot,name:'',username:'',bio:'',text:'',avatarId:'',badgeId:'',imageId:'',customEmojiIds:[],customEmojiMedia:[],verifiedCustomEmojiIds:[]};
+	for(const key of selected){
+		if(key==='name'){learning.name=snapshot.name||'';learning.username=snapshot.username||'';}
+		if(key==='bio')learning.bio=snapshot.bio||'';
+		if(key==='text')learning.text=snapshot.text||'';
+		if(key==='avatar')learning.avatarId=snapshot.avatarId||'';
+		if(key==='badge')learning.badgeId=snapshot.badgeId||'';
+		if(['image','sticker'].includes(key))learning.imageId=snapshot.imageId||'';
+		if(key.startsWith('emoji')){const item=snapshot.customEmojiMedia[Number(key.slice(5))];learning.customEmojiMedia.push({...item,verifiedAd:true});learning.customEmojiIds.push(item.id);learning.verifiedCustomEmojiIds.push(item.id);}
+		const position=key.startsWith('emoji')?'sticker':key;if(evaluation.positionEvidence?.[position]){evaluation.positionEvidence[position].grade=10;evaluation.positionEvidence[position].exempt=false;}
+	}
+	learning.domains=extractAdDomains([learning.name,learning.username,learning.bio,learning.text].filter(Boolean).join('\n'));
+	learning.imageVerifiedAd=Boolean(learning.imageId);
+	if(!access.local){
+		if(learning.avatarId)await upsertAdAvatar(env,learning.avatarId,{verdict:'ad',source:'owner',fileId:snapshot.originalProfile?.avatarFileId||'',lastUserId:row.user_id});
+		for(const id of new Set([learning.imageId,...learning.customEmojiMedia.map(item=>item.fileUniqueId)].filter(Boolean)))await upsertAdImage(env,id,{verdict:'ad',source:'owner',lastUserId:row.user_id});
+		if(learning.badgeId)await upsertAdBadge(env,learning.badgeId,{verdict:'ad',source:'owner',hits:1});
+	}
+	evaluation.verdict='ban';evaluation.positionHardBan=true;evaluation.positionHardBase=true;
+	evaluation.reasons=(evaluation.reasons||[]).concat(['人工确认实际广告位置：'+selected.map(key=>adReviewSources(row).find(source=>source.key===key)?.label||key).join('、')]);
+	evaluation.learningPayload=learning;evaluation.learningSnapshot={...snapshot};
+	evaluation.snapshot={...snapshot,humanReviewed:true,reviewScope:access.local?'local':'global'};
+	evaluation.globalDrillAssets={avatarAd:Boolean(learning.avatarId),imageAd:Boolean(learning.imageId),badgeIds:learning.verifiedCustomEmojiIds.concat(learning.badgeId?[learning.badgeId]:[])};
+	return {evaluation,local:access.local};
+}
+
+async function readLocalReviewedMaterial(env,gid,kind,key) {
+	if(!env?.DB||!gid||!key||!isIndependentGroup(gid))return null;
+	if(!await d1TableExists(env,'ad_content_reviews'))return null;
+	const rows=(await env.DB.prepare("SELECT evaluation,review_sources FROM ad_content_reviews WHERE chat_id=? AND decision='ad' AND json_valid(evaluation) ORDER BY seq DESC").bind(String(gid)).all()).results||[];
+	for(const row of rows){const s=JSON.parse(row.evaluation).snapshot||{},selected=JSON.parse(row.review_sources||'[]');
+		const match=kind==='avatar'?selected.includes('avatar')&&s.avatarId===key:kind==='badge'?selected.includes('badge')&&s.badgeId===key:
+			selected.some(field=>['image','sticker'].includes(field)&&s.imageId===key||field.startsWith('emoji')&&s.customEmojiMedia?.[Number(field.slice(5))]?.fileUniqueId===key);
+		if(match)return {file_unique_id:key,verdict:'ad',source:'local_review',localReviewVerified:true,localReviewChatId:String(gid),hits:0};
+	}return null;
+}
+
+async function saveAdContentReview(env, message, evaluation, options = {}) {
+	if (!env?.DB || !message?.from?.id || !message?.chat?.id) return null;
+	await ensureAdContentReviewTable(env);
+	const uid=String(message.from.id),gid=String(message.chat.id),now=Math.floor(Date.now()/1000);
+	const source=options.source || (Number(message.message_id)>0?'message':'profile');
+	const id=source==='operator'?'operator:'+gid+':'+Number(options.invocationId)+':'+uid+':'+String(options.operatorSource||'manual')
+		:Number(message.message_id)>0?'message:'+gid+':'+Number(message.message_id)+':'+uid
+		:'profile:'+gid+':'+uid+':'+String(evaluation?.snapshot?.groupAdContextKey||await exportSha256Hex(JSON.stringify(message.from)));
+	const frozen=freezeAdDrillPendingMessage(message),serialized=JSON.stringify(frozen);
+	if(new TextEncoder().encode(serialized).length>128*1024)throw new Error('待核原消息超过存储上限，未裁剪为完整现场');
+	const status=options.status || 'pending';
+	await env.DB.prepare('INSERT INTO ad_content_reviews (id,user_id,chat_id,source,message_json,evaluation,status,next_at,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) '
+		+ 'ON CONFLICT(id) DO UPDATE SET message_json=excluded.message_json,evaluation=excluded.evaluation,updated_at=excluded.updated_at '
+		+ 'WHERE ad_content_reviews.status IN (\'pending\',\'waiting\',\'manual\') AND ad_content_reviews.lease_until<=?')
+		.bind(id,uid,gid,source,serialized,serializeAdDryRunEvaluation(evaluation),status,now+30,now,now,now+7*86400,now).run();
+	if (status==='pending') {
+		const queued=await env.DB.prepare('SELECT status,next_at FROM ad_content_reviews WHERE id=?').bind(id).first();
+		if(queued?.status==='pending')await queueAdContentReview(env,id,Math.max(1,Number(queued.next_at)-now));
+		await notifyAdContentReviewPending(env,id);
+	}
+	return id;
+}
+
+async function queueAdContentReview(env,id,delay=30) {
+	const queue=getBulkQueue(env);if(!queue)return false;
+	try { await queue.send({type:'ad_content_review',reviewId:String(id)},{delaySeconds:Math.max(1,Math.min(Math.ceil(delay),43200))});return true; }
+	catch(error){console.error('[内容待核] 队列登记失败: '+formatD1SchemaError(error));return false;}
+}
+
+async function runAdContentReview(env,id) {
+	if(!id||!env?.DB)return {complete:true};
+	await ensureAdContentReviewTable(env);
+	const confirmed=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(id).first();
+	if(confirmed?.decision==='normal'&&confirmed.status!=='normal'){await finishAdNormalReview(env,confirmed);return {complete:true,normal:true};}
+	const now=Math.floor(Date.now()/1000),token=crypto.randomUUID();
+	const row=await env.DB.prepare('UPDATE ad_content_reviews SET status=\'processing\',lease_until=?,lease_token=? WHERE id=? AND status IN (\'pending\',\'waiting\',\'processing\') AND next_at<=? AND lease_until<=? AND expires_at>? RETURNING *')
+		.bind(now+900,token,id,now,now,now).first();
+	if(!row){const existing=await env.DB.prepare('SELECT status,next_at,lease_until,expires_at FROM ad_content_reviews WHERE id=?').bind(id).first();
+		return {complete:!existing||!['pending','waiting','processing'].includes(existing.status)||Number(existing.expires_at)<=now,
+			...existing&&Number(existing.expires_at)>now&&['pending','waiting','processing'].includes(existing.status)?{retryAfter:Math.max(1,Math.min(43200,Math.max(Number(existing.next_at),Number(existing.lease_until))-now))}:{} };}
+	let evaluation=null;
+	const save=async(status,nextAt=now)=>{
+		const updated=await env.DB.prepare('UPDATE ad_content_reviews SET status=?,evaluation=?,attempts=attempts+1,next_at=?,lease_until=0,lease_token=\'\',updated_at=? WHERE id=? AND lease_token=? AND status=\'processing\'')
+			.bind(status,serializeAdDryRunEvaluation(evaluation||JSON.parse(row.evaluation)),nextAt,Math.floor(Date.now()/1000),id,token).run();
+		return Number(updated?.meta?.changes)===1;
+	};
+	try {
+		if((await readGlobalDryRunState(env,{strict:true})).on){await save('pending',now+60);return {complete:false,retryAfter:60};}
+		const message=JSON.parse(row.message_json),uid=String(row.user_id),gid=String(row.chat_id);
+		if(!isConfiguredGroup(gid)&&!isKillerModeGroup(gid)||isAdExemptBot(message.from)||isAdDetectionExemptUser(uid)
+			||await isAdUserWhitelisted(env,uid)||await resolveLocalAdDetectionSkip(env,gid,uid)||await isAdminForAdDetection(gid,uid)||await isConfiguredGroupAdmin(env,uid)){
+			await save('skipped');return {complete:true};
+		}
+		const human=row.decision==='ad'?await buildHumanAdReview(env,row):null;
+		const result=human?{evaluation:human.evaluation,config:loadAdDetectionConfig(env),whitelist:await loadAdDomainWhitelist(env)}
+			:await collectGlobalDryRunEvaluation(env,message,null,{normalDetection:true,scopeChatId:gid,source:'content_retry',refreshProfile:true});
+		evaluation=result.evaluation;
+		if(evaluation.verdict==='ban'){
+			const current=await env.DB.prepare('SELECT status,lease_token,decision FROM ad_content_reviews WHERE id=?').bind(id).first();
+			if(current?.status!=='processing'||current.lease_token!==token)return {complete:true};
+			const enforced=await enforceAdDetection(env,{userId:uid,chatId:gid,chatTitle:String(message.chat.title||''),messageId:Number(message.message_id)||null,message},evaluation,
+				{config:result.config,whitelist:result.whitelist,fullEvaluationCollected:true,automaticCaseId:'content:'+id,
+					skipLearning:human?.local===true,reviewGuard:async()=>{const state=await env.DB.prepare('SELECT decision,status FROM ad_content_reviews WHERE id=?').bind(id).first();return state?.decision!=='normal'&&state?.status==='processing';}});
+			const after=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(id).first();
+			if(after?.decision==='normal'){await finishAdNormalReview(env,after);return {complete:true,normal:true};}
+			const success=enforced?.banned!==false&&(enforced?.banResults||[]).every(target=>target.ok===true);
+			await save(success?'ad':'action_failed');return {complete:true,ad:success};
+		}
+		if(!isAdDrillPendingEvaluation(evaluation,result.llmMemo)){await save('clean');return {complete:true,clean:true};}
+		const attempts=Number(row.attempts)+1,delay=attempts>=3?86400:30*Math.pow(4,attempts);
+		await save(attempts>=3?'waiting':'pending',now+delay);return {complete:false,retryAfter:Math.min(43200,delay)};
+	}catch(error){
+		console.error('[内容待核] 核验未完成: '+formatD1SchemaError(error));
+		evaluation=evaluation||JSON.parse(row.evaluation);evaluation.pendingReason=String(error?.message||error);
+		await save('pending',now+120);return {complete:false,retryAfter:120};
+	}
+}
+
+async function resumeAdContentReviews(env) {
+	if(!env?.DB)return {queued:0};
+	if(!getBulkQueue(env))return {queued:0};
+	if(!D1_AD_CONTENT_REVIEW_INIT.get(env.DB)&&!await d1TableExists(env,'ad_content_reviews'))return {queued:0};
+	await ensureAdContentReviewTable(env);
+	const now=Math.floor(Date.now()/1000);
+	const rows=(await env.DB.prepare('SELECT id FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\') AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY next_at LIMIT 20').bind(now,now,now).all()).results||[];
+	let queued=0;for(const row of rows)if(await queueAdContentReview(env,row.id,1))queued++;
+	return {queued};
 }
 
 function isAdDrillPendingEvaluation(evaluation, memo = null) {
@@ -13563,9 +13935,7 @@ async function ensureAdDryRunLogTable(env) {
 			return false;
 		}
 	})();
-	D1_AD_DRYRUN_LOG_INIT.set(env.DB, init);
-	const ok = await init;
-	if (!ok) D1_AD_DRYRUN_LOG_INIT.delete(env.DB);
+	const ok = await rememberD1Initialization(D1_AD_DRYRUN_LOG_INIT, env.DB, init);
 	return ok;
 }
 
@@ -13792,9 +14162,7 @@ async function ensureAdJoinChecksTable(env) {
 			return false;
 		}
 	})();
-	D1_AD_JOIN_CHECKS_INIT.set(env.DB, init);
-	const ok = await init;
-	if (!ok) D1_AD_JOIN_CHECKS_INIT.delete(env.DB);
+	const ok = await rememberD1Initialization(D1_AD_JOIN_CHECKS_INIT, env.DB, init);
 	return ok;
 }
 
@@ -13981,9 +14349,7 @@ async function ensureAdSpamTextsTable(env) {
 			return false;
 		}
 	})();
-	D1_AD_SPAM_TEXTS_INIT.set(env.DB, init);
-	const ok = await init;
-	if (!ok) D1_AD_SPAM_TEXTS_INIT.delete(env.DB);   // 失败不缓存，下次再试
+	const ok = await rememberD1Initialization(D1_AD_SPAM_TEXTS_INIT, env.DB, init);
 	return ok;
 }
 
@@ -14091,7 +14457,7 @@ async function cacheModerationMessage(env, message, options = {}) {
 		}
 		return { spamHit, norm: textKey?.norm || '' };
 	} catch (error) {
-		console.error('[清扫缓存] 写 D1 失败:', error);
+		console.error('[清扫缓存] 写 D1 失败: ' + formatD1SchemaError(error));
 		return none;
 	}
 }
@@ -14188,9 +14554,7 @@ async function ensureAdTextSkeletonTables(env) {
 			return false;
 		}
 	})();
-	D1_AD_TEXT_SKELETON_INIT.set(env.DB, init);
-	const ok = await init;
-	if (!ok) D1_AD_TEXT_SKELETON_INIT.delete(env.DB);
+	const ok = await rememberD1Initialization(D1_AD_TEXT_SKELETON_INIT, env.DB, init);
 	return ok;
 }
 
@@ -14215,7 +14579,7 @@ async function loadAdTextSkeletons(env) {
 
 function refreshAdTextSkeletonCache(env, skeleton, active) {
 	const cached = AD_TEXT_SKELETON_CACHE.get(env?.DB);
-	if (cached?.promise) {
+	if (cached?.loading) {
 		if (!cached.pendingChanges) cached.pendingChanges = new Map();
 		cached.pendingChanges.set(skeleton, active);
 		return;
@@ -15248,12 +15612,10 @@ async function ensureInterceptNotifyTable(env) {
 			return true;
 		} catch (error) {
 			console.error('[拦截通知去重] 建表失败:', error);
-			D1_INTERCEPT_NOTIFY_INIT.delete(env.DB);
 			return false;
 		}
 	})();
-	D1_INTERCEPT_NOTIFY_INIT.set(env.DB, init);
-	return init;
+	return rememberD1Initialization(D1_INTERCEPT_NOTIFY_INIT, env.DB, init);
 }
 
 // 返回 { send, suppressed }：send=false 表示这次压下不发；
@@ -15349,12 +15711,10 @@ async function ensurePermNoticeTable(env) {
 			return true;
 		} catch (error) {
 			console.error('[权限提醒] 建表失败:', error);
-			D1_PERM_NOTICE_INIT.delete(env.DB);
 			return false;
 		}
 	})();
-	D1_PERM_NOTICE_INIT.set(env.DB, init);
-	return init;
+	return rememberD1Initialization(D1_PERM_NOTICE_INIT, env.DB, init);
 }
 
 // 返回 true 表示这次该发。
@@ -16347,6 +16707,7 @@ async function editAdPagedMessage(chatId, messageId, text, keyboard) {
 // /words 翻页回调。data 形如 adwords:<页码>:<base64url 关键词>，或 adwords:noop。
 async function handleAdWordsPaginationCallback(callbackQuery, env) {
 	const data = String(callbackQuery?.data || '');
+	if(data.startsWith('review:'))return handleAdContentReviewCallback(callbackQuery,env);
 	const clickerId = String(callbackQuery?.from?.id || '');
 	// 指纹库能直接决定自动封禁，权限口径必须与 /words 命令本身完全一致 —— 只给第一主人。
 	// 否则任何人只要拿到一条带按钮的转发消息就能翻看整个指纹库。
@@ -16428,15 +16789,12 @@ async function ensureAdImageSimilarityTable(env) {
 				}
 				return true;
 			} catch (_) {
-				AD_IMAGE_SIMILARITY_INIT.delete(env.DB);
 				AD_IMAGE_SIMILARITY_RETRY.set(env.DB, Date.now() + 60000);
 				return false;
 			}
 		})();
-		AD_IMAGE_SIMILARITY_INIT.set(env.DB, ready);
 	}
-	const initialized = await ready;
-	if (!initialized) AD_IMAGE_SIMILARITY_INIT.delete(env.DB);
+	const initialized = await rememberD1Initialization(AD_IMAGE_SIMILARITY_INIT, env.DB, ready);
 	return initialized;
 }
 
@@ -16471,8 +16829,8 @@ const AD_IMAGE_CONTENT_SIGNATURE_PROMPT = '分析这张 Telegram 图片、贴纸
 	+ '"caption":"具体描述画面中的人物、物体、动作和广告内容，不要泛泛地说一张图片",'
 	+ '"layout":"poster|screenshot|photo|illustration|sticker|mixed|unknown 中的一项",'
 	+ '"ad":true或false,"confidence":0到1的数字,"promotion":true或false,"ad_evidence":["逐字抄录可见招揽语或具体描述色情赌博画面；没有则空数组"]}。'
-	+ '广告必须有实际可见的色情、赌博、诈骗推广、商品购买行动或明确招揽引流。代理所有技术与服务内容、API token、正常和官方域名、技术配置、教程、软件界面、报错、聊天截图属于正常内容；不能仅因网址、二维码、联系方式、代理或token等词判广告。'
-	+ 'promotion只在图中确有招揽推广行动时为true。ad_evidence不能抄普通域名、token提示、菜单或联系方式冒充招揽证据，不得编造看不见的文字。独立明确色情、博彩或诈骗画面不被无关技术词遮蔽。'
+	+ '广告必须有实际可见的招揽引流、赌博或诈骗推广、商品购买行动。纯色情或裸露画面只有同时出现明确广告招揽才算广告。代理所有技术与服务内容、API token、正常和官方域名、技术配置、教程、软件界面、报错、聊天截图属于正常内容；不能仅因网址、二维码、联系方式、代理或token等词判广告。'
+	+ 'promotion只在图中确有招揽推广行动时为true。ad_evidence不能抄普通域名、token提示、菜单或联系方式冒充招揽证据，不得编造看不见的文字。普通头像、英文人名、动漫与表情贴纸、色情但没有推广行动的素材不得标成广告。'
 	+ 'ad判断须基于整张图片，包括底部文案。色情视频引流可通过点我、点击观看等明确行动表达，不要求一定有标准网址。新闻、举报、反诈提醒及普通表情不属于主动推广。看不清、不能确定时不要伪造内容，降低confidence。';
 
 function adImageContentSignature(value) {
@@ -16643,7 +17001,6 @@ async function getAdImageSimilarityVector(env, media, image = null) {
 	const state = adImageSimilarityState(env.DB);
 	const key = media.fileUniqueId;
 	if (state.vectors.has(key)) return { ok: true, ...state.vectors.get(key), reused: true };
-	if (state.pending.has(key)) return state.pending.get(key);
 	const work = (async () => {
 		try {
 			const saved = await env.DB.prepare('SELECT embedding, model, owner_verdict, signature FROM ad_image_similarity WHERE file_unique_id = ?').bind(key).first();
@@ -16694,9 +17051,7 @@ async function getAdImageSimilarityVector(env, media, image = null) {
 			return { ok: true, vector: extracted, signature, reused: false };
 		} catch (_) { return { ok: false, reason: 'embedding_failed' }; }
 	})();
-	state.pending.set(key, work);
-	try { return await work; }
-	finally { state.pending.delete(key); }
+	return work;
 }
 
 async function recordAdImageOwnerDecision(env, media, verdict, options = {}) {
@@ -17031,12 +17386,15 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 }
 
 function classifyAdDeleteOutcome(result) {
+	if (result?.alreadyDeleted || isEffectivelyDeletedError(result?.error)) {
+		return { effective: true, status: 'already_deleted', summary: '已被其他机器人或管理员删除，等效成功', detail: '' };
+	}
 	if (result?.ok) {
 		return { effective: true, status: 'deleted', summary: '已删除当前含广告引用的消息', detail: '' };
 	}
 	const rawError = String(result?.error || '未知错误');
 	const lower = rawError.toLowerCase();
-	if (lower.includes('message to delete not found') || lower.includes('message identifier is not specified')) {
+	if (lower.includes('message to delete not found')) {
 		return {
 			effective: true,
 			status: 'already_deleted',
@@ -19214,8 +19572,29 @@ async function buildSelfUnbanApprovedReply() {
 	return { text, replyMarkup };
 }
 
-// 发送 Telegram 消息
+// 只缓存限流的时间，避免同一批通知继续撞 Telegram；不共享请求中的 Promise。
+const TELEGRAM_SEND_COOLDOWNS = new Map();
+function telegramSendCooldown(chatId) {
+	const key = BOT_TOKEN + ':' + String(chatId);
+	const until = TELEGRAM_SEND_COOLDOWNS.get(key) || 0;
+	if (until <= Date.now()) { TELEGRAM_SEND_COOLDOWNS.delete(key); return null; }
+	const retryAfterSeconds = Math.ceil((until - Date.now()) / 1000);
+	return { ok: false, error: 'Telegram 限流，请在 ' + retryAfterSeconds + ' 秒后重试', error_code: 429,
+		parameters: { retry_after: retryAfterSeconds }, retryAfterSeconds, retryAt: until, retryable: true };
+}
+function recordTelegramSendCooldown(chatId, response, result) {
+	if (Number(response?.status) !== 429 && Number(result?.error_code) !== 429) return 0;
+	const seconds = Number(result?.parameters?.retry_after) || Number(String(result?.description || '').match(/retry after (\d+)/i)?.[1]) || 1;
+	const delay = Math.max(1000, Math.ceil(seconds * 1000));
+	if (TELEGRAM_SEND_COOLDOWNS.size >= 512) TELEGRAM_SEND_COOLDOWNS.delete(TELEGRAM_SEND_COOLDOWNS.keys().next().value);
+	TELEGRAM_SEND_COOLDOWNS.set(BOT_TOKEN + ':' + String(chatId), Date.now() + delay);
+	return delay;
+}
+
+// 发送 Telegram 消息。只重试已明确拒绝的短限流或失效回复，不重放结果不确定的网络发送。
 async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId = null) {
+	const cooldown = telegramSendCooldown(chatId);
+	if (cooldown) return cooldown;
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
 	const body = {
 		chat_id: chatId,
@@ -19229,8 +19608,12 @@ async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId =
 	if (replyToMessageId) {
 		// 保持源代码 /ad 回复发起行为；其他既有调用未传该参数，行为完全不变。
 		body.reply_to_message_id = Number(replyToMessageId);
+		body.allow_sending_without_reply = true;
 	}
 
+	let rateLimitRetried = false;
+	let replyFallbackUsed = false;
+	for (let attempt = 0; attempt < 3; attempt++) {
 	try {
 		const response = await fetch(url, {
 			method: 'POST',
@@ -19241,15 +19624,29 @@ async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId =
 		console.log(`发送消息到 Telegram，状态: ${response.status}, 响应: ${JSON.stringify(result)}`);
 
 		if (!response.ok || !result.ok) {
-			// 软失败:记录但不抛,让调用方后续逻辑继续跑
+			if (body.reply_to_message_id && !replyFallbackUsed && /message to be replied not found|reply message not found/i.test(String(result.description || ''))) {
+				delete body.reply_to_message_id;
+				delete body.allow_sending_without_reply;
+				replyFallbackUsed = true;
+				continue;
+			}
+			const delay = recordTelegramSendCooldown(chatId, response, result);
+			if (delay > 0 && delay <= 3000 && !rateLimitRetried) {
+				rateLimitRetried = true;
+				await new Promise(resolve => setTimeout(resolve, delay));
+				continue;
+			}
 			console.error(`[sendTelegramMessage] 发送失败 chat=${chatId}: ${result.description || `HTTP ${response.status}`}`);
-			return { ok: false, error: result.description || `HTTP ${response.status}` };
+			return { ...result, ok: false, error: result.description || `HTTP ${response.status}`,
+				...(delay ? { retryAfterSeconds: Math.ceil(delay / 1000), retryAt: Date.now() + delay, retryable: true } : {}) };
 		}
+		TELEGRAM_SEND_COOLDOWNS.delete(BOT_TOKEN + ':' + String(chatId));
 		captureWebAdminReply(chatId, body.text);
 		return result;
 	} catch (error) {
 		console.error(`[sendTelegramMessage] 异常 chat=${chatId}:`, error);
 		return { ok: false, error: error.message };
+	}
 	}
 }
 
@@ -19993,12 +20390,13 @@ function parseMuteFailure(error) {
 // 【重试与 banUserFromGroup 同规格】429 / 5xx / 网络异常各重试一次，否则 /ban 改禁言后
 // 会丢掉踢出路径原有的限流重试保障 —— 同一条命令路径的可靠性不该因为换了处置方式而倒退。
 // 注意 restrictChatMember 只能禁言【已在群里】的人；目标不在群时 Telegram 报错 → ok:false（预期，无法预禁言）。
-async function muteUserInGroup(chatId, userId) {
+async function muteUserInGroup(chatId, userId, options = {}) {
 	let lastError = null;
 	let attempts = 0;
 	for (let attempt = 1; attempt <= 2; attempt += 1) {
 		attempts = attempt;
 		try {
+			if(options.reviewGuard&&!await options.reviewGuard())return {ok:false,cancelled:true,error:'人工查看或正常判断已登记，自动请求停止'};
 			await muteChatMember(chatId, userId);
 			return { ok: true, attempts, retried: attempt > 1 };
 		} catch (error) {
@@ -20051,6 +20449,7 @@ async function banUserFromGroup(chatId, userId, options = {}) {
 	for (let attempt = 1; attempt <= 2; attempt += 1) {
 		attempts = attempt;
 		try {
+			if(options.reviewGuard&&!await options.reviewGuard())return {ok:false,cancelled:true,error:'人工查看或正常判断已登记，自动请求停止'};
 			const response = await fetch(url, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
@@ -20195,6 +20594,7 @@ function translateLeaveChatError(description) {
 // bot 必须有 can_delete_messages 权限；私聊只能删自己发的消息
 // 返回 { ok: bool, error?: string }
 async function deleteMessage(chatId, messageId) {
+	if (!Number.isSafeInteger(Number(messageId)) || Number(messageId) <= 0) return { ok: false, error: 'message identifier is not specified' };
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`;
 	const body = { chat_id: chatId, message_id: messageId };
 
@@ -20207,6 +20607,7 @@ async function deleteMessage(chatId, messageId) {
 		const result = await response.json();
 		console.log(`[deleteMessage] chat=${chatId} msg=${messageId} ok=${result.ok}${result.description ? ' desc=' + result.description : ''}`);
 		if (!response.ok || !result.ok) {
+			if (isEffectivelyDeletedError(result.description)) return { ok: true, alreadyDeleted: true };
 			return { ok: false, error: result.description || `HTTP ${response.status}` };
 		}
 		return { ok: true };
@@ -22395,10 +22796,8 @@ async function ensureAdDetectionTables(env) {
 			return false;
 		}
 	})();
-	D1_AD_DETECTION_INIT_PROMISES.set(env.DB, initPromise);
-	const initialized = await initPromise;
+	const initialized = await rememberD1Initialization(D1_AD_DETECTION_INIT_PROMISES, env.DB, initPromise);
 	if (!initialized) {
-		D1_AD_DETECTION_INIT_PROMISES.delete(env.DB);
 		D1_AD_DETECTION_RETRY_AT.set(env.DB, Date.now() + AD_SCHEMA_RETRY_COOLDOWN_MS);
 	} else {
 		D1_AD_DETECTION_RETRY_AT.delete(env.DB);
@@ -22519,16 +22918,16 @@ async function adDetectionReady(env) {
 async function loadAdCachedValue(cache, db, ttlMs, loader) {
 	if (!db) return null;
 	const cached = cache.get(db);
-	if (cached?.promise) return await cached.promise;
 	if (cached && cached.expiresAt > Date.now()) return cached.value;
-	const promise = Promise.resolve().then(loader);
-	cache.set(db, { value: null, expiresAt: 0, promise });
+	const loading = { value: null, expiresAt: 0, loading: true, pendingChanges: cached?.pendingChanges };
+	cache.set(db, loading);
 	try {
-		const value = await promise;
-		cache.set(db, { value, expiresAt: Date.now() + ttlMs, promise: null });
-		return value;
+		const value = await retryD1Read(loader);
+		if (cache.get(db) === loading) cache.set(db, { value, expiresAt: Date.now() + ttlMs, promise: null });
+		const latest = cache.get(db);
+		return latest?.expiresAt > Date.now() ? latest.value : value;
 	} catch (error) {
-		cache.delete(db);
+		if (cache.get(db) === loading) cache.delete(db);
 		throw error;
 	}
 }
@@ -22597,7 +22996,7 @@ async function loadAdDomainWhitelist(env) {
 	if (!env?.DB) return fallback();
 	try {
 		const value = await loadAdCachedValue(AD_DOMAIN_WHITELIST_CACHE, env.DB, AD_WHITELIST_CACHE_TTL_MS, async () => {
-			if (!(await adDetectionReady(env))) return fallback();
+			if (!(await adDetectionReady(env))) throw new Error('域名白名单存储未就绪');
 			const { results } = await env.DB.prepare('SELECT domain FROM ad_domain_whitelist').all();
 			const set = new Set();
 			for (const row of results || []) {
@@ -22608,8 +23007,8 @@ async function loadAdDomainWhitelist(env) {
 		});
 		return value instanceof Set ? value : fallback();
 	} catch (error) {
-		console.error('[广告检测] 读取域名白名单失败:', error);
-		return fallback();
+		console.error('[广告检测] 读取域名白名单失败: ' + formatD1SchemaError(error));
+		throw new MiniAppError(503, '域名白名单暂不可用，本次广告检测未执行');
 	}
 }
 
@@ -22656,7 +23055,7 @@ async function loadAdUserWhitelist(env) {
 	if (!env?.DB) return fallback();
 	try {
 		const value = await loadAdCachedValue(AD_USER_WHITELIST_CACHE, env.DB, AD_WHITELIST_CACHE_TTL_MS, async () => {
-			if (!(await adDetectionReady(env))) return fallback();
+			if (!(await adDetectionReady(env))) throw new Error('用户白名单存储未就绪');
 			const { results } = await env.DB.prepare('SELECT user_id FROM ad_user_whitelist').all();
 			const set = new Set();
 			for (const row of results || []) {
@@ -22669,8 +23068,8 @@ async function loadAdUserWhitelist(env) {
 		});
 		return value instanceof Set ? value : fallback();
 	} catch (error) {
-		console.error('[广告检测] 读取用户白名单失败:', error);
-		return fallback();
+		console.error('[广告检测] 读取用户白名单失败: ' + formatD1SchemaError(error));
+		throw new MiniAppError(503, '用户白名单暂不可用，本次广告检测未执行');
 	}
 }
 
@@ -22747,7 +23146,7 @@ async function loadAdGroupAdminSet(env) {
 	if (!env?.DB) return fallback();
 	try {
 		const value = await loadAdCachedValue(AD_GROUP_ADMIN_CACHE, env.DB, AD_GROUP_ADMIN_CACHE_TTL_MS, async () => {
-			if (!(await adDetectionReady(env))) return fallback();
+			if (!(await adDetectionReady(env))) throw new Error('群管理员豁免存储未就绪');
 			// DISTINCT：同一个人可能在多个群都是管理员，(user_id, chat_id) 会有多行，
 			// 而这里要的只是「这个人是不是管理员」这一个布尔。
 			const { results } = await env.DB.prepare('SELECT DISTINCT user_id FROM ad_group_admins').all();
@@ -22761,8 +23160,8 @@ async function loadAdGroupAdminSet(env) {
 		});
 		return value instanceof Set ? value : fallback();
 	} catch (error) {
-		console.error('[广告检测] 读取配置群管理员失败:', error);
-		return fallback();
+		console.error('[广告检测] 读取配置群管理员失败: ' + formatD1SchemaError(error));
+		throw new MiniAppError(503, '群管理员豁免暂不可用，本次广告检测未执行');
 	}
 }
 
@@ -23843,9 +24242,7 @@ async function ensureAdLinkCacheTable(env) {
 			return false;
 		}
 	})();
-	D1_AD_LINK_CACHE_INIT.set(env.DB, init);
-	const ok = await init;
-	if (!ok) D1_AD_LINK_CACHE_INIT.delete(env.DB);
+	const ok = await rememberD1Initialization(D1_AD_LINK_CACHE_INIT, env.DB, init);
 	return ok;
 }
 
@@ -24845,7 +25242,7 @@ async function loadAdFingerprints(env, options = {}) {
 			: await loadAdCachedValue(AD_FINGERPRINT_CACHE, env.DB, AD_FINGERPRINT_CACHE_TTL_MS, loader);
 		return Array.isArray(value) ? value : [];
 	} catch (error) {
-		console.error('[广告检测] 读取指纹库失败:', error);
+		console.error('[广告检测] 读取指纹库失败: ' + formatD1SchemaError(error));
 		if (options.strict) throw error;
 		return [];
 	}
@@ -25142,8 +25539,14 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 	try {
 		// checklist 是与 text/caption 互斥的第六类正文来源 —— /spam /ban /sban 引用【清单】时
 		// message.text 恒为 undefined，不接它就只学得到一张空正文的资料卡。
-		const text = [String(quoted.text ?? quoted.caption ?? extractAdChecklistText(quoted)), extractAdWebPageText(quoted)].filter(Boolean).join(' ').trim();
-		const profile = options.profile || await fetchAdUserProfile(targetUserId, quoted?.from || {});
+		const collected=await collectGlobalDryRunEvaluation(env,quoted,null,{source:'operator',normalDetection:true,scopeChatId:String(quoted.chat?.id||''),
+			skipTextReview:true,profile:options.profile,refreshProfile:true});
+		const text = String(collected.evaluation.snapshot.text||'');
+		const profile = collected.profile;
+		out.snapshot=collected.evaluation.snapshot;
+		out.collectionComplete=collected.evaluation.globalDrill.complete;
+		out.collectionMissing=collected.evaluation.drillIncomplete||[];
+		out.reviewId=await saveAdContentReview(env,quoted,collected.evaluation,{source:'operator',status:'manual',invocationId:invocation.message_id,operatorSource:source});
 		const name = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
 		// 【媒体源】/ban <id>、/spam <id>、/sban 传进来的 message 是【命令消息本身】，
 		// 被引用的那条广告躺在 message.reply_to_message 里 —— 命令消息上没有 photo /
@@ -25156,10 +25559,12 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 		// （引用体兜底读的正是 message.reply_to_message 的文本，直接换掉会让它变成读「引用的引用」）。
 		const mediaSource = quoted;
 		const manualEmojiIds = extractCustomEmojiIds(mediaSource);
-		const manualEmojiRows = await readAdCustomEmojiMediaRows(env, manualEmojiIds, targetUserId);
+		const manualEmojiRows = collected.materials.emojiRows;
 		// 真实第一主人引用即是人工标注，完整记录其引用素材，不再让概率模型缩减标注内容。
-		const learnedEmojiRows = manualEmojiRows.filter((item) => item.fileUniqueId && item.visionFileId);
+		const learnedEmojiRows = manualEmojiRows.filter((item) => item.verifiedAd && item.fileUniqueId && item.visionFileId);
 		const payload = {
+			avatarText:collected.evaluation.payload.avatarText||'',badgeText:collected.evaluation.payload.badgeText||'',
+			customEmojiText:collected.evaluation.payload.customEmojiText||'',
 			name,
 			username: profile.username ? '@' + String(profile.username).replace(/^@/, '') : '',
 			bio: profile.bio || '',
@@ -25167,7 +25572,7 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 			domains: extractAdDomains([name, profile.bio, text].filter(Boolean).join('\n')),
 			// 正文里的自定义 emoji（点⚔️查 这类贴纸 emoji）id 就在被引用消息的 entities 里，
 			// 与资料无关，必须从媒体源现取 —— fetchAdUserProfile 的响应里没有它。
-			customEmojiIds: manualEmojiIds,
+			customEmojiIds: learnedEmojiRows.map(item=>item.id),
 			customEmojiMedia: learnedEmojiRows.map((item) => ({ id: item.id, fileUniqueId: item.fileUniqueId, visionFileId: item.visionFileId, kind: item.kind, verifiedAd: true }))
 		};
 		const learn = await learnAdFingerprints(env, payload, { source, createdBy });
@@ -25200,11 +25605,14 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 		// 判据写不进去最多是少学一条，不能让回执报错，更不能影响后面的语义样本与共性提炼。
 		try {
 			const avatarId = String(profile.avatarId || '');
-			if (avatarId && await learnAdAvatarOnBan(env, avatarId, targetUserId)) out.avatars += 1;
+			if (avatarId && collected.evaluation.globalDrillAssets.avatarAd && await learnAdAvatarOnBan(env, avatarId, targetUserId)) {
+				out.avatars += 1;
+				if (collected.materials.avatar?.ocr_text) await learnAdAvatarText(env,collected.materials.avatar.ocr_text);
+			}
 			// 会员标与正文自定义 emoji 共用 ad_badges、共用 hits 计数（+1 语义），
 			// 这里只学 profile 上那一个标：正文 emoji 属于消息，人工命令没有消息可取。
 			const badgeId = String(profile.badgeId || '');
-			if (badgeId && await learnAdBadgeOnBan(env, badgeId, targetUserId)) out.badges += 1;
+			if (badgeId && collected.evaluation.globalDrillAssets.badgeIds.includes(badgeId) && await learnAdBadgeOnBan(env, badgeId, targetUserId)) out.badges += 1;
 			// 正文自定义 emoji 与会员标共用 ad_badges、共用 hits 计数（+1 语义）。
 			// 2026-10-19 补：此前手动路径只学 profile 上那个会员标，正文里的贴纸 emoji
 			// 一个都不学 —— 管理员引用「正文只有 点⚔️查 这类 emoji」的广告发 /spam，
@@ -25309,6 +25717,7 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 function renderAdLearnLines(learn, source) {
 	const lines = [];
 	if (!learn) return lines;
+	if(learn.reviewId)lines.push('📋 已保存完整学习现场；'+(learn.collectionComplete?'资料与素材已核验':'仍有未核项：'+(learn.collectionMissing||[]).join('；')));
 	if (learn.learned > 0) lines.push('🧬 已学习广告指纹:' + learn.learned + ' 条(来源 /' + source + ' 人工判定)');
 	if (learn.imageLearned > 0) lines.push('🖼 已学习广告图片/贴纸: 引用消息里的那张已入库，下次任何人发同一张即命中');
 	if (learn.imageLearningFailedCount > 0) lines.push('⚠️ 图片/贴纸人工确认未完成:' + learn.imageLearningFailedCount + ' 项，未计入图片学习成功；请第一主人引用原广告再次发送 /spam 重试。');
@@ -25876,7 +26285,7 @@ async function topUpAdSampleEmbeddings(env) {
 		if (filled) AD_SAMPLE_EMBEDDING_CACHE.delete(env.DB);
 		return filled;
 	} catch (error) {
-		console.error('[广告检测] 补齐样本向量失败:', error);
+		console.error('[广告检测] 补齐样本向量失败: ' + formatD1SchemaError(error));
 		return 0;
 	}
 }
@@ -25928,7 +26337,7 @@ async function loadAdSampleEmbeddings(env) {
 		});
 		return Array.isArray(value) ? value : [];
 	} catch (error) {
-		console.error('[广告检测] 读取样本向量失败:', error);
+		console.error('[广告检测] 读取样本向量失败: ' + formatD1SchemaError(error));
 		return [];
 	}
 }
@@ -26304,9 +26713,11 @@ async function addAdSample(env, rawText, options = {}) {
 		const hash = adTextHash(text);
 		const existing = await env.DB.prepare('SELECT id FROM ad_sample_embeddings WHERE text_hash = ?').bind(hash).first();
 		if (existing) return { ok: true, added: false, text };
-		await env.DB.prepare(
-			'INSERT INTO ad_sample_embeddings (text_hash, sample_text, embedding, dimension, source, created_at) VALUES (?, ?, NULL, NULL, ?, ?)'
-		).bind(hash, text.slice(0, 500), String(options.source || 'manual'), Math.floor(Date.now() / 1000)).run();
+		const inserted = await env.DB.prepare(
+			'INSERT OR IGNORE INTO ad_sample_embeddings (text_hash, sample_text, embedding, dimension, source, created_at) VALUES (?, ?, NULL, NULL, ?, ?)'
+		).bind(hash, text, String(options.source || 'manual'), Math.floor(Date.now() / 1000)).run();
+		if (inserted?.success === false) throw new Error('语义样本写入未成功');
+		if (Number(inserted?.meta?.changes) === 0) return { ok: true, added: false, text };
 		AD_SAMPLE_EMBEDDING_CACHE.delete(env.DB);
 		return { ok: true, added: true, text };
 	} catch (error) {
@@ -26674,7 +27085,7 @@ function adFetchRetryAfter(result) {
 	return Number.isFinite(wait) && wait > 0 ? Math.min(wait, 3) : 1;
 }
 
-async function fetchAdUserProfile(userId, fallback = {}) {
+async function fetchAdUserProfile(userId, fallback = {}, options = {}) {
 	const profile = {
 		// userId：这份 profile 属于谁。registerAdAvatar 要靠它写 ad_avatars.last_user_id，
 		// 漏了它，巡检登记的头像就查不到出处（线上 1,561/3,434 张为空，全是这条路登记的）。
@@ -26706,7 +27117,7 @@ async function fetchAdUserProfile(userId, fallback = {}) {
 		isPremium: typeof fallback.is_premium === 'boolean' ? fallback.is_premium : null
 	};
 	if (!BOT_TOKEN || !userId) return profile;
-	const cached = readAdProfileCache(userId);
+	const cached = options.forceRefresh ? null : readAdProfileCache(userId);
 	// 缓存只在抓取成功时写入（见下方 writeAdProfileCache 的位置），
 	// 所以命中缓存等价于「近 5 分钟内成功查过」，bioFetched 置真。
 	if (cached) {
@@ -26817,7 +27228,7 @@ async function readAdScreening(env, userId) {
 			expiresAt: Number(row.expires_at) || 0
 		};
 	} catch (error) {
-		console.error('[广告检测] 读取观察记录失败:', error);
+		console.error('[广告检测] 读取观察记录失败: ' + formatD1SchemaError(error));
 		return null;
 	}
 }
@@ -26863,7 +27274,7 @@ async function upsertAdGroupMember(env, userId, chatId, from = null, nowSeconds 
 			now
 		).run();
 	} catch (error) {
-		console.error('[广告检测] 更新发言者名册失败:', error);
+		console.error('[广告检测] 更新发言者名册失败: ' + formatD1SchemaError(error));
 	}
 }
 
@@ -26877,7 +27288,7 @@ async function readAdGroupMember(env, userId) {
 		const row = await env.DB.prepare('SELECT user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at FROM ad_group_members WHERE user_id = ?').bind(uid).first();
 		return row || null;
 	} catch (error) {
-		console.error('[广告检测] 读取发言者名册失败:', error);
+		console.error('[广告检测] 读取发言者名册失败: ' + formatD1SchemaError(error));
 		return null;
 	}
 }
@@ -26902,7 +27313,7 @@ async function readAdAvatar(env, fileUniqueId, options = {}) {
 	} catch (error) {
 		// 查不到不等于干净：失败按「未入库」处理，下一条消息再试，
 		// 绝不把查询失败当成 clean 去放行。
-		console.error('[广告检测] 读取头像指纹失败:', error);
+		console.error('[广告检测] 读取头像指纹失败: ' + formatD1SchemaError(error));
 		if (options.strict) throw error;
 		return null;
 	}
@@ -26956,7 +27367,7 @@ async function upsertAdAvatar(env, fileUniqueId, patch = {}) {
 					+ 'verdict = CASE WHEN source IN (\'owner\', \'manual\') OR ? = \'\' THEN verdict ELSE ? END, '
 					+ 'source = CASE WHEN source IN (\'owner\', \'manual\') OR ? = \'\' THEN source ELSE \'vision\' END '
 					+ 'WHERE file_unique_id = ?')
-					.bind(result, String(patch.ocrText || '').slice(0, 200), Number(patch.ocrAt) || 0,
+					.bind(result, String(patch.ocrText || '').slice(0, 1200), Number(patch.ocrAt) || 0,
 						result, result, result, result, result, key).run();
 			} catch (ocrError) {
 				console.error('[广告检测] 写入头像读字结果失败:', ocrError);
@@ -26964,7 +27375,7 @@ async function upsertAdAvatar(env, fileUniqueId, patch = {}) {
 		}
 		return true;
 	} catch (error) {
-		console.error('[广告检测] 写入头像指纹失败:', error);
+		console.error('[广告检测] 写入头像指纹失败: ' + formatD1SchemaError(error));
 		return false;
 	}
 }
@@ -27096,6 +27507,28 @@ async function clearAdAvatarOnIgnore(env, fileUniqueId, options = {}) {
 //   ad + 本次已有任何判据   → 封（头像与正文/简介互相印证）
 //   ad + 本次干净           → 只进观察，不封（头像可能被盗用，单证不定罪）
 //   clean / pending / 无头像 → 原样返回，一个字节都不改
+function isReliableAdAvatarText(avatar) {
+	const text = String(avatar?.ocr_text || '').trim();
+	if (!text || hasAdProtectedTechnicalContext(text)&&!hasAdIndependentHarmfulContent(text)
+		|| /反诈|防骗|风险提示|诈骗警示|新闻报道|辟谣|举报|禁止(?:广告|引流|招揽)/.test(text)) return false;
+	const hit = avatar.textHit;
+	const matched = hit && normalizeAdAvatarText(text).includes(normalizeAdAvatarText(hit.value));
+	// 已有明确引流文字例外仍生效；自动学入的普通文字不能反过来授予封禁权。
+	if (/点我(?:进群|头像|主页|简介|赚钱)|看我(?:主页|简介|头像)|主页赚钱|赚钱看我|进群赚钱/.test(normalizeAdAvatarText(text))) return true;
+	const business = countAdKeywordHits(text, AD_BUSINESS_KEYWORDS).length || countAdKeywordHits(text, AD_PORN_PATTERNS).length;
+	if((countAdKeywordHits(text,AD_PORN_PATTERNS).length||/果聊|裸聊/.test(text))&&/\d+(?:\.\d+)?\s*(?:r\b|元|米|usdt|u\b)/i.test(text))return true;
+	const solicitation = countAdKeywordHits(text, AD_TRADE_VERBS).length || /联系|私聊|扫码|加微|加v|购买|下单|免费观看|点我|点击/i.test(text);
+	if (business && solicitation) return true;
+	return isReliableAdImageTextSignature({ ad:true, promotion:true, confidence:1, ocr_text:text, ad_evidence:[text] });
+}
+
+function isVerifiedAdAvatarRow(avatar) {
+	if (!avatar || avatar.verdict === 'clean' && ['owner','manual','group_feedback'].includes(String(avatar.source || ''))) return false;
+	if(avatar.verdict==='ad'&&avatar.source==='local_review'&&avatar.localReviewVerified)return true;
+	if (avatar.verdict === 'ad' && ['owner','manual'].includes(String(avatar.source || ''))) return true;
+	return isReliableAdAvatarText(avatar) && (Boolean(avatar.textHit) || Number(avatar.ocr_at)>0 && avatar.ocr_verdict==='ad');
+}
+
 function applyAvatarVerdict(evaluation, avatar) {
 	evaluation = finalizeAdAutomaticDecision(evaluation);
 	if (!evaluation || !avatar) return evaluation;
@@ -27120,7 +27553,7 @@ function applyAvatarVerdict(evaluation, avatar) {
 	// 一张都不命中。
 	// 【不看 verdict】模型判 clean 的图照样比字：6101665227 的头像写着「看我简介」，
 	// clef 判成了 clean。人工判过干净的（source='manual'）由调用方挡掉，不会走到这里。
-	const textHit = avatar.textHit && typeof avatar.textHit === 'object' ? avatar.textHit : null;
+	const textHit = avatar.textHit && typeof avatar.textHit === 'object' && isVerifiedAdAvatarRow(avatar) ? avatar.textHit : null;
 	if (textHit) {
 		const ocr = String(avatar.ocr_text || '').trim().slice(0, 60);
 		const line = '头像文字命中特征库：「' + ocr + '」→ 命中「' + String(textHit.value || '').slice(0, 30) + '」（'
@@ -27139,6 +27572,10 @@ function applyAvatarVerdict(evaluation, avatar) {
 		return judged;
 	}
 	if (String(avatar.verdict || '') !== 'ad') return evaluation;
+	if (!isVerifiedAdAvatarRow(avatar)) {
+		return Object.assign({}, evaluation, { positionNeedsReview:true,
+			reasons:(evaluation.reasons || []).concat(['头像尚无可核实广告文字，模型标记和复用次数不提供封禁证据']) });
+	}
 	const hits = Number(avatar.hits) || 0;
 	if (evaluation.positionEvidence) {
 		const judged = Object.assign({}, evaluation, { reasons: (evaluation.reasons || []).concat(['头像广告证据（复用定罪 ' + hits + ' 次）']) });
@@ -27834,7 +28271,7 @@ async function hasAdLLMSeenInD1(env, key, nowSeconds) {
 		// 过期的当成没判过（剪枝是异步的，不能依赖它已经跑过）
 		return nowSeconds - at < AD_LLM_SEEN_TTL_SECONDS;
 	} catch (error) {
-		console.error('[广告检测·深度判定] 读去重键失败:', error);
+		console.error('[广告检测·深度判定] 读去重键失败: ' + formatD1SchemaError(error));
 		return false;
 	}
 }
@@ -27983,10 +28420,8 @@ async function ensureAdDigestTable(env) {
 				return false;
 			}
 		})();
-		D1_DIGEST_INIT.set(env.DB, init);
 	}
-	const ok = await init;
-	if (!ok) D1_DIGEST_INIT.delete(env.DB);
+	const ok = await rememberD1Initialization(D1_DIGEST_INIT, env.DB, init);
 	return ok;
 }
 
@@ -28568,9 +29003,7 @@ async function ensureAdLLMCandidatesTable(env) {
 			return false;
 		}
 	})();
-	D1_AD_LLM_CANDIDATES_INIT.set(env.DB, init);
-	const ok = await init;
-	if (!ok) D1_AD_LLM_CANDIDATES_INIT.delete(env.DB);   // 失败不缓存，下次再试
+	const ok = await rememberD1Initialization(D1_AD_LLM_CANDIDATES_INIT, env.DB, init);
 	return ok;
 }
 
@@ -28769,10 +29202,8 @@ async function ensureAdFalsePositivesTable(env) {
 				return false;
 			}
 		})();
-		D1_FP_INIT.set(env.DB, init);
 	}
-	const ok = await init;
-	if (!ok) D1_FP_INIT.delete(env.DB);   // 失败不缓存，下次再试
+	const ok = await rememberD1Initialization(D1_FP_INIT, env.DB, init);
 	return ok;
 }
 
@@ -28988,6 +29419,7 @@ async function sendAdDryRunCloseProgress(env, sessionId, options = {}) {
 }
 
 async function sendAdDryRunReportDocument(ownerId, sessionId, report) {
+	if (telegramSendCooldown(ownerId)) return false;
 	const plain = report.replace(/<[^>]*>/g, '').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&amp;/g,'&');
 	const body = new FormData();
 	body.append('chat_id', ownerId);
@@ -28997,6 +29429,7 @@ async function sendAdDryRunReportDocument(ownerId, sessionId, report) {
 		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/sendDocument', {method:'POST',body});
 		const result = await response.json();
 		if (!response.ok || !result.ok) {
+			recordTelegramSendCooldown(ownerId, response, result);
 			console.error('[演练收尾] 完整报告附件发送失败: ' + String(result.description || response.status));
 			return false;
 		}
@@ -29902,6 +30335,7 @@ function applyCustomEmojiMaterialVerdicts(evaluation, rows) {
 	if (!evaluation) return evaluation;
 	let result = { ...evaluation, payload: { ...(evaluation.payload || {}) }, snapshot: { ...(evaluation.snapshot || {}) } };
 	const materials = rows.map((item) => ({ id: item.id, fileUniqueId: item.fileUniqueId, visionFileId: item.visionFileId,
+		fileId:item.fileId||'',setName:item.setName||'',
 		kind: item.kind, verdict: item.row?.verdict || 'pending', source: item.row?.source || '', verifiedAd: item.verifiedAd }));
 	result.payload.customEmojiMedia = materials;
 	result.snapshot.customEmojiMedia = materials;
@@ -30164,8 +30598,9 @@ const AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS = 5;
 //   · cross_user —— 三个人发过同一张没判过的图。普通动态贴纸天天被多人转发，
 //     这条一放开就会成批误封正常人。
 const AD_IMAGE_WEAK_SOURCES = new Set(['learned', 'cross_user']);
-const AD_IMAGE_VERIFIED_SOURCE = 'vision_content_v1';
+const AD_IMAGE_VERIFIED_SOURCE = 'vision_content_v3';
 function isReliableAdImageSource(image) {
+	if(image?.verdict==='ad'&&image.source==='local_review'&&image.localReviewVerified)return true;
 	return image?.verdict === 'ad' && [AD_IMAGE_VERIFIED_SOURCE, 'owner', 'manual', 'spam', 'ban', 'sban'].includes(String(image.source || ''));
 }
 function applyImageVerdict(evaluation, image) {
@@ -30326,7 +30761,7 @@ async function markAdBioChecked(env, userId, nowSeconds = Math.floor(Date.now() 
 	try {
 		await env.DB.prepare('UPDATE ad_group_members SET bio_checked_at = ? WHERE user_id = ?').bind(Number(nowSeconds) || 0, uid).run();
 	} catch (error) {
-		console.error('[广告检测] 标记 bio 检查时间失败:', error);
+		console.error('[广告检测] 标记 bio 检查时间失败: ' + formatD1SchemaError(error));
 	}
 }
 // 写回「上次判时这份资料的形状 + 结论」。只动这两列，不碰 bio_checked_at ——
@@ -30498,7 +30933,7 @@ async function readAdScanState(env, key, fallback = '', options = {}) {
 		const row = await env.DB.prepare('SELECT value FROM ad_scan_state WHERE key = ?').bind(String(key)).first();
 		return row?.value != null ? String(row.value) : fallback;
 	} catch (error) {
-		console.error('[广告检测] 读取扫描状态失败:', error);
+		console.error('[广告检测] 读取扫描状态失败: ' + formatD1SchemaError(error));
 		if (options.strict) throw error;
 		return fallback;
 	}
@@ -30626,107 +31061,36 @@ async function loadAdRescanBatch(env, limit, nowSeconds = Math.floor(Date.now() 
 // 差别只在输入：这里没有消息正文和转发来源（他没在发言），所以判据是昵称 + 用户名 + bio
 // 加上指纹库与 AI 语义。这正好对准「改了 bio 的潜伏号」。
 async function rescanAdMember(env, row, options = {}) {
-	const userId = String(row?.user_id || '');
-	if (!userId) return { scanned: false, banned: false };
-	const chatId = String(row?.chat_id || '');
-	const nowSeconds = Math.floor(Date.now() / 1000);
-
-	// 主人/副主人/超管永不判定，与消息路径一致。
-	if (isAdDetectionExemptUser(userId)) {
-		await markAdBioChecked(env, userId, nowSeconds);
-		return { scanned: false, banned: false, reason: 'privileged' };
-	}
-	// 管理员兜底豁免。消息路径在豁免后就不写名册，所以名册里的管理员只能来自
-	// 「先以普通成员发言、之后才被提为管理员」。缓存命中时这一步接近零成本。
-	if (chatId && await isAdminForAdDetection(chatId, userId)) {
-		await markAdBioChecked(env, userId, nowSeconds);
-		return { scanned: false, banned: false, reason: 'admin' };
-	}
-	// 任意配置群的管理员：cron 复查这一轨同样跳过（口径与消息路径 / 入群一致）。
-	// 走到这里的只可能是「曾以普通成员发言、后来升为管理员」的人 —— 豁免之后不再写名册，
-	// 所以新人不会进名册；但升职前留下的那行还在，靠这一句挡住。
-	// 顺带把 bio_checked_at 推到现在，免得每轮都被重新排到队首空转。
-	if (await isConfiguredGroupAdmin(env, userId)) {
-		await markAdBioChecked(env, userId, nowSeconds);
-		return { scanned: false, banned: false, reason: 'group_admin' };
-	}
-
-	const profile = await fetchAdUserProfile(userId, {
-		first_name: row?.first_name || '',
-		last_name: row?.last_name || '',
-		username: row?.username || ''
-	});
-	// 无论成功失败都记时间戳：失败多半是 429，卡在同一个人身上重试会拖垮整批，
-	// 而他只是排到队尾，下一轮还会被取到，不会永久漏掉。
-	await markAdBioChecked(env, userId, nowSeconds);
-	if (!profile.bioFetched) return { scanned: true, banned: false, reason: 'fetch_failed' };
-
-	// ===== 变化门：资料一个字没改、上次结论又是干净的，就跳过整轮判定 =====
-	// 这一轨的输入【只有资料、没有正文】，所以「同一份 bio + 空正文」必然得出同一结论 ——
-	// 再跑一遍 evaluateAdSuspect 只是把上次的结论重算一次，而那一遍要花指纹库查询、
-	// 头像库查询，外加一次 bge-m3 嵌入。getChat 省不掉（不拉 bio 就不知道变没变），
-	// 省掉的是拉到 bio 之后的全部判定开销。
-	//
-	// 【三道条件缺一不可】
-	//   ① 形状非空且与上次一致 —— bio 真的没改过；
-	//   ② 上次结论是 pass（干净）—— 上次判出 observe / ban 的一律重判，漏的风险不担；
-	//   ③ 判据库自上次判以来没被写过（bio_checked_at 严格晚于四张表的最新写入）。
-	//      这一条是【零钩子】的：指纹、样本、头像、形状任何一处新增或纠错都会把门关上。
-	//      少了它，「他没改 bio，但库里刚学进一条正好命中新 bio 的指纹」就会被整轮跳过 ——
-	//      而判据库的写入点分散在十几处，靠埋标记迟早漏一处，漏一处就是漏放。
-	const shape = adProfileShape(profile);
-	const lastHash = String(row.profile_hash || '');
-	const lastVerdict = String(row.last_verdict || '');
-	if (shape && shape === lastHash && lastVerdict === 'pass'
-		&& (Number(row.bio_checked_at) || 0) > await readAdJudgeLibStamp(env)) {
-		return { scanned: false, banned: false, reason: 'unchanged' };
-	}
-
-
-	const baseEvaluation = await evaluateAdSuspect(
-		env,
-		{ profile, text: '', forwardChat: null },
-		{ config: options.config, whitelist: options.whitelist, skipMissingBioPenalty: false }
-	);
-	// 头像指纹叠加（无头像则原样返回，本轨零额外开销）
-	const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile, { scopeChatId: chatId });
-	// 同款会员标叠加（无标则原样返回）：与头像同一层位、同一零开销条件，
-	// 排在头像之后 —— 两层都只加 reasons 不改 score，先后不影响分数。
-	let evaluation = await applyBadgeToEvaluation(env, avatarEvaluation, profile, { scopeChatId: chatId });
-	// 第四路补位：这一轨扫的是「不发言的人」，正文恒空，模型判的就是资料本身 ——
-	// 正对准「改了 bio 的潜伏号」。日限 300 人，LLM 每日上限还绰绰有余。
-	// 【degradeToObserve: false】这一轨「判不成」时不转观察，照旧掉回评分层结论。
-	// 理由与下面那段「不写观察记录」完全同源：这一轨扫的是不发言的人，一天 300 个，
-	// 把它们全推进观察窗口会把真正要盯的新入群用户挤掉；而且它用 verdict 写
-	// profile 形状缓存，observe 会让「资料没变就跳过」失效、下一轮全部重扫。
-	// 漏判的代价也小：同一批人明天还会被扫到，额度恢复后自然补上。
-	evaluation = await applyAdLLMToEvaluation(env, evaluation,
-		options.config || loadAdDetectionConfig(env), { profile, text: '' },
-		{ pool: 'cron', degradeToObserve: false });
-	// 写回形状与结论：pass 让下一轮能走门，observe / ban 则让门始终关着。
-	// 不碰 bio_checked_at —— 那个时间戳在判定之前已经推过一次（429 防卡死）。
-	await markAdProfileVerdict(env, userId, shape, evaluation.verdict);
-
-	if (evaluation.verdict !== 'ban') {
-		// 【不写观察记录】。观察窗口的语义是「短期内再有动作就合并裁决」，
-		// 而这一轨扫的正是不发言的人 —— 给他们写观察记录只会让 ad_user_screening
-		// 被 300 条/天的扫描结果灌满，把真正需要盯的新入群用户挤掉。
-		return { scanned: true, banned: false };
-	}
-	// 任意配置群的群主/管理员全群豁免：定罪后才查，未定罪的人不花这笔请求。
-	if (await isAdminInAnyConfiguredGroup(userId, chatId)) {
-		console.log('[广告检测·扫描] user=' + userId + ' 是其他配置群的管理员，豁免不封');
-		return { scanned: true, banned: false, reason: 'admin' };
-	}
-
-	const result = await enforceAdDetection(env, {
-		userId,
-		chatId,
-		chatTitle: '',
-		messageId: null
-	}, evaluation, { config: options.config, whitelist: options.whitelist });
-	console.log('[广告检测·扫描] 封禁 user=' + userId + ' score=' + evaluation.score + '/' + evaluation.threshold);
-	return { scanned: true, banned: result?.banned !== false, seq: result?.seq ?? null };
+  const userId=String(row?.user_id||''),chatId=String(row?.chat_id||''),now=Math.floor(Date.now()/1000);
+  if(!userId||!chatId)return {scanned:false,banned:false};
+  if(isAdDetectionExemptUser(userId)||await isAdUserWhitelisted(env,userId)||await isAdminForAdDetection(chatId,userId)||await isConfiguredGroupAdmin(env,userId)
+    ||await resolveLocalAdDetectionSkip(env,chatId,userId)){
+    await markAdBioChecked(env,userId,now);return {scanned:false,banned:false,reason:'exempt'};
+  }
+  const member={id:Number(userId),first_name:row.first_name||'',last_name:row.last_name||'',username:row.username||''};
+  const profile=await fetchAdUserProfile(userId,member,{forceRefresh:true});
+  await markAdBioChecked(env,userId,now);
+  const inspection=adProfileInspectionMessage(member,chatId);
+  if(!profile.bioFetched){
+    await saveAdContentReview(env,inspection,{verdict:'pending',snapshot:{name:member.first_name,text:'',bio:''},pendingReason:'profile_fetch_failed'});
+    return {scanned:true,banned:false,reason:'fetch_failed'};
+  }
+  const hash=await exportSha256Hex(JSON.stringify([profile.firstName,profile.lastName,profile.username,profile.bio,profile.avatarId,profile.badgeId]));
+  if(hash===String(row.profile_hash||'')&&row.last_verdict==='pass'&&Number(row.bio_checked_at)>await readAdJudgeLibStamp(env))
+    return {scanned:false,banned:false,reason:'unchanged'};
+  const drill=await isDryRunGroup(env,chatId);
+  const result=await collectGlobalDryRunEvaluation(env,inspection,null,{source:'cron',normalDetection:!drill,scopeChatId:chatId,
+    profile,config:options.config,whitelist:options.whitelist,reviewPool:'cron',forceReview:true});
+  const evaluation=result.evaluation,pending=isAdDrillPendingEvaluation(evaluation,result.llmMemo);
+  await markAdProfileVerdict(env,userId,hash,pending?'pending':evaluation.verdict);
+  if(evaluation.verdict!=='ban'){
+    if(pending&&!drill)await saveAdContentReview(env,inspection,evaluation);
+    return {scanned:true,banned:false,pending};
+  }
+  if(await isAdminInAnyConfiguredGroup(userId,chatId))return {scanned:true,banned:false,reason:'admin'};
+  const enforced=await enforceAdDetection(env,{userId,chatId,chatTitle:'',messageId:null},evaluation,
+    {config:result.config,whitelist:result.whitelist,fullEvaluationCollected:true});
+  return {scanned:true,banned:enforced?.banned!==false&&!enforced?.dryrun,seq:enforced?.seq??null};
 }
 
 // 一次 cron 触发扫多少：AD_SCAN_DAILY_LIMIT 个，切成 AD_SCAN_BATCH_SIZE 一批，
@@ -30934,8 +31298,9 @@ const AD_AVATAR_VISION_FALLBACK_TIMEOUT_MS = 20000;
 const AD_AVATAR_OCR_PROMPT = '这是一张 Telegram 用户头像。只输出一个 JSON，不要任何别的文字：'
 	+ '{"text":"逐字抄录图中所有文字（中文、英文、数字、@用户名、网址、水印），看不清的字用?代替，没有文字填空串",'
 	+ '"ad":true 或 false}。'
-	+ 'ad 的判断标准：图里有引流文字（代发、代理、赚钱、招租、换汇、看简介/看主页、联系方式、@用户名、网址）、'
-	+ '二维码、赌博/色情/灰产图案、商品推销即为 true；自拍、风景、宠物、动漫、普通 logo、纯色图案为 false。';
+	+ '请完整抄录全部可辨认文字，包括边角与底部文字。ad只有实际广告招揽、商品出售、赌博或灰产推广才为true；'
+	+ '普通昵称、英文人名、联系方式、网址、二维码、普通logo和色情或裸露画面都不能单独证明广告。纯色情必须同时有明确推广行动。'
+	+ '自拍、风景、宠物、动漫、梗图、普通logo、纯色图案和正常技术内容为false；原有明确引流语（如点我进群、赚钱看我简介）需要逐字抄录，不能猜测。';
 // 【2026-11 提额：50 → 150，按 clef-flash 的官方实价重算（第三批）】
 // 原来的 50 是按 moondream 的「单张 35~50 Neurons」估的 —— 那是用 $/M token
 // 反推 $11/M Neurons 得来的未验证值，官方从未公布过。
@@ -31156,10 +31521,9 @@ function isReliableAdImageContentSignature(signature) {
 	if (hasAdProtectedTechnicalContext(visible) && !independent) return false;
 	if (isReliableAdImageTextSignature(signature)) return true;
 	if (independent) {
-		const visual = /性行为|(?:成人|成年|人物).{0,8}(?:裸露|裸体)|裸露生殖器/i.test(evidence);
 		const gambling = /博彩|赌博|赌场|娱乐城|下注|投注/i.test(evidence) && /下注|投注|充值|赢现金|包赢/i.test(evidence);
 		const harmfulOffer = /洗钱|假钞|假币|盗刷|卡料|刷单返利|贩卖个人信息/i.test(evidence) && /出售|提供|联系|购买|下单|招募/i.test(evidence);
-		return visual || (signature.promotion === true && (gambling || harmfulOffer));
+		return signature.promotion === true && (gambling || harmfulOffer);
 	}
 	if (signature.promotion !== true) return false;
 	// 实际抄录的文字须同时包含招揽行动与购买/联系入口；孤立域名、价格、token均不算。
@@ -31171,10 +31535,10 @@ function isReliableAdImageContentSignature(signature) {
 
 // 低成本分类只找候选；使用现有内容模型抄录实际证据并缓存，旧分类缓存不授予封禁权限。
 async function verifyAdImageVisibleContent(env, media, encoded, judge) {
-	const key = 'image_content_v2:' + String(media?.fileUniqueId || '');
+	const key = 'image_content_v3:' + String(media?.fileUniqueId || '');
 	try {
 		const saved = JSON.parse(await readAdScanState(env, key, 'null'));
-		if (saved?.version === 2 && ['ad', 'clean','pending'].includes(saved.verdict) && adImageContentSignature(saved.signature)) return saved;
+		if (saved?.version === 3 && ['ad','clean'].includes(saved.verdict) && adImageContentSignature(saved.signature)) return saved;
 	} catch (_) { /* 缺失或损坏的核验记录重新取实际内容。 */ }
 	const described = await describeAdImageSimilarityContent(env, encoded);
 	if (!described.ok) return { verdict: 'pending', reason: described.reason, contentVerified: false };
@@ -31185,7 +31549,7 @@ async function verifyAdImageVisibleContent(env, media, encoded, judge) {
 	const reliable = !protectedContent && isReliableAdImageContentSignature(signature)
 		&& (judge?.ad === true || isReliableAdImageTextSignature(signature));
 	const verdict = reliable ? 'ad' : (protectedContent || (signature.ad === false && signature.confidence >= 0.85)) ? 'clean' : 'pending';
-	const result = { version: 2, verdict, contentVerified: reliable, signature, category: judge?.category || '',
+	const result = { version: 3, verdict, contentVerified: reliable, signature, category: judge?.category || '',
 		reason: protectedContent ? 'technical_content_exempt' : reliable ? 'visible_ad_evidence' : 'no_reliable_ad_evidence' };
 	await writeAdScanState(env, key, JSON.stringify(result));
 	return result;
@@ -31202,6 +31566,7 @@ async function runAvatarOcrJudge(env, imageUri) {
 		{ model: AD_AVATAR_VISION_FALLBACK_MODEL, timeoutMs: AD_AVATAR_VISION_FALLBACK_TIMEOUT_MS }
 	];
 	let lastError = null;
+	const failures = [];
 	for (const attempt of attempts) {
 		let timer = null;
 		try {
@@ -31210,7 +31575,7 @@ async function runAvatarOcrJudge(env, imageUri) {
 					{ type: 'text', text: AD_AVATAR_OCR_PROMPT },
 					{ type: 'image_url', image_url: { url: String(imageUri || '') } }
 				] }],
-				max_tokens: 300,
+				max_tokens: 1024,
 				temperature: 0,
 				chat_template_kwargs: { enable_thinking: false }
 			});
@@ -31224,13 +31589,15 @@ async function runAvatarOcrJudge(env, imageUri) {
 				return { ad: parsed.ad, text: String(parsed.text || '').trim(), model: attempt.model.split('/').pop() };
 			}
 			lastError = new Error('头像读字未返回可解析的 JSON（' + attempt.model.split('/').pop() + '）');
+			failures.push(attempt.model + ': ' + lastError.message);
 		} catch (error) {
 			lastError = error;
+			failures.push(attempt.model + ': ' + String(error?.message || error).slice(0,500));
 		} finally {
 			if (timer) clearTimeout(timer);
 		}
 	}
-	throw lastError || new Error('头像读字失败');
+	throw new Error('头像读字未完成：' + failures.join('；'), { cause:lastError });
 }
 
 // ===== 头像文字特征库（2026-11-01）=====
@@ -31264,7 +31631,7 @@ function normalizeAdAvatarText(value) {
 	return String(value ?? '')
 		.toLowerCase()
 		.replace(/[\s​-‍﻿·•・,，.。!！?？:：;；、|｜\-_\/\\()（）《》〈〉【】\[\]「」『』"'“”‘’~～*#]+/g, '')
-		.slice(0, 200);
+		.slice(0, 1200);
 }
 
 async function loadAdAvatarTexts(env) {
@@ -31310,8 +31677,10 @@ async function matchAdAvatarText(env, ocrText, options = {}) {
 // 定罪即学习：把这张头像上读到的字学进头像文字库（source='ocr'）。
 // 只学「模型自己也判它是广告」的头像 —— 被别的通道定罪的人，头像上可能只是普通文字。
 async function learnAdAvatarText(env, ocrText) {
+	const textHit=await matchAdAvatarText(env,ocrText);
+	if(!isReliableAdAvatarText({ocr_text:ocrText,textHit}))return false;
 	if (hasAdProtectedTechnicalContext(ocrText) && !hasAdIndependentHarmfulContent(ocrText)) return false;
-	const value = String(ocrText || '').trim().slice(0, 120);
+	const value = String(ocrText || '').trim().slice(0, 1200);
 	const normalized = normalizeAdAvatarText(value);
 	if (!env?.DB || normalized.length < AD_AVATAR_TEXT_MIN_LEARN_LENGTH) return false;
 	const now = Math.floor(Date.now() / 1000);
@@ -31330,7 +31699,7 @@ async function learnAdAvatarText(env, ocrText) {
 
 // /ignore 纠错：撤掉从这张头像学来的字。种子永远不删。
 async function forgetAdAvatarText(env, ocrText) {
-	const normalized = normalizeAdAvatarText(String(ocrText || '').trim().slice(0, 120));
+	const normalized = normalizeAdAvatarText(String(ocrText || '').trim().slice(0, 1200));
 	if (!env?.DB || !normalized) return false;
 	try {
 		await env.DB.prepare('DELETE FROM ad_avatar_texts WHERE text_key = ? AND source = \'ocr\'').bind(normalized).run();
@@ -31407,8 +31776,10 @@ function parseAvatarVisionAnswer(raw) {
 	if (end < 0) return null;
 	try {
 		const parsed = JSON.parse(text.slice(start, end + 1));
+		if (!['boolean','string'].includes(typeof parsed?.ad) || typeof parsed?.text !== 'string'
+			|| typeof parsed.ad === 'string' && !/^(true|false)$/i.test(parsed.ad)) return null;
 		const ad = parsed?.ad === true || String(parsed?.ad).toLowerCase() === 'true';
-		return { ad, text: String(parsed?.text || '').slice(0, 120), reason: String(parsed?.reason || '').slice(0, 120) };
+		return { ad, text: String(parsed?.text || '').slice(0, 1200), reason: String(parsed?.reason || '').slice(0, 240) };
 	} catch (_) {
 		return null;
 	}
@@ -32181,6 +32552,8 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	if (await hasGroupAdFeedback(env, options.scopeChatId, 'image', key)) {
 		return { file_unique_id: key, kind: String(media.kind || ''), verdict: 'clean', source: 'group_feedback', hits: 0 };
 	}
+	const localReview=await readLocalReviewedMaterial(env,options.scopeChatId,'image',key);
+	if(localReview)return {...localReview,kind:String(media.kind||'')};
 
 	// ① 已判过的图：直接用库里的结论，一个 Neurons 都不花。
 	let row = await readAdImage(env, key);
@@ -32200,12 +32573,15 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 		&& String(media.visionFileId || '') === String(media.fileId || '') && Boolean(media.visionFileId);
 	let savedContent=null;
 	if(options.requireContent===true){
-		try{const saved=JSON.parse(await readAdScanState(env,'image_content_v2:'+key,'null'));
-			if(saved?.version===2&&['ad','clean','pending'].includes(saved.verdict)&&adImageContentSignature(saved.signature))savedContent=saved;
+		try{const saved=JSON.parse(await readAdScanState(env,'image_content_v3:'+key,'null'));
+			if(saved?.version===3&&['ad','clean','pending'].includes(saved.verdict)&&adImageContentSignature(saved.signature))savedContent=saved;
 		}catch(_){/* 未核实的旧缓存不提供OCR内容证据。 */}
 	}
 	const withContent=(value,content=savedContent)=>{
 		const signature=adImageContentSignature(content?.signature);
+		if(signature && value && content?.verdict==='ad' && content.contentVerified===true && isReliableAdImageContentSignature(signature)) {
+			value={...value,verdict:'ad',source:AD_IMAGE_VERIFIED_SOURCE,contentVerified:true};
+		}
 		return signature&&value?{...value,contentSignature:signature,contentInspection:staticContent?'bitmap_body':'thumbnail'}:value;
 	};
 	let recheckClean = false;
@@ -32225,7 +32601,7 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 			return { ...row, verdict: 'ad', source: 'cross_user', hits: (Number(row.hits) || 0) + 1 };
 		}
 		if (String(row.verdict || '') !== 'pending') return withContent(row);
-		if(savedContent)return withContent(row);
+		if(savedContent && savedContent.verdict!=='pending')return withContent(row);
 		// pending 但没有可下载句柄的（动态贴纸没有缩略图）当下判不了 —— 这正是「漏判」：
 		// 绑了 AI 的部署要把它推给主人人工判，没绑 AI 的部署照旧只登记。
 		if (!String(row.file_id || media.visionFileId || '')) return env.AI ? adImageMiss(row, 'nothumb') : row;
@@ -32260,6 +32636,7 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	let prob = 0;
 	let judged = null;
 	let contentResult = null;
+	let capturedImage = null;
 	let skipBump = false;
 	try {
 		const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
@@ -32279,11 +32656,12 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 		const mime = sniffImageMime(new Uint8Array(buffer));
 		if (!mime) return adImageMiss(base, 'mime');
 		const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
+		capturedImage=image;
 		const judge = await runVisionJudge(env, image, CLEF_IMAGE_STATE);
 		if (!judge) throw new Error('clef 未返回判定');
 		judged = judge;
 		verdict = judge.ad ? 'ad' : 'clean';
-		if (judge.ad || options.requireContent === true && staticContent) {
+		if (judge.ad || options.requireContent === true) {
 			contentResult = await verifyAdImageVisibleContent(env, media, bytesToBase64(new Uint8Array(buffer)), judge);
 			verdict = contentResult.verdict;
 		}
@@ -32319,6 +32697,7 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
 	await writeAdScanState(env, 'img_count', String(quota.used + 1), Math.floor(Date.now() / 1000));
 
+	if(capturedImage&&verdict==='pending')await cacheAdReviewAsset(env,'image',key,capturedImage,staticContent?'body':'thumbnail');
 	const latestRow = await readAdImage(env, key);
 	let latestOwner = null;
 	try { latestOwner = await env.DB.prepare('SELECT owner_verdict, decision_at FROM ad_image_similarity WHERE file_unique_id = ?').bind(key).first(); } catch (_) { /* 兼容辅助表初始化失败 */ }
@@ -32329,9 +32708,10 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	if (verdict === 'pending') return withContent(adImageMiss(base,contentResult?.signature?'no_reliable_ad_evidence':'error'),contentResult);
 	if (verdict === 'clean') {
 		const cleanRow = { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid };
+		if (contentResult?.verdict==='clean') return withContent(cleanRow,contentResult);
 		// 灰区：判了干净，但广告概率（或某个广告类别的概率）够得上 AD_IMAGE_GRAY_MIN。
 		// 明显干净的（实测正常表情包 0.04 上下）不推，否则每张梗图都要主人点一次。
-		const grayProb = Math.max(prob, Number(judged?.categoryProb) || 0);
+		const grayProb = Math.max(prob, judged?.category && judged.category!=='clean' ? Number(judged.categoryProb) || 0 : 0);
 		return withContent(grayProb >= AD_IMAGE_GRAY_MIN ? adImageMiss(cleanRow, 'gray', grayProb) : cleanRow,contentResult);
 	}
 	// 【2026-10-14 删：不再把 hits 强写成 AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS】
@@ -32577,6 +32957,8 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 	if (await hasGroupAdFeedback(env, options.scopeChatId, 'avatar', key)) {
 		return { file_unique_id: key, verdict: 'clean', source: 'group_feedback', hits: 0 };
 	}
+	const localReview=await readLocalReviewedMaterial(env,options.scopeChatId,'avatar',key);
+	if(localReview)return localReview;
 	const uid = String(profile?.userId || '');
 
 	// ① 判过的直接命中库，一个 Neurons 都不花。
@@ -32587,9 +32969,12 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 	// 主人拍过板的结论不让模型再改。
 	const isReread = Boolean(row) && String(row.verdict || '') !== 'pending';
 	if (row) {
+		if(isReread&&Number(row.ocr_at)>0&&!['ad','clean'].includes(String(row.ocr_verdict||''))
+			&&Math.floor(Date.now()/1000)-Number(row.ocr_at)<AD_VISION_RETRY_COOLDOWN_SEC)return {...row,missReason:'ocr_retry_cooldown'};
 		// pending 但没有可下载句柄的，退回旧行为 —— 那种当下判不了，只能先登记着。
 		if (!String(row.file_id || '') && !String(profile?.avatarFileId || '')) return row;
-		if (isReread && (['owner', 'manual'].includes(String(row.source || ''))
+		const needsContentRecheck=row.verdict==='ad'&&!isVerifiedAdAvatarRow(row);
+		if (isReread && !needsContentRecheck && (['owner', 'manual'].includes(String(row.source || ''))
 			|| ['ad', 'clean'].includes(String(row.ocr_verdict || ''))
 			|| (Number(row.ocr_at) > 0 && Math.floor(Date.now() / 1000) - Number(row.ocr_at) < 86400))) return row;
 		if (!isReread && !String(row.file_id || '')) return row;
@@ -32618,6 +33003,7 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 	let ocrText = '';
 	let ocrAt = 0;
 	let ocrVerdict = '';
+	let capturedAvatar = null;
 	let skipBump = false;
 	try {
 		const askFile = async (id) => {
@@ -32650,11 +33036,20 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 		if (buffer.byteLength > AD_VISION_MAX_IMAGE_BYTES) return row || null;
 		const mime = sniffImageMime(new Uint8Array(buffer)) || 'image/jpeg';
 		const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
+		capturedAvatar=image;
 		const judge = await runAvatarOcrJudge(env, image);
 		verdict = judge.ad ? 'ad' : 'clean';
 		ocrText = judge.text;
+		const seeded=AD_AVATAR_TEXT_SEED.find(value=>normalizeAdAvatarText(ocrText).includes(normalizeAdAvatarText(value)));
+		const textEvidence=isReliableAdAvatarText({ocr_text:ocrText,textHit:seeded?{value:seeded}:null});
+		if(textEvidence)verdict='ad';
+		else if(judge.ad){
+			const verified=await verifyAdImageVisibleContent(env,{fileUniqueId:'avatar:'+key,kind:'photo'},bytesToBase64(new Uint8Array(buffer)),judge);
+			verdict=verified.verdict;
+			if(verified.signature?.ocr_text)ocrText=verified.signature.ocr_text;
+		}
 		ocrAt = Math.floor(Date.now() / 1000);
-		ocrVerdict = verdict;
+		ocrVerdict = verdict==='pending'?'':verdict;
 		console.log('[头像实时判定] ' + (judge.ad ? '广告' : '干净') + ' 模型=' + judge.model
 			+ (isReread ? ' 补读' : '')
 			+ ' 文字=' + (judge.text ? judge.text.slice(0, 30) : '（无）')
@@ -32675,7 +33070,7 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 			const oldVerdict = String(row.verdict || '');
 			const upgrade = verdict === 'ad' && oldVerdict !== 'ad';
 			await upsertAdAvatar(env, key, {
-				verdict: upgrade ? 'ad' : oldVerdict,
+				verdict: verdict!=='pending'?verdict:oldVerdict,
 				source: upgrade ? 'vision' : null,
 				fileId,
 				lastUserId: uid || null,
@@ -32699,6 +33094,7 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 	if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
 	await writeAdScanState(env, 'avatar_count', String(quota.used + 1), Math.floor(Date.now() / 1000));
 
+	if(capturedAvatar&&!isVerifiedAdAvatarRow({verdict,ocr_text:ocrText,ocr_verdict:ocrVerdict,ocr_at:ocrAt,source:'vision'}))await cacheAdReviewAsset(env,'avatar',key,capturedAvatar);
 	if (verdict === 'pending') return row || null;
 	// 【2026-11 删掉了这里的「把 hits 抬到 2」】原来视觉当场判出 ad 之后会执行
 	// `UPDATE ad_avatars SET hits = 2 WHERE hits < 2`，目的是让这张图够到
@@ -32808,21 +33204,22 @@ async function allocateAdPendingSnapshot(env, ownerId, payload) {
 		const owner = String(ownerId);
 		// 不带 expires_at 条件：已复核的行（expires_at = 0）也要参与取最大值，
 		// 否则它们占住的序号会被重新发出去，等于没改。
-		const maxRow = await env.DB.prepare('SELECT MAX(seq) AS m FROM ad_pending_snapshots WHERE owner_id = ?').bind(owner).first();
-		const seq = (Number(maxRow?.m) || 0) + 1;
-		await env.DB.prepare(
+		// 最大序号读取与插入必须是同一条 SQL，避免并发通知抢到相同序号。
+		const inserted = await env.DB.prepare(
 			'INSERT INTO ad_pending_snapshots (owner_id, seq, user_id, chat_id, score, reasons, snapshot, created_at, expires_at) '
-			+ 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+			+ 'SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ? FROM ad_pending_snapshots WHERE owner_id = ? RETURNING seq'
 		).bind(
-			owner, seq, String(payload?.userId ?? ''), String(payload?.chatId ?? ''),
+			owner, String(payload?.userId ?? ''), String(payload?.chatId ?? ''),
 			Math.max(0, Number(payload?.score) || 0),
 			serializeAdReviewValue(payload?.reasons || []),
 			serializeAdReviewValue(payload?.snapshot || {}),
-			now, now + AD_PENDING_SNAPSHOT_TTL_SECONDS
-		).run();
+			now, now + AD_PENDING_SNAPSHOT_TTL_SECONDS, owner
+		).first();
+		const seq = Number(inserted?.seq);
+		if (!Number.isSafeInteger(seq) || seq <= 0) throw new Error('快照写入未返回有效序号');
 		return seq;
 	} catch (error) {
-		console.error('[广告检测] 写入待确认快照失败:', error);
+		console.error('[广告检测] 写入待确认快照失败: ' + formatD1SchemaError(error));
 		return null;
 	}
 }
@@ -34670,6 +35067,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 // 每一步独立容错：加黑失败仍继续封禁，封禁部分失败仍推送通知，
 // 保证主人一定能看到现场快照并可用 /ignore <序号> 一键回滚。
 async function enforceAdDetection(env, input, evaluation, options = {}) {
+	if(options.reviewGuard&&!await options.reviewGuard())return {banned:false,reason:'human_review_hold'};
 	const userId = String(input?.userId ?? '');
 	const chatId = input?.chatId != null ? String(input.chatId) : '';
 	if (!userId) return { banned: false, seq: null, reason: 'no_user' };
@@ -34935,6 +35333,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			// 必然是 member，这一次 getChatMember 纯属浪费（与 screenAdJoinMember 里
 			// 「不查 getChatMember」那条注释同一取向）。
 			probeMembership: options.probeMembership !== false,
+			reviewGuard:options.reviewGuard,
 			revokeMessages: true,
 			// 自动检测记的是 system，不是第一主人：扇出跳过独立群，但事发群本身照封（批次 2 再细分独立群口径）。
 			mode: options.drillCloseReplay === true ? 'kick' : localScope ? (await loadGroupLocalSettings(env, chatId)).action : undefined,
@@ -34956,7 +35355,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 					if (!target.owned) return {groupId:gid,ok:true,skipped:'manual_punishment_retained'};
 					if (options.drillCloseReplay === true || gid !== chatId || options.probeMembership !== false) {
 						const probe = await probeTargetMemberBeforeBan(gid,userId); probes.set(gid,probe);
-						if (probe.state==='unknown') return {groupId:gid,ok:false,automaticNotExecuted:true,error:'无法核对该群原有处置，未执行自动封禁'};
+						if (probe.state==='unknown') return {groupId:gid,ok:false,automaticNotExecuted:true,error:'无法核对该群原有处置，未执行自动封禁：'+String(probe.error||probe.label||'未知原因')};
 						const old = await env.DB.prepare('SELECT result FROM ad_automatic_case_targets WHERE case_id=? AND chat_id=? AND user_id=?')
 							.bind(autoCaseId,gid,userId).first();
 						let previous={};try{previous=JSON.parse(old?.result||'{}');}catch(_){}
@@ -34989,6 +35388,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	} catch (error) {
 		console.error('[广告检测] 全群封禁失败:', error);
 	}
+	if(options.reviewGuard&&!await options.reviewGuard())return {banned:false,reason:'human_review_hold',banResults};
 
 	// ===== 同款连带：自动封禁与 /spam 走同一套 =====
 	//
@@ -35183,171 +35583,33 @@ async function interceptAdJoinBlacklist(env, member, chatId, chatTitle = '') {
 }
 
 async function screenAdJoinMember(env, member, options = {}) {
-	const userId = member?.id;
-	if (!userId || member?.is_bot) return 'skipped';			// bot 交给 handleNewChatMemberBots
-	if (isAdDetectionExemptUser(userId)) return 'skipped';		// 主人 / 副主人 / 超管豁免
-	// 用户白名单：入群这一步整体不查（评分、AI、头像、图片、指纹一个都不跑）。
-	// 与上面那条特权豁免并列而不是包进去：白名单是主人事后加的，随时可能增删，
-	// 必须走带 TTL 的缓存；特权名单是静态常量，两者缓存策略不同，混在一起会互相拖累。
-	if (await isAdUserWhitelisted(env, userId)) return 'whitelisted';
-	const chatId = String(options.chatId ?? '');
-	if (!chatId) return 'skipped';
-	if (!env?.DB) return 'skipped';
-	const configuredMemberGroup = isConfiguredGroup(chatId);
-	if (!configuredMemberGroup && !(isGlobalDryRunScopeGroup(chatId) && await isDryRunGroup(env, chatId))) return 'skipped';
-	// 独立群：本群白名单整体不查；本群关了检测也整体不查（全局群不读这两张表）。
-	const localSkip = await resolveLocalAdDetectionSkip(env, chatId, userId);
-	if (localSkip === 'whitelisted') return 'whitelisted';
-	try {
-		// chat_member 那条路的调用方已经查过黑名单（复入群拦截），别再查第二遍。
-		if (options.skipBlacklistCheck !== true) {
-			const already = await interceptAdJoinBlacklist(env, member, chatId, options.chatTitle || '');
-			if (already.blocked) return already.banned ? 'banned' : 'skipped';
-		}
-		if ((localSkip === 'disabled' && !(await isDryRunGroup(env, chatId))) || !(await adDetectionReady(env))) return 'skipped';
-		// 用 isAdminForAdDetection 而不是 checkIfUserIsAdminInGroup：这里是【检测豁免】不是鉴权，
-		// 前者带 5 分钟按群缓存，一次批量入群（拉人进群常常一次十几个）同群只拉一份管理员列表。
-		if (await isAdminForAdDetection(chatId, userId)) return 'skipped';
-		// 任意配置群的管理员：入群这一步也整条不进 —— 管理员申请加入另一个配置群
-		// 不该被当成新成员筛查，口径与消息路径一致（主人 2026-10-15）。
-		if (await isConfiguredGroupAdmin(env, userId)) return 'skipped';
-
-		const nowSeconds = Math.floor(Date.now() / 1000);
-		// 先读后写：要的是【本次入群之前】的 bio_checked_at。
-		const existing = configuredMemberGroup ? await readAdGroupMember(env, userId) : null;
-		// 【方案 C 的第二个修复】入群即进名册。原先名册只在 detectAdOnMessage 里写，
-		// 也就是只有发言过的人才在册 —— 一个入群时 bio 干净、之后改成广告且从不发言的号，
-		// 连闸三 cron 都扫不到他，因为他根本不在扫描源里。入群写册把这个口子堵上。
-		if (configuredMemberGroup) await upsertAdGroupMember(env, userId, chatId, member, nowSeconds);
-
-		// 去重：被别人拉进群时 ① ② 两种 update 都会到，同一个人会进来两次。
-		// 复用闸二那把三天冷却锁即可，不需要新机制。
-		// 残留竞态：两个 update 几乎同时到达时可能都读到 existing === null 而各查一次 bio，
-		// 但 fetchAdUserProfile 有 5 分钟按人缓存，第二次不会真的发出请求，代价为零。
-		// 申请进群那条路传 noBioLock，不受这把三天冷却锁约束：广告号被拒后等三天
-		// 再申请就绕过去了，而申请阶段正是「还没让他进门就拦住」的唯一机会。
-		// 其余两条入群路径照旧走锁（同一次进群会推两种 update，靠它去重）。
-		if (!options.noBioLock && !shouldCheckAdBio(existing, nowSeconds)) return 'cooled';
-
-		const profile = await fetchAdUserProfile(userId, member);
-		// 不查 getChatMember：restricted 已归零不计分，入群时状态必然是 member，
-		// 拉一次纯属浪费配额。留空后通知文案会显示「未查询」。
-		profile.status = '';
-		if (configuredMemberGroup) await markAdBioChecked(env, userId, nowSeconds);
-
-		// config / whitelist 必须先于链接解析拿到：前置分档要用同一份白名单算资料卡分，
-		// 与下面 evaluateAdSuspect 里那次保持同源。两行都是幂等读取，提前不改语义。
-		const config = options.config || loadAdDetectionConfig(env);
-		const whitelist = options.whitelist || await loadAdDomainWhitelist(env);
-
-		// ===== 解析资料里挂的频道 / 群 / bot（对齐 menshen resolveLink）=====
-		// 放在这里的理由：入群是「一次定终身」的事件，前面还有三天冷却锁兜着，
-		// 多花的 0~5 个 getChat 摊到每个人一生只有一次；而进群那一刻正是 menshen
-		// 冷判定（coldjudge）跑链接解析的同一条时机 —— 你要的「进群直接拦」靠它。
-		// 形态闸在 extractAdProfileHandles：bio 里没有 @xxx / t.me/xxx 就一个请求都不发。
-		// 【先判人，再查链接】2026-10-07 主人要的前置判定：资料卡与正文净分都不到 1 分的
-		// 正常人直接返回空数组，一个 getChat 都不花 —— 形态闸管「有没有链接可查」，
-		// 这道管「值不值得为他查」，两道各管一半。
-		profile.adLinks = await resolveAdProfileLinksElevated(env, profile, { whitelist });
-
-		// ===== 入群专用封禁线 =====
-		// 见 DEFAULT_AD_JOIN_SCORE_THRESHOLD 的说明：进群那一刻只有资料卡一份证据，
-		// 发消息那条路有正文 / 上下文 / 转发 / 历史累积多份 —— 证据少却用同一条线裁决，
-		// 等于对刚进门的人从严。所以入群单开一条更高的线，没到线就按现状转观察、不拦。
-		//
-		// 取 max 是防线：配置项写得比消息线还低时，不能让「进群」反而比「发言」更容易被封。
-		//
-		// 只覆盖 scoreThreshold —— 指纹硬命中、AI 硬命中、四通道结构查杀、头像定罪
-		// 在 evaluateAdSuspect 里都与 scoreThreshold 无关（`score >= threshold || hardHit`），
-		// 强证据照旧直接拦。这与 menshen「规则门与形状命中排在采信线之前、零 AI 直接处置」
-		// 是同一个取向：门槛收紧的只是「凭一份资料卡凑够分数就封」这一条路。
-		// 入群与消息共用位置证据规则，旧入群总分线不再覆盖判定口径。
-		const joinConfig = config;
-
-		// 整条判定链收进一个闭包：补查链接后要用同一条链原样重评一次（见下方）。
-		// 第⑥层的结论放进 llmMemo，重评时复用 —— 不重复花额度，也不会因载荷去重丢掉结论。
-		const joinLLMMemo = {};
-		const judgeJoinMember = async () => {
-			const baseEvaluation = await evaluateAdSuspect(
-				env,
-				{ profile, text: '', forwardChat: null },
-				// getChat 失败时不能扣「无 Bio」那一分 —— 那是「查到了、确实是空」才成立的判据。
-				{ config: joinConfig, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
-			);
-			// 入群即判头像：这是「广告号还没发广告就被拦住」的主通道，
-			// 头像指纹命中时即便正文干净也能进判据（分档见 applyAvatarVerdict）。
-			// 头像与其它强证据一样不走入群线，仍按原样定罪。
-			const avatarEvaluation = await applyAvatarToEvaluation(env, baseEvaluation, profile, { scopeChatId: chatId });
-			// 同款会员标同位叠加：走到这里已经为这次判定花过 getChat 了，
-			// 会员标就在那一份响应里，查一次库即可，零额外 Telegram 请求。
-			let judged = await applyBadgeToEvaluation(env, avatarEvaluation, profile, { scopeChatId: chatId });
-			// ===== 第四路补位：前三层都没定罪时交给生成式模型 =====
-			// 入群时正文为空（他还没发过言），载荷里 message 就是空串 —— 提示词
-			// 明写「message 为空不构成怀疑理由」，所以这一路在这里判的纯粹是资料卡。
-			judged = await applyAdLLMToEvaluation(env, judged, config, { profile, text: '' }, { pool: 'join', llmMemo: joinLLMMemo });
-			return judged;
-		};
-		let evaluation = await judgeJoinMember();
-		// ===== 补查资料卡挂的链接（2026-11）=====
-		// 前置分档没让查、但本次已经可疑（observe / AI 判广告 / 头像命中）的人，
-		// 补查他挂的东西；挂的东西真有广告内容才重评一次，否则判定原样不动。
-		const joinSuspectLinks = await recheckAdProfileLinks(env, profile, evaluation);
-		if (joinSuspectLinks) {
-			profile.adLinks = joinSuspectLinks;
-			evaluation = await judgeJoinMember();
-		}
-
-		// ===== 入群检查流水：任何 verdict 都记 =====
-		// 只记命中的话，看板上对绝大多数新成员是一片空白，管理员分不清
-		//「检查过、这个人正常」和「压根没看过他」—— 而后者正是漏放最典型的形态。
-		// 失败不影响入群筛查的返回值：流水只是看板数据。
-		try {
-			await recordAdJoinCheck(env, { userId, chatId, evaluation });
-		} catch (error) {
-			console.error('[入群检查] 记录流水失败:', error);
-		}
-
-		if (evaluation.verdict === 'ban') {
-			// 任意配置群的群主/管理员全群豁免（当前群入口处已查过）。
-			if (await isAdminInAnyConfiguredGroup(userId, chatId)) {
-				console.log('[广告检测] 入群筛查 user=' + userId + ' 是其他配置群的管理员，豁免不封');
-				return 'skipped';
-			}
-			const result = await enforceAdDetection(env, {
-				userId,
-				chatId,
-				chatTitle: options.chatTitle || '',
-				messageId: options.messageId ?? null
-			}, evaluation, {
-				config,
-				whitelist,
-				// 【入群秒封的两条提速】
-				// ① primaryGroupId：他刚进的这个群同步先封（1 次 banChatMember 就把人
-				//    请出去），其余群并发补上。改动前是 for 串行遍历全部群，每群还多一次
-				//    成员探测，20 个群 = 40 次串行往返 —— 人进群后要好几秒才被踢。
-				// ② probeMembership: false：人刚进群状态必然是 member，那次 getChatMember
-				//    换不来任何信息，入群回执也不展示 memberProbe（见 renderAdDetectionNotice）。
-				primaryGroupId: chatId,
-				probeMembership: false
-			});
-			// 风控·新人治理（方案 b 精确计数）：只统计【入群筛查当场处置】的新人，
-			// 口径严格等于「新人被处理数」—— 不含老成员被违规踢出（那是 kicked_count 的事）。
-			// 上面管理员豁免的分支已经 return，走不到这里，不会把豁免记成治理。
-			// disposal 这一格已由 enforceAdDetection 按封禁结果记过，这里只补 newcomer，不重复计。
-			// 演练命中不记 newcomer：风控这一格的口径是【真被处置过的新人】，
-			// 演练一个都没动，记进去会让面板的治理数据虚高。
-			if (result?.dryrun) return 'dryrun';
-			if (result?.groupFeedback) return 'clean';
-			if (result?.banned === false) return 'clean';
-			await recordStatAction(env, chatId, 'newcomer');
-			return 'banned';
-		}
-
-		return 'clean';
-	} catch (error) {
-		console.error('[广告检测] 入群检测异常 user=' + userId + ' 来源=' + (options.source || 'join') + ':', error);
-		return 'error';
-	}
+  const userId=member?.id,chatId=String(options.chatId||'');
+  if(!userId||member.is_bot||!chatId||!env?.DB||isAdDetectionExemptUser(userId))return 'skipped';
+  if(await isAdUserWhitelisted(env,userId))return 'whitelisted';
+  const configured=isConfiguredGroup(chatId),drill=await isDryRunGroup(env,chatId);
+  if(!configured&&!(isGlobalDryRunScopeGroup(chatId)&&drill))return 'skipped';
+  const localSkip=await resolveLocalAdDetectionSkip(env,chatId,userId);
+  if(localSkip==='whitelisted')return 'whitelisted';
+  try {
+    if(options.skipBlacklistCheck!==true){const prior=await interceptAdJoinBlacklist(env,member,chatId,options.chatTitle||'');if(prior.blocked)return prior.banned?'banned':'skipped';}
+    if(localSkip==='disabled'&&!drill||!await adDetectionReady(env))return 'skipped';
+    if(await isAdminForAdDetection(chatId,userId)||await isConfiguredGroupAdmin(env,userId))return 'skipped';
+    const now=Math.floor(Date.now()/1000);if(configured)await upsertAdGroupMember(env,userId,chatId,member,now);
+    const inspection=adProfileInspectionMessage(member,chatId,options.chatTitle||'');
+    const result=await collectGlobalDryRunEvaluation(env,inspection,null,{source:'join',normalDetection:!drill,scopeChatId:chatId,
+      refreshProfile:true,config:options.config,whitelist:options.whitelist,reviewPool:'join',forceReview:true});
+    const evaluation=result.evaluation,pending=isAdDrillPendingEvaluation(evaluation,result.llmMemo);
+    if(configured&&result.profile.bioFetched)await markAdBioChecked(env,userId,now);
+    await recordAdJoinCheck(env,{userId,chatId,evaluation:pending?{...evaluation,verdict:'pending'}:evaluation});
+    if(evaluation.verdict!=='ban'){
+      if(pending&&!drill)await saveAdContentReview(env,inspection,evaluation);return pending?'pending':'clean';
+    }
+    if(await isAdminInAnyConfiguredGroup(userId,chatId))return 'skipped';
+    const enforced=await enforceAdDetection(env,{userId,chatId,chatTitle:options.chatTitle||'',messageId:null},evaluation,
+      {config:result.config,whitelist:result.whitelist,fullEvaluationCollected:true,primaryGroupId:chatId,probeMembership:false});
+    if(enforced?.dryrun)return 'dryrun';if(enforced?.groupFeedback||enforced?.banned===false)return 'clean';
+    await recordStatAction(env,chatId,'newcomer');return 'banned';
+  }catch(error){console.error('[广告检测] 入群检测未完成: '+formatD1SchemaError(error));return 'error';}
 }
 
 // === 入群检测（第一道闸）===
@@ -35410,7 +35672,10 @@ async function detectAdOnMessage(message, env) {
 	if (evaluation.bioChecked === true || evaluation.globalDrill?.completeness?.bio?.complete === true) {
 		await markAdBioChecked(env, userId, Math.floor(Date.now() / 1000));
 	}
-	if (evaluation.verdict !== 'ban') return false;
+	if (evaluation.verdict !== 'ban') {
+		if(isAdDrillPendingEvaluation(evaluation,result.llmMemo))await saveAdContentReview(env,message,evaluation);
+		return false;
+	}
 	if (await isAdminInAnyConfiguredGroup(userId, chat.id)) return false;
 	const enforced = await enforceAdDetection(env, {
 		userId, chatId: chat.id, chatTitle: chat.title || '', messageId: message.message_id, message
@@ -35477,6 +35742,7 @@ function adPayloadFromSnapshot(snapshot) {
 async function handleAdDetectionCommands(message, env, ctx) {
 	const raw = typeof message?.text === 'string' ? message.text.trim() : '';
 	if (!raw) return false;
+	if(/^\/review(?:@\S+)?(?:\s|$)/i.test(raw)){await handleAdContentReviewCommand(message,env);return true;}
 	const match = raw.match(AD_COMMAND_RE);
 	if (!match) return false;
 
@@ -36144,9 +36410,9 @@ async function writeGroupAdFeedbackForCase(env, chatId, actorId, seq, snapshot) 
 		let init = D1_GROUP_AD_FEEDBACK_WRITE_INIT.get(env.DB);
 		if (!init) {
 			init = env.DB.prepare('CREATE TABLE IF NOT EXISTS group_ad_feedback (chat_id TEXT NOT NULL, kind TEXT NOT NULL, feedback_key TEXT NOT NULL, case_id TEXT NOT NULL, creator_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (chat_id, kind, feedback_key))').run();
-			D1_GROUP_AD_FEEDBACK_WRITE_INIT.set(env.DB, init);
 		}
-		await init;
+		const tableReady = await rememberD1Initialization(D1_GROUP_AD_FEEDBACK_WRITE_INIT, env.DB, init);
+		if (tableReady?.success === false) throw new Error('本群广告纠错表未就绪');
 		const now = Math.floor(Date.now() / 1000);
 		const statements = [...keys.values()].map(([kind, key]) => env.DB.prepare("INSERT INTO group_ad_feedback (chat_id, kind, feedback_key, case_id, creator_id, at) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM group_mode WHERE chat_id = ? AND mode = 'independent') ON CONFLICT(chat_id, kind, feedback_key) DO UPDATE SET case_id = excluded.case_id, creator_id = excluded.creator_id, at = excluded.at")
 			.bind(gid, kind, key, caseId, creatorId, now, gid));
@@ -36156,7 +36422,6 @@ async function writeGroupAdFeedbackForCase(env, chatId, actorId, seq, snapshot) 
 		}
 		return { ok: true, written: keys.size, seq: Number(seq), caseId };
 	} catch (error) {
-		D1_GROUP_AD_FEEDBACK_WRITE_INIT.delete(env.DB);
 		console.error('[本群广告纠错] 反馈写入失败:', error);
 		return { ok: false, written: 0 };
 	}
@@ -38281,10 +38546,8 @@ async function ensureStatTables(env) {
 			return false;
 		}
 	})();
-	D1_STAT_INIT_PROMISES.set(env.DB, initPromise);
-	const ok = await initPromise;
+	const ok = await rememberD1Initialization(D1_STAT_INIT_PROMISES, env.DB, initPromise);
 	if (!ok) {
-		D1_STAT_INIT_PROMISES.delete(env.DB);
 		D1_STAT_RETRY_AT.set(env.DB, Date.now() + STAT_SCHEMA_RETRY_COOLDOWN_MS);
 	} else {
 		D1_STAT_RETRY_AT.delete(env.DB);
@@ -38358,7 +38621,7 @@ async function recordMemberEvent(env, chatId, kind, nowMs = Date.now()) {
 			+ (kind === 'join' ? 1 : 0) + ', ' + (kind === 'leave' ? 1 : 0) + ', ' + (kind === 'kicked' ? 1 : 0) + ', ?) '
 			+ 'ON CONFLICT(chat_id, day) DO UPDATE SET ' + col + ' = ' + col + ' + 1, updated_at = excluded.updated_at'
 		).bind(String(chatId), day, Math.floor(nowMs / 1000)).run();
-	} catch (error) { console.error('[群统计] 记录成员事件失败:', error); }
+	} catch (error) { console.error('[群统计] 记录成员事件失败: ' + formatD1SchemaError(error)); }
 }
 
 // ===== 入群 / 退群 / 申请 事件明细（第2批 · 2026-10-02）=====
@@ -38401,9 +38664,7 @@ async function ensureStatMemberEventsTable(env) {
 			return false;
 		}
 	})();
-	D1_STAT_MEMBER_EVENTS_INIT.set(env.DB, init);
-	const ok = await init;
-	if (!ok) D1_STAT_MEMBER_EVENTS_INIT.delete(env.DB);   // 失败不缓存，下次重试
+	const ok = await rememberD1Initialization(D1_STAT_MEMBER_EVENTS_INIT, env.DB, init);
 	return ok;
 }
 
@@ -38436,7 +38697,7 @@ async function recordMemberEventDetail(env, chatId, userId, kind, atMs = Date.no
 			String(meta.username || '').slice(0, 64)
 		).run();
 	} catch (error) {
-		console.error('[入群记录] 写入失败:', error);
+		console.error('[入群记录] 写入失败: ' + formatD1SchemaError(error));
 	}
 }
 
@@ -38474,9 +38735,7 @@ async function ensureStatActionsTable(env) {
 			return false;
 		}
 	})();
-	D1_STAT_ACTIONS_INIT.set(env.DB, init);
-	const ok = await init;
-	if (!ok) D1_STAT_ACTIONS_INIT.delete(env.DB);   // 失败不缓存，下次重试
+	const ok = await rememberD1Initialization(D1_STAT_ACTIONS_INIT, env.DB, init);
 	return ok;
 }
 
