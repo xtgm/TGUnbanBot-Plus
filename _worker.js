@@ -22089,12 +22089,31 @@ const AD_EXEMPT_KEYWORD_CATEGORIES = [
 	'私聊', '代理', '官方中文', 't.me'
 	] },
 	// —— 2026-11-04 正常文化娱乐词汇 ——
-	{ name: '文化娱乐地理（2026-11-04）', words: [
-	// 根据 exam-v3/v4 题库统计（共 2,862 题），正常用户常提及的文化、娱乐、地理词汇。
-	// 这些词汇出现在正常讨论中，不应单独作为广告判据。
-	'电视剧', '网剧', '海外剧集', '电影', '音乐', '歌曲', '明星', '名人', '作家', '企业家', '科学家',
-	'国家', '地区', '城市', '省份', '景点', '地标', '国际城市', '剧集', '歌手', '乐队', '品牌', '公司',
-	'考试', '人类简史', '词族扩张', '英文名单', '正体本', '负体本', '原页样本', '中文', '英文'
+	{ name: '文化娱乐（2026-11-04）', words: [
+	// exam-v3: 电视剧与网剧 148、海外剧集与动漫 70、电影 118、音乐与歌曲 169、明星 163、名人 145
+	// exam-v4: 剧集 88、电影 145、歌曲 245、歌手乐队与演员 166
+	'电视剧', '网剧', '海外剧集', '动漫', '电影', '音乐', '歌曲', '明星', '名人', '作家', '企业家', '科学家', '运动员',
+	'剧集', '歌手', '乐队', '演员', '导演', '制片人', '编剧',
+	'drama', 'series', 'anime', 'movie', 'film', 'music', 'song', 'celebrity', 'star', 'actor', 'actress',
+	'singer', 'band', 'artist', 'writer', 'entrepreneur', 'scientist', 'athlete', 'director', 'producer'
+	] },
+	{ name: '地理词汇（2026-11-04）', words: [
+	// exam-v3: 国家与地区 148、国内城市与省份 153、景点地标 79、国际城市 91
+	// exam-v4: 美国州与城市 90、世界城市与地标 136
+	'国家', '地区', '城市', '省份', '景点', '地标', '州', '首都', '国际城市',
+	'country', 'region', 'city', 'province', 'state', 'landmark', 'capital', 'tourist attraction',
+	'United Kingdom', 'South Korea', 'New York', 'California', 'Eiffel Tower', 'Burj Khalifa'
+	] },
+	{ name: '品牌与组织（2026-11-04）', words: [
+	// exam-v4: 知名品牌公司 61（日常词汇）
+	'品牌', '公司', '企业', '组织',
+	'brand', 'company', 'corporation', 'organization',
+	'Apple', 'Google', 'Nike', 'Starbucks', 'McDonald\'s'
+	] },
+	{ name: '学术与语言（2026-11-04）', words: [
+	// exam-v3 + v4 统计：题库 2,862 题、正体本 425、负体本 2,437
+	'考试', '题库', '测试', '学习', '教育', '课程', '正体本', '负体本', '原页样本', '词族扩张', '人类简史',
+	'exam', 'test', 'quiz', 'study', 'education', 'course', 'learning', 'vocabulary', 'history'
 	] }
 ];
 const AD_EXEMPT_KEYWORDS = AD_EXEMPT_KEYWORD_CATEGORIES.flatMap(({ words }) => words);
