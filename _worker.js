@@ -13598,13 +13598,13 @@ async function handleAdContentReviewCallback(callback,env) {
 	const actor=String(callback.from?.id||''),chat=callback.message?.chat;
 	if(callback.from?.is_bot||chat?.type!=='private'||String(chat.id)!==actor)return;
 	const [,action,number,key]=String(callback.data||'').split(':');
-	if(action==='list'){await answerAdVoteCallback(callback.id);await showAdContentReviewList(env,actor,Number(number)||1);return;}
+	if(action==='list'){await answerAdVoteCallback(callback.id,'列表功能需要新对话查看');await showAdContentReviewList(env,actor,Number(number)||1);return;}
 	await ensureAdContentReviewTable(env);const row=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE seq=?').bind(Number(number)||0).first();
 	if(!row){await answerAdVoteCallback(callback.id,'现场不存在或已过期',true);return;}
 	const access=await adContentReviewAccess(env,actor,row);if(!access.read){await answerAdVoteCallback(callback.id,'权限不足',true);return;}
 	try {
-		if(action==='open'){await answerAdVoteCallback(callback.id);await showAdContentReview(env,actor,row);return;}
-		if(action==='asset'){await answerAdVoteCallback(callback.id);await sendAdReviewMaterial(env,actor,row,key);return;}
+		if(action==='open'){await answerAdVoteCallback(callback.id,'正在加载');await editAdContentReviewMessage(env,actor,row,callback.message);return;}
+		if(action==='asset'){await answerAdVoteCallback(callback.id,'正在显示素材');await sendAdReviewMaterial(env,actor,row,key);return;}
 		if(action==='original'){
 			const m=JSON.parse(row.message_json);const copied=await copyMessageToChat(actor,row.chat_id,Number(m.message_id),{disableNotification:true});
 			await answerAdVoteCallback(callback.id,copied?.ok?'原消息已显示':'原消息已不可取，请用逐项素材按钮',!copied?.ok);return;
@@ -13615,7 +13615,7 @@ async function handleAdContentReviewCallback(callback,env) {
 			const selected=JSON.parse(row.review_sources||'[]'),next=selected.includes(key)?selected.filter(item=>item!==key):selected.concat(key);
 			await env.DB.prepare("UPDATE ad_content_reviews SET review_sources=? WHERE id=? AND decision=''").bind(JSON.stringify(next),row.id).run();
 			await answerAdVoteCallback(callback.id,'已'+(next.includes(key)?'勾选':'取消')+'广告位置');
-			await editAdContentReviewMessage(env,actorId,{...row,review_sources:JSON.stringify(next)},callback.message);
+			await editAdContentReviewMessage(env,actor,{...row,review_sources:JSON.stringify(next)},callback.message);
 			return;
 		}
 		if(action==='auto'){await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',next_at=?,lease_until=0,lease_token='' WHERE id=? AND decision=''").bind(Math.floor(Date.now()/1000),row.id).run();await queueAdContentReview(env,row.id,1);await answerAdVoteCallback(callback.id,'已交回自动核验');return;}
