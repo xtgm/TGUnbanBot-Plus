@@ -13540,13 +13540,44 @@ async function showAdContentReview(env,actorId,row) {
 	await sendTelegramMessageChunks(actorId,lines.join('\n'),{inline_keyboard:keyboard});
 }
 
+async function editAdContentReviewMessage(env,actorId,row,callbackMessage) {
+	const access=await adContentReviewAccess(env,actorId,row);if(!access.read)throw new Error('无权查看该现场');
+	const e=JSON.parse(row.evaluation||'{}'),s=e.snapshot||{},m=JSON.parse(row.message_json||'{}'),p=s.originalProfile||{};
+	const lines=['<b>完整现场 #'+row.seq+'</b>','目标：'+formatUserMention({id:Number(row.user_id),first_name:s.name||'用户'}),'来源群：<code>'+escapeHtml(row.chat_id)+'</code>',
+		'处理范围：'+(access.local?'仅独立原群':'全局非独立治理群'),'',
+		'<b>检测时资料</b>','昵称：'+escapeHtml(s.name||'未获取'),'用户名：'+escapeHtml(s.username||'未获取'),
+		'简介：'+escapeHtml(s.bio||(p.fetched?'无简介':'尚未获取，不能当作没有简介')), '头像：'+(s.avatarId?'已记录原素材标识':'尚未获取或未设置'),
+		'会员标：'+(s.badgeId?'已记录原素材标识':'未发现或尚未获取'),'', '<b>原正文</b>',escapeHtml(s.text||getAdDetectionBodyText(m)||'无文字，查看原素材'),'',
+		'<b>核验过程</b>',...(e.drillIncomplete||[]).map(escapeHtml),escapeHtml(e.pendingReason||''),
+		'头像读取文字：'+escapeHtml(s.avatarText||s.rawAvatarText||'未读取或未核实'),'图片/表情读取文字：'+escapeHtml(s.customEmojiText||'见原素材'),
+		...(e.reasons||[]).map(reason=>escapeHtml(String(reason)))];
+	const keyboard=[];
+	if(Number(m.message_id)>0)keyboard.push([{text:'查看原消息（含原图/原贴纸）',callback_data:'review:original:'+row.seq}]);
+	for(const source of adReviewSources(row).filter(source=>['avatar','badge','image','sticker'].includes(source.key)||source.key.startsWith('emoji')))
+		keyboard.push([{text:'查看'+source.label,callback_data:'review:asset:'+row.seq+':'+source.key}]);
+	if(access.write&&row.source!=='operator'){
+		const selected=JSON.parse(row.review_sources||'[]');
+		lines.push('','先勾选你确认正常或广告的具体位置，再按对应按钮。不勾素材确认正常只记录该完整场景反例，避免改变未判断的素材。');
+		for(const source of adReviewSources(row))keyboard.push([{text:(selected.includes(source.key)?'✅ ':'☐ ')+source.label,callback_data:'review:pick:'+row.seq+':'+source.key}]);
+		keyboard.push([{text:'确认正常 · 写入反例',callback_data:'review:normal:'+row.seq},{text:'确认勾选位置是广告',callback_data:'review:ad:'+row.seq}]);
+		keyboard.push([{text:'交回自动核验',callback_data:'review:auto:'+row.seq}]);
+	}else if(!access.write)lines.push('','该独立群由原群群主判断，本页仅供你查看。');
+	keyboard.push([{text:'返回分页列表',callback_data:'review:list:1'}]);
+	const chatId=String(callbackMessage?.chat?.id||actorId),messageId=Number(callbackMessage?.message_id)||0;
+	if(messageId>0){
+		const response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/editMessageText',{method:'POST',headers:{'Content-Type':'application/json'},
+			body:JSON.stringify({chat_id:chatId,message_id:messageId,text:lines.join('\n'),parse_mode:'HTML',reply_markup:{inline_keyboard:keyboard}})});
+		const result=await response.json();if(!response.ok&&result.description!=='Bad Request: message is not modified')throw new Error('编辑消息失败：'+String(result.description||response.status));
+	}else await sendTelegramMessageChunks(actorId,lines.join('\n'),{inline_keyboard:keyboard});
+}
+
 async function sendAdReviewMaterial(env,actorId,row,key) {
 	const source=adReviewSources(row).find(source=>source.key===key);if(!source)throw new Error('没有该位置的原素材');
 	const e=JSON.parse(row.evaluation),s=e.snapshot||{},m=JSON.parse(row.message_json),media=extractAdMedia(m);
 	const kind=key==='avatar'?'avatar':'image',asset=await readAdReviewAsset(env,kind,source.value);
-	const method=key==='avatar'?'sendPhoto':key==='badge'||key.startsWith('emoji')||m.sticker?'sendSticker':media?.kind==='video'?'sendVideo':media?.kind==='animation'?'sendAnimation':'sendPhoto';
+	const method=key==='avatar'?'sendPhoto':key==='badge'?'sendDocument':key.startsWith('emoji')?'sendDocument':m.sticker?'sendSticker':media?.kind==='video'?'sendVideo':media?.kind==='animation'?'sendAnimation':'sendPhoto';
 	let fileId=key==='avatar'?s.originalProfile?.avatarFileId:key==='badge'?s.badgeMedia?.fileId||s.badgeMedia?.visionFileId:key.startsWith('emoji')?s.customEmojiMedia?.[Number(key.slice(5))]?.fileId||s.customEmojiMedia?.[Number(key.slice(5))]?.visionFileId:media?.fileId;
-	const field=method==='sendSticker'?'sticker':method==='sendVideo'?'video':method==='sendAnimation'?'animation':'photo';
+	const field=method==='sendDocument'?'document':method==='sendSticker'?'sticker':method==='sendVideo'?'video':method==='sendAnimation'?'animation':'photo';
 	let response;
 	if(asset){const body=new FormData();body.append('chat_id',String(actorId));body.append(field,new Blob([asset.bytes],{type:asset.mime}),asset.file_name);response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/'+method,{method:'POST',body});}
 	else {if(!fileId)throw new Error('原始素材未能取得，不能把当前素材当作原图');response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/'+method,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:actorId,[field]:fileId})});}
@@ -13583,7 +13614,9 @@ async function handleAdContentReviewCallback(callback,env) {
 			if(row.decision||!adReviewSources(row).some(source=>source.key===key))throw new Error('该位置不能修改');
 			const selected=JSON.parse(row.review_sources||'[]'),next=selected.includes(key)?selected.filter(item=>item!==key):selected.concat(key);
 			await env.DB.prepare("UPDATE ad_content_reviews SET review_sources=? WHERE id=? AND decision=''").bind(JSON.stringify(next),row.id).run();
-			await answerAdVoteCallback(callback.id,'已'+(next.includes(key)?'勾选':'取消')+'广告位置');await showAdContentReview(env,actor,{...row,review_sources:JSON.stringify(next)});return;
+			await answerAdVoteCallback(callback.id,'已'+(next.includes(key)?'勾选':'取消')+'广告位置');
+			await editAdContentReviewMessage(env,actorId,{...row,review_sources:JSON.stringify(next)},callback.message);
+			return;
 		}
 		if(action==='auto'){await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',next_at=?,lease_until=0,lease_token='' WHERE id=? AND decision=''").bind(Math.floor(Date.now()/1000),row.id).run();await queueAdContentReview(env,row.id,1);await answerAdVoteCallback(callback.id,'已交回自动核验');return;}
 		if(action==='ad'&&!JSON.parse(row.review_sources||'[]').length)throw new Error('先勾选实际含广告的位置');
