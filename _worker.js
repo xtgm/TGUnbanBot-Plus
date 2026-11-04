@@ -11307,7 +11307,7 @@ async function loadIndependentGroups(env) {
 		INDEPENDENT_GROUP_IDS = (Array.isArray(state?.independent) ? state.independent : [])
 			.filter((id) => configured.has(id) && !isKillerModeGroup(id));
 		LOCAL_BLACKLIST_CHAT_IDS = (Array.isArray(state?.localChats) ? state.localChats : [])
-			.filter((id) => configured.has(id));
+			.filter((id) => automaticAdConfiguredGroups().includes(id));
 	} catch (error) {
 		console.error('[群模式] 读取失败，全部按全局处理:', error);
 		INDEPENDENT_GROUP_IDS = [];
@@ -11403,6 +11403,7 @@ function autoDetectionScopeGroupIds(eventChatId) {
 }
 
 const AUTOMATIC_AD_TARGET_TABLE_READY = new WeakSet();
+const AUTOMATIC_AD_MODE_TABLE_READY = new WeakSet();
 async function ensureAutomaticAdTargetTable(env) {
 	if (!env?.DB) throw new Error('自动处罚目标账本未绑定');
 	if (AUTOMATIC_AD_TARGET_TABLE_READY.has(env.DB)) return;
@@ -11413,8 +11414,11 @@ async function ensureAutomaticAdTargetTable(env) {
 
 async function readStrictAutomaticAdModes(env, ids) {
 	if (!env?.DB) throw new Error('无法核对自动处罚群模式');
-	const table = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='group_mode'").first();
-	if (!table) return new Map();
+	if (!AUTOMATIC_AD_MODE_TABLE_READY.has(env.DB)) {
+		const table = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='group_mode'").first();
+		if (!table) return new Map();
+		AUTOMATIC_AD_MODE_TABLE_READY.add(env.DB);
+	}
 	const result = await env.DB.prepare('SELECT chat_id,mode FROM group_mode WHERE chat_id IN (SELECT value FROM json_each(?))')
 		.bind(JSON.stringify([...new Set(ids.map(String))])).all();
 	if (!result || result.success===false || !Array.isArray(result.results)) throw new Error('群模式查询未成功，未猜测全局范围');
@@ -35076,7 +35080,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	const failedBans = banResults.filter((r) => !r.ok);
 	// 风控·处置：按实际封成功的群逐群 +1（面板「本群挡下 N 次」的唯一数据来源）。
 	// 放在这里而不是黑名单写入之后 —— 加黑可能因已存在而没写成，但封禁成功了就是挡下了。
-	await recordDisposalsFromBanResults(env, banResults);
+	await recordDisposalsFromBanResults(env, banResults, { bulk: options.drillCloseReplay === true });
 	const banResultLine = okCount + '/' + banResults.length + ' 个群成功';
 	// 失败原因只给中文（英文原文由翻译兜底写入 Worker 日志）；最多列 3 个群，其余汇总成一句。
 	const failedGroupLines = failedBans.slice(0, 3)
@@ -38518,8 +38522,21 @@ async function queryStatActions(env, chatId, start, end) {
 // 【口径】只有封成功（或禁言模式下禁言成功）的群才 +1 —— 面板上的「本群挡下 N 次」
 // 指的是「本群实际拦下了几次」，一个群成功封掉这个号才算挡下一次，失败的不算。
 // 一次处置常常横扫全部配置群，每个群各自 +1，各群的数字与它自己拦下的次数严格相等。
-async function recordDisposalsFromBanResults(env, banResults) {
+async function recordDisposalsFromBanResults(env, banResults, options = {}) {
 	if (!env?.DB || !Array.isArray(banResults)) return;
+	if (options.bulk === true) {
+		const completed = banResults.filter(r => r && r.ok && r.groupId);
+		if (!completed.length || !(await ensureStatActionsTable(env))) return;
+		const now = Date.now(), day = statDayString(env, now);
+		try {
+			const results = await env.DB.batch(completed.map(r => env.DB.prepare(
+				'INSERT INTO stat_actions (chat_id, day, kind, cnt, updated_at) VALUES (?, ?, ?, 1, ?) '
+				+ 'ON CONFLICT(chat_id, day, kind) DO UPDATE SET cnt = cnt + 1, updated_at = excluded.updated_at'
+			).bind(String(r.groupId), day, 'disposal', Math.floor(now / 1000))));
+			if (!Array.isArray(results) || results.some(r => r?.success === false)) throw new Error('批量统计写入未成功');
+			return;
+		} catch (error) { console.error('[群统计] 批量处置统计失败，改为逐群记录: message=' + String(error?.message || error)); }
+	}
 	for (const r of banResults) {
 		if (!r || !r.ok || !r.groupId) continue;
 		await recordStatAction(env, r.groupId, 'disposal');
