@@ -18,10 +18,10 @@ binding = "AI"								# AI 绑定名默认不可修改
 # 部署前先创建同名队列：wrangler queues create tg-unban-bot-plus-bulk
 [[queues.producers]]
 binding = "BULK_QUEUE"
-queue = "tc0333"
+queue = "tc033"
 
 [[queues.consumers]]
-queue = "tc0333"
+queue = "tc033"
 max_batch_size = 1
 max_batch_timeout = 5
 max_retries = 3
