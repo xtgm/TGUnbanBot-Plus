@@ -29157,6 +29157,16 @@ function collectAdLLMHardEvidence(input) {
 	const hits = [];
 	// ① 真私有群一次性邀请链接：正常人发的是 t.me/username，不是 t.me/+xxx
 	if (hasAdPrivateInviteLink(text)) hits.push('私有群邀请链接');
+	// 对原文逐段核实招募动作、报酬和出口；不把「洗钱」单词或反诈引用当成招揽。
+	for(const part of [profile.bio,input?.text]){
+		const source=(normalizeAdVariantText(part)||String(part||'')).trim();
+		if(/不要|别信|谨防|举报|骗局|诈骗|曝光|提醒|示例|举例|转发|测试|正则/.test(source))continue;
+		if(/^(?:来做|来搞|招人做|招募做)[\s，,:：]*(?:洗钱|洗米|跑分)/.test(source)
+			&&/(?:一|每|1)\s*(?:个)?小时\s*[一二三四五六七八九十百千万\d]{2,}/.test(source)
+			&&/@[A-Za-z0-9_]{4,}/.test(source)){
+			hits.push('同段原文同时包含洗钱类招揽、报酬承诺和联系入口');break;
+		}
+	}
 	// ② 引流出口（@handle / 电话）∧ 招揽动作（强交易动词 / 收益承诺 / 招揽词）
 	const hasExit = /@[A-Za-z0-9_]{4,}/.test(text) || /[+\d][\d\s-]{9,}/.test(text);
 	if (hasExit
