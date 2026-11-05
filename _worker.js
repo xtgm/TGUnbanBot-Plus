@@ -13631,9 +13631,13 @@ async function adReviewDuplicateKey(row){
 		(s.customEmojiMedia||[]).map(material),s.avatarText||s.rawAvatarText||'',s.badgeText||'',s.customEmojiText||'']));
 }
 
-async function adReviewDuplicateCandidates(env,row){
+function adReviewDuplicateCondition(filter){
+	return filter==='actions'?"status='action_failed'":"decision='' AND source<>'operator' AND ("+AD_REVIEW_PENDING_CONDITION+" OR status='partial')";
+}
+
+async function adReviewDuplicateCandidates(env,row,filter='pending'){
 	const now=Math.floor(Date.now()/1000);
-	return (await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE user_id=? AND chat_id=? AND expires_at>? AND decision=\'\' AND source<>\'operator\' AND ('+AD_REVIEW_PENDING_CONDITION+" OR status='partial') ORDER BY seq DESC")
+	return (await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE user_id=? AND chat_id=? AND expires_at>? AND '+adReviewDuplicateCondition(filter)+' ORDER BY seq DESC')
 		.bind(row.user_id,row.chat_id,now).all()).results||[];
 }
 
@@ -13648,36 +13652,41 @@ async function adReviewMatchingDuplicates(env,row){
 	return {key,rows:matches};
 }
 
-async function showAdReviewDuplicateUsers(env,actorId,page,callbackMessage){
+async function showAdReviewDuplicateUsers(env,actorId,page,callbackMessage,filter='pending'){
 	await ensureAdContentReviewTable(env);
+	const actions=filter==='actions',suffix=actions?':actions':'';
 	const primary=isPrimaryOwner(actorId),groups=[];
 	if(!primary){for(const gid of INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length)throw new Error('仅第一主人或独立群群主可查看待核内容');}
 	const scope=primary?'':' AND chat_id IN (SELECT value FROM json_each(?))',args=primary?[]:[JSON.stringify(groups)],now=Math.floor(Date.now()/1000);
-	const query='SELECT user_id,chat_id,COUNT(*) AS n,MAX(seq) AS seq FROM ad_content_reviews WHERE decision=\'\' AND source<>\'operator\' AND expires_at>? AND ('+AD_REVIEW_PENDING_CONDITION+" OR status='partial')"+scope+' GROUP BY user_id,chat_id HAVING COUNT(*)>1';
+	const query='SELECT user_id,chat_id,COUNT(*) AS n,MAX(seq) AS seq FROM ad_content_reviews WHERE expires_at>? AND '+adReviewDuplicateCondition(filter)+scope+' GROUP BY user_id,chat_id HAVING COUNT(*)>1';
 	const count=await env.DB.prepare('SELECT COUNT(*) AS n FROM ('+query+')').bind(now,...args).first(),total=Number(count?.n||0),pages=Math.max(1,Math.ceil(total/10));
 	page=Math.max(1,Math.min(Number(page)||1,pages));
 	const rows=(await env.DB.prepare(query+' ORDER BY seq DESC LIMIT 10 OFFSET ?').bind(now,...args,(page-1)*10).all()).results||[];
-	const lines=['重复用户 · 第 '+page+'/'+pages+' 页，共 '+total+' 组（同一用户按来源群分组）','打开后按完整内容归并；相同现场确认一次，一并处理。'],keyboard=[];
+	const lines=[(actions?'处置待完成重复用户':'待核重复用户')+' · 第 '+page+'/'+pages+' 页，共 '+total+' 组（同一用户按来源群分组）',
+		actions?'仅统计处置尚未完成的记录；已有广告结论保留，可按用户集中查看各条回执。':'仅统计尚未确认的待核记录；已确认广告、处置未完成的记录在另一入口查看。',
+		...(actions?[]:['打开后按完整内容归并；相同现场确认一次，一并处理。'])],keyboard=[];
 	for(const item of rows){const row=await env.DB.prepare('SELECT evaluation FROM ad_content_reviews WHERE seq=?').bind(item.seq).first(),s=JSON.parse(row?.evaluation||'{}').snapshot||{};
-		const label=String(s.name||'用户').slice(0,30)+' · '+item.n+' 条';lines.push('#'+item.seq+' '+label);keyboard.push([{text:label,callback_data:'review:dupuser:'+item.seq+':1'}]);}
-	if(!rows.length)lines.push('没有重复的未确认用户记录。');
-	const nav=[];if(page>1)nav.push({text:'上一页',callback_data:'review:duplicates:'+(page-1)});if(page<pages)nav.push({text:'下一页',callback_data:'review:duplicates:'+(page+1)});if(nav.length)keyboard.push(nav);
-	keyboard.push([{text:'刷新重复用户',callback_data:'review:duplicates:'+page},{text:'返回待核列表',callback_data:'review:list:1'}]);
+		const label=String(s.name||'用户').slice(0,30)+' · '+item.n+' 条';lines.push('#'+item.seq+' '+label);keyboard.push([{text:label,callback_data:'review:dupuser:'+item.seq+':1'+suffix}]);}
+	if(!rows.length)lines.push(actions?'处置待完成列表中没有重复用户。':'没有重复的未确认用户记录。');
+	const nav=[];if(page>1)nav.push({text:'上一页',callback_data:'review:duplicates:'+(page-1)+suffix});if(page<pages)nav.push({text:'下一页',callback_data:'review:duplicates:'+(page+1)+suffix});if(nav.length)keyboard.push(nav);
+	keyboard.push([{text:'刷新重复用户',callback_data:'review:duplicates:'+page+suffix},{text:actions?'返回处置列表':'返回待核列表',callback_data:'review:list:1'+suffix}]);
+	keyboard.push([{text:actions?'查看待核重复用户':'查看处置重复用户',callback_data:'review:duplicates:1'+(actions?'':':actions')}]);
 	await renderAdReviewPage(actorId,callbackMessage,lines.join('\n'),keyboard);
 }
 
-async function showAdReviewDuplicateUser(env,actorId,row,page,callbackMessage){
+async function showAdReviewDuplicateUser(env,actorId,row,page,callbackMessage,filter='pending'){
 	if(!(await adContentReviewAccess(env,actorId,row)).read)throw new Error('无权查看该用户记录');
-	const candidates=await adReviewDuplicateCandidates(env,row),groups=new Map();
-	for(const item of candidates){const key=await adReviewDuplicateKey(item);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(item);}
+	const actions=filter==='actions',suffix=actions?':actions':'',candidates=await adReviewDuplicateCandidates(env,row,filter),groups=new Map();
+	for(const item of candidates){const key=actions?item.id:await adReviewDuplicateKey(item);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(item);}
 	const entries=[...groups.values()],pages=Math.max(1,Math.ceil(entries.length/8));page=Math.max(1,Math.min(Number(page)||1,pages));
-	const lines=['用户 TGID：'+row.user_id,'同一来源群共 '+candidates.length+' 条未确认记录，按完整内容归为 '+entries.length+' 组。',
-		'正文、头像、会员表情、简介或原消息入口不同的，分别核验。','第 '+page+'/'+pages+' 页'],keyboard=[];
+	const lines=['用户 TGID：'+row.user_id,actions?'同一来源群共 '+candidates.length+' 条处置未完成记录，属于同一个用户。':'同一来源群共 '+candidates.length+' 条未确认记录，按完整内容归为 '+entries.length+' 组。',
+		actions?'每条均可查看原始现场和实际处置回执；已有内容结论继续复用。':'正文、头像、会员表情、简介或原消息入口不同的，分别核验。','第 '+page+'/'+pages+' 页'],keyboard=[];
 	for(const items of entries.slice((page-1)*8,page*8)){const first=items[0],seqs=items.map(x=>'#'+x.seq).join('、');
-		lines.push('现场 #'+first.seq+' · 相同内容 '+items.length+' 条：'+seqs.slice(0,300));keyboard.push([{text:'查看 #'+first.seq+' · 相同内容 '+items.length+' 条',callback_data:'review:open:'+first.seq}]);}
-	if(!entries.length)lines.push('该用户已没有未确认记录。');
-	const nav=[];if(page>1)nav.push({text:'上一页',callback_data:'review:dupuser:'+row.seq+':'+(page-1)});if(page<pages)nav.push({text:'下一页',callback_data:'review:dupuser:'+row.seq+':'+(page+1)});if(nav.length)keyboard.push(nav);
-	keyboard.push([{text:'返回重复用户',callback_data:'review:duplicates:1'},{text:'返回待核列表',callback_data:'review:list:1'}]);
+		lines.push(actions?'现场 #'+first.seq+' · '+adReviewStatus(first):'现场 #'+first.seq+' · 相同内容 '+items.length+' 条：'+seqs.slice(0,300));
+		keyboard.push([{text:actions?'查看 #'+first.seq+' 的现场与处置回执':'查看 #'+first.seq+' · 相同内容 '+items.length+' 条',callback_data:'review:open:'+first.seq}]);}
+	if(!entries.length)lines.push(actions?'该用户已没有处置未完成记录。':'该用户已没有未确认记录。');
+	const nav=[];if(page>1)nav.push({text:'上一页',callback_data:'review:dupuser:'+row.seq+':'+(page-1)+suffix});if(page<pages)nav.push({text:'下一页',callback_data:'review:dupuser:'+row.seq+':'+(page+1)+suffix});if(nav.length)keyboard.push(nav);
+	keyboard.push([{text:'返回重复用户',callback_data:'review:duplicates:1'+suffix},{text:actions?'返回处置列表':'返回待核列表',callback_data:'review:list:1'+suffix}]);
 	await renderAdReviewPage(actorId,callbackMessage,lines.join('\n'),keyboard);
 }
 
@@ -13703,10 +13712,10 @@ async function showAdContentReviewList(env,actorId,page=1,callbackMessage=null,f
 	const scope=isPrimaryOwner(actorId)?'':' AND chat_id IN (SELECT value FROM json_each(?))',args=isPrimaryOwner(actorId)?[]:[JSON.stringify(groups)];
 	const partial=filter==='partial',actions=filter==='actions';
 	const where=(partial?"status='partial'":actions?"status='action_failed'":AD_REVIEW_PENDING_CONDITION)+' AND expires_at>?'+scope;
-	const now=Math.floor(Date.now()/1000),count=await env.DB.prepare('SELECT COUNT(*) AS n FROM ad_content_reviews WHERE '+where).bind(now,...args).first();
+	const now=Math.floor(Date.now()/1000),count=await env.DB.prepare('SELECT COUNT(*) AS n,COUNT(DISTINCT user_id) AS users FROM ad_content_reviews WHERE '+where).bind(now,...args).first();
 	const total=Number(count?.n||0),pages=Math.max(1,Math.ceil(total/10));page=Math.min(page,pages);
 	const rows=(await env.DB.prepare('SELECT seq,chat_id,user_id,status,evaluation FROM ad_content_reviews WHERE '+where+' ORDER BY seq DESC LIMIT 10 OFFSET ?').bind(now,...args,(page-1)*10).all()).results||[];
-	const lines=[(partial?'仅完成可用画面核验':actions?'已确认广告 · 处置待完成':'待核与待确认现场')+' · 第 '+page+'/'+pages+' 页，共 '+total+' 条',
+	const lines=[(partial?'仅完成可用画面核验':actions?'已确认广告 · 处置待完成':'待核与待确认现场')+' · 第 '+page+'/'+pages+' 页，共 '+total+' 条（'+Number(count?.users||0)+' 个用户）',
 		partial?'以下记录保留完整核验范围，可继续人工查看原文件。':actions?'内容结论已保留；后台只重试处置，不重复进行内容判定。各群失败原因可在详情核查。':'点击条目查看现场；仅查看不会暂停自动核验。'];
 	if(await isAdContentReviewCapturePaused(env))lines.push('新增待核与提醒已暂停；广告检测、已有记录核验和人工处理继续。');
 	const keyboard=[];
@@ -13716,7 +13725,7 @@ async function showAdContentReviewList(env,actorId,page=1,callbackMessage=null,f
 	if(page<pages)navigation.push({text:'下一页',callback_data:'review:list:'+(page+1)+':'+filter});if(navigation.length)keyboard.push(navigation);
 	keyboard.push([{text:partial||actions?'返回待核列表':'查看仅核验画面的记录',callback_data:'review:list:1:'+(partial||actions?'pending':'partial')}]);
 	if(!actions)keyboard.push([{text:'查看已确认但处置未完成',callback_data:'review:list:1:actions'}]);
-	keyboard.push([{text:'查看重复用户',callback_data:'review:duplicates:1'}]);
+	keyboard.push([{text:actions?'查看处置重复用户':'查看待核重复用户',callback_data:'review:duplicates:1'+(actions?':actions':'')}]);
 	await renderAdReviewPage(actorId,callbackMessage,lines.join('\n'),keyboard);
 }
 
@@ -13865,19 +13874,19 @@ async function handleAdContentReviewCommand(message,env) {
 async function handleAdContentReviewCallback(callback,env) {
 	const actor=String(callback.from?.id||''),chat=callback.message?.chat;
 	if(callback.from?.is_bot||chat?.type!=='private'||String(chat.id)!==actor)return;
-	const [,action,number,key]=String(callback.data||'').split(':');
+	const [,action,number,key,filter]=String(callback.data||'').split(':');
 	let row;
 	try {
 		if(action==='batch'){await answerAdVoteCallback(callback.id);await showAdContentReviewBatch(env,actor,number,Number(key)||1,callback.message);return;}
 		if(action==='list'){await answerAdVoteCallback(callback.id);await showAdContentReviewList(env,actor,Number(number)||1,callback.message,key);return;}
-		if(action==='duplicates'){await answerAdVoteCallback(callback.id);await showAdReviewDuplicateUsers(env,actor,Number(number)||1,callback.message);return;}
+		if(action==='duplicates'){await answerAdVoteCallback(callback.id);await showAdReviewDuplicateUsers(env,actor,Number(number)||1,callback.message,key);return;}
 		if(action==='next'){await answerAdVoteCallback(callback.id);await showNextAdContentReview(env,actor,Number(number),callback.message);return;}
 		await ensureAdContentReviewTable(env);
 		row=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE seq=? AND expires_at>?').bind(Number(number)||0,Math.floor(Date.now()/1000)).first();
 		if(!row)throw new Error('现场不存在或已过期');
 		const access=await adContentReviewAccess(env,actor,row);if(!access.read)throw new Error('权限不足');
 		await answerAdVoteCallback(callback.id);
-		if(action==='dupuser'){await showAdReviewDuplicateUser(env,actor,row,Number(key)||1,callback.message);return;}
+		if(action==='dupuser'){await showAdReviewDuplicateUser(env,actor,row,Number(key)||1,callback.message,filter);return;}
 		if(action==='open'||action==='page'||action==='original'){await editAdContentReviewMessage(env,actor,row,callback.message,Number(key)||1,'',action==='original');return;}
 		if(action==='asset'){await sendAdReviewMaterial(env,actor,row,key,callback.message);return;}
 		if(!access.write)throw new Error('当前账号无权判断该现场，或原处理范围已经变化');
