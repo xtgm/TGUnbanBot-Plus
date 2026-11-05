@@ -13574,12 +13574,30 @@ function adReviewStatus(row) {
 	return labels[row.status]||row.status;
 }
 
+const AD_REVIEW_PENDING_CONDITION="status IN ('pending','waiting','processing','viewing','normal_intent','sample','manual','action_failed')";
+
+async function showNextAdContentReview(env,actorId,currentSeq,callbackMessage){
+	await ensureAdContentReviewTable(env);
+	if(!Number.isSafeInteger(currentSeq)||currentSeq<1)throw new Error('现场序号无效');
+	const primary=isPrimaryOwner(actorId),groups=[];
+	if(!primary){for(const gid of INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length)throw new Error('仅第一主人或独立群群主可查看待核内容');}
+	const scope=primary?'':' AND chat_id IN (SELECT value FROM json_each(?))',args=primary?[]:[JSON.stringify(groups)];
+	const now=Math.floor(Date.now()/1000);
+	// 与待核列表同为倒序；走到末尾后回到剩余记录开头，且不重复返回当前记录。
+	const next=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE '+AD_REVIEW_PENDING_CONDITION+' AND expires_at>?'+scope+' AND seq<>? ORDER BY CASE WHEN seq<? THEN 0 ELSE 1 END,seq DESC LIMIT 1')
+		.bind(now,...args,currentSeq,currentSeq).first();
+	if(next){await editAdContentReviewMessage(env,actorId,next,callbackMessage,1,next.seq>currentSeq?'已到列表末尾，从剩余待核记录继续。':'');return;}
+	const current=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE expires_at>?'+scope+' AND seq=?').bind(now,...args,currentSeq).first();
+	if(current){await editAdContentReviewMessage(env,actorId,current,callbackMessage,1,'没有其他待核记录。');return;}
+	await renderAdReviewPage(actorId,callbackMessage,'当前没有其他待核记录。',[[{text:'返回分页列表',callback_data:'review:list:1'}]]);
+}
+
 async function showAdContentReviewList(env,actorId,page=1,callbackMessage=null,filter='pending') {
 	await ensureAdContentReviewTable(env);page=Math.max(1,Number(page)||1);
 	let groups=[];if(!isPrimaryOwner(actorId)){for(const gid of INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length)throw new Error('仅第一主人或独立群群主可查看待核内容');}
 	const scope=isPrimaryOwner(actorId)?'':' AND chat_id IN (SELECT value FROM json_each(?))',args=isPrimaryOwner(actorId)?[]:[JSON.stringify(groups)];
 	const partial=filter==='partial';
-	const where=(partial?"status='partial'":"status IN ('pending','waiting','processing','viewing','normal_intent','sample','manual','action_failed')")+' AND expires_at>?'+scope;
+	const where=(partial?"status='partial'":AD_REVIEW_PENDING_CONDITION)+' AND expires_at>?'+scope;
 	const now=Math.floor(Date.now()/1000),count=await env.DB.prepare('SELECT COUNT(*) AS n FROM ad_content_reviews WHERE '+where).bind(now,...args).first();
 	const total=Number(count?.n||0),pages=Math.max(1,Math.ceil(total/10));page=Math.min(page,pages);
 	const rows=(await env.DB.prepare('SELECT seq,chat_id,user_id,status,evaluation FROM ad_content_reviews WHERE '+where+' ORDER BY seq DESC LIMIT 10 OFFSET ?').bind(now,...args,(page-1)*10).all()).results||[];
@@ -13635,6 +13653,7 @@ async function editAdContentReviewMessage(env,actorId,row,callbackMessage,page=1
 	}else if(access.write&&row.decision&&!['normal','ad'].includes(row.status)){
 		keyboard.push([{text:'重试已登记的判断',callback_data:'review:retry:'+row.seq}]);
 	}
+	keyboard.push([{text:'下一条待核',callback_data:'review:next:'+row.seq}]);
 	keyboard.push([{text:'刷新状态',callback_data:'review:open:'+row.seq},{text:'返回分页列表',callback_data:'review:list:1'}]);
 	const header='现场 #'+row.seq+' · 第 '+page+'/'+pages.length+' 段\n状态：'+adReviewStatus(row)+'\n'
 		+(access.write&&!row.decision?'已选 '+JSON.parse(row.review_sources||'[]').length+' 个位置；确认正常只更正选中的素材及本场景。\n':'')
@@ -13709,6 +13728,7 @@ async function handleAdContentReviewCallback(callback,env) {
 	try {
 		if(action==='batch'){await answerAdVoteCallback(callback.id);await showAdContentReviewBatch(env,actor,number,Number(key)||1,callback.message);return;}
 		if(action==='list'){await answerAdVoteCallback(callback.id);await showAdContentReviewList(env,actor,Number(number)||1,callback.message,key);return;}
+		if(action==='next'){await answerAdVoteCallback(callback.id);await showNextAdContentReview(env,actor,Number(number),callback.message);return;}
 		await ensureAdContentReviewTable(env);
 		row=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE seq=? AND expires_at>?').bind(Number(number)||0,Math.floor(Date.now()/1000)).first();
 		if(!row)throw new Error('现场不存在或已过期');
