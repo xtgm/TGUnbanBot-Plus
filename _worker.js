@@ -14180,6 +14180,7 @@ async function runAdContentReviewSingle(env,id,options={}) {
 			const success=enforced?.banned===true&&enforced.complete===true;
 			if(enforced?.normalFeedback||enforced?.groupFeedback){evaluation.normalFeedback=true;await save('clean');return {complete:true,clean:true};}
 			if(!success)throw new Error('广告处置尚未完成：'+String(enforced?.reason||'部分目标未成功'));
+			evaluation.pendingReason='';
 			await save('ad');return {complete:true,ad:true};
 		}
 		const modelAnswer=result.llmMemo?.answer;
