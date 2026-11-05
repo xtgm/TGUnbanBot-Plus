@@ -14149,7 +14149,7 @@ async function runAdContentReviewSingle(env,id,options={}) {
 					await save(parent.status);return {complete:true,duplicate:true};
 				}
 				if(parent.status!=='ad'||shared.reviewAction?.complete!==true){
-					evaluation.reviewAction={...shared.reviewAction,complete:false};evaluation.pendingReason='已核实广告内容，等待代表现场 #'+parent.seq+' 的处置完成';
+					evaluation.reviewAction={...shared.reviewAction,complete:false,messageDeletion:original.reviewAction?.messageDeletion||null};evaluation.pendingReason='已核实广告内容，等待代表现场 #'+parent.seq+' 的处置完成';
 					await save('action_failed',now+86400);return {complete:false,retryAfter:43200};
 				}
 				const deletion=assisted.deleteMessage===true&&Number(message.message_id)>0?await deleteMessage(gid,message.message_id):{ok:true,notApplicable:true};
