@@ -5233,7 +5233,7 @@ function isTelegramUserLookupError(description) {
 
 function isTelegramUserUnresolvableError(description) {
 	const lower = String(description || '').toLowerCase();
-	return isTelegramUserLookupError(lower) || lower.includes('user not found');
+	return isTelegramUserLookupError(lower) || lower.includes('user not found') || lower.includes('member not found');
 }
 
 function isPureTgid(value) {
