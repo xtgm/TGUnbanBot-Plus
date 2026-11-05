@@ -536,6 +536,12 @@ export default {
 
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
+			if(body.type==='ad_review_batch_start'){
+				await startAdContentReviewBatch(env,body.batchId,body.seqs);continue;
+			}
+			if(body.type==='ad_review_batch_lane'){
+				await runAdContentReviewBatchLane(env,body.batchId);continue;
+			}
 			if (body.type === 'ad_content_review') {
 				const result = await runAdContentReview(env, String(body.reviewId || ''));
 				if (result.retryAfter && typeof message.retry === 'function') message.retry({ delaySeconds: result.retryAfter });
@@ -584,6 +590,8 @@ export default {
 		// 10 分钟那条只做联合封杀同步：bio 复查、识图、剪枝都有日预算 / 天节拍，跟着跑 144 次会白烧额度。
 		// 没填订阅变量时 runFederationSync 第一行就返回，零 SQL、零外呼。
 		if (controller?.cron === FED_SYNC_CRON) {
+			try { await resumeAdContentReviewBatches(env); }
+			catch(error){console.error('[内容批次] 恢复失败：'+formatD1SchemaError(error));}
 			try { await resumeAdContentReviews(env); }
 			catch (error) { console.error('[内容待核] 恢复失败: ' + formatD1SchemaError(error)); }
 			try { await resumeAdDryRunCloseJobs(env); }
@@ -13270,7 +13278,7 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	if (badgeReview && ['owner','manual','local_review'].includes(badgeReview.source)) {
 		badgeItem = {...badgeItem,id:badgeId,row:badgeReview,verifiedAd:badgeReview.verdict==='ad'};
 	}
-	let avatar = profile.avatarId ? await judgeAdAvatarRealtime(env, profile.avatarId, profile, {scopeChatId}) : null;
+	let avatar = profile.avatarId ? await judgeAdAvatarRealtime(env, profile.avatarId, profile, {scopeChatId,forceContent:options.forceMaterialReview===true}) : null;
 	const avatarOwnerClean = avatar?.verdict === 'clean' && ['owner', 'manual','group_feedback'].includes(String(avatar.source || ''));
 	if (avatar && !avatarOwnerClean && String(avatar.ocr_text || '').trim()) {
 		try {
@@ -13696,6 +13704,7 @@ async function handleAdContentReviewCallback(callback,env) {
 	const [,action,number,key]=String(callback.data||'').split(':');
 	let row;
 	try {
+		if(action==='batch'){await answerAdVoteCallback(callback.id);await showAdContentReviewBatch(env,actor,number,Number(key)||1,callback.message);return;}
 		if(action==='list'){await answerAdVoteCallback(callback.id);await showAdContentReviewList(env,actor,Number(number)||1,callback.message,key);return;}
 		await ensureAdContentReviewTable(env);
 		row=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE seq=? AND expires_at>?').bind(Number(number)||0,Math.floor(Date.now()/1000)).first();
@@ -13749,7 +13758,7 @@ async function finishAdNormalReview(env,row) {
 	const access=await adContentReviewAccess(env,row.decision_by,row);if(!access.write)throw new Error('判断权限或群模式已变化，未扩展原处理范围');
 	const evaluation=JSON.parse(row.evaluation||'{}'),snapshot=evaluation.snapshot||{},message=JSON.parse(row.message_json||'{}');
 	const key=snapshot.groupAdContextKey||await buildGroupAdContextKey({message},evaluation);
-	const selected=JSON.parse(row.review_sources||'[]'),caseId='content:'+row.id;
+	const selected=JSON.parse(row.review_sources||'[]'),caseId=evaluation.reviewBatch?.caseId||'content:'+row.id;
 	if(access.local){
 		const localSnapshot={...snapshot,automatic:true,punishmentScope:'local',punishmentChatId:row.chat_id,autoCaseId:caseId,groupAdContextKey:key,
 			imageId:selected.some(item=>['image','sticker'].includes(item))?snapshot.imageId:'',avatarId:selected.includes('avatar')?snapshot.avatarId:'',
@@ -13847,7 +13856,7 @@ async function queueAdContentReview(env,id,delay=30) {
 	catch(error){console.error('[内容待核] 队列登记失败: '+formatD1SchemaError(error));return false;}
 }
 
-async function runAdContentReview(env,id) {
+async function runAdContentReview(env,id,options={}) {
 	if(!id||!env?.DB)return {complete:true};
 	await ensureAdContentReviewTable(env);
 	const now=Math.floor(Date.now()/1000),token=crypto.randomUUID();
@@ -13873,21 +13882,30 @@ async function runAdContentReview(env,id) {
 		}
 		const human=row.decision==='ad'?await buildHumanAdReview(env,row):null;
 		const result=human?{evaluation:human.evaluation,config:loadAdDetectionConfig(env),whitelist:await loadAdDomainWhitelist(env)}
-			:await collectGlobalDryRunEvaluation(env,message,null,{normalDetection:true,scopeChatId:gid,source:'content_retry',refreshProfile:true});
+			:await collectGlobalDryRunEvaluation(env,message,null,{normalDetection:true,scopeChatId:gid,source:'content_retry',refreshProfile:true,
+				forceReview:true,forceMaterialReview:options.forceMaterialReview===true,profile:options.profile});
 		evaluation=result.evaluation;
+		if(options.batchId)evaluation.reviewBatch={id:options.batchId,representativeSeq:row.seq,caseId:'content:'+id};
 		if(evaluation.verdict==='ban'){
 			const current=await env.DB.prepare('SELECT status,lease_token,decision FROM ad_content_reviews WHERE id=?').bind(id).first();
 			if(current?.status!=='processing'||current.lease_token!==token)return {complete:true};
 			const enforced=await enforceAdDetection(env,{userId:uid,chatId:gid,chatTitle:String(message.chat.title||''),messageId:Number(message.message_id)||null,message},evaluation,
 				{config:result.config,whitelist:result.whitelist,fullEvaluationCollected:true,automaticCaseId:'content:'+id,
-					skipLearning:human?.local===true,reviewGuard:async()=>{const state=await env.DB.prepare('SELECT decision,status,lease_token FROM ad_content_reviews WHERE id=?').bind(id).first();return state?.decision!=='normal'&&state?.status==='processing'&&state?.lease_token===token;}});
+					skipLearning:human?.local===true||Boolean(options.batchId),skipLinked:Boolean(options.batchId),suppressNotify:Boolean(options.batchId),
+					reviewGuard:async()=>{const state=await env.DB.prepare('SELECT decision,status,lease_token FROM ad_content_reviews WHERE id=?').bind(id).first();return state?.decision!=='normal'&&state?.status==='processing'&&state?.lease_token===token;}});
+			evaluation.reviewAction={banned:enforced?.banned===true,complete:enforced?.complete===true,ownerSnapshotSeq:enforced?.seq||null,
+				banResults:enforced?.banResults||[],reason:enforced?.reason||'',messageDeletion:enforced?.messageDeletion||null};
 			const after=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(id).first();
 			if(after?.decision==='normal'){await finishAdNormalReview(env,after);return {complete:true,normal:true};}
 			const success=enforced?.banned===true&&enforced.complete===true;
+			if(enforced?.normalFeedback||enforced?.groupFeedback){evaluation.normalFeedback=true;await save('clean');return {complete:true,clean:true};}
 			if(!success)throw new Error('广告处置尚未完成：'+String(enforced?.reason||'部分目标未成功'));
 			await save('ad');return {complete:true,ad:true};
 		}
-		if(!isAdDrillPendingEvaluation(evaluation,result.llmMemo)){
+		const modelAnswer=result.llmMemo?.answer;
+		const missingModelResult=modelAnswer?.skipped===true||modelAnswer?.confidenceGiven===false
+			||modelAnswer?.ad===false&&Number(modelAnswer.confidence)<(Number(result.config?.llmConf)||AD_LLM_CONF);
+		if(!missingModelResult&&!isAdDrillPendingEvaluation(evaluation,result.llmMemo)){
 			const partial=Boolean(evaluation.drillIncomplete?.length);
 			await save(partial?'partial':'clean');return {complete:true,...partial?{partial:true}:{clean:true}};
 		}
@@ -13911,6 +13929,202 @@ async function resumeAdContentReviews(env) {
 	const rows=(await env.DB.prepare('SELECT id FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\') AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY next_at LIMIT 20').bind(now,now,now).all()).results||[];
 	let queued=0;for(const row of rows)if(await queueAdContentReview(env,row.id,1))queued++;
 	return {queued};
+}
+
+const D1_AD_REVIEW_BATCH_INIT=new WeakMap();
+async function ensureAdContentReviewBatchTables(env){
+	if(D1_AD_REVIEW_BATCH_INIT.get(env.DB))return;
+	await ensureAdContentReviewTable(env);
+	await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_review_batches (id TEXT PRIMARY KEY,status TEXT NOT NULL,total INTEGER NOT NULL,created_at INTEGER NOT NULL,completed_at INTEGER NOT NULL DEFAULT 0,notified_at INTEGER NOT NULL DEFAULT 0,report_lease INTEGER NOT NULL DEFAULT 0,report_message_id INTEGER NOT NULL DEFAULT 0)").run();
+	await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_review_batch_items (batch_id TEXT NOT NULL,review_id TEXT NOT NULL,seq INTEGER NOT NULL,representative_id TEXT NOT NULL,original_json TEXT NOT NULL,state TEXT NOT NULL,outcome TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0,lease_until INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(batch_id,review_id))").run();
+	D1_AD_REVIEW_BATCH_INIT.set(env.DB,true);
+}
+
+function adReviewBatchCanonical(value){
+	if(Array.isArray(value))return value.map(adReviewBatchCanonical);
+	if(value&&typeof value==='object')return Object.fromEntries(Object.keys(value).sort().filter(key=>!['message_id','date','edit_date','file_id','forward_date'].includes(key)).map(key=>[key,adReviewBatchCanonical(value[key])]));
+	return value;
+}
+
+async function adReviewBatchGroupKey(row){
+	const e=JSON.parse(row.evaluation||'{}'),s=e.snapshot||{},m=JSON.parse(row.message_json||'{}');
+	delete m.from;delete m.chat;
+	const fields=['name','username','bio','text','quotedText','avatarId','badgeId','imageId','customEmojiIds'];
+	return exportSha256Hex(JSON.stringify([row.user_id,row.chat_id,row.decision||'',row.review_sources||'[]',
+		fields.map(key=>s[key]??''),adReviewBatchCanonical(m)]));
+}
+
+function adReviewBatchProfile(row){
+	const e=JSON.parse(row.evaluation||'{}'),s=e.snapshot||{},p=s.originalProfile;
+	if(!p?.fetched)return undefined;
+	return {userId:row.user_id,firstName:p.firstName||s.name||'',lastName:p.lastName||'',username:p.username||s.username||'',bio:p.bio??s.bio??'',
+		avatarId:p.avatarId||s.avatarId||'',avatarFileId:p.avatarFileId||'',badgeId:p.badgeId||s.badgeId||'',isPremium:p.isPremium,
+		bioFetched:true,profileFetchedAt:p.fetchedAt||0,profileSource:'review_snapshot'};
+}
+
+async function queueAdReviewBatchLane(env,batchId,delay=1){
+	const queue=getBulkQueue(env);if(!queue)throw new Error('批次队列未绑定');
+	await queue.send({type:'ad_review_batch_lane',batchId},{delaySeconds:Math.max(1,Math.min(43200,delay))});
+}
+
+async function startAdContentReviewBatch(env,batchId,seqs){
+	if(!/^[a-zA-Z0-9_-]{1,48}$/.test(String(batchId||'')))throw new Error('批次编号无效');
+	const wanted=[...new Set((Array.isArray(seqs)?seqs:[]).map(Number))];
+	if(!wanted.length||wanted.length>1000||wanted.some(seq=>!Number.isSafeInteger(seq)||seq<1))throw new Error('批次记录范围无效');
+	if(!await isAdContentReviewCapturePaused(env))throw new Error('批次开始前必须暂停新增待核');
+	await ensureAdContentReviewBatchTables(env);
+	const existing=await env.DB.prepare('SELECT * FROM ad_review_batches WHERE id=?').bind(batchId).first();
+	if(existing&&existing.status!=='preparing')return existing;
+	const now=Math.floor(Date.now()/1000);
+	await env.DB.prepare("INSERT OR IGNORE INTO ad_review_batches (id,status,total,created_at) VALUES (?,'preparing',?,?)").bind(batchId,wanted.length,now).run();
+	const rows=(await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE seq IN (SELECT value FROM json_each(?)) ORDER BY seq').bind(JSON.stringify(wanted)).all()).results||[];
+	if(rows.length!==wanted.length)throw new Error('批次范围中存在缺失现场，未猜测替代记录');
+	const prior=(await env.DB.prepare('SELECT seq,original_json FROM ad_review_batch_items WHERE batch_id=?').bind(batchId).all()).results||[];
+	const originals=new Map(prior.map(item=>[Number(item.seq),JSON.parse(item.original_json)]));
+	const groups=new Map();
+	for(const current of rows){
+		const row=originals.get(Number(current.seq))||{...current,batchLocal:isIndependentGroup(current.chat_id)},key=await adReviewBatchGroupKey(row),representative=groups.get(key)||row.id;
+		groups.set(key,representative);
+		await env.DB.prepare("INSERT OR IGNORE INTO ad_review_batch_items (batch_id,review_id,seq,representative_id,original_json,state,next_at) VALUES (?,?,?,?,?,?,?)")
+			.bind(batchId,row.id,row.seq,representative,JSON.stringify(row),representative===row.id?'ready':'waiting_parent',now).run();
+	}
+	await env.DB.prepare("UPDATE ad_review_batches SET status='running' WHERE id=? AND status='preparing'").bind(batchId).run();
+	for(let lane=0;lane<4;lane++)await queueAdReviewBatchLane(env,batchId,lane+1);
+	return {id:batchId,total:rows.length,groups:groups.size};
+}
+
+async function completeAdReviewBatchGroup(env,batchId,item,representative){
+	const siblings=(await env.DB.prepare("SELECT * FROM ad_review_batch_items WHERE batch_id=? AND representative_id=? AND state NOT IN ('done','error') ORDER BY seq")
+		.bind(batchId,item.review_id).all()).results||[];
+	const parsed=JSON.parse(representative.evaluation||'{}'),now=Math.floor(Date.now()/1000);
+	for(const sibling of siblings){
+		const original=JSON.parse(sibling.original_json),current=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(sibling.review_id).first();
+		if(!current){await env.DB.prepare("UPDATE ad_review_batch_items SET state='error',error='现场记录缺失',lease_until=0 WHERE batch_id=? AND review_id=?").bind(batchId,sibling.review_id).run();continue;}
+		if(current.decision!==original.decision&&current.status!=='normal'){
+			await env.DB.prepare("UPDATE ad_review_batch_items SET state='error',error='人工判断在批次中发生变化，保留人工意图',lease_until=0 WHERE batch_id=? AND review_id=?").bind(batchId,sibling.review_id).run();continue;
+		}
+		let outcome=current.status==='normal'?'normal':representative.status;
+		if(sibling.review_id!==item.review_id&&current.status!=='normal'){
+			if(Number(current.lease_until)>now){await env.DB.prepare("UPDATE ad_review_batch_items SET state='error',error='关联记录有活动租约，未覆盖',lease_until=0 WHERE batch_id=? AND review_id=?").bind(batchId,sibling.review_id).run();continue;}
+			const evaluation=JSON.parse(JSON.stringify(parsed));
+			evaluation.reviewBatch={id:batchId,representativeSeq:representative.seq,caseId:parsed.reviewBatch?.caseId||'content:'+item.review_id,duplicate:true};
+			if(outcome==='ad'){
+				const m=JSON.parse(current.message_json||'{}'),deletion=Number(m.message_id)>0?await deleteMessage(current.chat_id,m.message_id):{ok:true,notApplicable:true};
+				evaluation.reviewAction={...evaluation.reviewAction,messageDeletion:deletion};
+				if(!deletion.ok){await env.DB.prepare("UPDATE ad_review_batch_items SET state='error',error=?,lease_until=0 WHERE batch_id=? AND review_id=?").bind('重复违规消息删除未完成：'+String(deletion.error||''),batchId,sibling.review_id).run();continue;}
+			}
+			const changed=await env.DB.prepare("UPDATE ad_content_reviews SET status=?,evaluation=?,review_sources=CASE WHEN decision='' THEN '[]' ELSE review_sources END,updated_at=?,expires_at=MAX(expires_at,?),lease_until=0,lease_token='' WHERE id=? AND lease_until<=? AND decision=?")
+				.bind(outcome,serializeAdDryRunEvaluation(evaluation),now,now+365*86400,sibling.review_id,now,current.decision).run();
+			if(Number(changed?.meta?.changes)!==1)throw new Error('重复现场状态发生变化，未覆盖');
+		}
+		await env.DB.prepare("UPDATE ad_review_batch_items SET state='done',outcome=?,error='',lease_until=0 WHERE batch_id=? AND review_id=?").bind(outcome,batchId,sibling.review_id).run();
+	}
+}
+
+async function runAdContentReviewBatchLane(env,batchId){
+	await ensureAdContentReviewBatchTables(env);
+	const batch=await env.DB.prepare('SELECT * FROM ad_review_batches WHERE id=?').bind(String(batchId)).first();
+	if(!batch||batch.status==='preparing')return;
+	if(batch.status!=='running'){if(!batch.notified_at)await sendAdContentReviewBatchReport(env,batch.id);return;}
+	const now=Math.floor(Date.now()/1000);
+	const item=await env.DB.prepare("UPDATE ad_review_batch_items SET state='running',lease_until=?,attempts=attempts+1 WHERE batch_id=? AND review_id=(SELECT review_id FROM ad_review_batch_items WHERE batch_id=? AND review_id=representative_id AND state IN ('ready','retry','running') AND next_at<=? AND lease_until<=? ORDER BY seq LIMIT 1) RETURNING *")
+		.bind(now+900,batch.id,batch.id,now,now).first();
+	if(!item){
+		const waiting=await env.DB.prepare("SELECT MIN(MAX(next_at,lease_until)) AS due FROM ad_review_batch_items WHERE batch_id=? AND review_id=representative_id AND state IN ('ready','retry','running')").bind(batch.id).first();
+		if(waiting?.due!=null)await queueAdReviewBatchLane(env,batch.id,Math.max(5,Math.min(43200,Number(waiting.due)-now)));
+		else await finishAdContentReviewBatch(env,batch.id);
+		return;
+	}
+	try {
+		const original=JSON.parse(item.original_json);
+		if(original.batchLocal!==isIndependentGroup(original.chat_id))throw new Error('群治理范围在批次中变化，未扩大处置');
+		const current=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(item.review_id).first();
+		if(!current)throw new Error('批次现场已不存在');
+		if(current.decision!==original.decision&&current.status!=='normal')throw new Error('人工判断已变化，批次未覆盖');
+		let result;
+		if(current.status==='normal')result={complete:true,normal:true};
+		else {
+			const prepared=await env.DB.prepare("UPDATE ad_content_reviews SET status=CASE WHEN decision='normal' THEN 'normal_intent' ELSE 'pending' END,next_at=?,lease_until=0,lease_token='',review_sources=CASE WHEN decision='' THEN '[]' ELSE review_sources END,expires_at=MAX(expires_at,?) WHERE id=? AND lease_until<=?")
+				.bind(now,now+365*86400,item.review_id,now).run();
+			if(Number(prepared?.meta?.changes)!==1)throw new Error('记录仍有活动租约，稍后重试');
+			result=await runAdContentReview(env,item.review_id,{batchId:batch.id,forceMaterialReview:Number(item.attempts)===1,profile:adReviewBatchProfile(original)});
+		}
+		const latest=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(item.review_id).first();
+		if(!result.complete)throw new Error(JSON.parse(latest.evaluation||'{}').pendingReason||'仍有未完成的内容核验');
+		if(latest.status==='ad'&&latest.evaluation&&JSON.parse(latest.evaluation).reviewAction?.messageDeletion?.ok===false)throw new Error('违规消息删除尚未完成');
+		await completeAdReviewBatchGroup(env,batch.id,item,latest);
+	}catch(error){
+		const exhausted=Number(item.attempts)>=3;
+		await env.DB.prepare('UPDATE ad_review_batch_items SET state=?,error=?,next_at=?,lease_until=0 WHERE batch_id=? AND review_id=?')
+			.bind(exhausted?'error':'retry',String(error?.message||error),now+Math.min(300,30*Number(item.attempts)),batch.id,item.review_id).run();
+		if(exhausted)await env.DB.prepare("UPDATE ad_review_batch_items SET state='error',error='代表现场核验未完成，未推断关联结果',lease_until=0 WHERE batch_id=? AND representative_id=? AND state='waiting_parent'").bind(batch.id,item.review_id).run();
+	}
+	const active=await env.DB.prepare("SELECT COUNT(*) AS n FROM ad_review_batch_items WHERE batch_id=? AND review_id=representative_id AND state IN ('ready','retry','running')").bind(batch.id).first();
+	if(Number(active?.n)>0)await queueAdReviewBatchLane(env,batch.id,2);
+	await finishAdContentReviewBatch(env,batch.id);
+}
+
+async function finishAdContentReviewBatch(env,batchId){
+	const active=await env.DB.prepare("SELECT COUNT(*) AS n FROM ad_review_batch_items WHERE batch_id=? AND state NOT IN ('done','error')").bind(batchId).first();
+	if(Number(active?.n)>0)return;
+	const errors=await env.DB.prepare("SELECT COUNT(*) AS n FROM ad_review_batch_items WHERE batch_id=? AND (state='error' OR outcome='partial')").bind(batchId).first();
+	await env.DB.prepare("UPDATE ad_review_batches SET status=?,completed_at=? WHERE id=? AND status='running'")
+		.bind(Number(errors?.n)?'needs_followup':'complete',Math.floor(Date.now()/1000),batchId).run();
+	// 未完成项先继续排查；完整结果在全部结清后统一发送，避免把待补核报成已完成。
+	if(!Number(errors?.n))await sendAdContentReviewBatchReport(env,batchId);
+}
+
+async function resumeAdContentReviewBatches(env){
+	if(!await d1TableExists(env,'ad_review_batches'))return;
+	await ensureAdContentReviewBatchTables(env);
+	const batches=(await env.DB.prepare("SELECT id,status FROM ad_review_batches WHERE status='running' OR (status='complete' AND notified_at=0)").all()).results||[];
+	for(const batch of batches)for(let lane=0;lane<(batch.status==='running'?4:1);lane++)await queueAdReviewBatchLane(env,batch.id,lane+1);
+}
+
+async function adContentReviewBatchResults(env,batchId){
+	return (await env.DB.prepare("SELECT i.*,r.status AS review_status,r.evaluation,r.user_id,r.chat_id FROM ad_review_batch_items i LEFT JOIN ad_content_reviews r ON r.id=i.review_id WHERE i.batch_id=? ORDER BY i.seq").bind(batchId).all()).results||[];
+}
+
+async function sendAdContentReviewBatchReport(env,batchId){
+	const now=Math.floor(Date.now()/1000);
+	const batch=await env.DB.prepare("UPDATE ad_review_batches SET report_lease=? WHERE id=? AND status='complete' AND notified_at=0 AND report_lease<=? RETURNING *").bind(now+120,batchId,now).first();
+	if(!batch)return;
+	const rows=await adContentReviewBatchResults(env,batchId),counts={};
+	for(const row of rows)counts[row.outcome]=(counts[row.outcome]||0)+1;
+	const lines=['# 内容复核完整结果 '+batchId,'','共 '+rows.length+' 条；'+Object.entries(counts).map(([key,value])=>key+' '+value).join('，'),
+		'原始证据、群范围及本批次处置结果如下。误判回退入口：在机器人私聊发送 /review open 序号，确认正常。',
+		'回退只撤销对应案件新增处罚，保留无关既有处罚；已删除的 Telegram 原消息无法原位恢复。独立群仍由原群群主判断。',''];
+	for(const row of rows){
+		const original=JSON.parse(row.original_json),before=JSON.parse(original.evaluation||'{}').snapshot||{},after=JSON.parse(row.evaluation||'{}');
+		lines.push('## 现场 #'+row.seq,'用户：'+(before.name||'')+'（'+row.user_id+'）','来源群：'+row.chat_id,
+			'结果：'+adReviewStatus({status:row.outcome||row.review_status})+(row.review_id!==row.representative_id?'；与代表现场共用核验':''),
+			'昵称/用户名：'+[before.name,before.username].filter(Boolean).join(' '),'简介：'+(before.bio||''),
+			'原正文：\n'+(before.text||''),'引用：\n'+(before.quotedText||''),
+			'头像识别文字：'+(after.snapshot?.avatarText||''),'会员标识别文字：'+(after.snapshot?.badgeText||''),
+			'依据：\n'+(after.reasons||[]).join('\n'),
+			'处置回执：'+JSON.stringify(after.reviewAction||{}),'回退与素材入口：/review open '+row.seq,'');
+	}
+	const body=new FormData();body.append('chat_id',String(OWNER_IDS[0]));body.append('document',new Blob([lines.join('\n')],{type:'text/markdown;charset=utf-8'}),'review-'+batchId+'.md');
+	body.append('caption','本批全部 '+rows.length+' 条的完整结果、原文及处置回执。');
+	const response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/sendDocument',{method:'POST',body}),sent=await response.json();
+	if(!response.ok||!sent.ok)throw new Error('第一主人报告发送失败：'+String(sent.description||response.status));
+	const summary=await sendTelegramMessage(String(OWNER_IDS[0]),'✅ 本批内容复核已完成：'+rows.length+' 条。\n'+Object.entries(counts).map(([key,value])=>adReviewStatus({status:key})+'：'+value).join('\n')+'\n完整原文见附件；下方逐页核查并可进入具体案件回退。',
+		{inline_keyboard:[[{text:'查看全部结果与回退入口',callback_data:'review:batch:'+batchId+':1'}]]});
+	if(!summary?.ok)throw new Error('第一主人结果入口发送失败');
+	await env.DB.prepare('UPDATE ad_review_batches SET notified_at=?,report_message_id=?,report_lease=0 WHERE id=?').bind(now,Number(sent.result?.message_id)||0,batchId).run();
+}
+
+async function showAdContentReviewBatch(env,actorId,batchId,page=1,callbackMessage=null){
+	if(!isPrimaryOwner(actorId))throw new Error('完整批次报告仅第一主人可查看');
+	await ensureAdContentReviewBatchTables(env);
+	const rows=await adContentReviewBatchResults(env,batchId),pages=Math.max(1,Math.ceil(rows.length/10));page=Math.max(1,Math.min(Number(page)||1,pages));
+	const lines=['批次 '+batchId+' · 第 '+page+'/'+pages+' 页，共 '+rows.length+' 条','点击现场可查看原文、素材和回退入口。'],keyboard=[];
+	for(const row of rows.slice((page-1)*10,page*10)){
+		const name=JSON.parse(row.original_json).user_id,label='#'+row.seq+' '+name+' · '+(row.error?'未完成':adReviewStatus({status:row.outcome||row.review_status}));
+		lines.push(label);keyboard.push([{text:label.slice(0,60),callback_data:'review:open:'+row.seq}]);
+	}
+	const nav=[];if(page>1)nav.push({text:'上一页',callback_data:'review:batch:'+batchId+':'+(page-1)});if(page<pages)nav.push({text:'下一页',callback_data:'review:batch:'+batchId+':'+(page+1)});if(nav.length)keyboard.push(nav);
+	await renderAdReviewPage(actorId,callbackMessage,lines.join('\n'),keyboard);
 }
 
 function isAdDrillPendingEvaluation(evaluation, memo = null) {
@@ -33167,15 +33381,15 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 	// 主人拍过板的结论不让模型再改。
 	const isReread = Boolean(row) && String(row.verdict || '') !== 'pending';
 	if (row) {
-		if(isReread&&Number(row.ocr_at)>0&&!['ad','clean'].includes(String(row.ocr_verdict||''))
+		if(options.forceContent!==true&&isReread&&Number(row.ocr_at)>0&&!['ad','clean'].includes(String(row.ocr_verdict||''))
 			&&Math.floor(Date.now()/1000)-Number(row.ocr_at)<AD_VISION_RETRY_COOLDOWN_SEC)return {...row,missReason:'ocr_retry_cooldown'};
 		// pending 但没有可下载句柄的，退回旧行为 —— 那种当下判不了，只能先登记着。
 		if (!String(row.file_id || '') && !String(profile?.avatarFileId || '')) return row;
 		const needsContentRecheck=row.verdict==='ad'&&!isVerifiedAdAvatarRow(row);
 		if (isReread && !needsContentRecheck && (['owner', 'manual'].includes(String(row.source || ''))
 			|| ['ad', 'clean'].includes(String(row.ocr_verdict || ''))
-			|| (Number(row.ocr_at) > 0 && Math.floor(Date.now() / 1000) - Number(row.ocr_at) < 86400))) return row;
-		if (!isReread && !String(row.file_id || '')) return row;
+			|| (options.forceContent!==true&&Number(row.ocr_at) > 0 && Math.floor(Date.now() / 1000) - Number(row.ocr_at) < 86400))) return row;
+		if (!isReread && !String(row.file_id || '')&&!String(profile?.avatarFileId||'')) return row;
 	} else {
 		// 首次见到：登记成 pending。登记本身零成本，实时判定紧接在后面。
 		await registerAdAvatar(env, profile, uid);
@@ -35649,7 +35863,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// 记的是判定载荷里的正文（evaluation.payload.text），不是昵称或简介 ——
 	// 重发者贴的正是这段正文，而昵称/简介是它自己的，对不上。
 	try {
-		if (options.drillCloseReplay !== true && (options.manualAction !== true || options.manualLearningAllowed === true)) {
+		if (options.skipLearning !== true && options.drillCloseReplay !== true && (options.manualAction !== true || options.manualLearningAllowed === true)) {
 			await recordHandledAdText(env, evaluation?.payload?.text || evaluation?.snapshot?.text || '');
 		}
 	} catch (_) { /* 记录失败不影响本次处置 */ }
@@ -35689,9 +35903,10 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	if (failedGroupLines.length) banSummary += '；失败群：' + failedGroupLines.join('、');
 
 	// 触发消息再单独删一次：revoke_messages 只对该群自己生效，服务消息也偶发残留。
+	let messageDeletion=null;
 	if (chatId && input?.messageId) {
 		try {
-			await deleteMessage(chatId, input.messageId);
+			messageDeletion=await deleteMessage(chatId, input.messageId);
 		} catch (error) {
 			console.error('[广告检测] 删除触发消息失败:', error);
 		}
@@ -35728,7 +35943,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			failedGroupLines,
 			learnLine: learnParts.join('，')
 		});
-		if (options.drillCloseReplay !== true) try {
+		if (options.drillCloseReplay !== true&&options.suppressNotify!==true) try {
 			// 回执底部挂两档纠错按钮：主人不用手打 /ignore <序号>（他手上未必有那个号），
 			// 也不用去查 /unban 的黑名单硬闸门 —— 看完判据当场就能点。见 buildAdNoticeKeyboard。
 			const groupLabel = input?.chatTitle ? '<a href="https://t.me/c/' + escapeHtml(chatId.replace(/^-100/, '')) + '">' + escapeHtml(input.chatTitle) + '</a> ' : '';
@@ -35738,7 +35953,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		} catch (error) {
 			console.error('[广告检测] 推送判定通知失败:', error);
 		}
-		if (automatic && localScope && options.drillCloseReplay !== true) await notifyIndependentGroupCreatorAdCase(env, chatId, seq, userId, notice + '\n范围：本群自动封禁（<code>' + escapeHtml(chatId) + '</code>）');
+		if (automatic && localScope && options.drillCloseReplay !== true&&options.suppressNotify!==true) await notifyIndependentGroupCreatorAdCase(env, chatId, seq, userId, notice + '\n范围：本群自动封禁（<code>' + escapeHtml(chatId) + '</code>）');
 	}
 
 	await deleteAdScreening(env, userId);
@@ -35748,7 +35963,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		+ ' 黑名单=' + blacklistCode + ' 封禁=' + banSummary
 		+ ' 指纹=' + learned + ' AI样本=' + (sampleAdded ? 1 : 0)
 	);
-	return { banned: true, seq, blacklistCode, banSummary, learned, sampleAdded, skeletons, local: automatic && localScope, automatic, autoCaseId,
+	return { banned: true, seq, blacklistCode, banSummary, learned, sampleAdded, skeletons, local: automatic && localScope, automatic, autoCaseId,messageDeletion,
 		complete: options.drillCloseReplay === true || options.reviewGuard ? blacklistCode !== 'ERROR' && banResults.length > 0 && banResults.every(row => row.ok === true) : undefined,
 		banResults: options.drillCloseReplay === true || options.reviewGuard ? banResults : undefined };
 }
