@@ -542,6 +542,9 @@ export default {
 			if(body.type==='ad_review_batch_lane'){
 				await runAdContentReviewBatchLane(env,body.batchId);continue;
 			}
+			if(body.type==='ad_review_batch_report'){
+				await sendAdContentReviewBatchReport(env,body.batchId,{includeUnresolved:body.includeUnresolved===true});continue;
+			}
 			if (body.type === 'ad_content_review') {
 				const result = await runAdContentReview(env, String(body.reviewId || ''));
 				if (result.retryAfter && typeof message.retry === 'function') message.retry({ delaySeconds: result.retryAfter });
@@ -13893,7 +13896,7 @@ async function runAdContentReview(env,id,options={}) {
 				{config:result.config,whitelist:result.whitelist,fullEvaluationCollected:true,automaticCaseId:'content:'+id,
 					skipLearning:human?.local===true||Boolean(options.batchId),skipLinked:Boolean(options.batchId),suppressNotify:Boolean(options.batchId),
 					reviewGuard:async()=>{const state=await env.DB.prepare('SELECT decision,status,lease_token FROM ad_content_reviews WHERE id=?').bind(id).first();return state?.decision!=='normal'&&state?.status==='processing'&&state?.lease_token===token;}});
-			evaluation.reviewAction={banned:enforced?.banned===true,complete:enforced?.complete===true,ownerSnapshotSeq:enforced?.seq||null,
+			evaluation.reviewAction={banned:enforced?.banned===true,complete:enforced?.complete===true,blacklistCode:enforced?.blacklistCode||'',ownerSnapshotSeq:enforced?.seq||null,
 				banResults:enforced?.banResults||[],reason:enforced?.reason||'',messageDeletion:enforced?.messageDeletion||null};
 			const after=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(id).first();
 			if(after?.decision==='normal'){await finishAdNormalReview(env,after);return {complete:true,normal:true};}
@@ -14085,30 +14088,37 @@ async function adContentReviewBatchResults(env,batchId){
 	return (await env.DB.prepare("SELECT i.*,r.status AS review_status,r.evaluation,r.user_id,r.chat_id FROM ad_review_batch_items i LEFT JOIN ad_content_reviews r ON r.id=i.review_id WHERE i.batch_id=? ORDER BY i.seq").bind(batchId).all()).results||[];
 }
 
-async function sendAdContentReviewBatchReport(env,batchId){
+async function sendAdContentReviewBatchReport(env,batchId,options={}){
 	const now=Math.floor(Date.now()/1000);
-	const batch=await env.DB.prepare("UPDATE ad_review_batches SET report_lease=? WHERE id=? AND status='complete' AND notified_at=0 AND report_lease<=? RETURNING *").bind(now+120,batchId,now).first();
+	const batch=await env.DB.prepare("UPDATE ad_review_batches SET report_lease=? WHERE id=? AND (status='complete' OR (?=1 AND status='needs_followup')) AND notified_at=0 AND report_lease<=? RETURNING *").bind(now+120,batchId,Number(options.includeUnresolved===true),now).first();
 	if(!batch)return;
 	const rows=await adContentReviewBatchResults(env,batchId),counts={};
-	for(const row of rows)counts[row.outcome]=(counts[row.outcome]||0)+1;
+	const label=key=>key==='unresolved'?'未完成，需核查':adReviewStatus({status:key});
+	for(const row of rows){const key=row.state==='error'?'unresolved':row.outcome;counts[key]=(counts[key]||0)+1;}
 	const lines=['# 内容复核完整结果 '+batchId,'','共 '+rows.length+' 条；'+Object.entries(counts).map(([key,value])=>key+' '+value).join('，'),
+		'批次状态：'+(batch.status==='complete'?'已全部结清':'仍有未完成项，不能视为全部处置成功')+'；涉及 '+new Set(rows.map(row=>row.user_id)).size+' 个用户。',
 		'原始证据、群范围及本批次处置结果如下。误判回退入口：在机器人私聊发送 /review open 序号，确认正常。',
 		'回退只撤销对应案件新增处罚，保留无关既有处罚；已删除的 Telegram 原消息无法原位恢复。独立群仍由原群群主判断。',''];
 	for(const row of rows){
 		const original=JSON.parse(row.original_json),before=JSON.parse(original.evaluation||'{}').snapshot||{},after=JSON.parse(row.evaluation||'{}');
 		lines.push('## 现场 #'+row.seq,'用户：'+(before.name||'')+'（'+row.user_id+'）','来源群：'+row.chat_id,
-			'结果：'+adReviewStatus({status:row.outcome||row.review_status})+(row.review_id!==row.representative_id?'；与代表现场共用核验':''),
+			'结果：'+label(row.state==='error'?'unresolved':row.outcome||row.review_status)+(row.review_id!==row.representative_id?'；与代表现场共用核验':''),
+			'未完成原因：'+(row.error||''));
+		if(after.reviewReport?.withheld===true)lines.push('本条原始内容保留在机器人审核入口，供第一主人直接核查；本次不展开判定。');
+		else lines.push(
 			'昵称/用户名：'+[before.name,before.username].filter(Boolean).join(' '),'简介：'+(before.bio||''),
 			'原正文：\n'+(before.text||''),'引用：\n'+(before.quotedText||''),
 			'头像识别文字：'+(after.snapshot?.avatarText||''),'会员标识别文字：'+(after.snapshot?.badgeText||''),
+			'正文表情识别文字：'+(after.snapshot?.customEmojiText||''),
 			'依据：\n'+(after.reasons||[]).join('\n'),
-			'处置回执：'+JSON.stringify(after.reviewAction||{}),'回退与素材入口：/review open '+row.seq,'');
+			'补充素材核验：'+JSON.stringify(after.batchVisualAudit||{}));
+		lines.push('处置回执：'+JSON.stringify(after.reviewAction||{}),'回退与素材入口：/review open '+row.seq,'');
 	}
 	const body=new FormData();body.append('chat_id',String(OWNER_IDS[0]));body.append('document',new Blob([lines.join('\n')],{type:'text/markdown;charset=utf-8'}),'review-'+batchId+'.md');
 	body.append('caption','本批全部 '+rows.length+' 条的完整结果、原文及处置回执。');
 	const response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/sendDocument',{method:'POST',body}),sent=await response.json();
 	if(!response.ok||!sent.ok)throw new Error('第一主人报告发送失败：'+String(sent.description||response.status));
-	const summary=await sendTelegramMessage(String(OWNER_IDS[0]),'✅ 本批内容复核已完成：'+rows.length+' 条。\n'+Object.entries(counts).map(([key,value])=>adReviewStatus({status:key})+'：'+value).join('\n')+'\n完整原文见附件；下方逐页核查并可进入具体案件回退。',
+	const summary=await sendTelegramMessage(String(OWNER_IDS[0]),(batch.status==='complete'?'✅ 本批内容复核已完成：':'本批自动复核结果（仍含未完成项）：')+rows.length+' 条。\n'+Object.entries(counts).map(([key,value])=>label(key)+'：'+value).join('\n')+'\n处置依据与回执见附件；下方逐页核查并可进入具体案件回退。',
 		{inline_keyboard:[[{text:'查看全部结果与回退入口',callback_data:'review:batch:'+batchId+':1'}]]});
 	if(!summary?.ok)throw new Error('第一主人结果入口发送失败');
 	await env.DB.prepare('UPDATE ad_review_batches SET notified_at=?,report_message_id=?,report_lease=0 WHERE id=?').bind(now,Number(sent.result?.message_id)||0,batchId).run();
@@ -29161,6 +29171,9 @@ function collectAdLLMHardEvidence(input) {
 	for(const part of [profile.bio,input?.text]){
 		const source=(normalizeAdVariantText(part)||String(part||'')).trim();
 		if(/不要|别信|谨防|举报|骗局|诈骗|曝光|提醒|示例|举例|转发|测试|正则/.test(source))continue;
+		if(/^小额[洗喜]钱\s*[日曰]入\s*[1-9][0-9oO]{2,}\s*\+/.test(source)&&/@[A-Za-z0-9_]{4,}/.test(source)){
+			hits.push('同段原文同时包含变形洗钱招揽、每日收益承诺和联系入口');break;
+		}
 		if(/^(?:来做|来搞|招人做|招募做)[\s，,:：]*(?:洗钱|洗米|跑分)/.test(source)
 			&&/(?:一|每|1)\s*(?:个)?小时\s*[一二三四五六七八九十百千万\d]{2,}/.test(source)
 			&&/@[A-Za-z0-9_]{4,}/.test(source)){
@@ -35488,6 +35501,12 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 // 判定为广告后的统一处置链：加黑 → 全群封禁 → 删触发消息 → 自动学指纹 → 存快照 → 推私聊 → 清观察记录。
 // 每一步独立容错：加黑失败仍继续封禁，封禁部分失败仍推送通知，
 // 保证主人一定能看到现场快照并可用 /ignore <序号> 一键回滚。
+function isAdEnforcementComplete(blacklistCode,results){
+	return ['ADDED','EXISTS'].includes(blacklistCode)&&Array.isArray(results)&&results.length>0
+		&&results.every(row=>!row.accountingFailed&&(row.ok===true||row.skipped==='not_in_group'
+			&&row.muted===true&&row.memberProbe?.state==='not_in_group'));
+}
+
 async function enforceAdDetection(env, input, evaluation, options = {}) {
 	if(options.reviewGuard&&!await options.reviewGuard())return {banned:false,reason:'human_review_hold'};
 	const userId = String(input?.userId ?? '');
@@ -35803,7 +35822,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 				try { await saveAutomaticAdTarget(env,autoCaseId,result.groupId,userId,chatId,localScope?'local':'global',
 					{owned:1,state:result.skipped?'skipped':result.ok?'done':'failed',result:{ok:result.ok,skipped:result.skipped||'',error:result.error||'',
 						attempted:result.automaticNotExecuted!==true&&!result.skipped,priorState:result.automaticPriorState||result.memberProbe?.state||'unobserved'}}); }
-				catch (_) { result.ok=false; result.error='自动处罚结果记账失败，保留重试'; }
+				catch (_) { result.ok=false; result.accountingFailed=true; result.error='自动处罚结果记账失败，保留重试'; }
 			});
 			if (Array.isArray(options.autoTargetGroupIds)) for (const gid of automaticRoute.skipped) banResults.push({groupId:gid,ok:true,skipped:automaticRoute.skipReasons[gid]||'out_of_scope'});
 		} else banResults = await banUserFromAllGroups(userId,banOptions);
@@ -35974,7 +35993,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		+ ' 指纹=' + learned + ' AI样本=' + (sampleAdded ? 1 : 0)
 	);
 	return { banned: true, seq, blacklistCode, banSummary, learned, sampleAdded, skeletons, local: automatic && localScope, automatic, autoCaseId,messageDeletion,
-		complete: options.drillCloseReplay === true || options.reviewGuard ? blacklistCode !== 'ERROR' && banResults.length > 0 && banResults.every(row => row.ok === true) : undefined,
+		complete: options.drillCloseReplay === true || options.reviewGuard ? isAdEnforcementComplete(blacklistCode,banResults) : undefined,
 		banResults: options.drillCloseReplay === true || options.reviewGuard ? banResults : undefined };
 }
 
