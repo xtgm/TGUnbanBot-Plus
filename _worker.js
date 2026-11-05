@@ -14241,7 +14241,6 @@ async function runAdReviewActionGroup(env,row,options={}){
 }
 
 async function runAdContentReview(env,id,options={}) {
-	if(env?.DB&&await isAdAuditPunishmentPaused(env))return {complete:false,paused:true,retryAfter:3600};
 	if(id&&env?.DB&&!options.reviewExecution&&!options.batchId){
 		await ensureAdContentReviewTable(env);
 		const candidate=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=? AND expires_at>? AND '+AD_REVIEW_ACTION_RETRY_CONDITION).bind(id,Math.floor(Date.now()/1000)).first();
@@ -36038,19 +36037,12 @@ function isAdEnforcementComplete(blacklistCode,results){
 			&&row.muted===true&&row.memberProbe?.state==='not_in_group'));
 }
 
-async function isAdAuditPunishmentPaused(env) {
-	if(!env?.DB)return false;
-	const row=await env.DB.prepare("SELECT value FROM ad_scan_state WHERE key='ad_audit_punishment_paused'").first();
-	return String(row?.value||'')==='1';
-}
-
 async function enforceAdDetection(env, input, evaluation, options = {}) {
 	if(options.reviewGuard&&!await options.reviewGuard())return {banned:false,reason:'human_review_hold'};
 	const userId = String(input?.userId ?? '');
 	const chatId = input?.chatId != null ? String(input.chatId) : '';
 	if (!userId) return { banned: false, seq: null, reason: 'no_user' };
 	const automatic = options.ownerConfirmed !== true && options.manualAction !== true;
-	if(automatic&&await isAdAuditPunishmentPaused(env))return {banned:false,complete:false,paused:true,reason:'audit_paused',error:'头像误判排查期间，自动广告处置已暂停'};
 	if(automatic&&options.globalDrillCollected===true){
 		const state=await readGlobalDryRunState(env),session=await readAdDryRunSession(env);
 		if(!state.on||state.at!==options.globalDrillStartedAt&&options.globalDrillStartedAt
@@ -36560,7 +36552,6 @@ async function interceptAdJoinBlacklist(env, member, chatId, chatTitle = '') {
 	const groupId = String(chatId || '');
 	const empty = { blocked: false, banned: false };
 	if (!userId || !groupId || !env?.DB || !isConfiguredGroup(groupId)) return empty;
-	if(await isAdAuditPunishmentPaused(env))return {...empty,paused:true};
 	const blacklistCheck = await resolveChatBlacklistCheck(env, groupId, userId, await checkBlacklist(userId, env));
 	if (!blacklistCheck?.isBlacklisted) return empty;
 	if (isAdDetectionExemptUser(userId) || await isAdUserWhitelisted(env, userId)
