@@ -13696,7 +13696,8 @@ async function showAdReviewDuplicateUser(env,actorId,row,page,callbackMessage,fi
 		const key=await exportSha256Hex(JSON.stringify([row.user_id,row.chat_id])),group=await env.DB.prepare('SELECT lease_until,result FROM ad_review_action_groups WHERE group_key=?').bind(key).first();
 		if(Number(group?.lease_until)>Math.floor(Date.now()/1000))lines.push('整组自动任务正在执行，请稍后刷新查看结果。');
 		else if(group?.result){const result=JSON.parse(group.result),records=result.records||[],pending=records.filter(item=>['pending','waiting','processing','action_failed','normal_intent'].includes(item.status)).length;
-			lines.push('最近整组处理 '+records.length+' 条：完成 '+(records.length-pending)+' 条，未完成 '+pending+' 条；复用 '+Number(result.reusedTargetReceipts||0)+' 份逐群回执。');}
+			lines.push('最近整组处理 '+records.length+' 条：完成 '+(records.length-pending)+' 条，未完成 '+pending+' 条；复用 '+Number(result.reusedTargetReceipts||0)+' 份逐群回执。');
+			if(result.identityRecovery?.label)lines.push('账号资料：'+result.identityRecovery.label+'。');}
 	}
 	for(const items of entries.slice((page-1)*8,page*8)){const first=items[0],seqs=items.map(x=>'#'+x.seq).join('、');
 		lines.push(actions?'现场 #'+first.seq+' · '+adReviewStatus(first):'现场 #'+first.seq+' · 相同内容 '+items.length+' 条：'+seqs.slice(0,300));
@@ -14110,6 +14111,58 @@ async function registerAdReviewDuplicateDecision(env,actor,row,decision,access){
 
 const AD_REVIEW_ACTION_RETRY_CONDITION="status IN ('action_failed','pending','waiting','processing') AND decision<>'normal' AND json_valid(evaluation) AND json_extract(evaluation,'$.verdict')='ban' AND json_type(evaluation,'$.reviewAction')='object'";
 
+// 官方服务内部会先搜索用户名再拒绝返回普通用户，可能因此补齐资料；这不是保证成功的公开解析接口。
+// 只给已有广告失败回执做恢复，始终复查原 TGID；同用户每天一次、全局每日最多 50 次是本项目限额。
+async function recoverAdReviewMemberIdentity(env,rows){
+	const labels={available:'原 TGID 已可查询',recovered:'已刷新资料并核对原 TGID',cooldown:'资料刷新处于 24 小时冷却期',
+		quota:'今日资料刷新次数已达项目上限',unresolved:'资料刷新后仍无法核实成员',failed:'资料刷新未完成，保留原处置状态',
+		mismatch:'资料身份不一致，已停止自动处置'};
+	const now=Math.floor(Date.now()/1000),done=(state,extra={})=>({state,label:labels[state],at:now,attempted:false,...extra});
+	const row=rows.find(item=>{try{const e=JSON.parse(item.evaluation||'{}'),m=JSON.parse(item.message_json||'{}');
+		return e.verdict==='ban'&&item.decision!=='normal'&&String(m.from?.id)===String(item.user_id)&&String(m.chat?.id)===String(item.chat_id)
+			&&/^[A-Za-z0-9_]{5,32}$/.test(String(m.from?.username||''))
+			&&(e.reviewAction?.banResults||[]).some(r=>!r.ok&&isTelegramUserUnresolvableError(r.error||r.memberProbe?.error));
+	}catch(_){return false;}});
+	if(!row)return null;
+	const uid=String(row.user_id),gid=String(row.chat_id),username=JSON.parse(row.message_json).from.username;
+	if(!isPureTgid(uid)||Number(uid)<=0||!Number.isSafeInteger(Number(uid)))return done('mismatch',{blocked:true});
+	let attempted=false,recovery=null,key='review_identity:'+uid;
+	try{
+		const before=await probeTargetMemberBeforeBan(gid,uid);
+		if(before.ok)return String(before.user?.id)===uid?done('available',{memberState:before.state}):done('mismatch',{blocked:true});
+		if(before.state!=='unresolvable')return done('failed');
+		if(!await adDetectionReady(env))return done('failed');
+		const claim=await env.DB.prepare("INSERT INTO ad_scan_state(key,value,updated_at) VALUES(?,'{}',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at WHERE ad_scan_state.updated_at<=? RETURNING key")
+			.bind(key,now,now-86400).first();
+		if(!claim)return done('cooldown');
+		const day=Math.floor(now/86400)*86400;
+		const budget=await env.DB.prepare("INSERT INTO ad_scan_state(key,value,updated_at) VALUES('review_identity_daily','1',?) ON CONFLICT(key) DO UPDATE SET value=CASE WHEN ad_scan_state.updated_at<? THEN '1' ELSE CAST(CAST(ad_scan_state.value AS INTEGER)+1 AS TEXT) END,updated_at=excluded.updated_at WHERE ad_scan_state.updated_at<? OR CAST(ad_scan_state.value AS INTEGER)<50 RETURNING key")
+			.bind(now,day,day).first();
+		if(!budget)return done('quota');
+		const read=async(method,body)=>{
+			const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
+			try{const response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/'+method,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:controller.signal});
+				const data=await response.json();return {...data,ok:response.ok&&data.ok===true};
+			}finally{clearTimeout(timer);}
+		};
+		attempted=true;
+		const lookup=await read('getChat',{chat_id:'@'+username});
+		if(lookup.ok&&String(lookup.result?.id)!==uid)recovery=done('mismatch',{attempted,blocked:true});
+		else if(!lookup.ok&&!(Number(lookup.error_code)===400&&/chat not found/i.test(lookup.description||'')))recovery=done('failed',{attempted});
+		else{
+			const profile=await read('getChat',{chat_id:Number(uid)});
+			if(!profile.ok)recovery=done('unresolved',{attempted});
+			else if(profile.result?.type!=='private'||String(profile.result?.id)!==uid)recovery=done('mismatch',{attempted,blocked:true});
+			else{
+				const member=await probeTargetMemberBeforeBan(gid,uid);
+				recovery=member.ok?String(member.user?.id)===uid?done('recovered',{attempted,memberState:member.state}):done('mismatch',{attempted,blocked:true}):done('unresolved',{attempted});
+			}
+		}
+		await env.DB.prepare('UPDATE ad_scan_state SET value=? WHERE key=? AND updated_at=?').bind(JSON.stringify(recovery),key,now).run();
+		return recovery;
+	}catch(_){return recovery||done('failed',{attempted});}
+}
+
 async function runAdReviewActionGroup(env,row,options={}){
 	const now=Math.floor(Date.now()/1000),key=await exportSha256Hex(JSON.stringify([row.user_id,row.chat_id])),token=crypto.randomUUID();
 	const locked=await env.DB.prepare("INSERT INTO ad_review_action_groups(group_key,lease_until,lease_token,updated_at) VALUES(?,?,?,?) ON CONFLICT(group_key) DO UPDATE SET lease_until=excluded.lease_until,lease_token=excluded.lease_token,updated_at=excluded.updated_at WHERE ad_review_action_groups.lease_until<=? RETURNING group_key")
@@ -14123,6 +14176,7 @@ async function runAdReviewActionGroup(env,row,options={}){
 		rows.sort((a,b)=>Number(isLinked(a))-Number(isLinked(b))||b.seq-a.seq);
 		const execution={key,token,userId:row.user_id,chatId:row.chat_id,receipts:new Map(),reused:0};
 		execution.guard=async()=>Boolean(await env.DB.prepare('SELECT group_key FROM ad_review_action_groups WHERE group_key=? AND lease_token=? AND lease_until>?').bind(key,token,Math.floor(Date.now()/1000)).first());
+		execution.identityRecovery=await recoverAdReviewMemberIdentity(env,rows);
 		for(const item of rows){
 			const at=Math.floor(Date.now()/1000);
 			const alive=await env.DB.prepare('UPDATE ad_review_action_groups SET lease_until=? WHERE group_key=? AND lease_token=? AND lease_until>?').bind(at+900,key,token,at).run();
@@ -14133,7 +14187,7 @@ async function runAdReviewActionGroup(env,row,options={}){
 		}
 		const outcomes=(await env.DB.prepare('SELECT seq,status,next_at FROM ad_content_reviews WHERE id IN (SELECT value FROM json_each(?)) ORDER BY seq DESC').bind(JSON.stringify(rows.map(item=>item.id))).all()).results||[];
 		const pending=outcomes.filter(item=>['pending','waiting','processing','action_failed','normal_intent'].includes(item.status));
-		const report={runId:token,records:outcomes,uniqueTargetReceipts:execution.receipts.size,reusedTargetReceipts:execution.reused,at:Math.floor(Date.now()/1000)};
+		const report={runId:token,records:outcomes,uniqueTargetReceipts:execution.receipts.size,reusedTargetReceipts:execution.reused,identityRecovery:execution.identityRecovery,at:Math.floor(Date.now()/1000)};
 		await env.DB.prepare('UPDATE ad_review_action_groups SET result=?,updated_at=? WHERE group_key=? AND lease_token=?').bind(JSON.stringify(report),report.at,key,token).run();
 		return {complete:!pending.length,grouped:true,processed:outcomes.length,ad:outcomes.length>0&&outcomes.every(item=>item.status==='ad'),...pending.length?{retryAfter:Math.max(1,Math.min(43200,Math.min(...pending.map(item=>Number(item.next_at)||report.at+60))-report.at))}:{}};
 	}finally{await env.DB.prepare("UPDATE ad_review_action_groups SET lease_until=0,lease_token='' WHERE group_key=? AND lease_token=?").bind(key,token).run();}
@@ -14203,6 +14257,10 @@ async function runAdContentReviewSingle(env,id,options={}) {
 		if(row.decision==='normal')return await finishAdNormalReview(env,row);
 		if((await readGlobalDryRunState(env,{strict:true})).on){await save('pending',now+60);return {complete:false,retryAfter:60};}
 		const message=JSON.parse(row.message_json),uid=String(row.user_id),gid=String(row.chat_id);
+		const identityRecovery=options.reviewExecution?.identityRecovery;
+		if(identityRecovery){evaluation=original;original.reviewIdentityRecovery=identityRecovery;
+			if(identityRecovery.blocked)throw new Error(identityRecovery.label);
+			if(identityRecovery.memberState==='admin'){await save('skipped');return {complete:true};}}
 		if(!isConfiguredGroup(gid)&&!isKillerModeGroup(gid)||isAdExemptBot(message.from)||isAdDetectionExemptUser(uid)
 			||await isAdUserWhitelisted(env,uid)||await resolveLocalAdDetectionSkip(env,gid,uid)||await isAdminForAdDetection(gid,uid)||await isConfiguredGroupAdmin(env,uid)){
 			await save('skipped');return {complete:true};
