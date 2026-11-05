@@ -13263,8 +13263,13 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	const emojiRows = await readAdCustomEmojiMediaRows(env, emojiIds, userId, { complete: true, scopeChatId });
 	const badgeId = String(profile.badgeId || '');
 	const badgeLocalClean=badgeId&&await hasGroupAdFeedback(env,scopeChatId,'badge',badgeId);
-	const badgeItem = badgeLocalClean?{id:badgeId,row:{verdict:'clean',source:'group_feedback'},verifiedAd:false}:emojiRows.find((item) => item.id === badgeId)
+	let badgeItem = badgeLocalClean?{id:badgeId,row:{verdict:'clean',source:'group_feedback'},verifiedAd:false}:emojiRows.find((item) => item.id === badgeId)
 		|| (badgeId ? (await readAdCustomEmojiMediaRows(env, [badgeId], userId, { complete: true, scopeChatId }))[0] : null);
+	const badgeReview = badgeId && !badgeLocalClean ? (isIndependentGroup(scopeChatId)
+		? await readLocalReviewedMaterial(env,scopeChatId,'badge',badgeId) : await readAdBadge(env,badgeId)) : null;
+	if (badgeReview && ['owner','manual','local_review'].includes(badgeReview.source)) {
+		badgeItem = {...badgeItem,id:badgeId,row:badgeReview,verifiedAd:badgeReview.verdict==='ad'};
+	}
 	let avatar = profile.avatarId ? await judgeAdAvatarRealtime(env, profile.avatarId, profile, {scopeChatId}) : null;
 	const avatarOwnerClean = avatar?.verdict === 'clean' && ['owner', 'manual','group_feedback'].includes(String(avatar.source || ''));
 	if (avatar && !avatarOwnerClean && String(avatar.ocr_text || '').trim()) {
@@ -13347,6 +13352,15 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	}
 	if (emojiMissingIds.length) drillIncomplete.push('正文自定义素材尚未核实：' + emojiMissingIds.join(','));
 	evaluation.drillIncomplete = drillIncomplete;
+	const contentReviewIncomplete = [];
+	// 正式检测依据实际取得的画面完成判定；完整动画的采集范围仍在演练记录中如实保留。
+	if (options.normalDetection === true) {
+		if (!profileFetched) contentReviewIncomplete.push('资料查询未完成');
+		if (profile.avatarId && !avatarComplete) contentReviewIncomplete.push('头像内容尚未核实');
+		if (badgeId && !badgeLocalClean && !materialComplete(badgeItem?.row, badgeItem?.verifiedAd)) contentReviewIncomplete.push('会员标内容尚未核实');
+		if (!imageComplete) contentReviewIncomplete.push('正文素材尚未核实');
+		if (emojiIds.some(id => !materialComplete(emojiById.get(String(id))?.row, emojiById.get(String(id))?.verifiedAd))) contentReviewIncomplete.push('正文表情尚未核实');
+	}
 	// 演练与正式检测共用补判链；复评保留已核验的模型答复，仍用完整现场重新核对证据。
 	const llmMemo = options.llmMemo || (prior?._adLlmMemo?.answer?.ad === true ? prior._adLlmMemo : { done: false });
 	let reviewInput = null, reviewOptions = null;
@@ -13378,15 +13392,16 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 		evaluationProfile.adLinks = recheckedLinks;
 		evaluation = await judgeCollectedContent();
 		if (reviewInput) { reviewInput.profile.adLinks = recheckedLinks; evaluation = await applyAdLLMToEvaluation(env, evaluation, config, reviewInput, reviewOptions); }
-		evaluation.drillIncomplete = drillIncomplete;
 	}
+	evaluation.drillIncomplete = drillIncomplete;
+	if (options.normalDetection === true) evaluation.contentReviewIncomplete = contentReviewIncomplete;
 	const fullyCollected = drillIncomplete.length === 0;
 	evaluation.globalDrill = { scope: 'all-configured-killer', attempted: true, collected: fullyCollected, complete: fullyCollected,
 		completeness, collectedAt: Math.floor(Date.now() / 1000), emojiTotal: emojiIds.length,
 		emojiReturned: emojiRows.length, emojiEvaluated: emojiIds.length - emojiMissingIds.length };
 	evaluation.globalDrillAssets = { avatarAd, imageAd: isVerifiedAdMediaRow(image), badgeIds: [...new Set(verifiedEmojiIds.concat(badgeItem?.verifiedAd ? [badgeId] : []))] };
 	if (badgeItem && !emojiRows.some((item) => item.id === badgeId)) {
-		const badgeMaterial = { id: badgeId, fileUniqueId: badgeItem.fileUniqueId, visionFileId: badgeItem.visionFileId,
+		const badgeMaterial = { id: badgeId, fileUniqueId: badgeItem.fileUniqueId, fileId: badgeItem.fileId || '', setName: badgeItem.setName || '', visionFileId: badgeItem.visionFileId,
 			kind: badgeItem.kind, verdict: badgeItem.row?.verdict || 'pending', source: badgeItem.row?.source || '', verifiedAd: badgeItem.verifiedAd };
 		evaluation.payload.customEmojiMedia = (evaluation.payload.customEmojiMedia || []).concat(badgeMaterial);
 	}
@@ -13402,7 +13417,7 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 			avatarId:profile.avatarId||'',avatarFileId:profile.avatarFileId||'',badgeId:profile.badgeId||'',isPremium:profile.isPremium,
 			fetched:profileFetched,fetchedAt:Number(profile.profileFetchedAt)||0 },
 		originalMedia:media?{...media}:null,
-		text, badgeMedia: badgeItem ? { id: badgeItem.id, fileUniqueId: badgeItem.fileUniqueId, visionFileId: badgeItem.visionFileId, kind: badgeItem.kind } : null };
+		text, badgeMedia: badgeItem ? { id: badgeItem.id, fileUniqueId: badgeItem.fileUniqueId, fileId: badgeItem.fileId || '', setName: badgeItem.setName || '', visionFileId: badgeItem.visionFileId, kind: badgeItem.kind } : null };
 	if (profile.bioFetched === true) evaluation.snapshot.groupAdContextKey = await buildGroupAdContextKey({ message }, evaluation);
 	const learning = globalDryRunLearningView(evaluation);
 	evaluation.learningPayload = learning.payload;
@@ -13469,7 +13484,8 @@ const AD_REVIEW_ALERT_CACHE = new WeakMap();
 async function adContentReviewAccess(env,actorId,row) {
 	const primary=isPrimaryOwner(actorId),local=isIndependentGroup(row.chat_id);
 	const creator=local&&await isGroupCreator(actorId,row.chat_id);
-	return {read:primary||creator,write:local?creator:primary,local};
+	const scope=JSON.parse(row.evaluation||'{}').snapshot?.reviewScope;
+	return {read:primary||creator,write:(local?creator:primary)&&(!row.decision||!scope||scope===(local?'local':'global')),local};
 }
 
 async function notifyAdContentReviewPending(env,id) {
@@ -13489,100 +13505,172 @@ async function notifyAdContentReviewPending(env,id) {
 }
 
 function adReviewSources(row) {
-	const evaluation=JSON.parse(row.evaluation||'{}'),s=evaluation.snapshot||{},m=JSON.parse(row.message_json||'{}');
+	const s=JSON.parse(row.evaluation||'{}').snapshot||{},m=JSON.parse(row.message_json||'{}');
 	const result=[];const add=(key,label,value)=>{if(value)result.push({key,label,value});};
 	add('name','昵称/用户名',[s.name,s.username].filter(Boolean).join(' '));add('bio','简介',s.bio);add('text','正文',s.text);
-	add('avatar','头像',s.avatarId);add('badge','会员标',s.badgeId);add(m.sticker?'sticker':'image',m.sticker?'贴纸':'图片',s.imageId);
-	for(const [index,item]of (s.customEmojiMedia||[]).entries())add('emoji'+index,'正文表情 '+(index+1),item.fileUniqueId);
+	add('avatar','头像',s.avatarId);add('badge','会员标',s.badgeId);
+	const media=s.originalMedia||extractAdMedia(m);
+	if(media)add(m.sticker?'sticker':'image',m.sticker?'贴纸':'图片/视频',media.fileUniqueId||s.imageId);
+	const bodyIds=new Set((s.customEmojiIds||extractCustomEmojiIds(m)).map(String));
+	for(const [index,item]of (s.customEmojiMedia||[]).entries()){
+		if(String(item.id)===String(s.badgeId)&&!bodyIds.has(String(item.id)))continue;
+		add('emoji'+index,'正文表情 '+(index+1),item.fileUniqueId||item.id);
+	}
 	return result;
 }
 
-async function showAdContentReviewList(env,actorId,page=1) {
+async function renderAdReviewPage(actorId,callbackMessage,text,keyboard,blocks=null,files=[]) {
+	const messageId=Number(callbackMessage?.message_id)||0;
+	const payload={chat_id:String(callbackMessage?.chat?.id||actorId),reply_markup:{inline_keyboard:keyboard}};
+	if(messageId)payload.message_id=messageId;
+	if(blocks)payload.rich_message={blocks:[{type:'paragraph',text},...blocks],skip_entity_detection:true};
+	else {payload.text=text;payload.link_preview_options={is_disabled:true};}
+	let body,headers;
+	if(files.length){
+		body=new FormData();for(const [key,value]of Object.entries(payload))body.append(key,typeof value==='object'?JSON.stringify(value):String(value));
+		for(const file of files)body.append(file.key,new Blob([file.bytes],{type:file.mime}),file.name);
+	}else{body=JSON.stringify(payload);headers={'Content-Type':'application/json'};}
+	const response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/'+(messageId?'editMessageText':blocks?'sendRichMessage':'sendMessage'),{method:'POST',headers,body});
+	const result=await response.json();
+	if(!response.ok||!result.ok){
+		if(messageId&&/message is not modified/i.test(result.description||''))return result;
+		throw new Error('页面更新失败：'+String(result.description||response.status));
+	}
+	return result;
+}
+
+function adReviewTextPages(text,limit=3400) {
+	const pages=[];let page='';
+	for(const character of String(text)){
+		if(page.length+character.length>limit){pages.push(page);page='';}
+		page+=character;
+	}
+	if(page||!pages.length)pages.push(page);
+	return pages;
+}
+
+function adReviewStatus(row) {
+	const labels={pending:'等待核验',waiting:'核验未完成，已降低重试频率',processing:'自动处理中',viewing:'人工选择中（30 分钟后恢复）',
+		normal_intent:'正常判断已登记，正在保存',normal:'人工确认正常',ad:'广告已处置',clean:'已核验，未发现广告',
+		partial:'已查可用画面，动态原文件未完整核验',sample:'待人工确认',action_failed:'处置未完成',manual:'待人工处理',skipped:'已按豁免或当前群范围跳过'};
+	return labels[row.status]||row.status;
+}
+
+async function showAdContentReviewList(env,actorId,page=1,callbackMessage=null,filter='pending') {
 	await ensureAdContentReviewTable(env);page=Math.max(1,Number(page)||1);
-	let groups=[];if(!isPrimaryOwner(actorId)){for(const gid of INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length){await sendTelegramMessage(actorId,'仅第一主人或独立群群主可查看待核内容。');return;}}
+	let groups=[];if(!isPrimaryOwner(actorId)){for(const gid of INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length)throw new Error('仅第一主人或独立群群主可查看待核内容');}
 	const scope=isPrimaryOwner(actorId)?'':' AND chat_id IN (SELECT value FROM json_each(?))',args=isPrimaryOwner(actorId)?[]:[JSON.stringify(groups)];
-	const where="status IN ('pending','waiting','processing','viewing','normal_intent','sample') AND expires_at>?"+scope;
+	const partial=filter==='partial';
+	const where=(partial?"status='partial'":"status IN ('pending','waiting','processing','viewing','normal_intent','sample','manual','action_failed')")+' AND expires_at>?'+scope;
 	const now=Math.floor(Date.now()/1000),count=await env.DB.prepare('SELECT COUNT(*) AS n FROM ad_content_reviews WHERE '+where).bind(now,...args).first();
 	const total=Number(count?.n||0),pages=Math.max(1,Math.ceil(total/10));page=Math.min(page,pages);
 	const rows=(await env.DB.prepare('SELECT seq,chat_id,user_id,status,evaluation FROM ad_content_reviews WHERE '+where+' ORDER BY seq DESC LIMIT 10 OFFSET ?').bind(now,...args,(page-1)*10).all()).results||[];
-	const lines=['<b>待核与待确认现场</b> · 第 '+page+'/'+pages+' 页，共 '+total+' 条','点击条目查看完整现场；查看素材由你主动点击。'];
+	const lines=[(partial?'仅完成可用画面核验':'待核与待确认现场')+' · 第 '+page+'/'+pages+' 页，共 '+total+' 条',
+		partial?'以下记录保留完整核验范围，可继续人工查看原文件。':'点击条目查看现场；仅查看不会暂停自动核验。'];
 	const keyboard=[];
-	for(const row of rows){const s=JSON.parse(row.evaluation||'{}').snapshot||{};const label='#'+row.seq+' '+String(s.name||'用户')+' · '+(isIndependentGroup(row.chat_id)?'独立本群':'全局群');
-		lines.push(escapeHtml(label));keyboard.push([{text:label.slice(0,60),callback_data:'review:open:'+row.seq}]);}
-	const navigation=[];if(page>1)navigation.push({text:'上一页',callback_data:'review:list:'+(page-1)});if(page<pages)navigation.push({text:'下一页',callback_data:'review:list:'+(page+1)});if(navigation.length)keyboard.push(navigation);
-	await sendTelegramMessage(actorId,lines.join('\n'),{inline_keyboard:keyboard});
+	for(const row of rows){const s=JSON.parse(row.evaluation||'{}').snapshot||{},label='#'+row.seq+' '+String(s.name||'用户').slice(0,40)+' · '+adReviewStatus(row);
+		lines.push(label);keyboard.push([{text:label.slice(0,60),callback_data:'review:open:'+row.seq}]);}
+	const navigation=[];if(page>1)navigation.push({text:'上一页',callback_data:'review:list:'+(page-1)+':'+filter});
+	if(page<pages)navigation.push({text:'下一页',callback_data:'review:list:'+(page+1)+':'+filter});if(navigation.length)keyboard.push(navigation);
+	keyboard.push([{text:partial?'返回待核列表':'查看仅核验画面的记录',callback_data:'review:list:1:'+(partial?'pending':'partial')}]);
+	await renderAdReviewPage(actorId,callbackMessage,lines.join('\n'),keyboard);
 }
 
 async function showAdContentReview(env,actorId,row) {
-	const access=await adContentReviewAccess(env,actorId,row);if(!access.read)throw new Error('无权查看该现场');
-	const e=JSON.parse(row.evaluation||'{}'),s=e.snapshot||{},m=JSON.parse(row.message_json||'{}'),p=s.originalProfile||{};
-	if(access.write&&!row.decision)await env.DB.prepare("UPDATE ad_content_reviews SET status='viewing',lease_token='',lease_until=0 WHERE id=? AND decision='' AND status IN ('pending','waiting','processing','sample')").bind(row.id).run();
-	const lines=['<b>完整现场 #'+row.seq+'</b>','目标：'+formatUserMention({id:Number(row.user_id),first_name:s.name||'用户'}),'来源群：<code>'+escapeHtml(row.chat_id)+'</code>',
-		'处理范围：'+(access.local?'仅独立原群':'全局非独立治理群'),'',
-		'<b>检测时资料</b>','昵称：'+escapeHtml(s.name||'未获取'),'用户名：'+escapeHtml(s.username||'未获取'),
-		'简介：'+escapeHtml(s.bio||(p.fetched?'无简介':'尚未获取，不能当作没有简介')), '头像：'+(s.avatarId?'已记录原素材标识':'尚未获取或未设置'),
-		'会员标：'+(s.badgeId?'已记录原素材标识':'未发现或尚未获取'),'', '<b>原正文</b>',escapeHtml(s.text||getAdDetectionBodyText(m)||'无文字，查看原素材'),'',
-		'<b>核验过程</b>',...(e.drillIncomplete||[]).map(escapeHtml),escapeHtml(e.pendingReason||''),
-		'头像读取文字：'+escapeHtml(s.avatarText||s.rawAvatarText||'未读取或未核实'),'图片/表情读取文字：'+escapeHtml(s.customEmojiText||'见原素材'),
-		...(e.reasons||[]).map(reason=>escapeHtml(String(reason)))];
-	const keyboard=[];
-	if(Number(m.message_id)>0)keyboard.push([{text:'查看原消息（含原图/原贴纸）',callback_data:'review:original:'+row.seq}]);
-	for(const source of adReviewSources(row).filter(source=>['avatar','badge','image','sticker'].includes(source.key)||source.key.startsWith('emoji')))
-		keyboard.push([{text:'查看'+source.label,callback_data:'review:asset:'+row.seq+':'+source.key}]);
-	if(access.write&&row.source!=='operator'){
-		const selected=JSON.parse(row.review_sources||'[]');
-		lines.push('','先勾选你确认正常或广告的具体位置，再按对应按钮。不勾素材确认正常只记录该完整场景反例，避免改变未判断的素材。');
-		for(const source of adReviewSources(row))keyboard.push([{text:(selected.includes(source.key)?'✅ ':'☐ ')+source.label,callback_data:'review:pick:'+row.seq+':'+source.key}]);
-		keyboard.push([{text:'确认正常 · 写入反例',callback_data:'review:normal:'+row.seq},{text:'确认勾选位置是广告',callback_data:'review:ad:'+row.seq}]);
-		keyboard.push([{text:'交回自动核验',callback_data:'review:auto:'+row.seq}]);
-	}else if(!access.write)lines.push('','该独立群由原群群主判断，本页仅供你查看。');
-	keyboard.push([{text:'返回分页列表',callback_data:'review:list:1'}]);
-	await sendTelegramMessageChunks(actorId,lines.join('\n'),{inline_keyboard:keyboard});
+	return editAdContentReviewMessage(env,actorId,row,null);
 }
 
-async function editAdContentReviewMessage(env,actorId,row,callbackMessage) {
+async function editAdContentReviewMessage(env,actorId,row,callbackMessage,page=1,notice='',original=false) {
 	const access=await adContentReviewAccess(env,actorId,row);if(!access.read)throw new Error('无权查看该现场');
 	const e=JSON.parse(row.evaluation||'{}'),s=e.snapshot||{},m=JSON.parse(row.message_json||'{}'),p=s.originalProfile||{};
-	const lines=['<b>完整现场 #'+row.seq+'</b>','目标：'+formatUserMention({id:Number(row.user_id),first_name:s.name||'用户'}),'来源群：<code>'+escapeHtml(row.chat_id)+'</code>',
+	const lines=original?['保存的原消息（分页保留全部字段）',JSON.stringify(m,null,2)]:[
+		'目标：'+(s.name||'用户')+'（'+row.user_id+'）','来源群：'+row.chat_id,
 		'处理范围：'+(access.local?'仅独立原群':'全局非独立治理群'),'',
-		'<b>检测时资料</b>','昵称：'+escapeHtml(s.name||'未获取'),'用户名：'+escapeHtml(s.username||'未获取'),
-		'简介：'+escapeHtml(s.bio||(p.fetched?'无简介':'尚未获取，不能当作没有简介')), '头像：'+(s.avatarId?'已记录原素材标识':'尚未获取或未设置'),
-		'会员标：'+(s.badgeId?'已记录原素材标识':'未发现或尚未获取'),'', '<b>原正文</b>',escapeHtml(s.text||getAdDetectionBodyText(m)||'无文字，查看原素材'),'',
-		'<b>核验过程</b>',...(e.drillIncomplete||[]).map(escapeHtml),escapeHtml(e.pendingReason||''),
-		'头像读取文字：'+escapeHtml(s.avatarText||s.rawAvatarText||'未读取或未核实'),'图片/表情读取文字：'+escapeHtml(s.customEmojiText||'见原素材'),
-		...(e.reasons||[]).map(reason=>escapeHtml(String(reason)))];
-	const keyboard=[];
-	if(Number(m.message_id)>0)keyboard.push([{text:'查看原消息（含原图/原贴纸）',callback_data:'review:original:'+row.seq}]);
-	for(const source of adReviewSources(row).filter(source=>['avatar','badge','image','sticker'].includes(source.key)||source.key.startsWith('emoji')))
+		'检测时资料','昵称：'+(s.name||'未获取'),'用户名：'+(s.username||'未获取'),
+		'简介：'+(s.bio||(p.fetched?'无简介':'尚未获取，不能当作没有简介')),
+		'Premium：'+(p.isPremium===true?'是':p.isPremium===false?'否':'未取得'),
+		'头像：'+(s.avatarId?'有素材，点击下方查看':'未设置或尚未获取'),
+		'会员标：'+(s.badgeId?'有自定义素材，点击下方查看':'未发现或尚未获取'),'',
+		'原正文',s.text||getAdDetectionBodyText(m)||'无文字，查看原素材','',
+		'检测时未核实的内容',...(e.contentReviewIncomplete||[]),e.pendingReason||'',
+		'实际采集范围',...(e.drillIncomplete||[]),
+		'头像读取文字：'+(s.avatarText||s.rawAvatarText||'未读取或未核实'),
+		'会员标读取文字：'+(s.badgeText||'未读取或未核实'),
+		'正文素材读取文字：'+(s.customEmojiText||'见原素材'),...(e.reasons||[]).map(String)];
+	const sources=adReviewSources(row),pages=adReviewTextPages(lines.join('\n'));
+	while(pages.length<Math.ceil(sources.length/8))pages.push('素材选择续页');
+	page=Math.max(1,Math.min(Number(page)||1,pages.length));
+	const pageSources=sources.slice((page-1)*8,page*8);
+	const keyboard=[],navigation=[],action=original?'original':'page';
+	if(page>1)navigation.push({text:'上一段',callback_data:'review:'+action+':'+row.seq+':'+(page-1)});
+	if(page<pages.length)navigation.push({text:'下一段',callback_data:'review:'+action+':'+row.seq+':'+(page+1)});
+	if(navigation.length)keyboard.push(navigation);
+	keyboard.push([{text:original?'返回现场':'查看保存的原消息全文',callback_data:'review:'+(original?'open':'original')+':'+row.seq}]);
+	for(const source of pageSources.filter(source=>['avatar','badge','image','sticker'].includes(source.key)||source.key.startsWith('emoji')))
 		keyboard.push([{text:'查看'+source.label,callback_data:'review:asset:'+row.seq+':'+source.key}]);
-	if(access.write&&row.source!=='operator'){
+	if(access.write&&row.source!=='operator'&&!row.decision){
 		const selected=JSON.parse(row.review_sources||'[]');
-		lines.push('','先勾选你确认正常或广告的具体位置，再按对应按钮。不勾素材确认正常只记录该完整场景反例，避免改变未判断的素材。');
-		for(const source of adReviewSources(row))keyboard.push([{text:(selected.includes(source.key)?'✅ ':'☐ ')+source.label,callback_data:'review:pick:'+row.seq+':'+source.key}]);
+		for(const source of pageSources)keyboard.push([{text:(selected.includes(source.key)?'☑ ':'☐ ')+source.label,callback_data:'review:pick:'+row.seq+':'+source.key}]);
 		keyboard.push([{text:'确认正常 · 写入反例',callback_data:'review:normal:'+row.seq},{text:'确认勾选位置是广告',callback_data:'review:ad:'+row.seq}]);
 		keyboard.push([{text:'交回自动核验',callback_data:'review:auto:'+row.seq}]);
-	}else if(!access.write)lines.push('','该独立群由原群群主判断，本页仅供你查看。');
-	keyboard.push([{text:'返回分页列表',callback_data:'review:list:1'}]);
-	const chatId=String(callbackMessage?.chat?.id||actorId),messageId=Number(callbackMessage?.message_id)||0;
-	if(messageId>0){
-		const response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/editMessageText',{method:'POST',headers:{'Content-Type':'application/json'},
-			body:JSON.stringify({chat_id:chatId,message_id:messageId,text:lines.join('\n'),parse_mode:'HTML',reply_markup:{inline_keyboard:keyboard}})});
-		const result=await response.json();if(!response.ok&&result.description!=='Bad Request: message is not modified')throw new Error('编辑消息失败：'+String(result.description||response.status));
-	}else await sendTelegramMessageChunks(actorId,lines.join('\n'),{inline_keyboard:keyboard});
+	}else if(access.write&&row.decision&&!['normal','ad'].includes(row.status)){
+		keyboard.push([{text:'重试已登记的判断',callback_data:'review:retry:'+row.seq}]);
+	}
+	keyboard.push([{text:'刷新状态',callback_data:'review:open:'+row.seq},{text:'返回分页列表',callback_data:'review:list:1'}]);
+	const header='现场 #'+row.seq+' · 第 '+page+'/'+pages.length+' 段\n状态：'+adReviewStatus(row)+'\n'
+		+(access.write&&!row.decision?'已选 '+JSON.parse(row.review_sources||'[]').length+' 个位置；确认正常只更正选中的素材及本场景。\n':'')
+		+(notice?String(notice).slice(0,240)+'\n':'');
+	await renderAdReviewPage(actorId,callbackMessage,header+pages[page-1],keyboard);
 }
 
-async function sendAdReviewMaterial(env,actorId,row,key) {
+async function sendAdReviewMaterial(env,actorId,row,key,callbackMessage=null) {
+	const access=await adContentReviewAccess(env,actorId,row);if(!access.read)throw new Error('无权查看该现场');
 	const source=adReviewSources(row).find(source=>source.key===key);if(!source)throw new Error('没有该位置的原素材');
-	const e=JSON.parse(row.evaluation),s=e.snapshot||{},m=JSON.parse(row.message_json),media=extractAdMedia(m);
-	const kind=key==='avatar'?'avatar':'image',asset=await readAdReviewAsset(env,kind,source.value);
-	const method=key==='avatar'?'sendPhoto':key==='badge'?'sendDocument':key.startsWith('emoji')?'sendDocument':m.sticker?'sendSticker':media?.kind==='video'?'sendVideo':media?.kind==='animation'?'sendAnimation':'sendPhoto';
-	let fileId=key==='avatar'?s.originalProfile?.avatarFileId:key==='badge'?s.badgeMedia?.fileId||s.badgeMedia?.visionFileId:key.startsWith('emoji')?s.customEmojiMedia?.[Number(key.slice(5))]?.fileId||s.customEmojiMedia?.[Number(key.slice(5))]?.visionFileId:media?.fileId;
-	const field=method==='sendDocument'?'document':method==='sendSticker'?'sticker':method==='sendVideo'?'video':method==='sendAnimation'?'animation':'photo';
-	let response;
-	if(asset){const body=new FormData();body.append('chat_id',String(actorId));body.append(field,new Blob([asset.bytes],{type:asset.mime}),asset.file_name);response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/'+method,{method:'POST',body});}
-	else {if(!fileId)throw new Error('原始素材未能取得，不能把当前素材当作原图');response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/'+method,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:actorId,[field]:fileId})});}
-	const result=await response.json();if(!response.ok||!result.ok)throw new Error('原素材显示未完成：'+String(result.description||response.status));
-	await sendTelegramMessage(actorId,(asset?'检测时保存的原材料：':'原材料文件：')+source.label);
+	const s=JSON.parse(row.evaluation||'{}').snapshot||{},m=JSON.parse(row.message_json||'{}');
+	const custom=key==='badge'||key.startsWith('emoji');
+	let media=key==='avatar'?{fileId:s.originalProfile?.avatarFileId,visionFileId:s.originalProfile?.avatarFileId,fileUniqueId:s.avatarId,kind:'photo'}
+		:key==='badge'?s.badgeMedia:key.startsWith('emoji')?s.customEmojiMedia?.[Number(key.slice(5))]:s.originalMedia||extractAdMedia(m);
+	if(custom&&(!media?.fileId||!media?.visionFileId)){
+		const id=key==='badge'?s.badgeId:media?.id;
+		if(id){const resolved=(await resolveCustomEmojiStickers(env,[String(id)],{requireMedia:true}))[id]?.media;
+			if(resolved&&(!media?.fileUniqueId||resolved.fileUniqueId===media.fileUniqueId))media={...media,...resolved};}
+	}
+	if(!media)throw new Error('检测时素材未保存，无法取得原文件');
+	const kind=key==='avatar'?'avatar':'image',cacheKey=media.fileUniqueId||source.value;
+	const bodyAsset=await readAdReviewAsset(env,kind,cacheKey,'body');
+	const thumbAsset=await readAdReviewAsset(env,kind,cacheKey,'thumbnail');
+	let preview=bodyAsset||thumbAsset,thumbnail=!bodyAsset&&Boolean(thumbAsset),previewError='';
+	if(!preview&&media.visionFileId){
+		try {
+			const bytes=await adImageSimilarityDownload(env,{visionFileId:media.visionFileId});
+			const mime=sniffImageMime(bytes);if(!mime)throw new Error('取得的预览不是受支持的图片');
+			preview={bytes,mime,file_name:'preview.'+(mime==='image/jpeg'?'jpg':mime.split('/')[1])};
+			thumbnail=String(media.visionFileId)!==String(media.fileId);
+		}catch(error){previewError='预览画面获取未完成。';}
+	}
+	const blocks=[],files=[],add=(type,file,name)=>{
+		const part='review_file_'+files.length;files.push({key:part,bytes:file.bytes,mime:file.mime||'application/octet-stream',name});
+		blocks.push({type,[type]:{type,media:'attach://'+part}});
+	};
+	if(preview)add('photo',preview,preview.file_name||'preview.jpg');
+	const isSticker=custom||media.kind==='sticker';
+	let originalAttached=false,originalError='';
+	if(isSticker&&media.fileId){
+		// 原 file_id 按贴纸存储，不能冒充 photo/document；下载后重新上传原文件。
+		try {
+			const bytes=await adImageSimilarityDownload(env,{visionFileId:media.fileId});
+			const mime=sniffImageMime(bytes)|| (bytes[0]===31&&bytes[1]===139?'application/x-tgsticker':bytes[0]===26&&bytes[1]===69?'video/webm':'application/octet-stream');
+			const ext=mime==='application/x-tgsticker'?'tgs':mime==='video/webm'?'webm':mime==='application/octet-stream'?'bin':mime.split('/')[1];
+			add('document',{bytes,mime},'original.'+ext);originalAttached=true;
+		}catch(error){if(!preview)throw error;originalError='原文件获取未完成，可返回后重试。';}
+	}else if(media.fileId&&['video','animation','document'].includes(media.kind)){
+		const type=media.kind;blocks.push({type,[type]:{type,media:media.fileId}});
+	}
+	if(!blocks.length)throw new Error('原素材获取失败，不能用文件标识冒充预览');
+	const label=source.label+' · 现场 #'+row.seq+'\n'+(previewError|| (thumbnail?'缩略图预览；动态原文件未逐帧核验。':'实际保存或下载的素材。'))
+		+(originalAttached?'\n下方附原文件，可下载查看完整内容。':originalError?'\n'+originalError:'');
+	const returnPage=Math.floor(adReviewSources(row).findIndex(item=>item.key===key)/8)+1;
+	await renderAdReviewPage(actorId,callbackMessage,label,[[{text:'返回现场',callback_data:'review:page:'+row.seq+':'+returnPage},{text:'返回列表',callback_data:'review:list:1'}]],blocks,files);
 }
 
 async function handleAdContentReviewCommand(message,env) {
@@ -13598,37 +13686,55 @@ async function handleAdContentReviewCallback(callback,env) {
 	const actor=String(callback.from?.id||''),chat=callback.message?.chat;
 	if(callback.from?.is_bot||chat?.type!=='private'||String(chat.id)!==actor)return;
 	const [,action,number,key]=String(callback.data||'').split(':');
-	if(action==='list'){await answerAdVoteCallback(callback.id,'列表功能需要新对话查看');await showAdContentReviewList(env,actor,Number(number)||1);return;}
-	await ensureAdContentReviewTable(env);const row=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE seq=?').bind(Number(number)||0).first();
-	if(!row){await answerAdVoteCallback(callback.id,'现场不存在或已过期',true);return;}
-	const access=await adContentReviewAccess(env,actor,row);if(!access.read){await answerAdVoteCallback(callback.id,'权限不足',true);return;}
+	let row;
 	try {
-		if(action==='open'){await answerAdVoteCallback(callback.id,'正在加载');await editAdContentReviewMessage(env,actor,row,callback.message);return;}
-		if(action==='asset'){await answerAdVoteCallback(callback.id,'正在显示素材');await sendAdReviewMaterial(env,actor,row,key);return;}
-		if(action==='original'){
-			const m=JSON.parse(row.message_json);const copied=await copyMessageToChat(actor,row.chat_id,Number(m.message_id),{disableNotification:true});
-			await answerAdVoteCallback(callback.id,copied?.ok?'原消息已显示':'原消息已不可取，请用逐项素材按钮',!copied?.ok);return;
-		}
-		if(!access.write){await answerAdVoteCallback(callback.id,'独立群只允许原群群主判断',true);return;}
+		if(action==='list'){await answerAdVoteCallback(callback.id);await showAdContentReviewList(env,actor,Number(number)||1,callback.message,key);return;}
+		await ensureAdContentReviewTable(env);
+		row=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE seq=? AND expires_at>?').bind(Number(number)||0,Math.floor(Date.now()/1000)).first();
+		if(!row)throw new Error('现场不存在或已过期');
+		const access=await adContentReviewAccess(env,actor,row);if(!access.read)throw new Error('权限不足');
+		await answerAdVoteCallback(callback.id);
+		if(action==='open'||action==='page'||action==='original'){await editAdContentReviewMessage(env,actor,row,callback.message,Number(key)||1,'',action==='original');return;}
+		if(action==='asset'){await sendAdReviewMaterial(env,actor,row,key,callback.message);return;}
+		if(!access.write)throw new Error('当前账号无权判断该现场，或原处理范围已经变化');
+		if(row.source==='operator')throw new Error('该记录仅供查看');
+		const now=Math.floor(Date.now()/1000);
 		if(action==='pick'){
 			if(row.decision||!adReviewSources(row).some(source=>source.key===key))throw new Error('该位置不能修改');
 			const selected=JSON.parse(row.review_sources||'[]'),next=selected.includes(key)?selected.filter(item=>item!==key):selected.concat(key);
-			await env.DB.prepare("UPDATE ad_content_reviews SET review_sources=? WHERE id=? AND decision=''").bind(JSON.stringify(next),row.id).run();
-			await answerAdVoteCallback(callback.id,'已'+(next.includes(key)?'勾选':'取消')+'广告位置');
-			await editAdContentReviewMessage(env,actor,{...row,review_sources:JSON.stringify(next)},callback.message);
-			return;
+			const updated=await env.DB.prepare("UPDATE ad_content_reviews SET review_sources=?,status='viewing',lease_token='',lease_until=?,next_at=?,updated_at=? WHERE id=? AND decision='' AND review_sources=? AND NOT (status='processing' AND lease_until>?) RETURNING *")
+				.bind(JSON.stringify(next),now+1800,now+1800,now,row.id,row.review_sources,now).first();
+			if(!updated)throw new Error('处理状态或选择已经变化，请刷新再选择');
+			const page=Math.floor(adReviewSources(row).findIndex(source=>source.key===key)/8)+1;
+			await editAdContentReviewMessage(env,actor,updated,callback.message,page,'选择已保存；30 分钟内未确认将交回自动核验。');return;
 		}
-		if(action==='auto'){await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',next_at=?,lease_until=0,lease_token='' WHERE id=? AND decision=''").bind(Math.floor(Date.now()/1000),row.id).run();await queueAdContentReview(env,row.id,1);await answerAdVoteCallback(callback.id,'已交回自动核验');return;}
-		if(action==='ad'&&!JSON.parse(row.review_sources||'[]').length)throw new Error('先勾选实际含广告的位置');
+		if(action==='auto'||action==='retry'){
+			if(action==='auto'&&row.decision)throw new Error('已登记的人工判断不能被自动核验覆盖');
+			const updated=await env.DB.prepare("UPDATE ad_content_reviews SET status=CASE WHEN decision='normal' THEN 'normal_intent' ELSE 'pending' END,review_sources=CASE WHEN decision='' THEN '[]' ELSE review_sources END,next_at=?,lease_until=0,lease_token='',updated_at=? WHERE id=? AND NOT (status='processing' AND lease_until>?) AND status NOT IN ('normal','ad') RETURNING *")
+				.bind(now,now,row.id,now).first();
+			if(!updated)throw new Error('正在处理或已经结清，请刷新状态');
+			await queueAdContentReview(env,row.id,1);
+			await editAdContentReviewMessage(env,actor,updated,callback.message,1,'已登记重试。');return;
+		}
 		if(!['ad','normal'].includes(action))return;
-		if(row.decision){await answerAdVoteCallback(callback.id,'该现场已确认，无需重复点击');return;}
+		if(action==='ad'&&!JSON.parse(row.review_sources||'[]').length)throw new Error('先勾选实际含广告的位置');
+		if(row.decision)throw new Error('该现场已确认，无需重复点击');
 		const e=JSON.parse(row.evaluation);e.snapshot={...e.snapshot,reviewScope:access.local?'local':'global'};
-		await env.DB.prepare("UPDATE ad_content_reviews SET decision=?,decision_by=?,status=?,evaluation=?,next_at=?,lease_token='',lease_until=0 WHERE id=? AND decision=''")
-			.bind(action,actor,action==='normal'?'normal_intent':'pending',serializeAdDryRunEvaluation(e),Math.floor(Date.now()/1000),row.id).run();
-		await answerAdVoteCallback(callback.id,action==='normal'?'正常判断已登记，正在保存反例':'广告位置已确认，正在按原范围处理');
-		if(action==='normal')await finishAdNormalReview(env,{...row,decision:'normal',decision_by:actor,evaluation:serializeAdDryRunEvaluation(e)});
-		else await queueAdContentReview(env,row.id,1);
-	}catch(error){await sendTelegramMessage(actor,'本次确认未完成：'+String(error?.message||error));}
+		const updated=await env.DB.prepare("UPDATE ad_content_reviews SET decision=?,decision_by=?,status=?,evaluation=?,next_at=?,lease_token='',lease_until=0,updated_at=? WHERE id=? AND decision='' AND review_sources=? RETURNING *")
+			.bind(action,actor,action==='normal'?'normal_intent':'pending',serializeAdDryRunEvaluation(e),now,now,row.id,row.review_sources).first();
+		if(!updated)throw new Error('选择或判断已被另一操作更新，请刷新');
+		await queueAdContentReview(env,row.id,1);
+		if(action==='normal')await runAdContentReview(env,row.id);
+		const latest=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(row.id).first();
+		await editAdContentReviewMessage(env,actor,latest||updated,callback.message,1,action==='normal'?'正常判断已登记，完成情况见当前状态。':'广告判断已登记，将按原范围处理。');
+	}catch(error){
+		const note='本次操作未完成：'+String(error?.message||error);
+		try {
+			if(row){const latest=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(row.id).first();
+				await editAdContentReviewMessage(env,actor,latest||row,callback.message,1,note);}
+			else await answerAdVoteCallback(callback.id,note.slice(0,180),true);
+		}catch(_){await answerAdVoteCallback(callback.id,note.slice(0,180),true);}
+	}
 }
 
 async function finishAdNormalReview(env,row) {
@@ -13658,8 +13764,8 @@ async function finishAdNormalReview(env,row) {
 			if(!result.complete)throw new Error('该现场的自动处置撤销尚未完成，已保留正常判断');}
 	}
 	await env.DB.prepare("UPDATE ad_content_reviews SET status='normal',evaluation=?,lease_until=0,lease_token='' WHERE id=? AND decision='normal'")
-		.bind(serializeAdDryRunEvaluation({...evaluation,normalFeedback:true}),row.id).run();
-	await sendTelegramMessage(row.decision_by,'✅ 该完整场景已确认正常并写入对应反例。\n'+(selected.length?'已按勾选位置撤销素材误判。':'未改变未勾选的素材分类。')+'新内容和新资料仍按正常检测流程检查。');
+		.bind(serializeAdDryRunEvaluation({...evaluation,normalFeedback:true,pendingReason:''}),row.id).run();
+	return {complete:true,normal:true};
 }
 
 async function buildHumanAdReview(env,row) {
@@ -13715,8 +13821,8 @@ async function saveAdContentReview(env, message, evaluation, options = {}) {
 	if(new TextEncoder().encode(serialized).length>128*1024)throw new Error('待核原消息超过存储上限，未裁剪为完整现场');
 	const status=options.status || 'pending';
 	await env.DB.prepare('INSERT INTO ad_content_reviews (id,user_id,chat_id,source,message_json,evaluation,status,next_at,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) '
-		+ 'ON CONFLICT(id) DO UPDATE SET message_json=excluded.message_json,evaluation=excluded.evaluation,updated_at=excluded.updated_at '
-		+ 'WHERE ad_content_reviews.status IN (\'pending\',\'waiting\',\'manual\') AND ad_content_reviews.lease_until<=?')
+		+ 'ON CONFLICT(id) DO UPDATE SET message_json=excluded.message_json,evaluation=excluded.evaluation,status=excluded.status,next_at=excluded.next_at,updated_at=excluded.updated_at '
+		+ 'WHERE ad_content_reviews.status IN (\'pending\',\'waiting\',\'manual\',\'partial\',\'clean\') AND ad_content_reviews.decision=\'\' AND ad_content_reviews.lease_until<=?')
 		.bind(id,uid,gid,source,serialized,serializeAdDryRunEvaluation(evaluation),status,now+30,now,now,now+7*86400,now).run();
 	if (status==='pending') {
 		const queued=await env.DB.prepare('SELECT status,next_at FROM ad_content_reviews WHERE id=?').bind(id).first();
@@ -13735,14 +13841,13 @@ async function queueAdContentReview(env,id,delay=30) {
 async function runAdContentReview(env,id) {
 	if(!id||!env?.DB)return {complete:true};
 	await ensureAdContentReviewTable(env);
-	const confirmed=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(id).first();
-	if(confirmed?.decision==='normal'&&confirmed.status!=='normal'){await finishAdNormalReview(env,confirmed);return {complete:true,normal:true};}
 	const now=Math.floor(Date.now()/1000),token=crypto.randomUUID();
-	const row=await env.DB.prepare('UPDATE ad_content_reviews SET status=\'processing\',lease_until=?,lease_token=? WHERE id=? AND status IN (\'pending\',\'waiting\',\'processing\') AND next_at<=? AND lease_until<=? AND expires_at>? RETURNING *')
+	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',review_sources='[]',lease_until=0,lease_token='',next_at=? WHERE id=? AND status='viewing' AND decision='' AND lease_until<=?").bind(now,id,now).run();
+	const row=await env.DB.prepare('UPDATE ad_content_reviews SET status=\'processing\',lease_until=?,lease_token=? WHERE id=? AND status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\') AND next_at<=? AND lease_until<=? AND expires_at>? RETURNING *')
 		.bind(now+900,token,id,now,now,now).first();
 	if(!row){const existing=await env.DB.prepare('SELECT status,next_at,lease_until,expires_at FROM ad_content_reviews WHERE id=?').bind(id).first();
-		return {complete:!existing||!['pending','waiting','processing'].includes(existing.status)||Number(existing.expires_at)<=now,
-			...existing&&Number(existing.expires_at)>now&&['pending','waiting','processing'].includes(existing.status)?{retryAfter:Math.max(1,Math.min(43200,Math.max(Number(existing.next_at),Number(existing.lease_until))-now))}:{} };}
+		return {complete:!existing||!['pending','waiting','processing','normal_intent','viewing'].includes(existing.status)||Number(existing.expires_at)<=now,
+			...existing&&Number(existing.expires_at)>now&&['pending','waiting','processing','normal_intent','viewing'].includes(existing.status)?{retryAfter:Math.max(1,Math.min(43200,Math.max(Number(existing.next_at),Number(existing.lease_until))-now))}:{} };}
 	let evaluation=null;
 	const save=async(status,nextAt=now)=>{
 		const updated=await env.DB.prepare('UPDATE ad_content_reviews SET status=?,evaluation=?,attempts=attempts+1,next_at=?,lease_until=0,lease_token=\'\',updated_at=? WHERE id=? AND lease_token=? AND status=\'processing\'')
@@ -13750,6 +13855,7 @@ async function runAdContentReview(env,id) {
 		return Number(updated?.meta?.changes)===1;
 	};
 	try {
+		if(row.decision==='normal')return await finishAdNormalReview(env,row);
 		if((await readGlobalDryRunState(env,{strict:true})).on){await save('pending',now+60);return {complete:false,retryAfter:60};}
 		const message=JSON.parse(row.message_json),uid=String(row.user_id),gid=String(row.chat_id);
 		if(!isConfiguredGroup(gid)&&!isKillerModeGroup(gid)||isAdExemptBot(message.from)||isAdDetectionExemptUser(uid)
@@ -13765,19 +13871,24 @@ async function runAdContentReview(env,id) {
 			if(current?.status!=='processing'||current.lease_token!==token)return {complete:true};
 			const enforced=await enforceAdDetection(env,{userId:uid,chatId:gid,chatTitle:String(message.chat.title||''),messageId:Number(message.message_id)||null,message},evaluation,
 				{config:result.config,whitelist:result.whitelist,fullEvaluationCollected:true,automaticCaseId:'content:'+id,
-					skipLearning:human?.local===true,reviewGuard:async()=>{const state=await env.DB.prepare('SELECT decision,status FROM ad_content_reviews WHERE id=?').bind(id).first();return state?.decision!=='normal'&&state?.status==='processing';}});
+					skipLearning:human?.local===true,reviewGuard:async()=>{const state=await env.DB.prepare('SELECT decision,status,lease_token FROM ad_content_reviews WHERE id=?').bind(id).first();return state?.decision!=='normal'&&state?.status==='processing'&&state?.lease_token===token;}});
 			const after=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(id).first();
 			if(after?.decision==='normal'){await finishAdNormalReview(env,after);return {complete:true,normal:true};}
-			const success=enforced?.banned!==false&&(enforced?.banResults||[]).every(target=>target.ok===true);
-			await save(success?'ad':'action_failed');return {complete:true,ad:success};
+			const success=enforced?.banned===true&&enforced.complete===true;
+			if(!success)throw new Error('广告处置尚未完成：'+String(enforced?.reason||'部分目标未成功'));
+			await save('ad');return {complete:true,ad:true};
 		}
-		if(!isAdDrillPendingEvaluation(evaluation,result.llmMemo)){await save('clean');return {complete:true,clean:true};}
+		if(!isAdDrillPendingEvaluation(evaluation,result.llmMemo)){
+			const partial=Boolean(evaluation.drillIncomplete?.length);
+			await save(partial?'partial':'clean');return {complete:true,...partial?{partial:true}:{clean:true}};
+		}
 		const attempts=Number(row.attempts)+1,delay=attempts>=3?86400:30*Math.pow(4,attempts);
 		await save(attempts>=3?'waiting':'pending',now+delay);return {complete:false,retryAfter:Math.min(43200,delay)};
 	}catch(error){
 		console.error('[内容待核] 核验未完成: '+formatD1SchemaError(error));
 		evaluation=evaluation||JSON.parse(row.evaluation);evaluation.pendingReason=String(error?.message||error);
-		await save('pending',now+120);return {complete:false,retryAfter:120};
+		const attempts=Number(row.attempts)+1,delay=attempts>=3?86400:120*Math.pow(4,attempts-1);
+		await save(attempts>=3?'waiting':'pending',now+delay);return {complete:false,retryAfter:Math.min(43200,delay)};
 	}
 }
 
@@ -13787,6 +13898,7 @@ async function resumeAdContentReviews(env) {
 	if(!D1_AD_CONTENT_REVIEW_INIT.get(env.DB)&&!await d1TableExists(env,'ad_content_reviews'))return {queued:0};
 	await ensureAdContentReviewTable(env);
 	const now=Math.floor(Date.now()/1000);
+	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',review_sources='[]',next_at=?,lease_until=0,lease_token='' WHERE status='viewing' AND decision='' AND lease_until<=? AND expires_at>?").bind(now,now,now).run();
 	const rows=(await env.DB.prepare('SELECT id FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\') AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY next_at LIMIT 20').bind(now,now,now).all()).results||[];
 	let queued=0;for(const row of rows)if(await queueAdContentReview(env,row.id,1))queued++;
 	return {queued};
@@ -13794,13 +13906,14 @@ async function resumeAdContentReviews(env) {
 
 function isAdDrillPendingEvaluation(evaluation, memo = null) {
 	if (!evaluation || evaluation.verdict === 'ban' || evaluation.normalFeedback || evaluation.groupFeedback) return false;
-	if (Array.isArray(evaluation.drillIncomplete) && evaluation.drillIncomplete.length) return true;
+	const incomplete = Array.isArray(evaluation.contentReviewIncomplete) ? evaluation.contentReviewIncomplete : evaluation.drillIncomplete;
+	if (Array.isArray(incomplete) && incomplete.length) return true;
 	const answer = memo?.answer;
 	if (answer && !answer.skipped && answer.ad === false && answer.confidenceGiven !== false
 		&& Number(answer.confidence) >= AD_LLM_CONF) return false;
 	return evaluation.verdict === 'pending' || evaluation.drillReviewStatus === 'pending'
 		|| evaluation.positionNeedsReview === true || evaluation.positionDecision?.needsVerification === true
-		|| answer?.skipped === true;
+		|| answer?.skipped === true && (!AD_LLM_SKIP_KINDS[answer.reason] || (answer.kind || adLLMSkipKind(answer.reason)) === AD_LLM_SKIP_DEGRADE);
 }
 
 function freezeAdDrillPendingMessage(message, includeReply = true) {
@@ -28000,6 +28113,18 @@ const AD_BADGE_BAN_HITS = 3;
 // 我按净分写的第一版在测试里是绿的（看着像修好了），改成数正分判据条数才真红 → 真绿。
 const AD_AVATAR_HITS_CORROBORATION = 3;
 
+// 人工会员标反馈按最终值写入，重复执行不会累加命中次数；失败交给复核任务重试。
+async function upsertAdBadge(env, badgeId, patch = {}) {
+	const key=String(badgeId||'');
+	if(!env?.DB||!key||!['ad','clean'].includes(patch.verdict))throw new Error('会员标反馈缺少有效素材或结论');
+	const now=Math.floor(Date.now()/1000),hits=patch.verdict==='clean'?0:Math.max(1,Number(patch.hits)||1);
+	const result=await env.DB.prepare('INSERT INTO ad_badges (badge_id,verdict,hits,source,last_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?) '
+		+'ON CONFLICT(badge_id) DO UPDATE SET verdict=excluded.verdict,hits=excluded.hits,source=excluded.source,last_user_id=excluded.last_user_id,updated_at=excluded.updated_at')
+		.bind(key,patch.verdict,hits,String(patch.source||'manual'),String(patch.lastUserId||''),now,now).run();
+	if(result?.success===false)throw new Error('会员标反馈写入失败');
+	return true;
+}
+
 // 读一条会员标指纹。查不到返回 null（= 未入库，既不是 ad 也不是 clean）。
 async function readAdBadge(env, badgeId) {
 	const key = String(badgeId || '');
@@ -28026,7 +28151,8 @@ async function learnAdBadgeOnBan(env, badgeId, userId) {
 			'INSERT INTO ad_badges (badge_id, verdict, hits, source, last_user_id, created_at, updated_at) '
 			+ 'VALUES (?, \'ad\', 1, \'learned\', ?, ?, ?) '
 			+ 'ON CONFLICT(badge_id) DO UPDATE SET verdict = \'ad\', hits = ad_badges.hits + 1, '
-			+ 'source = \'learned\', last_user_id = excluded.last_user_id, updated_at = excluded.updated_at'
+			+ 'source = \'learned\', last_user_id = excluded.last_user_id, updated_at = excluded.updated_at '
+			+ 'WHERE ad_badges.source NOT IN (\'owner\',\'manual\')'
 		).bind(key, String(userId || ''), now, now).run();
 		return true;
 	} catch (error) {
@@ -31147,7 +31273,7 @@ async function rescanAdMember(env, row, options = {}) {
   const evaluation=result.evaluation,pending=isAdDrillPendingEvaluation(evaluation,result.llmMemo);
   await markAdProfileVerdict(env,userId,hash,pending?'pending':evaluation.verdict);
   if(evaluation.verdict!=='ban'){
-    if(pending&&!drill)await saveAdContentReview(env,inspection,evaluation);
+    if(!drill&&(pending||evaluation.drillIncomplete?.length))await saveAdContentReview(env,inspection,evaluation,{status:pending?'pending':'partial'});
     return {scanned:true,banned:false,pending};
   }
   if(await isAdminInAnyConfiguredGroup(userId,chatId))return {scanned:true,banned:false,reason:'admin'};
@@ -35614,8 +35740,8 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		+ ' 指纹=' + learned + ' AI样本=' + (sampleAdded ? 1 : 0)
 	);
 	return { banned: true, seq, blacklistCode, banSummary, learned, sampleAdded, skeletons, local: automatic && localScope, automatic, autoCaseId,
-		complete: options.drillCloseReplay === true ? blacklistCode !== 'ERROR' && banResults.length > 0 && banResults.every(row => row.ok === true) : undefined,
-		banResults: options.drillCloseReplay === true ? banResults : undefined };
+		complete: options.drillCloseReplay === true || options.reviewGuard ? blacklistCode !== 'ERROR' && banResults.length > 0 && banResults.every(row => row.ok === true) : undefined,
+		banResults: options.drillCloseReplay === true || options.reviewGuard ? banResults : undefined };
 }
 
 // === 单个入群成员的广告筛查（两条入群路径共用）===
@@ -35665,7 +35791,8 @@ async function screenAdJoinMember(env, member, options = {}) {
     if(configured&&result.profile.bioFetched)await markAdBioChecked(env,userId,now);
     await recordAdJoinCheck(env,{userId,chatId,evaluation:pending?{...evaluation,verdict:'pending'}:evaluation});
     if(evaluation.verdict!=='ban'){
-      if(pending&&!drill)await saveAdContentReview(env,inspection,evaluation);return pending?'pending':'clean';
+      if(!drill&&(pending||evaluation.drillIncomplete?.length))await saveAdContentReview(env,inspection,evaluation,{status:pending?'pending':'partial'});
+      return pending?'pending':evaluation.drillIncomplete?.length?'partial':'clean';
     }
     if(await isAdminInAnyConfiguredGroup(userId,chatId))return 'skipped';
     const enforced=await enforceAdDetection(env,{userId,chatId,chatTitle:options.chatTitle||'',messageId:null},evaluation,
@@ -35736,7 +35863,8 @@ async function detectAdOnMessage(message, env) {
 		await markAdBioChecked(env, userId, Math.floor(Date.now() / 1000));
 	}
 	if (evaluation.verdict !== 'ban') {
-		if(isAdDrillPendingEvaluation(evaluation,result.llmMemo))await saveAdContentReview(env,message,evaluation);
+		const pending=isAdDrillPendingEvaluation(evaluation,result.llmMemo);
+		if(pending||evaluation.drillIncomplete?.length)await saveAdContentReview(env,message,evaluation,{status:pending?'pending':'partial'});
 		return false;
 	}
 	if (await isAdminInAnyConfiguredGroup(userId, chat.id)) return false;
