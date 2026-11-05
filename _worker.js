@@ -5293,6 +5293,7 @@ function translateTelegramError(description, options = {}) {
 	if (lower.includes('rich_message_document_invalid')) return { 中文:'页面中的原文件格式不受支持，暂时无法展示附件', 建议:'可先查看预览或打开原表情包' };
 	if (lower.includes('rich_message_photo_invalid')) return { 中文:'页面中的预览图片无效或格式不受支持', 建议:'返回现场后重新获取素材' };
 	if (/custom[_ ]emoji|premium_account_required/i.test(desc)) return { 中文:'表情状态暂时无法直接展示，可能是表情已失效或机器人没有展示权限', 建议:'打开原表情包查看' };
+	if (/participant_id_invalid|member not found/i.test(desc)) return { 中文:'平台暂时无法识别该用户在群内的状态，处置结果仍需核对', 建议:'保留失败回执，待平台恢复识别后重试' };
 	if (lower.includes('wrong file identifier') || lower.includes('file_id_invalid') || lower.includes('file reference expired')) return { 中文:'原文件标识无效或已过期', 建议:'返回现场后重新获取素材' };
 
 	// 更具体的错误码先匹配（Telegram 有时同时携带多个特征）
@@ -13597,7 +13598,7 @@ function adReviewTextPages(text,limit=3400) {
 function adReviewStatus(row) {
 	const labels={pending:'等待核验',waiting:'核验未完成，已降低重试频率',processing:'自动处理中',viewing:'人工选择中（30 分钟后恢复）',
 		normal_intent:'正常判断已登记，正在保存',normal:'人工确认正常',ad:'广告已处置',clean:'已核验，未发现广告',
-		partial:'已查可用画面，动态原文件未完整核验',sample:'待人工确认',action_failed:'处置未完成',manual:'待人工处理',skipped:'已按豁免或当前群范围跳过'};
+		partial:'已查可用画面，动态原文件未完整核验',sample:'待人工确认',action_failed:'已确认广告，处置尚未完成',manual:'待人工处理',skipped:'已按豁免或当前群范围跳过'};
 	return labels[row.status]||'状态暂无法识别，请刷新或查看后台日志';
 }
 
@@ -13620,7 +13621,7 @@ function adReviewBadgeDescription(snapshot) {
 	return profile.isPremium===true?'⭐ 默认会员星标（未设置表情状态）':'未设置表情状态';
 }
 
-const AD_REVIEW_PENDING_CONDITION="status IN ('pending','waiting','processing','viewing','normal_intent','sample','manual','action_failed')";
+const AD_REVIEW_PENDING_CONDITION="status IN ('pending','waiting','processing','viewing','normal_intent','sample','manual')";
 
 async function adReviewDuplicateKey(row){
 	const e=JSON.parse(row.evaluation||'{}'),s=e.snapshot||{};
@@ -13700,20 +13701,21 @@ async function showAdContentReviewList(env,actorId,page=1,callbackMessage=null,f
 	await ensureAdContentReviewTable(env);page=Math.max(1,Number(page)||1);
 	let groups=[];if(!isPrimaryOwner(actorId)){for(const gid of INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length)throw new Error('仅第一主人或独立群群主可查看待核内容');}
 	const scope=isPrimaryOwner(actorId)?'':' AND chat_id IN (SELECT value FROM json_each(?))',args=isPrimaryOwner(actorId)?[]:[JSON.stringify(groups)];
-	const partial=filter==='partial';
-	const where=(partial?"status='partial'":AD_REVIEW_PENDING_CONDITION)+' AND expires_at>?'+scope;
+	const partial=filter==='partial',actions=filter==='actions';
+	const where=(partial?"status='partial'":actions?"status='action_failed'":AD_REVIEW_PENDING_CONDITION)+' AND expires_at>?'+scope;
 	const now=Math.floor(Date.now()/1000),count=await env.DB.prepare('SELECT COUNT(*) AS n FROM ad_content_reviews WHERE '+where).bind(now,...args).first();
 	const total=Number(count?.n||0),pages=Math.max(1,Math.ceil(total/10));page=Math.min(page,pages);
 	const rows=(await env.DB.prepare('SELECT seq,chat_id,user_id,status,evaluation FROM ad_content_reviews WHERE '+where+' ORDER BY seq DESC LIMIT 10 OFFSET ?').bind(now,...args,(page-1)*10).all()).results||[];
-	const lines=[(partial?'仅完成可用画面核验':'待核与待确认现场')+' · 第 '+page+'/'+pages+' 页，共 '+total+' 条',
-		partial?'以下记录保留完整核验范围，可继续人工查看原文件。':'点击条目查看现场；仅查看不会暂停自动核验。'];
+	const lines=[(partial?'仅完成可用画面核验':actions?'已确认广告 · 处置待完成':'待核与待确认现场')+' · 第 '+page+'/'+pages+' 页，共 '+total+' 条',
+		partial?'以下记录保留完整核验范围，可继续人工查看原文件。':actions?'内容结论已保留；后台只重试处置，不重复进行内容判定。各群失败原因可在详情核查。':'点击条目查看现场；仅查看不会暂停自动核验。'];
 	if(await isAdContentReviewCapturePaused(env))lines.push('新增待核与提醒已暂停；广告检测、已有记录核验和人工处理继续。');
 	const keyboard=[];
 	for(const row of rows){const s=JSON.parse(row.evaluation||'{}').snapshot||{},label='#'+row.seq+' '+String(s.name||'用户').slice(0,40)+' · '+adReviewStatus(row);
 		lines.push(label);keyboard.push([{text:label.slice(0,60),callback_data:'review:open:'+row.seq}]);}
 	const navigation=[];if(page>1)navigation.push({text:'上一页',callback_data:'review:list:'+(page-1)+':'+filter});
 	if(page<pages)navigation.push({text:'下一页',callback_data:'review:list:'+(page+1)+':'+filter});if(navigation.length)keyboard.push(navigation);
-	keyboard.push([{text:partial?'返回待核列表':'查看仅核验画面的记录',callback_data:'review:list:1:'+(partial?'pending':'partial')}]);
+	keyboard.push([{text:partial||actions?'返回待核列表':'查看仅核验画面的记录',callback_data:'review:list:1:'+(partial||actions?'pending':'partial')}]);
+	if(!actions)keyboard.push([{text:'查看已确认但处置未完成',callback_data:'review:list:1:actions'}]);
 	keyboard.push([{text:'查看重复用户',callback_data:'review:duplicates:1'}]);
 	await renderAdReviewPage(actorId,callbackMessage,lines.join('\n'),keyboard);
 }
@@ -13739,7 +13741,8 @@ async function editAdContentReviewMessage(env,actorId,row,callbackMessage,page=1
 		'实际采集范围',...(e.drillIncomplete||[]).map(adReviewDiagnosticText),
 		'头像读取文字：'+(s.avatarText||s.rawAvatarText||'未读取或未核实'),
 		'会员标读取文字：'+(s.badgeText||'未读取或未核实'),
-		'正文素材读取文字：'+(s.customEmojiText||'见原素材'),...(e.reasons||[]).map(String)];
+		'正文素材读取文字：'+(s.customEmojiText||'见原素材'),...(e.reasons||[]).map(String),
+		...(e.reviewAction?['','实际处置回执',...(e.reviewAction.banResults||[]).map(result=>'群 '+result.groupId+'：'+(result.ok?'已执行或已核对':'未完成；'+toChineseErrorText(result.error||'尚未取得完成回执')))]:[])];
 	const sources=adReviewSources(row),pages=adReviewTextPages(lines.join('\n'));
 	const duplicates=!row.decision&&!e.reviewAction&&!e.reviewDuplicate&&row.source!=='operator'&&!busy?await adReviewMatchingDuplicates(env,row):{rows:[]};
 	const groupCount=e.reviewDuplicate?await env.DB.prepare("SELECT COUNT(*) AS n,SUM(CASE WHEN status IN ('normal','ad','clean','skipped') THEN 1 ELSE 0 END) AS done FROM ad_content_reviews WHERE json_valid(evaluation) AND json_extract(evaluation,'$.reviewDuplicate.representativeId')=?").bind(e.reviewDuplicate.representativeId).first():null;
@@ -13939,7 +13942,7 @@ async function finishAdNormalReview(env,row) {
 	const access=await adContentReviewAccess(env,row.decision_by,row);if(!access.write)throw new Error('判断权限或群模式已变化，未扩展原处理范围');
 	const evaluation=JSON.parse(row.evaluation||'{}'),snapshot=evaluation.snapshot||{},message=JSON.parse(row.message_json||'{}');
 	const key=snapshot.groupAdContextKey||await buildGroupAdContextKey({message},evaluation);
-	const selected=JSON.parse(row.review_sources||'[]'),caseId=evaluation.reviewDuplicate?.caseId||evaluation.reviewBatch?.caseId||'content:'+row.id;
+	const selected=JSON.parse(row.review_sources||'[]'),caseId=evaluation.reviewDuplicate?.caseId||evaluation.assistedReview?.caseId||evaluation.reviewBatch?.caseId||'content:'+row.id;
 	if(access.local){
 		const localSnapshot={...snapshot,automatic:true,punishmentScope:'local',punishmentChatId:row.chat_id,autoCaseId:caseId,groupAdContextKey:key,
 			imageId:selected.some(item=>['image','sticker'].includes(item))?snapshot.imageId:'',avatarId:selected.includes('avatar')?snapshot.avatarId:'',
@@ -14073,8 +14076,8 @@ async function runAdContentReview(env,id,options={}) {
 	const result=await runAdContentReviewSingle(env,id,options);
 	if(!id||!env?.DB||!result.complete)return result;
 	const parent=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(id).first(),e=JSON.parse(parent?.evaluation||'{}');
-	if(e.reviewDuplicate?.representativeId!==id||!['normal','ad','clean','partial','skipped'].includes(parent?.status))return result;
-	const children=(await env.DB.prepare("SELECT id FROM ad_content_reviews WHERE decision<>'' AND json_valid(evaluation) AND json_extract(evaluation,'$.reviewDuplicate.representativeId')=? AND id<>? AND status IN ('pending','waiting','normal_intent')").bind(id,id).all()).results||[];
+	if(!['normal','ad','clean','partial','skipped'].includes(parent?.status))return result;
+	const children=(await env.DB.prepare("SELECT id FROM ad_content_reviews WHERE json_valid(evaluation) AND (json_extract(evaluation,'$.reviewDuplicate.representativeId')=? OR json_extract(evaluation,'$.assistedReview.parentId')=?) AND id<>? AND status IN ('pending','waiting','normal_intent','action_failed')").bind(id,id,id).all()).results||[];
 	for(const child of children){
 		try{
 			await env.DB.prepare('UPDATE ad_content_reviews SET next_at=? WHERE id=? AND lease_until<=?').bind(Math.floor(Date.now()/1000),child.id,Math.floor(Date.now()/1000)).run();
@@ -14090,11 +14093,11 @@ async function runAdContentReviewSingle(env,id,options={}) {
 	await ensureAdContentReviewTable(env);
 	const now=Math.floor(Date.now()/1000),token=crypto.randomUUID();
 	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',review_sources='[]',lease_until=0,lease_token='',next_at=? WHERE id=? AND status='viewing' AND decision='' AND lease_until<=?").bind(now,id,now).run();
-	const row=await env.DB.prepare('UPDATE ad_content_reviews SET status=\'processing\',lease_until=?,lease_token=? WHERE id=? AND status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\') AND next_at<=? AND lease_until<=? AND expires_at>? RETURNING *')
+	const row=await env.DB.prepare('UPDATE ad_content_reviews SET status=\'processing\',lease_until=?,lease_token=? WHERE id=? AND status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\') AND next_at<=? AND lease_until<=? AND expires_at>? RETURNING *')
 		.bind(now+900,token,id,now,now,now).first();
 	if(!row){const existing=await env.DB.prepare('SELECT status,next_at,lease_until,expires_at FROM ad_content_reviews WHERE id=?').bind(id).first();
-		return {complete:!existing||!['pending','waiting','processing','normal_intent','viewing'].includes(existing.status)||Number(existing.expires_at)<=now,
-			...existing&&Number(existing.expires_at)>now&&['pending','waiting','processing','normal_intent','viewing'].includes(existing.status)?{retryAfter:Math.max(1,Math.min(43200,Math.max(Number(existing.next_at),Number(existing.lease_until))-now))}:{} };}
+		return {complete:!existing||!['pending','waiting','processing','normal_intent','viewing','action_failed'].includes(existing.status)||Number(existing.expires_at)<=now,
+			...existing&&Number(existing.expires_at)>now&&['pending','waiting','processing','normal_intent','viewing','action_failed'].includes(existing.status)?{retryAfter:Math.max(1,Math.min(43200,Math.max(Number(existing.next_at),Number(existing.lease_until))-now))}:{} };}
 	let evaluation=null;
 	const save=async(status,nextAt=now)=>{
 		const updated=await env.DB.prepare('UPDATE ad_content_reviews SET status=?,evaluation=?,attempts=attempts+1,next_at=?,lease_until=0,lease_token=\'\',updated_at=? WHERE id=? AND lease_token=? AND status=\'processing\'')
@@ -14114,6 +14117,7 @@ async function runAdContentReviewSingle(env,id,options={}) {
 			}
 			const shared=JSON.parse(parent.evaluation||'{}');
 			if(shared.reviewDuplicate?.key!==duplicate.key)throw new Error('代表现场的合并关系不一致，未推断本条结果');
+			evaluation.verdict=shared.verdict;
 			if(parent.status==='ad'){
 				if(shared.reviewAction?.complete!==true)throw new Error('代表现场广告处置尚未完成');
 				const message=JSON.parse(row.message_json||'{}'),deletion=Number(message.message_id)>0?await deleteMessage(row.chat_id,message.message_id):{ok:true,notApplicable:true};
@@ -14131,8 +14135,33 @@ async function runAdContentReviewSingle(env,id,options={}) {
 			||await isAdUserWhitelisted(env,uid)||await resolveLocalAdDetectionSkip(env,gid,uid)||await isAdminForAdDetection(gid,uid)||await isConfiguredGroupAdmin(env,uid)){
 			await save('skipped');return {complete:true};
 		}
-		const human=row.decision==='ad'?await buildHumanAdReview(env,row):null;
-		const result=human?{evaluation:human.evaluation,config:loadAdDetectionConfig(env),whitelist:await loadAdDomainWhitelist(env)}
+		const retryingAction=original.verdict==='ban'&&Boolean(original.reviewAction),assisted=original.assistedReview;
+		if(row.decision==='ad'&&!(await adContentReviewAccess(env,row.decision_by,row)).write)throw new Error('原人工判断权限或处理范围已变化');
+		if(assisted){
+			if(assisted.source!=='assistant_remaining_review_20261105'||assisted.verdict!=='ban'||await adReviewDuplicateKey(row)!==assisted.contentKey
+				||!(await adContentReviewAccess(env,assisted.authorizedBy,row)).write)throw new Error('辅助核验的授权或原始现场已变化');
+			if(assisted.parentId){
+				const parent=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(assisted.parentId).first();
+				if(!parent||parent.user_id!==row.user_id||parent.chat_id!==row.chat_id||await adReviewDuplicateKey(parent)!==assisted.parentContentKey)throw new Error('关联证据或原群范围已变化，未复用用户处置');
+				const shared=JSON.parse(parent.evaluation||'{}');evaluation={...original,verdict:'ban'};
+				if(['clean','normal','skipped'].includes(parent.status)){
+					evaluation.verdict='pass';evaluation.normalFeedback=shared.normalFeedback===true;evaluation.pendingReason='';
+					await save(parent.status);return {complete:true,duplicate:true};
+				}
+				if(parent.status!=='ad'||shared.reviewAction?.complete!==true){
+					evaluation.reviewAction={...shared.reviewAction,complete:false};evaluation.pendingReason='已核实广告内容，等待代表现场 #'+parent.seq+' 的处置完成';
+					await save('action_failed',now+86400);return {complete:false,retryAfter:43200};
+				}
+				const deletion=assisted.deleteMessage===true&&Number(message.message_id)>0?await deleteMessage(gid,message.message_id):{ok:true,notApplicable:true};
+				evaluation.reviewAction={...shared.reviewAction,messageDeletion:deletion};
+				if(!deletion.ok)throw new Error('关联违规消息删除未完成：'+String(deletion.error||deletion.description||'请稍后重试'));
+				evaluation.pendingReason='';await save('ad');return {complete:true,duplicate:true};
+			}
+		}
+		const human=!retryingAction&&!assisted&&row.decision==='ad'?await buildHumanAdReview(env,row):null;
+		const known=retryingAction?original:assisted?{...original,verdict:'ban',positionHardBan:true,positionHardBase:true,
+			reasons:[...(original.reasons||[]),'本次辅助核验：'+assisted.reason]}:human?.evaluation;
+		const result=known?{evaluation:known,config:loadAdDetectionConfig(env),whitelist:await loadAdDomainWhitelist(env)}
 			:await collectGlobalDryRunEvaluation(env,message,null,{normalDetection:true,scopeChatId:gid,source:'content_retry',refreshProfile:true,
 				forceReview:true,forceMaterialReview:options.forceMaterialReview===true,profile:options.profile});
 		evaluation=result.evaluation;
@@ -14142,7 +14171,7 @@ async function runAdContentReviewSingle(env,id,options={}) {
 			if(current?.status!=='processing'||current.lease_token!==token)return {complete:true};
 			const enforced=await enforceAdDetection(env,{userId:uid,chatId:gid,chatTitle:String(message.chat.title||''),messageId:Number(message.message_id)||null,message},evaluation,
 				{config:result.config,whitelist:result.whitelist,fullEvaluationCollected:true,automaticCaseId:'content:'+id,
-					skipLearning:human?.local===true||Boolean(options.batchId),skipLinked:Boolean(options.batchId),suppressNotify:Boolean(options.batchId),
+					skipLearning:human?.local===true||Boolean(options.batchId)||retryingAction||Boolean(assisted),skipLinked:Boolean(options.batchId)||retryingAction||Boolean(assisted),suppressNotify:Boolean(options.batchId)||Boolean(assisted),
 					reviewGuard:async()=>{const state=await env.DB.prepare('SELECT decision,status,lease_token FROM ad_content_reviews WHERE id=?').bind(id).first();return state?.decision!=='normal'&&state?.status==='processing'&&state?.lease_token===token;}});
 			evaluation.reviewAction={banned:enforced?.banned===true,complete:enforced?.complete===true,blacklistCode:enforced?.blacklistCode||'',ownerSnapshotSeq:enforced?.seq||null,
 				banResults:enforced?.banResults||[],reason:enforced?.reason||'',messageDeletion:enforced?.messageDeletion||null};
@@ -14161,12 +14190,12 @@ async function runAdContentReviewSingle(env,id,options={}) {
 			await save(partial?'partial':'clean');return {complete:true,...partial?{partial:true}:{clean:true}};
 		}
 		const attempts=Number(row.attempts)+1,delay=attempts>=3?86400:30*Math.pow(4,attempts);
-		await save(attempts>=3?'waiting':'pending',now+delay);return {complete:false,retryAfter:Math.min(43200,delay)};
+		await save(evaluation?.verdict==='ban'&&evaluation.reviewAction?'action_failed':attempts>=3?'waiting':'pending',now+delay);return {complete:false,retryAfter:Math.min(43200,delay)};
 	}catch(error){
 		console.error('[内容待核] 核验未完成: '+formatD1SchemaError(error));
 		evaluation=evaluation||JSON.parse(row.evaluation);evaluation.pendingReason=String(error?.message||error);
 		const attempts=Number(row.attempts)+1,delay=attempts>=3?86400:120*Math.pow(4,attempts-1);
-		await save(attempts>=3?'waiting':'pending',now+delay);return {complete:false,retryAfter:Math.min(43200,delay)};
+		await save(evaluation?.verdict==='ban'&&evaluation.reviewAction?'action_failed':attempts>=3?'waiting':'pending',now+delay);return {complete:false,retryAfter:Math.min(43200,delay)};
 	}
 }
 
@@ -14177,7 +14206,7 @@ async function resumeAdContentReviews(env) {
 	await ensureAdContentReviewTable(env);
 	const now=Math.floor(Date.now()/1000);
 	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',review_sources='[]',next_at=?,lease_until=0,lease_token='' WHERE status='viewing' AND decision='' AND lease_until<=? AND expires_at>?").bind(now,now,now).run();
-	const rows=(await env.DB.prepare('SELECT id FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\') AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY next_at LIMIT 20').bind(now,now,now).all()).results||[];
+	const rows=(await env.DB.prepare('SELECT id FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\') AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY next_at LIMIT 20').bind(now,now,now).all()).results||[];
 	let queued=0;for(const row of rows)if(await queueAdContentReview(env,row.id,1))queued++;
 	return {queued};
 }
