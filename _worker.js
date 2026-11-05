@@ -14095,7 +14095,7 @@ async function sendAdContentReviewBatchReport(env,batchId,options={}){
 	const rows=await adContentReviewBatchResults(env,batchId),counts={};
 	const label=key=>key==='unresolved'?'未完成，需核查':adReviewStatus({status:key});
 	for(const row of rows){const key=row.state==='error'?'unresolved':row.outcome;counts[key]=(counts[key]||0)+1;}
-	const lines=['# 内容复核完整结果 '+batchId,'','共 '+rows.length+' 条；'+Object.entries(counts).map(([key,value])=>key+' '+value).join('，'),
+	const lines=['# 内容复核完整结果 '+batchId,'','共 '+rows.length+' 条；'+Object.entries(counts).map(([key,value])=>label(key)+' '+value).join('，'),
 		'批次状态：'+(batch.status==='complete'?'已全部结清':'仍有未完成项，不能视为全部处置成功')+'；涉及 '+new Set(rows.map(row=>row.user_id)).size+' 个用户。',
 		'原始证据、群范围及本批次处置结果如下。误判回退入口：在机器人私聊发送 /review open 序号，确认正常。',
 		'回退只撤销对应案件新增处罚，保留无关既有处罚；已删除的 Telegram 原消息无法原位恢复。独立群仍由原群群主判断。',''];
@@ -14111,7 +14111,9 @@ async function sendAdContentReviewBatchReport(env,batchId,options={}){
 			'头像识别文字：'+(after.snapshot?.avatarText||''),'会员标识别文字：'+(after.snapshot?.badgeText||''),
 			'正文表情识别文字：'+(after.snapshot?.customEmojiText||''),
 			'依据：\n'+(after.reasons||[]).join('\n'),
-			'补充素材核验：'+JSON.stringify(after.batchVisualAudit||{}));
+			'补充素材核验：'+JSON.stringify(after.batchVisualAudit||{}),
+			'补充内容复核：'+JSON.stringify(after.batchContextAudit||{}),
+			'处置回执核对：'+JSON.stringify(after.batchReceiptAudit||{}));
 		lines.push('处置回执：'+JSON.stringify(after.reviewAction||{}),'回退与素材入口：/review open '+row.seq,'');
 	}
 	const body=new FormData();body.append('chat_id',String(OWNER_IDS[0]));body.append('document',new Blob([lines.join('\n')],{type:'text/markdown;charset=utf-8'}),'review-'+batchId+'.md');
