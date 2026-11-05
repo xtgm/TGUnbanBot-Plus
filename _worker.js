@@ -22989,7 +22989,7 @@ const AD_EXEMPT_KEYWORD_CATEGORIES = [
 ];
 const AD_EXEMPT_KEYWORDS = AD_EXEMPT_KEYWORD_CATEGORIES.flatMap(({ words }) => words);
 
-// 技术豁免与独立广告证据分开判断，文字、OCR 与图片描述复用同一口径。
+// 豁免按内容位置生效，文字、OCR 与图片描述复用相应口径。
 // 域名、令牌、网络代理和价格本身都不能证明招揽推广；明确有害内容仍独立判断。
 function hasAdIndependentHarmfulContent(text) {
 	const source = String(text || '');
@@ -23017,8 +23017,10 @@ function hasAdProtectedTechnicalContext(text) {
 function adTechnicalExemptPayload(payload) {
 	const filtered = { ...(payload || {}) };
 	for (const key of ['name', 'username', 'bio', 'text']) {
-		if (hasAdProtectedTechnicalContext(filtered[key]) && !hasAdIndependentHarmfulContent(filtered[key])) filtered[key] = '';
+		// 豁免不能只清评分：指纹、语义及结构入口也不能再使用该位置的文字。
+		if (adPositionExemptHits(filtered[key]).length) filtered[key] = '';
 	}
+	const names=adReviewNameLearningFields(filtered);filtered.name=names.name;filtered.username=names.username;
 	filtered.domains = extractAdDomains([filtered.name, filtered.username, filtered.bio, filtered.text].filter(Boolean).join('\n'));
 	return filtered;
 }
@@ -31243,8 +31245,7 @@ async function markAdStickerPack(env, setName, source, options = {}) {
 // 正文自定义 emoji 的贴纸包命中已定罪广告包 → 定罪（标签「表情包」）。
 // packs 是 resolveCustomEmojiStickers 的产出 { id → { setName, emoji } }；为空时零 SQL。
 function isVerifiedAdMediaRow(row) {
-	return row?.verdict === 'ad' && (isReliableAdImageSource(row) || row.ownerSimilarity?.strongMatch === true
-		|| (row.ownerSimilarity?.exact === true && row.ownerSimilarity?.verdict === 'ad'));
+	return isReliableAdImageSource(row);
 }
 
 async function readAdCustomEmojiMediaRows(env, ids, userId = '', options = {}) {
@@ -31548,8 +31549,13 @@ const AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS = 5;
 const AD_IMAGE_WEAK_SOURCES = new Set(['learned', 'cross_user']);
 const AD_IMAGE_VERIFIED_SOURCE = 'vision_content_v3';
 function isReliableAdImageSource(image) {
+	if(image?.verdict!=='ad')return false;
 	if(image?.verdict==='ad'&&image.source==='local_review'&&image.localReviewVerified)return true;
-	return image?.verdict === 'ad' && [AD_IMAGE_VERIFIED_SOURCE, 'owner', 'manual', 'spam', 'ban', 'sban'].includes(String(image.source || ''));
+	if(['owner','manual','spam','ban','sban'].includes(String(image.source||'')))return true;
+	const signature=adImageContentSignature(image.contentSignature);
+	if(image.source===AD_IMAGE_VERIFIED_SOURCE)return image.contentVerified===true&&isReliableAdImageContentSignature(signature);
+	const similarity=image.ownerSimilarity,similaritySignature=adImageContentSignature(similarity?.contentSignature);
+	return similarity?.verdict==='ad'&&similarity.strongMatch===true&&isReliableAdImageContentSignature(similaritySignature);
 }
 function applyImageVerdict(evaluation, image) {
 	evaluation = finalizeAdAutomaticDecision(evaluation);
@@ -31574,7 +31580,7 @@ function applyImageVerdict(evaluation, image) {
 	}
 	if (String(image.verdict || '') !== 'ad') return evaluation;
 	// 概率分类、旧素材标签和复用次数不能代替实际内容证据，也不能凑成图片6+AI3。
-	if (!isReliableAdImageSource(image) && ownerSimilarity?.strongMatch !== true) {
+	if (!isReliableAdImageSource(image)) {
 		const judged = Object.assign({}, evaluation, { reasons: (evaluation.reasons || []).concat(['图片广告标签尚无可靠内容证据，不参与自动封禁']) });
 		return evaluation.positionEvidence ? rejudgeAdPositionEvidence(judged) : judged;
 	}
@@ -31587,7 +31593,7 @@ function applyImageVerdict(evaluation, image) {
 		:'消息图片命中广告素材库（复用定罪 ' + hits + ' 次）' + (categoryLabel ? ' · 识图判为' + categoryLabel : '');
 	const reasons = (evaluation.reasons || []).concat([reason]);
 	if (evaluation.positionEvidence) {
-		const hardBan = ownerSimilarity?.verdict === 'ad' ? ownerSimilarity.strongMatch === true : isReliableAdImageSource(image);
+		const hardBan = isReliableAdImageSource(image);
 		const judged = Object.assign({}, evaluation, { reasons });
 		addAdPositionEvidence(judged, image.kind === 'sticker' ? 'sticker' : 'image', hardBan ? 10 : 6, reason);
 		if (hardBan) {
@@ -31597,7 +31603,7 @@ function applyImageVerdict(evaluation, image) {
 		}
 		return rejudgeAdPositionEvidence(judged);
 	}
-	if (isReliableAdImageSource(image) || ownerSimilarity?.strongMatch === true) {
+	if (isReliableAdImageSource(image)) {
 		const convicted = String(evaluation.verdict) !== 'ban';
 		return Object.assign({}, evaluation, { verdict: 'ban',
 			reasons: convicted ? markAdConvictLayer(reasons, packHit ? '表情包' : '正文图片') : reasons });
@@ -32486,7 +32492,9 @@ async function verifyAdImageVisibleContent(env, media, encoded, judge) {
 	const key = 'image_content_v3:' + String(media?.fileUniqueId || '');
 	try {
 		const saved = JSON.parse(await readAdScanState(env, key, 'null'));
-		if (saved?.version === 3 && ['ad','clean'].includes(saved.verdict) && adImageContentSignature(saved.signature)) return saved;
+		const signature=adImageContentSignature(saved?.signature);
+		if (saved?.version === 3 && signature && (saved.verdict==='clean'
+			||saved.verdict==='ad'&&saved.contentVerified===true&&isReliableAdImageContentSignature(signature))) return saved;
 	} catch (_) { /* 缺失或损坏的核验记录重新取实际内容。 */ }
 	const described = await describeAdImageSimilarityContent(env, encoded);
 	if (!described.ok) return { verdict: 'pending', reason: described.reason, contentVerified: false };
@@ -33532,6 +33540,7 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 		}
 		return signature&&value?{...value,contentSignature:signature,contentInspection:staticContent?'bitmap_body':'thumbnail'}:value;
 	};
+	row=withContent(row);
 	let recheckClean = false;
 	if (options.requireContent === true && staticContent && row?.verdict === 'clean') {
 		if(savedContent?.verdict==='clean')return withContent(row);
@@ -33652,7 +33661,8 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	if (latestOwner?.owner_verdict) return { ...(latestRow || {}), file_unique_id: key, verdict: latestOwner.owner_verdict, source: 'owner',
 		ownerSimilarity: { verdict: latestOwner.owner_verdict, exact: true, strongMatch: latestOwner.owner_verdict === 'ad', revision: Number(latestOwner.decision_at) || 0 } };
 	if (latestRow?.verdict === 'clean' && ['owner', 'manual'].includes(String(latestRow.source || ''))) return latestRow;
-	if (isReliableAdImageSource(latestRow)) return withContent({ ...latestRow, category: judged?.category || '', contentVerified: true },contentResult);
+	const verifiedLatest=withContent(latestRow,contentResult);
+	if (isReliableAdImageSource(verifiedLatest)) return {...verifiedLatest,category:judged?.category||''};
 	if (verdict === 'pending') return withContent(adImageMiss(base,contentResult?.signature?'no_reliable_ad_evidence':'error'),contentResult);
 	if (verdict === 'clean') {
 		const cleanRow = { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid };
@@ -34641,6 +34651,8 @@ function clearAdPositionHardBan(evaluation, key) {
 
 function adPositionExemptHits(text) {
 	const source = String(text || '');
+	const routine=source.normalize('NFKC').replace(/[\s\p{P}\p{S}]+/gu,'');
+	if(/^(?:签到|簽到|打卡|收到|冒泡|早安|晚安|早上好|晚上好|大家好|谢谢|謝謝|感谢|感謝){1,3}$/.test(routine))return ['日常问候或签到'];
 	let hits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
 	if (hasAdProtectedTechnicalContext(source) && !hasAdIndependentHarmfulContent(source)) {
 		return hits.length ? hits : ['技术或官方链接语境'];
@@ -35308,8 +35320,12 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 		// 注意：记录可能在 24 小时后已被 prune 删除 —— 那是旧通知失效的原因，
 		// 新通知不依赖它，所以这里的查询只作为回退。
 		const screening = await env.DB
-			.prepare('SELECT chat_id, snapshot, reasons, layer FROM ad_user_screening WHERE user_id = ?')
+			.prepare('SELECT chat_id, snapshot, reasons, layer, expires_at FROM ad_user_screening WHERE user_id = ?')
 			.bind(payloadStr).first();
+		if(action==='ok'&&(!screening||Number(screening.expires_at)<=Math.floor(Date.now()/1000))){
+			await answerAdVoteCallback(callbackQuery?.id,'旧观察通知已失效，未执行封禁；当前疑难统一由 /review 自动补查。',true);
+			return;
+		}
 		// 【2026-11：来源不再写死成头像】通知放宽到 observe 的全部八类来源之后，
 		// 这对按钮也要跟着走实际来源 —— 否则第⑥层判不成的号被点确认封，案底里会
 		// 写成「头像命中广告图库」，事后 /user 复盘查不到真实原因。
