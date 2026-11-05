@@ -5290,6 +5290,10 @@ function translateTelegramError(description, options = {}) {
 	const lower = desc.toLowerCase();
 	const isUnbanAction = options.action === 'unban';
 	if (lower === 'preexisting_native_ban') return { 中文:'本群已存在封禁，保留原有处罚', 建议:'' };
+	if (lower.includes('rich_message_document_invalid')) return { 中文:'页面中的原文件格式不受支持，暂时无法展示附件', 建议:'可先查看预览或打开原表情包' };
+	if (lower.includes('rich_message_photo_invalid')) return { 中文:'页面中的预览图片无效或格式不受支持', 建议:'返回现场后重新获取素材' };
+	if (/custom[_ ]emoji|premium_account_required/i.test(desc)) return { 中文:'表情状态暂时无法直接展示，可能是表情已失效或机器人没有展示权限', 建议:'打开原表情包查看' };
+	if (lower.includes('wrong file identifier') || lower.includes('file_id_invalid') || lower.includes('file reference expired')) return { 中文:'原文件标识无效或已过期', 建议:'返回现场后重新获取素材' };
 
 	// 更具体的错误码先匹配（Telegram 有时同时携带多个特征）
 	if (lower.includes('chat_admin_required')) {
@@ -5431,7 +5435,7 @@ function translateTelegramError(description, options = {}) {
 function looksLikeEnglishErrorText(text) {
 	const s = String(text || '');
 	if (!/[一-龥]/.test(s)) return /[a-z]/i.test(s);
-	return /[a-z]{2,}[\s:_\-]+[a-z]{2,}[\s:_\-]+[a-z]{2,}/i.test(s);
+	return /[a-z]{2,}[\s:_\-]+[a-z]{2,}/i.test(s);
 }
 
 // 报错 → 只含中文原因的一句话。聊天回执统一走这里；英文原文由翻译兜底写入日志。
@@ -13428,7 +13432,8 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 			avatarId:profile.avatarId||'',avatarFileId:profile.avatarFileId||'',badgeId:profile.badgeId||'',isPremium:profile.isPremium,
 			fetched:profileFetched,fetchedAt:Number(profile.profileFetchedAt)||0 },
 		originalMedia:media?{...media}:null,
-		text, badgeMedia: badgeItem ? { id: badgeItem.id, fileUniqueId: badgeItem.fileUniqueId, fileId: badgeItem.fileId || '', setName: badgeItem.setName || '', visionFileId: badgeItem.visionFileId, kind: badgeItem.kind } : null };
+		text, badgeMedia: badgeItem ? { id: badgeItem.id, fileUniqueId: badgeItem.fileUniqueId, fileId: badgeItem.fileId || '', setName: badgeItem.setName || '', visionFileId: badgeItem.visionFileId, kind: badgeItem.kind,
+			isAnimated:badgeItem.isAnimated===true,isVideo:badgeItem.isVideo===true } : null };
 	if (profile.bioFetched === true) evaluation.snapshot.groupAdContextKey = await buildGroupAdContextKey({ message }, evaluation);
 	const learning = globalDryRunLearningView(evaluation);
 	evaluation.learningPayload = learning.payload;
@@ -13526,7 +13531,7 @@ function adReviewSources(row) {
 	const s=JSON.parse(row.evaluation||'{}').snapshot||{},m=JSON.parse(row.message_json||'{}');
 	const result=[];const add=(key,label,value)=>{if(value)result.push({key,label,value});};
 	add('name','昵称/用户名',[s.name,s.username].filter(Boolean).join(' '));add('bio','简介',s.bio);add('text','正文',s.text);
-	add('avatar','头像',s.avatarId);add('badge','会员标',s.badgeId);
+	add('avatar','头像',s.avatarId);add('badge','会员表情状态',s.badgeId);
 	const media=s.originalMedia||extractAdMedia(m);
 	if(media)add(m.sticker?'sticker':'image',m.sticker?'贴纸':'图片/视频',media.fileUniqueId||s.imageId);
 	const bodyIds=new Set((s.customEmojiIds||extractCustomEmojiIds(m)).map(String));
@@ -13552,7 +13557,10 @@ async function renderAdReviewPage(actorId,callbackMessage,text,keyboard,blocks=n
 	const result=await response.json();
 	if(!response.ok||!result.ok){
 		if(messageId&&/message is not modified/i.test(result.description||''))return result;
-		throw new Error('页面更新失败：'+String(result.description||response.status));
+		const raw=String(result.description||('HTTP '+response.status));
+		console.error('[内容复核页面] '+raw);
+		const error=new Error('页面更新失败：'+toChineseErrorText(raw));
+		error.telegramDescription=raw;throw error;
 	}
 	return result;
 }
@@ -13571,7 +13579,26 @@ function adReviewStatus(row) {
 	const labels={pending:'等待核验',waiting:'核验未完成，已降低重试频率',processing:'自动处理中',viewing:'人工选择中（30 分钟后恢复）',
 		normal_intent:'正常判断已登记，正在保存',normal:'人工确认正常',ad:'广告已处置',clean:'已核验，未发现广告',
 		partial:'已查可用画面，动态原文件未完整核验',sample:'待人工确认',action_failed:'处置未完成',manual:'待人工处理',skipped:'已按豁免或当前群范围跳过'};
-	return labels[row.status]||row.status;
+	return labels[row.status]||'状态暂无法识别，请刷新或查看后台日志';
+}
+
+function adReviewDiagnosticText(value) {
+	const text=String(value||'');if(!text)return '';
+	const labels={clean:'已查画面未发现广告，但仍有其他核验缺口',pending:'等待核验',unknown:'尚未取得结果',error:'核验发生错误',
+		missing_result:'未取得核验结果',profile_fetch_failed:'用户资料读取失败',reliable_verdict_unavailable:'尚未取得可靠判断',
+		custom_emoji_media_unavailable:'表情原素材暂不可用',custom_emoji_judge_failed:'表情内容核验失败',ocr_retry_cooldown:'文字识别失败后正在等待重试',
+		no_reliable_ad_evidence:'尚未取得可靠的广告证据',nothumb:'没有可用预览图',quota:'今日识别额度已用完',break:'识别服务暂时暂停',
+		size:'素材超过读取大小限制',mime:'素材格式暂不支持',ratelimit:'请求过于频繁，请稍后重试',gray:'识别结果不确定，仍需核验'};
+	const split=text.lastIndexOf('：'),reason=text.slice(split+1).trim();
+	if(labels[reason])return (split>=0?text.slice(0,split+1):'')+labels[reason];
+	return toChineseErrorText(text);
+}
+
+function adReviewBadgeDescription(snapshot) {
+	const profile=snapshot.originalProfile||{},media=snapshot.badgeMedia;
+	if(snapshot.badgeId)return (media?.isAnimated||media?.isVideo?'已设置动态表情状态':'已设置表情状态')+'，点击下方查看；可能来自现成表情包，不代表用户自行制作或含广告';
+	if(!profile.fetched)return '资料未完整获取，暂无法确认';
+	return profile.isPremium===true?'⭐ 默认会员星标（未设置表情状态）':'未设置表情状态';
 }
 
 const AD_REVIEW_PENDING_CONDITION="status IN ('pending','waiting','processing','viewing','normal_intent','sample','manual','action_failed')";
@@ -13617,20 +13644,21 @@ async function showAdContentReview(env,actorId,row) {
 	return editAdContentReviewMessage(env,actorId,row,null);
 }
 
-async function editAdContentReviewMessage(env,actorId,row,callbackMessage,page=1,notice='',original=false) {
+async function editAdContentReviewMessage(env,actorId,row,callbackMessage,page=1,notice='',original=false,busy=false) {
 	const access=await adContentReviewAccess(env,actorId,row);if(!access.read)throw new Error('无权查看该现场');
 	const e=JSON.parse(row.evaluation||'{}'),s=e.snapshot||{},m=JSON.parse(row.message_json||'{}'),p=s.originalProfile||{};
 	const lines=original?['保存的原消息（分页保留全部字段）',JSON.stringify(m,null,2)]:[
-		'目标：'+(s.name||'用户')+'（'+row.user_id+'）','来源群：'+row.chat_id,
+		'目标：'+(s.name||'用户'),'来源群：'+row.chat_id,
 		'处理范围：'+(access.local?'仅独立原群':'全局非独立治理群'),'',
 		'检测时资料','昵称：'+(s.name||'未获取'),'用户名：'+(s.username||'未获取'),
 		'简介：'+(s.bio||(p.fetched?'无简介':'尚未获取，不能当作没有简介')),
-		'Premium：'+(p.isPremium===true?'是':p.isPremium===false?'否':'未取得'),
+		'Telegram 会员：'+(p.isPremium===true?'是':p.isPremium===false?'否':'未取得'),
 		'头像：'+(s.avatarId?'有素材，点击下方查看':'未设置或尚未获取'),
-		'会员标：'+(s.badgeId?'有自定义素材，点击下方查看':'未发现或尚未获取'),'',
+		'会员标（检测时）：'+adReviewBadgeDescription(s),
+		...(s.badgeMedia?.setName?['检测时表情包：'+s.badgeMedia.setName]:[]),'',
 		'原正文',s.text||getAdDetectionBodyText(m)||'无文字，查看原素材','',
-		'检测时未核实的内容',...(e.contentReviewIncomplete||[]),e.pendingReason||'',
-		'实际采集范围',...(e.drillIncomplete||[]),
+		'检测时未核实的内容',...(e.contentReviewIncomplete||[]).map(adReviewDiagnosticText),adReviewDiagnosticText(e.pendingReason),
+		'实际采集范围',...(e.drillIncomplete||[]).map(adReviewDiagnosticText),
 		'头像读取文字：'+(s.avatarText||s.rawAvatarText||'未读取或未核实'),
 		'会员标读取文字：'+(s.badgeText||'未读取或未核实'),
 		'正文素材读取文字：'+(s.customEmojiText||'见原素材'),...(e.reasons||[]).map(String)];
@@ -13642,6 +13670,7 @@ async function editAdContentReviewMessage(env,actorId,row,callbackMessage,page=1
 	if(page>1)navigation.push({text:'上一段',callback_data:'review:'+action+':'+row.seq+':'+(page-1)});
 	if(page<pages.length)navigation.push({text:'下一段',callback_data:'review:'+action+':'+row.seq+':'+(page+1)});
 	if(navigation.length)keyboard.push(navigation);
+	keyboard.push([{text:'复制用户 TGID',copy_text:{text:String(row.user_id)}}]);
 	keyboard.push([{text:original?'返回现场':'查看保存的原消息全文',callback_data:'review:'+(original?'open':'original')+':'+row.seq}]);
 	for(const source of pageSources.filter(source=>['avatar','badge','image','sticker'].includes(source.key)||source.key.startsWith('emoji')))
 		keyboard.push([{text:'查看'+source.label,callback_data:'review:asset:'+row.seq+':'+source.key}]);
@@ -13655,9 +13684,10 @@ async function editAdContentReviewMessage(env,actorId,row,callbackMessage,page=1
 	}
 	keyboard.push([{text:'下一条待核',callback_data:'review:next:'+row.seq}]);
 	keyboard.push([{text:'刷新状态',callback_data:'review:open:'+row.seq},{text:'返回分页列表',callback_data:'review:list:1'}]);
-	const header='现场 #'+row.seq+' · 第 '+page+'/'+pages.length+' 段\n状态：'+adReviewStatus(row)+'\n'
+	if(busy)keyboard.splice(0,keyboard.length,[{text:'复制用户 TGID',copy_text:{text:String(row.user_id)}}]);
+	const header='现场 #'+row.seq+' · 第 '+page+'/'+pages.length+' 段\n用户 TGID：'+row.user_id+'\n状态：'+adReviewStatus(row)+'\n'
 		+(access.write&&!row.decision?'已选 '+JSON.parse(row.review_sources||'[]').length+' 个位置；确认正常只更正选中的素材及本场景。\n':'')
-		+(notice?String(notice).slice(0,240)+'\n':'');
+		+(notice?adReviewDiagnosticText(notice).slice(0,240)+'\n':'');
 	await renderAdReviewPage(actorId,callbackMessage,header+pages[page-1],keyboard);
 }
 
@@ -13668,10 +13698,12 @@ async function sendAdReviewMaterial(env,actorId,row,key,callbackMessage=null) {
 	const custom=key==='badge'||key.startsWith('emoji');
 	let media=key==='avatar'?{fileId:s.originalProfile?.avatarFileId,visionFileId:s.originalProfile?.avatarFileId,fileUniqueId:s.avatarId,kind:'photo'}
 		:key==='badge'?s.badgeMedia:key.startsWith('emoji')?s.customEmojiMedia?.[Number(key.slice(5))]:s.originalMedia||extractAdMedia(m);
-	if(custom&&(!media?.fileId||!media?.visionFileId)){
+	let emojiInfo;
+	if(custom){
 		const id=key==='badge'?s.badgeId:media?.id;
-		if(id){const resolved=(await resolveCustomEmojiStickers(env,[String(id)],{requireMedia:true}))[id]?.media;
-			if(resolved&&(!media?.fileUniqueId||resolved.fileUniqueId===media.fileUniqueId))media={...media,...resolved};}
+		if(id){const info=(await resolveCustomEmojiStickers(env,[String(id)],{requireMedia:true}))[id],resolved=info?.media;
+			if(resolved&&(!media?.fileUniqueId||resolved.fileUniqueId===media.fileUniqueId)){media={...media,...resolved};emojiInfo=info;}
+			if(!media)media={id:String(id),kind:'sticker'};}
 	}
 	if(!media)throw new Error('检测时素材未保存，无法取得原文件');
 	const kind=key==='avatar'?'avatar':'image',cacheKey=media.fileUniqueId||source.value;
@@ -13684,31 +13716,52 @@ async function sendAdReviewMaterial(env,actorId,row,key,callbackMessage=null) {
 			const mime=sniffImageMime(bytes);if(!mime)throw new Error('取得的预览不是受支持的图片');
 			preview={bytes,mime,file_name:'preview.'+(mime==='image/jpeg'?'jpg':mime.split('/')[1])};
 			thumbnail=String(media.visionFileId)!==String(media.fileId);
-		}catch(error){previewError='预览画面获取未完成。';}
+		}catch(error){console.error('[内容复核预览] '+String(error?.message||error));previewError='预览画面获取未完成：'+toChineseErrorText(error?.message||String(error))+'。';}
 	}
 	const blocks=[],files=[],add=(type,file,name)=>{
 		const part='review_file_'+files.length;files.push({key:part,bytes:file.bytes,mime:file.mime||'application/octet-stream',name});
-		blocks.push({type,[type]:{type,media:'attach://'+part}});
+		blocks.push({type,[type]:{type,media:'attach://'+part,...type==='document'?{disable_content_type_detection:true}:{}}});
 	};
+	const emojiId=key==='badge'?s.badgeId:media.id;
+	const emojiBlock=custom&&/^\d+$/.test(String(emojiId||''))?{type:'paragraph',text:[{type:'custom_emoji',custom_emoji_id:String(emojiId),alternative_text:emojiInfo?.emoji||'❔'}]}:null;
+	if(emojiBlock)blocks.push(emojiBlock);
 	if(preview)add('photo',preview,preview.file_name||'preview.jpg');
 	const isSticker=custom||media.kind==='sticker';
-	let originalAttached=false,originalError='';
+	let originalAttached=false,originalError=isSticker&&!media.fileId?'未取得原文件，不能确认已完整展示素材。':'';
 	if(isSticker&&media.fileId){
-		// 原 file_id 按贴纸存储，不能冒充 photo/document；下载后重新上传原文件。
+		// 贴纸原文件下载后按普通文档上传，关闭类型自动识别，避免被重新识别为贴纸而拒绝嵌入。
 		try {
 			const bytes=await adImageSimilarityDownload(env,{visionFileId:media.fileId});
 			const mime=sniffImageMime(bytes)|| (bytes[0]===31&&bytes[1]===139?'application/x-tgsticker':bytes[0]===26&&bytes[1]===69?'video/webm':'application/octet-stream');
 			const ext=mime==='application/x-tgsticker'?'tgs':mime==='video/webm'?'webm':mime==='application/octet-stream'?'bin':mime.split('/')[1];
 			add('document',{bytes,mime},'original.'+ext);originalAttached=true;
-		}catch(error){if(!preview)throw error;originalError='原文件获取未完成，可返回后重试。';}
+		}catch(error){console.error('[内容复核原文件] '+String(error?.message||error));if(!preview&&!emojiBlock)throw error;originalError='原文件获取未完成：'+toChineseErrorText(error?.message||String(error))+'。';}
 	}else if(media.fileId&&['video','animation','document'].includes(media.kind)){
 		const type=media.kind;blocks.push({type,[type]:{type,media:media.fileId}});
 	}
 	if(!blocks.length)throw new Error('原素材获取失败，不能用文件标识冒充预览');
-	const label=source.label+' · 现场 #'+row.seq+'\n'+(previewError|| (thumbnail?'缩略图预览；动态原文件未逐帧核验。':'实际保存或下载的素材。'))
-		+(originalAttached?'\n下方附原文件，可下载查看完整内容。':originalError?'\n'+originalError:'');
+	const label=source.label+' · 现场 #'+row.seq+'\n用户 TGID：'+row.user_id+'\n检测时保存的素材；用户当前状态可能已变化。\n'
+		+(previewError|| (thumbnail?'缩略图预览；动态原文件未逐帧核验。':preview?'实际保存或下载的素材。':'未取得预览图片。'));
 	const returnPage=Math.floor(adReviewSources(row).findIndex(item=>item.key===key)/8)+1;
-	await renderAdReviewPage(actorId,callbackMessage,label,[[{text:'返回现场',callback_data:'review:page:'+row.seq+':'+returnPage},{text:'返回列表',callback_data:'review:list:1'}]],blocks,files);
+	const keyboard=[];
+	if(/^[A-Za-z0-9_]{1,64}$/.test(String(media.setName||'')))keyboard.push([{text:custom?'打开原表情包（可查看动画）':'打开原贴纸包',url:'https://t.me/'+(custom?'addemoji/':'addstickers/')+media.setName}]);
+	keyboard.push([{text:'复制用户 TGID',copy_text:{text:String(row.user_id)}}]);
+	keyboard.push([{text:'返回现场',callback_data:'review:page:'+row.seq+':'+returnPage},{text:'下一条待核',callback_data:'review:next:'+row.seq}]);
+	keyboard.push([{text:'返回列表',callback_data:'review:list:1'}]);
+	let visible=blocks,emojiError='';
+	for(let attempt=0;attempt<3;attempt++){
+		const text=label+(originalAttached?'\n下方附原文件，可下载查看完整内容。':originalError?'\n'+originalError:'')+(emojiError?'\n'+emojiError:'');
+		const attachments=files.filter(file=>visible.some(block=>block[block.type]?.media==='attach://'+file.key));
+		try{return await renderAdReviewPage(actorId,callbackMessage,text,keyboard,visible.length?visible:null,attachments);}
+		catch(error){
+			const raw=String(error.telegramDescription||'');
+			if(/RICH_MESSAGE_DOCUMENT_INVALID/i.test(raw)&&visible.some(block=>block.type==='document')){
+				visible=visible.filter(block=>block.type!=='document');originalAttached=false;originalError=toChineseErrorText(raw)+'。';
+			}else if(emojiBlock&&visible.includes(emojiBlock)&&/custom[_ ]emoji|premium_account_required/i.test(raw)){
+				visible=visible.filter(block=>block!==emojiBlock);emojiError=toChineseErrorText(raw)+'。';
+			}else throw error;
+		}
+	}
 }
 
 async function handleAdContentReviewCommand(message,env) {
@@ -13763,12 +13816,16 @@ async function handleAdContentReviewCallback(callback,env) {
 		const updated=await env.DB.prepare("UPDATE ad_content_reviews SET decision=?,decision_by=?,status=?,evaluation=?,next_at=?,lease_token='',lease_until=0,updated_at=? WHERE id=? AND decision='' AND review_sources=? RETURNING *")
 			.bind(action,actor,action==='normal'?'normal_intent':'pending',serializeAdDryRunEvaluation(e),now,now,row.id,row.review_sources).first();
 		if(!updated)throw new Error('选择或判断已被另一操作更新，请刷新');
-		await queueAdContentReview(env,row.id,1);
-		if(action==='normal')await runAdContentReview(env,row.id);
+		// 两种判断都在本次操作中执行并刷新结果；延后队列仅负责中断或失败后的恢复，避免抢先领取。
+		await queueAdContentReview(env,row.id,30);
+		try{await editAdContentReviewMessage(env,actor,updated,callback.message,1,'判断已登记，正在处理；本页将自动更新，请稍候。',false,true);}
+		catch(error){console.error('[内容复核进度] '+String(error?.message||error));}
+		await runAdContentReview(env,row.id);
 		const latest=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(row.id).first();
-		await editAdContentReviewMessage(env,actor,latest||updated,callback.message,1,action==='normal'?'正常判断已登记，完成情况见当前状态。':'广告判断已登记，将按原范围处理。');
+		await editAdContentReviewMessage(env,actor,latest||updated,callback.message,1,'处理结果已自动刷新，完成情况见当前状态。');
 	}catch(error){
-		const note='本次操作未完成：'+String(error?.message||error);
+		console.error('[内容复核操作] '+String(error?.message||error));
+		const note='本次操作未完成：'+toChineseErrorText(error?.message||String(error));
 		try {
 			if(row){const latest=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(row.id).first();
 				await editAdContentReviewMessage(env,actor,latest||row,callback.message,1,note);}
@@ -30568,7 +30625,8 @@ function extractAdMedia(message) {
 			visionFileId,
 			// 贴纸包名：同一个广告包里的几十张贴纸 file_unique_id 各不相同，
 			// 只按单张记永远追不上「换一张同包贴纸再发」。非贴纸恒为空串。
-			setName: kind === 'sticker' ? String(node.set_name || '') : ''
+			setName: kind === 'sticker' ? String(node.set_name || '') : '',
+			...kind==='sticker'?{isAnimated:node.is_animated===true,isVideo:node.is_video===true}:{}
 		};
 	};
 	if (Array.isArray(message.photo) && message.photo.length) {
