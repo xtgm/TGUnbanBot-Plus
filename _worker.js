@@ -13431,6 +13431,12 @@ function adProfileInspectionMessage(user, chatId, title = '') {
 }
 
 const D1_AD_CONTENT_REVIEW_INIT = new WeakMap();
+const AD_CONTENT_REVIEW_CAPTURE_PAUSE_KEY = 'content_review_capture_paused';
+async function isAdContentReviewCapturePaused(env) {
+	try { return String(await readAdScanState(env,AD_CONTENT_REVIEW_CAPTURE_PAUSE_KEY,'0',{strict:true}))==='1'; }
+	catch(error){console.error('[内容待核] 新增开关读取失败，暂缓采集：'+formatD1SchemaError(error));return true;}
+}
+
 async function ensureAdContentReviewTable(env) {
 	if (!env?.DB) return false;
 	if (D1_AD_CONTENT_REVIEW_INIT.get(env.DB)) return true;
@@ -13489,6 +13495,7 @@ async function adContentReviewAccess(env,actorId,row) {
 }
 
 async function notifyAdContentReviewPending(env,id) {
+	if(await isAdContentReviewCapturePaused(env))return;
 	const row=await env.DB.prepare('SELECT seq,chat_id,notified FROM ad_content_reviews WHERE id=?').bind(id).first();
 	if(!row||row.notified)return;
 	let owner=String(OWNER_IDS[0]||'');
@@ -13567,6 +13574,7 @@ async function showAdContentReviewList(env,actorId,page=1,callbackMessage=null,f
 	const rows=(await env.DB.prepare('SELECT seq,chat_id,user_id,status,evaluation FROM ad_content_reviews WHERE '+where+' ORDER BY seq DESC LIMIT 10 OFFSET ?').bind(now,...args,(page-1)*10).all()).results||[];
 	const lines=[(partial?'仅完成可用画面核验':'待核与待确认现场')+' · 第 '+page+'/'+pages+' 页，共 '+total+' 条',
 		partial?'以下记录保留完整核验范围，可继续人工查看原文件。':'点击条目查看现场；仅查看不会暂停自动核验。'];
+	if(await isAdContentReviewCapturePaused(env))lines.push('新增待核与提醒已暂停；广告检测、已有记录核验和人工处理继续。');
 	const keyboard=[];
 	for(const row of rows){const s=JSON.parse(row.evaluation||'{}').snapshot||{},label='#'+row.seq+' '+String(s.name||'用户').slice(0,40)+' · '+adReviewStatus(row);
 		lines.push(label);keyboard.push([{text:label.slice(0,60),callback_data:'review:open:'+row.seq}]);}
@@ -13811,6 +13819,7 @@ async function readLocalReviewedMaterial(env,gid,kind,key) {
 
 async function saveAdContentReview(env, message, evaluation, options = {}) {
 	if (!env?.DB || !message?.from?.id || !message?.chat?.id) return null;
+	if(options.source!=='operator'&&await isAdContentReviewCapturePaused(env))return null;
 	await ensureAdContentReviewTable(env);
 	const uid=String(message.from.id),gid=String(message.chat.id),now=Math.floor(Date.now()/1000);
 	const source=options.source || (Number(message.message_id)>0?'message':'profile');
