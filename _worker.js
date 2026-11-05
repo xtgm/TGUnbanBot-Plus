@@ -11530,6 +11530,16 @@ async function rollbackAutomaticAdCaseTargets(env, snapshot) {
 		const gid = String(target.chat_id);
 		if (!gid || target.state === 'rolled_back') continue;
 		try {
+		let previous = {}; try { previous=JSON.parse(target.result||'{}'); } catch (_) {}
+		const sharedCases=new Set([caseId]);
+		while(Number(previous.attempted)!==1&&previous.sharedCaseId){
+			if(sharedCases.has(previous.sharedCaseId)||sharedCases.size>=8)throw new Error('共享处置回执关联异常，未推断回退范围');
+			sharedCases.add(previous.sharedCaseId);
+			const source=await env.DB.prepare('SELECT result FROM ad_automatic_case_targets WHERE case_id=? AND chat_id=? AND user_id=? AND scope_type=? AND source_chat_id=?')
+				.bind(previous.sharedCaseId,gid,uid,scope,String(snapshot.chatId||frozen.punishmentChatId||'')).first();
+			if(!source)throw new Error('共享处置原始回执缺失，保留回退重试');
+			previous=JSON.parse(source.result||'{}');
+		}
 		const removed = await removeAutomaticGroupBan(env,gid,uid,caseId);
 		const remaining = await readGroupBlacklistEntry(env,gid,uid);
 		const shared = await readD1BlacklistOrFederatedEntry(env,uid);
@@ -11548,7 +11558,6 @@ async function rollbackAutomaticAdCaseTargets(env, snapshot) {
 			await skipAutomaticAdCaseTarget(env,{caseId,userId:uid,chatId:gid,reason:'independent_mode_rollback'});
 			continue;
 		}
-		let previous = {}; try { previous=JSON.parse(target.result||'{}'); } catch (_) {}
 		if (previous.priorState==='already_banned' || (previous.attempted!==undefined && Number(previous.attempted)!==1)) {
 			retained = retained || previous.priorState==='already_banned';
 			const saved = await env.DB.prepare("UPDATE ad_automatic_case_targets SET state='rolled_back',owned=0 WHERE case_id=? AND chat_id=? AND user_id=?")
@@ -13464,6 +13473,7 @@ async function ensureAdContentReviewTable(env) {
 		await runD1SchemaStatement(env,'ad_content_reviews', 'CREATE TABLE IF NOT EXISTS ad_content_reviews (seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,user_id TEXT NOT NULL,chat_id TEXT NOT NULL,source TEXT NOT NULL,message_json TEXT NOT NULL,evaluation TEXT NOT NULL,status TEXT NOT NULL,decision TEXT NOT NULL DEFAULT \'\',decision_by TEXT NOT NULL DEFAULT \'\',review_sources TEXT NOT NULL DEFAULT \'[]\',notified INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL,lease_until INTEGER NOT NULL DEFAULT 0,lease_token TEXT NOT NULL DEFAULT \'\',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,expires_at INTEGER NOT NULL)');
 		await runD1SchemaStatement(env,'idx_ad_content_reviews_due','CREATE INDEX IF NOT EXISTS idx_ad_content_reviews_due ON ad_content_reviews (status,next_at)',{optional:true});
 		await runD1SchemaStatement(env,'ad_review_duplicate_groups','CREATE TABLE IF NOT EXISTS ad_review_duplicate_groups (group_key TEXT PRIMARY KEY,review_id TEXT NOT NULL,decision TEXT NOT NULL,decision_by TEXT NOT NULL,review_sources TEXT NOT NULL,created_at INTEGER NOT NULL)');
+		await runD1SchemaStatement(env,'ad_review_action_groups','CREATE TABLE IF NOT EXISTS ad_review_action_groups (group_key TEXT PRIMARY KEY,lease_until INTEGER NOT NULL DEFAULT 0,lease_token TEXT NOT NULL DEFAULT \'\',result TEXT NOT NULL DEFAULT \'\',updated_at INTEGER NOT NULL)');
 		return true;
 	})();
 	return rememberD1Initialization(D1_AD_CONTENT_REVIEW_INIT,env.DB,work);
@@ -13680,7 +13690,14 @@ async function showAdReviewDuplicateUser(env,actorId,row,page,callbackMessage,fi
 	for(const item of candidates){const key=actions?item.id:await adReviewDuplicateKey(item);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(item);}
 	const entries=[...groups.values()],pages=Math.max(1,Math.ceil(entries.length/8));page=Math.max(1,Math.min(Number(page)||1,pages));
 	const lines=['用户 TGID：'+row.user_id,actions?'同一来源群共 '+candidates.length+' 条处置未完成记录，属于同一个用户。':'同一来源群共 '+candidates.length+' 条未确认记录，按完整内容归为 '+entries.length+' 组。',
-		actions?'每条均可查看原始现场和实际处置回执；已有内容结论继续复用。':'正文、头像、会员表情、简介或原消息入口不同的，分别核验。','第 '+page+'/'+pages+' 页'],keyboard=[];
+		actions?'后台会自动整组处理，无需逐条点击；同一轮每个群共用一次用户处置回执。':'正文、头像、会员表情、简介或原消息入口不同的，分别核验。','第 '+page+'/'+pages+' 页'],keyboard=[];
+	if(actions&&candidates.length&&(await adContentReviewAccess(env,actorId,row)).write)keyboard.push([{text:'立即整组自动重试（'+candidates.length+' 条）',callback_data:'review:retry_user:'+row.seq}]);
+	if(actions){
+		const key=await exportSha256Hex(JSON.stringify([row.user_id,row.chat_id])),group=await env.DB.prepare('SELECT lease_until,result FROM ad_review_action_groups WHERE group_key=?').bind(key).first();
+		if(Number(group?.lease_until)>Math.floor(Date.now()/1000))lines.push('整组自动任务正在执行，请稍后刷新查看结果。');
+		else if(group?.result){const result=JSON.parse(group.result),records=result.records||[],pending=records.filter(item=>['pending','waiting','processing','action_failed','normal_intent'].includes(item.status)).length;
+			lines.push('最近整组处理 '+records.length+' 条：完成 '+(records.length-pending)+' 条，未完成 '+pending+' 条；复用 '+Number(result.reusedTargetReceipts||0)+' 份逐群回执。');}
+	}
 	for(const items of entries.slice((page-1)*8,page*8)){const first=items[0],seqs=items.map(x=>'#'+x.seq).join('、');
 		lines.push(actions?'现场 #'+first.seq+' · '+adReviewStatus(first):'现场 #'+first.seq+' · 相同内容 '+items.length+' 条：'+seqs.slice(0,300));
 		keyboard.push([{text:actions?'查看 #'+first.seq+' 的现场与处置回执':'查看 #'+first.seq+' · 相同内容 '+items.length+' 条',callback_data:'review:open:'+first.seq}]);}
@@ -13887,6 +13904,16 @@ async function handleAdContentReviewCallback(callback,env) {
 		const access=await adContentReviewAccess(env,actor,row);if(!access.read)throw new Error('权限不足');
 		await answerAdVoteCallback(callback.id);
 		if(action==='dupuser'){await showAdReviewDuplicateUser(env,actor,row,Number(key)||1,callback.message,filter);return;}
+		if(action==='retry_user'){
+			if(!access.write)throw new Error('当前账号无权处理该用户');
+			const now=Math.floor(Date.now()/1000);
+			const ready=await env.DB.prepare('UPDATE ad_content_reviews SET next_at=? WHERE id=? AND lease_until<=? AND '+AD_REVIEW_ACTION_RETRY_CONDITION+' RETURNING id').bind(now,row.id,now).first();
+			if(!ready)throw new Error('整组正在处理或已结清，请刷新状态');
+			await queueAdContentReview(env,row.id,30);
+			await renderAdReviewPage(actor,callback.message,'已启动整组自动处理，处理结果将自动更新。',[]);
+			await runAdContentReview(env,row.id);
+			await showAdReviewDuplicateUser(env,actor,row,1,callback.message,'actions');return;
+		}
 		if(action==='open'||action==='page'||action==='original'){await editAdContentReviewMessage(env,actor,row,callback.message,Number(key)||1,'',action==='original');return;}
 		if(action==='asset'){await sendAdReviewMaterial(env,actor,row,key,callback.message);return;}
 		if(!access.write)throw new Error('当前账号无权判断该现场，或原处理范围已经变化');
@@ -14081,7 +14108,43 @@ async function registerAdReviewDuplicateDecision(env,actor,row,decision,access){
 	return group;
 }
 
+const AD_REVIEW_ACTION_RETRY_CONDITION="status IN ('action_failed','pending','waiting','processing') AND decision<>'normal' AND json_valid(evaluation) AND json_extract(evaluation,'$.verdict')='ban' AND json_type(evaluation,'$.reviewAction')='object'";
+
+async function runAdReviewActionGroup(env,row,options={}){
+	const now=Math.floor(Date.now()/1000),key=await exportSha256Hex(JSON.stringify([row.user_id,row.chat_id])),token=crypto.randomUUID();
+	const locked=await env.DB.prepare("INSERT INTO ad_review_action_groups(group_key,lease_until,lease_token,updated_at) VALUES(?,?,?,?) ON CONFLICT(group_key) DO UPDATE SET lease_until=excluded.lease_until,lease_token=excluded.lease_token,updated_at=excluded.updated_at WHERE ad_review_action_groups.lease_until<=? RETURNING group_key")
+		.bind(key,now+900,token,now,now).first();
+	if(!locked)return {complete:false,retryAfter:60,groupBusy:true};
+	try{
+		const rows=(await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE user_id=? AND chat_id=? AND expires_at>? AND '+AD_REVIEW_ACTION_RETRY_CONDITION+' ORDER BY seq DESC LIMIT 50')
+			.bind(row.user_id,row.chat_id,now).all()).results||[];
+		if(rows.some(item=>Number(item.lease_until)>now))return {complete:false,retryAfter:60,groupBusy:true};
+		const isLinked=item=>{const e=JSON.parse(item.evaluation||'{}');return Boolean(e.assistedReview?.parentId||e.reviewDuplicate&&e.reviewDuplicate.representativeId!==item.id);};
+		rows.sort((a,b)=>Number(isLinked(a))-Number(isLinked(b))||b.seq-a.seq);
+		const execution={key,token,userId:row.user_id,chatId:row.chat_id,receipts:new Map(),reused:0};
+		execution.guard=async()=>Boolean(await env.DB.prepare('SELECT group_key FROM ad_review_action_groups WHERE group_key=? AND lease_token=? AND lease_until>?').bind(key,token,Math.floor(Date.now()/1000)).first());
+		for(const item of rows){
+			const at=Math.floor(Date.now()/1000);
+			const alive=await env.DB.prepare('UPDATE ad_review_action_groups SET lease_until=? WHERE group_key=? AND lease_token=? AND lease_until>?').bind(at+900,key,token,at).run();
+			if(Number(alive?.meta?.changes)!==1)throw new Error('整组处理租约已变化，保留未完成记录');
+			const ready=await env.DB.prepare('UPDATE ad_content_reviews SET next_at=? WHERE id=? AND lease_until<=? AND '+AD_REVIEW_ACTION_RETRY_CONDITION+' RETURNING id').bind(at,item.id,at).first();
+			if(!ready)continue;
+			await runAdContentReview(env,item.id,{...options,reviewExecution:execution});
+		}
+		const outcomes=(await env.DB.prepare('SELECT seq,status,next_at FROM ad_content_reviews WHERE id IN (SELECT value FROM json_each(?)) ORDER BY seq DESC').bind(JSON.stringify(rows.map(item=>item.id))).all()).results||[];
+		const pending=outcomes.filter(item=>['pending','waiting','processing','action_failed','normal_intent'].includes(item.status));
+		const report={runId:token,records:outcomes,uniqueTargetReceipts:execution.receipts.size,reusedTargetReceipts:execution.reused,at:Math.floor(Date.now()/1000)};
+		await env.DB.prepare('UPDATE ad_review_action_groups SET result=?,updated_at=? WHERE group_key=? AND lease_token=?').bind(JSON.stringify(report),report.at,key,token).run();
+		return {complete:!pending.length,grouped:true,processed:outcomes.length,ad:outcomes.length>0&&outcomes.every(item=>item.status==='ad'),...pending.length?{retryAfter:Math.max(1,Math.min(43200,Math.min(...pending.map(item=>Number(item.next_at)||report.at+60))-report.at))}:{}};
+	}finally{await env.DB.prepare("UPDATE ad_review_action_groups SET lease_until=0,lease_token='' WHERE group_key=? AND lease_token=?").bind(key,token).run();}
+}
+
 async function runAdContentReview(env,id,options={}) {
+	if(id&&env?.DB&&!options.reviewExecution&&!options.batchId){
+		await ensureAdContentReviewTable(env);
+		const candidate=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=? AND expires_at>? AND '+AD_REVIEW_ACTION_RETRY_CONDITION).bind(id,Math.floor(Date.now()/1000)).first();
+		if(candidate&&(options.forceActionGroup||Number(candidate.next_at)<=Math.floor(Date.now()/1000)))return runAdReviewActionGroup(env,candidate,options);
+	}
 	const result=await runAdContentReviewSingle(env,id,options);
 	if(!id||!env?.DB||!result.complete)return result;
 	const parent=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(id).first(),e=JSON.parse(parent?.evaluation||'{}');
@@ -14090,7 +14153,7 @@ async function runAdContentReview(env,id,options={}) {
 	for(const child of children){
 		try{
 			await env.DB.prepare('UPDATE ad_content_reviews SET next_at=? WHERE id=? AND lease_until<=?').bind(Math.floor(Date.now()/1000),child.id,Math.floor(Date.now()/1000)).run();
-			const outcome=await runAdContentReviewSingle(env,child.id);
+			const outcome=await runAdContentReviewSingle(env,child.id,options);
 			if(!outcome.complete)await queueAdContentReview(env,child.id,outcome.retryAfter||60);
 		}catch(error){console.error('[重复现场处理] '+String(error?.message||error));await queueAdContentReview(env,child.id,60);}
 	}
@@ -14158,7 +14221,9 @@ async function runAdContentReviewSingle(env,id,options={}) {
 					await save(parent.status);return {complete:true,duplicate:true};
 				}
 				if(parent.status!=='ad'||shared.reviewAction?.complete!==true){
-					evaluation.reviewAction={...shared.reviewAction,complete:false,messageDeletion:original.reviewAction?.messageDeletion||null};evaluation.pendingReason='已核实广告内容，等待代表现场 #'+parent.seq+' 的处置完成';
+					let deletion=original.reviewAction?.messageDeletion||null;
+					if(options.reviewExecution&&shared.verdict==='ban'&&assisted.deleteMessage===true&&Number(message.message_id)>0&&!deletion?.ok)deletion=await deleteMessage(gid,message.message_id);
+					evaluation.reviewAction={...shared.reviewAction,complete:false,messageDeletion:deletion};evaluation.pendingReason='已核实广告内容，等待代表现场 #'+parent.seq+' 的处置完成';
 					await save('action_failed',now+86400);return {complete:false,retryAfter:43200};
 				}
 				const deletion=assisted.deleteMessage===true&&Number(message.message_id)>0?await deleteMessage(gid,message.message_id):{ok:true,notApplicable:true};
@@ -14174,21 +14239,25 @@ async function runAdContentReviewSingle(env,id,options={}) {
 			:await collectGlobalDryRunEvaluation(env,message,null,{normalDetection:true,scopeChatId:gid,source:'content_retry',refreshProfile:true,
 				forceReview:true,forceMaterialReview:options.forceMaterialReview===true,profile:options.profile});
 		evaluation=result.evaluation;
+		if(options.reviewExecution)evaluation.reviewActionGroup={key:options.reviewExecution.key,runId:options.reviewExecution.token,automatic:true};
 		if(options.batchId)evaluation.reviewBatch={id:options.batchId,representativeSeq:row.seq,caseId:'content:'+id};
 		if(evaluation.verdict==='ban'){
 			const current=await env.DB.prepare('SELECT status,lease_token,decision FROM ad_content_reviews WHERE id=?').bind(id).first();
 			if(current?.status!=='processing'||current.lease_token!==token)return {complete:true};
 			const enforced=await enforceAdDetection(env,{userId:uid,chatId:gid,chatTitle:String(message.chat.title||''),messageId:Number(message.message_id)||null,message},evaluation,
 				{config:result.config,whitelist:result.whitelist,fullEvaluationCollected:true,automaticCaseId:'content:'+id,
-					skipLearning:human?.local===true||Boolean(options.batchId)||retryingAction||Boolean(assisted),skipLinked:Boolean(options.batchId)||retryingAction||Boolean(assisted),suppressNotify:Boolean(options.batchId)||Boolean(assisted),
-					reviewGuard:async()=>{const state=await env.DB.prepare('SELECT decision,status,lease_token FROM ad_content_reviews WHERE id=?').bind(id).first();return state?.decision!=='normal'&&state?.status==='processing'&&state?.lease_token===token;}});
+					skipLearning:human?.local===true||Boolean(options.batchId)||retryingAction||Boolean(assisted),skipLinked:Boolean(options.batchId)||retryingAction||Boolean(assisted),suppressNotify:Boolean(options.batchId)||Boolean(assisted)||Boolean(options.reviewExecution),
+					reviewExecution:options.reviewExecution,reviewMessageDeletion:original.reviewAction?.messageDeletion||null,
+					reviewGuard:async()=>{const state=await env.DB.prepare('SELECT decision,status,lease_token FROM ad_content_reviews WHERE id=?').bind(id).first();return state?.decision!=='normal'&&state?.status==='processing'&&state?.lease_token===token&&(!options.reviewExecution||await options.reviewExecution.guard());}});
 			evaluation.reviewAction={banned:enforced?.banned===true,complete:enforced?.complete===true,blacklistCode:enforced?.blacklistCode||'',ownerSnapshotSeq:enforced?.seq||null,
 				banResults:enforced?.banResults||[],reason:enforced?.reason||'',messageDeletion:enforced?.messageDeletion||null};
 			const after=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(id).first();
 			if(after?.decision==='normal'){await finishAdNormalReview(env,after);return {complete:true,normal:true};}
-			const success=enforced?.banned===true&&enforced.complete===true;
+			const needsDeletion=Boolean(options.reviewExecution)&&row.source!=='operator'&&Number(message.message_id)>0&&assisted?.deleteMessage!==false;
+			const success=enforced?.banned===true&&enforced.complete===true&&(!needsDeletion||enforced.messageDeletion?.ok===true);
+			evaluation.reviewAction.complete=success;
 			if(enforced?.normalFeedback||enforced?.groupFeedback){evaluation.normalFeedback=true;await save('clean');return {complete:true,clean:true};}
-			if(!success)throw new Error('广告处置尚未完成：'+String(enforced?.reason||'部分目标未成功'));
+			if(!success)throw new Error('广告处置尚未完成：'+String(enforced?.reason||(enforced?.complete&&needsDeletion?'原消息删除未完成':'部分目标未成功')));
 			evaluation.pendingReason='';
 			await save('ad');return {complete:true,ad:true};
 		}
@@ -14216,8 +14285,11 @@ async function resumeAdContentReviews(env) {
 	await ensureAdContentReviewTable(env);
 	const now=Math.floor(Date.now()/1000);
 	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',review_sources='[]',next_at=?,lease_until=0,lease_token='' WHERE status='viewing' AND decision='' AND lease_until<=? AND expires_at>?").bind(now,now,now).run();
-	const rows=(await env.DB.prepare('SELECT id FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\') AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY next_at LIMIT 20').bind(now,now,now).all()).results||[];
-	let queued=0;for(const row of rows)if(await queueAdContentReview(env,row.id,1))queued++;
+	const rows=(await env.DB.prepare('SELECT id,user_id,chat_id,CASE WHEN '+AD_REVIEW_ACTION_RETRY_CONDITION+' THEN 1 ELSE 0 END AS grouped FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\') AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY next_at LIMIT 20').bind(now,now,now).all()).results||[];
+	let queued=0;const users=new Set();for(const row of rows){
+		const key=JSON.stringify([row.user_id,row.chat_id]);if(row.grouped&&users.has(key))continue;
+		if(await queueAdContentReview(env,row.id,1)){queued++;if(row.grouped)users.add(key);}
+	}
 	return {queued};
 }
 
@@ -36051,6 +36123,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	}
 
 	let banResults = [];
+	const reviewExecution=automatic&&options.reviewExecution?.userId===userId&&options.reviewExecution.chatId===chatId?options.reviewExecution:null;
 	try {
 		const banOptions = {
 			// 入群路径会传 primaryGroupId：事发群【同步】先封，其余群并发补上。
@@ -36072,6 +36145,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		};
 		if (automatic) {
 			const probes = new Map();
+			const receiptKey=gid=>JSON.stringify([String(gid),automaticRoute.policy,banOptions.mode||'',isKillerModeGroup(gid)]);
 			banOptions.perGroupOptions = gid => probes.has(gid) ? {...banOptions,precheckedMemberProbe:probes.get(gid),probeMembership:false} : banOptions;
 			banOptions.beforeGroup = async gid => {
 				const target = automaticTargets.find(row=>row.chatId===gid);
@@ -36084,6 +36158,12 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 					}
 					if (!target || target.state==='failed') return {groupId:gid,ok:false,error:'自动目标名单或账本未完成'};
 					if (!target.owned) return {groupId:gid,ok:true,skipped:'manual_punishment_retained'};
+					const shared=reviewExecution?.receipts.get(receiptKey(gid));
+					if(shared){
+						if(!await reviewExecution.guard())return {groupId:gid,ok:false,automaticNotExecuted:true,error:'整组处理租约已变化'};
+						reviewExecution.reused++;
+						return {...shared.result,automaticNotExecuted:true,reviewSharedCaseId:shared.caseId};
+					}
 					if (options.drillCloseReplay === true || gid !== chatId || options.probeMembership !== false) {
 						const probe = await probeTargetMemberBeforeBan(gid,userId); probes.set(gid,probe);
 						if (probe.state==='unknown') return {groupId:gid,ok:false,automaticNotExecuted:true,error:'无法核对该群原有处置，未执行自动封禁：'+String(probe.error||probe.label||'未知原因')};
@@ -36111,9 +36191,10 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 				if (!target || !target.owned || result.skipped==='independent_mode') return;
 				try { await saveAutomaticAdTarget(env,autoCaseId,result.groupId,userId,chatId,localScope?'local':'global',
 					{owned:1,state:result.skipped?'skipped':result.ok?'done':'failed',result:{ok:result.ok,skipped:result.skipped||'',error:result.error||'',
-						attempted:result.automaticNotExecuted!==true&&!result.skipped,priorState:result.automaticPriorState||result.memberProbe?.state||'unobserved'}}); }
+						attempted:result.automaticNotExecuted!==true&&!result.skipped,priorState:result.automaticPriorState||result.memberProbe?.state||'unobserved',sharedCaseId:result.reviewSharedCaseId||''}}); }
 				catch (_) { result.ok=false; result.accountingFailed=true; result.error='自动处罚结果记账失败，保留重试'; }
 			});
+			if(reviewExecution)for(const result of banResults)if(!result.accountingFailed&&!result.reviewSharedCaseId)reviewExecution.receipts.set(receiptKey(result.groupId),{caseId:autoCaseId,result:{...result}});
 			if (Array.isArray(options.autoTargetGroupIds)) for (const gid of automaticRoute.skipped) banResults.push({groupId:gid,ok:true,skipped:automaticRoute.skipReasons[gid]||'out_of_scope'});
 		} else banResults = await banUserFromAllGroups(userId,banOptions);
 	} catch (error) {
@@ -36211,7 +36292,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	const failedBans = banResults.filter((r) => !r.ok);
 	// 风控·处置：按实际封成功的群逐群 +1（面板「本群挡下 N 次」的唯一数据来源）。
 	// 放在这里而不是黑名单写入之后 —— 加黑可能因已存在而没写成，但封禁成功了就是挡下了。
-	await recordDisposalsFromBanResults(env, banResults, { bulk: options.drillCloseReplay === true });
+	await recordDisposalsFromBanResults(env, banResults.filter(result=>!result.reviewSharedCaseId), { bulk: options.drillCloseReplay === true });
 	const banResultLine = okCount + '/' + banResults.length + ' 个群成功';
 	// 失败原因只给中文（英文原文由翻译兜底写入 Worker 日志）；最多列 3 个群，其余汇总成一句。
 	const failedGroupLines = failedBans.slice(0, 3)
@@ -36222,8 +36303,8 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	if (failedGroupLines.length) banSummary += '；失败群：' + failedGroupLines.join('、');
 
 	// 触发消息再单独删一次：revoke_messages 只对该群自己生效，服务消息也偶发残留。
-	let messageDeletion=null;
-	if (chatId && input?.messageId) {
+	let messageDeletion=reviewExecution?options.reviewMessageDeletion||null:null;
+	if (chatId && input?.messageId && !messageDeletion?.ok) {
 		try {
 			messageDeletion=await deleteMessage(chatId, input.messageId);
 		} catch (error) {
