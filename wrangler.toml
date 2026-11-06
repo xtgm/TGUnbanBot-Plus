@@ -26,6 +26,8 @@ queue = "tc033"
 max_batch_size = 1
 max_batch_timeout = 5
 max_retries = 3
+# 收尾、媒体采集和报告可并行；限制消费实例，避免把 Telegram 接口打成限流。
+max_concurrency = 4
 
 # Cron 触发器：广告检测第三道闸（定时滚动复查 bio）。
 # 抓的是「先用干净资料混进来、发几句正常话过检，事后才把简介改成广告」的号 ——
