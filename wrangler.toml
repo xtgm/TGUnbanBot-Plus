@@ -2,6 +2,7 @@
 name = "tc033"
 main = "_worker.js"
 compatibility_date = "2026-05-19"
+compatibility_flags = ["nodejs_als"]
 keep_vars = true
 
 # D1 数据库（唯一存储后端，必须绑定；表结构由代码自动建立）

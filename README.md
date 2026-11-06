@@ -214,13 +214,16 @@
 
 ## 环境变量
 
-### 必填（缺失会返回 500）
+### 必填
+
+缺少前三项时配置加载返回 500；缺少有效的 `WEBHOOK_SECRET` 时，Telegram 更新入口和 Webhook 初始化返回 503。管理后台仍按原有配置和身份要求开放。
 
 | 变量 | 说明 |
 | --- | --- |
 | `TOKEN` | 初始化入口密钥。访问 `https://你的域名/{TOKEN}` 注册 Webhook 与命令，**并顺带同步一次配置群管理员表**（改完群配置想立刻生效就重访一次，不必等 cron）；`/{TOKEN}/export` 导出黑名单；`/{TOKEN}/purge/run` 分批清扫存量黑名单。**不是** Bot Token，建议用随机长字符串 |
 | `BOT_TOKEN` | Telegram Bot Token，从 [@BotFather](https://t.me/BotFather) 取 |
 | `GROUP_ID` | 目标群 ID，逗号分隔多群（半角 `,` 与全角 `，` 均可）。**第一个群是主群** |
+| `WEBHOOK_SECRET` | Telegram Webhook 来源校验密钥，仅允许 `A-Z a-z 0-9 _ -`，长度 1～256，建议使用至少 32 位随机字符串。初始化会下发 `secret_token`；更新请求缺少或带错误的 `X-Telegram-Bot-Api-Secret-Token` 头时返回 401。在 Cloudflare 配置为密钥，不写入仓库 |
 
 ### 可选（不填则使用源码顶部默认值）
 
@@ -337,12 +340,13 @@ wrangler queues create tg-unban-bot-plus-bulk
 
 完整清单见 [环境变量](#环境变量)。下面只列关键点。
 
-#### 6.1 最小可用配置（3 个必填项）
+#### 6.1 最小可用配置（4 个必填项）
 
 ```bash
 wrangler secret put TOKEN        # 你定的随机字符串，用作 HTTP 接口密码
 wrangler secret put BOT_TOKEN    # BotFather 给的 token
 wrangler secret put GROUP_ID     # -1001234567890（可逗号分隔多群）
+wrangler secret put WEBHOOK_SECRET # 独立的随机字符串，用于验证 Telegram 更新来源
 ```
 
 #### 6.2 推荐加上（强烈建议）
@@ -354,7 +358,9 @@ wrangler secret put GROUP_ID     # -1001234567890（可逗号分隔多群）
 
 #### 6.3 老部署升级需要做什么
 
-- **`wrangler.toml`** —— 确认 `keep_vars = true`，否则部署会用本地覆盖远端变量
+- **Webhook 校验** —— 本版本不再允许未配置或非法的 `WEBHOOK_SECRET` 放行。升级前先在仍运行的旧版本完成有效密钥配置，访问 `/{TOKEN}` 重新注册，并确认消息正常接收，再发布本版本。仅填写密钥而未重新注册，Telegram 不会发送匹配的头
+- **`wrangler.toml`** —— 保留 `keep_vars = true`，并启用 `compatibility_flags = ["nodejs_als"]`。手动上传 `_worker.js` 时也需要启用 `nodejs_als` 兼容标志，供请求状态隔离使用
+- **队列** —— 保留消费者 `max_retries = 3`（与源码的重试上限一致）。临时故障按当前消息有限重试；已保存成功的群操作不会重放，重试耗尽或永久错误会记录失败，仍可按原权限用 `/jobrun` 续跑
 - **数据** —— 无需手动 SQL，表结构自动迁移，黑名单一条不动
 - **订阅** —— 改过 `allowed_updates` 必须**重新访问一次初始化地址**
 - **AI** —— 绑了 AI 记得发几次 `/warmup` 补满向量
@@ -369,7 +375,7 @@ Workers 已连 GitHub 时，`git push` 即自动部署。
 
 ### 8. 初始化 Webhook
 
-浏览器访问 `https://你的Worker域名/{TOKEN}` —— 这一步**注册 Webhook + 下发 `allowed_updates` + 注册命令菜单 + 设置第一主人的小程序菜单**。改过 `allowed_updates` 或升级小程序入口后必须重访一次。检查返回的 `MiniApp.已设置`；菜单失败会单独说明原因，重试初始化即可。
+浏览器访问 `https://你的Worker域名/{TOKEN}` —— 这一步**注册 Webhook + 下发 `secret_token` 和 `allowed_updates` + 注册命令菜单 + 设置第一主人的小程序菜单**。修改 `WEBHOOK_SECRET`、`allowed_updates` 或升级小程序入口后必须重访一次。检查返回的 Webhook 注册结果和 `MiniApp.已设置`；菜单失败会单独说明原因，重试初始化即可。
 
 ## Telegram 管理小程序
 

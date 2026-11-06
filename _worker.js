@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 // =============================================================================
 // =可修改= 项目内置文案与参数
 // 优先级：环境变量 > 这里的硬编码默认值
@@ -224,72 +226,98 @@ const AD_JOB_PAGINATION_PREFIX = 'adjob:';
 const AD_WORDS_PAGE_LIMIT = 20;
 const AD_VOTE_HISTORY_FALLBACK_LIMIT = 20;
 
-// 运行期生效的可配置项（每次请求开始时由 loadRequiredConfig 写入）
-let SELF_UNBAN_KEYWORD;
-let START_WELCOME;
-let SELF_UNBAN_PROMPT;
-let SELF_UNBAN_APPROVED;
-let SELF_UNBAN_APPROVED_NOLINK;
-let SELF_UNBAN_CONTACT_GROUP;
-let BLACKLIST_PAGE_LIMIT;
-let BLACKLIST_REASON_LABELS;
-let GKY_BANLIST_ENDPOINT;
-// 群内闪屏存活毫秒数。给初值是因为 sendFlashMessage 可能在 getConfig 之前被调用
-// （例如配置解析本身报错时的提示），此时不该因为 undefined 退化成"永不撤回"。
-let FLASH_MESSAGE_TTL_MS = DEFAULT_FLASH_MESSAGE_TTL_MS;
+const REQUEST_RUNTIME = new AsyncLocalStorage();
+// 只共享已取得的元数据；按机器人及主群分开，不缓存请求中的 Promise。
+const RUNTIME_BOT_METADATA = new Map();
+const RUNTIME_GROUP_METADATA = new Map();
 
-// Telegram Bot Token
-let TOKEN;
-let BOT_TOKEN;
-// 主群组ID（GROUP_IDS 的第一项，用于发送二次审核提醒、缓存群组信息等"主群行为"）
-let GROUP_ID;
-// 全部配置群组ID列表（支持 GROUP_ID 环境变量逗号分隔多群组）
-let GROUP_IDS = [];
-// GROUP_ID 环境变量原始群列表（不含 /addgroup 动态群）。用于 /listgroups 分段展示、
-// 以及禁止把环境变量里已有的群重复加进动态表。
-let ENV_GROUP_IDS = [];
-// D1 dynamic_groups 里合并进来的群（每请求由 mergeDynamicGroupsFromD1 重建）
-let DYNAMIC_GROUP_IDS = [];
-// 动态群基线本次是否可信（读 D1 失败时为 false）。GROUP_IDS 的可信度依赖它：
-// 读失败时 GROUP_IDS 会静默停在环境变量群上，那是「短」不是「少」，任何以它为准的
-// 清理都可能误删动态群的数据 —— 见 syncAdGroupAdmins 末尾的孤儿群清理。
-let DYNAMIC_GROUPS_READY = false;
-// 主人 TGID 列表:第一个是主人,后续是副主人。空数组 = 未配置,禁用通知
-let OWNER_IDS = [];
-// 超级管理员 TGID 列表：等同 Telegram 群管理员的全部权限（免实际管理员身份），
-// 可用 /ban /spam /unban /check；不含主人/副主人高级权限，也不参与 /stats。空数组 = 未配置。
-let SUPER_ADMIN_IDS = [];
-// 杀手群 ID 列表（环境变量 KILLER_MODE_GROUPS）。处置口径固定，见顶部 10.6。
-let KILLER_MODE_GROUPS = [];
-// 独立模式群 ID 列表（D1 group_mode 表，/groupmode 切换）。全局黑名单在这些群不生效（第一主人封的除外），
-// 由群主自治、写本群黑名单 group_blacklist。每请求由 loadIndependentGroups 从 D1 重新加载。
-let INDEPENDENT_GROUP_IDS = [];
-// 有本群黑名单（group_blacklist）记录的群。拦截链路据此决定要不要多查一条。
-// 【为什么全局群也可能有】超管的范围选择按钮（已于 2026-10-25 取消）曾能在全局群
-// 写本群名单，那些历史记录还在表里、还要继续生效 —— 所以这个集合不能假定只含独立群。
-let LOCAL_BLACKLIST_CHAT_IDS = [];
-// 杀手权限 TGID 列表（环境变量 KILLER_ADMIN_IDS），见顶部 10.6b。
-let KILLER_ADMIN_IDS = [];
-// 关键词搜索的保留群 ID 列表（环境变量 STAT_SEARCH_GROUPS）。这些群的正文按天保留 180 天，
-// 其余群维持全局 200 条。空数组 = 不启用，裁剪行为与改动前完全一致。
-let STAT_SEARCH_GROUPS = [];
-// 静态用户资料表：bot 不在其所在群时作为 /admins 权限名单的兜底显示
-// 格式：TGID 字符串 → { id, first_name, last_name, username }
-// 环境变量 STATIC_USER_PROFILES（JSON 字符串）优先，留空则为空表
-let STATIC_USER_PROFILES = {};
-// 只读资料群：仅用于 /admins 查询用户昵称/用户名/来源群，【完全不参与治理】。
-// 刻意【不并入 GROUP_IDS】—— isConfiguredGroup 看不到这个名单，
-// 因此广告检测、封禁、命令鉴权、/purge、/ad 投票全都不会碰这些群。
-// bot 在里面不需要任何权限，普通成员即可（getChatMember 只要求 bot 在群内）。
-let PROFILE_LOOKUP_GROUPS = [];
-// 清扫回看上限(/spam 按它决定 moderation_messages 回看多少条)
-let MSG_CACHE_SIZE = 50;
-// 机器人用户名缓存
-let BOT_USERNAME = null;
-let BOT_ID = null;
-// 群组信息缓存（仅缓存主群）
-let GROUP_TITLE = null;
-let GROUP_USERNAME = null;
+function runtime() {
+	const state = REQUEST_RUNTIME.getStore();
+	if (!state) throw new Error('运行上下文未初始化');
+	return state;
+}
+
+function withRuntime(handler) {
+	return (...args) => REQUEST_RUNTIME.run(createRuntimeState(), () => handler(...args));
+}
+
+function runtimeMetadata(cache, key) {
+	if (!cache.has(key)) {
+		if (cache.size >= 32) cache.delete(cache.keys().next().value);
+		cache.set(key, {});
+	}
+	return cache.get(key);
+}
+
+function createRuntimeState() {
+	return {
+		// 每个入口独立保存配置及治理范围，异步等待和 waitUntil 延续同一份上下文。
+		SELF_UNBAN_KEYWORD: undefined,
+		START_WELCOME: undefined,
+		SELF_UNBAN_PROMPT: undefined,
+		SELF_UNBAN_APPROVED: undefined,
+		SELF_UNBAN_APPROVED_NOLINK: undefined,
+		SELF_UNBAN_CONTACT_GROUP: undefined,
+		BLACKLIST_PAGE_LIMIT: undefined,
+		BLACKLIST_REASON_LABELS: undefined,
+		GKY_BANLIST_ENDPOINT: undefined,
+		// 群内闪屏存活毫秒数。给初值是因为 sendFlashMessage 可能在 getConfig 之前被调用
+		// （例如配置解析本身报错时的提示），此时不该因为 undefined 退化成"永不撤回"。
+		FLASH_MESSAGE_TTL_MS: DEFAULT_FLASH_MESSAGE_TTL_MS,
+
+		// Telegram Bot Token
+		TOKEN: undefined,
+		BOT_TOKEN: undefined,
+		// 主群组ID（GROUP_IDS 的第一项，用于发送二次审核提醒、缓存群组信息等"主群行为"）
+		GROUP_ID: undefined,
+		// 全部配置群组ID列表（支持 GROUP_ID 环境变量逗号分隔多群组）
+		GROUP_IDS: [],
+		// GROUP_ID 环境变量原始群列表（不含 /addgroup 动态群）。用于 /listgroups 分段展示、
+		// 以及禁止把环境变量里已有的群重复加进动态表。
+		ENV_GROUP_IDS: [],
+		// D1 dynamic_groups 里合并进来的群（每请求由 mergeDynamicGroupsFromD1 重建）
+		DYNAMIC_GROUP_IDS: [],
+		// 动态群基线本次是否可信（读 D1 失败时为 false）。GROUP_IDS 的可信度依赖它：
+		// 读失败时 GROUP_IDS 会静默停在环境变量群上，那是「短」不是「少」，任何以它为准的
+		// 清理都可能误删动态群的数据 —— 见 syncAdGroupAdmins 末尾的孤儿群清理。
+		DYNAMIC_GROUPS_READY: false,
+		// 主人 TGID 列表:第一个是主人,后续是副主人。空数组 = 未配置,禁用通知
+		OWNER_IDS: [],
+		// 超级管理员 TGID 列表：等同 Telegram 群管理员的全部权限（免实际管理员身份），
+		// 可用 /ban /spam /unban /check；不含主人/副主人高级权限，也不参与 /stats。空数组 = 未配置。
+		SUPER_ADMIN_IDS: [],
+		// 杀手群 ID 列表（环境变量 KILLER_MODE_GROUPS）。处置口径固定，见顶部 10.6。
+		KILLER_MODE_GROUPS: [],
+		// 独立模式群 ID 列表（D1 group_mode 表，/groupmode 切换）。全局黑名单在这些群不生效（第一主人封的除外），
+		// 由群主自治、写本群黑名单 group_blacklist。每请求由 loadIndependentGroups 从 D1 重新加载。
+		INDEPENDENT_GROUP_IDS: [],
+		// 有本群黑名单（group_blacklist）记录的群。拦截链路据此决定要不要多查一条。
+		// 【为什么全局群也可能有】超管的范围选择按钮（已于 2026-10-25 取消）曾能在全局群
+		// 写本群名单，那些历史记录还在表里、还要继续生效 —— 所以这个集合不能假定只含独立群。
+		LOCAL_BLACKLIST_CHAT_IDS: [],
+		// 杀手权限 TGID 列表（环境变量 KILLER_ADMIN_IDS），见顶部 10.6b。
+		KILLER_ADMIN_IDS: [],
+		// 关键词搜索的保留群 ID 列表（环境变量 STAT_SEARCH_GROUPS）。这些群的正文按天保留 180 天，
+		// 其余群维持全局 200 条。空数组 = 不启用，裁剪行为与改动前完全一致。
+		STAT_SEARCH_GROUPS: [],
+		// 静态用户资料表：bot 不在其所在群时作为 /admins 权限名单的兜底显示
+		// 格式：TGID 字符串 → { id, first_name, last_name, username }
+		// 环境变量 STATIC_USER_PROFILES（JSON 字符串）优先，留空则为空表
+		STATIC_USER_PROFILES: {},
+		// 只读资料群：仅用于 /admins 查询用户昵称/用户名/来源群，【完全不参与治理】。
+		// 刻意【不并入 GROUP_IDS】—— isConfiguredGroup 看不到这个名单，
+		// 因此广告检测、封禁、命令鉴权、/purge、/ad 投票全都不会碰这些群。
+		// bot 在里面不需要任何权限，普通成员即可（getChatMember 只要求 bot 在群内）。
+		PROFILE_LOOKUP_GROUPS: [],
+		// 清扫回看上限(/spam 按它决定 moderation_messages 回看多少条)
+		MSG_CACHE_SIZE: 50,
+		AD_PROTECTED_USERNAMES: [],
+		AD_TRUSTED_BOTS: [],
+		WEB_ADMIN_CAPTURE: null,
+		BOT_INFO: {},
+		GROUP_INFO: {}
+	};
+}
 
 // ===== Webhook 来源校验（2026-10-20）=====
 //
@@ -299,14 +327,9 @@ let GROUP_USERNAME = null;
 // Telegram 官方给 webhook 的验签手段只有 secret_token：setWebhook 时下发，
 // 之后每条更新都带 X-Telegram-Bot-Api-Secret-Token 头。
 //
-// 【为什么做成可选】存量部署的 webhook 是在没有 secret 的情况下注册的。新代码上线瞬间
-// 如果强制校验，Telegram 推来的每条更新都会被 401，机器人直接停摆，直到有人访问
-// `/{TOKEN}` 重新注册。为了不把「修漏洞」变成「停机事故」，这里按环境变量显式启用：
-//   · 配了 WEBHOOK_SECRET（只允许 A-Za-z0-9_-，1~256 位）→ setWebhook 带 secret_token，
-//     fetch 拒绝所有不带匹配头的 POST；
-//   · 没配 → 行为与改动前逐字节一致（离线测试也不受影响）。
-// 启用步骤：Dashboard 加 WEBHOOK_SECRET → 访问一次 `/{TOKEN}` 重新注册 → 再部署/生效。
-// 只配变量不重新注册，Telegram 不会带新头，等于没启用。
+// WEBHOOK_SECRET 必须有效（A-Za-z0-9_-，1~256 位）；缺失或非法时关闭更新入口。
+// 存量升级先在旧版本配置 secret 并重新注册 Webhook，确认接收正常后再发布严格版本。
+// 后台和 TOKEN 初始化入口仍可访问，便于修复配置；初始化也禁止注册无 secret 的 Webhook。
 let WEBHOOK_SECRET_WARNED = false;
 function getConfiguredWebhookSecret(env) {
 	const raw = String(env?.WEBHOOK_SECRET || '').trim();
@@ -314,7 +337,7 @@ function getConfiguredWebhookSecret(env) {
 	if (!/^[A-Za-z0-9_-]{1,256}$/.test(raw)) {
 		if (!WEBHOOK_SECRET_WARNED) {
 			WEBHOOK_SECRET_WARNED = true;
-			console.warn('[Webhook] WEBHOOK_SECRET 含非法字符（只允许 A-Za-z0-9_-，1~256 位），已忽略；本次仍未启用来源校验');
+			console.warn('[Webhook] WEBHOOK_SECRET 含非法字符（只允许 A-Za-z0-9_-，1~256 位），更新入口已关闭');
 		}
 		return '';
 	}
@@ -322,50 +345,53 @@ function getConfiguredWebhookSecret(env) {
 }
 function webhookSecretFields(env) {
 	const secret = getConfiguredWebhookSecret(env);
-	return secret ? { secret_token: secret } : {};
+	if (!secret) throw new Error('请配置有效的 WEBHOOK_SECRET 后重新初始化 Webhook');
+	return { secret_token: secret };
 }
 
 function applyRuntimeConfig(config) {
-	TOKEN = config.TOKEN;
-	BOT_TOKEN = config.BOT_TOKEN;
-	KILLER_MODE_GROUPS = config.KILLER_MODE_GROUPS || [];
-	KILLER_ADMIN_IDS = config.KILLER_ADMIN_IDS || [];
-	STAT_SEARCH_GROUPS = config.STAT_SEARCH_GROUPS || [];
+	runtime().TOKEN = config.TOKEN;
+	runtime().BOT_TOKEN = config.BOT_TOKEN;
+	runtime().KILLER_MODE_GROUPS = config.KILLER_MODE_GROUPS || [];
+	runtime().KILLER_ADMIN_IDS = config.KILLER_ADMIN_IDS || [];
+	runtime().STAT_SEARCH_GROUPS = config.STAT_SEARCH_GROUPS || [];
 	// 杀手群并入有效 GROUP_IDS：它们即使不在 GROUP_ID 环境变量里，也享受全群治理
 	// （/stats、/ban、/spam、/check、广告检测、发言/进退群统计），处置口径按顶部 10.6 固定。
 	// 搜索群同样并入：不并入就不算配置群，isConfiguredGroup 为 false，消息一条都不写缓存，
 	// STAT_SEARCH_GROUPS 配了也搜不到东西。语义上它也确实是「我们要治理并留下记录的群」。
-	const effectiveGroupIds = [...new Set([...(config.GROUP_IDS || []), ...KILLER_MODE_GROUPS, ...STAT_SEARCH_GROUPS])];
-	GROUP_IDS = effectiveGroupIds;
+	const effectiveGroupIds = [...new Set([...(config.GROUP_IDS || []), ...runtime().KILLER_MODE_GROUPS, ...runtime().STAT_SEARCH_GROUPS])];
+	runtime().GROUP_IDS = effectiveGroupIds;
 	// 每请求把动态群基线重置为空：GROUP_IDS 此刻只含环境变量群（含杀手模式群），
 	// 随后 mergeDynamicGroupsFromD1 再按 D1 内容追加，避免 isolate 复用时残留上次的群。
-	ENV_GROUP_IDS = [...effectiveGroupIds];
-	DYNAMIC_GROUP_IDS = [];
-	DYNAMIC_GROUPS_READY = false;
-	INDEPENDENT_GROUP_IDS = [];
-	LOCAL_BLACKLIST_CHAT_IDS = [];
-	GROUP_ID = config.GROUP_ID;
-	OWNER_IDS = config.OWNER_IDS;
-	SUPER_ADMIN_IDS = config.SUPER_ADMIN_IDS || [];
-	STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
-	PROFILE_LOOKUP_GROUPS = config.PROFILE_LOOKUP_GROUPS || [];
-	AD_PROTECTED_USERNAMES = config.AD_PROTECTED_USERNAMES || [];
-	AD_TRUSTED_BOTS = config.AD_TRUSTED_BOTS || [];
-	MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
-	FLASH_MESSAGE_TTL_MS = config.FLASH_MESSAGE_TTL_MS;
-	SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
-	START_WELCOME = config.START_WELCOME;
-	SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
-	SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
-	SELF_UNBAN_APPROVED_NOLINK = config.SELF_UNBAN_APPROVED_NOLINK;
-	SELF_UNBAN_CONTACT_GROUP = config.SELF_UNBAN_CONTACT_GROUP;
-	BLACKLIST_PAGE_LIMIT = config.BLACKLIST_PAGE_LIMIT;
-	BLACKLIST_REASON_LABELS = config.BLACKLIST_REASON_LABELS;
-	GKY_BANLIST_ENDPOINT = config.GKY_BANLIST_ENDPOINT;
+	runtime().ENV_GROUP_IDS = [...effectiveGroupIds];
+	runtime().DYNAMIC_GROUP_IDS = [];
+	runtime().DYNAMIC_GROUPS_READY = false;
+	runtime().INDEPENDENT_GROUP_IDS = [];
+	runtime().LOCAL_BLACKLIST_CHAT_IDS = [];
+	runtime().GROUP_ID = config.GROUP_ID;
+	runtime().OWNER_IDS = config.OWNER_IDS;
+	runtime().SUPER_ADMIN_IDS = config.SUPER_ADMIN_IDS || [];
+	runtime().STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
+	runtime().PROFILE_LOOKUP_GROUPS = config.PROFILE_LOOKUP_GROUPS || [];
+	runtime().AD_PROTECTED_USERNAMES = config.AD_PROTECTED_USERNAMES || [];
+	runtime().AD_TRUSTED_BOTS = config.AD_TRUSTED_BOTS || [];
+	runtime().MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
+	runtime().FLASH_MESSAGE_TTL_MS = config.FLASH_MESSAGE_TTL_MS;
+	runtime().SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
+	runtime().START_WELCOME = config.START_WELCOME;
+	runtime().SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
+	runtime().SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
+	runtime().SELF_UNBAN_APPROVED_NOLINK = config.SELF_UNBAN_APPROVED_NOLINK;
+	runtime().SELF_UNBAN_CONTACT_GROUP = config.SELF_UNBAN_CONTACT_GROUP;
+	runtime().BLACKLIST_PAGE_LIMIT = config.BLACKLIST_PAGE_LIMIT;
+	runtime().BLACKLIST_REASON_LABELS = config.BLACKLIST_REASON_LABELS;
+	runtime().GKY_BANLIST_ENDPOINT = config.GKY_BANLIST_ENDPOINT;
+	runtime().BOT_INFO = runtimeMetadata(RUNTIME_BOT_METADATA, config.BOT_TOKEN);
+	runtime().GROUP_INFO = runtimeMetadata(RUNTIME_GROUP_METADATA, JSON.stringify([config.BOT_TOKEN, config.GROUP_ID]));
 }
 
 export default {
-	async fetch(request, env, ctx) {
+	fetch: withRuntime(async function fetch(request, env, ctx) {
 		const url = new URL(request.url);
 		const path = url.pathname.slice(1); // 移除开头的斜杠
 		// 公共页面只返回静态外壳；身份与权限由 API 校验，不消耗 D1。
@@ -411,14 +437,14 @@ export default {
 			});
 		}
 		// 独立查询页：打开 /check 输入 TGID 查询（GKY + 全局黑名单 + 群级封禁记录）。
-		if (request.method === 'GET' && path === 'check' && path !== TOKEN) {
+		if (request.method === 'GET' && path === 'check' && path !== runtime().TOKEN) {
 			return await handlePublicCheckPage(env, url);
 		}
-		if (request.method === 'GET' && path !== TOKEN && PUBLIC_TGID_PATTERN.test(path)) {
+		if (request.method === 'GET' && path !== runtime().TOKEN && PUBLIC_TGID_PATTERN.test(path)) {
 			return await handlePublicLookup(env, url, path);
 		}
 		// 联合封杀数据源：订阅方凭后台生成的 key 拉变更（鉴权在函数里，key 错 401，不碰黑名单表）。
-		if (url.pathname === '/fed/changes' && path !== TOKEN) {
+		if (url.pathname === '/fed/changes' && path !== runtime().TOKEN) {
 			try {
 				return await handleFedChanges(request, env, url);
 			} catch (error) {
@@ -429,8 +455,11 @@ export default {
 		// ===== Webhook 来源校验（放在任何 D1 读写之前）=====
 		// 校验不通过就不碰数据库：伪造请求连一次 D1 查询都不该消耗。
 		// 只拦 POST 根路径（Telegram 更新入口）；GET/POST `/{TOKEN}` 初始化走 TOKEN 鉴权，不受影响。
-		const configuredWebhookSecret = getConfiguredWebhookSecret(env);
-		if (request.method === 'POST' && path === '' && configuredWebhookSecret) {
+		if (request.method === 'POST' && path === '') {
+			const configuredWebhookSecret = getConfiguredWebhookSecret(env);
+			if (!configuredWebhookSecret) {
+				return new Response('Webhook secret is not configured correctly', { status: 503 });
+			}
 			const receivedSecret = String(request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '');
 			if (receivedSecret !== configuredWebhookSecret) {
 				console.warn('[Webhook] 拒绝来源不明的更新：secret token 不匹配');
@@ -439,7 +468,7 @@ export default {
 		}
 
 		// 网页管理后台：登录页与鉴权不需要动态群；接口内部按本请求重建群列表（同小程序）。
-		if ((url.pathname === '/admin' || url.pathname.startsWith('/admin/api/')) && path !== TOKEN) {
+		if ((url.pathname === '/admin' || url.pathname.startsWith('/admin/api/')) && path !== runtime().TOKEN) {
 			return await handleWebAdmin(request, env, ctx, url);
 		}
 
@@ -451,22 +480,22 @@ export default {
 			return new Response('治理群配置暂不可用，请稍后重试', { status: 503, headers: { 'Retry-After': '5' } });
 		}
 
-		if (request.method === 'GET' && path === `${TOKEN}/export`) {
+		if (request.method === 'GET' && path === `${runtime().TOKEN}/export`) {
 			// 黑名单导出（浏览器 / JSON / CSV，受 TOKEN 保护）
 			return await handleExport(env, url);
 		} else if (path === 'export') {
 			// 黑名单导出（一次性密码登录）：给可信用户，只能看/下载黑名单，碰不到任何 TOKEN 管理接口
 			return await handlePasswordExport(request, env, url);
-		} else if (request.method === 'GET' && path === `${TOKEN}/purge/groups`) {
+		} else if (request.method === 'GET' && path === `${runtime().TOKEN}/purge/groups`) {
 			// 清扫前预检：只保留 bot 具备封禁权限的群
 			return await handlePurgeGroups();
-		} else if (request.method === 'GET' && path === `${TOKEN}/purge/run`) {
+		} else if (request.method === 'GET' && path === `${runtime().TOKEN}/purge/run`) {
 			// 浏览器自动续跑页：由客户端逐批调用 /purge，避免单次 Worker 超限
 			return handlePurgeRunner(url);
-		} else if (request.method === 'GET' && path === `${TOKEN}/purge`) {
+		} else if (request.method === 'GET' && path === `${runtime().TOKEN}/purge`) {
 			// 分批清扫：把仍在群里的黑名单用户全部踢出（受 TOKEN 保护）
 			return await handlePurge(env, url);
-		} else if (request.method === 'GET' && path === `${TOKEN}/jobrun`) {
+		} else if (request.method === 'GET' && path === `${runtime().TOKEN}/jobrun`) {
 			// D1 批量任务续跑入口：每次仍只跑安全分片，正常由 Queue 自动续接，异常时可手动调用。
 			return await handleBulkJobAutoRun(env, url, ctx, request.url);
 		} else if (request.method === 'POST') {
@@ -510,19 +539,19 @@ export default {
 				}
 
 				return new Response('OK');
-			} else if (path === TOKEN) {
+			} else if (path === runtime().TOKEN) {
 				// 处理初始化命令
 				return await handleInitialization(request, env);
 			}
-		} else if (request.method === 'GET' && path === TOKEN) {
+		} else if (request.method === 'GET' && path === runtime().TOKEN) {
 			// 处理 GET 初始化请求
 			return await handleInitialization(request, env);
 		}
 
 		return new Response('Method Not Allowed', { status: 405 });
-	},
+	}),
 
-	async queue(batch, env, ctx) {
+	queue: withRuntime(async function queue(batch, env, ctx) {
 		try {
 			applyRuntimeConfig(loadRequiredConfig(env));
 		} catch (error) {
@@ -565,23 +594,17 @@ export default {
 				console.error('[批量任务] Queue 消息缺少 job id:', body);
 				continue;
 			}
-			await runBulkModerationJob(env, jobId, {
-				notifyOnDone: true,
-				autoContinue: true,
-				ctx,
-				requestUrl: '',
-				source: 'queue'
-			});
+			await consumeBulkModerationMessage(message, env, jobId);
 		}
-	},
+	}),
 
 	// Cron 入口（闸三）。触发器在 wrangler.toml 的 [triggers] crons 里配置。
 	// 只做一件事：滚动复查发言者名册的 bio，抓「先干净过检、事后改 bio」的逃逸。
 	// 与 fetch / queue 一样必须先 applyRuntimeConfig —— BOT_TOKEN 等运行期配置
-	// 是模块级变量，不初始化的话所有 Telegram 调用都会带空 token 静默失败。
+	// 保存在本次入口的上下文中，不初始化会导致 Telegram 调用缺少 token。
 	// mergeDynamicGroupsFromD1 同样必要：enforceAdDetection 的全群封禁要遍历
 	// 配置群 + 动态群，不合并会漏掉动态群里的封禁。
-	async scheduled(controller, env, ctx) {
+	scheduled: withRuntime(async function scheduled(controller, env, ctx) {
 		try {
 			applyRuntimeConfig(loadRequiredConfig(env));
 		} catch (error) {
@@ -638,7 +661,7 @@ export default {
 		} catch (error) {
 			console.error('[广告检测·扫描] Cron 执行失败:', error);
 		}
-	}
+	})
 };
 
 function loadRequiredConfig(env) {
@@ -2227,7 +2250,7 @@ function miniAppPaging(items, page, pageSize) {
 async function miniAppRefreshGroups(env) {
 	const rows = await loadDynamicGroupsFromD1(env);
 	const list = Array.isArray(rows) ? rows : [];
-	const envSet = new Set(ENV_GROUP_IDS.map((id) => String(id)));
+	const envSet = new Set(runtime().ENV_GROUP_IDS.map((id) => String(id)));
 	const extra = [];
 	for (const row of list) {
 		const id = String(row.chatId || '').trim();
@@ -2235,9 +2258,9 @@ async function miniAppRefreshGroups(env) {
 		envSet.add(id);
 		extra.push(id);
 	}
-	DYNAMIC_GROUP_IDS = extra;
-	GROUP_IDS = [...ENV_GROUP_IDS, ...extra];
-	DYNAMIC_GROUPS_READY = Array.isArray(rows);
+	runtime().DYNAMIC_GROUP_IDS = extra;
+	runtime().GROUP_IDS = [...runtime().ENV_GROUP_IDS, ...extra];
+	runtime().DYNAMIC_GROUPS_READY = Array.isArray(rows);
 	return { rows: list, readable: Array.isArray(rows) };
 }
 
@@ -2248,8 +2271,8 @@ async function miniAppRefreshGroups(env) {
 async function miniAppGroupList(env, loaded) {
 	const source = loaded || await miniAppRefreshGroups(env);
 	const dynamicRows = source.rows;
-	const envInfos = await Promise.all(ENV_GROUP_IDS.map((id) => resolveGroupInfoCached(String(id))));
-	const list = ENV_GROUP_IDS.map((id, index) => ({
+	const envInfos = await Promise.all(runtime().ENV_GROUP_IDS.map((id) => resolveGroupInfoCached(String(id))));
+	const list = runtime().ENV_GROUP_IDS.map((id, index) => ({
 		chatId: String(id),
 		title: String(envInfos[index]?.title || ''),
 		source: 'env',
@@ -2280,7 +2303,7 @@ async function miniAppBootstrap(env, auth, loaded) {
 		user: { id: auth.userId, name, username: String(user.username || '') },
 		primaryOwner: auth.primaryOwner === true,
 		// 主后台给第一主人一个进杀手后台的入口；没配杀手群就整个不显示。
-		killerEntry: KILLER_MODE_GROUPS.length > 0,
+		killerEntry: runtime().KILLER_MODE_GROUPS.length > 0,
 		groups: groups.list,
 		groupsReadable: groups.readable
 	};
@@ -2289,7 +2312,7 @@ async function miniAppBootstrap(env, auth, loaded) {
 async function miniAppAddGroup(env, payload, actorId) {
 	const id = String(payload.chatId || '').trim();
 	if (!isSupergroupChatId(id)) throw new MiniAppError(400, '群组 ID 必须是 -100 开头的超级群组 ID');
-	if (ENV_GROUP_IDS.some((g) => String(g) === id)) {
+	if (runtime().ENV_GROUP_IDS.some((g) => String(g) === id)) {
 		throw new MiniAppError(400, '该群已在 GROUP_ID 环境变量中，无需重复添加');
 	}
 	if (isDynamicGroup(id)) throw new MiniAppError(409, '该群已在动态群组列表中');
@@ -2325,7 +2348,7 @@ async function miniAppAddGroup(env, payload, actorId) {
 async function miniAppRemoveGroup(env, payload) {
 	const id = String(payload.chatId || '').trim();
 	if (!isSupergroupChatId(id)) throw new MiniAppError(400, '群组 ID 格式错误');
-	if (ENV_GROUP_IDS.some((g) => String(g) === id)) {
+	if (runtime().ENV_GROUP_IDS.some((g) => String(g) === id)) {
 		throw new MiniAppError(400, '该群来自 GROUP_ID 环境变量，不能在页面停止治理。请到 Cloudflare 后台修改 GROUP_ID');
 	}
 	const removed = await removeDynamicGroup(env, id);
@@ -2340,7 +2363,7 @@ async function miniAppRemoveGroup(env, payload) {
 async function miniAppLeaveGroup(env, payload) {
 	const id = String(payload.chatId || '').trim();
 	if (!isSupergroupChatId(id)) throw new MiniAppError(400, '群组 ID 格式错误');
-	if (ENV_GROUP_IDS.some((g) => String(g) === id)) {
+	if (runtime().ENV_GROUP_IDS.some((g) => String(g) === id)) {
 		// 与群内 /delgroup 同一条理由：Worker 写不了自己的环境变量，
 		// 主群这样退掉之后没有任何入口能把它加回来。
 		throw new MiniAppError(400, '该群来自 GROUP_ID 环境变量，不能在这里退出。请先到 Cloudflare 后台修改 GROUP_ID');
@@ -2411,7 +2434,7 @@ async function miniAppUnban(env, payload) {
 	const automaticRemoved = await removeAutomaticGroupBansInScope(env, [userId], globalUnbanScopeGroupIds());
 	if (automaticRemoved.failed.length) throw new MiniAppError(503, '移除本群自动封禁记录失败，请重试');
 	// 4甲：联合名单里的人同样写本地豁免（与 /unban 同口径）。没订阅时零 SQL。
-	const fedExempted = (await exemptFederatedOnUnban(env, [userId], String(OWNER_IDS[0] || ''))).includes(userId);
+	const fedExempted = (await exemptFederatedOnUnban(env, [userId], String(runtime().OWNER_IDS[0] || ''))).includes(userId);
 	// 全局解封不碰独立群（本群黑名单与踢出由那个群自己管）。
 	const results = await unbanUserFromAllGroups(userId, globalUnbanScopeGroupIds());
 	const failed = results.filter((row) => !row.ok);
@@ -2470,7 +2493,7 @@ async function miniAppAdSummary(env) {
 async function miniAppAdPending(env, payload) {
 	if (!(await adDetectionReady(env))) throw new MiniAppError(503, '广告检测尚未就绪');
 	// 快照只发给第一主人：序号是 /ignore 的唯一入口，多人共用会互相抢号。
-	const ownerId = OWNER_IDS[0] || '';
+	const ownerId = runtime().OWNER_IDS[0] || '';
 	const now = Math.floor(Date.now() / 1000);
 	const size = MINI_APP_AD_PAGE_SIZE;
 	try {
@@ -2591,7 +2614,7 @@ async function miniAppAdLLM(env) {
 
 async function miniAppAdDryRun(env, payload) {
 	const chatId = String(payload?.chatId || '').trim();
-	if (chatId && !(GROUP_IDS || []).map(String).includes(chatId)) throw new MiniAppError(400, '该群组不在治理范围内');
+	if (chatId && !(runtime().GROUP_IDS || []).map(String).includes(chatId)) throw new MiniAppError(400, '该群组不在治理范围内');
 	if (!(await ensureAdDryRunLogTable(env))) throw new MiniAppError(503, '演练流水暂不可用');
 	const where = chatId ? ' WHERE chat_id = ?' : '';
 	const args = chatId ? [chatId] : [];
@@ -2693,7 +2716,7 @@ const MINI_APP_BOT_PERMISSIONS = [
 async function miniAppGroupDetail(env, payload) {
 	const chatId = String(payload?.chatId || '').trim();
 	if (!isSupergroupChatId(chatId)) throw new MiniAppError(400, '群组 ID 必须是 -100 开头的超级群组 ID');
-	if (!(GROUP_IDS || []).map(String).includes(chatId)) throw new MiniAppError(404, '该群组不在治理范围内');
+	if (!(runtime().GROUP_IDS || []).map(String).includes(chatId)) throw new MiniAppError(404, '该群组不在治理范围内');
 	const [info, bot, dryRun, dryRunStats, dryRows, joinRows] = await Promise.all([
 		resolveGroupInfoCached(chatId),
 		miniAppBotPermissions(chatId),
@@ -2756,7 +2779,7 @@ async function miniAppBotPermissions(chatId) {
 	const botId = await getBotId();
 	if (!botId) return { ok: false, status: '', reason: '暂时无法获取机器人身份', permissions: [] };
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatMember`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: chatId, user_id: Number(botId) })
@@ -2783,12 +2806,12 @@ async function miniAppAdIgnore(env, payload) {
 	const seq = Number(payload.seq);
 	if (!Number.isSafeInteger(seq) || seq <= 0) throw new MiniAppError(400, '序号无效');
 	if (!(await adDetectionReady(env))) throw new MiniAppError(503, '广告检测尚未就绪');
-	const ownerId = OWNER_IDS[0] || '';
+	const ownerId = runtime().OWNER_IDS[0] || '';
 	const snapshot = await readAdPendingSnapshot(env, ownerId, seq);
 	if (!snapshot) throw new MiniAppError(404, '序号 #' + seq + ' 不存在或已复核过');
 	const result = await rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, {
 		strict: true,
-		groupIds: GROUP_IDS
+		groupIds: runtime().GROUP_IDS
 	});
 	// 记反例：与 /ignore 同一条路 —— 删掉特征之外，还要告诉模型「这段话主人确认过是正常的」，
 	// 否则下次看到同类内容它还会再判一次。失败只记日志，不影响回滚结果。
@@ -2989,10 +3012,10 @@ async function miniAppHealth(env, options = {}) {
 // 直接用它底下的 resolvePermissionUserProfiles + resolvePermissionGroupLabels 组装结构化数据。
 // 两处共用同一份预算常量，请求消耗与 /admins 完全一致。
 async function miniAppAdmins(env) {
-	const owners = Array.isArray(OWNER_IDS) ? OWNER_IDS.map(String) : [];
+	const owners = Array.isArray(runtime().OWNER_IDS) ? runtime().OWNER_IDS.map(String) : [];
 	const primary = owners.length ? [owners[0]] : [];
 	const secondary = owners.slice(1);
-	const superAdmins = [...new Set((SUPER_ADMIN_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
+	const superAdmins = [...new Set((runtime().SUPER_ADMIN_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
 	const allIds = [...primary, ...secondary, ...superAdmins];
 	const budget = createLookupBudget(ADMINS_LOOKUP_BUDGET);
 	const profiles = await resolvePermissionUserProfiles(allIds, { budget });
@@ -3049,7 +3072,7 @@ async function miniAppSearch(env, payload) {
 	} else {
 		keywordFilter = q.value;
 	}
-	const chatIds = [...new Set((GROUP_IDS || []).map(String).filter(Boolean))];
+	const chatIds = [...new Set((runtime().GROUP_IDS || []).map(String).filter(Boolean))];
 	const result = await runSearchMessages(env, {
 		chatIds, userId: userIdFilter, keyword: keywordFilter, page
 	});
@@ -3073,7 +3096,7 @@ async function miniAppNoticeSend(env, payload) {
 	const text = String(payload?.text || '').trim();
 	if (!text) throw new MiniAppError(400, '请输入通知内容');
 	if (text.length > 4096) throw new MiniAppError(400, '通知内容不能超过 4096 字');
-	const configured = [...new Set((GROUP_IDS || []).map(String).filter(Boolean))];
+	const configured = [...new Set((runtime().GROUP_IDS || []).map(String).filter(Boolean))];
 	if (!configured.length) throw new MiniAppError(400, '还没有配置治理群组');
 	const target = String(payload?.chatId || '').trim();
 	if (target && !configured.includes(target)) throw new MiniAppError(400, '该群组不在治理范围内');
@@ -3089,7 +3112,7 @@ async function miniAppNoticeSend(env, payload) {
 async function sendMiniAppNoticeText(groups, text, silent) {
 	const results = await mapWithConcurrency(groups, 5, async (groupId) => {
 		try {
-			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+			const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/sendMessage`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
@@ -3519,15 +3542,15 @@ async function dispatchKillerMiniAppAction(action, body, env, auth, ctx) {
 
 // 杀手权限持有者的菜单按钮（只对他们本人设置，与第一主人的菜单互不影响）。
 async function setKillerMiniAppMenuButtons(request) {
-	if (!KILLER_ADMIN_IDS.length || !KILLER_MODE_GROUPS.length) return { 已设置: 0, 原因: '未配置 KILLER_ADMIN_IDS 或 KILLER_MODE_GROUPS' };
+	if (!runtime().KILLER_ADMIN_IDS.length || !runtime().KILLER_MODE_GROUPS.length) return { 已设置: 0, 原因: '未配置 KILLER_ADMIN_IDS 或 KILLER_MODE_GROUPS' };
 	const appUrl = new URL('/app', request.url);
 	if (appUrl.protocol !== 'https:') return { 已设置: 0, 原因: 'Telegram 小程序入口需要 HTTPS' };
-	const targets = KILLER_ADMIN_IDS.filter((id) => !OWNER_IDS.includes(String(id)));
+	const targets = runtime().KILLER_ADMIN_IDS.filter((id) => !runtime().OWNER_IDS.includes(String(id)));
 	let ok = 0;
 	const failures = [];
 	for (const id of targets) {
 		try {
-			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setChatMenuButton`, {
+			const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/setChatMenuButton`, {
 				method: 'POST', headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ chat_id: id, menu_button: { type: 'web_app', text: '杀手后台', web_app: { url: appUrl.toString() } } })
 			});
@@ -3541,13 +3564,13 @@ async function setKillerMiniAppMenuButtons(request) {
 }
 
 async function setMiniAppMenuButton(request) {
-	if (!OWNER_IDS.length) return { 已设置: false, 原因: '未配置 OWNER_IDS，管理小程序未启用' };
+	if (!runtime().OWNER_IDS.length) return { 已设置: false, 原因: '未配置 OWNER_IDS，管理小程序未启用' };
 	const appUrl = new URL('/app', request.url);
 	if (appUrl.protocol !== 'https:') return { 已设置: false, 原因: 'Telegram 小程序入口需要 HTTPS' };
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setChatMenuButton`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/setChatMenuButton`, {
 			method: 'POST', headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ chat_id: OWNER_IDS[0], menu_button: { type: 'web_app', text: '群务台', web_app: { url: appUrl.toString() } } })
+			body: JSON.stringify({ chat_id: runtime().OWNER_IDS[0], menu_button: { type: 'web_app', text: '群务台', web_app: { url: appUrl.toString() } } })
 		});
 		const result = await response.json();
 		if (!response.ok || result.ok !== true) return { 已设置: false, HTTP状态码: response.status, 原因: String(result.description || 'Telegram 未确认菜单设置成功') };
@@ -3556,12 +3579,15 @@ async function setMiniAppMenuButton(request) {
 }
 
 async function handleInitialization(request, env) {
+	if (!getConfiguredWebhookSecret(env)) {
+		return jsonResponse({ success: false, error: '请配置有效的 WEBHOOK_SECRET 后重新初始化 Webhook' }, 503);
+	}
 	try {
 		// 设置 Webhook
 		const webhookUrl = new URL(request.url);
 		webhookUrl.pathname = '/';
 
-		const setWebhookUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`;
+		const setWebhookUrl = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/setWebhook`;
 		const setWebhookBody = {
 			url: webhookUrl.toString(),
 			// chat_join_request：入群审批请求。第2批新增 —— 有了它才能记录「申请时间」。
@@ -3575,8 +3601,7 @@ async function handleInitialization(request, env) {
 			// ⚠️ setWebhook 的 allowed_updates 是整体覆盖而不是追加：加了这一项之后
 			//    必须重新访问一次初始化地址，否则线上仍是旧列表、频道那条路永远不触发。
 			allowed_updates: ['message', 'chat_member', 'my_chat_member', 'callback_query', 'chat_join_request'],
-			// 配了 WEBHOOK_SECRET 才下发 secret_token；未配置时展开为空对象，
-			// 请求体与改动前完全一致（存量部署重新访问初始化地址不会被意外改成强制校验）。
+			// 重新注册时必须下发与接收端一致的 secret_token。
 			...webhookSecretFields(env)
 		};
 
@@ -3601,7 +3626,7 @@ async function handleInitialization(request, env) {
 		}
 
 		// 设置机器人命令
-		const setCommandsUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
+		const setCommandsUrl = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/setMyCommands`;
 		const setCommandsBody = {
 			commands: [
 				// 【2026-10-25 主人要求】/ 菜单只留六条常用命令；其余命令的处理代码全部保留、照样能直接发，
@@ -3638,8 +3663,8 @@ async function handleInitialization(request, env) {
 			const miniAppMenu = await setMiniAppMenuButton(request);
 			// 杀手后台入口：只对 KILLER_ADMIN_IDS 本人设置；失败不影响初始化成败（多半是对方还没私聊过 bot）。
 			const killerMenu = await setKillerMiniAppMenuButtons(request);
-			if (KILLER_ADMIN_IDS.length) miniAppMenu.杀手后台 = killerMenu;
-			const miniAppMenuFailed = OWNER_IDS.length > 0 && !miniAppMenu.已设置;
+			if (runtime().KILLER_ADMIN_IDS.length) miniAppMenu.杀手后台 = killerMenu;
+			const miniAppMenuFailed = runtime().OWNER_IDS.length > 0 && !miniAppMenu.已设置;
 			return beautifyJsonResponse(request, {
 				成功: !miniAppMenuFailed,
 				消息: miniAppMenuFailed ? 'Webhook 和命令已设置，小程序菜单设置失败，请重试初始化' : 'Webhook、命令和管理入口设置完成',
@@ -3691,6 +3716,8 @@ const BULK_TASK_USER_BATCH_SIZE = 20;
 const BULK_TASK_OPERATION_SLICE_SIZE = 24;
 const BULK_TASK_CONCURRENCY = 3;
 const BULK_TASK_D1_RETRY_LIMIT = 1;
+// 与 wrangler.toml 的 queues.consumers.max_retries 保持一致（首次投递之外的重试数）。
+const BULK_TASK_QUEUE_RETRY_LIMIT = 3;
 const BULK_TASK_D1_RETRY_DELAY_MS = 200;
 const BULK_TASK_FAILURE_LIMIT = 100;
 const BULK_TASK_LEASE_MS = 45000;
@@ -3798,7 +3825,7 @@ function buildActionContextLines(message, actionNote) {
 		const chatId = message?.chat?.id ?? '未知';
 		lines.push(`📍 命令来源:${escapeHtml(title)} <code>${escapeHtml(String(chatId))}</code>`);
 		const scope = Array.isArray(message?.__moderationScope) ? message.__moderationScope : null;
-		const groupCount = Array.isArray(GROUP_IDS) ? GROUP_IDS.length : 0;
+		const groupCount = Array.isArray(runtime().GROUP_IDS) ? runtime().GROUP_IDS.length : 0;
 		if (message?.__moderationScopeLocal === true) lines.push('🧹 作用范围:仅本群(本群黑名单)');
 		else if (scope && scope.length !== groupCount) lines.push(`🧹 作用范围:${scope.length} 个群(已跳过独立群)`);
 		else lines.push(`🧹 作用范围:全部 ${groupCount} 个配置群`);
@@ -4200,29 +4227,29 @@ async function loadDynamicGroupsCachedFromD1(env) {
 // 造成批量任务显示成功但那些群实际未执行。
 async function prepareGovernanceScope(env) {
 	await mergeDynamicGroupsFromD1(env);
-	if (env?.DB && !DYNAMIC_GROUPS_READY) throw new MiniAppError(503, '动态治理群读取失败，本次治理未执行');
+	if (env?.DB && !runtime().DYNAMIC_GROUPS_READY) throw new MiniAppError(503, '动态治理群读取失败，本次治理未执行');
 	await loadIndependentGroups(env);
 }
 
 async function mergeDynamicGroupsFromD1(env) {
 	if (!env?.DB) return;
 	// 环境变量群基线由 applyRuntimeConfig 每请求重置，这里只做追加。
-	ENV_GROUP_IDS = [...GROUP_IDS];
+	runtime().ENV_GROUP_IDS = [...runtime().GROUP_IDS];
 	try {
 		const rows = await loadDynamicGroupsCachedFromD1(env);
 		// 读失败（null）与「真的没有动态群」（空数组）在这里必须分开：前者 GROUP_IDS
 		// 会停在环境变量群上，那是「短」不是「少」，不能当成「动态群被删光了」。
 		if (rows === null) {
-			DYNAMIC_GROUP_IDS = [];
-			DYNAMIC_GROUPS_READY = false;
+			runtime().DYNAMIC_GROUP_IDS = [];
+			runtime().DYNAMIC_GROUPS_READY = false;
 			return;
 		}
 		if (rows.length === 0) {
-			DYNAMIC_GROUP_IDS = [];
-			DYNAMIC_GROUPS_READY = true;
+			runtime().DYNAMIC_GROUP_IDS = [];
+			runtime().DYNAMIC_GROUPS_READY = true;
 			return;
 		}
-		const envSet = new Set(GROUP_IDS.map((id) => String(id)));
+		const envSet = new Set(runtime().GROUP_IDS.map((id) => String(id)));
 		const extra = [];
 		for (const row of rows) {
 			const id = String(row.chatId || '').trim();
@@ -4230,20 +4257,20 @@ async function mergeDynamicGroupsFromD1(env) {
 			envSet.add(id);
 			extra.push(id);
 		}
-		DYNAMIC_GROUP_IDS = extra;
-		if (extra.length > 0) GROUP_IDS = [...GROUP_IDS, ...extra];
-		DYNAMIC_GROUPS_READY = true;
+		runtime().DYNAMIC_GROUP_IDS = extra;
+		if (extra.length > 0) runtime().GROUP_IDS = [...runtime().GROUP_IDS, ...extra];
+		runtime().DYNAMIC_GROUPS_READY = true;
 	} catch (error) {
 		// 读失败时保持环境变量群不变，绝不因此丢群
 		console.error('[动态群组] 合并失败，仅使用 GROUP_ID 环境变量:', error);
-		DYNAMIC_GROUP_IDS = [];
-		DYNAMIC_GROUPS_READY = false;
+		runtime().DYNAMIC_GROUP_IDS = [];
+		runtime().DYNAMIC_GROUPS_READY = false;
 	}
 }
 
 function isDynamicGroup(chatId) {
 	const idStr = String(chatId ?? '');
-	return DYNAMIC_GROUP_IDS.some((id) => String(id) === idStr);
+	return runtime().DYNAMIC_GROUP_IDS.some((id) => String(id) === idStr);
 }
 
 function isSupergroupChatId(value) {
@@ -4257,7 +4284,7 @@ async function addDynamicGroup(env, chatId, options = {}) {
 		return { ok: false, code: 'INVALID', message: '群组 ID 格式错误，必须是 -100 开头的超级群组 ID' };
 	}
 	// 已在环境变量里的群不允许重复加入，避免两套数据来源打架
-	if (ENV_GROUP_IDS.some((g) => String(g) === id)) {
+	if (runtime().ENV_GROUP_IDS.some((g) => String(g) === id)) {
 		return { ok: false, code: 'ENV_DUPLICATE', message: '该群已在 GROUP_ID 环境变量中，无需重复添加' };
 	}
 	try {
@@ -4314,7 +4341,7 @@ async function readD1BlacklistEntry(env, userId) {
 
 async function readD1BlacklistRecent(env, limit) {
 	await ensureD1Table(env);
-	const safeLimit = Math.max(1, Math.min(Number(limit) || BLACKLIST_PAGE_LIMIT, 200));
+	const safeLimit = Math.max(1, Math.min(Number(limit) || runtime().BLACKLIST_PAGE_LIMIT, 200));
 	const { results } = await env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at DESC, id DESC LIMIT ?')
 		.bind(safeLimit)
 		.all();
@@ -4341,30 +4368,30 @@ async function pruneAutoincrementCacheTable(env, table, keepLimit, nowMs = Date.
 	const cacheCutoffIso = new Date(nowMs - MSG_CACHE_RETENTION_DAYS * 86400000).toISOString();
 	// 【第2批 · 分群裁剪】搜索群按 created_at 保留 STAT_SEARCH_RETENTION_DAYS 天（/search 的历史来源），
 	// 其余群按 MSG_CACHE_RETENTION_DAYS 天保留，行数只做兜底。
-	if (STAT_SEARCH_GROUPS.length) {
-		const notIn = STAT_SEARCH_GROUPS.map(() => '?').join(',');
+	if (runtime().STAT_SEARCH_GROUPS.length) {
+		const notIn = runtime().STAT_SEARCH_GROUPS.map(() => '?').join(',');
 		// created_at 存的是 UTC ISO（new Date().toISOString()），字典序即时间序，直接比字符串。
 		const searchCutoffIso = new Date(nowMs - STAT_SEARCH_RETENTION_DAYS * 86400000).toISOString();
 		await env.DB.prepare(
 			`DELETE FROM ${table} WHERE chat_id IN (${notIn}) AND created_at < ?`
-		).bind(...STAT_SEARCH_GROUPS, searchCutoffIso).run();
+		).bind(...runtime().STAT_SEARCH_GROUPS, searchCutoffIso).run();
 		// 非搜索群的保留窗。放在行数兜底之前，两道都过才算留下。
 		await env.DB.prepare(
 			`DELETE FROM ${table} WHERE chat_id NOT IN (${notIn}) AND created_at < ?`
-		).bind(...STAT_SEARCH_GROUPS, cacheCutoffIso).run();
+		).bind(...runtime().STAT_SEARCH_GROUPS, cacheCutoffIso).run();
 		// 行数硬上限：名额必须【只在非搜索群里算】——
 		// 子查询不排除搜索群的话，搜索群的行会占掉名额，别的群实际保留数少于上限。
 		await env.DB.prepare(
 			`DELETE FROM ${table} WHERE chat_id NOT IN (${notIn}) AND id <= COALESCE((
 				SELECT id FROM ${table} WHERE chat_id NOT IN (${notIn}) ORDER BY id DESC LIMIT 1 OFFSET ?
 			), 0)`
-		).bind(...STAT_SEARCH_GROUPS, ...STAT_SEARCH_GROUPS, MSG_CACHE_HARD_LIMIT).run();
+		).bind(...runtime().STAT_SEARCH_GROUPS, ...runtime().STAT_SEARCH_GROUPS, MSG_CACHE_HARD_LIMIT).run();
 		// 搜索群自己也有硬上限：它按 180 天保留，一个高频搜索群同样能涨到几十万行。
 		await env.DB.prepare(
 			`DELETE FROM ${table} WHERE chat_id IN (${notIn}) AND id <= COALESCE((
 				SELECT id FROM ${table} WHERE chat_id IN (${notIn}) ORDER BY id DESC LIMIT 1 OFFSET ?
 			), 0)`
-		).bind(...STAT_SEARCH_GROUPS, ...STAT_SEARCH_GROUPS, MSG_CACHE_HARD_LIMIT).run();
+		).bind(...runtime().STAT_SEARCH_GROUPS, ...runtime().STAT_SEARCH_GROUPS, MSG_CACHE_HARD_LIMIT).run();
 		return;
 	}
 	await env.DB.prepare(`DELETE FROM ${table} WHERE created_at < ?`).bind(cacheCutoffIso).run();
@@ -4488,7 +4515,7 @@ async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, option
 	}
 	// 独立群不认全局黑名单（第一主人封的除外）：有独立群时放行，但只允许在独立群自助解封。
 	// options.scope 由调用方传入一个对象，这里写 independentOnly 告诉它只解独立群。
-	if (!blacklistCheck.checkFailed && INDEPENDENT_GROUP_IDS.length > 0
+	if (!blacklistCheck.checkFailed && runtime().INDEPENDENT_GROUP_IDS.length > 0
 		&& !isPrimaryOwner(blacklistCheck.entry?.by) && options.scope && typeof options.scope === 'object') {
 		options.scope.independentOnly = true;
 		return false;
@@ -5120,6 +5147,8 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 			userId: String(userId),
 			ok: r.ok,
 			error: r.error,
+			retryable: r.retryable === true,
+			retryAfterSeconds: r.retryAfterSeconds,
 			retried: r.retried === true,
 			muted: true,
 			mutedBy: mode === 'human' ? 'human' : 'killer',
@@ -5129,12 +5158,14 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 	const memberProbe = options.precheckedMemberProbe || (options.probeMembership
 		? await probeTargetMemberBeforeBan(groupId, userId)
 		: null);
-	const r = await banUserFromGroup(groupId, userId, { revokeMessages: options.revokeMessages !== false,reviewGuard:options.reviewGuard });
+	const r = await banUserFromGroup(groupId, userId, { revokeMessages: options.revokeMessages !== false, reviewGuard: options.reviewGuard, deferRetry: options.deferRetry });
 	return {
 		groupId,
 		userId: String(userId),
 		ok: r.ok,
 		error: r.error,
+		retryable: r.retryable === true,
+		retryAfterSeconds: r.retryAfterSeconds,
 		retried: r.retried === true,
 		memberProbe,
 		muted: false,
@@ -5156,7 +5187,7 @@ const BAN_ALL_GROUPS_CONCURRENCY = 5;
 // options.groupIds：只封这批群（不给 = 全部配置群）。同款 / 连带 / 投票传 nonKillerGroupIds()，
 // 让杀手群不被这三个功能波及。
 async function banUserFromAllGroups(userId, options = {}) {
-	const scope = Array.isArray(options.groupIds) ? options.groupIds : GROUP_IDS;
+	const scope = Array.isArray(options.groupIds) ? options.groupIds : runtime().GROUP_IDS;
 	const requestedPrimary = String(options.primaryGroupId || '');
 	const primary = scope.map(String).includes(requestedPrimary) ? requestedPrimary : '';
 	const rest = scope.filter((groupId) => String(groupId) !== primary);
@@ -5188,7 +5219,7 @@ async function banUserFromAllGroups(userId, options = {}) {
 // 所以每个群固定两步：先 restrictChatMember 恢复发言，再 unbanChatMember 解除封禁。
 // 顺序固定「先恢复发言、后解除封禁」，两者终态等价（群成员 + 默认权限），
 // 对「本就不存在的状态」（没被禁言的人 / 没被封的人）报错即吞掉 —— 至少一步成功就算该群成功。
-async function unbanUserFromAllGroups(userId, groupIds = GROUP_IDS) {
+async function unbanUserFromAllGroups(userId, groupIds = runtime().GROUP_IDS) {
 	const results = [];
 	for (const groupId of groupIds) {
 		let restrictOk = false;
@@ -5257,7 +5288,7 @@ async function probeTargetMemberBeforeBan(groupId, userId) {
 	}
 
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatMember`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: groupId, user_id: Number(userId) })
@@ -5722,7 +5753,7 @@ function isBotOperator(user) {
 // 不豁免就会被删甚至被封，直接影响群治理。
 // 按 username 匹配而非 TGID：bot 的 TGID 不易获取，而 username 稳定且主人能直接看到。
 const DEFAULT_AD_TRUSTED_BOTS = ['nmnmfunbot', 'tc520lh_bot'];
-let AD_TRUSTED_BOTS = [];
+
 
 // 解析可信 bot 白名单：逗号分隔（半角 / 全角均可），@ 前缀可省，大小写不敏感。
 function parseAdTrustedBots(raw) {
@@ -5798,22 +5829,22 @@ async function checkMessageOperatorIsAdmin(message, userId) {
 }
 
 function isOwner(id) {
-	return OWNER_IDS.length > 0 && OWNER_IDS.includes(String(id || ''));
+	return runtime().OWNER_IDS.length > 0 && runtime().OWNER_IDS.includes(String(id || ''));
 }
 
 function isPrimaryOwner(id) {
-	return OWNER_IDS.length > 0 && String(id || '') === OWNER_IDS[0];
+	return runtime().OWNER_IDS.length > 0 && String(id || '') === runtime().OWNER_IDS[0];
 }
 
 function isSecondaryOwner(id) {
 	const idStr = String(id || '');
-	return OWNER_IDS.length > 1 && OWNER_IDS.slice(1).includes(idStr);
+	return runtime().OWNER_IDS.length > 1 && runtime().OWNER_IDS.slice(1).includes(idStr);
 }
 
 // 超级管理员：等同 Telegram 群管理员的全部权限（免实际管理员身份），
 // 仅用于 /ban /spam /unban /check 的鉴权放行；不含主人/副主人高级权限、不参与 /stats。
 function isSuperAdmin(id) {
-	return SUPER_ADMIN_IDS.length > 0 && SUPER_ADMIN_IDS.includes(String(id || ''));
+	return runtime().SUPER_ADMIN_IDS.length > 0 && runtime().SUPER_ADMIN_IDS.includes(String(id || ''));
 }
 
 // 主人、副主人保留原有管理命令和跨群操作权限。
@@ -5839,7 +5870,7 @@ async function checkIfUserIsAdminInGroup(userId, groupId, options = {}) {
 	if (!userIdStr || !isConfiguredGroup(groupIdStr)) return false;
 
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatAdministrators`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: groupIdStr }),
@@ -5907,12 +5938,12 @@ async function isNonPrimaryConfiguredGroupManager(message, userId) {
 }
 
 function getOwnerNotifyTargets(includeSecondaryOwners = false) {
-	if (!OWNER_IDS.length) return [];
-	return includeSecondaryOwners ? OWNER_IDS : [OWNER_IDS[0]];
+	if (!runtime().OWNER_IDS.length) return [];
+	return includeSecondaryOwners ? runtime().OWNER_IDS : [runtime().OWNER_IDS[0]];
 }
 
 async function notifyAllOwners(text, excludeId, includeSecondaryOwners = false) {
-	if (!OWNER_IDS.length) return;
+	if (!runtime().OWNER_IDS.length) return;
 	const excludeStr = excludeId ? String(excludeId) : '';
 	const targets = getOwnerNotifyTargets(includeSecondaryOwners);
 	await Promise.allSettled(
@@ -6249,7 +6280,7 @@ async function checkManyUnbanEligibilityCore(ids, env, options = {}) {
 	}
 	// 第一主人封的人只有第一主人能解：别人发的 /unban（含管理层）一律拒，D1 记录不动。
 	// 逐条读记录而不是在上面的 IN 查询里带 by_user —— 只有命中黑名单的才多读一条，未命中零开销。
-	if (results.blacklisted.length && OWNER_IDS.length && !isPrimaryOwner(options.operatorId)) {
+	if (results.blacklisted.length && runtime().OWNER_IDS.length && !isPrimaryOwner(options.operatorId)) {
 		const stillBlocked = [];
 		for (const id of results.blacklisted) {
 			let entry = null;
@@ -6467,10 +6498,12 @@ async function loadBulkJob(env, jobId) {
 	if (!env.DB) return null;
 	await ensureD1Table(env);
 	const row = await env.DB
-		.prepare('SELECT id, type, status, payload FROM batch_jobs WHERE id = ?')
+		.prepare('SELECT id, type, status, payload, updated_at FROM batch_jobs WHERE id = ?')
 		.bind(String(jobId || '').trim())
 		.first();
-	return normalizeBulkJob(row);
+	const job = normalizeBulkJob(row);
+	if (job && row.updated_at) setBulkJobLeaseVersion(job, row.updated_at);
+	return job;
 }
 
 async function acquireBulkJobLease(env, job, leaseOwner) {
@@ -6549,7 +6582,7 @@ function estimateBulkAuthorizationRequests(message) {
 	if (isAnonymousAdminMessage(message)) return 0;
 	const actorId = getMessageActorId(message);
 	if (isPrivilegedManager(actorId)) return 0;
-	if (message?.chat?.type === 'private') return GROUP_IDS.length;
+	if (message?.chat?.type === 'private') return runtime().GROUP_IDS.length;
 	return isConfiguredGroup(message?.chat?.id) ? 1 : 0;
 }
 
@@ -6557,7 +6590,7 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 	const now = new Date().toISOString();
 	const operator = formatMessageActorMention(message);
 	// options.groupIds：只处置这批群（同款连带的批量任务传 nonKillerGroupIds()，不波及杀手群）。
-	const groupIds = (Array.isArray(options.groupIds) ? options.groupIds : GROUP_IDS).map((id) => String(id));
+	const groupIds = (Array.isArray(options.groupIds) ? options.groupIds : runtime().GROUP_IDS).map((id) => String(id));
 	const normalizedAction = normalizeBulkJobAction(action);
 	const isUnban = normalizedAction === 'unban';
 	const budget = shouldUseBulkQueue(ids.length, groupIds.length, {
@@ -7070,36 +7103,50 @@ function isEffectivelyDeletedError(error) {
 	return lower.includes('message to delete not found');
 }
 
-async function processBulkJobOperationSlice(job, env) {
+async function processBulkJobOperationSlice(job, env, options = {}) {
 	const active = job.activeBatch;
 	if (!active) return;
 	const start = Math.max(0, Number(active.operationCursor) || 0);
 	const end = Math.min(active.totalOperations, start + BULK_TASK_OPERATION_SLICE_SIZE);
+	// 并发片段中成功的目标可能排在失败目标之后，单一游标不足以记住这些成功。
+	active.operationCursor = start;
+	const completed = active.completedOperations ||= {};
 	const tasks = [];
 	for (let index = start; index < end; index += 1) {
+		if (completed[index]) continue;
 		const task = getBulkJobOperationTask(job, index);
-		if (task) tasks.push(task);
+		if (task) tasks.push({ ...task, operationIndex: index });
+		else completed[index] = true;
 	}
 	const isUnban = job.action === 'unban';
 
-	await mapWithConcurrency(tasks, getBulkJobSafeConcurrency(job), async (task) => {
+	// 每个分支都等待结束，再统一保存并释放租约，避免一个异常让其它分支在重试中继续跑。
+	const failures = await mapWithConcurrency(tasks, getBulkJobSafeConcurrency(job), (task) => (async () => {
 		if (isUnban) {
 			// 双解（与 unbanUserFromAllGroups 同口径）：每群固定两步「先恢复发言、后解除封禁」。
 			// 同一个人可能在部分群被 /sban 踢出、部分群被 /ban 禁言，D1 不记录各群处置方式，
 			// 只做一步会漏掉另一半；对「本就不存在的状态」报错即吞，至少一步成功就算该群成功。
 			let restrictOk = false, unbanOk = false, errText = '群解封失败';
+			const retryErrors = [];
 			try {
 				const rr = await restrictUser(task.userId, task.groupId);
 				restrictOk = rr?.ok === true;
 				if (!restrictOk) errText = rr?.description || '恢复发言失败';
-			} catch (e) { restrictOk = false; errText = e?.message || '恢复发言失败'; }
+				if (!restrictOk) retryErrors.push(bulkTelegramRetryError(rr));
+			} catch (e) { restrictOk = false; errText = e?.message || '恢复发言失败'; retryErrors.push(bulkTelegramRetryError({ ...parseMuteFailure(e), error: errText })); }
 			try {
-				const rr = await unbanUser(task.userId, task.groupId);
+				const rr = await unbanUser(task.userId, task.groupId, options);
 				unbanOk = rr?.ok === true;
 				if (unbanOk) errText = '群解封失败';
 				else errText = rr?.description || rr?.error || errText;
-			} catch (e) { unbanOk = false; if (!restrictOk) errText = e?.message || '解除封禁失败'; }
+				if (!unbanOk) retryErrors.push(bulkTelegramRetryError(rr));
+			} catch (e) { unbanOk = false; if (!restrictOk) errText = e?.message || '解除封禁失败'; retryErrors.push(bulkTelegramRetryError({ ...parseMuteFailure(e), error: e?.message })); }
 			const ok = restrictOk || unbanOk;
+			if (!ok && retryErrors.some(Boolean)) {
+				const retryError = retryErrors.find(Boolean);
+				retryError.retryAfterSeconds = Math.max(...retryErrors.map(e => Number(e?.retryAfterSeconds) || 0));
+				throw retryError;
+			}
 			if (ok) {
 				incrementBulkJobStat(job, 'unbanOk');
 			} else {
@@ -7118,7 +7165,9 @@ async function processBulkJobOperationSlice(job, env) {
 		//   'kick'  → /sban 恒踢出（含撤回历史发言）
 		//   'human' → /ban /spam 口径：杀手群踢出、普通群禁言
 		//   缺省    → 自动路径口径：杀手群禁言、普通群踢出（老任务的 payload 没有该字段）
-		const result = await applyGroupModeration(task.groupId, task.userId, job.mode);
+		const result = await applyGroupModeration(task.groupId, task.userId, job.mode, options);
+		const retryError = !result.ok && bulkTelegramRetryError(result);
+		if (retryError) throw retryError;
 		if (result.ok) {
 			incrementBulkJobStat(job, 'kickOk');
 		} else {
@@ -7152,10 +7201,13 @@ async function processBulkJobOperationSlice(job, env) {
 				}
 			}
 		}
-	});
+	})().then(() => { completed[task.operationIndex] = true; return null; }, error => error));
 
-	active.operationCursor = end;
-	if (end >= active.totalOperations) {
+	while (active.operationCursor < end && completed[active.operationCursor]) {
+		delete completed[active.operationCursor];
+		active.operationCursor += 1;
+	}
+	if (active.operationCursor >= active.totalOperations) {
 		job.cursor = Math.min(job.ids.length, active.startCursor + active.userCount);
 		job.stats.usersProcessed = job.cursor;
 		job.activeBatch = null;
@@ -7166,8 +7218,15 @@ async function processBulkJobOperationSlice(job, env) {
 	} else {
 		job.status = 'queued';
 	}
+	const errors = failures.filter(Boolean);
+	job.lastError = errors.length ? getErrorMessage(errors[0]).slice(0, 500) : null;
 	clearBulkJobLease(job);
 	await saveBulkJob(env, job);
+	if (errors.length) {
+		const error = errors.find(e => !isRetryableBulkJobError(e)) || errors[0];
+		error.retryAfterSeconds = Math.max(...errors.map(e => Number(e.retryAfterSeconds) || 0));
+		throw error;
+	}
 }
 
 function getBulkJobSafeConcurrency(job) {
@@ -7229,6 +7288,89 @@ function getBulkQueue(env) {
 	return env?.BULK_QUEUE && typeof env.BULK_QUEUE.send === 'function' ? env.BULK_QUEUE : null;
 }
 
+function bulkTelegramRetryError(result) {
+	const failure = {
+		...result,
+		errorCode: result?.errorCode || result?.error_code,
+		retryAfterSeconds: result?.retryAfterSeconds || result?.parameters?.retry_after
+	};
+	if (!failure.retryable && !shouldRetryTelegramMutationFailure(failure)) return null;
+	const error = new Error(result?.error || result?.description || 'Telegram 临时失败');
+	error.retryable = true;
+	error.retryAfterSeconds = Number(failure.retryAfterSeconds) || 0;
+	return error;
+}
+
+function isRetryableBulkJobError(error) {
+	if (typeof error?.retryable === 'boolean') return error.retryable;
+	if (error instanceof TypeError && /fetch|network|terminated|timeout/i.test(getErrorMessage(error))) return true;
+	if (error instanceof TypeError || error instanceof ReferenceError || error instanceof SyntaxError) return false;
+	// 未知的运行/网络故障允许有限重试，明确的 SQL 或配置错误则直接报告。
+	return !/no such (?:table|column)|syntax error|SQLITE_(?:CONSTRAINT|MISMATCH|MISUSE)|BULK_QUEUE 未绑定/i.test(getErrorMessage(error));
+}
+
+function retryBulkQueueMessage(message, error, attempt, job = null) {
+	if (typeof message.retry !== 'function') throw error;
+	const leaseDelay = Math.ceil((Date.parse(job?.leaseUntil || '') - Date.now()) / 1000) + 1;
+	const delaySeconds = Math.ceil(Math.min(43200, Math.max(5, 5 * 2 ** Math.min(attempt, 6), Number(error?.retryAfterSeconds) || 0, leaseDelay || 0)));
+	message.retry({ delaySeconds });
+}
+
+async function enqueueBulkJob(job, env) {
+	const queue = getBulkQueue(env);
+	if (!queue) throw new Error('BULK_QUEUE 未绑定');
+	let lastError;
+	for (let attempt = 1; attempt <= 3; attempt += 1) {
+		try {
+			await queue.send({ type: 'bulk_job_run', id: job.id });
+			return;
+		} catch (error) {
+			lastError = error;
+		}
+		if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 300 * attempt));
+	}
+	const error = new Error('Queue 自动续接触发失败: ' + getErrorMessage(lastError), { cause: lastError });
+	error.retryable = true;
+	throw error;
+}
+
+async function consumeBulkModerationMessage(message, env, jobId) {
+	const attempt = Math.max(1, Number(message.attempts) || 1);
+	let job;
+	try {
+		job = await runBulkModerationJob(env, jobId, {
+			notifyOnDone: true, autoContinue: false, source: 'queue', throwOnError: true
+		});
+		if (!job || job.status === 'done' || job.status === 'failed' || job.status === 'paused' || job.autoContinue === false) {
+			message.ack?.();
+			return;
+		}
+		if (isBulkJobLeaseActive(job) || job.status === 'running') {
+			retryBulkQueueMessage(message, new Error('批量任务租约仍在使用'), attempt, job);
+			return;
+		}
+		// 必须等续接消息成功入队，才确认本条消息；不能交给 waitUntil 吞掉发送失败。
+		await enqueueBulkJob(job, env);
+		message.ack?.();
+	} catch (error) {
+		if (isRetryableBulkJobError(error) && attempt <= BULK_TASK_QUEUE_RETRY_LIMIT) {
+			console.warn(`[批量任务] Queue 第 ${attempt} 次执行暂缓 ${jobId}: ${getErrorMessage(error)}`);
+			retryBulkQueueMessage(message, error, attempt);
+			return;
+		}
+		job = error.bulkJob || job || await loadBulkJob(env, jobId);
+		if (isBulkJobLeaseActive(job)) {
+			// 旧投递不能把另一个执行器正在处理的任务标为失败。
+			retryBulkQueueMessage(message, error, attempt, job);
+			return;
+		}
+		console.error(`[批量任务] Queue 执行终止 ${jobId}: ${getErrorMessage(error)}`);
+		if (job) await markBulkJobFailedIfCurrent(env, job, error);
+		else throw error;
+		message.ack?.();
+	}
+}
+
 function scheduleBulkJobAutoContinue(job, ctx, requestUrl, env = null) {
 	if (!env || !job || job.status === 'done' || job.cursor >= job.ids.length || job.autoContinue === false) return false;
 	const queue = getBulkQueue(env);
@@ -7236,22 +7378,7 @@ function scheduleBulkJobAutoContinue(job, ctx, requestUrl, env = null) {
 		console.warn(`[批量任务] 未绑定 BULK_QUEUE，自动续接未启动 ${job.id}; 可手动 /jobrun ${job.id}`);
 		return false;
 	}
-	const task = (async () => {
-		let lastError = null;
-		for (let attempt = 1; attempt <= 3; attempt += 1) {
-			try {
-				await queue.send({ type: 'bulk_job_run', id: job.id });
-				return;
-			} catch (error) {
-				lastError = getErrorMessage(error);
-				console.error(`[批量任务] Queue 自动续接触发异常 ${job.id}:`, error);
-			}
-			if (attempt < 3) {
-				await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
-			}
-		}
-		await markBulkJobFailedIfCurrent(env, job, `Queue 自动续接触发失败: ${lastError || '未知错误'}`);
-	})().catch(async (error) => {
+	const task = enqueueBulkJob(job, env).catch(async (error) => {
 		console.error(`[批量任务] 自动续接异常 ${job.id}:`, error);
 		await markBulkJobFailedIfCurrent(env, job, error);
 	});
@@ -7266,18 +7393,28 @@ function scheduleBulkJobAutoContinue(job, ctx, requestUrl, env = null) {
 async function runBulkModerationJob(env, jobId, options = {}) {
 	let job = await loadBulkJob(env, jobId);
 	if (!job) return null;
-	if (job.status === 'done') return job;
+	if (job.status === 'done') {
+		if (options.notifyOnDone !== false && !job.doneNotified) {
+			await notifyBulkJobTargets(job, formatBulkJobDetail(job, '✅ <b>批量任务完成</b>'));
+			job.doneNotified = true;
+			await saveBulkJob(env, job);
+		}
+		return job;
+	}
+	if (options.source === 'queue' && (job.status === 'failed' || job.status === 'paused')) return job;
 	if (!options.ignoreLease && isBulkJobLeaseActive(job)) return job;
 
 	const leaseOwner = `${options.source || 'run'}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+	let leaseAcquired = false;
 	try {
 		const acquired = await acquireBulkJobLease(env, job, leaseOwner);
 		if (!acquired) return await loadBulkJob(env, job.id) || job;
 		job = acquired;
+		leaseAcquired = true;
 
 		const activeBatch = await prepareBulkJobActiveBatch(job, env);
 		if (activeBatch) {
-			await processBulkJobOperationSlice(job, env);
+			await processBulkJobOperationSlice(job, env, { deferRetry: options.source === 'queue' });
 		} else {
 			job.status = 'done';
 			job.finishedAt = new Date().toISOString();
@@ -7302,6 +7439,25 @@ async function runBulkModerationJob(env, jobId, options = {}) {
 			return await loadBulkJob(env, job.id) || job;
 		}
 		console.error(`[批量任务] 执行异常 ${job.id}:`, error);
+		if (!leaseAcquired) throw error;
+		if (options.throwOnError) {
+			if (job.status !== 'done') {
+				job.status = 'queued';
+				job.lastError = getErrorMessage(error).slice(0, 500);
+				clearBulkJobLease(job);
+				try {
+					await saveBulkJob(env, job);
+				} catch (saveError) {
+					if (saveError?.code === 'BULK_JOB_LEASE_LOST') return await loadBulkJob(env, job.id) || job;
+					console.error(`[批量任务] 暂缓状态保存失败 ${job.id}:`, saveError);
+				}
+			}
+			const failure = new Error(getErrorMessage(error), { cause: error });
+			failure.retryable = isRetryableBulkJobError(error);
+			failure.retryAfterSeconds = Number(error?.retryAfterSeconds) || 0;
+			failure.bulkJob = job;
+			throw failure;
+		}
 		try {
 			return await markBulkJobFailed(env, job, error);
 		} catch (markError) {
@@ -7321,7 +7477,7 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 	// executeScopedModeration 的 local 任务不走这个通知口径，它单独调 replyToModerationAdmin。
 	const notifyVice = !(String(options.mode || '') === 'kick' && options.local !== true);
 	// options.groupIds：本次作用的群（独立群本群 / 跳过独立群的全局范围）；不给 = 全部配置群。
-	const scopeGroupIds = Array.isArray(options.groupIds) ? options.groupIds : GROUP_IDS;
+	const scopeGroupIds = Array.isArray(options.groupIds) ? options.groupIds : runtime().GROUP_IDS;
 	const budget = shouldUseBulkQueue(valid.length, scopeGroupIds.length, {
 		probeMembership: action !== 'unban' && valid.length === 1,
 		authorizationRequests: estimateBulkAuthorizationRequests(message)
@@ -7697,7 +7853,7 @@ async function redeemAdminLogin(env, request, input) {
 		try { await env.DB.batch(stmts); } catch (error) { console.error('[后台登录] 记录失败:', error?.message || error); }
 	}
 	try {
-		await sendTelegramMessage(String(OWNER_IDS[0]), '🔐 <b>后台新登录</b>\n\n'
+		await sendTelegramMessage(String(runtime().OWNER_IDS[0]), '🔐 <b>后台新登录</b>\n\n'
 			+ 'IP：<code>' + escapeHtml(ip || '未知') + '</code>' + (country ? '（' + escapeHtml(country) + '）' : '') + '\n'
 			+ '方式：' + (fixed ? '正式密码' : '一次性密码') + '\n'
 			+ (trusted ? '' : '⚠️ 这个 IP 第一次登录；不是你本人请立刻改密码，并在后台「登录记录」移除它。'));
@@ -7717,19 +7873,18 @@ async function webAdminLogins(env) {
 const WEB_ADMIN_ACTIONS = new Set(['web/exec', 'web/groupmode', 'web/localset', 'web/localwl', 'web/localbans', 'web/localunban', 'web/dryrun', 'web/stats', 'web/exportpass', 'web/logins', 'web/loginip-del', 'web/logout', 'web/fedkeys', 'web/fedkey-add', 'web/fedkey-del', 'web/fedlist', 'web/fedexempt']);
 const WEB_ADMIN_REPLY_LIMIT = 30;
 // 命令台回执镜像：执行期间发给第一主人私聊的消息同时记一份文本。
-// Worker 没开 nodejs_compat（没有 AsyncLocalStorage），用模块级变量；同一时刻别的请求恰好也给第一主人
-// 发了消息会被一起镜像进来 —— 那本来就是发给第一主人的内容，不泄漏给第三人。
-let WEB_ADMIN_CAPTURE = null;
+// 捕获容器随命令上下文传递，结束后关闭，避免并发命令和后台通知串入。
 const WEB_ADMIN_COMMAND_AUTH = Symbol('verified-primary-web-command');
 
 function captureWebAdminReply(chatId, text) {
-	if (!WEB_ADMIN_CAPTURE || String(chatId) !== WEB_ADMIN_CAPTURE.chatId) return;
-	if (WEB_ADMIN_CAPTURE.replies.length >= WEB_ADMIN_REPLY_LIMIT) return;
-	WEB_ADMIN_CAPTURE.replies.push(miniAppPlainText(text));
+	const capture = runtime().WEB_ADMIN_CAPTURE;
+	if (!capture?.active || String(chatId) !== capture.chatId) return;
+	if (capture.replies.length >= WEB_ADMIN_REPLY_LIMIT) return;
+	capture.replies.push(miniAppPlainText(text));
 }
 
 function webAdminAuth() {
-	const owner = String(OWNER_IDS[0] || '');
+	const owner = String(runtime().OWNER_IDS[0] || '');
 	return { userId: owner, primaryOwner: true, killer: false, user: { id: Number(owner), first_name: '网页后台' } };
 }
 
@@ -7744,7 +7899,7 @@ async function handleWebAdmin(request, env, ctx, url) {
 	if (url.pathname.startsWith('/admin/api/')) return handleWebAdminApi(request, env, ctx, url);
 	if (url.pathname !== '/admin') return new Response('Not Found', { status: 404 });
 	if (!env.DB) return new Response('❌ 未绑定 D1 存储空间', { status: 400 });
-	if (!OWNER_IDS.length) return new Response('❌ 未配置 OWNER_IDS，后台无人可用', { status: 503 });
+	if (!runtime().OWNER_IDS.length) return new Response('❌ 未配置 OWNER_IDS，后台无人可用', { status: 503 });
 	if (request.method === 'POST') {
 		if (adminLoginFromForeignSite(request, url)) return new Response('Forbidden', { status: 403, headers: EXPORT_PRIVATE_HEADERS });
 		let password = '';
@@ -7776,7 +7931,7 @@ async function handleWebAdminApi(request, env, ctx, url) {
 		if (!origin || origin !== url.origin) throw new MiniAppError(403, '请求来源不受支持');
 		const action = url.pathname.slice('/admin/api/'.length);
 		if (!MINI_APP_ACTIONS.has(action) && !WEB_ADMIN_ACTIONS.has(action)) throw new MiniAppError(404, '接口不存在');
-		if (!env.DB || !OWNER_IDS.length) throw new MiniAppError(503, '后台未就绪（需要 D1 与 OWNER_IDS）');
+		if (!env.DB || !runtime().OWNER_IDS.length) throw new MiniAppError(503, '后台未就绪（需要 D1 与 OWNER_IDS）');
 		if (!(await adminSessionValid(env, request))) throw new MiniAppError(401, '登录已失效，请刷新页面重新登录');
 		const body = await readMiniAppBody(request);
 		const auth = webAdminAuth();
@@ -7819,7 +7974,7 @@ async function dispatchWebAdminAction(action, body, env, auth, ctx, url) {
 	// 其余接口与小程序同口径用 miniAppRefreshGroups。两者只能二选一：先后各跑一次会把动态群当成环境变量群。
 	if (action === 'web/exec') await mergeDynamicGroupsFromD1(env);
 	else await miniAppRefreshGroups(env);
-	if (env?.DB && !DYNAMIC_GROUPS_READY) throw new MiniAppError(503, '治理群配置暂不可用，请稍后重试');
+	if (env?.DB && !runtime().DYNAMIC_GROUPS_READY) throw new MiniAppError(503, '治理群配置暂不可用，请稍后重试');
 	await loadIndependentGroups(env);
 	const payload = body && typeof body === 'object' ? body : {};
 	const owner = auth.userId;
@@ -7998,14 +8153,14 @@ async function webAdminExec(env, ctx, url, payload, auth) {
 		__webAdmin: true
 	};
 	message[WEB_ADMIN_COMMAND_AUTH] = String(auth.userId);
-	const previous = WEB_ADMIN_CAPTURE;
-	const capture = { chatId: String(ownerId), replies: [] };
-	WEB_ADMIN_CAPTURE = capture;
-	try {
-		await handleMessage(message, env, ctx, url.origin + '/');
-	} finally {
-		WEB_ADMIN_CAPTURE = previous;
-	}
+	const capture = { chatId: String(ownerId), replies: [], active: true };
+	await REQUEST_RUNTIME.run({ ...runtime(), WEB_ADMIN_CAPTURE: capture }, async () => {
+		try {
+			await handleMessage(message, env, ctx, url.origin + '/');
+		} finally {
+			capture.active = false;
+		}
+	});
 	return { command, replies: capture.replies, truncated: capture.replies.length >= WEB_ADMIN_REPLY_LIMIT };
 }
 
@@ -8892,7 +9047,7 @@ async function handleExport(env, url) {
 
 	// 默认：HTML 视图
 	const dataSource = 'D1（权威）';
-	const reasonLabels = BLACKLIST_REASON_LABELS || {};
+	const reasonLabels = runtime().BLACKLIST_REASON_LABELS || {};
 	const rows = sorted.map((e, i) => {
 		const reasonText = e.reason ? (reasonLabels[e.reason] || e.reason) : '—';
 		return `<tr>
@@ -9027,7 +9182,7 @@ async function mapWithConcurrency(items, concurrency, worker) {
 function parsePurgeGroupIds(url) {
 	const raw = url.searchParams.get('groups');
 	if (raw === null) {
-		return GROUP_IDS;
+		return runtime().GROUP_IDS;
 	}
 	const requested = new Set(
 		String(raw)
@@ -9035,7 +9190,7 @@ function parsePurgeGroupIds(url) {
 			.map((id) => id.trim())
 			.filter(Boolean)
 	);
-	return GROUP_IDS.filter((groupId) => requested.has(String(groupId)));
+	return runtime().GROUP_IDS.filter((groupId) => requested.has(String(groupId)));
 }
 
 function parsePurgeReasons(url) {
@@ -9092,7 +9247,7 @@ function botCanRestrictMember(member) {
 
 async function checkPurgeGroupAccess(groupId, botId) {
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatAdministrators`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: groupId })
@@ -9120,7 +9275,7 @@ async function checkPurgeGroupAccess(groupId, botId) {
 }
 
 async function handlePurgeGroups() {
-	if (!Array.isArray(GROUP_IDS) || GROUP_IDS.length === 0) {
+	if (!Array.isArray(runtime().GROUP_IDS) || runtime().GROUP_IDS.length === 0) {
 		return jsonResponse({ 成功: false, 错误: 'GROUP_IDS 未配置' }, 400);
 	}
 
@@ -9130,7 +9285,7 @@ async function handlePurgeGroups() {
 	}
 
 	const checks = await mapWithConcurrency(
-		GROUP_IDS,
+		runtime().GROUP_IDS,
 		PURGE_CONCURRENCY,
 		(groupId) => checkPurgeGroupAccess(groupId, botId)
 	);
@@ -9141,7 +9296,7 @@ async function handlePurgeGroups() {
 	return jsonResponse({
 		成功: true,
 		bot_id: String(botId),
-		配置群组数: GROUP_IDS.length,
+		配置群组数: runtime().GROUP_IDS.length,
 		可清扫群组数: available.length,
 		跳过群组数: skipped.length,
 		可清扫群组: available,
@@ -9425,7 +9580,7 @@ async function handlePurge(env, url) {
 	if (!env.DB) {
 		return jsonResponse({ 成功: false, 错误: '未绑定 D1 存储空间' }, 400);
 	}
-	if (!Array.isArray(GROUP_IDS) || GROUP_IDS.length === 0) {
+	if (!Array.isArray(runtime().GROUP_IDS) || runtime().GROUP_IDS.length === 0) {
 		return jsonResponse({ 成功: false, 错误: 'GROUP_IDS 未配置' }, 400);
 	}
 
@@ -9451,7 +9606,7 @@ async function handlePurge(env, url) {
 		清扫范围: purgeScope,
 		reasons: purgeReasonsParam,
 		黑名单总数: totalBlacklist,
-		配置群组数: GROUP_IDS.length,
+		配置群组数: runtime().GROUP_IDS.length,
 		参与群组数: groupCount,
 		参与群组列表: activeGroupIds,
 		总任务数: totalPairs,
@@ -9618,10 +9773,10 @@ async function resolveBlacklistOperatorUsernames(entries) {
 	if (missing.length === 0) return result;
 
 	// 按群批量拉管理员：一次调用覆盖该群所有管理员，远比按人查省
-	for (const groupId of GROUP_IDS) {
+	for (const groupId of runtime().GROUP_IDS) {
 		if (missing.every((id) => result.has(id))) break;
 		try {
-			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+			const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatAdministrators`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ chat_id: groupId }),
@@ -9685,7 +9840,7 @@ function renderBlacklistOperator(byId, usernames) {
 // 竖排后折行位置固定，且记录之间的空行正好是 splitTelegramHtmlBlocks 的切分点，
 // 条数调大触发分块时不会把某一条记录劈成两半。
 function renderBlacklist(blacklist, options = {}) {
-	const limit = options.limit ?? BLACKLIST_PAGE_LIMIT;
+	const limit = options.limit ?? runtime().BLACKLIST_PAGE_LIMIT;
 	const alreadyRecent = Boolean(options.alreadyRecent);
 	const total = Number.isFinite(options.total) ? Number(options.total) : blacklist.length;
 
@@ -9693,7 +9848,7 @@ function renderBlacklist(blacklist, options = {}) {
 		return '📋 <b>当前黑名单</b>\n\n（空）';
 	}
 
-	const reasonLabels = BLACKLIST_REASON_LABELS;
+	const reasonLabels = runtime().BLACKLIST_REASON_LABELS;
 	const usernames = options.operatorUsernames;
 	const visible = alreadyRecent ? blacklist.slice(0, limit) : blacklist.slice(-limit).reverse(); // 最近添加的排前面
 	const limitedText = total > visible.length ? ` · 显示最近 ${visible.length} 条` : '';
@@ -9795,7 +9950,7 @@ function isConfiguredGroup(chatId) {
 		return false;
 	}
 	const idStr = chatId.toString();
-	return GROUP_IDS.some((g) => g.toString() === idStr);
+	return runtime().GROUP_IDS.some((g) => g.toString() === idStr);
 }
 
 function parseTelegramCommand(text) {
@@ -9905,7 +10060,7 @@ async function resolveBatchUserProfiles(ids, sourceChatId) {
 	const profiles = new Map();
 	const preferredGroupId = isConfiguredGroup(sourceChatId)
 		? String(sourceChatId)
-		: String(GROUP_IDS[0] || '');
+		: String(runtime().GROUP_IDS[0] || '');
 	if (!preferredGroupId) return profiles;
 
 	const uniqueIds = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(isPureTgid))];
@@ -9925,7 +10080,7 @@ async function resolveBatchUserProfiles(ids, sourceChatId) {
 // 失败/没在任何群里时,返回纯 TGID code
 async function formatTargetByTgid(tgid) {
 	const idStr = String(tgid);
-	for (const groupId of GROUP_IDS) {
+	for (const groupId of runtime().GROUP_IDS) {
 		try {
 			const result = await checkUserStatus(idStr, groupId);
 			const user = result?.result?.user;
@@ -9969,8 +10124,8 @@ async function resolvePermissionUserProfiles(ids, options = {}) {
 
 	// 先用静态表填充兜底资料，后续 API 查到时会覆盖
 	for (const id of wanted) {
-		if (STATIC_USER_PROFILES[id]) {
-			profiles.set(id, { user: STATIC_USER_PROFILES[id], status: '', source: 'static', groupId: '' });
+		if (runtime().STATIC_USER_PROFILES[id]) {
+			profiles.set(id, { user: runtime().STATIC_USER_PROFILES[id], status: '', source: 'static', groupId: '' });
 		}
 	}
 
@@ -9978,12 +10133,12 @@ async function resolvePermissionUserProfiles(ids, options = {}) {
 	// 来源群优先显示治理群（那是主人更关心的上下文）。
 	// 【只在这个函数里合并】PROFILE_LOOKUP_GROUPS 不进 GROUP_IDS、不进 isConfiguredGroup，
 	// 所以封禁 / 检测 / 命令鉴权 / purge / 投票一个都不会碰到这些群。
-	const lookupGroups = [...GROUP_IDS, ...PROFILE_LOOKUP_GROUPS];
+	const lookupGroups = [...runtime().GROUP_IDS, ...runtime().PROFILE_LOOKUP_GROUPS];
 
 	for (const groupId of lookupGroups) {
 		if (!take()) continue;
 		try {
-			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+			const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatAdministrators`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ chat_id: groupId }),
@@ -10129,10 +10284,10 @@ function renderPermissionSection(title, ids, profiles, groupLabels) {
 }
 
 async function renderPermissionAdminsList() {
-	const primaryOwner = OWNER_IDS.length ? [OWNER_IDS[0]] : [];
-	const secondaryOwners = OWNER_IDS.length > 1 ? OWNER_IDS.slice(1) : [];
+	const primaryOwner = runtime().OWNER_IDS.length ? [runtime().OWNER_IDS[0]] : [];
+	const secondaryOwners = runtime().OWNER_IDS.length > 1 ? runtime().OWNER_IDS.slice(1) : [];
 	// 只读 SUPER_ADMIN_IDS；旧变量 SUPER_ADMINS 早已废弃，不进名单也不单独查资料。
-	const superAdmins = [...new Set((SUPER_ADMIN_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
+	const superAdmins = [...new Set((runtime().SUPER_ADMIN_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
 	const allIds = [...primaryOwner, ...secondaryOwners, ...superAdmins];
 	// 超管常常不在任何群当管理员，要靠逐群补查才拿得到资料 —— 这一轨最费请求，
 	// 所以整条命令共用一份预算（见 ADMINS_LOOKUP_BUDGET），免费版也不会超子请求上限。
@@ -10165,7 +10320,7 @@ async function renderPermissionAdminsList() {
 
 async function fetchConfiguredGroupInfo(groupId) {
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChat`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: groupId }),
@@ -10202,7 +10357,7 @@ function renderConfiguredGroupLine(groupId, result, index) {
 }
 
 async function renderConfiguredGroupsList() {
-	const groupIds = [...new Set((GROUP_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
+	const groupIds = [...new Set((runtime().GROUP_IDS || []).map((id) => String(id || '').trim()).filter(Boolean))];
 	const lines = [
 		'📋 <b>配置群组列表</b>',
 		`配置群数:${groupIds.length}`,
@@ -10259,7 +10414,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	if (options.env) {
 		try {
 			const groupBans = await readUserGroupBans(options.env, queryTgid);
-			if (groupBans.length || INDEPENDENT_GROUP_IDS.length) {
+			if (groupBans.length || runtime().INDEPENDENT_GROUP_IDS.length) {
 				groupBanLines.push('<b>━━ 群级封禁记录 ━━</b>');
 				if (!groupBans.length) groupBanLines.push('状态　　✅ 不在任何群的本群黑名单');
 				groupBans.forEach((ban, idx) => {
@@ -10443,7 +10598,7 @@ function getMessageLogInfo(message) {
 		消息ID: message?.message_id,
 		聊天ID: chat?.id,
 		聊天类型: chat?.type,
-		配置群组列表: GROUP_IDS,
+		配置群组列表: runtime().GROUP_IDS,
 		发送者ID: sender?.id,
 		发送者用户名: sender?.username,
 		发送者昵称: sender?.first_name,
@@ -10560,7 +10715,7 @@ async function handleBotSelfJoin(update, env) {
 	}
 
 	try {
-		await sendTelegramMessage(OWNER_IDS[0],
+		await sendTelegramMessage(runtime().OWNER_IDS[0],
 			'🆕 <b>已自动纳入动态群组</b>\n\n'
 			+ '名称：' + escapeHtml(chat.title || String(chat.id)) + '\n'
 			+ 'ID：<code>' + escapeHtml(String(chat.id)) + '</code>\n'
@@ -11122,25 +11277,25 @@ async function setAdVoteAllowlist(env, userId, enabled, byUser) {
 // 处置口径固定（见顶部 10.6）。原 /killer 开关、killer_mode 表、禁言模式集合已于 2026-10-23 删除；
 // 线上若残留 killer_mode 表，代码不再读写它，留着无害。
 function isKillerModeGroup(chatId) {
-	return KILLER_MODE_GROUPS.length > 0 && KILLER_MODE_GROUPS.includes(String(chatId || ''));
+	return runtime().KILLER_MODE_GROUPS.length > 0 && runtime().KILLER_MODE_GROUPS.includes(String(chatId || ''));
 }
 
 // 同款直封 / 同款连带 / /ad 投票的作用范围：全部配置群减去杀手群。
 // 杀手群与这三个功能完全隔离 —— 杀手群里不触发，别的群触发时封禁也不波及杀手群。
 // 独立群同理不被这些全局扇出波及（群主自治，见 group_mode）。
 function nonKillerGroupIds() {
-	return GROUP_IDS.filter((groupId) => !isKillerModeGroup(groupId) && !isIndependentGroup(groupId));
+	return runtime().GROUP_IDS.filter((groupId) => !isKillerModeGroup(groupId) && !isIndependentGroup(groupId));
 }
 
 // ===== 杀手权限（KILLER_ADMIN_IDS）=====
 // 口径见顶部 10.6b。一句话：只作用于杀手群，一根头发都不碰 GROUP_ID 的群。
 function isKillerAdmin(id) {
-	return KILLER_ADMIN_IDS.length > 0 && KILLER_ADMIN_IDS.includes(String(id || ''));
+	return runtime().KILLER_ADMIN_IDS.length > 0 && runtime().KILLER_ADMIN_IDS.includes(String(id || ''));
 }
 
 // 杀手权限的作用范围：全部杀手群。所有杀手身份的处置、查询、通知都只用这一份名单。
 function killerScopeGroupIds() {
-	return [...new Set(KILLER_MODE_GROUPS.map((id) => String(id || '').trim()).filter(Boolean))];
+	return [...new Set(runtime().KILLER_MODE_GROUPS.map((id) => String(id || '').trim()).filter(Boolean))];
 }
 
 // 杀手身份能用的命令。不在这里的（/addgroup /dryrun /admins /ad 维护类…）一律落回原有分发，按他的其他身份鉴权。
@@ -11338,27 +11493,27 @@ async function loadGroupModeStateFromD1(env) {
 
 // 每请求入口调用。无法确认群模式时停止本次治理，不能把独立群当成全局群。
 async function loadIndependentGroups(env) {
-	INDEPENDENT_GROUP_IDS = [];
-	LOCAL_BLACKLIST_CHAT_IDS = [];
+	runtime().INDEPENDENT_GROUP_IDS = [];
+	runtime().LOCAL_BLACKLIST_CHAT_IDS = [];
 	if (!env?.DB) return;
 	try {
 		const state = await loadD1RuntimeCachedValue(env, D1_GROUP_MODE_CACHE, loadGroupModeStateFromD1);
 		// 只认当前配置群里的；杀手群永远不算独立（双保险，/groupmode 本身也拒绝）。
-		const configured = new Set(GROUP_IDS.map((id) => String(id)));
-		INDEPENDENT_GROUP_IDS = (Array.isArray(state?.independent) ? state.independent : [])
+		const configured = new Set(runtime().GROUP_IDS.map((id) => String(id)));
+		runtime().INDEPENDENT_GROUP_IDS = (Array.isArray(state?.independent) ? state.independent : [])
 			.filter((id) => configured.has(id) && !isKillerModeGroup(id));
-		LOCAL_BLACKLIST_CHAT_IDS = (Array.isArray(state?.localChats) ? state.localChats : [])
+		runtime().LOCAL_BLACKLIST_CHAT_IDS = (Array.isArray(state?.localChats) ? state.localChats : [])
 			.filter((id) => automaticAdConfiguredGroups().includes(id));
 	} catch (error) {
 		console.error('[群模式] 读取失败，本次治理已停止: ' + formatD1SchemaError(error));
-		INDEPENDENT_GROUP_IDS = [];
-		LOCAL_BLACKLIST_CHAT_IDS = [];
+		runtime().INDEPENDENT_GROUP_IDS = [];
+		runtime().LOCAL_BLACKLIST_CHAT_IDS = [];
 		throw new MiniAppError(503, '群模式暂不可用，本次治理未执行，请稍后重试');
 	}
 }
 
 function isIndependentGroup(chatId) {
-	return INDEPENDENT_GROUP_IDS.length > 0 && INDEPENDENT_GROUP_IDS.includes(String(chatId ?? ''));
+	return runtime().INDEPENDENT_GROUP_IDS.length > 0 && runtime().INDEPENDENT_GROUP_IDS.includes(String(chatId ?? ''));
 }
 
 // 群主的反例只在本群独立模式生效；读取不建表，也不修改任何共享判据。
@@ -11409,25 +11564,25 @@ async function buildGroupAdContextKey(input, evaluation) {
 }
 
 function hasGroupLocalBlacklist(chatId) {
-	return LOCAL_BLACKLIST_CHAT_IDS.length > 0 && LOCAL_BLACKLIST_CHAT_IDS.includes(String(chatId ?? ''));
+	return runtime().LOCAL_BLACKLIST_CHAT_IDS.length > 0 && runtime().LOCAL_BLACKLIST_CHAT_IDS.includes(String(chatId ?? ''));
 }
 
 // 全局 /unban 的作用范围：一律不碰独立群（第一主人的也一样）。
-function globalUnbanScopeGroupIds(base = GROUP_IDS) {
-	const list = Array.isArray(base) ? base : GROUP_IDS;
+function globalUnbanScopeGroupIds(base = runtime().GROUP_IDS) {
+	const list = Array.isArray(base) ? base : runtime().GROUP_IDS;
 	return list.filter((groupId) => !isIndependentGroup(groupId));
 }
 
 // 全局封禁 / 解封的作用范围：第一主人 = 全部（含独立群）；其他人一律跳过独立群。
-function globalScopeGroupIds(operatorId, base = GROUP_IDS) {
-	const list = Array.isArray(base) ? base : GROUP_IDS;
-	if (isPrimaryOwner(operatorId) || !INDEPENDENT_GROUP_IDS.length) return [...list];
+function globalScopeGroupIds(operatorId, base = runtime().GROUP_IDS) {
+	const list = Array.isArray(base) ? base : runtime().GROUP_IDS;
+	if (isPrimaryOwner(operatorId) || !runtime().INDEPENDENT_GROUP_IDS.length) return [...list];
 	return list.filter((groupId) => !isIndependentGroup(groupId));
 }
 
 // 全局自动检测联动治理群；独立群继续只治理本群。执行前另从 D1 严格复核模式。
 function automaticAdConfiguredGroups() {
-	return [...new Set([...GROUP_IDS, ...(Array.isArray(KILLER_MODE_GROUPS) ? KILLER_MODE_GROUPS : [])].map(String).filter(Boolean))];
+	return [...new Set([...runtime().GROUP_IDS, ...(Array.isArray(runtime().KILLER_MODE_GROUPS) ? runtime().KILLER_MODE_GROUPS : [])].map(String).filter(Boolean))];
 }
 
 function getAutomaticAdTargetGroups(eventChatId) {
@@ -12296,8 +12451,8 @@ async function handleGroupModeCommand(message, env, ctx, rest) {
 	}
 	await reply(lines.join('\n'));
 	// 群主切的：私聊告知第一主人一声（谁、哪个群、切成什么）。
-	if (!isPrimaryOwner(operatorId) && OWNER_IDS.length) {
-		await sendTelegramMessage(OWNER_IDS[0], `🔔 <b>群模式变更</b>\n👤 操作人:${formatMessageActorMention(message)}（群主）\n${lines.join('\n')}`);
+	if (!isPrimaryOwner(operatorId) && runtime().OWNER_IDS.length) {
+		await sendTelegramMessage(runtime().OWNER_IDS[0], `🔔 <b>群模式变更</b>\n👤 操作人:${formatMessageActorMention(message)}（群主）\n${lines.join('\n')}`);
 	}
 }
 
@@ -12438,7 +12593,7 @@ async function dispatchNonGlobalModerationRoute(route, message, env, ctx, opts) 
 
 // /check /profile 里的「杀手黑名单」一节。未配置杀手群时不出这一节（零开销）。
 async function renderKillerBlacklistLines(env, userId) {
-	if (!KILLER_MODE_GROUPS.length || !env?.DB) return [];
+	if (!runtime().KILLER_MODE_GROUPS.length || !env?.DB) return [];
 	const lines = ['<b>━━ 杀手黑名单 ━━</b>'];
 	try {
 		const entry = await readKillerBlacklistEntry(env, userId);
@@ -13096,13 +13251,13 @@ async function startAdDryRunSession(env, at, legacy = false) {
 			+ (Number(ambiguous.n)?'开启同秒有 '+ambiguous.n+' 条无法证明属于本轮，未自动处理，流水ID：'+ambiguous.ids:'');
 	} else first = await env.DB.prepare('SELECT COALESCE(MAX(id),0)+1 AS id FROM ad_dryrun_log').first();
 	await env.DB.prepare("INSERT INTO ad_dryrun_sessions(start_row_id,opened_at,owner_id,boundary_note) SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM ad_dryrun_sessions WHERE status IN ('open','closing','processing'))")
-		.bind(Number(first.id), String(at), String(OWNER_IDS[0] || ''),boundaryNote).run();
+		.bind(Number(first.id), String(at), String(runtime().OWNER_IDS[0] || ''),boundaryNote).run();
 	return await readAdDryRunSession(env,true);
 }
 
 function globalDryRunScopeGroupIds() {
-	return [...new Set([...GROUP_IDS, ...KILLER_MODE_GROUPS, ...STAT_SEARCH_GROUPS, ...PROFILE_LOOKUP_GROUPS,
-		String(SELF_UNBAN_CONTACT_GROUP || '')].map((id) => String(id || '').trim()).filter((id) => /^-\d+$/.test(id)))];
+	return [...new Set([...runtime().GROUP_IDS, ...runtime().KILLER_MODE_GROUPS, ...runtime().STAT_SEARCH_GROUPS, ...runtime().PROFILE_LOOKUP_GROUPS,
+		String(runtime().SELF_UNBAN_CONTACT_GROUP || '')].map((id) => String(id || '').trim()).filter((id) => /^-\d+$/.test(id)))];
 }
 
 function isGlobalDryRunScopeGroup(chatId) {
@@ -13532,7 +13687,7 @@ async function notifyAdContentReviewPending(env,id) {
 	if(await isAdContentReviewCapturePaused(env))return;
 	const row=await env.DB.prepare('SELECT seq,chat_id,notified FROM ad_content_reviews WHERE id=? AND '+AD_REVIEW_PENDING_CONDITION).bind(id).first();
 	if(!row||row.notified)return;
-	let owner=String(OWNER_IDS[0]||'');
+	let owner=String(runtime().OWNER_IDS[0]||'');
 	if(isIndependentGroup(row.chat_id)){
 		const admins=await fetchGroupAdminsOnce(row.chat_id);
 		owner=String((Array.isArray(admins)?admins:[]).find(member=>member.status==='creator')?.user?.id||'');
@@ -13594,7 +13749,7 @@ async function renderAdReviewPage(actorId,callbackMessage,text,keyboard,blocks=n
 		body=new FormData();for(const [key,value]of Object.entries(payload))body.append(key,typeof value==='object'?JSON.stringify(value):String(value));
 		for(const file of files)body.append(file.key,new Blob([file.bytes],{type:file.mime}),file.name);
 	}else{body=JSON.stringify(payload);headers={'Content-Type':'application/json'};}
-	const response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/'+(messageId?'editMessageText':blocks?'sendRichMessage':'sendMessage'),{method:'POST',headers,body});
+	const response=await fetch('https://api.telegram.org/bot'+runtime().BOT_TOKEN+'/'+(messageId?'editMessageText':blocks?'sendRichMessage':'sendMessage'),{method:'POST',headers,body});
 	const result=await response.json();
 	if(!response.ok||!result.ok){
 		if(messageId&&/message is not modified/i.test(result.description||''))return result;
@@ -13679,7 +13834,7 @@ async function showAdReviewDuplicateUsers(env,actorId,page,callbackMessage,filte
 	await ensureAdContentReviewTable(env);
 	const actions=filter==='actions',suffix=actions?':actions':'';
 	const primary=isPrimaryOwner(actorId),groups=[];
-	if(!primary){for(const gid of INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length)throw new Error('仅第一主人或独立群群主可查看待核内容');}
+	if(!primary){for(const gid of runtime().INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length)throw new Error('仅第一主人或独立群群主可查看待核内容');}
 	const scope=primary?'':' AND chat_id IN (SELECT value FROM json_each(?))',args=primary?[]:[JSON.stringify(groups)],now=Math.floor(Date.now()/1000);
 	const query='SELECT user_id,chat_id,COUNT(*) AS n,MAX(seq) AS seq FROM ad_content_reviews WHERE expires_at>? AND '+adReviewDuplicateCondition(filter)+scope+' GROUP BY user_id,chat_id HAVING COUNT(*)>1';
 	const count=await env.DB.prepare('SELECT COUNT(*) AS n FROM ('+query+')').bind(now,...args).first(),total=Number(count?.n||0),pages=Math.max(1,Math.ceil(total/10));
@@ -13725,7 +13880,7 @@ async function showNextAdContentReview(env,actorId,currentSeq,callbackMessage){
 	await ensureAdContentReviewTable(env);
 	if(!Number.isSafeInteger(currentSeq)||currentSeq<1)throw new Error('现场序号无效');
 	const primary=isPrimaryOwner(actorId),groups=[];
-	if(!primary){for(const gid of INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length)throw new Error('仅第一主人或独立群群主可查看待核内容');}
+	if(!primary){for(const gid of runtime().INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length)throw new Error('仅第一主人或独立群群主可查看待核内容');}
 	const scope=primary?'':' AND chat_id IN (SELECT value FROM json_each(?))',args=primary?[]:[JSON.stringify(groups)];
 	const now=Math.floor(Date.now()/1000);
 	// 与待核列表同为倒序；走到末尾后回到剩余记录开头，且不重复返回当前记录。
@@ -13739,7 +13894,7 @@ async function showNextAdContentReview(env,actorId,currentSeq,callbackMessage){
 
 async function showAdContentReviewList(env,actorId,page=1,callbackMessage=null,filter='pending') {
 	await ensureAdContentReviewTable(env);page=Math.max(1,Number(page)||1);
-	let groups=[];if(!isPrimaryOwner(actorId)){for(const gid of INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length)throw new Error('仅第一主人或独立群群主可查看待核内容');}
+	let groups=[];if(!isPrimaryOwner(actorId)){for(const gid of runtime().INDEPENDENT_GROUP_IDS)if(await isGroupCreator(actorId,gid))groups.push(gid);if(!groups.length)throw new Error('仅第一主人或独立群群主可查看待核内容');}
 	const scope=isPrimaryOwner(actorId)?'':' AND chat_id IN (SELECT value FROM json_each(?))',args=isPrimaryOwner(actorId)?[]:[JSON.stringify(groups)];
 	const partial=filter==='partial',actions=filter==='actions',background=filter==='background',learning=filter==='learning';
 	const where=(partial?"status='partial'":actions?"status='action_failed'":learning?"source='operator'":background?
@@ -14188,7 +14343,7 @@ async function recoverAdReviewMemberIdentity(env,rows){
 		if(!budget)return done('quota');
 		const read=async(method,body)=>{
 			const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
-			try{const response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/'+method,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:controller.signal});
+			try{const response=await fetch('https://api.telegram.org/bot'+runtime().BOT_TOKEN+'/'+method,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:controller.signal});
 				const data=await response.json();return {...data,ok:response.ok&&data.ok===true};
 			}finally{clearTimeout(timer);}
 		};
@@ -14602,11 +14757,11 @@ async function sendAdContentReviewBatchReport(env,batchId,options={}){
 			'处置回执核对：'+JSON.stringify(after.batchReceiptAudit||{}));
 		lines.push('处置回执：'+JSON.stringify(after.reviewAction||{}),'回退与素材入口：/review open '+row.seq,'');
 	}
-	const body=new FormData();body.append('chat_id',String(OWNER_IDS[0]));body.append('document',new Blob([lines.join('\n')],{type:'text/markdown;charset=utf-8'}),'review-'+batchId+'.md');
+	const body=new FormData();body.append('chat_id',String(runtime().OWNER_IDS[0]));body.append('document',new Blob([lines.join('\n')],{type:'text/markdown;charset=utf-8'}),'review-'+batchId+'.md');
 	body.append('caption','本批全部 '+rows.length+' 条的完整结果、原文及处置回执。');
-	const response=await fetch('https://api.telegram.org/bot'+BOT_TOKEN+'/sendDocument',{method:'POST',body}),sent=await response.json();
+	const response=await fetch('https://api.telegram.org/bot'+runtime().BOT_TOKEN+'/sendDocument',{method:'POST',body}),sent=await response.json();
 	if(!response.ok||!sent.ok)throw new Error('第一主人报告发送失败：'+String(sent.description||response.status));
-	const summary=await sendTelegramMessage(String(OWNER_IDS[0]),(batch.status==='complete'?'✅ 本批内容复核已完成：':'本批自动复核结果（仍含未完成项）：')+rows.length+' 条。\n'+Object.entries(counts).map(([key,value])=>label(key)+'：'+value).join('\n')+'\n处置依据与回执见附件；下方逐页核查并可进入具体案件回退。',
+	const summary=await sendTelegramMessage(String(runtime().OWNER_IDS[0]),(batch.status==='complete'?'✅ 本批内容复核已完成：':'本批自动复核结果（仍含未完成项）：')+rows.length+' 条。\n'+Object.entries(counts).map(([key,value])=>label(key)+'：'+value).join('\n')+'\n处置依据与回执见附件；下方逐页核查并可进入具体案件回退。',
 		{inline_keyboard:[[{text:'查看全部结果与回退入口',callback_data:'review:batch:'+batchId+':1'}]]});
 	if(!summary?.ok)throw new Error('第一主人结果入口发送失败');
 	await env.DB.prepare('UPDATE ad_review_batches SET notified_at=?,report_message_id=?,report_lease=0 WHERE id=?').bind(now,Number(sent.result?.message_id)||0,batchId).run();
@@ -14714,7 +14869,7 @@ async function handleGlobalDryRunMessage(message, env) {
 	const chatId = String(message?.chat?.id || '');
 	if (!message?.from || message.chat?.type === 'private' || !isGlobalDryRunScopeGroup(chatId)
 		|| isTelegramServiceMessage(message) || !hasAdMessageContent(message) || isTelegramSlashCommand(message.text)
-		|| classifyAdReplyIntent(message.text) || String(message.text || '').trim() === SELF_UNBAN_KEYWORD) return false;
+		|| classifyAdReplyIntent(message.text) || String(message.text || '').trim() === runtime().SELF_UNBAN_KEYWORD) return false;
 	if (!(await isDryRunGroup(env, chatId))) return false;
 	if (await isAdDryRunClosing(env)) return true;
 	const captureSession=await readAdDryRunSession(env);
@@ -15319,7 +15474,7 @@ async function cacheModerationMessage(env, message, options = {}) {
 				)
 				.run();
 		}
-		const limit = Math.max(MSG_CACHE_SIZE, 200);
+		const limit = Math.max(runtime().MSG_CACHE_SIZE, 200);
 		if (shouldPruneD1Cache(insertResult)) {
 			await pruneAutoincrementCacheTable(env, 'moderation_messages', limit);
 		}
@@ -15355,7 +15510,7 @@ const LINKED_SPAM_MAX_TARGETS = 20;                  // 单次连带硬上限（
 // 而群数还会随 /addgroup 增长，任何写死的号数都会在某个群数下失效。
 // 复用 shouldUseBulkQueue 的同一套口径，与 /ban /spam 手动批量的判定标准完全一致。
 function shouldRunLinkedSpamSync(targetCount) {
-	const budget = shouldUseBulkQueue(targetCount, GROUP_IDS.length, { probeMembership: false });
+	const budget = shouldUseBulkQueue(targetCount, runtime().GROUP_IDS.length, { probeMembership: false });
 	return !budget.useQueue;
 }
 
@@ -16025,7 +16180,7 @@ async function cleanupCurrentChatUserMessages(env, chatId, userId, fallbackMessa
 		try {
 			await ensureD1Table(env);
 			const { results } = await env.DB.prepare('SELECT mid FROM moderation_messages WHERE chat_id = ? AND from_id = ? ORDER BY id DESC LIMIT ?')
-				.bind(String(chatId), String(userId), Math.max(MSG_CACHE_SIZE, 200))
+				.bind(String(chatId), String(userId), Math.max(runtime().MSG_CACHE_SIZE, 200))
 				.all();
 			for (const row of results || []) addMessageId(row.mid);
 			await env.DB.prepare('DELETE FROM moderation_messages WHERE chat_id = ? AND from_id = ?')
@@ -16402,7 +16557,7 @@ async function translateBlacklistOperator(byId) {
 
 	// 尝试查询操作人名字和类型
 	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChat`;
+		const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChat`;
 		const resp = await fetch(url, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
@@ -16544,7 +16699,7 @@ async function botHasRestrictRight(chatId) {
 	const botId = await getBotId();
 	if (!botId) return true;
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatMember`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: chatId, user_id: Number(botId) })
@@ -16640,7 +16795,7 @@ function buildNoRestrictRightResult(groupId, userId) {
 
 // 黑名单自动拦截通知主人（复入群拦截 / 发言拦截 / 群内手动解封拦截时调用）
 async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklistInfo, banResult, env) {
-	if (!OWNER_IDS.length) return;
+	if (!runtime().OWNER_IDS.length) return;
 	const failed = !!(banResult && !banResult.ok);
 	let suppressed = 0;
 	const deduped = !String(action || '').startsWith('群内手动解封拦截');
@@ -16695,10 +16850,10 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 		let seq = null;
 		try {
 			const row = await env.DB.prepare('SELECT seq FROM ad_pending_snapshots WHERE owner_id = ? AND expires_at > ? AND json_valid(snapshot) AND json_extract(snapshot, \'$.autoCaseId\') = ? ORDER BY seq DESC LIMIT 1')
-				.bind(String(OWNER_IDS[0]), Math.floor(Date.now() / 1000), entry.autoCaseId).first();
+				.bind(String(runtime().OWNER_IDS[0]), Math.floor(Date.now() / 1000), entry.autoCaseId).first();
 			seq = row?.seq || null;
 		} catch (_) { /* 旧或未写成的快照不生成伪回滚按钮 */ }
-		await sendTelegramMessageChunks(OWNER_IDS[0], lines.join('\n'), buildAdNoticeKeyboard(seq, targetId, { automatic: true }));
+		await sendTelegramMessageChunks(runtime().OWNER_IDS[0], lines.join('\n'), buildAdNoticeKeyboard(seq, targetId, { automatic: true }));
 		await notifyIndependentGroupCreatorAdCase(env, String(chat.id), seq, targetId, lines.join('\n'));
 	} else await notifyAllOwners(lines.join('\n'), null);
 }
@@ -16710,7 +16865,7 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 //   'start'         —— 只是打开了 bot（Telegram 自动发 /start），可能只是误触，
 //                      /start 现在只回自我介绍、不拒绝，所以这条纯属知情通报。
 async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo, kind = 'appeal', origin = null) {
-	if (!OWNER_IDS.length) return;
+	if (!runtime().OWNER_IDS.length) return;
 	const target = fromUser
 		? formatUserMention(fromUser)
 		: '<code>未知</code>';
@@ -16747,7 +16902,7 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo, kind = 'appea
 // origin = 发起这次解封的会话（message.chat 或裸 chatId）。不传则不显示来源行 ——
 // 宁可少一行，也不显示一个编出来的「未知」。
 async function notifyOwnerSelfUnban(fromUser, perGroupResults, origin = null) {
-	if (!OWNER_IDS.length) return;
+	if (!runtime().OWNER_IDS.length) return;
 	const target = fromUser
 		? formatUserMention(fromUser)
 		: '<code>未知</code>';
@@ -16948,7 +17103,7 @@ async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) 
 			disable_web_page_preview: true
 		};
 		if (replyMarkup) body.reply_markup = replyMarkup;
-		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/editMessageText', {
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/editMessageText', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify(body)
@@ -16968,7 +17123,7 @@ async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) 
 async function answerAdVoteCallback(callbackQueryId, text = '', showAlert = false) {
 	if (!callbackQueryId) return { ok: false, error: 'callback_query_id 缺失' };
 	try {
-		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/answerCallbackQuery', {
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/answerCallbackQuery', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
@@ -16994,7 +17149,7 @@ async function setAdVotePinned(chatId, messageId, pinned) {
 		message_id: messageId,
 	};
 	try {
-		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/' + method, {
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/' + method, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify(body),
@@ -17022,7 +17177,7 @@ async function unpinAdVoteMessage(chatId, messageId) {
 async function editAdVoteMessage(chatId, messageId, state) {
 	if (!messageId) return { ok: false, error: '投票消息 ID 缺失' };
 	try {
-		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/editMessageText', {
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/editMessageText', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
@@ -17049,7 +17204,7 @@ async function editAdVoteMessage(chatId, messageId, state) {
 async function userHasActiveChatBoost(chatId, userId) {
 	if (!/^\d+$/.test(String(userId || ''))) return false;
 	try {
-		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getUserChatBoosts', {
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getUserChatBoosts', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: chatId, user_id: Number(userId) }),
@@ -17340,7 +17495,7 @@ async function formatAdVoteSourceGroup(state) {
 }
 
 async function notifyOwnerAdVoteApproved(state, blacklistResult, banResults, deleteResult) {
-	if (!OWNER_IDS.length) return;
+	if (!runtime().OWNER_IDS.length) return;
 	const sourceGroup = await formatAdVoteSourceGroup(state);
 	const lines = [
 		'🗳️ <b>广告举报投票已通过</b>',
@@ -17372,7 +17527,7 @@ async function notifyOwnerAdVoteApproved(state, blacklistResult, banResults, del
 }
 
 async function notifyOwnerAdVoteClosed(state) {
-	if (!OWNER_IDS.length || !state?.finalized || state.result === 'approved') return;
+	if (!runtime().OWNER_IDS.length || !state?.finalized || state.result === 'approved') return;
 	const sourceGroup = await formatAdVoteSourceGroup(state);
 	const resultMeta = {
 		rejected: {
@@ -17546,7 +17701,7 @@ async function sendAdPagedMessage(chatId, text, keyboard, fallbackLine) {
 async function editAdPagedMessage(chatId, messageId, text, keyboard) {
 	if (!messageId) return { ok: false, error: 'message_id 缺失' };
 	try {
-		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/editMessageText', {
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/editMessageText', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
@@ -17802,7 +17957,7 @@ async function reserveAdImageSimilarityQuota(env) {
 }
 
 async function adImageSimilarityDownload(env, media) {
-	const token = String(env?.BOT_TOKEN || BOT_TOKEN || '');
+	const token = String(env?.BOT_TOKEN || runtime().BOT_TOKEN || '');
 	if (!token || !media.visionFileId) throw new Error('no_media');
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 8000);
@@ -18329,7 +18484,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 非配置群默认禁用 bot 指令；只放行只读的 /check 查询。
 	// /check 的复制按钮会在响应构建时继续按 GROUP_IDS 严格校验。
 	const isNonConfiguredGroup = message.chat.type !== 'private' && !isConfiguredGroup(chatId);
-	const isSelfUnbanConfirmText = typeof text === 'string' && text.trim() === SELF_UNBAN_KEYWORD;
+	const isSelfUnbanConfirmText = typeof text === 'string' && text.trim() === runtime().SELF_UNBAN_KEYWORD;
 	const isReadOnlyExternalCheck = isNonConfiguredGroup && isCheckCommand(text);
 	if (isNonConfiguredGroup && ((isTelegramSlashCommand(text) && !isReadOnlyExternalCheck) || isSelfUnbanConfirmText)) {
 		return;
@@ -18420,7 +18575,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 按群分身份：判成杀手身份的命令在这里处理完就 return，不进原有分发；
 	// 没判成的（GROUP_ID 群、杀手身份没有的命令、私聊里超管共有的四条）原样落回下面，鉴权一个字节不变。
 	// 通知内容可以是图片 / 视频（没有 text），所以捕获那一支不能要求 text 是字符串。
-	if (KILLER_ADMIN_IDS.length && message.from && !message.from.is_bot) {
+	if (runtime().KILLER_ADMIN_IDS.length && message.from && !message.from.is_bot) {
 		if (message.chat.type === 'private' && !isTelegramSlashCommand(text)) {
 			if (await maybeCaptureKillerNoticeContent(message, env)) return;
 		} else if (typeof text === 'string' && await handleKillerAdminCommand(message, env, ctx, requestUrl)) {
@@ -19223,7 +19378,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			}
 			const [total, blacklist] = await Promise.all([
 				getD1BlacklistCount(env),
-				readD1BlacklistRecent(env, BLACKLIST_PAGE_LIMIT)
+				readD1BlacklistRecent(env, runtime().BLACKLIST_PAGE_LIMIT)
 			]);
 			const operatorUsernames = await resolveBlacklistOperatorUsernames(blacklist);
 			await replyToAdmin(message, ctx, {
@@ -19247,7 +19402,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		const [total, blacklist] = await Promise.all([
 			getD1BlacklistCount(env),
-			readD1BlacklistRecent(env, BLACKLIST_PAGE_LIMIT)
+			readD1BlacklistRecent(env, runtime().BLACKLIST_PAGE_LIMIT)
 		]);
 		const operatorUsernames = await resolveBlacklistOperatorUsernames(blacklist);
 		// 保持单条发送：splitTelegramHtmlBlocks 的阈值按 HTML 原文长度算（30 条原文约
@@ -19542,12 +19697,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const lines = ['🗂️ <b>当前生效的群组</b>', ''];
 			// 群名：环境变量群库里没存，实时拉一次（外面有 10 分钟缓存）。
 			// 并发发出即可，十几个请求远低于 Telegram 的限流阈值。
-			const envInfos = await Promise.all(ENV_GROUP_IDS.map((id) => resolveGroupInfoCached(id)));
-			lines.push(`<b>环境变量群（GROUP_ID，共 ${ENV_GROUP_IDS.length} 个）</b>`);
-			if (ENV_GROUP_IDS.length === 0) {
+			const envInfos = await Promise.all(runtime().ENV_GROUP_IDS.map((id) => resolveGroupInfoCached(id)));
+			lines.push(`<b>环境变量群（GROUP_ID，共 ${runtime().ENV_GROUP_IDS.length} 个）</b>`);
+			if (runtime().ENV_GROUP_IDS.length === 0) {
 				lines.push('  （空）');
 			} else {
-				ENV_GROUP_IDS.forEach((id, index) => {
+				runtime().ENV_GROUP_IDS.forEach((id, index) => {
 					const mark = (index === 0 ? ' ⭐ 主群' : '') + groupRoleMark(id);
 					lines.push(`  ${index + 1}. ${renderGroupNameLabel(envInfos[index])}<code>${escapeHtml(String(id))}</code>${mark}`);
 				});
@@ -19573,9 +19728,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					if (meta.length) lines.push(`     ${meta.join(' · ')}`);
 				});
 			}
-			lines.push('', `📊 合计生效群组:${ENV_GROUP_IDS.length + rows.length} 个`);
+			lines.push('', `📊 合计生效群组:${runtime().ENV_GROUP_IDS.length + rows.length} 个`);
 			lines.push('ℹ️ 主群固定为 GROUP_ID 第一个群，指令添加的群不会顶替主群。');
-			if (ENV_GROUP_IDS.some((id) => groupRoleMark(id))) lines.push('ℹ️ 标 🚫 的杀手群 / 搜索群不收全体通知（/notice）。');
+			if (runtime().ENV_GROUP_IDS.some((id) => groupRoleMark(id))) lines.push('ℹ️ 标 🚫 的杀手群 / 搜索群不收全体通知（/notice）。');
 			await sendTelegramMessageChunks(chatId, lines.join('\n'));
 			return;
 		}
@@ -19606,7 +19761,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				await sendTelegramMessage(chatId, '用法:<code>/delgroup -100xxxx</code>');
 				return;
 			}
-			if (ENV_GROUP_IDS.some((g) => String(g) === targetId)) {
+			if (runtime().ENV_GROUP_IDS.some((g) => String(g) === targetId)) {
 				// 环境变量群（含杀手模式群、搜索群）不能用指令停 —— 尤其是群内这条，
 				// 退出后没有任何入口能把它加回来（Worker 写不了自己的环境变量），
 				// 主群一旦这样退掉，整台机器人就与所有群失联了。
@@ -19645,7 +19800,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await deleteAuthorizedGroupCommandMessage(message, '/delgroup');
 
 			// 私聊回执必须先发 —— 退群之后这个群发不出任何消息，回执只能落在私聊。
-			await sendTelegramMessage(OWNER_IDS[0],
+			await sendTelegramMessage(runtime().OWNER_IDS[0],
 				'✅ <b>已停止治理并退出该群</b>\n\n'
 				+ '🏷️ 群名:' + escapeHtml(groupTitle) + '\n'
 				+ '🆔 群 ID:<code>' + escapeHtml(targetId) + '</code>\n\n'
@@ -19661,14 +19816,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			const beforeLeave = await getBotChatMembership(chatId);
 			if (beforeLeave.ok && !beforeLeave.inChat) {
-				await sendTelegramMessage(OWNER_IDS[0],
+				await sendTelegramMessage(runtime().OWNER_IDS[0],
 					'ℹ️ bot 本就不在该群，无需退出\n群 ID:<code>' + escapeHtml(targetId) + '</code>');
 				return;
 			}
 
 			const leaveResult = await leaveTelegramChat(chatId);
 			if (!leaveResult.ok) {
-				await sendTelegramMessage(OWNER_IDS[0],
+				await sendTelegramMessage(runtime().OWNER_IDS[0],
 					'⚠️ <b>治理已停，但退群失败</b>\n\n'
 					+ '群:<b>' + escapeHtml(groupTitle) + '</b> <code>' + escapeHtml(targetId) + '</code>\n'
 					+ '原因:' + escapeHtml(translateLeaveChatError(leaveResult.error)) + '\n\n'
@@ -19679,15 +19834,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			const afterLeave = await getBotChatMembership(chatId);
 			if (afterLeave.ok && !afterLeave.inChat) {
-				await sendTelegramMessage(OWNER_IDS[0],
+				await sendTelegramMessage(runtime().OWNER_IDS[0],
 					'✅ 已确认退出 <b>' + escapeHtml(groupTitle) + '</b> <code>' + escapeHtml(targetId) + '</code>');
 			} else if (afterLeave.ok && afterLeave.inChat) {
-				await sendTelegramMessage(OWNER_IDS[0],
+				await sendTelegramMessage(runtime().OWNER_IDS[0],
 					'⚠️ Telegram 返回退出成功，但复查显示 bot 仍在群内（状态:'
 					+ escapeHtml(formatBotChatMembershipStatus(afterLeave)) + '）。\n'
 					+ '治理配置已删除，请稍后手动确认。');
 			} else {
-				await sendTelegramMessage(OWNER_IDS[0],
+				await sendTelegramMessage(runtime().OWNER_IDS[0],
 					'⚠️ 退出请求已发送，但无法确认最终状态:'
 					+ escapeHtml(translateLeaveChatError(afterLeave.error)) + '\n治理配置已删除。');
 			}
@@ -19697,7 +19852,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// /addgroup
 		// 先查"是否已配置"再查格式：已在配置里的群回一句"无需重复添加"比"格式错误"有用得多，
 		// 也兼容历史上 GROUP_ID 里填过非 -100 群组 ID 的部署。
-		if (ENV_GROUP_IDS.some((g) => String(g) === targetGroupId)) {
+		if (runtime().ENV_GROUP_IDS.some((g) => String(g) === targetGroupId)) {
 			await sendTelegramMessage(chatId, `⚠️ <code>${escapeHtml(targetGroupId)}</code> 已在 GROUP_ID 环境变量中，无需重复添加。`);
 			return;
 		}
@@ -19739,7 +19894,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await sendTelegramMessage(chatId, `❌ 添加失败:${escapeHtml(added.message || '未知错误')}`);
 			return;
 		}
-		const totalGroups = ENV_GROUP_IDS.length + DYNAMIC_GROUP_IDS.length + 1;
+		const totalGroups = runtime().ENV_GROUP_IDS.length + runtime().DYNAMIC_GROUP_IDS.length + 1;
 		await sendTelegramMessage(
 			chatId,
 			[
@@ -19749,7 +19904,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				`🤖 bot 身份:${escapeHtml(access.status || '管理员')}`,
 				noteParts.length ? `📝 备注:${escapeHtml(noteParts.join(' ').trim())}` : '',
 				'',
-				`📊 当前生效群组:${totalGroups} 个（环境变量 ${ENV_GROUP_IDS.length} + 指令添加 ${DYNAMIC_GROUP_IDS.length + 1}）`,
+				`📊 当前生效群组:${totalGroups} 个（环境变量 ${runtime().ENV_GROUP_IDS.length} + 指令添加 ${runtime().DYNAMIC_GROUP_IDS.length + 1}）`,
 				'',
 				'ℹ️ 该群已纳入全套治理:黑名单拦截、复入群踢回、广告自动检测、/ban /spam 全群封禁、/purge 清扫、批量任务。',
 				'⚠️ 群数增加会线性放大全群操作的耗时与请求数，批量任务会更早转为异步执行。',
@@ -20256,16 +20411,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			} catch (error) {
 				console.error('[/start] 统计面板渲染失败:', error);
 				// 渲染失败必须回落介绍语，不能让第一主人收到空回复。
-				const fbTitle = START_WELCOME.includes('{title}') ? (await getGroupInfo()).title : '';
-				await sendTelegramMessage(chatId, START_WELCOME
+				const fbTitle = runtime().START_WELCOME.includes('{title}') ? (await getGroupInfo()).title : '';
+				await sendTelegramMessage(chatId, runtime().START_WELCOME
 					.replaceAll('{userId}', String(userId))
 					.replaceAll('{title}', fbTitle));
 			}
 			return;
 		}
 		// {title} 需要额外一次 getChat，默认文案并不使用它，所以按需才查。
-		const startTitle = START_WELCOME.includes('{title}') ? (await getGroupInfo()).title : '';
-		await sendTelegramMessage(chatId, START_WELCOME
+		const startTitle = runtime().START_WELCOME.includes('{title}') ? (await getGroupInfo()).title : '';
+		await sendTelegramMessage(chatId, runtime().START_WELCOME
 			.replaceAll('{userId}', String(userId))
 			.replaceAll('{title}', startTitle));
 		return;
@@ -20286,7 +20441,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const quietManagerCommand = await isNonPrimaryConfiguredGroupManager(message, userId);
 		// D1 全局黑名单是自助解封的硬闸门：命中任何 reason 都拒绝，且不自动移除黑名单。
 		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env, {
-			silentGroupReply: quietManagerCommand && OWNER_IDS.length > 0,
+			silentGroupReply: quietManagerCommand && runtime().OWNER_IDS.length > 0,
 			ctx,
 			message,
 			scope: {},
@@ -20295,10 +20450,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		const groupInfo = await getGroupInfo();
-		const welcomeMessage = SELF_UNBAN_PROMPT
+		const welcomeMessage = runtime().SELF_UNBAN_PROMPT
 			.replaceAll('{userId}', String(userId))
 			.replaceAll('{title}', groupInfo.title)
-			.replaceAll('{keyword}', SELF_UNBAN_KEYWORD);
+			.replaceAll('{keyword}', runtime().SELF_UNBAN_KEYWORD);
 
 		if (quietManagerCommand) {
 			await replyToModerationAdmin(message, ctx, {
@@ -20311,7 +20466,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 	}
 	// 检查用户回复是否完全匹配提示语，禁止夹带其它内容
-	else if (text && text.trim() === SELF_UNBAN_KEYWORD) {
+	else if (text && text.trim() === runtime().SELF_UNBAN_KEYWORD) {
 		// D1 全局黑名单是自助解封的硬闸门：命中任何 reason 都拒绝，且不自动移除黑名单。
 		const selfUnbanScope = {};
 		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env, { scope: selfUnbanScope })) {
@@ -20323,9 +20478,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 遍历所有配置群组，按用户在每个群的状态分别尝试解封/解禁
 		// 杀手黑名单里的人：杀手群跳过（那张表只管杀手群，其余群照常自助解封）。
 		// 在全局黑名单（非第一主人封的）里的人：只解独立群，全局群保持封禁。
-		const killerHit = KILLER_MODE_GROUPS.length ? await readKillerBlacklistEntrySafe(env, userId) : null;
+		const killerHit = runtime().KILLER_MODE_GROUPS.length ? await readKillerBlacklistEntrySafe(env, userId) : null;
 		const perGroupResults = [];
-		const selfUnbanGroupIds = selfUnbanScope.independentOnly ? GROUP_IDS.filter((g) => isIndependentGroup(g)) : GROUP_IDS;
+		const selfUnbanGroupIds = selfUnbanScope.independentOnly ? runtime().GROUP_IDS.filter((g) => isIndependentGroup(g)) : runtime().GROUP_IDS;
 		if (selfUnbanScope.independentOnly) {
 			perGroupResults.push('ℹ️ 你仍在全局黑名单中，全局群保持封禁；以下仅为独立群的自助解封结果。');
 		}
@@ -20403,7 +20558,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				infoMessage += `- TGID: <a href="tg://user?id=${banlistData.tgid}">${banlistData.tgid}</a>\n`;
 				if (banlistData.reason) infoMessage += `- 封禁原因: ${banlistData.reason}\n`;
 				infoMessage += `\n需要群组管理员进行<b><a href="https://t.me/${botUsername}?start=check_${banlistData.tgid}">二次审核</a></b>。`;
-				await sendTelegramMessage(GROUP_ID, infoMessage);
+				await sendTelegramMessage(runtime().GROUP_ID, infoMessage);
 			}
 		} catch (error) {
 			console.error('查询 GKY 封禁记录失败:', error);
@@ -20417,7 +20572,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 // 而是告知"全部群组限制已解除"，并给一个能联系到管理员的主群按钮。
 // 拿不到群链接时使用降级文案（无"点击下方按钮"字样）且不附按钮，绝不出现点不动的假链接。
 async function buildSelfUnbanApprovedReply() {
-	const contactGroupId = SELF_UNBAN_CONTACT_GROUP || GROUP_ID;
+	const contactGroupId = runtime().SELF_UNBAN_CONTACT_GROUP || runtime().GROUP_ID;
 	let title = '';
 	let link = '';
 	try {
@@ -20427,9 +20582,9 @@ async function buildSelfUnbanApprovedReply() {
 	} catch (error) {
 		console.error('[自助解封] 获取联系主群信息失败:', error?.message || error);
 	}
-	const groupCount = Array.isArray(GROUP_IDS) ? GROUP_IDS.length : 0;
+	const groupCount = Array.isArray(runtime().GROUP_IDS) ? runtime().GROUP_IDS.length : 0;
 	const clickable = Boolean(link && title);
-	const template = clickable ? SELF_UNBAN_APPROVED : SELF_UNBAN_APPROVED_NOLINK;
+	const template = clickable ? runtime().SELF_UNBAN_APPROVED : runtime().SELF_UNBAN_APPROVED_NOLINK;
 	const groupName = title || String(contactGroupId);
 	const text = String(template)
 		.replaceAll('{groupcount}', String(groupCount))
@@ -20446,7 +20601,7 @@ async function buildSelfUnbanApprovedReply() {
 // 只缓存限流的时间，避免同一批通知继续撞 Telegram；不共享请求中的 Promise。
 const TELEGRAM_SEND_COOLDOWNS = new Map();
 function telegramSendCooldown(chatId) {
-	const key = BOT_TOKEN + ':' + String(chatId);
+	const key = runtime().BOT_TOKEN + ':' + String(chatId);
 	const until = TELEGRAM_SEND_COOLDOWNS.get(key) || 0;
 	if (until <= Date.now()) { TELEGRAM_SEND_COOLDOWNS.delete(key); return null; }
 	const retryAfterSeconds = Math.ceil((until - Date.now()) / 1000);
@@ -20458,7 +20613,7 @@ function recordTelegramSendCooldown(chatId, response, result) {
 	const seconds = Number(result?.parameters?.retry_after) || Number(String(result?.description || '').match(/retry after (\d+)/i)?.[1]) || 1;
 	const delay = Math.max(1000, Math.ceil(seconds * 1000));
 	if (TELEGRAM_SEND_COOLDOWNS.size >= 512) TELEGRAM_SEND_COOLDOWNS.delete(TELEGRAM_SEND_COOLDOWNS.keys().next().value);
-	TELEGRAM_SEND_COOLDOWNS.set(BOT_TOKEN + ':' + String(chatId), Date.now() + delay);
+	TELEGRAM_SEND_COOLDOWNS.set(runtime().BOT_TOKEN + ':' + String(chatId), Date.now() + delay);
 	return delay;
 }
 
@@ -20466,7 +20621,7 @@ function recordTelegramSendCooldown(chatId, response, result) {
 async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId = null) {
 	const cooldown = telegramSendCooldown(chatId);
 	if (cooldown) return cooldown;
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+	const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/sendMessage`;
 	const body = {
 		chat_id: chatId,
 		text: sanitizeTelegramText(text),
@@ -20511,7 +20666,7 @@ async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId =
 			return { ...result, ok: false, error: result.description || `HTTP ${response.status}`,
 				...(delay ? { retryAfterSeconds: Math.ceil(delay / 1000), retryAt: Date.now() + delay, retryable: true } : {}) };
 		}
-		TELEGRAM_SEND_COOLDOWNS.delete(BOT_TOKEN + ':' + String(chatId));
+		TELEGRAM_SEND_COOLDOWNS.delete(runtime().BOT_TOKEN + ':' + String(chatId));
 		captureWebAdminReply(chatId, body.text);
 		return result;
 	} catch (error) {
@@ -20569,7 +20724,7 @@ function parseRmLink(text) {
 // 公开群用户名 → 群 ID。查不到返回 ''。
 async function resolvePublicChatId(username) {
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChat`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: '@' + username })
@@ -21008,7 +21163,7 @@ function isNoticeCommand(text) {
 // 复制一条消息到目标聊天（Telegram copyMessage）：以 bot 身份重发，不带「转发自」抬头，
 // 保留原文文本/图片/排版。返回 { ok, error }。
 async function copyMessageToChat(toChatId, fromChatId, messageId, options = {}) {
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`;
+	const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/copyMessage`;
 	const body = { chat_id: toChatId, from_chat_id: fromChatId, message_id: Number(messageId) };
 	if (options.disableNotification === true) body.disable_notification = true;
 	try {
@@ -21033,7 +21188,7 @@ async function clearNoticeState(env) { await writeAdScanState(env, NOTICE_PENDIN
 // 搜索群（STAT_SEARCH_GROUPS）只为 /search 留历史才并入治理群，全体通知不发给它们。
 // 判据只认这个环境变量：同一个群既在 GROUP_ID 又在 STAT_SEARCH_GROUPS，也按搜索群排除。
 function isStatSearchGroup(chatId) {
-	return STAT_SEARCH_GROUPS.includes(String(chatId));
+	return runtime().STAT_SEARCH_GROUPS.includes(String(chatId));
 }
 // 全体通知不发的群：杀手群（KILLER_MODE_GROUPS，主人把搜索群也配在这里，且其中的普通禁言群一并不收）
 // 与搜索群。杀手群的通知走杀手版 /notice / 杀手后台，不受这里影响。
@@ -21042,7 +21197,7 @@ function isNoticeExcludedGroup(chatId) {
 }
 // 全体通知的目标：全部配置群去重后去掉杀手群与搜索群。/notice 与后台 notice/send 共用这一份口径。
 function noticeTargetGroups() {
-	const all = [...new Set((GROUP_IDS || []).map((g) => String(g)).filter(Boolean))];
+	const all = [...new Set((runtime().GROUP_IDS || []).map((g) => String(g)).filter(Boolean))];
 	const groups = all.filter((g) => !isNoticeExcludedGroup(g));
 	return { groups, skipped: all.length - groups.length };
 }
@@ -21063,7 +21218,7 @@ function groupRoleMark(chatId) {
 }
 // 确认页逐个列出会发到的群和不发的群（群名走 10 分钟缓存，拉不到只显示 ID），点确认前一眼看清范围。
 async function noticeConfirmGroupLines() {
-	const all = [...new Set((GROUP_IDS || []).map((g) => String(g)).filter(Boolean))];
+	const all = [...new Set((runtime().GROUP_IDS || []).map((g) => String(g)).filter(Boolean))];
 	const infos = await Promise.all(all.map((g) => resolveGroupInfoCached(g)));
 	const send = [];
 	const skip = [];
@@ -21190,7 +21345,7 @@ async function handleNoticeCallback(callbackQuery, env) {
 
 // Telegram moderation helpers
 async function muteChatMember(chatId, userId) {
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/restrictChatMember`;
+	const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/restrictChatMember`;
 	const body = {
 		chat_id: chatId,
 		user_id: Number(userId),
@@ -21272,7 +21427,7 @@ async function muteUserInGroup(chatId, userId, options = {}) {
 			return { ok: true, attempts, retried: attempt > 1 };
 		} catch (error) {
 			lastError = error;
-			if (attempt >= 2) break;
+			if (attempt >= 2 || options.deferRetry) break;
 			const failure = parseMuteFailure(error);
 			if (!shouldRetryTelegramMutationFailure(failure)) break;
 			await new Promise((resolve) => setTimeout(resolve, getTelegramMutationRetryDelayMs(failure)));
@@ -21281,6 +21436,8 @@ async function muteUserInGroup(chatId, userId, options = {}) {
 	return {
 		ok: false,
 		error: lastError?.message || String(lastError || '失败'),
+		retryable: shouldRetryTelegramMutationFailure(parseMuteFailure(lastError)),
+		retryAfterSeconds: parseMuteFailure(lastError).retryAfterSeconds || 0,
 		attempts,
 		retried: attempts > 1
 	};
@@ -21308,7 +21465,7 @@ function getTelegramMutationRetryDelayMs(failure) {
 }
 
 async function banUserFromGroup(chatId, userId, options = {}) {
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`;
+	const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/banChatMember`;
 	const body = {
 		chat_id: chatId,
 		user_id: Number(userId),
@@ -21349,13 +21506,15 @@ async function banUserFromGroup(chatId, userId, options = {}) {
 			console.error(`[banChatMember] chat=${chatId} user=${userId} attempt=${attempt} 异常:`, error);
 		}
 
-		if (attempt >= 2 || !shouldRetryTelegramMutationFailure(lastFailure)) break;
+		if (attempt >= 2 || options.deferRetry || !shouldRetryTelegramMutationFailure(lastFailure)) break;
 		await new Promise((resolve) => setTimeout(resolve, getTelegramMutationRetryDelayMs(lastFailure)));
 	}
 
 	return {
 		ok: false,
 		error: lastFailure?.error || '失败',
+		retryable: shouldRetryTelegramMutationFailure(lastFailure),
+		retryAfterSeconds: Number(lastFailure?.retryAfterSeconds) || 0,
 		attempts,
 		retried: attempts > 1
 	};
@@ -21364,7 +21523,7 @@ async function banUserFromGroup(chatId, userId, options = {}) {
 // 让 bot 退出指定群组（Telegram leaveChat API）
 // 返回 { ok: bool, error?: string }；目标群不存在、bot 不在群内等场景不抛异常。
 async function leaveTelegramChat(chatId) {
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/leaveChat`;
+	const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/leaveChat`;
 	const body = { chat_id: String(chatId) };
 
 	try {
@@ -21391,7 +21550,7 @@ async function getBotChatMembership(chatId) {
 		return { ok: false, inChat: false, error: '无法获取机器人 ID' };
 	}
 
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`;
+	const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatMember`;
 	const body = { chat_id: String(chatId), user_id: Number(botId) };
 
 	try {
@@ -21466,7 +21625,7 @@ function translateLeaveChatError(description) {
 // 返回 { ok: bool, error?: string }
 async function deleteMessage(chatId, messageId) {
 	if (!Number.isSafeInteger(Number(messageId)) || Number(messageId) <= 0) return { ok: false, error: 'message identifier is not specified' };
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`;
+	const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/deleteMessage`;
 	const body = { chat_id: chatId, message_id: messageId };
 
 	try {
@@ -21497,7 +21656,7 @@ async function deleteMessage(chatId, messageId) {
 // ttlMs <= 0 表示永不撤回，此时不注册后台任务。
 // ⚠️ ctx 必须由调用方透传：延时撤回挂在 ctx.waitUntil 上，传 null 会让提示永久留在群里。
 async function sendFlashMessage(chatId, text, ctx, ttlMs) {
-	const ttl = Number.isFinite(Number(ttlMs)) ? Number(ttlMs) : FLASH_MESSAGE_TTL_MS;
+	const ttl = Number.isFinite(Number(ttlMs)) ? Number(ttlMs) : runtime().FLASH_MESSAGE_TTL_MS;
 	const result = await sendTelegramMessage(chatId, text);
 	const messageId = result?.result?.message_id;
 	if (!messageId || ttl <= 0 || !ctx || typeof ctx.waitUntil !== 'function') return result;
@@ -21508,8 +21667,8 @@ async function sendFlashMessage(chatId, text, ctx, ttlMs) {
 	return result;
 }
 
-async function unbanUser(userId, groupId = GROUP_ID) {
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`;
+async function unbanUser(userId, groupId = runtime().GROUP_ID, options = {}) {
+	const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/unbanChatMember`;
 	const body = {
 		chat_id: groupId,
 		user_id: Number(userId),
@@ -21550,7 +21709,7 @@ async function unbanUser(userId, groupId = GROUP_ID) {
 			};
 			console.error(`[unbanChatMember] chat=${groupId} user=${userId} attempt=${attempt} 异常:`, error);
 		}
-		if (attempt >= 2 || !shouldRetryTelegramMutationFailure(lastFailure)) break;
+		if (attempt >= 2 || options.deferRetry || !shouldRetryTelegramMutationFailure(lastFailure)) break;
 		await new Promise((resolve) => setTimeout(resolve, getTelegramMutationRetryDelayMs(lastFailure)));
 	}
 
@@ -21558,14 +21717,16 @@ async function unbanUser(userId, groupId = GROUP_ID) {
 		ok: false,
 		description: lastFailure?.description || lastFailure?.error || '失败',
 		error: lastFailure?.error || lastFailure?.description || '失败',
+		retryable: shouldRetryTelegramMutationFailure(lastFailure),
+		retryAfterSeconds: Number(lastFailure?.retryAfterSeconds) || 0,
 		attempts,
 		retried: attempts > 1
 	};
 }
 
 // 解除用户禁言（恢复发言权限）
-async function restrictUser(userId, groupId = GROUP_ID) {
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/restrictChatMember`;
+async function restrictUser(userId, groupId = runtime().GROUP_ID) {
+	const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/restrictChatMember`;
 	const body = {
 		chat_id: groupId,
 		user_id: Number(userId),
@@ -21600,8 +21761,8 @@ async function restrictUser(userId, groupId = GROUP_ID) {
 }
 
 // 检查用户在群组中的状态
-async function checkUserStatus(userId, groupId = GROUP_ID) {
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`;
+async function checkUserStatus(userId, groupId = runtime().GROUP_ID) {
+	const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatMember`;
 	const body = {
 		chat_id: groupId,
 		user_id: Number(userId)
@@ -21637,7 +21798,7 @@ const ADMIN_CHECK_CACHE_TTL_MS = 60 * 1000;
 // 在 60 秒内一直命中旧结果（false），私聊命令被误拒。
 // 排序后拼接，避免 D1 返回顺序波动导致无谓的 miss。
 function adminCacheKeyFor(userIdStr) {
-	return `${userIdStr}|${[...GROUP_IDS].sort().join(',')}`;
+	return `${userIdStr}|${[...runtime().GROUP_IDS].sort().join(',')}`;
 }
 
 // 过期项不会主动消失；用户量大时做一次轻量清理，避免 Map 无限增长。
@@ -21685,9 +21846,9 @@ async function checkIfUserIsAdmin(userId) {
 	let failedCount = 0;
 	let checkedCount = 0;
 
-	for (const groupId of GROUP_IDS) {
+	for (const groupId of runtime().GROUP_IDS) {
 		try {
-			const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`;
+			const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatAdministrators`;
 			const response = await fetch(url, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
@@ -21736,21 +21897,21 @@ async function checkIfUserIsAdmin(userId) {
 
 // 获取机器人用户名
 async function getBotId() {
-	if (BOT_ID) {
-		return BOT_ID;
+	if (runtime().BOT_INFO.id) {
+		return runtime().BOT_INFO.id;
 	}
 
 	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getMe`;
+		const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/getMe`;
 		const response = await fetch(url);
 		const result = await response.json();
 
 		if (response.ok && result.result && result.result.id) {
-			BOT_ID = result.result.id;
+			runtime().BOT_INFO.id = result.result.id;
 			if (result.result.username) {
-				BOT_USERNAME = result.result.username;
+				runtime().BOT_INFO.username = result.result.username;
 			}
-			return BOT_ID;
+			return runtime().BOT_INFO.id;
 		}
 
 		console.error('Failed to get bot ID:', result);
@@ -21763,8 +21924,8 @@ async function getBotId() {
 
 async function getBotUsername() {
 	// 如果已经缓存，直接返回
-	if (BOT_USERNAME) {
-		return BOT_USERNAME;
+	if (runtime().BOT_INFO.username) {
+		return runtime().BOT_INFO.username;
 	}
 
 	// 【绝不能返回占位名】旧实现在 getMe 失败时返回 'unknown_bot'，首页拿它拼出
@@ -21774,17 +21935,17 @@ async function getBotUsername() {
 	// 宁可少一个按钮，也不能给一个必然失败的。
 	for (let attempt = 1; attempt <= 2; attempt += 1) {
 		try {
-			const url = `https://api.telegram.org/bot${BOT_TOKEN}/getMe`;
+			const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/getMe`;
 			const response = await fetch(url);
 			const result = await response.json();
 
 			if (response.ok && result.result && result.result.username) {
 				if (result.result.id) {
-					BOT_ID = result.result.id;
+					runtime().BOT_INFO.id = result.result.id;
 				}
-				BOT_USERNAME = result.result.username;
-				console.log(`机器人用户名: ${BOT_USERNAME}`);
-				return BOT_USERNAME;
+				runtime().BOT_INFO.username = result.result.username;
+				console.log(`机器人用户名: ${runtime().BOT_INFO.username}`);
+				return runtime().BOT_INFO.username;
 			}
 			console.error('获取机器人信息失败（第 ' + attempt + ' 次）:', result);
 		} catch (error) {
@@ -21808,17 +21969,17 @@ function resolveChatInviteUrl(chatResult) {
 
 async function getGroupInfo() {
 	// 如果已经缓存，直接返回
-	if (GROUP_TITLE && GROUP_USERNAME) {
+	if (runtime().GROUP_INFO.title && runtime().GROUP_INFO.username) {
 		return {
-			title: GROUP_TITLE,
-			username: GROUP_USERNAME
+			title: runtime().GROUP_INFO.title,
+			username: runtime().GROUP_INFO.username
 		};
 	}
 
 	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChat`;
+		const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChat`;
 		const body = {
-			chat_id: GROUP_ID
+			chat_id: runtime().GROUP_ID
 		};
 
 		const response = await fetch(url, {
@@ -21830,19 +21991,19 @@ async function getGroupInfo() {
 		const result = await response.json();
 
 		if (response.ok && result.result) {
-			GROUP_TITLE = result.result.title || '当前群组';
-			GROUP_USERNAME = result.result.username ? `@${result.result.username}` : String(GROUP_ID);
-			console.log(`群组信息: 名称=${GROUP_TITLE}, 用户名=${GROUP_USERNAME}`);
+			runtime().GROUP_INFO.title = result.result.title || '当前群组';
+			runtime().GROUP_INFO.username = result.result.username ? `@${result.result.username}` : String(runtime().GROUP_ID);
+			console.log(`群组信息: 名称=${runtime().GROUP_INFO.title}, 用户名=${runtime().GROUP_INFO.username}`);
 			return {
-				title: GROUP_TITLE,
-				username: GROUP_USERNAME
+				title: runtime().GROUP_INFO.title,
+				username: runtime().GROUP_INFO.username
 			};
 		} else {
 			console.error('获取群组信息失败:', result);
 			// 失败时返回中性默认值
 			return {
 				title: '当前群组',
-				username: String(GROUP_ID)
+				username: String(runtime().GROUP_ID)
 			};
 		}
 	} catch (error) {
@@ -21850,7 +22011,7 @@ async function getGroupInfo() {
 		// 失败时返回中性默认值
 		return {
 			title: '当前群组',
-			username: String(GROUP_ID)
+			username: String(runtime().GROUP_ID)
 		};
 	}
 }
@@ -21957,7 +22118,7 @@ async function handleBanlist(chatId) {
 	}
 
 	// 访问原始的 banlist API
-	const targetUrl = `${GKY_BANLIST_ENDPOINT}?tgid=${chatId}`;
+	const targetUrl = `${runtime().GKY_BANLIST_ENDPOINT}?tgid=${chatId}`;
 	const response = await fetch(targetUrl);
 	const html = await response.text();
 
@@ -22253,7 +22414,7 @@ ${body}
 // 通过群组ID获取群组信息
 async function getChatInfoFromId(chatId) {
 	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChat`;
+		const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChat`;
 		const body = {
 			chat_id: chatId
 		};
@@ -23138,7 +23299,7 @@ const AD_FINGERPRINT_TYPES = ['keyword', 'domain', 'username', 'bio', 'phone'];
 // 例：`ym94203,suqi_20` 或 `@ym94203，@suqi_20`。
 // 留空则只靠方案 A 的结构性移除兜底（已足够，白名单是加固而非必需）。
 const DEFAULT_AD_PROTECTED_USERNAMES = [];
-let AD_PROTECTED_USERNAMES = [];
+
 
 // 解析只读资料群名单：逗号分隔（半角 , 与全角 ， 均可），格式与 GROUP_ID 一致。
 // 用途单一 —— 只给 /admins 多几个可查资料的群，让不在任何治理群里的权限人也能显示
@@ -23203,10 +23364,10 @@ function parseAdProtectedUsernames(raw) {
 // 候选值里是否含受保护的 username。子串判定 —— keyword 短语是截断片段，
 // 受保护 handle 可能夹在中间（「收购账号 联系 @ym94203」）。
 function containsAdProtectedUsername(value) {
-	if (!AD_PROTECTED_USERNAMES.length) return false;
+	if (!runtime().AD_PROTECTED_USERNAMES.length) return false;
 	const lower = String(value || '').toLowerCase();
 	if (!lower) return false;
-	return AD_PROTECTED_USERNAMES.some((name) => lower.includes('@' + name) || lower.includes(name));
+	return runtime().AD_PROTECTED_USERNAMES.some((name) => lower.includes('@' + name) || lower.includes(name));
 }
 
 // 结构化评分正则（全部来自真实样本的名称 / 用户名形态）
@@ -24078,7 +24239,7 @@ async function isConfiguredGroupAdmin(env, userId) {
 //        null = 命令失败 / 网络异常，调用方必须跳过该群、绝不清空它的行。
 async function fetchGroupAdminsOnce(gid) {
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatAdministrators`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: gid }),
@@ -24103,11 +24264,11 @@ async function fetchGroupAdminsOnce(gid) {
 // 逐个 await 写 D1 又是 176 次。两者都互不依赖，改成并发拉 + batch 批量写。
 async function syncAdGroupAdmins(env) {
 	if (!env?.DB || !(await adDetectionReady(env))) {
-		return { groups: 0, admins: 0, failed: 0, orphans: 0, baseline: DYNAMIC_GROUPS_READY };
+		return { groups: 0, admins: 0, failed: 0, orphans: 0, baseline: runtime().DYNAMIC_GROUPS_READY };
 	}
 
 	// ① 并发拉取：各群的 getChatAdministrators 互不依赖，没理由排队
-	const groupIds = GROUP_IDS.map((id) => String(id || '')).filter(Boolean);
+	const groupIds = runtime().GROUP_IDS.map((id) => String(id || '')).filter(Boolean);
 	const fetched = await Promise.all(groupIds.map((gid) => fetchGroupAdminsOnce(gid)));
 
 	// ② 逐群算增量，攒成一批待执行的 SQL
@@ -24158,7 +24319,7 @@ async function syncAdGroupAdmins(env) {
 	// 「某个群没读出来」完全同形，照删就是把动态群的管理员集体误删，而且同样是静默的。
 	// 拿不准就不删：宁可多留一批旧行（下轮 cron 再清），也不误删活人的豁免。
 	let orphans = 0;
-	if (!DYNAMIC_GROUPS_READY) {
+	if (!runtime().DYNAMIC_GROUPS_READY) {
 		console.error('[广告检测] 跳过孤儿群清理：动态群基线不可信');
 	} else if (groupIds.length && groups > 0) {
 		const placeholders = groupIds.map(() => '?').join(', ');
@@ -24172,7 +24333,7 @@ async function syncAdGroupAdmins(env) {
 		}
 	}
 	// baseline 一并回报：cron 汇总日志里能直接看出这轮为什么没清理孤儿行
-	return { groups, admins, failed, orphans, baseline: DYNAMIC_GROUPS_READY };
+	return { groups, admins, failed, orphans, baseline: runtime().DYNAMIC_GROUPS_READY };
 }
 
 async function addAdUserWhitelist(env, userId, addedBy, note) {
@@ -24287,7 +24448,7 @@ async function resolveAdWhitelistNames(env, rows) {
 	if (!missing.length) return found;
 
 	await mapWithConcurrency(missing, AD_WL_NAME_CONCURRENCY, async (row) => {
-		for (const groupId of GROUP_IDS) {
+		for (const groupId of runtime().GROUP_IDS) {
 			try {
 				const result = await checkUserStatus(row.userId, groupId);
 				const user = result?.result?.user;
@@ -25278,7 +25439,7 @@ function extractAdProfileHandles(profile) {
 // 标题、简介、案底。结果按小写 handle 缓存 6 小时。
 async function resolveAdLink(env, handle) {
 	const key = String(handle || '').toLowerCase();
-	if (!key || !BOT_TOKEN) return null;
+	if (!key || !runtime().BOT_TOKEN) return null;
 	const cached = await readAdLinkCache(env, key);
 	if (cached) return cached;
 
@@ -25287,7 +25448,7 @@ async function resolveAdLink(env, handle) {
 	// 按死 6 小时，期间这个号挂的频道永远显示 unknown。
 	let cacheable = true;
 	try {
-		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getChat', {
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getChat', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: '@' + key })
@@ -28039,7 +28200,7 @@ async function fetchAdUserProfile(userId, fallback = {}, options = {}) {
 		profileFetchedAt: 0,
 		isPremium: typeof fallback.is_premium === 'boolean' ? fallback.is_premium : null
 	};
-	if (!BOT_TOKEN || !userId) return profile;
+	if (!runtime().BOT_TOKEN || !userId) return profile;
 	const cached = options.forceRefresh ? null : readAdProfileCache(userId);
 	// 缓存只在抓取成功时写入（见下方 writeAdProfileCache 的位置），
 	// 所以命中缓存等价于「近 5 分钟内成功查过」，bioFetched 置真。
@@ -28060,7 +28221,7 @@ async function fetchAdUserProfile(userId, fallback = {}, options = {}) {
 		let retryWait = 0;
 		for (let attempt = 0; attempt < 2; attempt++) {
 			if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, retryWait * 1000));
-			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+			const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChat`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ chat_id: String(userId) })
@@ -28107,9 +28268,9 @@ async function fetchAdUserProfile(userId, fallback = {}, options = {}) {
 
 // 顺带取群内成员状态：restricted 是强信号（+5）。
 async function fetchAdMemberStatus(chatId, userId) {
-	if (!BOT_TOKEN || !chatId || !userId) return '';
+	if (!runtime().BOT_TOKEN || !chatId || !userId) return '';
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatMember`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: String(chatId), user_id: String(userId) })
@@ -30362,7 +30523,7 @@ async function sendAdDryRunCloseProgress(env, sessionId, options = {}) {
 		+ '\n查看：/dryrun status；失败续跑：/dryrun retry ' + session.id + '；完整结果：/dryrun report ' + session.id;
 	if (options.notify && Number(session.report_sent) === 1) return true;
 	if (options.notify) await env.DB.prepare('UPDATE ad_dryrun_sessions SET report=? WHERE id=?').bind(text,Number(sessionId)).run();
-	const sent = await sendTelegramMessage(String(OWNER_IDS[0] || ''), text);
+	const sent = await sendTelegramMessage(String(runtime().OWNER_IDS[0] || ''), text);
 	if (options.notify && sent?.ok) await env.DB.prepare('UPDATE ad_dryrun_sessions SET report_sent=1 WHERE id=?').bind(Number(sessionId)).run();
 	return sent?.ok === true;
 }
@@ -30375,7 +30536,7 @@ async function sendAdDryRunReportDocument(ownerId, sessionId, report) {
 	body.append('caption', '本轮演练关闭完整逐条结果 #' + sessionId + '；包含全部流水、逐群处置结果和失败原因。');
 	body.append('document', new Blob(['\uFEFF' + plain], {type:'text/plain;charset=utf-8'}), 'tc033-dryrun-' + sessionId + '.txt');
 	try {
-		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/sendDocument', {method:'POST',body});
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/sendDocument', {method:'POST',body});
 		const result = await response.json();
 		if (!response.ok || !result.ok) {
 			recordTelegramSendCooldown(ownerId, response, result);
@@ -30450,7 +30611,7 @@ async function sendAdDryRunCloseReport(env, sessionId, options = {}) {
 	const savedReport = asDocument ? lines.slice(0,lines.indexOf('')).join('\n') + '\n完整逐条明细以附件发送；可使用 /dryrun report ' + session.id + ' 从持久账本重新生成。' : report;
 	if(!options.force&&session.report===savedReport&&Number(session.report_sent)===1)return true;
 	await env.DB.prepare('UPDATE ad_dryrun_sessions SET report=? WHERE id=?').bind(savedReport, Number(sessionId)).run();
-	const currentOwner=String(OWNER_IDS[0]||'');
+	const currentOwner=String(runtime().OWNER_IDS[0]||'');
 	if(!currentOwner||!isPrimaryOwner(currentOwner))return false;
 	const sent = await sendTelegramMessageChunks(currentOwner, savedReport);
 	const complete = sent?.ok === true && (!asDocument || await sendAdDryRunReportDocument(currentOwner,sessionId,report));
@@ -30957,11 +31118,11 @@ async function resolveCustomEmojiStickers(env, ids, options = {}) {
 	const wanted = [...new Set((Array.isArray(ids) ? ids : [])
 		.map((id) => String(id || '')).filter(Boolean))];
 	const out = {};
-	if (!wanted.length || !BOT_TOKEN) return out;
+	if (!wanted.length || !runtime().BOT_TOKEN) return out;
 	const now = Date.now();
 	const pending = [];
 	for (const id of wanted) {
-		const cacheKey = adTextHash(String(env?.BOT_TOKEN || BOT_TOKEN)) + ':' + id;
+		const cacheKey = adTextHash(String(env?.BOT_TOKEN || runtime().BOT_TOKEN)) + ':' + id;
 		const hit = AD_CUSTOM_EMOJI_CACHE.get(cacheKey);
 		if (hit && hit.expiresAt > now && (!options.requireMedia || hit.value?.media?.fileUniqueId)) out[id] = hit.value;
 		else pending.push(id);
@@ -30969,7 +31130,7 @@ async function resolveCustomEmojiStickers(env, ids, options = {}) {
 	if (!pending.length) return out;
 	for (let offset = 0; offset < pending.length; offset += 200) {
 	try {
-		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getCustomEmojiStickers', {
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getCustomEmojiStickers', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ custom_emoji_ids: pending.slice(offset, offset + 200) })
@@ -30997,7 +31158,7 @@ async function resolveCustomEmojiStickers(env, ids, options = {}) {
 						const oldest = AD_CUSTOM_EMOJI_CACHE.keys().next();
 						if (!oldest.done) AD_CUSTOM_EMOJI_CACHE.delete(oldest.value);
 					}
-					AD_CUSTOM_EMOJI_CACHE.set(adTextHash(String(env?.BOT_TOKEN || BOT_TOKEN)) + ':' + id, { value, expiresAt: now + AD_CUSTOM_EMOJI_CACHE_TTL_MS });
+					AD_CUSTOM_EMOJI_CACHE.set(adTextHash(String(env?.BOT_TOKEN || runtime().BOT_TOKEN)) + ':' + id, { value, expiresAt: now + AD_CUSTOM_EMOJI_CACHE_TTL_MS });
 				}
 			}
 		}
@@ -31362,7 +31523,7 @@ function pickAdPackSamples(stickers, limit) {
 async function fetchAdStickerSet(name) {
 	const hit = AD_STICKER_SET_CACHE.get(name);
 	if (hit && hit.expiresAt > Date.now()) return hit.value;
-	const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getStickerSet', {
+	const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getStickerSet', {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ name })
@@ -31386,7 +31547,7 @@ async function fetchAdStickerSet(name) {
 
 // 下载一张图并转成 clef 吃的 data URI；尺寸 / 格式不合格返回 { miss }，网络或接口错误抛出。
 async function fetchAdVisionImageUri(fileId) {
-	const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
+	const fileResponse = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getFile', {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ file_id: String(fileId || '') })
@@ -31395,7 +31556,7 @@ async function fetchAdVisionImageUri(fileId) {
 	if (!fileResult?.ok) throw new Error(fileResult?.description || 'getFile 失败');
 	const filePath = String(fileResult?.result?.file_path || '');
 	if (!filePath) throw new Error('file_path 为空');
-	const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
+	const imageResponse = await fetch('https://api.telegram.org/file/bot' + runtime().BOT_TOKEN + '/' + filePath);
 	if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
 	const buffer = await imageResponse.arrayBuffer();
 	if (buffer.byteLength > AD_VISION_MAX_IMAGE_BYTES) return { miss: 'size' };
@@ -31410,7 +31571,7 @@ async function fetchAdVisionImageUri(fileId) {
 // options.excludeUniqueId：本条消息那张已经单独识图过，抽样时跳过它。
 async function scanAdStickerPack(env, setName, options = {}) {
 	const name = String(setName || '');
-	if (!env?.DB || !name || !BOT_TOKEN) return null;
+	if (!env?.DB || !name || !runtime().BOT_TOKEN) return null;
 	const stateKey = AD_PACK_SCAN_KEY_PREFIX + name;
 	const config = loadAdDetectionConfig(env);
 	const dailyLimit = Number(config.imageVisionDaily);
@@ -31815,7 +31976,7 @@ async function isAdminForAdDetection(chatId, userId) {
 	const hit = AD_ADMIN_CACHE.get(chatKey);
 	if (hit && Date.now() <= hit.expiresAt) return hit.ids.has(uid);
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatAdministrators`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: chatKey }),
@@ -31849,7 +32010,7 @@ async function isAdminInAnyConfiguredGroup(userId, skipChatId = '') {
 	const uid = String(userId || '');
 	if (!uid) return false;
 	const skip = String(skipChatId || '');
-	for (const groupId of GROUP_IDS) {
+	for (const groupId of runtime().GROUP_IDS) {
 		const gid = String(groupId || '');
 		if (!gid || gid === skip) continue;
 		if (await isAdminForAdDetection(gid, uid)) return true;
@@ -32966,7 +33127,7 @@ async function refreshAvatarFileId(env, userId) {
 	const uid = Number(userId);
 	if (!Number.isFinite(uid) || uid <= 0) return null;
 	try {
-		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getUserProfilePhotos', {
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getUserProfilePhotos', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ user_id: uid, limit: 1 })
@@ -33172,7 +33333,7 @@ async function runAdAvatarVision(env, options = {}) {
 		try {
 			stage = 'getFile';
 			// 与全文件其它 Telegram 调用同一写法（项目没有通用封装，一律直连 fetch）。
-			const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
+			const fileResponse = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getFile', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ file_id: String(row.file_id) })
@@ -33190,7 +33351,7 @@ async function runAdAvatarVision(env, options = {}) {
 					} catch (writeError) {
 						console.error('[广告检测·头像] 回写新 file_id 失败: ' + String(writeError?.message || writeError));
 					}
-					const retryResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
+					const retryResponse = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getFile', {
 						method: 'POST',
 						headers: { 'Content-Type': 'application/json' },
 						body: JSON.stringify({ file_id: freshFileId })
@@ -33203,7 +33364,7 @@ async function runAdAvatarVision(env, options = {}) {
 			if (!filePath) throw new Error('file_path 为空');
 			// 官方：该下载链接至少 1 小时有效，文件上限 20MB（头像远小于它）。
 			stage = 'download';
-			const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
+			const imageResponse = await fetch('https://api.telegram.org/file/bot' + runtime().BOT_TOKEN + '/' + filePath);
 			if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
 			const buffer = await imageResponse.arrayBuffer();
 			// 【尺寸闸】超限的图喂进去必然失败 —— 2026-10-12 实测 512×512 直接调用失败，
@@ -33378,7 +33539,7 @@ async function runAdImageVision(env, options = {}) {
 		let skipBump = false;
 		try {
 			stage = 'getFile';
-			const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
+			const fileResponse = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getFile', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ file_id: String(row.file_id) })
@@ -33388,7 +33549,7 @@ async function runAdImageVision(env, options = {}) {
 			const filePath = String(fileResult?.result?.file_path || '');
 			if (!filePath) throw new Error('file_path 为空');
 			stage = 'download';
-			const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
+			const imageResponse = await fetch('https://api.telegram.org/file/bot' + runtime().BOT_TOKEN + '/' + filePath);
 			if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
 			const buffer = await imageResponse.arrayBuffer();
 			// 【尺寸闸】超限的图喂进去必然失败 —— 2026-10-12 实测 512×512 直接调用失败，
@@ -33596,7 +33757,7 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	let capturedImage = null;
 	let skipBump = false;
 	try {
-		const fileResponse = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
+		const fileResponse = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getFile', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ file_id: visionFileId })
@@ -33605,7 +33766,7 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 		if (!fileResult?.ok) throw new Error(fileResult?.description || 'getFile 失败');
 		const filePath = String(fileResult?.result?.file_path || '');
 		if (!filePath) throw new Error('file_path 为空');
-		const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
+		const imageResponse = await fetch('https://api.telegram.org/file/bot' + runtime().BOT_TOKEN + '/' + filePath);
 		if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
 		const buffer = await imageResponse.arrayBuffer();
 		// 尺寸闸与格式闸与 cron 轨完全一致：喂错格式 = 模型抛错 = 白烧一次额度。
@@ -33747,7 +33908,7 @@ async function readAdImageOwnerReview(env, userId, chatId, fileUniqueId) {
 }
 
 async function clearAdImageOwnerLearning(env, { userId, chatId, fileUniqueId, eventKey = '' }) {
-	const ownerId = String(OWNER_IDS[0] || '');
+	const ownerId = String(runtime().OWNER_IDS[0] || '');
 	const uid = String(userId || '');
 	const gid = chatId && chatId !== '0' ? String(chatId) : '';
 	const review = await readAdImageOwnerReview(env, uid, gid, fileUniqueId);
@@ -33965,7 +34126,7 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 	let skipBump = false;
 	try {
 		const askFile = async (id) => {
-			const resp = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getFile', {
+			const resp = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getFile', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ file_id: id })
@@ -33988,7 +34149,7 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 		if (!fileResult?.ok) throw new Error(fileResult?.description || 'getFile 失败');
 		const filePath = String(fileResult?.result?.file_path || '');
 		if (!filePath) throw new Error('file_path 为空');
-		const imageResponse = await fetch('https://api.telegram.org/file/bot' + BOT_TOKEN + '/' + filePath);
+		const imageResponse = await fetch('https://api.telegram.org/file/bot' + runtime().BOT_TOKEN + '/' + filePath);
 		if (!imageResponse.ok) throw new Error('下载失败 status=' + imageResponse.status);
 		const buffer = await imageResponse.arrayBuffer();
 		if (buffer.byteLength > AD_VISION_MAX_IMAGE_BYTES) return row || null;
@@ -35957,7 +36118,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 		// 定罪本身就是学习凭据，不需要再问一遍「结构层同不同意」。
 		const learn = await learnAdFingerprints(env, textLearningPayload, {
 			source: options.ownerConfirmed ? 'manual' : 'auto',
-			createdBy: options.ownerConfirmed ? String(OWNER_IDS[0] || 'system') : 'system',
+			createdBy: options.ownerConfirmed ? String(runtime().OWNER_IDS[0] || 'system') : 'system',
 			whitelist: options.whitelist
 		});
 		learned = Number(learn?.learned) || 0;
@@ -36204,7 +36365,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			automaticRoute = await resolveAutomaticAdTargets(env,chatId,options);
 			automaticScopeGroupIds = automaticRoute.groupIds;
 			localScope = automaticRoute.local;
-			INDEPENDENT_GROUP_IDS = automaticRoute.independentIds;
+			runtime().INDEPENDENT_GROUP_IDS = automaticRoute.independentIds;
 			if (localScope && (await resolveLocalAdDetectionSkip(env,chatId,userId)) === 'whitelisted') return { banned:false,seq:null,reason:'whitelisted' };
 		} catch (_) { return {banned:false,seq:null,complete:false,reason:'自动处罚群模式读取失败，未猜测全局范围'}; }
 	}
@@ -36413,7 +36574,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 					// ④ 连带封禁：内部会删同款消息 + 加黑 + 全群封禁
 					//（banUserFromAllGroups 未传 revokeMessages → 默认 true → Telegram 撤回其历史发言）。
 					const done = await enforceLinkedSpamTargets(env, capped, {
-						operatorId: automatic ? 'system' : String(options.operatorId || OWNER_IDS[0] || 'system'),
+						operatorId: automatic ? 'system' : String(options.operatorId || runtime().OWNER_IDS[0] || 'system'),
 						automaticChatId: automatic ? chatId : '', text: autoText,
 						note: '同款广告连带(自动封禁 ' + userId + ')'
 					});
@@ -37342,7 +37503,7 @@ async function readFreshAdIgnoreGroupMode(env, chatId) {
 }
 
 async function resolveAdIgnoreAccess(env, actorId, seq, origin = {}) {
-	const uid = String(actorId || ''), ownerId = String(OWNER_IDS[0] || '');
+	const uid = String(actorId || ''), ownerId = String(runtime().OWNER_IDS[0] || '');
 	const chatId = String(origin.chatId || ''), chatType = String(origin.chatType || '');
 	const denied = (code, message = '权限不足：仅第一主人私聊，或独立模式本群当前群主可纠正本群自动处罚。') => ({ ok: false, code, message });
 	if (!ownerId || !/^\d+$/.test(uid) || origin.actorIsBot === true || origin.anonymous === true
@@ -37418,7 +37579,7 @@ async function notifyIndependentGroupCreatorAdCase(env, chatId, seq, userId, tex
 		const creators = (members || []).filter((member) => member?.status === 'creator' && member?.user?.is_bot !== true && /^\d+$/.test(String(member?.user?.id || '')));
 		if (creators.length !== 1) return;
 		const creatorId = String(creators[0].user.id);
-		if (creatorId === String(OWNER_IDS[0] || '') || !(await readFreshAdIgnoreGroupMode(env, chatId))) return;
+		if (creatorId === String(runtime().OWNER_IDS[0] || '') || !(await readFreshAdIgnoreGroupMode(env, chatId))) return;
 		const keyboard = { inline_keyboard: [[{ text: '↩️ 误封解除（本群纠错）', callback_data: ADFIX_BUTTON_PREFIX + 'ig:' + Number(seq) }]] };
 		await sendTelegramMessageChunks(creatorId, text + '\n本群纠错：/ignore ' + seq + '（仅撤本次自动处罚并记录本群误判反馈）', keyboard);
 	} catch (error) { console.error('[本群广告纠错] 群主私聊通知失败:', error); }
@@ -37497,7 +37658,7 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, options = 
 	}
 	if (!automaticRollback && !retainedPunishment && (removed.success || removed.code === 'NOT_FOUND')) {
 		const results = await unbanUserFromAllGroups(targetId,
-			localAutomatic ? [punishmentChatId] : globalUnbanScopeGroupIds(options.groupIds || GROUP_IDS));
+			localAutomatic ? [punishmentChatId] : globalUnbanScopeGroupIds(options.groupIds || runtime().GROUP_IDS));
 		unbanResults = results;
 		const okCount = results.filter((r) => r.ok).length;
 		unbanSummary = okCount + '/' + results.length + ' 个群成功';
@@ -39791,7 +39952,7 @@ async function recordDisposalsFromBanResults(env, banResults, options = {}) {
 async function fetchChatMemberCount(chatId) {
 	if (!chatId) return null;
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMemberCount`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatMemberCount`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: String(chatId) })
@@ -39903,7 +40064,7 @@ async function checkGroupHealth(groupId, botId) {
 		canDelete: false, canRestrict: false, canInvite: false, error: ''
 	};
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChat`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: out.groupId })
@@ -39914,7 +40075,7 @@ async function checkGroupHealth(groupId, botId) {
 	} catch (error) { out.error = error.message || String(error); return out; }
 
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatAdministrators`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: out.groupId })
@@ -39941,7 +40102,7 @@ async function runHealthLayerOne(env) {
 	try {
 		const id = await getBotId();
 		items.push(id
-			? { ok: true, text: 'Bot 身份　<code>@' + escapeHtml(String(BOT_USERNAME || '')) + '</code>（' + escapeHtml(String(id)) + '）' }
+			? { ok: true, text: 'Bot 身份　<code>@' + escapeHtml(String(runtime().BOT_INFO.username || '')) + '</code>（' + escapeHtml(String(id)) + '）' }
 			: { ok: false, text: 'Bot 身份　❌ getMe 未返回 —— token 可能失效或网络不通' });
 	} catch (error) {
 		items.push({ ok: false, text: 'Bot 身份　❌ ' + escapeHtml(toChineseErrorText(error.message || '未知错误')) });
@@ -39982,10 +40143,10 @@ async function runHealthLayerOne(env) {
 		: { ok: null, text: 'Workers AI　⚠️ 未绑定 —— 广告检测降级为「评分 + 指纹」两层（不是故障）' });
 
 	// ⑤ 配置规模
-	const killerCount = KILLER_MODE_GROUPS.length;
+	const killerCount = runtime().KILLER_MODE_GROUPS.length;
 	items.push({
 		ok: true,
-		text: '配置规模　📋 配置群 <b>' + GROUP_IDS.length + '</b> 个　杀手模式 <b>' + killerCount + '</b> 个'
+		text: '配置规模　📋 配置群 <b>' + runtime().GROUP_IDS.length + '</b> 个　杀手模式 <b>' + killerCount + '</b> 个'
 	});
 	return items;
 }
@@ -39997,7 +40158,7 @@ async function runHealthCheck(env, options = {}) {
 	let botId = '';
 	try { botId = String(await getBotId() || ''); } catch (_) {}
 
-	const targets = (Array.isArray(options.groupIds) ? options.groupIds : GROUP_IDS).filter(Boolean).map(String);
+	const targets = (Array.isArray(options.groupIds) ? options.groupIds : runtime().GROUP_IDS).filter(Boolean).map(String);
 	let layer2 = [];
 	if (botId && targets.length) {
 		layer2 = await mapWithConcurrency(targets, HEALTH_GROUP_CONCURRENCY, async (g) => {
@@ -40082,7 +40243,7 @@ function mkMenuButton(action, chatId, label, page) {
 // 单个群查失败回落成群 ID 文本，不整页崩掉。
 async function renderOwnerHome(env) {
 	const botName = String(await getBotUsername() || '').replace(/^@+/, '');
-	const targets = GROUP_IDS.filter(Boolean).map(String);
+	const targets = runtime().GROUP_IDS.filter(Boolean).map(String);
 	let titles = new Map();
 	if (targets.length) {
 		try {
@@ -40323,7 +40484,7 @@ async function isGroupCreator(userId, chatId) {
 	const gid = String(chatId || '');
 	if (!uid || !gid || !isConfiguredGroup(gid)) return false;
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/getChatAdministrators`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: gid }),
@@ -40446,7 +40607,7 @@ function renderSearchResult(o) {
 
 // 保留策略提示：说清楚「为什么有些群只有最近 200 条」，别让人以为是 bug。
 function searchHistoryNote(scopeChatIds) {
-	const configured = scopeChatIds.filter((c) => STAT_SEARCH_GROUPS.includes(String(c)));
+	const configured = scopeChatIds.filter((c) => runtime().STAT_SEARCH_GROUPS.includes(String(c)));
 	if (configured.length === scopeChatIds.length && configured.length > 0) {
 		return '📖 本群正文保留 <b>' + STAT_SEARCH_RETENTION_DAYS + '</b> 天（在 <code>STAT_SEARCH_GROUPS</code> 里）。';
 	}
@@ -40498,7 +40659,7 @@ async function handleSearchCommand(message, env) {
 
 	// 群内只查本群；私聊（已确认是第一主人）跨全部配置群。
 	await runSearchQueryAndReply(env, chatId, raw, {
-		scopeChatIds: isInGroup ? [String(chatId)] : GROUP_IDS.map(String),
+		scopeChatIds: isInGroup ? [String(chatId)] : runtime().GROUP_IDS.map(String),
 		scopeToken: isInGroup ? String(chatId) : 'all',
 		scopeLabel: isInGroup
 			? (String(message.chat?.title || '') || '群 <code>' + escapeHtml(String(chatId)) + '</code>')
@@ -40631,7 +40792,7 @@ async function screenJoinRequestAd(env, user, chatId, chatTitle) {
 // 拒绝一条入群申请。返回是否成功；失败只记日志 —— 预封已经生效，这一步只是收尾。
 async function declineJoinRequest(env, chatId, userId) {
 	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/declineChatJoinRequest`, {
+		const response = await fetch(`https://api.telegram.org/bot${runtime().BOT_TOKEN}/declineChatJoinRequest`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ chat_id: String(chatId), user_id: Number(userId) })
@@ -41269,7 +41430,7 @@ async function handleSearchPaginationCallback(callbackQuery, env) {
 		return;
 	}
 
-	const scopeChatIds = scope === 'all' ? GROUP_IDS.map(String) : scope === 'killer' ? killerScopeGroupIds() : [String(scope)];
+	const scopeChatIds = scope === 'all' ? runtime().GROUP_IDS.map(String) : scope === 'killer' ? killerScopeGroupIds() : [String(scope)];
 	let userIdFilter = null;
 	let keywordFilter = null;
 	let queryLabel = '';
