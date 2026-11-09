@@ -35251,6 +35251,16 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 		: (row ? Object.assign({}, row, { ocr_text: ocrText, ocr_at: ocrAt }) : null)), contentResult);
 }
 
+// 拦门通知保留期。ad_join_notices 是全项目唯一【只增不减】的表：
+// 每条 payload 存着完整回执与历次执行记录，线上实测平均 19.5 KB、最大 29.5 KB。
+// 不剪的后果不是「占点空间」而是硬顶 —— D1 单行上限 2 MB、单库 10 GB 且不可提升，
+// 撞上之后 INSERT 直接失败；而 saveAdJoinNotice 的调用点（enforceAdDetection 末尾）
+// 没有兜底，异常会被 enforceAdDetectionWithRetry 吞成 action_failed，
+// 变成每 5 分钟重试一次、每次都失败的死循环，案件永远出不来。
+// 30 天足够回溯任何一次误判 —— /ignore 回滚用的是 ad_pending_snapshots（那张表刻意不剪），
+// 不依赖本表。
+const AD_JOIN_NOTICE_RETENTION_SECONDS = 30 * 24 * 3600;
+
 async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 1000)) {
 	if (!env?.DB) return;
 	try {
@@ -35272,6 +35282,20 @@ async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 10
 		]);
 	} catch (error) {
 		console.error('[广告检测] 清理过期数据失败:', error);
+	}
+	// 拦门通知单独一段、单独 try：表是懒建的（ensureAdJoinNoticeTable），
+	// 全新部署时可能还不存在，放进上面的 batch 会让一条 DELETE 拖垮其余三张表的剪枝。
+	// 只删 next_at=0 的终态行 —— 还有重试待办（next_at>0）的记录一旦删掉，
+	// 那条通知就永远发不出去，且 Queue 里的消息找不到 id 会静默返回 complete。
+	try {
+		await ensureAdJoinNoticeTable(env);
+		const now = Number(nowSeconds) || 0;
+		const removed = await env.DB.prepare('DELETE FROM ad_join_notices WHERE next_at=0 AND updated_at < ?')
+			.bind(now - AD_JOIN_NOTICE_RETENTION_SECONDS).run();
+		const count = Number(removed?.meta?.changes || 0);
+		if (count > 0) console.log('[拦门通知] 已清理过期记录 ' + count + ' 条');
+	} catch (error) {
+		console.error('[拦门通知] 过期记录清理失败：' + formatD1SchemaError(error));
 	}
 }
 
