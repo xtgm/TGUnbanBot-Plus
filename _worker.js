@@ -5100,6 +5100,12 @@ function isKillerMuteReason(reason) {
 	return String(reason || '') === 'ad_auto';
 }
 
+// 普通群自动识别的广告持续禁言；人工名单仍按原命令的处置规则执行。
+function isAutomaticAdMuteEntry(groupId, entry) {
+	return isAdJoinGuardGroup(groupId) && String(entry?.reason || '') === 'ad_auto'
+		&& (Boolean(entry?.autoCaseId) || entry?.by === 'system');
+}
+
 // 单群执行处置，按 mode 分派。mode 值域：
 //   'kick'  → 恒踢出（/sban，含预封与撤回历史发言）
 //   'human' → 人工命令口径（resolveHumanCommandMode：杀手群踢、普通群禁言）
@@ -5131,8 +5137,11 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 		// actorIsSelfBot 兜住：就算把人拉回来，也不会再被判成「复入群」刷通知）。
 		// 注意与 ban 分支的差异：踢出有「预封」能力，人不在群照样封得住；禁言没有。
 		const memberProbe = options.precheckedMemberProbe || (options.probeMembership
-			? await probeTargetMemberBeforeBan(groupId, userId)
+			? await probeTargetMemberBeforeBan(groupId, userId, {timeoutMs:options.timeoutMs})
 			: null);
+		if (options.requireMember === true && !['in_group','not_in_group','already_banned'].includes(memberProbe?.state))
+			return {groupId,userId:String(userId),ok:false,muted:true,memberProbe,attempts:0,
+				error:'未确认用户可禁言，保留自动重试：'+String(memberProbe?.error||memberProbe?.label||'状态未知')};
 		const notInGroup = Boolean(memberProbe)
 			&& (memberProbe.state === 'not_in_group' || memberProbe.state === 'already_banned');
 		if (notInGroup) {
@@ -5156,8 +5165,9 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 						+ '该用户若后续进群/发言仍会按 D1 黑名单拦截',
 				retried: false,
 				muted: true,
-				// 'human' 只有普通配置群会走到（杀手群的人工命令是踢）；其余禁言都是杀手群口径。
-				mutedBy: mode === 'human' ? 'human' : 'killer',
+				pendingMute: !alreadyBanned,
+				attempts: 0,
+				mutedBy: mode === 'human' ? 'human' : isKillerModeGroup(groupId) ? 'killer' : 'automatic',
 				memberProbe,
 				// skipped 让回执能分辨「探测后主动跳过」与「真的调用失败」——
 				// 两者都可能 ok:false，但含义完全不同，混在一起会让回执说不清发生了什么。
@@ -5173,8 +5183,9 @@ async function applyGroupModeration(groupId, userId, mode, options = {}) {
 			retryable: r.retryable === true,
 			retryAfterSeconds: r.retryAfterSeconds,
 			retried: r.retried === true,
+			attempts: r.attempts,
 			muted: true,
-			mutedBy: mode === 'human' ? 'human' : 'killer',
+			mutedBy: mode === 'human' ? 'human' : isKillerModeGroup(groupId) ? 'killer' : 'automatic',
 			memberProbe
 		};
 	}
@@ -5319,7 +5330,8 @@ async function probeTargetMemberBeforeBan(groupId, userId, options = {}) {
 		});
 		const result = await response.json();
 		if (response.ok && result?.ok && result.result) {
-			const classified = classifyMemberProbeStatus(result.result.status);
+			const classified = result.result.status === 'restricted' && result.result.is_member === false
+				? {state:'not_in_group',label:'不在群内（保留限制）'} : classifyMemberProbeStatus(result.result.status);
 			return {
 				ok: true,
 				state: classified.state,
@@ -5532,7 +5544,7 @@ function formatBanSuccessResult(r) {
 	// 【不能说「预封」】禁言接口【没有预封能力】—— 那是既有断言明确守住的语义。
 	// 这个用户只是被 D1 黑名单记着，进群时由复入群拦截兜底，不是被 Telegram 预封。
 	if (r?.skipped === 'not_in_group') return '目标当前不在群内，已跳过禁言（不把已离群的人拉回来）；D1 黑名单已生效，后续进群/发言仍会按 D1 黑名单拦截';
-	if (r?.muted) return r?.mutedBy === 'human' ? '已永久禁言（未踢出）' : '已永久禁言（杀手群自动检测口径，未踢出）';
+	if (r?.muted) return r?.mutedBy === 'killer' ? '已永久禁言（杀手群自动检测口径，未踢出）' : '已永久禁言（未踢出）';
 	const state = r?.memberProbe?.state;
 	if (state === 'in_group') return '已封禁并移出群聊';
 	if (state === 'not_in_group') return '已加入群封禁列表（预封，禁止后续进群）';
@@ -11098,7 +11110,10 @@ async function handleChatMemberUpdate(chatMember, env) {
 		// 独立群：全局记录只认第一主人封的，其余看本群黑名单 —— 群主解封自己封的人不封回。
 		const blacklistCheck = await resolveChatBlacklistCheck(env, chat.id, targetIdStr, await checkBlacklist(targetIdStr, env));
 		if (blacklistCheck.isBlacklisted) {
-			if (isKillerModeGroup(chat.id) && isKillerMuteReason(blacklistCheck.entry?.reason)) {
+			if (isAutomaticAdMuteEntry(chat.id, blacklistCheck.entry)) {
+				// 普通群的自动广告记录只维持禁言；原生解封不改成踢出，实际入群时再执行禁言。
+				return;
+			} else if (isKillerModeGroup(chat.id) && isKillerMuteReason(blacklistCheck.entry?.reason)) {
 				// 杀手群里自动检测禁言的人本来就没被踢过，原生解封对他无意义：不封回，仅记日志。
 				console.log('[chat_member] 杀手群自动检测禁言的用户被手动解封，不封回（不再通知主人）:', JSON.stringify(logCommon));
 			} else {
@@ -13588,7 +13603,7 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	const text = [ownText, extractAdWebPageText(message)].filter(Boolean).join(' ').trim();
 	const config = options.config || loadAdDetectionConfig(env);
 	const whitelist = options.whitelist instanceof Set ? options.whitelist : await loadAdDomainWhitelist(env);
-	const joinScreen = Boolean(message?.adJoinRequest) && options.normalDetection === true && options.drillCollection !== true;
+	const joinScreen = isAdJoinGuardMessage(message) && options.normalDetection === true && options.drillCollection !== true;
 	let profile;
 	try { profile = options.profile || await fetchAdUserProfile(userId, message?.from || {}, { forceRefresh:options.refreshProfile === true,
 		...(joinScreen ? {timeoutMs:5000,deferRetry:true} : {}) }); }
@@ -13615,7 +13630,7 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 		profile = { ...profile, firstName: String(message.from.first_name ?? profile.firstName ?? ''),
 			lastName: String(message.from.last_name ?? ''), username: String(message.from.username ?? '') };
 	}
-	// 申请现场的文字已足够定罪时，不让头像/会员标下载和模型调用延后拒绝申请。
+	// 申请或入群现场的文字已足够定罪时，不让头像/会员标下载和模型调用延后处置。
 	// 仍复用同一判据和完整现场纠错键；未命中时继续原有完整采集，未知素材不当作正常。
 	let joinTextEvaluation = null;
 	if (joinScreen) {
@@ -13678,7 +13693,7 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	const profileLinkOptions = { forceRefresh: options.refreshProfile === true, metadataOnly: Boolean(joinTextEvaluation),
 		...(joinScreen ? {signal:AbortSignal.timeout(5000)} : {}) };
 	try {
-		evaluationProfile.adLinks = message?.adJoinRequest || profile.personalChat
+		evaluationProfile.adLinks = joinScreen || message?.adJoinRequest || profile.personalChat
 			? await resolveAdProfileLinks(env, evaluationProfile, profileLinkOptions)
 			: await resolveAdProfileLinksElevated(env, evaluationProfile, { whitelist, text });
 		profileLinksFailed = evaluationProfile.adLinks.some(link => link.lookupFailed || link.kind === 'unknown');
@@ -14480,7 +14495,7 @@ async function saveAdContentReview(env, message, evaluation, options = {}) {
 	await ensureAdContentReviewTable(env);
 	const uid=String(message.from.id),gid=String(message.chat.id),now=Math.floor(Date.now()/1000);
 	const source=options.source || (message.adJoinRequest?'join_request':Number(message.message_id)>0?'message':'profile');
-	const retryDelay=source==='join_request'?5:30;
+	const retryDelay=source!=='operator'&&isAdJoinGuardMessage(message)?5:30;
 	const frozen=freezeAdDrillPendingMessage(message),serialized=JSON.stringify(frozen);
 	const id=source==='operator'?'operator:'+gid+':'+Number(options.invocationId)+':'+uid+':'+String(options.operatorSource||'manual')
 		:message.adJoinRequest?'join_request:'+gid+':'+uid+':'+Number(message.adJoinRequest.date||0)
@@ -14847,7 +14862,7 @@ async function runAdContentReviewSingle(env,id,options={}) {
 			const partial=Boolean(evaluation.drillIncomplete?.length);
 			await save(partial?'partial':'clean');return {complete:true,...partial?{partial:true}:{clean:true}};
 		}
-		const attempts=Number(row.attempts)+1,delay=row.source==='join_request'?Math.min(300,5*Math.pow(2,Math.min(attempts,6)))
+		const attempts=Number(row.attempts)+1,delay=isAdJoinGuardMessage(message)?Math.min(300,5*Math.pow(2,Math.min(attempts,6)))
 			:evaluation.contentReviewProgress?30:attempts>=3?86400:30*Math.pow(4,attempts);
 		// 不确定的结果继续后台核验，不向任何角色发送观察或要求人工判断的通知。
 		evaluation.reviewRouting={lane:'background',...assessment};
@@ -14857,7 +14872,7 @@ async function runAdContentReviewSingle(env,id,options={}) {
 		console.error('[内容待核] 核验未完成: '+formatD1SchemaError(error));
 		evaluation=evaluation||JSON.parse(row.evaluation);evaluation.pendingReason=String(error?.message||error);
 		if(!row.decision&&!(evaluation.verdict==='ban'&&evaluation.reviewAction))evaluation.reviewRouting={lane:row.source==='operator'?'learning':'background',kind:'technical',systemFailure:true};
-		const attempts=Number(row.attempts)+1,delay=row.source==='join_request'?Math.min(300,5*Math.pow(2,Math.min(attempts,6)))
+		const attempts=Number(row.attempts)+1,delay=row.source!=='operator'&&isAdJoinGuardMessage(JSON.parse(row.message_json||'{}'))?Math.min(300,5*Math.pow(2,Math.min(attempts,6)))
 			:attempts>=3?86400:120*Math.pow(4,attempts-1);
 		await save(row.source==='operator'?'learning_failed':evaluation?.verdict==='ban'&&evaluation.reviewAction?'action_failed':attempts>=3?'waiting':'pending',now+delay);return {complete:false,retryAfter:Math.min(43200,delay)};
 	}
@@ -18925,7 +18940,8 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				// 杀手群按 reason 分流（见上）。处置结果真实回传，失败时通知写明原因，不再静默。
 				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+按人工命令口径处置`);
 				await deleteMessage(chatId, message.message_id);
-				const interceptMode = independentChat
+				const automaticMute = isAutomaticAdMuteEntry(chatId, blacklistCheck.entry);
+				const interceptMode = automaticMute ? 'mute' : independentChat
 					? 'kick'
 					: (isKillerModeGroup(chatId) && isKillerMuteReason(blacklistCheck.entry?.reason)
 						? 'mute'
@@ -18936,12 +18952,13 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				// 热路径不会因此多出按条计的 getChatMember（理由见 botHasRestrictRight）。
 				const hasRestrictRight = await botHasRestrictRight(chatId);
 				const moderation = hasRestrictRight
-					? await applyGroupModeration(chatId, userId, interceptMode)
+					? await applyGroupModeration(chatId, userId, interceptMode, automaticMute ? {probeMembership:true,requireMember:true,timeoutMs:5000,deferRetry:true} : {})
 					: buildNoRestrictRightResult(chatId, userId);
 				// 群里提醒一次，让群主知道「人还在发」是权限被关掉的结果，不是 bot 坏了。
 				if (!hasRestrictRight) await noticeGroupMissingRestrictRight(env, chatId);
 				await recordDisposalsFromBanResults(env, [{ groupId: chatId, ok: moderation?.ok === true }]);
 				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, moderation, env);
+				if(automaticMute&&!moderation.ok&&!moderation.pendingMute)throw new Error('广告名单禁言未完成，等待 Webhook 自动重投');
 				return;
 			}
 		}
@@ -21741,12 +21758,13 @@ async function handleNoticeCallback(callbackQuery, env) {
 
 
 // Telegram moderation helpers
-async function muteChatMember(chatId, userId) {
+async function muteChatMember(chatId, userId, options = {}) {
 	const url = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/restrictChatMember`;
 	const body = {
 		chat_id: chatId,
 		user_id: Number(userId),
 		use_independent_chat_permissions: true,
+		until_date: 0,
 		permissions: {
 			can_send_messages: false,
 			can_send_audios: false,
@@ -21768,7 +21786,8 @@ async function muteChatMember(chatId, userId) {
 	const response = await fetch(url, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(body)
+		body: JSON.stringify(body),
+		...(options.timeoutMs?{signal:AbortSignal.timeout(options.timeoutMs)}:{})
 	});
 
 	const result = await response.json();
@@ -21780,7 +21799,7 @@ async function muteChatMember(chatId, userId) {
 		返回说明: result.description
 	});
 
-	if (!response.ok || !result.ok) {
+	if (!response.ok || !result.ok || result.result !== true) {
 		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
 	}
 
@@ -21812,7 +21831,7 @@ function parseMuteFailure(error) {
 // 与 banUserFromGroup 的返回形状对齐，供 applyGroupModeration 统一收集。
 // 【重试与 banUserFromGroup 同规格】429 / 5xx / 网络异常各重试一次，否则 /ban 改禁言后
 // 会丢掉踢出路径原有的限流重试保障 —— 同一条命令路径的可靠性不该因为换了处置方式而倒退。
-// 注意 restrictChatMember 只能禁言【已在群里】的人；目标不在群时 Telegram 报错 → ok:false（预期，无法预禁言）。
+// 调用前由处置入口确认人在群内；不能假定给群外用户设限一定会报错。
 async function muteUserInGroup(chatId, userId, options = {}) {
 	let lastError = null;
 	let attempts = 0;
@@ -21820,7 +21839,7 @@ async function muteUserInGroup(chatId, userId, options = {}) {
 		attempts = attempt;
 		try {
 			if(options.reviewGuard&&!await options.reviewGuard())return {ok:false,cancelled:true,error:'人工查看或正常判断已登记，自动请求停止'};
-			await muteChatMember(chatId, userId);
+			await muteChatMember(chatId, userId, options);
 			return { ok: true, attempts, retried: attempt > 1 };
 		} catch (error) {
 			lastError = error;
@@ -36269,7 +36288,7 @@ function renderAdDetectionNotice(evaluation, context) {
 		lines.push('<b>🧪 广告号演练命中（未处置）</b>');
 		lines.push('全局演练：先采集全部现场，第一主人判定后学习，期间不处罚，关闭后分批收尾；独立群不参与');
 	} else {
-		lines.push('<b>🚫 广告号自动封禁</b>');
+		lines.push(context?.muted?'<b>🔇 广告号自动禁言</b>':'<b>🚫 广告号自动封禁</b>');
 		lines.push('自动处理结果，供核查；无需点击确认才执行，回退按钮仅用于纠错。');
 	}
 	if (context?.seq) lines.push('快照序号：<b>#' + context.seq + '</b>');
@@ -36309,7 +36328,7 @@ function renderAdDetectionNotice(evaluation, context) {
 	}
 	// 封禁结果拆三行：成功数 / 失败群（每群一行、只给中文原因）/ 自动学习结果，不再挤成一整行长句。
 	if (context?.banResultLine) {
-		lines.push('封禁结果：' + escapeHtml(String(context.banResultLine)));
+		lines.push((context?.muted?'处置结果：':'封禁结果：') + escapeHtml(String(context.banResultLine)));
 		const failed = Array.isArray(context.failedGroupLines) ? context.failedGroupLines : [];
 		failed.forEach((text, idx) => {
 			lines.push((idx === 0 ? '失败群：' : '　　　　') + escapeHtml(String(text)));
@@ -37414,7 +37433,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	let autoCaseId = automatic ? String(options.automaticCaseId || newAutomaticAdCaseId()) : '';
 	const automaticTargets = [];
 	let prepareAutomaticTarget = null;
-	// 先发起拒绝，同时推进来源群预封；拒绝接口变慢不能阻塞封禁。两项结果分别保存。
+	// 先发起拒绝，同时登记禁言并核对成员状态；拒绝接口变慢不阻塞已经入群的用户禁言。
 	const joinReceiptPromise = joinRequest
 		? options.reviewJoinRequest?.declined ? Promise.resolve({ ok:true }) : declineJoinRequest(env,chatId,userId,{detailed:true,reviewGuard:options.reviewGuard,timeoutMs:options.telegramTimeoutMs})
 		: null;
@@ -37486,11 +37505,11 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		};
 		if (automatic) {
 			const probes = new Map();
-			const receiptKey=gid=>JSON.stringify([String(gid),automaticRoute.policy,(joinRequest||approvedJoin)&&gid===chatId?'kick':banOptions.mode||'',isKillerModeGroup(gid)]);
+			const groupMode=gid=>options.drillCloseReplay!==true&&(joinGuard||isAdJoinGuardGroup(gid))?'mute':banOptions.mode;
+			const receiptKey=gid=>JSON.stringify([String(gid),automaticRoute.policy,groupMode(gid)||'',isKillerModeGroup(gid)]);
 			banOptions.perGroupOptions = gid => ({...banOptions,
 				...(probes.has(gid)?{precheckedMemberProbe:probes.get(gid),probeMembership:false}:{}),
-				// 申请阶段预封，第三方 bot 触发的真人入群补查也踢出；只对来源群强制。
-				...((joinRequest||approvedJoin)&&gid===chatId?{mode:'kick'}:{})});
+				mode:groupMode(gid),requireMember:groupMode(gid)==='mute'});
 			banOptions.beforeGroup = async gid => {
 				let target = automaticTargets.find(row=>row.chatId===gid);
 				try {
@@ -37512,13 +37531,14 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 						reviewExecution.reused++;
 						return {...shared.result,automaticNotExecuted:true,reviewSharedCaseId:shared.caseId};
 					}
-					if (options.drillCloseReplay === true || gid !== chatId || options.probeMembership !== false) {
+					if (groupMode(gid)==='mute' || options.drillCloseReplay === true || gid !== chatId || options.probeMembership !== false) {
 						const probe = await probeTargetMemberBeforeBan(gid,userId,{timeoutMs:options.telegramTimeoutMs}); probes.set(gid,probe);
-						if (probe.state==='unknown') return {groupId:gid,ok:false,automaticNotExecuted:true,error:'无法核对该群原有处置，未执行自动封禁：'+String(probe.error||probe.label||'未知原因')};
+						if (probe.state==='unknown'||groupMode(gid)==='mute'&&!['in_group','not_in_group','already_banned'].includes(probe.state))
+							return {groupId:gid,ok:false,muted:groupMode(gid)==='mute',automaticNotExecuted:true,error:'无法核对该群原有状态，未执行自动处置：'+String(probe.error||probe.label||'未知原因')};
 						const old = await env.DB.prepare('SELECT result FROM ad_automatic_case_targets WHERE case_id=? AND chat_id=? AND user_id=?')
 							.bind(autoCaseId,gid,userId).first();
 						let previous={};try{previous=JSON.parse(old?.result||'{}');}catch(_){}
-						if (probe.state==='already_banned') return {groupId:gid,ok:true,memberProbe:probe,
+						if (probe.state==='already_banned') return {groupId:gid,ok:true,memberProbe:probe,muted:groupMode(gid)==='mute',
 							skipped:Number(previous.attempted)===1&&previous.priorState!=='already_banned'?'already_banned':'preexisting_native_ban',
 							automaticNotExecuted:true,automaticPriorState:previous.priorState||'already_banned'};
 					}
@@ -37544,7 +37564,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 				const target = automaticTargets.find(row=>row.chatId===String(result.groupId));
 				if (!target || !target.owned || result.skipped==='independent_mode') return;
 				try { await saveAutomaticAdTarget(env,autoCaseId,result.groupId,userId,chatId,localScope?'local':'global',
-					{owned:1,state:result.skipped?'skipped':result.ok?'done':'failed',result:{ok:result.ok,skipped:result.skipped||'',error:result.error||'',
+					{owned:1,state:result.skipped?'skipped':result.ok?'done':'failed',result:{ok:result.ok,skipped:result.skipped||'',error:result.error||'',mode:result.muted?'mute':'kick',pendingMute:result.pendingMute===true,
 						attempted:result.automaticNotExecuted!==true&&!result.skipped,priorState:result.automaticPriorState||result.memberProbe?.state||'unobserved',sharedCaseId:result.reviewSharedCaseId||''}}); }
 				catch (_) { result.ok=false; result.accountingFailed=true; result.error='自动处罚结果记账失败，保留重试'; }
 			});
@@ -37556,7 +37576,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	}
 	const joinReceipt = joinReceiptPromise ? await joinReceiptPromise : null;
 	if(options.reviewGuard&&!await options.reviewGuard())return {banned:false,reason:'human_review_hold',banResults};
-	const joinVerification = joinRequest || approvedJoin ? await verifyAdJoinBlocked(userId, chatId) : null;
+	const joinVerification = joinGuard ? await verifyAdJoinProtection(userId, chatId) : null;
 
 	// ===== 同款连带：自动封禁与 /spam 走同一套 =====
 	//
@@ -37646,12 +37666,13 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	}
 
 	const okCount = banResults.filter((r) => r.ok).length;
-	const failedBans = banResults.filter((r) => !r.ok);
+	const failedBans = banResults.filter((r) => !r.ok&&!r.pendingMute);
 	// 风控·处置：按实际封成功的群逐群 +1（面板「本群挡下 N 次」的唯一数据来源）。
 	// 放在这里而不是黑名单写入之后 —— 加黑可能因已存在而没写成，但封禁成功了就是挡下了。
 	try { await recordDisposalsFromBanResults(env, banResults.filter(result=>!result.reviewSharedCaseId), { bulk: options.drillCloseReplay === true }); }
 	catch(error){console.error('[广告检测] 处置统计未保存: '+formatD1SchemaError(error));}
-	const banResultLine = okCount + '/' + banResults.length + ' 个群成功';
+	const pendingMuteCount=banResults.filter(r=>r.pendingMute).length;
+	const banResultLine = okCount + '/' + banResults.length + ' 个群成功'+(pendingMuteCount?'；'+pendingMuteCount+' 个群当前不在群内，已登记入群后禁言':'');
 	// 失败原因只给中文（英文原文由翻译兜底写入 Worker 日志）；最多列 3 个群，其余汇总成一句。
 	const failedGroupLines = failedBans.slice(0, 3)
 		.map((r) => r.groupId + '（' + toChineseErrorText(r.error || '未知') + '）');
@@ -37697,6 +37718,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		const notice = renderAdDetectionNotice(evaluation, {
 			userId,
 			chatTitle: input?.chatTitle || '',
+			muted:banResults.some(row=>String(row.groupId)===chatId&&row.muted),
 			seq,
 			banResultLine,
 			failedGroupLines,
@@ -37723,17 +37745,17 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		+ ' 指纹=' + learned + ' AI样本=' + (sampleAdded ? 1 : 0)
 	);
 	const currentBan=banResults.find(row=>String(row.groupId)===chatId);
-	const preBanned=Boolean(currentBan?.ok&&!currentBan.accountingFailed&&(!currentBan.skipped||['already_banned','preexisting_native_ban'].includes(currentBan.skipped)));
 	const joinedAction=joinRequest?{declined:joinReceipt===true||joinReceipt?.ok===true,requestAbsent:joinReceipt?.requestAbsent===true,
-		alreadyParticipant:joinReceipt?.alreadyParticipant===true,preBanned,error:joinReceipt?.error||'',verification:joinVerification}:null;
+		alreadyParticipant:joinReceipt?.alreadyParticipant===true,error:joinReceipt?.error||'',verification:joinVerification}:null;
+	const joinComplete=!joinGuard||isAdJoinMuteComplete(approvedJoin,joinedAction,currentBan,joinVerification);
 	if ((joinRequest || approvedJoin) && options.drillCloseReplay !== true) await saveAdJoinNotice(env,input,evaluation,{
-		decline:joinedAction,verification:joinVerification,banResults,blacklistCode,autoCaseId,seq,local:automatic&&localScope,
+		mode:'mute',decline:joinedAction,verification:joinVerification,banResults,blacklistCode,autoCaseId,seq,local:automatic&&localScope,
 		learning:{learned,sampleAdded,skeletons,complete:learningComplete,skipped:options.skipLearning===true},
-		complete:isAdEnforcementComplete(blacklistCode,banResults)&&joinVerification?.blocked===true&&(!joinedAction||preBanned&&(joinedAction.declined||joinedAction.requestAbsent))
+		complete:isAdEnforcementComplete(blacklistCode,banResults)&&joinComplete
 	});
 	return { banned: true, seq, blacklistCode, banSummary, learned, sampleAdded, skeletons, local: automatic && localScope, automatic, autoCaseId,messageDeletion,
 		learningComplete,joinRequest:joinedAction,banResults,
-		complete:isAdEnforcementComplete(blacklistCode,banResults)&&(!(joinRequest||approvedJoin)||joinVerification?.blocked===true)&&(!joinedAction||preBanned&&(joinedAction.declined||joinedAction.requestAbsent))
+		complete:isAdEnforcementComplete(blacklistCode,banResults)&&joinComplete
 			&&(!input?.messageId||messageDeletion?.ok===true) };
 }
 
@@ -37785,13 +37807,17 @@ async function interceptAdJoinBlacklist(env, member, chatId, chatTitle = '', opt
 		|| (await resolveLocalAdDetectionSkip(env, groupId, userId)) === 'whitelisted'
 		|| await isProtectedFromAutoModeration(userId, groupId)) return empty;
 	if ((options.joinRequest || options.approvedJoin) && !await isAdJoinGuardGroupCurrent(env, groupId)) return empty;
-	// 命中已有名单时，拒绝与预封都必须先于统计及通知。
-	const declinePromise = options.joinRequest ? declineJoinRequest(env,groupId,userId,{detailed:true,timeoutMs:5000}) : null;
-	const banResult = await banUserFromGroup(groupId, userId, options.joinRequest || options.approvedJoin ? {timeoutMs:5000,deferRetry:true} : {});
+	// 自动广告名单先拒绝申请；已在群内则禁言，未入群保留名单，不能为禁言把人带回群。
+	const mute = isAutomaticAdMuteEntry(groupId, blacklistCheck.entry);
+	const declinePromise = options.joinRequest ? options.previous?.joinRequest?.declined||options.previous?.joinRequest?.ok
+		? Promise.resolve({ok:true}) : declineJoinRequest(env,groupId,userId,{detailed:true,timeoutMs:5000}) : null;
+	const banResult = mute ? await applyGroupModeration(groupId,userId,'mute',{probeMembership:true,requireMember:true,timeoutMs:5000,deferRetry:true})
+		: await banUserFromGroup(groupId, userId, options.joinRequest || options.approvedJoin ? {timeoutMs:5000,deferRetry:true} : {});
 	const joinRequest = declinePromise ? await declinePromise : null;
-	const verification = options.joinRequest || options.approvedJoin ? await verifyAdJoinBlocked(userId,groupId) : null;
-	const complete=banResult?.ok===true&&(!verification||verification.blocked===true)&&(!options.joinRequest||joinRequest?.ok===true||joinRequest?.requestAbsent===true);
-	try { await recordDisposalsFromBanResults(env, [{ groupId, ok: banResult?.ok === true }]); }
+	const verification = options.joinRequest || options.approvedJoin ? await verifyAdJoinProtection(userId,groupId) : null;
+	const complete=mute ? isAdJoinMuteComplete(options.approvedJoin,joinRequest,banResult,verification)
+		: banResult?.ok===true&&(!verification||verification.blocked===true)&&(!options.joinRequest||joinRequest?.ok===true||joinRequest?.requestAbsent===true);
+	try { await recordDisposalsFromBanResults(env, [{ groupId, ...banResult }]); }
 	catch(error){console.error('[申请筛查] 拦截统计未保存: '+formatD1SchemaError(error));}
 	if(options.joinRequest||options.approvedJoin){
 		const inspection=adProfileInspectionMessage(member,groupId,chatTitle);
@@ -37799,7 +37825,7 @@ async function interceptAdJoinBlacklist(env, member, chatId, chatTitle = '', opt
 		if(options.approvedJoin){inspection.adJoinApproved=true;inspection.date=Number(options.joinDate)||0;inspection.adJoinApprover=options.joinApprover;}
 		await saveAdJoinNotice(env,{userId,chatId:groupId,chatTitle,message:inspection},
 			{verdict:'ban',layer:'blacklist',reasons:['命中已有黑名单'],snapshot:{},blacklistEntry:blacklistCheck.entry},
-			{decline:joinRequest,verification,banResults:[{groupId,...banResult}],blacklistCode:'EXISTS',complete,blacklistOnly:true});
+			{mode:mute?'mute':'kick',decline:joinRequest,verification,banResults:[{groupId,...banResult}],blacklistCode:'EXISTS',complete,blacklistOnly:true});
 	}else try { await notifyOwnerBlacklistIntercept(member, { id: groupId, title: chatTitle }, '入群黑名单拦截', blacklistCheck, banResult, env); }
 	catch(error){console.error('[申请筛查] 拦截回执未发送: '+formatD1SchemaError(error));}
 	return { blocked: true, banned: banResult?.ok === true, blacklistCheck, banResult, joinRequest,verification,complete };
@@ -37869,7 +37895,7 @@ async function screenAdJoinMember(env, member, options = {}) {
   }catch(error){console.error('[广告检测] 入群检测未完成: '+formatD1SchemaError(error));if(joinGuard)throw error;return 'error';}
 }
 
-// === 入群检测（第一道闸）===
+// === 实际入群检测（第二道防线的即时入口）===
 // 必须插在 handleMessage 顶部、handleNewChatMemberBots 之前：后者对配置群的任何进群消息
 // 一律 return true，放在它之后本函数永远不会执行。
 // 本函数固定返回 false，绝不短路，保证既有的新 bot 静音逻辑照旧运行。
@@ -41829,7 +41855,7 @@ async function runSearchQueryAndReply(env, chatId, raw, { scopeChatIds, scopeTok
 }
 
 // chat_join_request 处理：申请人「发起申请」的那一刻（还不是群成员）。
-// 申请处于验证等待阶段时筛查，确认广告即发起拒绝和来源群预封，再记录时间线。
+// 申请处于验证等待阶段时筛查，确认广告即发起拒绝，并登记入群后禁言，再记录时间线。
 // 与验证机器人的名称无关；invite_link.creator 只是邀请链接创建者，不能据此认定验证者。
 // 普通申请事件没有 bot 间的抢占顺序设置，不能把本地先执行误报为平台保证先审核。
 // 已入群成员事件仍保留补查，用于迟到的更新。
@@ -41838,7 +41864,8 @@ async function runSearchQueryAndReply(env, chatId, raw, { scopeChatIds, scopeTok
 //
 // 【2026-10-10 起不再「只记时间」】原先这里对审批一律不碰，结果广告号提交申请时
 // 无人过问：要等管理员手动批准、人进了群，chat_member / new_chat_members 那两条路
-// 才筛查得到，而那时人已经在群里活动过了。改成申请那一刻就判，判成广告当场预封。
+// 才筛查得到，而那时人已经在群里活动过了。改成申请那一刻就判，判成广告当场拒绝，
+// 并保留入群后立即禁言的自动名单。
 async function handleChatJoinRequest(req, env) {
 	const chat = req?.chat;
 	const user = req?.from || req?.user;
@@ -41909,11 +41936,11 @@ async function screenJoinRequestAd(env, user, chatId, chatTitle, request = {}) {
 	if (verdict !== 'banned') return;
 	if (await isDryRunGroup(env, chatId)) return;
 
-	// 拒绝申请与预封禁已在同一自动处置链完成；后台重试也保留申请来源。
+	// 拒绝申请与入群后禁言登记已在同一自动处置链完成；后台重试也保留申请来源。
 	console.log('[申请筛查] 申请来源的广告处置完成 user=' + userId + ' chat=' + chatId);
 }
 
-// 返回真实拒绝结果；申请已失效只表示没有待审批条目，仍须单独确认预封禁成功。
+// 返回真实拒绝结果；申请已失效只表示没有待审批条目，仍须单独核对禁言或待入群登记。
 async function declineJoinRequest(env, chatId, userId, options = {}) {
 	try {
 		if(options.reviewGuard&&!await options.reviewGuard())return options.detailed?{ok:false,error:'原处置已取消'}:false;
@@ -41939,15 +41966,28 @@ async function declineJoinRequest(env, chatId, userId, options = {}) {
 	}
 }
 
-// 拦门专用回执：拒绝和封禁之后实时复查；通知单独续投，不靠重放封禁补发消息。
-async function verifyAdJoinBlocked(userId,chatId) {
+// 两道防线分别核验：拒绝后确认不在群，禁言后确认所有发送权限关闭且永久有效。
+async function verifyAdJoinProtection(userId,chatId) {
 	const checkedAt=Date.now();
 	try {
 		const result=await checkUserStatus(userId,chatId,{timeoutMs:5000});
-		const status=result?.ok===true?String(result.result?.status||''):'';
+		const member=result?.ok===true?result.result:null,status=String(member?.status||'');
+		const permissions=['can_send_messages','can_send_audios','can_send_documents','can_send_photos','can_send_videos',
+			'can_send_video_notes','can_send_voice_notes','can_send_polls','can_send_other_messages','can_add_web_page_previews'];
 		return {blocked:status==='kicked',status:status||'unknown',checkedAt,
+			isMember:['member','administrator','creator'].includes(status)||status==='restricted'&&member.is_member===true,
+			notInGroup:['left','kicked'].includes(status)||status==='restricted'&&member.is_member===false,
+			muted:status==='restricted'&&member.until_date===0&&permissions.every(key=>member[key]===false),
+			untilDate:member?.until_date??null,permissions:Object.fromEntries(permissions.map(key=>[key,member?.[key]??null])),
 			error:result?.ok===true?'':String(result?.description||'成员状态查询未成功')};
 	}catch(error){return {blocked:false,status:'unknown',checkedAt,error:String(error?.message||error)};}
+}
+
+function isAdJoinMuteComplete(approvedJoin,decline,result,verification){
+	const protectedNow=result?.muted===true&&!result.accountingFailed
+		&& (result.ok===true&&!result.skipped&&verification?.isMember===true&&verification?.muted===true
+			|| verification?.notInGroup===true&&(result.pendingMute===true||result.ok===true));
+	return protectedNow&&(approvedJoin===true||decline?.declined===true||decline?.ok===true||decline?.requestAbsent===true);
 }
 
 const D1_AD_JOIN_NOTICE_INIT=new WeakMap();
@@ -41961,6 +42001,13 @@ async function ensureAdJoinNoticeTable(env){
 
 function adJoinNoticeOutcome(data){
 	const receipt=data.receipt||{},decline=receipt.decline||{},ban=(receipt.banResults||[]).find(row=>String(row.groupId)===data.chatId);
+	if(receipt.mode==='mute'){
+		const v=receipt.verification||{};
+		if(ban?.ok===true&&ban.muted===true&&!ban.skipped&&!ban.accountingFailed&&v.isMember===true&&v.muted===true)return 'muted';
+		if(!data.approvedJoin&&!decline.alreadyParticipant&&(decline.declined===true||decline.ok===true)
+			&&isAdJoinMuteComplete(false,decline,ban,v)&&v.notInGroup===true)return 'blocked';
+		return 'pending';
+	}
 	const ownBan=ban?.ok===true&&(!ban.skipped||ban.skipped==='already_banned');
 	if(!ownBan||receipt.verification?.blocked!==true)return 'pending';
 	if(data.approvedJoin||decline.alreadyParticipant===true)return 'after_join';
@@ -41969,7 +42016,7 @@ function adJoinNoticeOutcome(data){
 
 function adJoinNoticeTitle(outcome,ad=true){
 	const subject=ad?'广告':'黑名单';
-	return {blocked:'🛡 '+subject+'入群拦截成功',after_join:'🛡 '+subject+'用户入群后补拦截',
+	return {blocked:'🛡 '+subject+'入群拦截成功',muted:'🔇 '+subject+'用户禁言成功',after_join:'🛡 '+subject+'用户入群后补拦截',
 		sealed:'🛡 '+subject+'用户已封禁（门前拦截未确认）',pending:'⚠️ '+subject+'入群拦截尚未确认'}[outcome];
 }
 
@@ -42001,8 +42048,9 @@ async function saveAdJoinNotice(env,input,evaluation,receipt,options={}){
 	data.outcome=adJoinNoticeOutcome(data);
 	const signature=await exportSha256Hex(JSON.stringify({outcome:data.outcome,complete:receipt.complete,blacklistCode:['ADDED','EXISTS'].includes(receipt.blacklistCode)?'saved':receipt.blacklistCode,
 		decline:{ok:receipt.decline?.declined===true||receipt.decline?.ok===true,absent:receipt.decline?.requestAbsent,error:receipt.decline?.error},
-		verification:{status:receipt.verification?.status,error:receipt.verification?.error},
-		bans:(receipt.banResults||[]).map(row=>[row.groupId,row.ok,row.skipped==='already_banned'?'':row.skipped||'',row.error||'']),learning:receipt.learning}));
+		mode:receipt.mode,verification:{status:receipt.verification?.status,muted:receipt.verification?.muted,isMember:receipt.verification?.isMember,
+			notInGroup:receipt.verification?.notInGroup,permissions:receipt.verification?.permissions,untilDate:receipt.verification?.untilDate,error:receipt.verification?.error},
+		bans:(receipt.banResults||[]).map(row=>[row.groupId,row.ok,row.muted,row.pendingMute,row.skipped==='already_banned'?'':row.skipped||'',row.error||'']),learning:receipt.learning}));
 	const now=Math.floor(Date.now()/1000);
 	await env.DB.prepare("INSERT INTO ad_join_notices(id,chat_id,user_id,payload,signature,next_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,signature=excluded.signature,revision=ad_join_notices.revision+CASE WHEN ad_join_notices.signature<>excluded.signature THEN 1 ELSE 0 END,owner_part=CASE WHEN ad_join_notices.signature<>excluded.signature THEN 0 ELSE ad_join_notices.owner_part END,owner_chunks=CASE WHEN ad_join_notices.signature<>excluded.signature THEN '' ELSE ad_join_notices.owner_chunks END,next_at=excluded.next_at,updated_at=excluded.updated_at")
 		.bind(id,chatId,userId,JSON.stringify(data),signature,now,now,now).run();
@@ -42013,15 +42061,17 @@ async function saveAdJoinNotice(env,input,evaluation,receipt,options={}){
 
 function renderAdJoinOwnerNotice(data,row,groupResult){
 	const e=data.evaluation||{},s=e.snapshot||{},p=e.payload||{},r=data.receipt||{},d=r.decline||{},v=r.verification||{};
+	const pendingMute=r.mode==='mute'&&v.notInGroup===true;
 	const value=x=>escapeHtml(String(x??'未取得'));
 	const time=x=>Number(x)>0?new Date(Number(x)).toISOString().replace('T',' ').replace('Z',' UTC'):'未提供';
 	const userName=[data.user.first_name,data.user.last_name].filter(Boolean).join(' ')||s.name||'未提供';
 	const lines=['<b>🛡 '+(data.isAd?'广告':'黑名单')+'入群拦截完整报告</b>',
 		'拦截结论　'+value(adJoinNoticeTitle(data.outcome,data.isAd)),
-		'整体进度　'+(r.complete?r.learning?.complete===false?'拦截处置已完成；学习未完成，后台自动续办':'本次处置已完成':'处置或核验未完成，后台自动续办'),
+		'整体进度　'+(r.complete?pendingMute?'当前拒绝/状态处理已完成；禁言记录已保存，实际入群时执行':r.learning?.complete===false?'处置已完成；学习未完成，后台自动续办':'本次处置已完成':'处置或核验未完成，后台自动续办'),
 		'处理方式　全自动；无需主人判断或确认',
+		'防线动作　'+(r.mode==='mute'?(data.approvedJoin?'第二道：入群即筛查，广告永久禁言':'第一道：拒绝申请并登记禁言；已经入群时由第二道立即永久禁言'):'沿用原名单处置'),
 		'案件编号　'+value(r.autoCaseId||data.id)+(r.seq?' / 快照 #'+r.seq:''),
-		'触发来源　'+(data.approvedJoin?'已入群事件（补拦截）':'入群申请'),
+		'触发来源　'+(data.approvedJoin?'已入群事件（第二道防线）':'入群申请（第一道防线）'),
 		'来源群组　'+value(data.chatTitle)+'（'+value(data.chatId)+'）',
 		'治理范围　'+(r.blacklistOnly?'已有名单，仅本群处置':'全局普通治理群；排除主群、杀手群和独立群，逐群结果见下方'),
 		'用户昵称　'+value(userName),'用户 ID　 '+value(data.userId),'用户名　　'+value(data.user.username||s.username||'未设置'),
@@ -42043,17 +42093,17 @@ function renderAdJoinOwnerNotice(data,row,groupResult){
 		if(detail)lines.push(label+'：\n'+value(JSON.stringify(detail,null,2)));
 	lines.push('', '<b>执行结果</b>',
 		'拒绝申请　'+(data.approvedJoin?'不适用：用户已经入群':d.declined===true||d.ok===true?'Telegram 确认成功':d.alreadyParticipant?'申请处理时用户已经入群':d.requestAbsent?'待审批申请已不存在，不能据此认定拒绝成功':'未成功')+(d.error?'；'+value(d.error):''),
-		'状态复查　'+value(v.status||'unknown')+'；'+(v.blocked?'已封禁，当前不在群内':'未确认封禁生效')+(v.error?'；'+value(v.error):''),
+		'状态复查　'+value(v.status||'unknown')+'；'+(r.mode==='mute'?v.notInGroup?'当前不在群内，禁言待实际入群执行':v.muted&&v.isMember?'已确认在群且永久禁言':'尚未确认永久禁言生效':v.blocked?'已封禁，当前不在群内':'未确认封禁生效')+(v.error?'；'+value(v.error):''),
 		'复查时间　'+time(v.checkedAt),'名单结果　'+value(r.blacklistCode||'未取得'),
 		'群内通知　'+(groupResult?.ok?'发送成功，消息 ID '+value(groupResult.messageId??'未返回'):groupResult?.skipped?value(groupResult.skipped):'等待自动补发；'+value(groupResult?.error||'未发送')),
 		...(groupResult?.verification?['补发前复查　'+value(groupResult.verification.status)+'；'+time(groupResult.verification.checkedAt)]:[]),
 		'逐群处置：');
-	for(const ban of r.banResults||[])lines.push('· '+value(ban.groupId)+'：'+(ban.skipped?'跳过（'+value(ban.skipped)+'）':ban.ok?'成功':'失败')
+	for(const ban of r.banResults||[])lines.push('· '+value(ban.groupId)+'：'+(ban.pendingMute?'不在群内，禁言记录已保存，待入群执行':ban.skipped?'跳过（'+value(ban.skipped)+'）':ban.ok?(ban.muted?'禁言接口成功':'封禁成功'):'失败')
 		+(ban.error?'；'+value(ban.error):'')+(ban.accountingFailed?'；结果记账未完成':'')+'；本次接口尝试 '+Number(ban.attempts||0));
 	lines.push('自动学习　'+(r.blacklistOnly?'已有名单拦截，不重复学习':r.local?'独立群，不写共享学习库':r.learning?.skipped?'沿用已完成学习':value(JSON.stringify(r.learning||{}))),
 		'', '<b>历次执行回执</b>');
 	for(const [index,event] of data.history.entries())lines.push('第 '+(index+1)+' 次　'+time(event.at)+'\n'+value(JSON.stringify(event,null,2)));
-	lines.push('', '说明：复查证明查询时的成员状态；仅“已封禁”不能证明此前从未短暂入群。',
+	lines.push('', '说明：复查证明查询时的成员状态；拒绝成功、禁言生效与待入群执行分别记录，不据此推断此前从未短暂入群。',
 		'本报告仅投递第一主人；后续结果变化及发送失败均自动续办。');
 	return lines.join('\n');
 }
@@ -42073,12 +42123,13 @@ async function deliverAdJoinNotice(env,id){
 		else if(data.outcome==='pending')groupResult={skipped:'尚未核实拦截成功，不发送成功通知'};
 		else if(!data.isAd)groupResult={skipped:'非广告名单拦截，不发送广告通知'};
 		else if(row.group_outcome!==data.outcome){
-			// 延迟补发时重新查询，避免把已解除的封禁仍报作成功。
-			const verification=Number(row.attempts)>1?await verifyAdJoinBlocked(data.userId,data.chatId):data.receipt.verification;
-			if(!verification?.blocked){
+			// 延迟补发时重新查询，避免把过期的拒绝/禁言结果仍报作成功。
+			const verification=Number(row.attempts)>1?await verifyAdJoinProtection(data.userId,data.chatId):data.receipt.verification;
+			const verified=data.receipt.mode==='mute'?(data.outcome==='blocked'?verification?.notInGroup:verification?.muted&&verification?.isMember):verification?.blocked;
+			if(!verified){
 				if(verification?.status&&verification.status!=='unknown'&&!verification.error)
-					groupResult={skipped:'补发前用户已不是封禁状态，停止补发过期成功通知',verification};
-				else{groupResult={error:'补发前未确认封禁仍有效：'+String(verification?.error||verification?.status||'unknown')};retryAfter=300;}
+					groupResult={skipped:'补发前处置状态已变化，停止补发过期成功通知',verification};
+				else{groupResult={error:'补发前未确认处置仍有效：'+String(verification?.error||verification?.status||'unknown')};retryAfter=300;}
 			}
 			else{
 				const name=String([data.user.first_name,data.user.last_name].filter(Boolean).join(' ')||data.evaluation?.snapshot?.name||'用户').replace(/[\r\n\t]+/g,' ').slice(0,80);
