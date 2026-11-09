@@ -11674,10 +11674,14 @@ function automaticAdConfiguredGroups() {
 	return [...new Set([...runtime().GROUP_IDS, ...(Array.isArray(runtime().KILLER_MODE_GROUPS) ? runtime().KILLER_MODE_GROUPS : [])].map(String).filter(Boolean))];
 }
 
-// 拦门仅治理普通配置群（含动态群）；主群、杀手群和独立群不参与。
+// 天诚技术交流群（@zyssadmin）明确纳入入群防线，保留原杀手群身份。
+const AD_JOIN_GUARD_KILLER_EXCEPTIONS = new Set(['-1002212563246']);
+
+// 拦门治理普通配置群（含动态群）及指定杀手群例外；主群、其他杀手群和独立群不参与。
 function isAdJoinGuardGroup(chatId) {
 	const id = String(chatId || '');
-	return isConfiguredGroup(id) && id !== String(runtime().GROUP_ID) && !isKillerModeGroup(id) && !isIndependentGroup(id);
+	return isConfiguredGroup(id) && id !== String(runtime().GROUP_ID) && !isIndependentGroup(id)
+		&& (!isKillerModeGroup(id) || AD_JOIN_GUARD_KILLER_EXCEPTIONS.has(id));
 }
 
 async function isAdJoinGuardGroupCurrent(env, chatId) {
@@ -11738,7 +11742,7 @@ async function resolveAutomaticAdTargets(env, sourceChatId, options = {}) {
 	const candidates = explicit ? requested : local ? [source] : configured;
 	const allowed = [], skipped = [], skipReasons = {};
 	for (const id of candidates) {
-		const joinExcluded = joinGuard && (!joinSourceAllowed || id === String(runtime().GROUP_ID) || isKillerModeGroup(id));
+		const joinExcluded = joinGuard && (!joinSourceAllowed || !isAdJoinGuardGroup(id));
 		if (joinExcluded || (local ? id !== source || (!configured.includes(id) && !(options.drillCloseReplay && isGlobalDryRunScopeGroup(id)))
 			: !configured.includes(id) || independent(id))) {
 			skipped.push(id); skipReasons[id] = joinExcluded ? 'join_guard_excluded' : !configured.includes(id) ? 'not_configured' : independent(id) ? 'independent_mode' : 'outside_local_source';
@@ -37304,7 +37308,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	const joinGuard = joinRequest || approvedJoin;
 	if (joinGuard) {
 		if (!isAdJoinGuardGroup(chatId)) return {banned:false,complete:true,released:true,reason:'join_guard_excluded'};
-		// 后台重试也从原申请现场恢复范围，不能退回包含杀手群的通用自动治理。
+		// 后台重试也从原申请现场恢复范围，不能退回包含全部杀手群的通用自动治理。
 		options = {...options,automaticPolicy:'join_guard_global',telegramTimeoutMs:options.telegramTimeoutMs||5000,deferRetry:true};
 	}
 	if(options.drillCloseReplay!==true&&chatId&&await isDryRunGroup(env,chatId)){
@@ -42073,7 +42077,7 @@ function renderAdJoinOwnerNotice(data,row,groupResult){
 		'案件编号　'+value(r.autoCaseId||data.id)+(r.seq?' / 快照 #'+r.seq:''),
 		'触发来源　'+(data.approvedJoin?'已入群事件（第二道防线）':'入群申请（第一道防线）'),
 		'来源群组　'+value(data.chatTitle)+'（'+value(data.chatId)+'）',
-		'治理范围　'+(r.blacklistOnly?'已有名单，仅本群处置':'全局普通治理群；排除主群、杀手群和独立群，逐群结果见下方'),
+		'治理范围　'+(r.blacklistOnly?'已有名单，仅本群处置':'普通治理群及指定杀手群例外；排除主群、其他杀手群和独立群，逐群结果见下方'),
 		'用户昵称　'+value(userName),'用户 ID　 '+value(data.userId),'用户名　　'+value(data.user.username||s.username||'未设置'),
 		'申请时间　'+time(Number(data.request?.date)*1000),'结果时间　'+time(data.updatedAt),
 		'执行次数　'+data.history.length+'（后续执行含自动重试 / 事件重投）',
