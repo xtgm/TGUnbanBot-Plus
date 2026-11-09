@@ -42138,17 +42138,28 @@ async function saveAdJoinNotice(env,input,evaluation,receipt,options={}){
 		receipt={...previous.receipt,...receipt,blacklistOnly:false,autoCaseId:previous.receipt.autoCaseId,seq:previous.receipt.seq,
 			complete:previous.receipt.complete&&receipt.complete,blacklistCode:previous.receipt.blacklistCode,
 			banResults:[...(previous.receipt.banResults||[]).filter(row=>String(row.groupId)!==chatId),...receipt.banResults]};
+	// history 只增不减会让报告随每次重投 / 重试无限膨胀（旧版一条 event 就是整份回执，
+	// 25 次执行能把报告顶到 9 条消息）。这里只保留最近 30 条，总次数另存 historyTotal，
+	// 报告按 historyTotal 显示真实执行次数，明细仍完整留在本次 payload 之外的 D1 记录里。
+	const priorHistory=previous?.history||[],priorTotal=Number(previous?.historyTotal||0)||priorHistory.length;
+	const nextHistory=[...priorHistory,{at:Date.now(),...(options.learningOnly?{stage:'learning',learning:receipt.learning}:
+		{decline:receipt.decline,verification:receipt.verification,banResults:receipt.banResults}),complete:receipt.complete}];
 	const data={id,chatId,userId,chatTitle:String(input.chatTitle||''),user:message.from||{},request,approvedJoin,
 		approver:message.adJoinApprover||previous?.approver||null,evaluation:selected,receipt,updatedAt:Date.now(),
 		isAd:!receipt.blacklistOnly||['ad_auto','ad_vote','spam'].includes(String(evaluation.blacklistEntry?.reason||''))||Boolean(evaluation.blacklistEntry?.autoCaseId),
-		history:[...(previous?.history||[]),{at:Date.now(),...(options.learningOnly?{stage:'learning',learning:receipt.learning}:
-			{decline:receipt.decline,verification:receipt.verification,banResults:receipt.banResults}),complete:receipt.complete}]};
+		history:nextHistory.slice(-30),historyTotal:priorTotal+1};
 	data.outcome=adJoinNoticeOutcome(data);
 	const signature=await exportSha256Hex(JSON.stringify({outcome:data.outcome,complete:receipt.complete,blacklistCode:['ADDED','EXISTS'].includes(receipt.blacklistCode)?'saved':receipt.blacklistCode,
 		decline:{ok:receipt.decline?.declined===true||receipt.decline?.ok===true,absent:receipt.decline?.requestAbsent,error:receipt.decline?.error},
 		mode:receipt.mode,verification:{status:receipt.verification?.status,muted:receipt.verification?.muted,isMember:receipt.verification?.isMember,
 			notInGroup:receipt.verification?.notInGroup,permissions:receipt.verification?.permissions,untilDate:receipt.verification?.untilDate,error:receipt.verification?.error},
-		bans:(receipt.banResults||[]).map(row=>[row.groupId,row.ok,row.muted,row.pendingMute,row.skipped==='already_banned'?'':row.skipped||'',row.error||'']),learning:receipt.learning}));
+	// bans 必须按群 ID 排序后再算签名。Telegram 对同一次入群会先后下发
+	// message.new_chat_members 和 chat_member 两个 update；两条路径的 banResults
+	// 只是【顺序不同】（后到的那次会把本次群移到末尾），内容一模一样。
+	// 不排序 → 签名每次都变 → revision+1 → 整份报告从头重发一遍。
+	// 实测同一次入群因此收到 5 条 + 6 条 = 11 条消息。
+		bans:(receipt.banResults||[]).slice().sort((a,b)=>String(a.groupId||'').localeCompare(String(b.groupId||'')))
+			.map(row=>[row.groupId,row.ok,row.muted,row.pendingMute,row.skipped==='already_banned'?'':row.skipped||'',row.error||'']),learning:receipt.learning}));
 	const now=Math.floor(Date.now()/1000);
 	await env.DB.prepare("INSERT INTO ad_join_notices(id,chat_id,user_id,payload,signature,next_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,signature=excluded.signature,revision=ad_join_notices.revision+CASE WHEN ad_join_notices.signature<>excluded.signature THEN 1 ELSE 0 END,owner_part=CASE WHEN ad_join_notices.signature<>excluded.signature THEN 0 ELSE ad_join_notices.owner_part END,owner_chunks=CASE WHEN ad_join_notices.signature<>excluded.signature THEN '' ELSE ad_join_notices.owner_chunks END,next_at=excluded.next_at,updated_at=excluded.updated_at")
 		.bind(id,chatId,userId,JSON.stringify(data),signature,now,now,now).run();
@@ -42157,12 +42168,36 @@ async function saveAdJoinNotice(env,input,evaluation,receipt,options={}){
 	catch(error){console.error('[拦门通知] Queue 未投递，定时补发：'+formatD1SchemaError(error));}
 }
 
+// 报告是【给主人看的结论】，不是把 D1 里的原始结构体倒出来。
+// 旧写法对 6 段明细用 JSON.stringify(detail,null,2) 缩进展开，permissions 8 个布尔键
+// 摊成 10 行、每群回执 5 行、每条 history 一整段 —— 一份报告 15,894 字符 / 588 行，
+// 被切成 5~6 条 Telegram 消息连发，这就是「刷屏」。字段一个不少，只是每个细节压成一行。
+// 原始回执仍完整保存在 ad_join_notices.payload，需要逐键核查时查 D1 / 后台案件编号。
 function renderAdJoinOwnerNotice(data,row,groupResult){
 	const e=data.evaluation||{},s=e.snapshot||{},p=e.payload||{},r=data.receipt||{},d=r.decline||{},v=r.verification||{};
 	const pendingMute=r.mode==='mute'&&v.notInGroup===true;
 	const value=x=>escapeHtml(String(x??'未取得'));
 	const time=x=>Number(x)>0?new Date(Number(x)).toISOString().replace('T',' ').replace('Z',' UTC'):'未提供';
 	const userName=[data.user.first_name,data.user.last_name].filter(Boolean).join(' ')||s.name||'未提供';
+	// 任意嵌套结构压成一行：数组只报条数与前 3 项，对象展开成 k=v。
+	// 空数组 / 空对象返回空串 —— 否则会出现「未完成检查　0 项；0 项」这种纯噪音。
+	// 这些值来自 JSON payload，不含循环引用。
+	const brief=x=>{
+		if(x===null||x===undefined)return'';
+		if(typeof x!=='object')return String(x);
+		if(Array.isArray(x))return x.length?' '+x.length+' 项：'+x.slice(0,3).map(brief).join('、')+(x.length>3?' 等':''):'';
+		const entries=Object.entries(x).filter(([,val])=>val!==null&&val!==undefined);
+		return entries.length?entries.map(([k,val])=>k+'='+(typeof val==='object'?brief(val).trim():String(val))).join('，'):'';
+	};
+	const banRows=r.banResults||[],groupTotal=banRows.length;
+	// 互斥分类：pendingMute 的项同时带 skipped='not_in_group'，先归到「待入群执行」，
+	// 否则会被 skipped 再算一次，8 个群会汇总成 9。
+	const okBans=banRows.filter(x=>x.ok===true&&x.muted!==true),okMutes=banRows.filter(x=>x.ok===true&&x.muted===true),
+		pendingBans=banRows.filter(x=>x.pendingMute===true),
+		failedBans=banRows.filter(x=>x.ok!==true&&!x.pendingMute&&!x.skipped),
+		skippedBans=banRows.filter(x=>x.ok!==true&&!x.pendingMute&&Boolean(x.skipped));
+	const totalEvents=Number(data.historyTotal||0)||(data.history||[]).length;
+	const historyShown=(data.history||[]).slice(-10),historyOffset=totalEvents-historyShown.length;
 	const lines=['<b>🛡 '+(data.isAd?'广告':'黑名单')+'入群拦截完整报告</b>',
 		'拦截结论　'+value(adJoinNoticeTitle(data.outcome,data.isAd)),
 		'整体进度　'+(r.complete?pendingMute?'当前拒绝/状态处理已完成；禁言记录已保存，实际入群时执行':r.learning?.complete===false?'处置已完成；学习未完成，后台自动续办':'本次处置已完成':'处置或核验未完成，后台自动续办'),
@@ -42174,7 +42209,7 @@ function renderAdJoinOwnerNotice(data,row,groupResult){
 		'治理范围　'+(r.blacklistOnly?'已有名单，仅本群处置':'普通治理群及指定杀手群例外；排除主群、其他杀手群和独立群，逐群结果见下方'),
 		'用户昵称　'+value(userName),'用户 ID　 '+value(data.userId),'用户名　　'+value(data.user.username||s.username||'未设置'),
 		'申请时间　'+time(Number(data.request?.date)*1000),'结果时间　'+time(data.updatedAt),
-		'执行次数　'+data.history.length+'（后续执行含自动重试 / 事件重投）',
+		'执行次数　'+totalEvents+'（后续执行含自动重试 / 事件重投）',
 		'审核机器人　'+(data.approver?value((data.approver.username?'@'+data.approver.username+' ':'')+data.approver.id)+'（入群事件的操作者）':(data.approvedJoin?'成员':'申请')+'事件未提供验证机器人身份，不推测'),
 		'', '<b>广告判定与现场</b>',
 		'判定来源　'+value(AD_LAYER_LABELS[e.layer]||e.layer||'已有黑名单'),
@@ -42185,22 +42220,80 @@ function renderAdJoinOwnerNotice(data,row,groupResult){
 		'复查简介　'+value(s.currentBio??s.originalProfile?.bio??'未单独取得'),
 		'头像文字　'+value(p.avatarText??s.avatarText??'未取得'),
 		'会员标文字　'+value(p.badgeText??s.badgeText??'未取得'),
-		'命中依据：',...(e.reasons||[]).map((reason,i)=>(i+1)+'. '+value(reason))];
-	for(const [label,detail] of [['位置证据',e.positionEvidence],['指纹命中',e.fingerprintHits],['相似样本',e.aiSample],
-		['已有名单',e.blacklistEntry],['采集覆盖',e.globalDrill?.completeness],['未完成检查',e.drillIncomplete||e.contentReviewIncomplete]])
-		if(detail)lines.push(label+'：\n'+value(JSON.stringify(detail,null,2)));
+		// 命中依据是判定本身的证据，全部保留 —— 这部分不是「废话」，
+		// 删掉它主人就没法核查判得对不对，也就没法决定要不要 /ignore。
+		'命中依据（共 '+Number((e.reasons||[]).length)+' 条）：',
+		...((e.reasons||[]).map((reason,i)=>(i+1)+'. '+value(reason)))];
+	// 六段明细各压一行，不再缩进展开 JSON。
+	if(e.positionEvidence){
+		const slots=Object.values(e.positionEvidence).filter(x=>!x.exempt&&Number(x.grade)>0)
+			.sort((a,b)=>b.grade-a.grade).map(x=>x.label+' '+x.grade);
+		lines.push('位置证据　'+value(slots.join(' + ')||'无'));
+	}
+	if(Array.isArray(e.fingerprintHits)&&e.fingerprintHits.length)
+		lines.push('指纹命中　'+e.fingerprintHits.length+' 条：'+value(e.fingerprintHits.map(x=>String(x?.text??x?.fingerprint??'未提供')+(x?.weight!==undefined?'('+x.weight+')':'')).join('、')));
+	if(e.aiSample)lines.push('相似样本　'+value(String(e.aiSample.key??'未提供'))
+		+(e.aiSample.similarity!==undefined?'，相似度 '+value(e.aiSample.similarity):'')
+		+(e.aiSample.text?'，文本「'+value(e.aiSample.text)+'」':''));
+	if(e.blacklistEntry){
+		const b=e.blacklistEntry;
+		lines.push('已有名单　'+value(String(b.reason||'未提供'))
+			+(b.at||b.by?'（'+[b.at?String(b.at):'',b.by?'操作人 '+String(b.by):''].filter(Boolean).join('，')+'）':''));
+	}
+	// 采集覆盖是「按位置」的完整度表（profile / nickname / bio / avatar / badge / image / emoji…），
+	// 每项自身又是一个小对象。整份展开会变成一行上千字符（实测 1,200+），
+	// 主人真正要知道的只有「几个位置查全了、哪几个没查全」。
+	if(e.globalDrill?.completeness&&typeof e.globalDrill.completeness==='object'){
+		const entries=Object.entries(e.globalDrill.completeness);
+		if(entries.length){
+			const done=entries.filter(([,val])=>val?.complete===true);
+			const missing=entries.filter(([,val])=>val?.complete!==true).map(([k,val])=>k+(val?.missingReason?'（'+val.missingReason+'）':''));
+			lines.push('采集覆盖　'+done.length+'/'+entries.length+' 个位置已查全'+(missing.length?'；未查全：'+value(missing.join('、')):''));
+		}
+	}
+	// 未完成检查：两个字段都可能是数组或对象，空的就别渲染 —— 否则输出「0 项；0 项」。
+	const incomplete=self=>{
+		if(!self)return'';
+		if(Array.isArray(self))return self.length?self.map(x=>typeof x==='string'?x:(x?.reason||brief(x).trim())).join('；'):'';
+		if(typeof self==='object'&&!Object.keys(self).length)return'';
+		return String(self.reason||brief(self).trim());
+	};
+	const incompleteText=[incomplete(e.drillIncomplete),incomplete(e.contentReviewIncomplete)].filter(Boolean).join('；');
+	if(incompleteText)lines.push('未完成检查　'+value(incompleteText));
 	lines.push('', '<b>执行结果</b>',
 		'拒绝申请　'+(data.approvedJoin?'不适用：用户已经入群':d.declined===true||d.ok===true?'Telegram 确认成功':d.alreadyParticipant?'申请处理时用户已经入群':d.requestAbsent?'待审批申请已不存在，不能据此认定拒绝成功':'未成功')+(d.error?'；'+value(d.error):''),
 		'状态复查　'+value(v.status||'unknown')+'；'+(r.mode==='mute'?v.notInGroup?'当前不在群内，禁言待实际入群执行':v.muted&&v.isMember?'已确认在群且永久禁言':'尚未确认永久禁言生效':v.blocked?'已封禁，当前不在群内':'未确认封禁生效')+(v.error?'；'+value(v.error):''),
 		'复查时间　'+time(v.checkedAt),'名单结果　'+value(r.blacklistCode||'未取得'),
 		'群内通知　'+(groupResult?.ok?'发送成功，消息 ID '+value(groupResult.messageId??'未返回'):groupResult?.skipped?value(groupResult.skipped):'等待自动补发；'+value(groupResult?.error||'未发送')),
 		...(groupResult?.verification?['补发前复查　'+value(groupResult.verification.status)+'；'+time(groupResult.verification.checkedAt)]:[]),
-		'逐群处置：');
-	for(const ban of r.banResults||[])lines.push('· '+value(ban.groupId)+'：'+(ban.pendingMute?'不在群内，禁言记录已保存，待入群执行':ban.skipped?'跳过（'+value(ban.skipped)+'）':ban.ok?(ban.muted?'禁言接口成功':'封禁成功'):'失败')
-		+(ban.error?'；'+value(ban.error):'')+(ban.accountingFailed?'；结果记账未完成':'')+'；本次接口尝试 '+Number(ban.attempts||0));
-	lines.push('自动学习　'+(r.blacklistOnly?'已有名单拦截，不重复学习':r.local?'独立群，不写共享学习库':r.learning?.skipped?'沿用已完成学习':value(JSON.stringify(r.learning||{}))),
-		'', '<b>历次执行回执</b>');
-	for(const [index,event] of data.history.entries())lines.push('第 '+(index+1)+' 次　'+time(event.at)+'\n'+value(JSON.stringify(event,null,2)));
+		// 逐群先给一行汇总，然后只详列【失败 / 待入群 / 跳过】这三类需要主人看的；
+		// 成功的群逐条列出只是噪音（8 个群 8 行、每个群还要 5 行 JSON）。
+		'逐群处置　'+groupTotal+' 群：'+value([
+			okBans.length?'封禁成功 '+okBans.length:'',okMutes.length?'禁言成功 '+okMutes.length:'',
+			failedBans.length?'失败 '+failedBans.length:'',pendingBans.length?'待入群执行 '+pendingBans.length:'',
+			skippedBans.length?'跳过 '+skippedBans.length:''].filter(Boolean).join('、')||'无记录'));
+	for(const ban of failedBans)lines.push('· 失败 '+value(ban.groupId)+'：'+value(ban.error||'未知原因')
+		+(ban.accountingFailed?'；结果记账未完成':'')+'；尝试 '+Number(ban.attempts||0)+' 次');
+	for(const ban of pendingBans)lines.push('· 待执行 '+value(ban.groupId)+'：不在群内，禁言记录已保存，入群时执行');
+	for(const ban of skippedBans)lines.push('· 跳过 '+value(ban.groupId)+'：'+value(ban.skipped));
+	lines.push('自动学习　'+(r.blacklistOnly?'已有名单拦截，不重复学习':r.local?'独立群，不写共享学习库':r.learning?.skipped?'沿用已完成学习'
+		:'指纹 +'+Number(r.learning?.learned||0)+'、AI 样本 +'+(r.learning?.sampleAdded?1:0)+'、资料骨架 +'+Number(r.learning?.skeletons||0)
+			+(r.learning?.complete===false?'（未完成，后台自动续办）':'')),
+		'', '<b>历次执行回执</b>　共 '+totalEvents+' 次执行'+(historyOffset>0?'，下列第 '+(historyOffset+1)+'~'+totalEvents+' 次（最近 '+historyShown.length+' 次）':''));
+	// 每次执行压成一行变化点。旧写法把整份 event（含每群回执与 8 项权限）缩进展开，
+	// 单条就 2500 字符；而 history 只增不减，越重发越长 —— 这是报告膨胀的主因。
+	for(const [index,event] of historyShown.entries()){
+		const bits=[];
+		if(event?.stage==='learning')bits.push(event.learning?.complete===false?'学习未完成':'学习完成');
+		if(event?.decline)bits.push(event.decline.declined===true||event.decline.ok===true?'拒绝成功':'拒绝未确认'+(event.decline.error?'（'+brief(event.decline.error)+'）':''));
+		if(event?.verification){const vv=event.verification;bits.push('复查 '+(vv.status||'unknown')
+			+(vv.isMember===true?'，在群':'')+(vv.muted===true?'，已禁言':'')+(vv.notInGroup===true?'，不在群':'')+(vv.error?'，'+brief(vv.error):''));}
+		if(Array.isArray(event?.banResults)){const okc=event.banResults.filter(x=>x.ok===true).length;
+			const flag=event.banResults.filter(x=>x.ok!==true&&!x.pendingMute&&x.skipped).length;
+			bits.push('处罚 '+okc+'/'+event.banResults.length+(flag?'（跳过 '+flag+'）':''));}
+		bits.push(event?.complete===true?'处置完成':'处置未完成');
+		lines.push('第 '+(historyOffset+index+1)+' 次　'+time(event?.at)+'　'+value(bits.join('；')));
+	}
 	lines.push('', '说明：复查证明查询时的成员状态；拒绝成功、禁言生效与待入群执行分别记录，不据此推断此前从未短暂入群。',
 		'本报告仅投递第一主人；后续结果变化及发送失败均自动续办。');
 	return lines.join('\n');
