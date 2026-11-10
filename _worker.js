@@ -7933,7 +7933,7 @@ async function webAdminLogins(env) {
 	]);
 	return { total: Number(total?.n) || 0, ips: ips?.results || [], logs: logs?.results || [] };
 }
-const WEB_ADMIN_ACTIONS = new Set(['web/exec', 'web/groupmode', 'web/localset', 'web/localwl', 'web/localbans', 'web/localunban', 'web/dryrun', 'web/stats', 'web/exportpass', 'web/logins', 'web/loginip-del', 'web/logout', 'web/fedkeys', 'web/fedkey-add', 'web/fedkey-del', 'web/fedlist', 'web/fedexempt']);
+const WEB_ADMIN_ACTIONS = new Set(['web/exec', 'web/groupmode', 'web/localset', 'web/localwl', 'web/localbans', 'web/localunban', 'web/dryrun', 'web/stats', 'web/defense-stats', 'web/exportpass', 'web/logins', 'web/loginip-del', 'web/logout', 'web/fedkeys', 'web/fedkey-add', 'web/fedkey-del', 'web/fedlist', 'web/fedexempt']);
 const WEB_ADMIN_REPLY_LIMIT = 30;
 // 命令台回执镜像：执行期间发给第一主人私聊的消息同时记一份文本。
 // 捕获容器随命令上下文传递，结束后关闭，避免并发命令和后台通知串入。
@@ -8104,6 +8104,7 @@ async function dispatchWebAdminAction(action, body, env, auth, ctx, url) {
 			]);
 			return { chatId, range, label, summary, ranking };
 		}
+		case 'web/defense-stats': return webAdminDefenseStats(env);
 		case 'web/exportpass': {
 			const password = await createExportPassword(env, 'export');
 			if (!password) throw new MiniAppError(503, '生成导出密码失败，请稍后重试');
@@ -8154,6 +8155,65 @@ async function dispatchWebAdminAction(action, body, env, auth, ctx, url) {
 		}
 		default: throw new MiniAppError(404, '接口不存在');
 	}
+}
+
+// === 两道防线统计（2026-11-10）===
+// 主人的口径：第一道 = 进群那一刻资料检测，命中即禁言；第二道 = 漏进来的人一发言就处理。
+// 这个接口只回答一个问题：哪个群第一道没跑、哪个群兜不住。全部只读，不写库不调 Telegram。
+// 「漏检」= 进群人数 - 第一道检测数。bot 被拉进群、管理员进群也会算进群，
+// 所以它是近似值，负数按 0 处理，页面上已注明，不用它当绝对值下结论。
+async function webAdminDefenseStats(env) {
+	const [day, week] = await Promise.all([
+		defenseStatsWindow(env, 24, '近 24 小时'),
+		defenseStatsWindow(env, 24 * 7, '近 7 天')
+	]);
+	return { day, week };
+}
+
+async function defenseStatsWindow(env, hours, label) {
+	const since = Math.floor(Date.now() / 1000) - hours * 3600;
+	const [checkRows, joinRows, caseRows, pendingRows] = await Promise.all([
+		env.DB.prepare('SELECT chat_id, verdict, COUNT(*) AS n FROM ad_join_checks WHERE created_at >= ? GROUP BY chat_id, verdict').bind(since).all(),
+		env.DB.prepare("SELECT chat_id, COUNT(*) AS n FROM stat_member_events WHERE kind = 'join' AND at >= ? GROUP BY chat_id").bind(since).all(),
+		env.DB.prepare('SELECT source_chat_id AS chat_id, COUNT(*) AS n FROM ad_automatic_case_targets WHERE created_at >= ? GROUP BY source_chat_id').bind(since).all(),
+		env.DB.prepare("SELECT chat_id, user_id, score, layer, created_at FROM ad_join_checks WHERE verdict = 'pending' AND created_at >= ? ORDER BY id DESC LIMIT 50").bind(since).all()
+	]);
+	const rows = new Map();
+	const pick = (chatId) => {
+		const id = String(chatId || '');
+		if (!rows.has(id)) rows.set(id, { chatId: id, joins: 0, checks: 0, pass: 0, pending: 0, ban: 0, cases: 0, missed: 0 });
+		return rows.get(id);
+	};
+	for (const r of joinRows?.results || []) pick(r.chat_id).joins = Number(r.n) || 0;
+	for (const r of checkRows?.results || []) {
+		const row = pick(r.chat_id);
+		const n = Number(r.n) || 0;
+		row.checks += n;
+		if (r.verdict === 'ban') row.ban += n;
+		else if (r.verdict === 'pending') row.pending += n;
+		else row.pass += n;
+	}
+	for (const r of caseRows?.results || []) pick(r.chat_id).cases = Number(r.n) || 0;
+	const groups = [...rows.values()]
+		.map((row) => ({ ...row, missed: Math.max(0, row.joins - row.checks) }))
+		.sort((a, b) => (b.ban + b.cases) - (a.ban + a.cases) || b.joins - a.joins || String(a.chatId).localeCompare(String(b.chatId)));
+	const totals = groups.reduce((sum, row) => ({
+		joins: sum.joins + row.joins,
+		checks: sum.checks + row.checks,
+		pass: sum.pass + row.pass,
+		pending: sum.pending + row.pending,
+		ban: sum.ban + row.ban,
+		cases: sum.cases + row.cases,
+		missed: sum.missed + row.missed
+	}), { joins: 0, checks: 0, pass: 0, pending: 0, ban: 0, cases: 0, missed: 0 });
+	const pendingUsers = (pendingRows?.results || []).map((r) => ({
+		chatId: String(r.chat_id || ''),
+		userId: String(r.user_id || ''),
+		score: Number(r.score) || 0,
+		layer: String(r.layer || ''),
+		at: Number(r.created_at) || 0
+	}));
+	return { label, since, groups, totals, pendingUsers };
 }
 
 // 联合封杀 · 数据源一侧：发出去的 key（只列哈希，明文从不回传）。
@@ -8355,6 +8415,7 @@ dl.kv dd{margin:0;min-width:0}
 <div class="card"><h2>广告检测</h2>
 <div class="subtabs" id="ads-sub">
 <button class="btn" type="button" data-ads="summary" aria-pressed="true">总览</button>
+<button class="btn" type="button" data-ads="defense">防线统计</button>
 <button class="btn" type="button" data-ads="pending">处罚记录</button>
 <button class="btn" type="button" data-ads="fingerprints">指纹库</button>
 <button class="btn" type="button" data-ads="samples">AI 样本</button>
@@ -8770,6 +8831,24 @@ var ADS = {
 	summary: { action: 'ads/summary', paged: false, render: function (d) {
 		var c = d.counts || {}, f = d.config || {};
 		return kv([['指纹', c.fingerprints], ['AI 样本', c.samples], ['处罚记录', c.pending + ' 条'], ['自动判定', f.decisionPolicy || '独立位置 6 + 3'], ['第⑥层 AI', f.aiEnabled ? '开启' : '关闭'], ['AI 每日额度', f.llmDaily], ['视觉模型', d.visionModel]]);
+	} },
+	// 两道防线（2026-11-10）：第一道看进群瞬间有没有判、判了多少；第二道看漏进来的有没有被抓。
+	// 「漏检」是近似值 —— bot 被拉进群、管理员进群也计入进群人数，页面上已注明口径。
+	defense: { action: 'web/defense-stats', paged: false, render: function (d) {
+		var box = el('div');
+		var cols = [['群', function (r) { return groupTitle(r.chatId); }], ['进群', 'joins'], ['第一道检测', 'checks'], ['通过', 'pass'], ['待观察', 'pending'], ['当场禁言', 'ban'], ['漏检', 'missed'], ['第二道', 'cases']];
+		['day', 'week'].forEach(function (key) {
+			var w = d[key] || {}, t = w.totals || {};
+			box.appendChild(el('h3', { text: (w.label || key) + '：进群 ' + (t.joins || 0) + ' · 第一道检测 ' + (t.checks || 0) + ' · 当场禁言 ' + (t.ban || 0) + ' · 待观察 ' + (t.pending || 0) + ' · 第二道 ' + (t.cases || 0) }));
+			box.appendChild(table(w.groups || [], cols));
+			var pending = w.pendingUsers || [];
+			if (pending.length) {
+				box.appendChild(el('p', { cls: 'muted', text: (w.label || key) + '内第一道没当场禁言、交给第二道盯的 ' + pending.length + ' 条（最多列 50）' }));
+				box.appendChild(table(pending, [['时间', function (r) { return fmtTime(r.at); }], ['群', function (r) { return groupTitle(r.chatId); }], ['用户', 'userId'], ['得分', 'score'], ['判定层', 'layer']]));
+			}
+		});
+		box.appendChild(el('p', { cls: 'hint', text: '第一道＝进群瞬间资料检测，命中即禁言；第二道＝发言或定时复查触发。「漏检」＝进群人数减第一道检测数，bot、管理员进群也算进群，只作参考。' }));
+		return box;
 	} },
 	pending: { action: 'ads/pending', paged: true, render: function (d) {
 		return table(d.items || [], [['序号', 'seq'], ['时间', function (r) { return fmtTime(r.createdAt); }], ['用户', function (r) { var s = r.snapshot || {}; return (s.name || '') + (s.username ? ' @' + s.username : '') + ' · ' + r.userId; }], ['群', function (r) { return groupTitle(r.chatId); }], ['得分', 'score'], ['判据', 'reasons'], ['内容', function (r) { return (r.snapshot && r.snapshot.text) || ''; }]]);
@@ -11693,14 +11772,12 @@ function automaticAdConfiguredGroups() {
 	return [...new Set([...runtime().GROUP_IDS, ...(Array.isArray(runtime().KILLER_MODE_GROUPS) ? runtime().KILLER_MODE_GROUPS : [])].map(String).filter(Boolean))];
 }
 
-// 天诚技术交流群（@zyssadmin）明确纳入入群防线，保留原杀手群身份。
-const AD_JOIN_GUARD_KILLER_EXCEPTIONS = new Set(['-1002212563246']);
-
-// 拦门治理普通配置群（含动态群）及指定杀手群例外；主群、其他杀手群和独立群不参与。
+// 主人口径（2026-11-10）：独立群与杀手群全部不管，它们的治理权归各自的管理者；
+// 其余全局治理群一律拦门。主群是主人自己的观测群（不公开、只有本人），也不参与。
 function isAdJoinGuardGroup(chatId) {
 	const id = String(chatId || '');
-	return isConfiguredGroup(id) && id !== String(runtime().GROUP_ID) && !isIndependentGroup(id)
-		&& (!isKillerModeGroup(id) || AD_JOIN_GUARD_KILLER_EXCEPTIONS.has(id));
+	return isConfiguredGroup(id) && id !== String(runtime().GROUP_ID)
+		&& !isIndependentGroup(id) && !isKillerModeGroup(id);
 }
 
 async function isAdJoinGuardGroupCurrent(env, chatId) {
@@ -11790,7 +11867,9 @@ async function resolveAutomaticAdTargets(env, sourceChatId, options = {}) {
 	const explicit = Array.isArray(options.autoTargetGroupIds);
 	const requested = explicit ? [...new Set(options.autoTargetGroupIds.map(String))] : configured;
 	const modes = await readStrictAutomaticAdModes(env, [...configured, source, ...requested]);
-	const independent = id => !isKillerModeGroup(id) && modes.get(id) === 'independent';
+	// 主人口径（2026-11-10）：独立群与杀手群都不参与跨群联动，治理权归各自管理者。
+	// 保留「源群在本群处置」：它们作为来源群时 policy 落到 *_local，只动本群。
+	const independent = id => isKillerModeGroup(id) || modes.get(id) === 'independent';
 	const policy = String(options.automaticPolicy || options.autoScopePolicy || (independent(source) ? 'independent_local' : 'global_non_independent'));
 	const joinGuard = policy === 'join_guard_global';
 	const joinSourceAllowed = !joinGuard || isAdJoinGuardGroup(source) && !independent(source);
@@ -38291,6 +38370,56 @@ async function enforceAdDetectionWithRetry(env,input,evaluation,options={}) {
 	return result;
 }
 
+// 申请命中已有名单时本群已经拦下，但联动群的名单可能没写成功（addToGroupBlacklist 抛错）。
+// Webhook 重投是唯一补齐机会：上一次回执里失败的那些群，这次逐个补写名单。
+// 只补名单不封人 —— 人不在那些群里，真正的处罚由第二道防线在他进群 / 发言时执行。
+async function resumeIncompleteAdJoinTargets(env, userId, chatId, chatTitle, request = {}) {
+	if (!env?.DB || !isAdJoinGuardGroup(chatId)) return { complete: true };
+	const noticeId = 'request:' + String(chatId) + ':' + String(userId) + ':' + Number(request?.date || 0);
+	const row = await env.DB.prepare('SELECT payload FROM ad_join_notices WHERE id=?').bind(noticeId).first();
+	if (!row) return { complete: true };
+	let data = null;
+	try { data = JSON.parse(row.payload || 'null'); } catch (_) { data = null; }
+	if (!data) return { complete: true };
+	const receipt = data.receipt || {};
+	if (receipt.complete === true && receipt.blacklistCode !== 'ERROR') return { complete: true };
+	const seen = new Set(), targets = [];
+	for (const item of (Array.isArray(receipt.banResults) ? receipt.banResults : [])) {
+		const gid = String(item?.groupId || '');
+		if (!gid || gid === String(chatId) || seen.has(gid)) continue;
+		if (item?.ok === true || item?.skipped) continue;
+		if (!isAdJoinGuardGroup(gid)) continue;
+		seen.add(gid); targets.push(gid);
+	}
+	if (!targets.length) return { complete: true };
+	const caseId = String(receipt.autoCaseId || '');
+	let remaining = 0;
+	for (const gid of targets) {
+		try {
+			await addToGroupBlacklist(env, gid, [String(userId)], { reason: 'ad_auto', by: 'system', note: '申请联动群名单补写', ...(caseId ? { autoCaseId: caseId } : {}) });
+			const written = await readGroupBlacklistEntry(env, gid, String(userId));
+			if (!written) { remaining++; continue; }
+			if (caseId) await saveAutomaticAdTarget(env, caseId, gid, userId, chatId,
+				String(receipt.scopeType || '') === 'local' ? 'local' : 'global',
+				{ owned: written.autoCaseId === caseId ? 1 : 0, state: written.autoCaseId === caseId ? 'pending' : 'skipped', result: {} });
+		} catch (error) {
+			remaining++;
+			console.error('[申请筛查] 联动群名单补写失败 ' + gid + ': ' + formatD1SchemaError(error));
+		}
+	}
+	if (remaining) return { complete: false };
+	try {
+		await saveAdJoinNotice(env, {
+			userId, chatId, chatTitle: String(data.chatTitle || chatTitle || ''),
+			message: { from: data.user || { id: Number(userId) }, adJoinRequest: data.request || { date: 0 } }
+		}, data.evaluation || { verdict: 'ban', snapshot: {} }, { ...receipt, complete: true, blacklistCode: 'ADDED' });
+	} catch (error) {
+		console.error('[申请筛查] 联动群补写后回执更新失败: ' + formatD1SchemaError(error));
+		return { complete: false };
+	}
+	return { complete: true, patched: targets.length };
+}
+
 // === 单个入群成员的广告筛查（两条入群路径共用）===
 // 抽出来是因为 Telegram 的入群会走两种完全不同的 update，而它们【不保证同时出现】：
 //   ① message.new_chat_members —— service message，被别人拉进群时出现
@@ -42467,6 +42596,25 @@ async function quickJoinRequestGate(env, user, chatId, chatTitle, request = {}) 
 
 	if (evaluation.verdict !== 'ban') return false;
 
+	// 完整链路（collectGlobalDryRunEvaluation）会把资料挂载链接的标题 / 简介写进
+	// payload.profileLinks，它是「正常现场纠错」上下文键的一部分。快筛原先漏了这一项，
+	// 于是主人确认过「含链接的正常现场」的同款，在门前算出的键对不上，仍会被拒绝。
+	// 这里只取元数据（metadataOnly），不做链接语义识别，不影响拒绝的时机。
+	try {
+		const links = await resolveAdProfileLinks(env, profile, { metadataOnly: true, signal: AbortSignal.timeout(5000) });
+		if (Array.isArray(links) && links.length) {
+			evaluation.payload = {
+				...(evaluation.payload || {}),
+				profileLinks: links.map(link => ({
+					handle: String(link.handle || ''), kind: String(link.kind || ''),
+					title: String(link.title || ''), about: String(link.about || '')
+				}))
+			};
+		}
+	} catch (error) {
+		console.warn('[申请快筛] 链接元数据未取到，纠错键按现状生成：' + String(error?.message || error));
+	}
+
 	console.log('[申请快筛] 资料零 AI 定罪，立即拒绝 user=' + userId + ' chat=' + chatIdStr
 		+ ' layer=' + evaluation.layer + ' score=' + evaluation.score);
 	// 走与完整链路完全相同的处置：拒绝申请、写名单、登记入群后禁言、
@@ -42532,6 +42680,14 @@ async function processChatJoinRequest(req, env) {
 	const userId = String(user?.id || '');
 	if (!chatId || !userId || !isAdJoinGuardGroup(chatId)) return;
 	console.log('[申请筛查] 收到申请 user=' + userId + ' chat=' + chatId);
+
+	// 上一轮如果联动群名单没写成功，重投是唯一的补齐机会：先补名单，再照常处置。
+	// 补不上只记日志，不打断本次拒绝 —— 门前的拒绝永远优先。
+	try {
+		await resumeIncompleteAdJoinTargets(env, userId, chatId, String(chat?.title || ''), req);
+	} catch (error) {
+		console.error('[申请筛查] 联动群名单补写异常: ' + formatD1SchemaError(error));
+	}
 
 	// 先筛查处置，再记时间线；记录失败不能拖延或吞掉拒绝，筛查失败仍保留申请事件。
 	try {
