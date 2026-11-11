@@ -23395,10 +23395,25 @@ const AD_EMBEDDING_DIMENSION = 1024;
 // 与其它判据一样可用 `/ignore` 纠错。它是第四路，不是替代前三层：
 // 前三层零成本，这一路要花 Neurons，所以挂每日上限 + 同载荷内存去重。
 //
-// 【模型选型】qwen3-30b-a3b 是 MoE（30B 总参、3B 激活），中文广告语料能力远强于
-// llama-3.2-1b 这类 1B 小模型 —— 判据本身就是中文同音变形，模型认不出变形等于白花钱。
-// 换模型直接改环境变量，不动代码。
-const AD_LLM_MODEL = '@cf/qwen/qwen3-30b-a3b-fp8';
+// 【模型选型·2026-11-11 改为主备双模型】
+//
+// 主力 @cf/zai-org/glm-5.3-flash：320B 总参 / 18B 激活、1,048,576 上下文、
+// 原生 Vision、$0.15 / $0.50 per 1M tokens。选它是因为这一层同时要干三件事 ——
+// 认出中文变体、给出一句话 reason、逐字抽出 features（自我学习的原料），
+// 单次调用能全给齐；1M 上下文也让 50 条样本的形态摘要不再挤。
+//
+// 备用 @cf/deepseek-ai/deepseek-v4.1-flash-1017：552B MoE、1M 上下文、
+// $0.30 / $1.20。只在主力【调用抛错】时接管，日常不产生费用。
+//
+// 旧 qwen3-30b-a3b（32K 上下文、Reasoning）保留为回退项：Dashboard 设
+// AD_LLM_MODEL=@cf/qwen/qwen3-30b-a3b-fp8 即可整体切回，不必改代码。
+//
+// 【两个新模型都是 Reasoning 模型，思考参数必须按模型区分】见 adLLMReasoningParams：
+// glm-5.3-flash 官方写明 "Reasoning cannot be disabled"，只能降到 low；
+// deepseek-v4.1 的 reasoning_effort 枚举含 none。不区分的话思考会吃掉 max_tokens，
+// JSON 被截断在半截 —— 线上表现就是解析失败率暴涨、连续 20 次后熔断。
+const AD_LLM_MODEL = '@cf/zai-org/glm-5.3-flash';
+const AD_LLM_FALLBACK_MODEL = '@cf/deepseek-ai/deepseek-v4.1-flash-1017';
 // 【每日上限：2026-10-11 从 200 提到 1000，并拆成三个池】
 //
 // 【旧配置的病】三个调用点共用一个 200 次的池，而其中两个轨（入群筛查、cron bio 扫描）
@@ -24267,7 +24282,11 @@ function loadAdDetectionConfig(env) {
 		llmConf: pickFloat(env.AD_LLM_CONF, AD_LLM_CONF, 0.5, 1),
 		// 换模型只改这个环境变量，不动代码（与 AD_EMBEDDING_MODEL 必须写死在代码里不同：
 		// 嵌入模型与向量维度绑定，LLM 模型没有维度包袱）。
-		llmModel: String(env.AD_LLM_MODEL || AD_LLM_MODEL).trim() || AD_LLM_MODEL
+		llmModel: String(env.AD_LLM_MODEL || AD_LLM_MODEL).trim() || AD_LLM_MODEL,
+		// 备用模型：只在主模型【调用抛错】时接管（网络 / 503 / 账号额度）。
+		// 解析失败不触发 —— 那一路已有连续失败熔断，再翻倍花钱没有依据。
+		// 显式配空串 = 关闭备用，行为退回到换模型之前。
+		llmFallbackModel: String(env.AD_LLM_FALLBACK_MODEL ?? AD_LLM_FALLBACK_MODEL).trim()
 	};
 }
 
@@ -27002,14 +27021,17 @@ async function prewarmCheck(env, message, profile, stats) {
 			console.log('[前置号复核] 额度不足或链路熔断，本次不判 uid=' + String(message.from?.id || ''));
 			return null;
 		}
-		const aiResult = await env.AI.run(String(config.llmModel || AD_LLM_MODEL), {
+		const aiRun = await runAdLLMModel(env, config, {
 			messages: [
 				{ role: 'system', content: AD_PREWARM_PROMPT + AD_LLM_NO_THINK },
 				{ role: 'user', content: payload }
 			],
-			max_tokens: 512,
+			// glm-5.3-flash 的思考关不掉（只能降到 low），512 会被思考吃掉、JSON 截断 —— 抬到 1024。
+			// 上限不是配额：Neurons 按实际生成计费，抬高只影响最坏情况。
+			max_tokens: 1024,
 			temperature: 0.1
 		});
+		const aiResult = aiRun.result;
 		await bumpAdLLMQuota(env, 'join', Math.floor(Date.now() / 1000));
 		const raw = extractAdLLMResponseText(aiResult);
 		const matched = raw.match(/\{[\s\S]*\}/);
@@ -30277,6 +30299,44 @@ function buildAdLLMPayload(input) {
 // 结果是第⑥层【从上线到今天一次都没真正读到过模型的回答】——
 // 242 次调用、0 次判为广告，不是模型保守，是答案根本没被取出来。
 //
+// ===== 思考参数：换模型必须跟着换，否则 JSON 会被思考截断 =====
+// qwen3 走 prompt 末尾的 /no_think 软开关（见 AD_LLM_NO_THINK）；
+// glm-5.3-flash 的 reasoning_effort 只有 max/high/low，官方写明
+// "Reasoning cannot be disabled"，只能降到 low 把思考压到最短；
+// deepseek-v4.1 的枚举里多一个 none，可以彻底关掉。
+// 认不出的模型一律不传，保持旧行为 —— 不能把吐出来的参数硬塞给不认识的模型。
+function adLLMReasoningParams(model) {
+	const id = String(model || '').toLowerCase();
+	if (id.includes('glm-5.3')) return { reasoning_effort: 'low' };
+	if (id.includes('deepseek-v4.1') || id.includes('deepseek-v4-flash')) return { reasoning_effort: 'none' };
+	return {};
+}
+
+// ===== 主备统一入口：只在【调用抛错】时换模型 =====
+// 【为什么只认抛错】调用抛错 = 一次 token 都没生成，本来就不记额度、不记去重键
+//（见 judgeAdByLLM 的 call_failed 分支），换一个模型重试不改变这个语义。
+// 解析失败则已经花过钱，再花一次没有依据 —— 那一路由连续失败熔断兜底。
+// 显式配空串（AD_LLM_FALLBACK_MODEL=""）等于关闭备用，行为退回单模型时代。
+async function runAdLLMModel(env, config, body) {
+	const primary = String(config?.llmModel || AD_LLM_MODEL);
+	const fallback = String(config?.llmFallbackModel || '').trim();
+	try {
+		return {
+			model: primary,
+			usedFallback: false,
+			result: await env.AI.run(primary, Object.assign({}, body, adLLMReasoningParams(primary)))
+		};
+	} catch (error) {
+		if (!fallback || fallback === primary) throw error;
+		console.error('[广告检测] 主模型调用失败，改走备用 ' + primary + ' → ' + fallback + ':', error);
+		return {
+			model: fallback,
+			usedFallback: true,
+			result: await env.AI.run(fallback, Object.assign({}, body, adLLMReasoningParams(fallback)))
+		};
+	}
+}
+
 // 【为什么要留旧字段名】Workers AI 对不同模型返回的外壳并不统一：
 // 部分视觉 / 嵌入模型走 `{ result: ... }`，早期版本与部分任务走 `{ response: ... }`。
 // 一律按「能拿到字符串就用」的顺序兜，宁可多认几个字段，
@@ -30648,7 +30708,7 @@ async function buildAdDigest(env, config) {
 			// 这条链路是 role:'user' 单消息、没有 system，所以开关要自己带上。
 			// 它的输入侧是 50 条样本拼接，单次比判定路大得多，漏掉这里省不下多少。
 			+ AD_LLM_NO_THINK;
-		const aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
+		const aiRun = await runAdLLMModel(env, config, {
 			messages: [{ role: 'user', content: prompt }],
 			// 【4000 → 512，2026-10-25】4000 是 2026-10-18 为了容纳 thinking 抬上去的
 			//（旧注释说 thinking 普遍写 1500~2200 字）。prompt 末尾加了 AD_LLM_NO_THINK
@@ -30659,10 +30719,13 @@ async function buildAdDigest(env, config) {
 			// 【为什么还留着这道上限】/no_think 万一在上游某次更新后失效，
 			// 输出会弹回 500+ token，这时候 max_tokens 就是最后一道成本闸 ——
 			// 删掉它等于把成本上界完全交给模型的心情。
-			max_tokens: 512,
+			// 【2026-11-11 换 glm 后 512 → 1024】/no_think 只对 qwen3 生效，
+			// glm-5.3-flash 不认这个软开关，思考照样占 token；摘要正文本身只有 300 字，
+			// 多出来的额度就是给思考留的。上限不是配额，按实际生成计费。
+			max_tokens: 1024,
 			temperature: 0.2
 		});
-		const raw = extractAdLLMResponseText(aiResult);
+		const raw = extractAdLLMResponseText(aiRun.result);
 		const matched = raw.match(/\{[\s\S]*\}/);
 		const parsed = matched ? JSON.parse(matched[0]) : null;
 		const digest = String(parsed?.digest || '').trim();
@@ -30814,8 +30877,11 @@ async function judgeAdByLLM(env, config, input, options) {
 	let answer = null;
 	let rawText = '';
 	let aiResult = null;
+	// 实际应答的模型名：主模型调用失败时 runAdLLMModel 会换备用，
+	// 日志与熔断排查必须记清「到底是谁答的」。
+	let runModel = String(config?.llmModel || AD_LLM_MODEL);
 	try {
-		aiResult = await env.AI.run(String(config?.llmModel || AD_LLM_MODEL), {
+		const aiRun = await runAdLLMModel(env, config, {
 			messages: [
 				{ role: 'system', content: buildAdLLMSystemPrompt(await loadAdDigest(env)) },
 				{ role: 'user', content: payload }
@@ -30843,9 +30909,15 @@ async function judgeAdByLLM(env, config, input, options) {
 			// 【上限不是配额，别指望靠它省钱】Neurons 按实际生成量计费。
 			// 实测只压上限（4000 → 800）而不关思考：18.48 vs 18.91 Neurons/次，
 			// 几乎一分没省，还多了 1 个误封。真正省钱的是 /no_think，上限只管截断。
-			max_tokens: 1024,
+			// 【2026-11-11 换 glm 后 1024 → 2048】/no_think 只对 qwen3 生效，
+			// glm-5.3-flash 只能把 reasoning_effort 降到 low，思考照样先于正文输出并计入额度。
+			// 结构上界（features 全满约 970 字符）仍满足，多出来的额度就是给思考留的余量。
+			// 上限不是配额，Neurons 按实际生成计费。
+			max_tokens: 2048,
 			temperature: 0.1
 		});
+		aiResult = aiRun.result;
+		runModel = aiRun.model;
 		// Workers AI 对 chat 模型返回 OpenAI 兼容结构，正文在 choices[0].message.content，
 		// 旧写法 `aiResult?.response ?? aiResult?.result` 两个字段都取不到 —— 详见 extractAdLLMResponseText。
 		rawText = extractAdLLMResponseText(aiResult);
@@ -30869,7 +30941,7 @@ async function judgeAdByLLM(env, config, input, options) {
 		// 没有它的话，解析失败与「模型判 false」在线上完全无法区分 ——
 		// 线上真实状态正是「221 调用、0 命中、22 解析失败」，其中那 22 次此前无从查证。
 		console.error('[广告检测·深度判定] 模型输出未能解析 pool=' + pool
-			+ ' model=' + String(config?.llmModel || AD_LLM_MODEL)
+			+ ' model=' + runModel + (runModel !== String(config?.llmModel || AD_LLM_MODEL) ? '（备用）' : '')
 			// rawText 为空 = extractAdLLMResponseText 没认出这个返回外壳。
 			// 那时必须把整个返回结构打出来 —— 否则又是一次「只有 [object Object]」的排查，
 			// 2026-10-11 那轮就卡在这里：日志确实打了，但打的正是那个没用的对象字符串。
