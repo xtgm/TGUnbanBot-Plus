@@ -28534,17 +28534,32 @@ async function embedAdText(env, text) {
 async function topUpAdSampleEmbeddings(env) {
 	if (!(env?.AI && typeof env.AI.run === 'function')) return 0;
 	try {
+		const nowSeconds = Math.floor(Date.now() / 1000);
+		// 【2026-11-12 补】样本补齐也必须走嵌入配额：此前直接调 embedAdText，
+		// 既不检查 AD_EMBED_DAILY、也不写 emb_count —— 线上实测今天补了 46 条向量，
+		// 记账仍是 0 增长，额度形同虚设；AD_EMBED_DAILY=0 关掉嵌入时它也照跑。
+		// 与 readAdEmbedCache 同一口径：0 = 这一层关闭，不加补、不花钱。
+		const config = loadAdDetectionConfig(env);
+		const dailyLimit = Number(config.embedDaily) || 0;
+		if (dailyLimit <= 0) return 0;
+		const quota = await readImageVisionQuota(env, nowSeconds, 'emb');
+		if (dailyLimit - quota.used <= 0) return 0;
 		const { results } = await env.DB.prepare(
 			'SELECT id, sample_text FROM ad_sample_embeddings WHERE embedding IS NULL ORDER BY id ASC LIMIT ?'
 		).bind(AD_SAMPLE_LAZY_BATCH).all();
 		if (!results?.length) return 0;
 
 		let filled = 0;
+		let used = quota.used;
 		for (const row of results) {
+			if (dailyLimit - used <= 0) break;
 			const vector = await embedAdText(env, row.sample_text);
 			if (!vector) continue;
 			await env.DB.prepare('UPDATE ad_sample_embeddings SET embedding = ?, dimension = ? WHERE id = ?')
 				.bind(JSON.stringify(vector), vector.length, row.id).run();
+			// 先记账再计入本轮：写失败时宁可少算一次，也不能让额度虚低。
+			await bumpAdScanCounter(env, AD_EMBED_COUNT_KEY, 1, nowSeconds);
+			used += 1;
 			filled += 1;
 		}
 		if (filled) AD_SAMPLE_EMBEDDING_CACHE.delete(env.DB);
@@ -33120,10 +33135,19 @@ async function scanAdStickerPack(env, setName, options = {}) {
 			if (img.miss) return { done: true, i };
 			called += 1;
 			const judge = await runVisionJudge(env, img.uri, CLEF_IMAGE_STATE);
-			if (!judge) return { done: false, failed: true, i };
+			if (!judge) {
+				// 【2026-11-12 补】模型没给判定（返回结构变了 / 空应答）过去只 return，
+				// 不落台账 —— 线上 19:55 连撞 10 次触发熔断，ad_vision_failures 里一条记录都没有，
+				// 只能看着「已熔断」猜原因。与头像/正文图同一口径：落一条 stage=ai.run。
+				await logAdVisionFailure(env, '贴纸包·抽查', 'ai.run', name, new Error('clef 未返回判定'));
+				return { done: false, failed: true, i };
+			}
 			return { done: true, judge, i };
 		} catch (error) {
-			if (isVisionRateLimited(error)) return { done: false, i };
+			if (isVisionRateLimited(error)) {
+				await bumpAdScanCounter(env, adVisionRateLimitKey(Math.floor(Date.now() / 1000)), 1, Math.floor(Date.now() / 1000));
+				return { done: false, i };
+			}
 			await logAdVisionFailure(env, '贴纸包·抽查', 'ai.run', name, error);
 			return { done: false, failed: true, i };
 		}
@@ -34007,6 +34031,37 @@ const AD_IMAGE_VISION_DAILY = 800;
 // 10 是折中：偶发抖动扛得住，链路真坏了也不会像 moondream 那样烧满 20 次。
 const AD_VISION_FAIL_BREAK = 10;
 
+// 【2026-11-12】调用节流：需要 Workers Paid 计划的模型是【每账号每模型 20 RPM】，
+// 批量识别是串行连发，一批几十张几分钟内就能撞上去。撞了不算链路故障
+// （isVisionRateLimited 会跳过、不熔断、不花 Neurons），但那张图这一轮判不成，
+// 积压只会越滚越大 —— 主人看到的「识别一直失败」有一半是这么来的。
+// 按 18 RPM 留余量：两次调用之间至少隔 3.3 秒。isolate 内共用一个时间戳，
+// 多个 isolate 各自节流；一天几百张的量，这点粗粒度足够。
+const AD_VISION_MIN_INTERVAL_MS = 3300;
+let adVisionLastCallAt = 0;
+async function throttleAdVisionCall() {
+	const wait = AD_VISION_MIN_INTERVAL_MS - (Date.now() - adVisionLastCallAt);
+	if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+	adVisionLastCallAt = Date.now();
+}
+
+// 【2026-11-12】单轮时间预算：cron 是 */10 分钟一跳，节流后一张要 3.3 秒，
+// 一批 150 张要 8 分多钟 —— 与下一跳首尾相接，两个 isolate 各自节流就是 36 RPM，
+// 反而比不节流更容易撞 429（节流只在本 isolate 内有效）。
+// 单轮最多跑 4 分钟：剩下的靠 vision_checked_at 排序，下一跳接着来，既不重叠也不丢队列。
+const AD_VISION_ROUND_BUDGET_MS = 4 * 60 * 1000;
+// 头像轨原本不传 batchSize，取的是 Math.min(remaining, dailyLimit) —— 额度 10000 时
+// 一次就把上万行塞进内存再逐张跑。加一个显式上限：一轮最多取 120 张，
+// 实际能跑几张由上面的时间预算决定，这个值只是 SQL 的单轮取数上限。
+const AD_AVATAR_VISION_BATCH = 120;
+
+// 429 计数按天落一个键，/adstats 之外也能直接查：
+//   SELECT * FROM ad_scan_state WHERE key LIKE 'vision_rl_%'
+// 此前只进 stats，cron 一跑完就没了，事后无法回答「今天到底撞了多少次限流」。
+function adVisionRateLimitKey(nowSeconds) {
+	return 'vision_rl_' + new Date(Number(nowSeconds) * 1000).toISOString().slice(0, 10);
+}
+
 // moondream/llama 输入图的字节上限。官方没公布精确值，取 2MB ——
 // 头像（几 KB~几百 KB）永不触发；正文图取的是【原图】，几 MB 的会撞上。
 
@@ -34808,7 +34863,7 @@ async function runAdAvatarVision(env, options = {}) {
 			+ 'WHERE verdict = \'pending\' AND (vision_checked_at = 0 OR vision_checked_at < ?) AND file_id != \'\' '
 			+ 'ORDER BY vision_checked_at ASC, updated_at ASC LIMIT ?'
 		).bind(nowSeconds - AD_VISION_RETRY_COOLDOWN_SEC,
-			Math.min(remaining, Number(options.batchSize) > 0 ? Number(options.batchSize) : dailyLimit)).all();
+			Math.min(remaining, Number(options.batchSize) > 0 ? Number(options.batchSize) : AD_AVATAR_VISION_BATCH)).all();
 		rows = (rows && rows.results) || rows || [];
 	} catch (error) {
 		console.error('[广告检测·头像] 取队列失败:', error);
@@ -34822,7 +34877,18 @@ async function runAdAvatarVision(env, options = {}) {
 	// 末条判定摘要，仅供日志。声明必须在循环外 —— 否则日志那一行会 ReferenceError，
 	// 而这个函数整趟跑在 cron 里，崩了就等于当天头像识别全部白跑。
 	let lastNote = '';
+	// 单轮时间预算，理由见 AD_VISION_ROUND_BUDGET_MS。
+	const roundStartedAt = Date.now();
+	const roundBudget = Number(options.roundBudgetMs) > 0 ? Number(options.roundBudgetMs) : AD_VISION_ROUND_BUDGET_MS;
+	let roundIndex = 0;
 	for (const row of rows) {
+		roundIndex += 1;
+		if (Date.now() - roundStartedAt >= roundBudget) {
+			stats.skipped = 'round_budget';
+			console.log('[广告检测·头像] 本轮用时到顶（' + Math.round((Date.now() - roundStartedAt) / 1000)
+				+ 's，已处理 ' + (roundIndex - 1) + '/' + rows.length + '），剩余留给下一轮');
+			break;
+		}
 		// 【批次内熔断】熔断检查原本只在函数开头做一次 —— 第 10 张失败把标记写进去之后，
 		// 本批剩余的图照样跑完（2026-10-12 实测 vision_consec_fail 从 10 一路涨到 28，
 		// 一批 50 张串行要跑好几分钟，等于当批的熔断完全没拦住烧钱）。
@@ -34907,6 +34973,8 @@ async function runAdAvatarVision(env, options = {}) {
 			stage = 'encode';
 			const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
 			stage = 'ai.run';
+			// 批量串行连发会撞 20 RPM —— 调用前按 18 RPM 节流，见 AD_VISION_MIN_INTERVAL_MS。
+			await throttleAdVisionCall();
 			const judge = await runAvatarOcrJudge(env, image);
 			verdict = judge.ad ? 'ad' : 'clean';
 			ocrText = judge.text;
@@ -34920,6 +34988,9 @@ async function runAdAvatarVision(env, options = {}) {
 			// 这中间一个 Neurons 都没花（调用本身就被拒了）。
 			if (isVisionRateLimited(error)) {
 				stats.rateLimited += 1;
+				// 429 不熔断也不白花钱，但要留下次数 —— 否则「今天撞了多少次限流」
+				// 只能在跑批的那几分钟从日志里看，事后查不到。
+				await bumpAdScanCounter(env, adVisionRateLimitKey(Math.floor(Date.now() / 1000)), 1, Math.floor(Date.now() / 1000));
 				continue;
 			}
 			// 【文件永久失效】不计 failed、不推熔断，但仍推进 vision_checked_at
@@ -34983,9 +35054,25 @@ const AD_IMAGE_VISION_KINDS = ['photo', 'sticker'];
 async function readImageVisionQuota(env, nowSeconds, prefix = 'img') {
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
 	const savedDay = await readAdScanState(env, prefix + '_day', '');
-	const count = savedDay === today ? (Number(await readAdScanState(env, prefix + '_count', '0')) || 0) : 0;
-	if (savedDay !== today) await writeAdScanState(env, prefix + '_day', today, nowSeconds);
-	return { today, used: count };
+	if (savedDay === today) return { today, used: Number(await readAdScanState(env, prefix + '_count', '0')) || 0 };
+	// 【2026-11-12 修】跨天时 day 与 count 必须一起清零。
+	// 旧实现只写 day、不写 count，当天第一次读取拿到的就是昨天的计数：
+	// 线上 emb_count 停在 20010（AD_EMBED_DAILY=20000），从零点起就一直读成「已用满」，
+	// 语义相似度那一层整天退场，而 /adstats 上只显示一行「今日已用 20010 次」。
+	// 两次独立写之间被别的请求穿插会留下「day=今天、count=昨天」的中间态，
+	// 与 readAdLLMQuota 同一处理：用 batch 原子写，要么全成要么全不成。
+	try {
+		await env.DB.batch([
+			env.DB.prepare('INSERT INTO ad_scan_state (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+				.bind(prefix + '_day', today, Number(nowSeconds) || 0),
+			env.DB.prepare('INSERT INTO ad_scan_state (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+				.bind(prefix + '_count', '0', Number(nowSeconds) || 0)
+		]);
+	} catch (error) {
+		// 清零失败不能把判定链带崩 —— 与 readAdLLMQuota 同一口径，只记日志。
+		console.error('[广告检测] 跨天清零视觉额度失败 key=' + String(prefix) + ':', error);
+	}
+	return { today, used: 0 };
 }
 
 // ===== 正文图片视觉识别（L2）=====
@@ -35034,7 +35121,18 @@ async function runAdImageVision(env, options = {}) {
 
 	let used = quota.used;
 	let lastNote = '';
+	// 单轮时间预算，理由见 AD_VISION_ROUND_BUDGET_MS。
+	const roundStartedAt = Date.now();
+	const roundBudget = Number(options.roundBudgetMs) > 0 ? Number(options.roundBudgetMs) : AD_VISION_ROUND_BUDGET_MS;
+	let roundIndex = 0;
 	for (const row of rows) {
+		roundIndex += 1;
+		if (Date.now() - roundStartedAt >= roundBudget) {
+			stats.skipped = 'round_budget';
+			console.log('[广告检测·图片] 本轮用时到顶（' + Math.round((Date.now() - roundStartedAt) / 1000)
+				+ 's，已处理 ' + (roundIndex - 1) + '/' + rows.length + '），剩余留给下一轮');
+			break;
+		}
 		// 【批次内熔断】理由与头像轨完全相同：熔断标记原本只在函数开头查一次，
 		// 写进去之后本批剩余的图照样跑完，等于当批的熔断没拦住烧钱。每张图开头复核。
 		if ((await readVisionBreakState(env, nowSeconds)).broken) {
@@ -35090,6 +35188,7 @@ async function runAdImageVision(env, options = {}) {
 			stage = 'encode';
 			const image = 'data:' + mime + ';base64,' + bytesToBase64(new Uint8Array(buffer));
 			stage = 'ai.run';
+			await throttleAdVisionCall();
 			const judge = await runVisionJudge(env, image, CLEF_IMAGE_STATE);
 			if (!judge) throw new Error('clef 未返回判定');
 			verdict = judge.ad ? 'ad' : 'clean';
@@ -35109,6 +35208,9 @@ async function runAdImageVision(env, options = {}) {
 			// 这中间一个 Neurons 都没花（调用本身就被拒了）。
 			if (isVisionRateLimited(error)) {
 				stats.rateLimited += 1;
+				// 429 不熔断也不白花钱，但要留下次数 —— 否则「今天撞了多少次限流」
+				// 只能在跑批的那几分钟从日志里看，事后查不到。
+				await bumpAdScanCounter(env, adVisionRateLimitKey(Math.floor(Date.now() / 1000)), 1, Math.floor(Date.now() / 1000));
 				continue;
 			}
 			if (isVisionFileMissing(error)) {
@@ -35308,7 +35410,10 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 			+ ' 当日=' + (quota.used + 1) + '/' + dailyLimit);
 	} catch (error) {
 		// 429 是临时状态不是链路故障：不推熔断、不落库（理由见 runAdImageVision 同名分支）。
-		if (isVisionRateLimited(error)) return adImageMiss(base, 'ratelimit');
+		if (isVisionRateLimited(error)) {
+			await bumpAdScanCounter(env, adVisionRateLimitKey(Math.floor(Date.now() / 1000)), 1, Math.floor(Date.now() / 1000));
+			return adImageMiss(base, 'ratelimit');
+		}
 		if (isVisionFileMissing(error)) skipBump = true;
 		await logAdVisionFailure(env, '图片·实时', 'ai.run', key, error);
 	}
@@ -35794,7 +35899,10 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 			+ ' 头像=' + key.slice(0, 20) + ' 归属=' + (uid || '未知')
 			+ ' 当日=' + (quota.used + 1) + '/' + dailyLimit);
 	} catch (error) {
-		if (isVisionRateLimited(error)) return row || null;
+		if (isVisionRateLimited(error)) {
+			await bumpAdScanCounter(env, adVisionRateLimitKey(Math.floor(Date.now() / 1000)), 1, Math.floor(Date.now() / 1000));
+			return row || null;
+		}
 		if (isVisionFileMissing(error)) skipBump = true;
 		await logAdVisionFailure(env, '头像·实时', 'ai.run', key, error);
 		// 补读失败也记一次 ocr_at：两个模型都读不了的图，下条消息再读还是一样，
