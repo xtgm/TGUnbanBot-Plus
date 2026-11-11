@@ -14787,6 +14787,36 @@ async function runAdReviewActionGroup(env,row,options={}){
 	}finally{await env.DB.prepare("UPDATE ad_review_action_groups SET lease_until=0,lease_token='' WHERE group_key=? AND lease_token=?").bind(key,token).run();}
 }
 
+// ===== 观察记录重试：复用上次的模型结论（2026-11-12）=====
+//
+// 【治什么】线上一天烧掉 4603 次模型调用，其中 5107 次是【同一批记录的重试】：
+// 314 条记录、去重后的唯一载荷只有 307 个，93% 的调用是在重复问同一个问题。
+//
+// 三步叠加成死循环：
+//   ① runAdContentReviewSingle 重跑完整判定时写死 forceReview:true，绕过了
+//      judgeAdByLLM 的两级去重（内存 adLLMSeen + D1 的 llm_seen_*）；
+//   ② 入群记录的 next_at 被特判成最多 300 秒（见 15004 行附近），普通记录才是
+//      3 次后 24 小时；
+//   ③ resumeAdContentReviews 的捞取条件包含 status='waiting'，attempts 没有上限。
+// 于是「模型看过、但归为不确定」的记录每 5 分钟被重问一次，一直问到 attempts=51。
+//
+// 【为什么不能把 forceReview 直接改成 false】重试拿不到上一次的结论：
+// collectGlobalDryRunEvaluation 内部的 llmMemo 每次都是 {done:false}。关掉强制送审后，
+// 「上次判广告」的结论会丢；而送审了又会被 seen_d1 挡住，直接返回评分层结论。
+//
+// 【正确做法】把上次结论取出来复用。applyAdLLMToEvaluation 写入的 _adLlmMemo 会随
+// 记录一起落库（serializeAdDryRunEvaluation 完整序列化，不裁字段）。只要 memo.done=true，
+// 它就直接重放结论、不发起模型调用。
+//
+// 【只复用有效结论】调用失败和额度不足（skipped）都不算结论：复用它们会让记录永远
+// 停在「没判过」，额度恢复后也不会再试。这两类必须重新送审。
+function adReviewReusableMemo(evaluation) {
+	const memo = evaluation && evaluation._adLlmMemo;
+	if (!memo || memo.done !== true || !memo.answer) return null;
+	if (memo.answer.skipped === true) return null;
+	return memo;
+}
+
 async function runAdContentReview(env,id,options={}) {
 	if(id&&env?.DB&&!options.reviewExecution&&!options.batchId){
 		await ensureAdContentReviewTable(env);
@@ -14820,9 +14850,17 @@ async function runAdContentReviewSingle(env,id,options={}) {
 		return {complete:!existing||!['pending','waiting','processing','normal_intent','viewing','action_failed','learning_pending','learning_failed'].includes(existing.status)||Number(existing.expires_at)<=now,
 			...existing&&Number(existing.expires_at)>now&&['pending','waiting','processing','normal_intent','viewing','action_failed','learning_pending','learning_failed'].includes(existing.status)?{retryAfter:Math.max(1,Math.min(43200,Math.max(Number(existing.next_at),Number(existing.lease_until))-now))}:{} };}
 	let evaluation=null;
+	// 重试时可复用的上次模型结论（见 adReviewReusableMemo）。声明在 save 之前 ——
+	// save 写库时必须把它补回去，否则下一轮重试又读不到，等于白省。
+	let reusedMemo=null;
 	const save=async(status,nextAt=now)=>{
+		// 【2026-11-12】结论是「不是广告」且本次没有触发送审时，不会经过
+		// applyAdLLMToEvaluation，也就不会重新挂 _adLlmMemo。不补这一步，下一轮
+		// 又退回 forceReview:true 重新调用 —— 省下来的额度会原样烧回去。
+		const persisted=evaluation||JSON.parse(row.evaluation);
+		if(reusedMemo&&!persisted._adLlmMemo)persisted._adLlmMemo=reusedMemo;
 		const updated=await env.DB.prepare('UPDATE ad_content_reviews SET status=?,evaluation=?,attempts=attempts+1,next_at=?,lease_until=0,lease_token=\'\',updated_at=? WHERE id=? AND lease_token=? AND status=\'processing\'')
-			.bind(status,serializeAdDryRunEvaluation(evaluation||JSON.parse(row.evaluation)),nextAt,Math.floor(Date.now()/1000),id,token).run();
+			.bind(status,serializeAdDryRunEvaluation(persisted),nextAt,Math.floor(Date.now()/1000),id,token).run();
 		return Number(updated?.meta?.changes)===1;
 	};
 	try {
@@ -14966,9 +15004,12 @@ async function runAdContentReviewSingle(env,id,options={}) {
 		const human=!retryingAction&&!assisted&&row.decision==='ad'?await buildHumanAdReview(env,row):null;
 		const known=retryingAction?original:assisted?{...original,verdict:'ban',positionHardBan:true,positionHardBase:true,
 			reasons:[...(original.reasons||[]),'本次辅助核验：'+assisted.reason]}:human?.evaluation;
+		// 【2026-11-12】上次已经问过模型、且拿到的是有效结论（不是额度不足 / 调用失败），
+		// 这次重试直接复用，不再花钱重问。只有从未判过、或上次没拿到结论时才强制送审。
+		reusedMemo=adReviewReusableMemo(original);
 		const result=known?{evaluation:known,config:loadAdDetectionConfig(env),whitelist:await loadAdDomainWhitelist(env)}
 			:await collectGlobalDryRunEvaluation(env,message,null,{normalDetection:true,scopeChatId:gid,source:message.adJoinRequest?'join_request':'content_retry',refreshProfile:true,
-				...(isAdJoinGuardMessage(message)?{reviewPool:'join'}:{}),forceReview:true,forceMaterialReview:options.forceMaterialReview===true,profile:options.profile});
+				...(isAdJoinGuardMessage(message)?{reviewPool:'join'}:{}),forceReview:!reusedMemo,llmMemo:reusedMemo||undefined,forceMaterialReview:options.forceMaterialReview===true,profile:options.profile});
 		evaluation=result.evaluation;
 		if(original.reviewRouting)evaluation.reviewRouting={...original.reviewRouting};
 		if(original.reviewDuplicate?.automatic)evaluation.reviewDuplicate=original.reviewDuplicate;
@@ -15026,7 +15067,7 @@ async function resumeAdContentReviews(env) {
 	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',next_at=?,evaluation=json_set(evaluation,'$.reviewRouting.lane','background') WHERE status='manual' AND decision='' AND lease_until<=? AND expires_at>? AND json_valid(evaluation)").bind(now,now,now).run();
 	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',review_sources='[]',next_at=?,lease_until=0,lease_token='' WHERE status='viewing' AND decision='' AND lease_until<=? AND expires_at>?").bind(now,now,now).run();
 	const readyChild="(json_extract(evaluation,'$.reviewDuplicate.automatic')=1 AND NOT EXISTS (SELECT 1 FROM ad_content_reviews parent WHERE parent.id=json_extract(ad_content_reviews.evaluation,'$.reviewDuplicate.representativeId') AND parent.expires_at>? AND parent.status IN ('pending','waiting','processing','viewing','normal_intent','action_failed')))";
-	const rows=(await env.DB.prepare('SELECT id,user_id,chat_id,CASE WHEN '+AD_REVIEW_ACTION_RETRY_CONDITION+' THEN 1 ELSE 0 END AS grouped FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\',\'learning_pending\',\'learning_failed\') AND (status=\'action_failed\' OR '+AD_REVIEW_REPRESENTATIVE_CONDITION+' OR '+readyChild+') AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY next_at LIMIT 20').bind(now,now,now,now).all()).results||[];
+	const rows=(await env.DB.prepare('SELECT id,user_id,chat_id,CASE WHEN '+AD_REVIEW_ACTION_RETRY_CONDITION+' THEN 1 ELSE 0 END AS grouped FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\',\'learning_pending\',\'learning_failed\') AND (status=\'action_failed\' OR '+AD_REVIEW_REPRESENTATIVE_CONDITION+' OR '+readyChild+') AND (source=\'operator\' OR attempts<8) AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY next_at LIMIT 20').bind(now,now,now,now).all()).results||[];
 	let queued=0;const users=new Set();for(const row of rows){
 		const key=JSON.stringify([row.user_id,row.chat_id]);if(row.grouped&&users.has(key))continue;
 		if(await queueAdContentReview(env,row.id,1)){queued++;if(row.grouped)users.add(key);}
