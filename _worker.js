@@ -14645,7 +14645,7 @@ async function saveAdContentReview(env, message, evaluation, options = {}) {
 	const status=operator?'learning_pending':learningFailed?'learning_failed':actionFailed?'action_failed':'pending';
 	await env.DB.prepare('INSERT INTO ad_content_reviews (id,user_id,chat_id,source,message_json,evaluation,status,next_at,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) '
 		+ 'ON CONFLICT(id) DO UPDATE SET message_json=excluded.message_json,evaluation=excluded.evaluation,status=excluded.status,next_at=excluded.next_at,updated_at=excluded.updated_at '
-		+ 'WHERE ad_content_reviews.status IN (\'pending\',\'waiting\',\'manual\',\'partial\',\'clean\',\'action_failed\') AND ad_content_reviews.decision=\'\' AND ad_content_reviews.lease_until<=?')
+		+ 'WHERE ad_content_reviews.status IN (\'pending\',\'waiting\',\'manual\',\'partial\',\'clean\',\'action_failed\') AND ad_content_reviews.decision=\'\' AND NOT (ad_content_reviews.source<>\'operator\' AND ad_content_reviews.attempts>=8 AND json_valid(ad_content_reviews.evaluation) AND json_extract(ad_content_reviews.evaluation,\'$._adLlmMemo.answer.skipped\') IS 1) AND ad_content_reviews.lease_until<=?')
 		.bind(id,uid,gid,source,serialized,serializeAdDryRunEvaluation(evaluation),status,operator?now:now+retryDelay,now,now,now+7*86400,now).run();
 	if(status==='pending'){
 		const current=await env.DB.prepare('SELECT * FROM ad_content_reviews WHERE id=?').bind(id).first();
@@ -14844,9 +14844,19 @@ async function runAdContentReviewSingle(env,id,options={}) {
 	await ensureAdContentReviewTable(env);
 	const now=Math.floor(Date.now()/1000),token=crypto.randomUUID();
 	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',review_sources='[]',lease_until=0,lease_token='',next_at=? WHERE id=? AND status='viewing' AND decision='' AND lease_until<=?").bind(now,id,now).run();
-	const row=await env.DB.prepare('UPDATE ad_content_reviews SET status=\'processing\',lease_until=?,lease_token=? WHERE id=? AND status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\',\'learning_pending\',\'learning_failed\') AND next_at<=? AND lease_until<=? AND expires_at>? RETURNING *')
+	// 【2026-11-12 补】模型判 skipped 且已试满 8 次的自动记录不再 lease。
+	// 动作失败 / 学习失败 / 资料失败的重试不带着「模型已给结论」的语义，一条都不挡：
+	// 挡了会让「禁言成功但成员仍能发言」这类案子的续办停在半路（test_join_guard 覆盖）。
+	const row=await env.DB.prepare('UPDATE ad_content_reviews SET status=\'processing\',lease_until=?,lease_token=? WHERE id=? AND status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\',\'learning_pending\',\'learning_failed\') AND NOT (status NOT IN (\'action_failed\',\'learning_failed\',\'learning_pending\') AND source<>\'operator\' AND attempts>=8 AND json_valid(evaluation) AND json_extract(evaluation,\'$._adLlmMemo.answer.skipped\') IS 1) AND next_at<=? AND lease_until<=? AND expires_at>? RETURNING *')
 		.bind(now+900,token,id,now,now,now).first();
-	if(!row){const existing=await env.DB.prepare('SELECT status,next_at,lease_until,expires_at FROM ad_content_reviews WHERE id=?').bind(id).first();
+	if(!row){const existing=await env.DB.prepare('SELECT status,next_at,lease_until,expires_at,attempts,source,evaluation FROM ad_content_reviews WHERE id=?').bind(id).first();
+		// 【2026-11-12 补】模型明确判「额度不足 / 跳过」且已试满 8 次的自动记录，不再重跑。
+		// 队列消息（ad_content_review）直接带 id 进来，绕过 resume 的 SQL；不在这里收口，
+		// 这批 skipped 记录会每 30 秒重新送审一次，额度一恢复就原样烧回去。
+		// 资料获取失败、动作失败、人工学习都没有 skipped 结论，保持原有重试语义，不受此限。
+		const capped = existing && existing.source !== 'operator' && Number(existing.attempts) >= 8
+			&& (() => { try { const m = JSON.parse(existing.evaluation || '{}')._adLlmMemo; return m?.done === true && m?.answer?.skipped === true; } catch (e) { return false; } })();
+		if (capped) return { complete: true, attemptCap: true };
 		return {complete:!existing||!['pending','waiting','processing','normal_intent','viewing','action_failed','learning_pending','learning_failed'].includes(existing.status)||Number(existing.expires_at)<=now,
 			...existing&&Number(existing.expires_at)>now&&['pending','waiting','processing','normal_intent','viewing','action_failed','learning_pending','learning_failed'].includes(existing.status)?{retryAfter:Math.max(1,Math.min(43200,Math.max(Number(existing.next_at),Number(existing.lease_until))-now))}:{} };}
 	let evaluation=null;
