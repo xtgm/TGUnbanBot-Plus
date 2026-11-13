@@ -15982,26 +15982,85 @@ async function ensureAdSpamTextsTable(env) {
 
 // 第一主人回复广告 /spam 时调用：把被举报消息的正文写进同款直封名单。
 // 与 moderation_messages 用同一个 buildModerationTextKey 取哈希与归一化正文，保证两边比对口径一致。
-async function recordSpamText(env, repliedMsg) {
+// 写入同款直封名单。返回值供回执显示，主人不用翻 Worker 日志才知道学没学到：
+//   { ok:true, norm } / { ok:false, reason, norm }
+// 三道闸（短文案 / 无广告证据 / 建表失败）此前全是静默 return ——
+// 线上表现就是「第一主人 /spam 过同款，广告照发不误」，而回执里一个字都看不出来。
+async function recordSpamText(env, repliedMsg, options = {}) {
 	const key = buildModerationTextKey(repliedMsg);
+	if (!key) return { ok: false, reason: '取不到正文（纯图片/贴纸或无文字）', norm: '' };
+	const norm = String(key.norm);
 	// 与已处置名单同一道短文案门槛：不到 6 个字不记，防止「你好」「在吗」误伤。
-	if (!key || String(key.norm).length < 6) return;
+	if (norm.length < 6) return { ok: false, reason: '正文不足 6 字', norm };
 	// 模板资格闸（2026-10-17）：正文自身没有广告证据 → 不进同款直封名单。
 	// 名单就是模板，口径与 findLinkedSpamTargets 完全一致：不查词表，只看正文分。
 	// 挡的是「节点订阅链接」这类长技术词（能过 6 字门槛，但正文自身 0 分）。
-	if (!isAdBearingText(key.norm)) return;
-	if (!(await ensureAdSpamTextsTable(env))) return;
+	if (!isAdBearingText(norm)) return { ok: false, reason: '正文自身没有广告证据', norm };
+	if (!(await ensureAdSpamTextsTable(env))) return { ok: false, reason: '名单表初始化失败', norm };
 	const now = Date.now();
 	try {
 		await env.DB.prepare(
 			'INSERT INTO ad_spam_texts (text_hash, text_norm, at) VALUES (?, ?, ?) '
 			+ 'ON CONFLICT(text_hash) DO UPDATE SET text_norm = excluded.text_norm, at = excluded.at'
-		).bind(key.hash, key.norm, now).run();
-		// 顺手清过期行：只在写入（即第一主人 /spam）时做，不占普通发言的热路径。
-		await env.DB.prepare('DELETE FROM ad_spam_texts WHERE at < ?').bind(now - AD_SPAM_TEXTS_TTL_MS).run();
+		).bind(key.hash, norm, now).run();
+		// 顺手清过期行：只在写入时做，不占普通发言的热路径。
+		// 批量学习（一次写 5 条）传 prune:false，循环结束后统一清一次，省掉重复的 D1 往返。
+		if (options?.prune !== false) {
+			await env.DB.prepare('DELETE FROM ad_spam_texts WHERE at < ?').bind(now - AD_SPAM_TEXTS_TTL_MS).run();
+		}
+		return { ok: true, norm };
 	} catch (error) {
 		console.error('[同款直封] 写入名单失败:', error?.message || error);
+		return { ok: false, reason: '写入失败', norm };
 	}
+}
+
+// 第一主人手动指令（/spam <ID>、/ban、/sban，含批量）补写同款名单。
+// 【为什么必须补这一条】回复式 /spam 一直会写名单，而日常主力是 /spam <ID> ——
+// 线上七天 ad_spam_texts 里的 148 行全部来自回复式，TGID 模式一行都没有。
+// 名单没写 → 同款直封永不触发 → 主人看到的就是「同类广告的用户都不封」。
+// 逐条写入而不是拼成一整段：缓存里是该用户最近 5 条发言，拼起来是一个新 key，
+// 之后别人单发其中一条永远匹配不上（与 loadRecentUserAdText 的多行拼接是两回事）。
+// seeds：调用方手上已有正文（回复式 /spam 的引用消息、/ban 的引用正文）时直接传；
+// cached：调用方已读过缓存列表时直接复用，省掉一次 D1 往返，也避免两次查询之间缓存变动。
+// 两者与内部读取的缓存列表合并去重 —— /ban 群内路径的缓存会被清扫删掉，正文必须提前取好。
+async function learnSpamTextsFromCache(env, userId, { seeds = null, cached: preloaded = null } = {}) {
+	const cached = Array.isArray(preloaded) ? preloaded : await loadRecentUserAdTextList(env, userId);
+	const merged = [];
+	const seen = new Set();
+	for (const raw of [...(Array.isArray(seeds) ? seeds : []), ...cached]) {
+		const text = String(raw || '').trim();
+		if (!text || seen.has(text)) continue;
+		seen.add(text);
+		merged.push(text);
+	}
+	const out = { added: 0, rejected: [], total: merged.length };
+	for (const text of merged) {
+		const r = await recordSpamText(env, { text }, { prune: false });
+		if (r.ok) out.added += 1;
+		else if (r.reason) out.rejected.push(r.reason);
+	}
+	// 过期行统一清一次（recordSpamText 单条调用时自己会清，这里批量写省掉重复往返）。
+	if (out.added > 0) {
+		try {
+			await env.DB.prepare('DELETE FROM ad_spam_texts WHERE at < ?').bind(Date.now() - AD_SPAM_TEXTS_TTL_MS).run();
+		} catch (error) {
+			console.error('[同款直封] 清理过期名单失败:', error?.message || error);
+		}
+	}
+	return out;
+}
+
+// 回执行：学没学到、为什么没学到，一句话说清。一条都没收录且没有具体原因时不发。
+// 失败也要发：回执里看不见原因，主人就还是「不知道为什么同款不封」——这正是本次修的症状。
+function renderSpamTextLearnLine(result) {
+	if (!result) return '';
+	const added = Number(result.added) || 0;
+	const why = [...new Set(result.rejected || [])].slice(0, 2).join('；');
+	if (added > 0) return '📇 同款名单:已收录 ' + added + ' 条文案（一周内同款直封，无需再 /spam）';
+	if (why) return '📇 同款名单:未收录（' + why + '）';
+	if (Number(result.total) > 0) return '📇 同款名单:未收录（正文不合格）';
+	return '';
 }
 
 // 返回 { spamHit, norm }：spamHit = 这条消息的正文命中了同款直封名单（第一主人一周内 /spam 过）。
@@ -19515,13 +19574,24 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				// 来不及引用」这种最常见的场景，一个字都学不到。
 				// 【2026-10-15 乙】改成从消息缓存捞该用户最近的发言 ——
 				// 缓存保留期已改成 7 天（MSG_CACHE_RETENTION_DAYS），那里有原文。
-				const spamIdTextForLearn = await loadRecentUserAdText(env, valid[0]);
+				// 列表只查一次：join 后的文本给 learnAdFromOperatorAction（与改动前逐字一致），
+				// 逐条列表直接交给同款名单写入 —— 少一次 D1 往返，也避免两次查询之间缓存变动。
+				const spamIdTextList = await loadRecentUserAdTextList(env, valid[0]);
+				const spamIdTextForLearn = spamIdTextList.join('\n').slice(0, 1000);
 				const spamIdLearn = await learnAdFromOperatorAction(env, valid[0], message, {
 					source: 'spam',
 					createdBy: String(operatorId ?? ''),
 					text: spamIdTextForLearn
 				});
 				lines.push(...renderAdLearnLines(spamIdLearn, 'spam'));
+				// 【同款名单补齐】线上七天 ad_spam_texts 的 148 行全部来自回复式 /spam，
+				// /spam <ID> 一行都没有 → 同款直封永不触发。这里把缓存里的发言逐条写进名单。
+				// 只收第一主人：与回复式 /spam 同一道门（副主人不写）。
+				if (isPrimaryOwner(operatorId)) {
+					const spamTextLearn = await learnSpamTextsFromCache(env, valid[0], { cached: spamIdTextList });
+					const spamTextLearnLine = renderSpamTextLearnLine(spamTextLearn);
+					if (spamTextLearnLine) lines.push(spamTextLearnLine);
+				}
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
 					flashText = `${result.success ? '✅ 已加黑并全群禁言' : '⚠️ 已在黑名单，已继续全群禁言'}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
 				} else {
@@ -19558,6 +19628,24 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				await recordDisposalsFromBanResults(env, banResults);
 			}
 			const failedCount = invalid.length + results.failed.length;
+			// 批量 /spam 的同款名单补齐：放后台跑（逐个目标读缓存 + 写名单，串行会拖慢回执），
+			// 回执行先按「提交情况」给出状态，不让主人等。只收第一主人，与单条同一道门。
+			let spamBatchLearnLine = '';
+			if (isPrimaryOwner(operatorId) && idsToKick.length) {
+				const learnTargets = [...idsToKick];
+				const learnTask = (async () => {
+					const sum = { added: 0, rejected: [], total: 0 };
+					for (const id of learnTargets) {
+						const one = await learnSpamTextsFromCache(env, id);
+						sum.added += one.added;
+						sum.total += one.total;
+						sum.rejected.push(...one.rejected);
+					}
+					return sum;
+				})();
+				if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(learnTask);
+				spamBatchLearnLine = '📇 同款名单:已提交 ' + learnTargets.length + ' 个目标的后台收录';
+			}
 			const flashText = `✅ 批量加黑(/spam)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`
 				+ (idsToKick.length ? '\n' + idsToKick.map((id) => `· ${formatBatchUserTarget(id, userProfiles)}`).join('\n') : '');
 			const baseDetail = renderBatchAddResult(results, invalid, banSummary, userProfiles);
@@ -19578,6 +19666,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				}
 				fullDetail += `\n\n<b>逐用户 Telegram 群封禁/预封明细</b>:\n\n${perUserBlocks.join('\n\n')}`;
 			}
+			if (spamBatchLearnLine) fullDetail = spamBatchLearnLine + '\n' + fullDetail;
 			await replyToModerationAdmin(message, ctx, {
 				flashText,
 				detailText: withActionContext(message, fullDetail, note),
@@ -19659,6 +19748,8 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			let spamSampleAdded = 0;
 			let spamEnriched = 0;
 			let spamLearnResult = null;
+			// 提到 try 外：下面的同款名单写入要用它，而它由 try 内计算（学习失败时仍要能写名单）。
+			let spamTextForLearn = '';
 			try {
 			// 学习逻辑已抽成 learnAdFromOperatorAction（/spam /ban /sban 三条命令共用），
 			// 这里只传【引用的那条消息】+ source='spam'，三段内容与改动前逐字一致。
@@ -19672,7 +19763,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			const spamOwnTextForLearn = String(repliedMsg.text || repliedMsg.caption
 				|| extractAdChecklistText(repliedMsg) || '').trim();
 			const spamWebPageForLearn = extractAdWebPageText(repliedMsg);
-			const spamTextForLearn = [spamOwnTextForLearn, spamWebPageForLearn]
+			spamTextForLearn = [spamOwnTextForLearn, spamWebPageForLearn]
 				.filter(Boolean).join(' ').trim();
 			const spamLearn = await learnAdFromOperatorAction(env, repliedUserId, repliedMsg, {
 				source: 'spam',
@@ -19705,16 +19796,23 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			// 今天那次误封（管理员回复「广告」封了 14 个群）正是触发权开给群管理员的后果。
 			// 副主人 / 群管理员的 /spam 照常执行加黑 + 封禁 + 学指纹，只是不连带。
 			// 非第一主人【完全静默】：不提示、不在群里留任何痕迹，不暴露这个能力的存在。
-			try {
-				const linkedKey = isPrimaryOwner(operatorId) ? buildModerationTextKey(repliedMsg) : null;
-				// 【同款直封】第一主人回复广告 /spam → 文案写进两份名单（均保留一周）：
-				//   ad_spam_texts    —— 同款直封：广告号之后直发同款 → 发言时即删除 + 封禁，不需二次 /spam
-				//   ad_handled_texts —— 重发只删：机器人贴原文 / 群友带引用回复 → 只删不封
-				// 只收第一主人：副主人 / 超管 / 群管理员的 /spam 不写名单（与连带同一道门）。
-				if (isPrimaryOwner(operatorId)) {
-					await recordSpamText(env, repliedMsg);
-					await recordHandledAdText(env, repliedMsg?.text ?? repliedMsg?.caption ?? '');
-				}
+			// 【同款名单 · 同步】第一主人回复广告 /spam → 文案写进两份名单（均保留一周）：
+			//   ad_spam_texts    —— 同款直封：广告号之后直发同款 → 发言时即删除 + 封禁，不需二次 /spam
+			//   ad_handled_texts —— 重发只删：机器人贴原文 / 群友带引用回复 → 只删不封
+			// 只收第一主人：副主人 / 超管 / 群管理员的 /spam 不写名单（与连带同一道门）。
+			// 【为什么这一段同步、连带却后台】写入只有几条 D1 小 SQL，换来回执里「学没学到」可见；
+			// 而连带是 20 人 × 14 群的串行 HTTP，正是「/spam 回执很慢」的来源，必须挪到后台。
+			if (isPrimaryOwner(operatorId)) {
+				const spamTextLearn = await learnSpamTextsFromCache(env, repliedUserId, { seeds: [spamTextForLearn] });
+				const spamTextLearnLine = renderSpamTextLearnLine(spamTextLearn);
+				if (spamTextLearnLine) lines.push(spamTextLearnLine);
+				await recordHandledAdText(env, repliedMsg?.text ?? repliedMsg?.caption ?? '');
+				// 连带处置整块移入 ctx.waitUntil：findLinkedSpamTargets 反查 + 受保护过滤 +
+				// enforceLinkedSpamTargets（串行 deleteMessage/addToBlacklist/banUserFromAllGroups）。
+				// 下面的函数体沿用原来的缩进层级（整块搬运，刻意不重排，减少 diff 出错面）。
+				const linkedKey = buildModerationTextKey(repliedMsg);
+				const runLinkedSpam = async () => {
+				try {
 				if (linkedKey) {
 					const found = await findLinkedSpamTargets(env, linkedKey, repliedUserId);
 					// 受保护角色（超管 / 任一配置群群主·管理员 / 主副主人）永不被连带封禁：入队前剔除。
@@ -19783,6 +19881,21 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			} catch (error) {
 				// 连带失败绝不影响 /spam 本职（当事人的加黑 + 封禁 + 清扫早已完成）。
 				console.error('[同款连带] 执行失败:', error);
+			}
+				};
+				// 状态行【只私聊第一主人，绝不进 lines】：
+				// lines 走 detailText，会同时投给副主人与来源群，而连带能力按既定口径
+				// 「仅第一主人可见、不在群里留痕迹」。用私聊单独发一条，回执本身照旧立即返回。
+				// 此前这一行不存在，主人只看到慢，看不出连带到底执行了没有。
+				let linkedStatusText = '';
+				if (linkedKey) {
+					linkedStatusText = '🔗 同款:后台查杀中，结果单独私聊';
+					if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(runLinkedSpam());
+					else await runLinkedSpam();
+				} else {
+					linkedStatusText = '🔗 同款:本条没有可反查的正文（图片/贴纸或无文字），未启动连带';
+				}
+				await sendTelegramMessage(String(operatorId), linkedStatusText);
 			}
 
 			await replyToModerationAdmin(message, ctx, {
@@ -20719,7 +20832,11 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				// 私聊路径不清扫，所以只有群内 /ban 会踩到这一点。
 				// 读出来的正文在下面交给 learnAdFromOperatorAction。
 				// 引用时被引用的那条就是广告原文，优先学它（缓存里不一定有，比如刚发就被引用）。
-				const banIdTextForLearn = replyTarget?.text || await loadRecentUserAdText(env, valid[0]);
+				// 【逐条列表必须在清扫前整批读走】清扫会 DELETE 掉本群缓存，晚读一步就是空数组。
+				// 列表用于同款名单逐条写入（保留每条正文的原始换行，不经过 join/split 的二次加工）；
+				// join 后的文本仍旧交给 learnAdFromOperatorAction，与改动前逐字一致。
+				const banIdTextList = replyTarget?.text ? [] : await loadRecentUserAdTextList(env, valid[0]);
+				const banIdTextForLearn = replyTarget?.text || banIdTextList.join('\n').slice(0, 1000);
 				// 引用时被引用的那条一并撤回（与 /spam 引用同口径：作为清扫的兜底 ID，清扫内部去重）。
 				const cleanupResult = isInGroup
 					? await cleanupCurrentChatUserMessages(env, chatId, valid[0], replyTarget?.messageId ? [replyTarget.messageId] : [])
@@ -20746,6 +20863,17 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 					text: banIdTextForLearn
 				});
 				lines.push(...renderAdLearnLines(manualLearn, isSban ? 'sban' : 'ban'));
+				// 【同款名单补齐】/ban、/sban 与 /spam <ID> 同一缺口：只学指纹不写名单。
+				// 引用时用被引用正文，否则用清扫前读走的缓存正文（banIdTextForLearn 可能是多行，
+				// learnSpamTextsFromCache 内部会与缓存列表合并、去重、逐条写）。
+				if (isPrimaryOwner(operatorId)) {
+					const banTextSeeds = replyTarget?.text
+						? [String(replyTarget.text).trim()].filter(Boolean)
+						: banIdTextList;
+					const banTextLearn = await learnSpamTextsFromCache(env, valid[0], { seeds: banTextSeeds });
+					const banTextLearnLine = renderSpamTextLearnLine(banTextLearn);
+					if (banTextLearnLine) lines.push(banTextLearnLine);
+				}
 				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: commandName }));
 				if (cleanupResult) {
 					lines.push(renderCurrentChatCleanupResult(cleanupResult));
@@ -20796,6 +20924,23 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			await recordDisposalsFromBanResults(env, banResults);
 		}
 		const failedCount = invalid.length + results.failed.length;
+		// 批量 /ban、/sban 的同款名单补齐：与批量 /spam 同口径 —— 放后台，回执不等人。
+		let banBatchLearnLine = '';
+		if (isPrimaryOwner(operatorId) && idsToKick.length) {
+			const learnTargets = [...idsToKick];
+			const learnTask = (async () => {
+				const sum = { added: 0, rejected: [], total: 0 };
+				for (const id of learnTargets) {
+					const one = await learnSpamTextsFromCache(env, id);
+					sum.added += one.added;
+					sum.total += one.total;
+					sum.rejected.push(...one.rejected);
+				}
+				return sum;
+			})();
+			if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(learnTask);
+			banBatchLearnLine = '📇 同款名单:已提交 ' + learnTargets.length + ' 个目标的后台收录';
+		}
 		const flashText = `✅ 批量加黑(${commandName})：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`
 			+ (idsToKick.length ? '\n' + idsToKick.map((id) => `· ${formatBatchUserTarget(id, userProfiles)}`).join('\n') : '');
 		// 详细 detailText：批量汇总 + 每个用户的逐群明细
@@ -20817,6 +20962,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			}
 			fullDetail += `\n\n<b>逐用户 Telegram ${isSban ? '群踢出' : '禁言/踢出'}明细</b>:\n\n${perUserBlocks.join('\n\n')}`;
 		}
+		if (banBatchLearnLine) fullDetail = banBatchLearnLine + '\n' + fullDetail;
 		await replyToModerationAdmin(message, ctx, {
 			flashText,
 			detailText: withActionContext(message, fullDetail, note),
@@ -27691,20 +27837,26 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 // 【失败一律返回空串】正文只是学习的一个来源，捞不到就退回「只学资料卡」，
 // 绝不能因为一次 D1 抖动让 /spam 的加黑与封禁失败。
 async function loadRecentUserAdText(env, userId) {
+	const texts = await loadRecentUserAdTextList(env, userId);
+	return texts.join('\n').slice(0, 1000);
+}
+
+// 逐条返回该用户最近 5 条发言（同 loadRecentUserAdText 的取数口径），供同款名单逐条写入。
+// 逐条写是必须的：join 成一段之后 hash 与任何单条都对不上，名单就永远命不中。
+async function loadRecentUserAdTextList(env, userId) {
 	const uid = String(userId || '');
-	if (!env?.DB || !uid) return '';
+	if (!env?.DB || !uid) return [];
 	try {
 		const rows = await env.DB.prepare(
 			"SELECT text_norm FROM moderation_messages WHERE from_id = ? "
 			+ "AND text_norm IS NOT NULL AND text_norm != '' ORDER BY id DESC LIMIT 5"
 		).bind(uid).all();
-		const texts = (rows?.results || [])
+		return (rows?.results || [])
 			.map((row) => String(row?.text_norm || '').trim())
 			.filter(Boolean);
-		return texts.join('\n').slice(0, 1000);
 	} catch (error) {
 		console.error('[广告检测] 读缓存正文失败:', error);
-		return '';
+		return [];
 	}
 }
 
