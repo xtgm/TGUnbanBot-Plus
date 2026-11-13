@@ -34086,6 +34086,13 @@ const AD_VISION_MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 // 只有「判过但失败」（verdict 仍是 pending）的图才会等到冷却期满再试一次。
 // 24 小时对应每天 cron 两次只重试一次：88 张失败图约 352 Neurons，占日预算 10000 的 3.5%。
 const AD_VISION_RETRY_COOLDOWN_SEC = 24 * 60 * 60;
+// 【2026-11-13 方案 A】同一个 file_unique_id 累计 3 次「文件永久失效」后，
+// 把 vision_checked_at 推到十年后，移出识别队列。
+// 口径：file_unique_id 标识的是【同一张图】—— 用户换头像会拿到新的
+// file_unique_id，不会继承旧图的失败次数，所以不存在误伤新头像。
+// verdict 保持 pending、台账与数据都不删，手动审查照常可见。
+const AD_VISION_FILE_MISSING_PARK_AFTER = 3;
+const AD_VISION_PARK_AHEAD_SEC = 10 * 365 * 24 * 60 * 60;
 // 单轮 cron 最多推理多少张。取「日预算 ÷ 每天轮次」，正好让两轮吃完 300：
 // crons 是每天 2 次（03:17 / 15:17），设 100 的话日预算永远用不完，
 // 配置上限与实际消耗对不上，看板上「当日 x/300」会一直停在 200 以下。
@@ -34741,7 +34748,7 @@ async function logAdVisionFailure(env, kind, stage, id, error, skipped = false) 
 		+ ' errorString=' + String(error).slice(0, 200)
 		+ ' stack=' + String(error?.stack || '').replace(/\s+/g, ' ').slice(0, 300));
 	const key = String(id || '').trim();
-	if (!env?.DB || !key) return;
+	if (!env?.DB || !key) return 0;
 	try {
 		const now = Math.floor(Date.now() / 1000);
 		await env.DB.prepare(
@@ -34751,9 +34758,14 @@ async function logAdVisionFailure(env, kind, stage, id, error, skipped = false) 
 			+ 'error_name = excluded.error_name, error_message = excluded.error_message, '
 			+ 'fail_count = ad_vision_failures.fail_count + 1, last_at = excluded.last_at'
 		).bind(key, String(kind || ''), String(stage || ''), name, message.slice(0, 300), now, now).run();
+		// 回读累计次数，供「文件失效 N 次后移出队列」判断。多一次点查只发生在
+		// 失败路径上，成功判定不经过这里，对日常开销没有影响。
+		const row = await env.DB.prepare('SELECT fail_count FROM ad_vision_failures WHERE target_id = ?').bind(key).first();
+		return Number(row?.fail_count) || 0;
 	} catch (writeError) {
 		// 台账写失败绝不能反过来把识别主链路带崩 —— 它是可观测性，不是主流程。
 		console.error('[广告检测·视觉] 失败台账写入失败:', writeError);
+		return 0;
 	}
 }
 
@@ -34829,7 +34841,7 @@ async function bumpVisionBreakState(env, ok, nowSeconds) {
 }
 
 async function runAdAvatarVision(env, options = {}) {
-	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0, skippedMissing: 0, skippedUnsupported: 0 };
+	const stats = { queued: 0, done: 0, ad: 0, clean: 0, failed: 0, skipped: '', skippedLarge: 0, rateLimited: 0, skippedMissing: 0, skippedUnsupported: 0, parked: 0 };
 	if (!env?.DB) { stats.skipped = 'no_db'; return stats; }
 	if (!(await adDetectionReady(env))) { stats.skipped = 'not_ready'; return stats; }
 
@@ -34912,6 +34924,8 @@ async function runAdAvatarVision(env, options = {}) {
 		let stage = 'init';
 		// 文件永久失效时置位：这种失败不推熔断（见 isVisionFileMissing 注释）。
 		let skipBump = false;
+		// 方案 A：文件失效累计到阈值后，本张写远期 vision_checked_at（0 表示照常推进）。
+		let parkUntil = 0;
 		try {
 			stage = 'getFile';
 			// 与全文件其它 Telegram 调用同一写法（项目没有通用封装，一律直连 fetch）。
@@ -34999,7 +35013,14 @@ async function runAdAvatarVision(env, options = {}) {
 			if (isVisionFileMissing(error)) {
 				stats.skippedMissing += 1;
 				skipBump = true;
-				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error, true);
+				const failCount = await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error, true);
+				// 【方案 A】同一张图累计 3 次失效就不再进队列 —— 文件本身没了，
+				// 再试一百次结果一样，只会占批次、刷台账。远期值不影响手动审查。
+				if (failCount >= AD_VISION_FILE_MISSING_PARK_AFTER) {
+					parkUntil = Math.floor(Date.now() / 1000) + AD_VISION_PARK_AHEAD_SEC;
+					stats.parked += 1;
+					console.warn('[广告检测·头像] 文件失效累计 ' + failCount + ' 次，移出识别队列 id=' + String(row.file_unique_id || ''));
+				}
 			} else if (isVisionUnsupportedFormat(error)) {
 				// 【不是位图】与「文件失效」同款处置：失败发生在 ai.run【之前】（sniff 那一步），
 				// 一个 Neurons 都没花，重判一百次结果还是一样 —— 它证明不了链路坏了，
@@ -35017,7 +35038,7 @@ async function runAdAvatarVision(env, options = {}) {
 			await upsertAdAvatar(env, row.file_unique_id, {
 				verdict,
 				source: verdict === 'pending' ? null : 'vision',
-				visionCheckedAt: Math.floor(Date.now() / 1000),
+				visionCheckedAt: parkUntil || Math.floor(Date.now() / 1000),
 				ocrText,
 				ocrAt,
 				ocrVerdict: verdict === 'ad' || verdict === 'clean' ? verdict : ''
@@ -35811,6 +35832,10 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 	// 主人拍过板的结论不让模型再改。
 	const isReread = Boolean(row) && String(row.verdict || '') !== 'pending';
 	if (row) {
+		// 【方案 A】已移出识别队列的 pending 头像（vision_checked_at 在远期），
+		// 实时路径也不再重试 —— 同一张图文件已永久失效，每条消息取一次只是白跑。
+		// 换头像会得到新的 file_unique_id，不受这里影响；判过的图 isReread 为真也不受影响。
+		if (!isReread && Number(row.vision_checked_at) > Math.floor(Date.now() / 1000) + AD_VISION_RETRY_COOLDOWN_SEC) return row;
 		if(options.forceContent!==true&&isReread&&Number(row.ocr_at)>0&&!['ad','clean'].includes(String(row.ocr_verdict||''))
 			&&Math.floor(Date.now()/1000)-Number(row.ocr_at)<AD_VISION_RETRY_COOLDOWN_SEC)return {...row,missReason:'ocr_retry_cooldown'};
 		// pending 但没有可下载句柄的，退回旧行为 —— 那种当下判不了，只能先登记着。
@@ -35849,6 +35874,8 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 	let contentResult = null;
 	let capturedAvatar = null;
 	let skipBump = false;
+	// 方案 A：文件失效累计到阈值后，写远期 vision_checked_at（0 表示照常推进）。
+	let parkUntil = 0;
 	try {
 		const askFile = async (id) => {
 			const resp = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getFile', {
@@ -35905,7 +35932,11 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 			return row || null;
 		}
 		if (isVisionFileMissing(error)) skipBump = true;
-		await logAdVisionFailure(env, '头像·实时', 'ai.run', key, error);
+		const failCount = await logAdVisionFailure(env, '头像·实时', 'ai.run', key, error);
+		if (isVisionFileMissing(error) && failCount >= AD_VISION_FILE_MISSING_PARK_AFTER) {
+			parkUntil = Math.floor(Date.now() / 1000) + AD_VISION_PARK_AHEAD_SEC;
+			console.warn('[头像实时判定] 文件失效累计 ' + failCount + ' 次，移出识别队列 id=' + key);
+		}
 		// 补读失败也记一次 ocr_at：两个模型都读不了的图，下条消息再读还是一样，
 		// 不能让同一张图每条消息都烧一次额度。
 		if (isReread) ocrAt = Math.floor(Date.now() / 1000);
@@ -35921,6 +35952,8 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 				source: upgrade ? 'vision' : null,
 				fileId,
 				lastUserId: uid || null,
+				// 补读路径本来不推进 vision_checked_at；只有方案 A park 时才写远期。
+				visionCheckedAt: parkUntil || undefined,
 				ocrText,
 				ocrAt, ocrVerdict
 			});
@@ -35930,7 +35963,7 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 				source: verdict === 'pending' ? null : 'vision',
 				fileId,
 				lastUserId: uid || null,
-				visionCheckedAt: Math.floor(Date.now() / 1000),
+				visionCheckedAt: parkUntil || Math.floor(Date.now() / 1000),
 				ocrText,
 				ocrAt, ocrVerdict
 			});
