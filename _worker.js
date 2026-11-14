@@ -7047,33 +7047,50 @@ async function performBulkJobD1Mutation(job, env, ids) {
 		if (job.reason) {
 			const learnSource = String(job.action) === 'spam' ? 'spam'
 				: String(job.mode) === 'kick' ? 'sban' : 'manual';
-			const learnIds = [...(lastResults.success || [])].slice(0, BULK_LEARN_LIMIT);
+			// 【2026-11-14 补 exists】原先只取 success。重复提交同一批 TGID 时（主人补学、
+			// 或第一次任务中途失败后重发），这批目标全部落在 exists 里，success 为空
+			// → learnIds 为空 → 一个都不学，名单永远补不上。与同步批量（idsToKick）同一口径。
+			const learnIds = [...(lastResults.success || []), ...(lastResults.exists || [])].slice(0, BULK_LEARN_LIMIT);
+			// 【同款名单：队列路径此前完全不写】handleSpam 的名单写入只覆盖「同步批量」，
+			// 也就是目标数 < BULK_TASK_THRESHOLD(20) 时才走。一旦越过 20 个，命令转成队列任务，
+			// 那个分支根本执行不到 —— 而主人日常正是 /spam 一批十几个到几十个号，
+			// 等于主路径的名单一条都进不去，同款直封永远不触发。这里按第一主人同一道门补写。
+			const learnSpamTexts = isPrimaryOwner(String(job.createdBy || ''));
 			let learnedTotal = 0;
 			let sampleTotal = 0;
+			let spamTextTotal = 0;
 			// 2026-10-15：判据学习补进这条链之后，这行日志若只记指纹与语义样本，
 			// 批量封禁后就无法从日志确认头像 / 会员标 / 形状到底学没学到 —— 记录不准等于没记。
 			let avatarTotal = 0;
 			let badgeTotal = 0;
 			let shapeTotal = 0;
 			await mapWithConcurrency(learnIds, BULK_LEARN_CONCURRENCY, async (uid) => {
+				// 正文列表只查一次：join 后的给指纹学习（与改动前逐字一致），
+				// 逐条列表给名单写入（保留每条正文的原始换行，不经 join/split 二次加工）。
+				const textList = await loadRecentUserAdTextList(env, uid);
 				const r = await learnAdFromOperatorAction(env, uid, null, {
 					source: learnSource,
 					createdBy: String(job.createdBy || ''),
 					// 【2026-10-15 乙】批量路径同样从缓存捞正文（与 /spam 单条同一个来源）。
 					// 改之前传空串，批量封一批广告号却只学得到资料卡。
-					text: await loadRecentUserAdText(env, uid)
+					text: textList.join('\n').slice(0, 1000)
 				});
 				learnedTotal += Number(r.learned || 0);
 				sampleTotal += Number(r.sampleAdded || 0);
 				avatarTotal += Number(r.avatars || 0);
 				badgeTotal += Number(r.badges || 0);
 				shapeTotal += Number(r.shapes || 0);
+				if (learnSpamTexts) {
+					const one = await learnSpamTextsFromCache(env, uid, { cached: textList });
+					spamTextTotal += Number(one.added) || 0;
+				}
 				return r;
 			});
 			console.log('[广告检测] 批量封禁学习完成', JSON.stringify({
 				来源: learnSource, 学习目标数: learnIds.length,
 				指纹: learnedTotal, 语义样本: sampleTotal,
-				头像: avatarTotal, 会员标: badgeTotal, 资料形状: shapeTotal
+				头像: avatarTotal, 会员标: badgeTotal, 资料形状: shapeTotal,
+				同款名单: spamTextTotal
 			}));
 		}
 		if (!lastResults.failed.length) return lastResults;
