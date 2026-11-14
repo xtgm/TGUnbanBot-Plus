@@ -16457,7 +16457,14 @@ async function findLinkedSpamTargets(env, textKey, excludeUserId) {
 	// 反查 24 小时，把全群发打卡词的正常人一锅端（TGID 1335910695 就是这么死的）。
 	// 【只挡模板，不挡处置本人】触发者该封还封 —— 这里管的只是「别拿他的正文去连坐别人」。
 	// 返回结构照抄正常返回：/spam 那侧读的是 found.targets.length，没有可选链，返回 null 会崩。
-	if (!isAdBearingText(textKey?.norm)) {
+	// 【2026-11-14 补模板旁路】词库只认词，线上主力广告大量绕开词库：
+	// `✨✨✨✨✨✨✨✨✨ @otrx` 被 20 个号发同一句，score / tradeHits / businessHits 全 0 →
+	// 主人 /spam 其中一个，其余 19 个一条都连不出来 —— 这恰恰是连带最该命中的场景。
+	// 判据 ② 是「正文自带 @推广号（4 位以上）且 12 字以上」，是为连带场景量身定制的：
+	// 带推广账号的长句几乎不可能是正常人闲聊，而「签到」「今天天气不错」这类 6 字以内
+	// 的打卡/寒暄仍被长度闸挡住（线上误封 1335910695 那次正是被「签到」害的）。
+	// 判据 ①（跨目标重复）在单条 /spam 路径拿不到 crossUsers，故传 0 不启用。
+	if (!isAdBearingText(textKey?.norm) && !isTemplateAdText(textKey?.norm, 0)) {
 		console.log('[同款连带] 模板正文自身无广告证据（' + String(textKey?.norm || '').slice(0, 40)
 			+ '），不作同款模板、跳过反查');
 		return { targets: [], truncated: 0, overflowIds: [] };
@@ -16850,7 +16857,20 @@ async function enforceHandledRepeatBan(env, message, hit) {
 	const userId = String(message?.from?.id || '');
 	const chatId = String(message?.chat?.id || '');
 	if (!userId || !autoDetectionScopeGroupIds(chatId).length) return;
-	if (!isAdBearingText(String(hit?.norm || ''))) return;
+	// 【2026-11-14 删掉这里的 isAdBearingText 复判】原先读取端又判一次「正文自身有没有广告证据」，
+	// 而写入端 recordSpamText 已有同一道闸。两头都卡 = 整条同款直封链对线上主力广告完全失效：
+	//   ① 词库 0 分的真广告进不了名单（已在 recordSpamText 加模板旁路修掉）；
+	//   ② 就算名单里有，命中后这里又拒一次，`✨✨✨✨✨✨✨✨✨ @otrx` 这类 20 个号发同一句的
+	//      主力广告照样不封 —— 名单写得再全也是白写。
+	// 【为什么敢信任名单】ad_spam_texts 只在 learnSpamTextsFromCache 写入，而那条链的入口
+	// 全部要求 isPrimaryOwner（学习是第一主人专属权限）。名单里每一条都是主人亲手 /spam /
+	// /ban /sban 判定过的正文 —— 人工判定本身就是最强证据，再判一次等于不信任写入端。
+	// 【逐条核对过】线上 142 条全部是广告（洗钱/代收/跑分/博彩/机房/代发），无一条正常内容，
+	// 不存在「历史脏数据靠这道闸兜住」的情况。
+	// 写入端的质量闸一条没动：6 字下限、isAdBearingText、isTemplateAdText 模板判据、
+	// 7 天 TTL 全部照旧。这里只保留长度兜底，挡住写入端迁移前可能残留的极短正文。
+	const norm = String(hit?.norm || '');
+	if (norm.length < 6) return;
 	const text = getAdDetectionBodyText(message);
 	const payload = { name: [message.from?.first_name, message.from?.last_name].filter(Boolean).join(' '),
 		username: String(message.from?.username || ''), bio: '', text };
