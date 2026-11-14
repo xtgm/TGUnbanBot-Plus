@@ -19420,6 +19420,30 @@ async function handleGovernableBotMessage(message, env) {
 	if (cached?.spamHit) {
 		console.log('[同款直封·bot] 群 ' + chatId + ' bot ' + message.from.id + ' 消息 ' + message.message_id + ' 命中主人判定过的同款，仅删消息');
 		await deleteMessage(chatId, message.message_id);
+		return true;
+	}
+	// ③ 自动检测：规则结构判定（零额度）优先；规则不中且正文带广告词时调一次语义相似度。
+	//    只判正文，不拉 bot 资料、不做头像/图片识别 —— 避免正常 bot 回执浪费视觉额度。
+	//    命中只删消息：bot 不加黑、不封禁、不学习（封 bot 会破坏群功能，且它只是投放工具）。
+	const bodyText = getAdDetectionBodyText(message);
+	if (bodyText && !isTelegramSlashCommand(bodyText)) {
+		const structure = judgeAdBodyWithBio({ name: '', username: '', bio: '', text: bodyText });
+		let guilty = structure.guilty === true;
+		if (!guilty && isAdBearingText(normalizeAdFingerprintValue(bodyText))) {
+			try {
+				const config = loadAdDetectionConfig(env);
+				if (config.aiEnabled) {
+					const ai = await checkAdAiSimilarity(env, buildAdSampleText({ name: '', username: '', bio: '', text: bodyText }), { config });
+					guilty = ai.isMatch === true;
+				}
+			} catch (error) {
+				console.error('[自动检测·bot] 语义判定失败:', error?.message || error);
+			}
+		}
+		if (guilty) {
+			await deleteMessage(chatId, message.message_id);
+			console.log('[自动检测·bot] 群 ' + chatId + ' bot ' + message.from.id + ' 消息 ' + message.message_id + ' 判定为广告，已删消息（不封 bot）');
+		}
 	}
 	return true;
 }
