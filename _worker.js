@@ -11817,17 +11817,22 @@ function hasGroupLocalBlacklist(chatId) {
 	return runtime().LOCAL_BLACKLIST_CHAT_IDS.length > 0 && runtime().LOCAL_BLACKLIST_CHAT_IDS.includes(String(chatId ?? ''));
 }
 
-// 全局 /unban 的作用范围：一律不碰独立群（第一主人的也一样）。
+// 全局 /unban 的作用范围：一律不碰独立群与杀手群。
+// 【2026-11-15 主人口径】三种治理互不沾边：独立群、杀手群只归各自治理，
+// 全局解封（含第一主人发起）不得再把它们卷进来。
 function globalUnbanScopeGroupIds(base = runtime().GROUP_IDS) {
 	const list = Array.isArray(base) ? base : runtime().GROUP_IDS;
-	return list.filter((groupId) => !isIndependentGroup(groupId));
+	return list.filter((groupId) => !isIndependentGroup(groupId) && !isKillerModeGroup(groupId));
 }
 
-// 全局封禁 / 解封的作用范围：第一主人 = 全部（含独立群）；其他人一律跳过独立群。
+// 全局封禁 / 解封的作用范围：一律跳过独立群与杀手群。
+// 【2026-11-15 主人口径】三种治理互不沾边：
+//   独立群封禁只属于独立群；全局封禁走全局；杀手群治理只属于杀手群。
+// 第一主人发起的全局封禁也不再包含这两类群 —— 要在独立群/杀手群封人，
+// 必须在该群内发起（独立群走本群黑名单，杀手群走杀手黑名单）。
 function globalScopeGroupIds(operatorId, base = runtime().GROUP_IDS) {
 	const list = Array.isArray(base) ? base : runtime().GROUP_IDS;
-	if (isPrimaryOwner(operatorId) || !runtime().INDEPENDENT_GROUP_IDS.length) return [...list];
-	return list.filter((groupId) => !isIndependentGroup(groupId));
+	return list.filter((groupId) => !isIndependentGroup(groupId) && !isKillerModeGroup(groupId));
 }
 
 // 全局自动检测联动治理群；独立群继续只治理本群。执行前另从 D1 严格复核模式。
@@ -12524,17 +12529,77 @@ async function enforceLocalAdDetection(env, input, evaluation, options, ctx) {
 	return { banned: true, local: true, seq: null, blacklistCode, banSummary, learned: 0, sampleAdded: false };
 }
 
+// 杀手群的手动广告确认：只写杀手黑名单、只封本群，不进全局、不进独立群。
+// 【2026-11-15 主人口径】三种治理互不沾边。以前手动确认在杀手群会写全局黑名单，
+// 等于把杀手群的判定外溢到全局群 —— 这条路径改为完全隔离。
+async function enforceKillerAdDetection(env, input, evaluation, options, ctx) {
+	const { userId, chatId, note } = ctx;
+	let blacklistCode = 'ERROR';
+	try {
+		const added = await addToKillerBlacklist(env, [userId], { reason: 'killer_spam', by: 'system', note });
+		blacklistCode = added.success.length ? 'ADDED' : added.exists.length ? 'EXISTS' : 'ERROR';
+	} catch (error) {
+		console.error('[广告检测·杀手群] 加入杀手黑名单失败:', error);
+	}
+	let banResults = [];
+	try {
+		banResults = await banUserFromAllGroups(userId, {
+			probeMembership: options.probeMembership !== false,
+			revokeMessages: true,
+			mode: 'kick',
+			groupIds: [chatId]
+		});
+	} catch (error) {
+		console.error('[广告检测·杀手群] 本群处置失败:', error);
+	}
+	await recordDisposalsFromBanResults(env, banResults);
+	const okCount = banResults.filter((r) => r.ok).length;
+	const failedGroupLines = banResults.filter((r) => !r.ok)
+		.map((r) => r.groupId + '（' + toChineseErrorText(r.error || '未知') + '）');
+	const banResultLine = '本群踢出 ' + okCount + '/' + banResults.length;
+	if (chatId && input?.messageId) {
+		try {
+			await deleteMessage(chatId, input.messageId);
+		} catch (error) {
+			console.error('[广告检测·杀手群] 删除触发消息失败:', error);
+		}
+	}
+	const ownerId = getOwnerNotifyTargets()[0] || '';
+	if (ownerId) {
+		const notice = renderAdDetectionNotice(evaluation, {
+			userId,
+			chatTitle: input?.chatTitle || '',
+			seq: null,
+			banResultLine,
+			failedGroupLines,
+			learnLine: '杀手群不学特征（判据库与全局隔离）'
+		});
+		const tail = [
+			'',
+			'范围：杀手黑名单（杀手群 <code>' + escapeHtml(chatId) + '</code>，只处置本群，不进全局/独立群）',
+			'误判由该群杀手权限持有者在群里发 <code>/unban ' + escapeHtml(userId) + '</code> 解除'
+		];
+		try {
+			await sendTelegramMessageChunks(ownerId, notice + '\n' + tail.join('\n'));
+		} catch (error) {
+			console.error('[广告检测·杀手群] 推送判定通知失败:', error);
+		}
+	}
+	const banSummary = banResultLine + (failedGroupLines.length ? '；失败：' + failedGroupLines.join('、') : '');
+	console.log('[广告检测·杀手群] 已处置 user=' + userId + ' chat=' + chatId + ' layer=' + evaluation.layer
+		+ ' score=' + evaluation.score + ' 杀手黑名单=' + blacklistCode + ' 处置=' + banSummary);
+	return { banned: true, local: true, seq: null, blacklistCode, banSummary, learned: 0, sampleAdded: false };
+}
+
 // 拦截判定（发言 / 复入群 / 原生解封封回共用），输入是 checkBlacklist 的结果，返回同形状：
 //   独立群：全局记录只认第一主人封的；其余看本群黑名单。
 //   全局群：全局记录照旧；没命中且该群有本群黑名单记录（见 LOCAL_BLACKLIST_CHAT_IDS）才多查一条主键。
 // 没有独立群、也没有任何本群黑名单记录时原样返回，热路径零额外 SQL。
 async function resolveChatBlacklistCheck(env, chatId, userId, globalCheck) {
 	const independent = isIndependentGroup(chatId);
-	if (!independent) {
-		if (globalCheck?.isBlacklisted) return globalCheck;
-	} else if (globalCheck?.isBlacklisted && isPrimaryOwner(globalCheck.entry?.by)) {
-		return { ...globalCheck, localSource: 'primary' };
-	}
+	// 【2026-11-15 主人口径】独立群完全不看全局记录：三种治理互不沾边，
+	// 独立群只认本群黑名单；全局封禁（含第一主人封的）不再在独立群生效。
+	if (!independent && globalCheck?.isBlacklisted) return globalCheck;
 	const local = await readGroupBlacklistEntrySafe(env, chatId, userId);
 	if (local) {
 		if (local.autoCaseId) {
@@ -12563,11 +12628,39 @@ const INDEPENDENT_LOCAL_NOTICE = 'ℹ️ 独立群只封本群，要全局封禁
 //   { kind: 'global', groupIds }        → 原有全局流程，只是作用范围按身份收窄
 //   { kind: 'local', groupIds, notice } → 写本群黑名单、只踢本群、不学习
 //   { kind: 'reject', text }            → 拒绝（私聊收回 / 独立群缺权限）
-// 口径：第一主人在哪都是全局（含独立群）；全局 /unban 一律不碰独立群。
+// 口径（2026-11-15 主人定）：三种治理互不沾边。
+//   独立群：只作用于本群，第一主人也一样；不进全局、不进杀手、不进动态群。
+//   全局群：走全局，范围排除独立群与杀手群。
+//   杀手群：用杀手权限命令，只作用于杀手群。
 function resolveModerationRoute(message, operatorId, cmd) {
 	const isUnban = cmd === 'unban';
 	const globalScope = (id) => (isUnban ? globalUnbanScopeGroupIds() : globalScopeGroupIds(id));
 	const chatId = String(message?.chat?.id ?? '');
+	const inGroup = message?.chat?.type !== 'private';
+	// 独立群优先：群里的封禁/解封只作用于本群，第一主人也不例外。
+	if (inGroup && isIndependentGroup(chatId)) {
+		if (isPrimaryOwner(operatorId) || isSecondaryOwner(operatorId) || isSuperAdmin(operatorId)) {
+			return { kind: 'local', groupIds: [chatId], notice: INDEPENDENT_LOCAL_NOTICE };
+		}
+		if (isAnonymousAdminMessage(message)) {
+			return isUnban
+				? { kind: 'reject', text: '❌ 独立群的匿名管理员只能用封禁类命令；/unban 请关闭匿名身份后再发。' }
+				: { kind: 'local', groupIds: [chatId] };
+		}
+		if (message?.__operatorIsCreator === true || message?.__operatorCanRestrict === true) {
+			return { kind: 'local', groupIds: [chatId] };
+		}
+		return { kind: 'reject', text: '❌ 独立群里使用 /' + cmd + ' 需要 Telegram「封禁用户」管理员权限，请联系群主开通。' };
+	}
+	// 杀手群：只走杀手治理（写杀手黑名单、只封杀手群），不进全局、不进独立群、不进动态群。
+	// 杀手身份的人已在 handleKillerAdminCommand 提前分流；这里兜住第一主人/副主人/超管/群管理员。
+	if (inGroup && isKillerModeGroup(chatId)) {
+		if (isPrimaryOwner(operatorId) || isSecondaryOwner(operatorId) || isSuperAdmin(operatorId)
+			|| message?.__operatorIsCreator === true || message?.__operatorCanRestrict === true) {
+			return { kind: 'killer', groupIds: [chatId] };
+		}
+		return { kind: 'reject', text: '❌ 杀手群只执行杀手治理：请使用杀手权限命令，或私聊第一主人使用全局命令。' };
+	}
 	if (isPrimaryOwner(operatorId)) {
 		return { kind: 'global', groupIds: globalScope(operatorId) };
 	}
@@ -12575,33 +12668,8 @@ function resolveModerationRoute(message, operatorId, cmd) {
 		if (isSecondaryOwner(operatorId) || isSuperAdmin(operatorId)) return { kind: 'global', groupIds: globalScope(operatorId) };
 		return { kind: 'reject', text: PRIVATE_MODERATION_REDIRECT_TEXT };
 	}
-	const independent = isIndependentGroup(chatId);
-	if (isSecondaryOwner(operatorId)) {
-		return independent
-			? { kind: 'local', groupIds: [chatId], notice: INDEPENDENT_LOCAL_NOTICE }
-			: { kind: 'global', groupIds: globalScope(operatorId) };
-	}
-	if (isSuperAdmin(operatorId)) {
-		// 【2026-10-25 取消范围选择】原先超管在群里发 /ban /spam 会先弹「① 本群 / ② 全域」
-		// 按钮，60 秒内不点就作废 —— 作废的后果不是「封禁失败」而是【从未执行】：
-		// D1 名单没写、人没踢、消息没删、一条日志都没有。线上真实漏过：超管发了命令忘了点，
-		// 而按钮带排他性（只有发令人能点），旁人连接管都做不到。
-		// 现在按群模式自动定范围，与副主人在同一个群里完全一致 —— 封禁的本意是「这个人要封」，
-		// 范围由群模式决定就够了，不值得为了选范围留一个会漏广告的确认闸。
-		return independent
-			? { kind: 'local', groupIds: [chatId], notice: INDEPENDENT_LOCAL_NOTICE }
-			: { kind: 'global', groupIds: globalScope(operatorId) };
-	}
-	if (!independent) return { kind: 'global', groupIds: globalScope(operatorId) };
-	if (isAnonymousAdminMessage(message)) {
-		return isUnban
-			? { kind: 'reject', text: '❌ 独立群的匿名管理员只能用封禁类命令；/unban 请关闭匿名身份后再发。' }
-			: { kind: 'local', groupIds: [chatId] };
-	}
-	if (message?.__operatorIsCreator === true || message?.__operatorCanRestrict === true) {
-		return { kind: 'local', groupIds: [chatId] };
-	}
-	return { kind: 'reject', text: '❌ 独立群里使用 /' + cmd + ' 需要 Telegram「封禁用户」管理员权限，请联系群主开通。' };
+	// 非独立群：副主人 / 超管 / 群管理员走全局；全局范围已排除独立群与杀手群。
+	return { kind: 'global', groupIds: globalScope(operatorId) };
 }
 
 // 分流结果落到消息上：回执的「作用范围」一行据此写实际范围。
@@ -12951,6 +13019,24 @@ async function dispatchNonGlobalModerationRoute(route, message, env, ctx, opts) 
 	if (route.kind === 'reject') {
 		if (message.chat.type === 'private') await sendTelegramMessage(message.chat.id, route.text);
 		else await sendFlashMessage(message.chat.id, route.text, ctx);
+		return true;
+	}
+	if (route.kind === 'killer') {
+		// 【2026-11-15 主人口径】杀手群只走杀手治理：写杀手黑名单、只封杀手群。
+		// 不进全局、不进独立群、不进动态群。
+		const ids = Array.isArray(opts.ids) ? opts.ids.map(String) : [];
+		if (!ids.length) return false;
+		if (opts.action === 'unban') {
+			await handleKillerUnban(message, env, ctx, { rest: ids.join(','), requestUrl: opts.requestUrl || '' });
+			return true;
+		}
+		await killerBanIds(message, env, ctx, {
+			ids,
+			invalid: Array.isArray(opts.invalid) ? opts.invalid : [],
+			note: String(opts.note || ''),
+			commandName: opts.action === 'spam' ? '/spam' : '/ban',
+			requestUrl: opts.requestUrl || ''
+		});
 		return true;
 	}
 	if (route.kind === 'local') {
@@ -21352,6 +21438,13 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			if (valid.length > BATCH_LIMIT) {
 				const limitText = `❌ 一次最多 ${BATCH_LIMIT} 个 TGID（你输入了 ${valid.length} 个）`;
 				await replyToModerationAdmin(message, ctx, { flashText: limitText });
+				return;
+			}
+			// 杀手群：只走杀手治理（移出杀手黑名单 + 只解封杀手群），不进全局。
+			if (unbanRoute.kind === 'killer') {
+				await dispatchNonGlobalModerationRoute(unbanRoute, message, env, ctx, {
+					action: 'unban', ids: valid, invalid, requestUrl
+				});
 				return;
 			}
 			if (await startBulkModerationJobFromCommand(message, env, ctx, {
@@ -38830,6 +38923,12 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// 独立群：只记本群黑名单、只处置本群，不进全局黑名单、不学特征、不做同款连带。
 	if (localScope && !automatic) {
 		const result = await enforceLocalAdDetection(env, input, evaluation, options, { userId, chatId, note });
+		await deleteAdScreening(env, userId);
+		return result;
+	}
+	// 杀手群：只写杀手黑名单、只封本群，不进全局、不进独立群。
+	if (!automatic && isKillerModeGroup(chatId)) {
+		const result = await enforceKillerAdDetection(env, input, evaluation, options, { userId, chatId, note });
 		await deleteAdScreening(env, userId);
 		return result;
 	}
