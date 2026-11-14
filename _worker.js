@@ -16355,10 +16355,27 @@ function isAdBearingText(text) {
 // 判据只有两条，都要求调用方拿得出证据，单条 /spam 拿不到证据 → 一律返回 false（行为不变）：
 //   ① crossUsers >= 2：同一句被两个以上不同目标发过。主人一次性 /spam 一批号时，
 //      这批号里出现一模一样的一句，正常用户不可能集体发同样的话 —— 这是投放的硬证据。
-//      线上实例：「✨✨…✨ @otrx」被 20 个号发、「帮忙收资 一天9千」被 2 个号发。
-//   ② 正文自带推广账号：@username（4 位以上）+ 总长 >= 12。挡的是「@张三 在吗」这类短寒暄。
+//      线上实例：「帮忙收资 一天9千」被 2 个号发。
+//   ② 正文连续提及 2 个以上不同的 bot（@xxxbot 或 t.me/xxxbot）+ 总长 >= 12。
+//      【2026-11-14 主人口径】正常人最多 @ 一个 bot（问一句怎么用），
+//      连续 @ 两个及以上才是「召唤代发矩阵」的投放形态 —— 只凭「正文里有一个 bot」
+//      绝不能当广告证据，那会把正常请教 bot 用法的人一起删掉。
 // 不满足这两条时仍然照旧被 isAdBearingText 卡住 —— 「签到」「今天天气不错」「节点订阅链接」
 // 一个都进不来，与改动前一致。
+function countMentionedBots(text) {
+	const source = String(text ?? '');
+	// @xxxbot 与 t.me/xxxbot（含 telegram.me、http(s):// 前缀）都算。
+	// TG 硬性规定 bot 用户名以 bot 结尾（最短 5 字符，即 {2,}bot），所以正则只认这个后缀，
+	// 普通 @handle 不计。与 AD_BOT_MENTION_RE 的 {2,} 口径一致。
+	const matches = source.match(/(?:@|(?:https?:\/\/)?(?:t|telegram)\.me\/)([A-Za-z0-9_]{2,32}bot)\b/gi) || [];
+	const names = new Set();
+	for (const raw of matches) {
+		const name = String(raw).replace(/^.*?([A-Za-z0-9_]{2,32}bot)$/i, '$1').toLowerCase();
+		if (name) names.add(name);
+	}
+	return names.size;
+}
+
 function isTemplateAdText(norm, crossUsers) {
 	const text = String(norm ?? '').trim();
 	if (text.length < 6) return false;
@@ -16366,7 +16383,16 @@ function isTemplateAdText(norm, crossUsers) {
 	//    两个号都说过也可能只是巧合，不足以当模板；而「帮忙收资 一天9千」(9 字)、
 	//    「✨✨…✨ @otrx」(15 字) 这类带金额/账号的投放句不受影响。
 	if (Number(crossUsers) >= 2) return text.length >= 8;
-	// ② 正文自带推广账号：@username（4 位以上）+ 总长 >= 12。挡的是「@张三 在吗」这类短寒暄。
+	// ② 单条路径的模板证据。原判据是「任一 @username（4 位以上）+ 总长 >= 12」，
+	//    但主人 2026-11-14 明确：正常人发 bot 要么带内容再带一个，最多一个；
+	//    正常人不会在正文里连发两个以上 bot —— 而广告号的诱饵正文正是「只发一串 bot」，
+	//    随后由这些 bot 回来发引用式广告。所以按 bot 数量分流：
+	//      >=2 个不同 bot（@xxxbot 或 t.me/xxxbot）→ 投放诱饵，成立（不另设长度门槛）；
+	//      恰好 1 个 bot → 正常请教用法，不成立；
+	//      0 个 bot → 维持原判据（普通 @推广号 / 多个普通 @ + 12 字）。
+	const botCount = countMentionedBots(text);
+	if (botCount >= 2) return true;
+	if (botCount === 1) return false;
 	return text.length >= 12 && /@[A-Za-z0-9_]{4,}/.test(text);
 }
 
