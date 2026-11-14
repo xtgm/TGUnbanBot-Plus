@@ -13813,12 +13813,13 @@ async function collectAdDrillMaterial(key,previous,complete,operation) {
 // 【2026-11-14】素材缺口分两类，判据是「再试一次，结果会不会变」：
 //   会变（额度用完、识别故障、请求过频、刚判过还没落库）→ 记进 drillIncomplete，等下一轮补；
 //   不会变（nothumb 没有可用预览图 / size 超过读取上限 / mime 格式不支持 /
-//          no_reliable_ad_evidence 模型看过画面对不出广告证据）→ 不记。
+//          no_reliable_ad_evidence 模型看过画面对不出广告证据 /
+//          custom_emoji_media_unavailable Telegram 没把这份表情素材返回来）→ 不记。
 // 后者若继续算「未收齐」，等于给这条学习记录判了无期：operator 记录不受 attempts 上限约束，
 // cron 每 10 分钟重捞一轮，每轮都要重新下载素材、重新调用视觉与文字核验 —— 既学不完，
 // 也白烧图像相似度额度（线上 11-14 的 10 条 /spam 学习记录就卡在这类缺口上）。
 function adMaterialSettled(reason) {
-	return ['nothumb', 'size', 'mime', 'no_reliable_ad_evidence'].includes(String(reason || ''));
+	return ['nothumb', 'size', 'mime', 'no_reliable_ad_evidence', 'custom_emoji_media_unavailable'].includes(String(reason || ''));
 }
 
 // 【2026-11-14】第一主人 /spam 学习是否算做完，只看「会不会真正影响判定」的三项：
@@ -13938,7 +13939,12 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 		evaluationProfile.adLinks = joinScreen || message?.adJoinRequest || profile.personalChat
 			? await resolveAdProfileLinks(env, evaluationProfile, profileLinkOptions)
 			: await resolveAdProfileLinksElevated(env, evaluationProfile, { whitelist, text });
-		profileLinksFailed = evaluationProfile.adLinks.some(link => link.lookupFailed || link.kind === 'unknown');
+		// 【2026-11-14】只有「暂时查不到」（429 / 5xx / timeout / 异常）才算待补缺口。
+		// 已删号、私有群、打错的用户名在 resolveAdLink 里已标 lookupTransient=false：
+		// 那是查过之后的确定结论，重试一辈子也是同一个结果；kind=unknown 同理，是
+		// Telegram 认得这个用户名却给不出类型，不是「没查」。这两类以前都会让学习记录
+		// 永远停在 learning_failed（线上 9267172901 的 laicai6681 就是 kind=unknown）。
+		profileLinksFailed = evaluationProfile.adLinks.some(link => link.lookupTransient === true);
 	} catch (_) { profileLinksFailed = true; }
 	const judgeCollectedContent = async () => {
 	let evaluation = joinTextEvaluation ? JSON.parse(JSON.stringify(joinTextEvaluation)) : await evaluateAdSuspect(env, {
@@ -14014,7 +14020,12 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 		drillIncomplete.push('正文素材尚未核实：' + String(image?.missReason || 'pending'));
 	}
 	// completeness.emoji 仍如实记录全部缺口；只有「重试也不会有答案」的那部分不再阻塞学习完成。
-	const emojiBlockingIds = emojiMissingIds.filter((id) => !adMaterialSettled(emojiById.get(String(id))?.row?.missReason));
+	// 注意 missingReason 挂在 item 上，不在 row 上 —— row 为 null（素材压根没返回来）时
+	// 只有 item.missingReason 有值，只读 row.missReason 会把这类永远判成待补。
+	const emojiBlockingIds = emojiMissingIds.filter((id) => {
+		const item = emojiById.get(String(id));
+		return !adMaterialSettled(item?.missingReason) && !adMaterialSettled(item?.row?.missReason);
+	});
 	if (emojiBlockingIds.length) drillIncomplete.push('正文自定义素材尚未核实：' + emojiBlockingIds.join(','));
 	evaluation.drillIncomplete = drillIncomplete;
 	const contentReviewIncomplete = [];
@@ -26553,13 +26564,18 @@ async function resolveAdLink(env, handle, options = {}) {
 			cacheable = response.status !== 429 && response.status < 500
 				&& !/429|too many requests|internal server|timeout/i.test(description);
 			info.lookupFailed = true;
+			// 【2026-11-14】lookupFailed 混着两种语义，只有暂态的那半该让学习记录继续重试：
+			//   已删号 / 私有群 / 打错的用户名 —— 查过了，再查是同一个结果（cacheable）；
+			//   429 / 5xx / timeout / 数组异常 —— 暂时故障，下次可能查得到。
+			info.lookupTransient = !cacheable;
 		}
 	} catch (error) {
 		cacheable = false;
 		info.lookupFailed = true;
+		info.lookupTransient = true;
 		console.error('[广告检测·链接] 解析失败 handle=' + key + ':', error?.message || error);
 	}
-	if (options.signal?.aborted) { cacheable=false; info.lookupFailed=true; }
+	if (options.signal?.aborted) { cacheable=false; info.lookupFailed=true; info.lookupTransient=true; }
 	if (cacheable) await writeAdLinkCache(env, info);
 	return info;
 }
@@ -33035,7 +33051,11 @@ async function inspectAdDynamicContent(env, media) {
 			|| hasAdProtectedTechnicalContext(visible) && !hasAdIndependentHarmfulContent(visible));
 		if (!ad && !clean) return pending('no_reliable_ad_evidence', { signature });
 		for (const frame of fresh) seen.add(frame.hash);
-		const complete = !batch || batch.complete;
+		// 【2026-11-14】没有新帧 = 帧集合已经穷尽，不该再报 frames_remaining。
+		// 此前只认 batch.complete：渲染器持续给 complete=false 时，这条记录会每 30 秒重跑一次，
+		// 每次都从头下载整份动画、重新送模型，永远学不完（线上 8838860132 的 DogeEmoji 会员标
+		// 就是这样空转 10 轮）。fresh 为空说明这一轮没有任何没看过的画面，再跑也是同一批。
+		const complete = !batch || batch.complete || fresh.length === 0;
 		const result = { version: 1, format, verdict: ad ? 'ad' : complete ? 'clean' : 'pending', contentVerified: ad,
 			signature, complete, nextFrame: batch?.nextFrame || 0, totalFrames: batch?.frameCount || 0, seenHashes: [...seen],
 			reason: ad ? 'visible_ad_evidence' : complete ? 'dynamic_checked' : 'frames_remaining' };
