@@ -13812,14 +13812,21 @@ async function collectAdDrillMaterial(key,previous,complete,operation) {
 
 // 【2026-11-14】素材缺口分两类，判据是「再试一次，结果会不会变」：
 //   会变（额度用完、识别故障、请求过频、刚判过还没落库）→ 记进 drillIncomplete，等下一轮补；
-//   不会变（nothumb 没有可用预览图 / size 超过读取上限 / mime 格式不支持 /
-//          no_reliable_ad_evidence 模型看过画面对不出广告证据 /
-//          custom_emoji_media_unavailable Telegram 没把这份表情素材返回来）→ 不记。
+//   不会变 → 不记。目前有六种：
+//     nothumb                          没有可用预览图
+//     size / mime                      素材超过读取上限 / 格式不支持
+//     no_reliable_ad_evidence          模型看过画面，对不出广告证据
+//     custom_emoji_media_unavailable   Telegram 没把这份表情素材返回来
+//     pending                          有记录但没结论 —— 这条只在「判过了、给不出 ad/clean」时
+//                                      出现：真正没跑的暂态都有独立字符串（quota / break /
+//                                      dynamic_busy / error / daily_limit / drill_batch_pending），
+//                                      素材整个缺失时 fallback 是 missing_result，都到不了这里。
 // 后者若继续算「未收齐」，等于给这条学习记录判了无期：operator 记录不受 attempts 上限约束，
 // cron 每 10 分钟重捞一轮，每轮都要重新下载素材、重新调用视觉与文字核验 —— 既学不完，
 // 也白烧图像相似度额度（线上 11-14 的 10 条 /spam 学习记录就卡在这类缺口上）。
 function adMaterialSettled(reason) {
-	return ['nothumb', 'size', 'mime', 'no_reliable_ad_evidence', 'custom_emoji_media_unavailable'].includes(String(reason || ''));
+	return ['nothumb', 'size', 'mime', 'no_reliable_ad_evidence', 'custom_emoji_media_unavailable', 'pending']
+		.includes(String(reason || ''));
 }
 
 // 【2026-11-14】第一主人 /spam 学习是否算做完，只看「会不会真正影响判定」的三项：
