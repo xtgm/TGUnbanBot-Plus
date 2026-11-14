@@ -5839,7 +5839,14 @@ function isBotAdMuteRelease(member) {
 
 function isIgnoredBotUpdate(update) {
 	const message = update?.message || update?.edited_message || update?.channel_post || update?.edited_channel_post;
-	if (isExternalBotMessage(message) || update?.callback_query?.from?.is_bot === true || update?.chat_join_request?.from?.is_bot === true) return true;
+	if (isExternalBotMessage(message)) {
+		// 【2026-11-14 放行】治理群里的普通 bot 消息不再整条丢弃：线上主力广告是
+		// 「真人发诱饵 @ 投放 bot → bot 回一条引用式广告」，广告正文的实际发送者是 bot。
+		// 入口丢掉它，同款直封 / 重发删除 / 当前群清扫三条确定性通道就全部看不到。
+		// 只放行 update.message；edited_message / channel_post / 私聊照旧忽略。
+		return !(update?.message === message && isGovernableBotMessage(message));
+	}
+	if (update?.callback_query?.from?.is_bot === true || update?.chat_join_request?.from?.is_bot === true) return true;
 	const member = update?.chat_member;
 	if (member?.from?.is_bot === true || member?.new_chat_member?.user?.is_bot === true || member?.old_chat_member?.user?.is_bot === true) {
 		if (member?.chat?.id && member.old_chat_member?.status !== member.new_chat_member?.status) invalidateAdAdminCache(member.chat.id);
@@ -5851,6 +5858,33 @@ function isIgnoredBotUpdate(update) {
 
 function isAdExemptBot(user) {
 	return user?.is_bot === true;
+}
+
+// 治理群内的第三方 bot 消息是否放行进入确定性治理（只删不封，见 handleGovernableBotMessage）。
+// 【为什么必须放行】线上主力广告形态：真人发诱饵（@ 若干投放 bot）→ 投放 bot 回一条
+// 「引用诱饵」的广告正文。广告正文的实际发送者是 bot，入口原先把所有 bot 消息整条丢弃，
+// 于是同款直封（ad_spam_texts）、重发删除（ad_handled_texts）、当前群清扫三条通道全空。
+// 【放行范围刻意收紧】
+//   · 只在治理群（GROUP_ID + 动态群）内；私聊 / 非治理群照旧忽略
+//   · 排除匿名管理员代理（那是真人在发言）
+//   · 排除本 bot 自己（回执里含广告原文，删了会破坏治理）
+//   · 排除 AD_TRUSTED_BOTS 白名单协作 bot（回执同样原样引用广告文本）
+//   · 放行后只走「命中主人判定过的文案才删」的确定性通道，永不封禁 bot
+function isGovernableBotMessage(message) {
+	if (message?.from?.is_bot !== true) return false;
+	// 入口过滤也可能在无运行上下文的边缘路径被调用（队列重放、离线脚本）：
+	// 拿不到治理范围时按「不放行」处理，保持改动前的忽略语义，绝不抛错。
+	let config;
+	try { config = runtime(); } catch (_) { return false; }
+	const chatId = String(message?.chat?.id ?? '');
+	if (!config.GROUP_IDS.some((gid) => String(gid) === chatId)) return false;
+	if (String(message.from.id) === String(ANON_ADMIN_BOT_ID)) return false;
+	const tokenId = String(config.BOT_TOKEN || '').split(':')[0] || '';
+	const selfId = String(config.BOT_INFO?.id || tokenId || '');
+	if (selfId && String(message.from.id) === selfId) return false;
+	const username = String(message.from.username || '').toLowerCase();
+	if (username && config.AD_TRUSTED_BOTS.includes(username)) return false;
+	return true;
 }
 
 function isAnonymousAdminMessage(message) {
@@ -16835,13 +16869,16 @@ function primeHandledAdTexts(env, list) {
 
 // 记录一条「已被处置的广告文案」（重发只删通道用）。
 // 调用方：enforceAdDetection 自动检测封禁后；第一主人回复广告 /spam 后（同时另写同款直封名单）。
-async function recordHandledAdText(env, rawText) {
+async function recordHandledAdText(env, rawText, options = {}) {
 	const norm = normalizeAdFingerprintValue(rawText);
 	// 过短的不记：那种文案撞正常发言概率高，而这条通道是【无条件删消息】，宁缺毋滥。
 	if (norm.length < 6) return;
 	// 模板资格闸（2026-10-17）：正文自身没有广告证据 → 不进重发名单（名单同样是模板）。
 	// 这条通道是【无条件删消息】，误伤代价不比封禁低，口径与 findLinkedSpamTargets 一致。
-	if (!isAdBearingText(norm)) return;
+	// 【2026-11-14 补模板旁路】与 recordSpamText / findLinkedSpamTargets 对齐：
+	// 线上投放诱饵「@bot1 @bot2 @bot3」词库 0 分，但它是三连 @ 推广号（判据②），
+	// 不放开就永远进不了重发名单 —— 主人 /spam 过后同款再发照样不删。
+	if (!isAdBearingText(norm) && !isTemplateAdText(norm, options?.crossUsers)) return;
 	try {
 		const now = Date.now();
 		const list = await loadHandledAdTexts(env);
@@ -16899,18 +16936,19 @@ async function clearAdTextReuseOnIgnore(env, rawText, options = {}) {
 // 重发形态正是「引用主人的命令消息 + 自己贴广告正文」，所以两边都要看。
 async function matchHandledAdText(env, message) {
 	if (!env?.DB) return false;
-	// 同上：清单消息的 text 是 undefined，不接 checklist 就永远匹配不上已处置名单。
+	// 与 buildModerationTextKey 同口径（正文 + 清单 + 链接预览卡）：写入端已按这个口径
+	// 记录，读取端只取 text/caption 会让「诱饵正文 + 预览卡广告」的形态永远匹配不上。
 	const candidates = [
-		String(message?.text ?? message?.caption ?? extractAdChecklistText(message)),
-		String(message?.reply_to_message?.text ?? message?.reply_to_message?.caption
-			?? extractAdChecklistText(message?.reply_to_message))
-	].map((t) => normalizeAdFingerprintValue(t)).filter((t) => t.length >= 6);
+		buildModerationTextKey(message)?.norm,
+		buildModerationTextKey(message?.reply_to_message)?.norm
+	].map((t) => String(t || '')).filter((t) => t.length >= 6);
 	// 模板资格闸（2026-10-17）：拿不出「自身有广告证据」的正文，一律不参与比对 ——
 	// 这条通道是【只删消息】，误删正常发言（「签到」）的代价不比误封低。
 	// 名单侧还多一层意义：改造【之前】写进 ad_handled_texts 的脏数据（「签到」这类）
 	// 也一并失效，不必干等 7 天 TTL 自然过期。
 	// 口径与 findLinkedSpamTargets / enforceHandledRepeatBan 的闸门完全一致：不看词表，只看正文自身证据。
-	const adBearingCandidates = candidates.filter((t) => isAdBearingText(t));
+	// 模板旁路与 recordHandledAdText 写入端一致：词库 0 分的三连 @ 诱饵也要能匹配。
+	const adBearingCandidates = candidates.filter((t) => isAdBearingText(t) || isTemplateAdText(t, 0));
 	if (!adBearingCandidates.length) return false;
 	try {
 		const list = await loadHandledAdTexts(env);
@@ -19330,8 +19368,43 @@ function isChannelAutoForward(message) {
 	return message?.is_automatic_forward === true && Boolean(message?.sender_chat);
 }
 
+// 第三方 bot 消息的确定性治理：只按「主人已经 /spam 判定过的正文」删消息，不判定、不封禁。
+// 三条通道与真人消息同源：
+//   ① ad_handled_texts  —— 重发只删：命中主人处置过的文案，删消息；
+//   ② ad_spam_texts     —— 同款直封：命中主人 /spam 过的同款，删消息（bot 不加黑、不封禁）；
+//   ③ moderation_messages —— 未命中时也写缓存，供后续 /spam 当前群清扫与同款反查。
+// 返回 true = 已处理（调用方立即 return）；false = 不归本通道管。
+async function handleGovernableBotMessage(message, env) {
+	if (!isGovernableBotMessage(message)) return false;
+	if (!env?.DB) return true;
+	const chatId = String(message?.chat?.id ?? '');
+	if (!chatId || !message?.message_id) return true;
+	// 与主人口径一致：杀手群与独立群不归全局治理。
+	if (isKillerModeGroup(chatId) || isIndependentGroup(chatId)) return true;
+	if (isTelegramServiceMessage(message) || isChannelAutoForward(message)) return true;
+	if (!getAdDetectionBodyText(message) && !message.reply_to_message) return true;
+	// ① 重发只删
+	if (await matchHandledAdText(env, message)) {
+		console.log('[重发删除·bot] 群 ' + chatId + ' bot ' + message.from.id + ' 消息 ' + message.message_id + ' 命中已处置文案，仅删消息');
+		await deleteMessage(chatId, message.message_id);
+		return true;
+	}
+	// ② 同款直封（写缓存与查名单是同一条 SQL）
+	const cached = await cacheModerationMessage(env, message, { isAd: false });
+	if (cached?.spamHit) {
+		console.log('[同款直封·bot] 群 ' + chatId + ' bot ' + message.from.id + ' 消息 ' + message.message_id + ' 命中主人判定过的同款，仅删消息');
+		await deleteMessage(chatId, message.message_id);
+	}
+	return true;
+}
+
 async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
-	if (isExternalBotMessage(message)) return;
+	if (isExternalBotMessage(message)) {
+		// 治理群内的第三方 bot 消息只走确定性治理（见 handleGovernableBotMessage）；
+		// 其余 bot 消息照旧整条忽略。
+		await handleGovernableBotMessage(message, env);
+		return;
+	}
 	// 频道关联群自动转发帖直接放行:不删、不缓存、不当命令。
 	// 放在最顶部,先于一切治理逻辑,保证任意频道内容(不只是像广告的)都不被误删误取消置顶。
 	if (isChannelAutoForward(message)) {
@@ -19991,7 +20064,13 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				const spamTextLearn = await learnSpamTextsFromCache(env, repliedUserId, { seeds: [spamTextForLearn] });
 				const spamTextLearnLine = renderSpamTextLearnLine(spamTextLearn);
 				if (spamTextLearnLine) lines.push(spamTextLearnLine);
-				await recordHandledAdText(env, repliedMsg?.text ?? repliedMsg?.caption ?? '');
+				// 与 buildModerationTextKey / spamTextForLearn 同口径：正文 + 清单 + 链接预览卡。
+				// 只取 text/caption，会让「正文是诱饵、广告在预览卡里」的重发永远匹配不上。
+				const handledTextForLearn = [
+					String(repliedMsg?.text ?? repliedMsg?.caption ?? extractAdChecklistText(repliedMsg) ?? '').trim(),
+					extractAdWebPageText(repliedMsg)
+				].filter(Boolean).join(' ').trim();
+				await recordHandledAdText(env, handledTextForLearn);
 				// 连带处置整块移入 ctx.waitUntil：findLinkedSpamTargets 反查 + 受保护过滤 +
 				// enforceLinkedSpamTargets（串行 deleteMessage/addToBlacklist/banUserFromAllGroups）。
 				// 下面的函数体沿用原来的缩进层级（整块搬运，刻意不重排，减少 diff 出错面）。
