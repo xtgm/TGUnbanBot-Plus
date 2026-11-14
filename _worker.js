@@ -35197,6 +35197,12 @@ async function runAdAvatarVision(env, options = {}) {
 		let stage = 'init';
 		// 文件永久失效时置位：这种失败不推熔断（见 isVisionFileMissing 注释）。
 		let skipBump = false;
+		// 【2026-11-14 新增】只在【调用真故障】时置位。熔断要衡量的是「模型调不调得通」，
+		// 不是「模型判得准不准」—— 模型正常返回但给不出定罪证据（pending）是有效响应，
+		// 不该计入连续失败。线上 11-14 01:33 就是这么熔断的：10 次「返回 pending」被当成
+		// 10 次「识别失败」→ vision_broken_day 当天置位 → 当天全部头像/图片/会员标/
+		// 自定义表情核验一律返回 break → 所有学习记录卡在 learning_failed。
+		let modelFailed = false;
 		// 方案 A：文件失效累计到阈值后，本张写远期 vision_checked_at（0 表示照常推进）。
 		let parkUntil = 0;
 		try {
@@ -35304,6 +35310,7 @@ async function runAdAvatarVision(env, options = {}) {
 				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error, true);
 			} else {
 				stats.failed += 1;
+				modelFailed = true;
 				await logAdVisionFailure(env, '头像', stage, row.file_unique_id, error);
 			}
 		}
@@ -35322,7 +35329,7 @@ async function runAdAvatarVision(env, options = {}) {
 		// 熔断计数：verdict 仍是 'pending' 就是这次没判成（失败或跳过），
 		// 连着 AD_VISION_FAIL_BREAK 次没判成，当天就别再烧 moondream 额度了。
 		// skipBump = 文件失效：这种失败证明不了链路坏了，不参与熔断判定。
-		if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
+		if (!skipBump) await bumpVisionBreakState(env, !modelFailed, Math.floor(Date.now() / 1000));
 		if (verdict === 'ad') stats.ad += 1;
 		else if (verdict === 'clean') stats.clean += 1;
 		if (verdict !== 'pending') stats.done += 1;
@@ -35445,6 +35452,8 @@ async function runAdImageVision(env, options = {}) {
 		// 正文图没有「换一张再试」的余地（图片来自群消息本身，取不到就是取不到），
 		// 所以这里只做甲那半：跳过且不计熔断。
 		let skipBump = false;
+		// 同头像那侧：只有调用真失败才计入熔断，正常返回 pending 不算（见上条注释）。
+		let modelFailed = false;
 		try {
 			stage = 'getFile';
 			const fileResponse = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getFile', {
@@ -35522,6 +35531,7 @@ async function runAdImageVision(env, options = {}) {
 				await logAdVisionFailure(env, '图片', stage, row.file_unique_id, error, true);
 			} else {
 				stats.failed += 1;
+				modelFailed = true;
 				await logAdVisionFailure(env, '图片', stage, row.file_unique_id, error);
 			}
 		}
@@ -35537,7 +35547,7 @@ async function runAdImageVision(env, options = {}) {
 		}
 		// 熔断计数：verdict 仍是 'pending' 就是这次没判成（失败或跳过），
 		// 连着 AD_VISION_FAIL_BREAK 次没判成，当天就别再烧 moondream 额度了。
-		if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
+		if (!skipBump) await bumpVisionBreakState(env, !modelFailed, Math.floor(Date.now() / 1000));
 		if (verdict === 'ad') stats.ad += 1;
 		else if (verdict === 'clean') stats.clean += 1;
 		if (verdict !== 'pending') stats.done += 1;
@@ -35671,6 +35681,8 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	let contentResult = null;
 	let capturedImage = null;
 	let skipBump = false;
+	// 同头像那侧：只有调用真失败才计入熔断，正常返回 pending 不算。
+	let modelFailed = false;
 	try {
 		const fileResponse = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getFile', {
 			method: 'POST',
@@ -35710,6 +35722,7 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 			return adImageMiss(base, 'ratelimit');
 		}
 		if (isVisionFileMissing(error)) skipBump = true;
+		else modelFailed = true;
 		await logAdVisionFailure(env, '图片·实时', 'ai.run', key, error);
 	}
 	try {
@@ -35733,7 +35746,7 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	} catch (error) {
 		console.error('[图片实时判定] 写回结果失败:', error);
 	}
-	if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
+	if (!skipBump) await bumpVisionBreakState(env, !modelFailed, Math.floor(Date.now() / 1000));
 	await writeAdScanState(env, 'img_count', String(quota.used + 1), Math.floor(Date.now() / 1000));
 
 	if(capturedImage&&verdict==='pending')await cacheAdReviewAsset(env,'image',key,capturedImage,staticContent?'body':'thumbnail');
@@ -36147,6 +36160,8 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 	let contentResult = null;
 	let capturedAvatar = null;
 	let skipBump = false;
+	// 同头像那侧：只有调用真失败才计入熔断，正常返回 pending 不算。
+	let modelFailed = false;
 	// 方案 A：文件失效累计到阈值后，写远期 vision_checked_at（0 表示照常推进）。
 	let parkUntil = 0;
 	try {
@@ -36205,6 +36220,7 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 			return row || null;
 		}
 		if (isVisionFileMissing(error)) skipBump = true;
+		else modelFailed = true;
 		const failCount = await logAdVisionFailure(env, '头像·实时', 'ai.run', key, error);
 		if (isVisionFileMissing(error) && failCount >= AD_VISION_FILE_MISSING_PARK_AFTER) {
 			parkUntil = Math.floor(Date.now() / 1000) + AD_VISION_PARK_AHEAD_SEC;
@@ -36244,7 +36260,7 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 	} catch (error) {
 		console.error('[头像实时判定] 写回结果失败:', error);
 	}
-	if (!skipBump) await bumpVisionBreakState(env, verdict !== 'pending', Math.floor(Date.now() / 1000));
+	if (!skipBump) await bumpVisionBreakState(env, !modelFailed, Math.floor(Date.now() / 1000));
 	await writeAdScanState(env, 'avatar_count', String(quota.used + 1), Math.floor(Date.now() / 1000));
 
 	if(capturedAvatar&&!isVerifiedAdAvatarRow(withContent({verdict,ocr_text:ocrText,ocr_verdict:ocrVerdict,ocr_at:ocrAt,source:'vision'},contentResult)))await cacheAdReviewAsset(env,'avatar',key,capturedAvatar);
