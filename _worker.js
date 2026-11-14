@@ -13023,18 +13023,23 @@ async function dispatchNonGlobalModerationRoute(route, message, env, ctx, opts) 
 	}
 	if (route.kind === 'killer') {
 		// 【2026-11-15 主人口径】杀手群只走杀手治理：写杀手黑名单、只封杀手群。
-		// 不进全局、不进独立群、不进动态群。
+		// 不进全局、不进独立群、不进动态群。权限判定不动（/sban 仍只认第一主人）。
 		const ids = Array.isArray(opts.ids) ? opts.ids.map(String) : [];
 		if (!ids.length) return false;
 		if (opts.action === 'unban') {
 			await handleKillerUnban(message, env, ctx, { rest: ids.join(','), requestUrl: opts.requestUrl || '' });
 			return true;
 		}
+		// 引用式 /spam：先删掉被引用的那条广告（与 handleKillerSpam 同口径）。
+		if (opts.action === 'spam' && opts.replyTarget?.messageId) {
+			await deleteMessage(message.chat.id, opts.replyTarget.messageId);
+		}
+		const commandName = opts.action === 'spam' ? '/spam' : opts.action === 'sban' ? '/sban' : '/ban';
 		await killerBanIds(message, env, ctx, {
 			ids,
 			invalid: Array.isArray(opts.invalid) ? opts.invalid : [],
 			note: String(opts.note || ''),
-			commandName: opts.action === 'spam' ? '/spam' : '/ban',
+			commandName,
 			requestUrl: opts.requestUrl || ''
 		});
 		return true;
