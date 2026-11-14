@@ -13810,22 +13810,41 @@ async function collectAdDrillMaterial(key,previous,complete,operation) {
 	return operation();
 }
 
-// 【2026-11-14】素材缺口分两类，判据是「再试一次，结果会不会变」：
-//   会变（额度用完、识别故障、请求过频、刚判过还没落库）→ 记进 drillIncomplete，等下一轮补；
-//   不会变 → 不记。目前有六种：
+// 【2026-11-14】素材缺口分两类，判据是「这条学习记录再跑一轮，这个缺口会不会补上」：
+//   会变（另一实例正在判、批量预算用尽、模型偶发失败）→ 记进 drillIncomplete，等下一轮补；
+//   不会变 → 不记。分三组：
+//
+//   ① 素材本身的确定结论，重试多少次都是同一份字节：
 //     nothumb                          没有可用预览图
 //     size / mime                      素材超过读取上限 / 格式不支持
 //     no_reliable_ad_evidence          模型看过画面，对不出广告证据
 //     custom_emoji_media_unavailable   Telegram 没把这份表情素材返回来
-//     pending                          有记录但没结论 —— 这条只在「判过了、给不出 ad/clean」时
-//                                      出现：真正没跑的暂态都有独立字符串（quota / break /
-//                                      dynamic_busy / error / daily_limit / drill_batch_pending），
-//                                      素材整个缺失时 fallback 是 missing_result，都到不了这里。
-// 后者若继续算「未收齐」，等于给这条学习记录判了无期：operator 记录不受 attempts 上限约束，
+//     custom_emoji_judge_failed        这条表情素材判定抛错
+//     pending                          有记录但没结论
+//
+//   ② 全局开关与全局额度，与这条学习记录无关：
+//     disabled / no_ai / dynamic_unavailable   功能没开（环境变量关掉 / 没绑 AI 或 DB）
+//     quota / daily_limit / break              当天识图额度、相似度额度用完 / 视觉熔断
+//     这些是【全站共享】的状态：今天满了明天还会满（线上 img_similarity_count 从 11-05
+//     起天天打满 100），让一条 operator 学习记录为等全局额度而永远 learning_failed，
+//     等于把「额度不够」升级成「手动指令卡死」——两道都不该发生的错叠在一起。
+//     后台 cron 有额度时会自己继续补这份素材，学习记录不等它。
+//
+//   ③ 动态素材（TGS 动画分帧）的确定结论：
+//     dynamic_format / dynamic_no_content      格式不支持 / 模型给不出内容签名
+//
+// 刻意【不收】的只有真暂态：dynamic_busy（另一实例正在判）、drill_batch_pending
+// （本轮批预算用尽）、description_timeout / description_failed / bad_description
+// （模型偶发失败）、tgs_* 解析错误。这几种下一轮确实可能变，仍按未收齐处理。
+//
+// 若把整组都算「未收齐」，等于给这条学习记录判了无期：operator 记录不受 attempts 上限约束，
 // cron 每 10 分钟重捞一轮，每轮都要重新下载素材、重新调用视觉与文字核验 —— 既学不完，
 // 也白烧图像相似度额度（线上 11-14 的 10 条 /spam 学习记录就卡在这类缺口上）。
 function adMaterialSettled(reason) {
-	return ['nothumb', 'size', 'mime', 'no_reliable_ad_evidence', 'custom_emoji_media_unavailable', 'pending']
+	return ['nothumb', 'size', 'mime', 'no_reliable_ad_evidence', 'custom_emoji_media_unavailable',
+		'custom_emoji_judge_failed', 'pending',
+		'disabled', 'no_ai', 'dynamic_unavailable', 'quota', 'daily_limit', 'break',
+		'dynamic_format', 'dynamic_no_content']
 		.includes(String(reason || ''));
 }
 
