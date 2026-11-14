@@ -7056,6 +7056,8 @@ async function performBulkJobD1Mutation(job, env, ids) {
 			// 那个分支根本执行不到 —— 而主人日常正是 /spam 一批十几个到几十个号，
 			// 等于主路径的名单一条都进不去，同款直封永远不触发。这里按第一主人同一道门补写。
 			const learnSpamTexts = isPrimaryOwner(String(job.createdBy || ''));
+			// 各目标的缓存正文，下面读一次、两处复用（指纹学习 + 名单）。
+			const textLists = new Map();
 			let learnedTotal = 0;
 			let sampleTotal = 0;
 			let spamTextTotal = 0;
@@ -7065,9 +7067,19 @@ async function performBulkJobD1Mutation(job, env, ids) {
 			let badgeTotal = 0;
 			let shapeTotal = 0;
 			await mapWithConcurrency(learnIds, BULK_LEARN_CONCURRENCY, async (uid) => {
+				textLists.set(String(uid), await loadRecentUserAdTextList(env, uid));
+			});
+			// 「同一句正文被几个不同目标发过」：同款名单的模板旁路（isTemplateAdText）靠它。
+			// 聚合在内存里做 —— 各目标的正文本来就要读一次，不增加任何 D1 往返。
+			const templateCounts = learnSpamTexts ? collectCrossUserTemplateCounts(textLists) : null;
+			let templateHitTotal = 0;
+			if (templateCounts) {
+				for (const [, count] of templateCounts) if (count >= 2) templateHitTotal += 1;
+			}
+			await mapWithConcurrency(learnIds, BULK_LEARN_CONCURRENCY, async (uid) => {
 				// 正文列表只查一次：join 后的给指纹学习（与改动前逐字一致），
 				// 逐条列表给名单写入（保留每条正文的原始换行，不经 join/split 二次加工）。
-				const textList = await loadRecentUserAdTextList(env, uid);
+				const textList = textLists.get(String(uid)) || [];
 				const r = await learnAdFromOperatorAction(env, uid, null, {
 					source: learnSource,
 					createdBy: String(job.createdBy || ''),
@@ -7081,7 +7093,7 @@ async function performBulkJobD1Mutation(job, env, ids) {
 				badgeTotal += Number(r.badges || 0);
 				shapeTotal += Number(r.shapes || 0);
 				if (learnSpamTexts) {
-					const one = await learnSpamTextsFromCache(env, uid, { cached: textList });
+					const one = await learnSpamTextsFromCache(env, uid, { cached: textList, templateCounts });
 					spamTextTotal += Number(one.added) || 0;
 				}
 				return r;
@@ -7090,7 +7102,7 @@ async function performBulkJobD1Mutation(job, env, ids) {
 				来源: learnSource, 学习目标数: learnIds.length,
 				指纹: learnedTotal, 语义样本: sampleTotal,
 				头像: avatarTotal, 会员标: badgeTotal, 资料形状: shapeTotal,
-				同款名单: spamTextTotal
+				同款名单: spamTextTotal, 跨目标同款句: templateHitTotal
 			}));
 		}
 		if (!lastResults.failed.length) return lastResults;
@@ -16012,7 +16024,17 @@ async function recordSpamText(env, repliedMsg, options = {}) {
 	// 模板资格闸（2026-10-17）：正文自身没有广告证据 → 不进同款直封名单。
 	// 名单就是模板，口径与 findLinkedSpamTargets 完全一致：不查词表，只看正文分。
 	// 挡的是「节点订阅链接」这类长技术词（能过 6 字门槛，但正文自身 0 分）。
-	if (!isAdBearingText(norm)) return { ok: false, reason: '正文自身没有广告证据', norm };
+	//
+	// 【2026-11-14 加旁路】这条闸只认词库，而线上主力广告大量绕开词库：
+	// 实测「✨✨✨✨✨✨✨✨✨ @otrx」（20 个号发同一句）、「帮忙收资 一天9千」（2 个号）、
+	// 「出实时申请  下款」「新模式AI外挂刷水…」「屏蔽和解除屏蔽频道和聊天群组 📱 ✅」
+	// 的 score / tradeHits / businessHits 全是 0 → 主人已经 /spam 判定的广告被这道闸
+	// 悄悄拒收，名单一条都进不去（线上 7 条 learning_failed 全是这个原因）。
+	// 旁路判的是「这条正文是不是投放模板」而不是「有没有广告词」，口径见 isTemplateAdText：
+	// 只能由调用方在拿得到跨用户重复证据时传入，单条路径传不了 → 行为与改动前逐字节一致。
+	if (!isAdBearingText(norm) && !isTemplateAdText(norm, options?.crossUsers)) {
+		return { ok: false, reason: '正文自身没有广告证据', norm };
+	}
 	if (!(await ensureAdSpamTextsTable(env))) return { ok: false, reason: '名单表初始化失败', norm };
 	const now = Date.now();
 	try {
@@ -16041,7 +16063,9 @@ async function recordSpamText(env, repliedMsg, options = {}) {
 // seeds：调用方手上已有正文（回复式 /spam 的引用消息、/ban 的引用正文）时直接传；
 // cached：调用方已读过缓存列表时直接复用，省掉一次 D1 往返，也避免两次查询之间缓存变动。
 // 两者与内部读取的缓存列表合并去重 —— /ban 群内路径的缓存会被清扫删掉，正文必须提前取好。
-async function learnSpamTextsFromCache(env, userId, { seeds = null, cached: preloaded = null } = {}) {
+// templateCounts：Map<正文, 发过它的不同目标数>，批量入口用 collectCrossUserTemplateCounts 算好后传入。
+// 传了就启用「投放模板」旁路（见 isTemplateAdText），不传则完全走原闸门。
+async function learnSpamTextsFromCache(env, userId, { seeds = null, cached: preloaded = null, templateCounts = null } = {}) {
 	const cached = Array.isArray(preloaded) ? preloaded : await loadRecentUserAdTextList(env, userId);
 	const merged = [];
 	const seen = new Set();
@@ -16053,7 +16077,10 @@ async function learnSpamTextsFromCache(env, userId, { seeds = null, cached: prel
 	}
 	const out = { added: 0, rejected: [], total: merged.length };
 	for (const text of merged) {
-		const r = await recordSpamText(env, { text }, { prune: false });
+		const r = await recordSpamText(env, { text }, {
+			prune: false,
+			crossUsers: templateCounts instanceof Map ? (Number(templateCounts.get(text)) || 0) : 0
+		});
 		if (r.ok) out.added += 1;
 		else if (r.reason) out.rejected.push(r.reason);
 	}
@@ -16214,6 +16241,43 @@ function isAdBearingText(text) {
 	if (Number(r?.score) > 0) return true;
 	return Array.isArray(r?.tradeHits) && r.tradeHits.length > 0
 		|| Array.isArray(r?.businessHits) && r.businessHits.length > 0;
+}
+
+// 「这条正文是不是投放模板」—— 与 isAdBearingText（正文里有没有广告词）是两回事。
+// 同款名单的作用是挡住后来的同款，所以真正要判的是【模板性】，不是词库命中。
+// 判据只有两条，都要求调用方拿得出证据，单条 /spam 拿不到证据 → 一律返回 false（行为不变）：
+//   ① crossUsers >= 2：同一句被两个以上不同目标发过。主人一次性 /spam 一批号时，
+//      这批号里出现一模一样的一句，正常用户不可能集体发同样的话 —— 这是投放的硬证据。
+//      线上实例：「✨✨…✨ @otrx」被 20 个号发、「帮忙收资 一天9千」被 2 个号发。
+//   ② 正文自带推广账号：@username（4 位以上）+ 总长 >= 12。挡的是「@张三 在吗」这类短寒暄。
+// 不满足这两条时仍然照旧被 isAdBearingText 卡住 —— 「签到」「今天天气不错」「节点订阅链接」
+// 一个都进不来，与改动前一致。
+function isTemplateAdText(norm, crossUsers) {
+	const text = String(norm ?? '').trim();
+	if (text.length < 6) return false;
+	// ① 跨目标重复，且至少 8 个字。8 字下限挡的是「今天天气不错」这种 6 字通用短句 ——
+	//    两个号都说过也可能只是巧合，不足以当模板；而「帮忙收资 一天9千」(9 字)、
+	//    「✨✨…✨ @otrx」(15 字) 这类带金额/账号的投放句不受影响。
+	if (Number(crossUsers) >= 2) return text.length >= 8;
+	// ② 正文自带推广账号：@username（4 位以上）+ 总长 >= 12。挡的是「@张三 在吗」这类短寒暄。
+	return text.length >= 12 && /@[A-Za-z0-9_]{4,}/.test(text);
+}
+
+// 批量学习入口用：把「同一句正文 → 发过它的不同目标数」先算出来，供 isTemplateAdText 判 ①。
+// 全程只在内存里聚合，不增加任何 D1 往返 —— 各目标的正文列表本来就要读一次。
+function collectCrossUserTemplateCounts(textLists) {
+	const owners = new Map();
+	for (const [userId, list] of textLists || []) {
+		for (const raw of Array.isArray(list) ? list : []) {
+			const text = String(raw || '').trim();
+			if (!text) continue;
+			if (!owners.has(text)) owners.set(text, new Set());
+			owners.get(text).add(String(userId));
+		}
+	}
+	const counts = new Map();
+	for (const [text, users] of owners) counts.set(text, users.size);
+	return counts;
 }
 
 // 正文骨架只提供正文位置的证据，不走同款直封或引用重发的处置通道。
@@ -19652,8 +19716,19 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				const learnTargets = [...idsToKick];
 				const learnTask = (async () => {
 					const sum = { added: 0, rejected: [], total: 0 };
+					// 先读一遍各目标的缓存正文：既省掉 learnSpamTextsFromCache 内部的重复查询，
+					// 也用来聚合「同一句被几个不同目标发过」—— 模板旁路 isTemplateAdText 的判据 ①。
+					// 主人一次性 /spam 的这批号里出现一模一样的一句，正常用户不会集体发同样的话。
+					const textLists = new Map();
+					await mapWithConcurrency(learnTargets, BULK_LEARN_CONCURRENCY, async (id) => {
+						textLists.set(String(id), await loadRecentUserAdTextList(env, id));
+					});
+					const templateCounts = collectCrossUserTemplateCounts(textLists);
 					for (const id of learnTargets) {
-						const one = await learnSpamTextsFromCache(env, id);
+						const one = await learnSpamTextsFromCache(env, id, {
+							cached: textLists.get(String(id)) || [],
+							templateCounts
+						});
 						sum.added += one.added;
 						sum.total += one.total;
 						sum.rejected.push(...one.rejected);
@@ -20947,8 +21022,17 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			const learnTargets = [...idsToKick];
 			const learnTask = (async () => {
 				const sum = { added: 0, rejected: [], total: 0 };
+				// 与批量 /spam 同一口径：先读正文列表，聚合跨目标重复后统一写名单。
+				const textLists = new Map();
+				await mapWithConcurrency(learnTargets, BULK_LEARN_CONCURRENCY, async (id) => {
+					textLists.set(String(id), await loadRecentUserAdTextList(env, id));
+				});
+				const templateCounts = collectCrossUserTemplateCounts(textLists);
 				for (const id of learnTargets) {
-					const one = await learnSpamTextsFromCache(env, id);
+					const one = await learnSpamTextsFromCache(env, id, {
+						cached: textLists.get(String(id)) || [],
+						templateCounts
+					});
 					sum.added += one.added;
 					sum.total += one.total;
 					sum.rejected.push(...one.rejected);
