@@ -13810,6 +13810,30 @@ async function collectAdDrillMaterial(key,previous,complete,operation) {
 	return operation();
 }
 
+// 【2026-11-14】素材缺口分两类，判据是「再试一次，结果会不会变」：
+//   会变（额度用完、识别故障、请求过频、刚判过还没落库）→ 记进 drillIncomplete，等下一轮补；
+//   不会变（nothumb 没有可用预览图 / size 超过读取上限 / mime 格式不支持 /
+//          no_reliable_ad_evidence 模型看过画面对不出广告证据）→ 不记。
+// 后者若继续算「未收齐」，等于给这条学习记录判了无期：operator 记录不受 attempts 上限约束，
+// cron 每 10 分钟重捞一轮，每轮都要重新下载素材、重新调用视觉与文字核验 —— 既学不完，
+// 也白烧图像相似度额度（线上 11-14 的 10 条 /spam 学习记录就卡在这类缺口上）。
+function adMaterialSettled(reason) {
+	return ['nothumb', 'size', 'mime', 'no_reliable_ad_evidence'].includes(String(reason || ''));
+}
+
+// 【2026-11-14】第一主人 /spam 学习是否算做完，只看「会不会真正影响判定」的三项：
+//   learningError            —— 资料/素材查询整段失败，等于没学到该学的；
+//   imageLearningFailedCount —— 主人确认的那张图没能写进指纹库，同图判定确实会漏；
+//   collectionComplete       —— 采集范围内的素材还有可重试的缺口（口径见 adMaterialSettled）。
+// 刻意不含 imageSimilarityPendingCount：它记的是「相似素材的向量还没算出来」，只服务于
+// 广告相似度检索；主人确认的那张图本身早已写进 ad_images，同图判定不受影响（回执里本来
+// 也是这么写的）。让它参与判定会造成死锁 —— 额度满 → 向量接口返回 daily_limit →
+// 计数 +1 → learning_failed → 次日重跑 → 额度又满。线上 img_similarity_count 从 11-05
+// 起天天打满 100、学习记录永远学不完，走的就是这条链。
+function adOperatorLearningComplete(learning) {
+	return !learning?.learningError && !learning?.imageLearningFailedCount && learning?.collectionComplete === true;
+}
+
 async function collectGlobalDryRunEvaluation(env, message, prior = null, options = {}) {
 	if (options.drillCollection === true && !AD_DRILL_CAPTURE.getStore()) {
 		return AD_DRILL_CAPTURE.run({ materials: new Map(), deadline:Date.now()+60000 }, () => collectGlobalDryRunEvaluation(env,message,prior,options));
@@ -13937,6 +13961,7 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	return evaluation;
 	};
 	let evaluation = await judgeCollectedContent();
+	// 只影响「还要不要继续补」；completeness 里仍如实记录没核验到，诊断信息不粉饰。
 	const drillIncomplete = [];
 	const materialComplete = (row, verifiedAd) => Boolean(row && !row.missReason
 		&& (row.verdict === 'clean' || row.verdict === 'ad' && verifiedAd));
@@ -13974,17 +13999,23 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	}
 	if (!profileFetched) drillIncomplete.push('资料查询未完成：简介、头像和会员标无法确认为已获取；保留消息基础姓名/用户名');
 	if (profileLinksFailed) drillIncomplete.push('资料关联频道或群组查询未完成');
-	if (profile.avatarId && !avatarComplete) drillIncomplete.push('头像内容或文字尚未核实：' + String(avatar?.missReason || (avatar ? avatar.ocr_verdict || avatar.verdict : 'missing_result')));
-	if (badgeId && !badgeComplete) drillIncomplete.push('会员标素材尚未核实：' + String(badgeItem?.missingReason || badgeItem?.row?.missReason || badgeItem?.row?.verdict || 'missing_result'));
+	const avatarMissReason = String(avatar?.missReason || (avatar ? avatar.ocr_verdict || avatar.verdict : 'missing_result'));
+	const badgeMissReason = String(badgeItem?.missingReason || badgeItem?.row?.missReason || badgeItem?.row?.verdict || 'missing_result');
+	// 终态缺口（见 adMaterialSettled）不再排进待补清单，其余照旧。
+	if (profile.avatarId && !avatarComplete && !adMaterialSettled(avatarMissReason)) drillIncomplete.push('头像内容或文字尚未核实：' + avatarMissReason);
+	if (badgeId && !badgeComplete && !adMaterialSettled(badgeMissReason)) drillIncomplete.push('会员标素材尚未核实：' + badgeMissReason);
 	if (imageInspection === 'thumbnail') drillIncomplete.push('正文动态或非位图素材仅核验缩略图，未逐帧或完整核验原文件');
 	if (media && imageInspection === 'unavailable') drillIncomplete.push('正文素材没有可核验的图片或缩略图，未完整核验原文件');
 	if (badgeInspection === 'thumbnail') drillIncomplete.push('会员标仅核验缩略图，未逐帧完整核验');
 	if (emojiMissingIds.some((id) => inspectionOf(emojiById.get(String(id))) === 'thumbnail')) drillIncomplete.push('正文自定义表情仅核验缩略图，未逐帧完整核验');
 	if (media && (['photo', 'sticker', 'video', 'animation'].includes(media.kind) || media.visionFileId)
-		&& (!image || image.verdict === 'pending' || image.verdict === 'ad' && !isVerifiedAdMediaRow(image))) {
+		&& (!image || image.verdict === 'pending' || image.verdict === 'ad' && !isVerifiedAdMediaRow(image))
+		&& !adMaterialSettled(image?.missReason)) {
 		drillIncomplete.push('正文素材尚未核实：' + String(image?.missReason || 'pending'));
 	}
-	if (emojiMissingIds.length) drillIncomplete.push('正文自定义素材尚未核实：' + emojiMissingIds.join(','));
+	// completeness.emoji 仍如实记录全部缺口；只有「重试也不会有答案」的那部分不再阻塞学习完成。
+	const emojiBlockingIds = emojiMissingIds.filter((id) => !adMaterialSettled(emojiById.get(String(id))?.row?.missReason));
+	if (emojiBlockingIds.length) drillIncomplete.push('正文自定义素材尚未核实：' + emojiBlockingIds.join(','));
 	evaluation.drillIncomplete = drillIncomplete;
 	const contentReviewIncomplete = [];
 	// 缩略图中的广告足以处置；缩略图正常不能冒充完整动画正常，未覆盖部分后台继续补查。
@@ -14975,7 +15006,8 @@ async function runAdContentReviewSingle(env,id,options={}) {
 			};
 			const learning=await learnAdOperatorSnapshot(env,row.user_id,invocation,{source:progress.source,createdBy:progress.createdBy,
 				reviewId:id,progress,checkpoint,profile:options.operatorProfile||adReviewBatchProfile(row)});
-			const complete=!learning.learningError&&!learning.imageLearningFailedCount&&!learning.imageSimilarityPendingCount&&learning.collectionComplete===true;
+			// 【2026-11-14】是否算学完，只看会真正卡住流程的失败项（见 adOperatorLearningComplete）。
+			const complete=adOperatorLearningComplete(learning);
 			learning.automaticPending=!complete;
 			evaluation.operatorLearning={...evaluation.operatorLearning,complete,result:learning};
 			const delay=learning.dynamicProgress?30:Number(row.attempts)>=2?86400:120*Math.pow(4,Number(row.attempts));
@@ -15156,7 +15188,11 @@ async function resumeAdContentReviews(env) {
 	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',next_at=?,evaluation=json_set(evaluation,'$.reviewRouting.lane','background') WHERE status='manual' AND decision='' AND lease_until<=? AND expires_at>? AND json_valid(evaluation)").bind(now,now,now).run();
 	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',review_sources='[]',next_at=?,lease_until=0,lease_token='' WHERE status='viewing' AND decision='' AND lease_until<=? AND expires_at>?").bind(now,now,now).run();
 	const readyChild="(json_extract(evaluation,'$.reviewDuplicate.automatic')=1 AND NOT EXISTS (SELECT 1 FROM ad_content_reviews parent WHERE parent.id=json_extract(ad_content_reviews.evaluation,'$.reviewDuplicate.representativeId') AND parent.expires_at>? AND parent.status IN ('pending','waiting','processing','viewing','normal_intent','action_failed')))";
-	const rows=(await env.DB.prepare('SELECT id,user_id,chat_id,CASE WHEN '+AD_REVIEW_ACTION_RETRY_CONDITION+' THEN 1 ELSE 0 END AS grouped FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\',\'learning_pending\',\'learning_failed\') AND (status=\'action_failed\' OR '+AD_REVIEW_REPRESENTATIVE_CONDITION+' OR '+readyChild+') AND (source=\'operator\' OR attempts<8) AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY next_at LIMIT 20').bind(now,now,now,now).all()).results||[];
+	// 【2026-11-14】operator 学习记录排最前。此前统一按 next_at 排队，第一主人 /spam 提交
+	// 的学习记录要排在近两千条自动待核记录后面 —— 队列积压时手动指令等于卡死。
+	// 主人手动提交的量很小（一天几十条），优先它不会挤占自动检测，却能把「手动指令要立刻跑」
+	// 从「看运气」变成确定行为。同一优先级内仍按 next_at 先到先处理。
+	const rows=(await env.DB.prepare('SELECT id,user_id,chat_id,CASE WHEN '+AD_REVIEW_ACTION_RETRY_CONDITION+' THEN 1 ELSE 0 END AS grouped FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\',\'learning_pending\',\'learning_failed\') AND (status=\'action_failed\' OR '+AD_REVIEW_REPRESENTATIVE_CONDITION+' OR '+readyChild+') AND (source=\'operator\' OR attempts<8) AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY CASE WHEN source=\'operator\' THEN 0 ELSE 1 END, next_at LIMIT 20').bind(now,now,now,now).all()).results||[];
 	let queued=0;const users=new Set();for(const row of rows){
 		const key=JSON.stringify([row.user_id,row.chat_id]);if(row.grouped&&users.has(key))continue;
 		if(await queueAdContentReview(env,row.id,1)){queued++;if(row.grouped)users.add(key);}
