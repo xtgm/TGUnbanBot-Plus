@@ -14366,6 +14366,33 @@ async function notifyAdContentReviewPending(env,id) {
 	}finally{if(!sent?.ok)await env.DB.prepare('UPDATE ad_scan_state SET updated_at=0 WHERE key=? AND value=?').bind(noticeKey,noticeToken).run();}
 }
 
+// 第一主人手动指令的学习正文：只保留有广告证据的段落。
+// 缓存里是该用户最近 5 条发言，可能混有「你好」「在吗」这类正常寒暄；
+// 人工判定的是「这个人是广告用户」，但不能把正常寒暄学成广告指纹。
+// 判据与投放模板一致：词库有广告词，或正文是投放模板（@推广号 / >=2 bot）。
+function adLearningBodyText(raw, options = {}) {
+	const source = String(raw || '').trim();
+	if (!source) return '';
+	// 判定链已经给正文记了广告证据（positionEvidence.text.grade >= 6）→ 整段可信。
+	if (options.wholeTextTrusted === true) return source;
+	const evidence = (value) => {
+		const norm = normalizeAdFingerprintValue(value);
+		return isAdBearingText(norm) || isTemplateAdText(norm, 0);
+	};
+	const lines = source.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+	// 缓存里同时有广告和正常发言时，只学有词库/模板证据的段。
+	const hits = lines.filter(evidence);
+	if (hits.length) return hits.join('\n');
+	// 一条词库证据都没有：人工判定为广告用户，词库 0 分的正文仍必须学。
+	// 只排除明显的日常寒暄（签到/打卡/你好/收到）和不足 6 字的短句。
+	const keepLine = (line) => {
+		const norm = normalizeAdFingerprintValue(line);
+		if (!norm || norm.length < 6) return false;
+		return !/^(签到|打卡|收到|在吗|冒泡|你好|您好|早上好|晚上好|大家好|来了|谢谢|好的|好|ok|okay)[\s!！。.]*$/i.test(norm);
+	};
+	return lines.filter(keepLine).join('\n');
+}
+
 function adReviewNameLearningFields(snapshot,evaluation={}) {
 	const fields={name:'',username:''},recorded=evaluation.positionEvidence?.name;
 	for(const key of ['name','username']){
@@ -28291,9 +28318,31 @@ function operatorQuotedLearningMessage(invocation, actorId, targetUserId) {
 		|| String(getMessageActorId(invocation)) !== String(actorId) || Number(invocation.message_id) <= 0) return null;
 	const quoted = invocation.reply_to_message;
 	if (!quoted || Number(quoted.message_id) <= 0 || !quoted.from?.id) return null;
-	if (quoted.from.is_bot === true) return null;
+	// 【2026-11-15 主人口径】第一主人的手动指令是人工判定，引用 bot 回发的引用式广告
+	// 同样必须学到真正的广告正文与正文媒体。bot 的资料卡（昵称/头像/会员标）不学，
+	// 由 learnAdOperatorSnapshot 按 quoted.from.is_bot 单独跳过。
 	if (String(quoted.from.id) !== String(targetUserId)) return null;
 	return quoted;
+}
+
+// TGID 模式（/spam 123、/ban 123、/sban 123）没有可引用的消息，用「命令消息 + 该用户
+// 缓存正文」合成一份学习现场。此前这条路径被 operatorQuotedLearningMessage 直接判 null，
+// 第一主人的日常主力指令一个特征都学不到 —— 与本轮主人口径冲突。
+// 只在：第一主人本人发令、且拿到了缓存正文时构造；媒体为空（没有现场可学）。
+function operatorSyntheticLearningMessage(invocation, targetUserId, options = {}) {
+	if (!invocation || invocation.__webAdmin || !isPrimaryOwner(options.createdBy)) return null;
+	if (String(getMessageActorId(invocation)) !== String(options.createdBy)) return null;
+	if (Number(invocation.message_id) <= 0) return null;
+	// 正文可以为空：/spam <ID> 时缓存里可能没有原文（刚发就被删 / 已过保留期），
+	// 但第一主人的指令仍然要学资料卡（昵称 / bio / 头像 / 会员标）。
+	const text = String(options.text || '').trim();
+	return {
+		message_id: Number(invocation.message_id),
+		date: Number(invocation.date) || Math.floor(Date.now() / 1000),
+		chat: invocation.chat,
+		from: { id: Number(targetUserId), is_bot: false, first_name: String(options.firstName || ''), last_name: '', username: String(options.username || '') },
+		text
+	};
 }
 
 async function learnAdFromOperatorAction(env, targetUserId, message, options = {}) {
@@ -28302,7 +28351,8 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 		imageSimilarityPendingCount:0,avatars:0,badges:0,shapes:0,aiPromoted:0};
 	if(!isPrimaryOwner(createdBy))return out;
 	const invocation=options.invocationMessage||(message&&isTelegramSlashCommand(message.text)?message:null);
-	const quoted=operatorQuotedLearningMessage(invocation,createdBy,targetUserId);
+	const quoted=operatorQuotedLearningMessage(invocation,createdBy,targetUserId)
+		||operatorSyntheticLearningMessage(invocation,targetUserId,{...options,createdBy});
 	if(!quoted||await isAdUserWhitelisted(env,targetUserId))return out;
 	try{
 		// 先落原始引用与授权，再开始采集；服务中断后队列与定时任务均能续接。
@@ -28360,17 +28410,25 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 				globalDrill:{complete:false},drillIncomplete:['资料或素材查询失败，已保留原始现场等待自动核验'],globalDrillAssets:{avatarAd:false,badgeIds:[]}}};
 			out.learningError='资料补充查询失败；已学习上报正文，素材在后台继续核验';
 		}
-		const text = String(collected.evaluation.snapshot.text||'');
+		const targetIsBot = quoted.from?.is_bot === true;
+		// 人工判定只学有广告证据的正文段落；正常寒暄不学。
+		// 判定链已给正文记了广告证据（grade >= 6）时整段可信，否则只保留有词库/模板证据的段。
+		const textEvidence = collected.evaluation.positionEvidence?.text;
+		const text = adLearningBodyText(collected.evaluation.snapshot.text, {
+			wholeTextTrusted: !textEvidence?.exempt && Number(textEvidence?.grade) >= 6
+		});
 		const profile = collected.profile;
 		out.snapshot=collected.evaluation.snapshot;
 		out.collectionComplete=collected.evaluation.globalDrill.complete;
 		out.dynamicProgress=collected.evaluation.contentReviewProgress===true;
 		out.collectionMissing=collected.evaluation.drillIncomplete||[];
 		await checkpoint(collected.evaluation);
+		// 投放 bot 是工具账号，它的昵称/头像/会员标不是广告用户特征：
+		// 只学它发出的正文与正文媒体，资料卡一项都不学（避免把通用 bot 资料学成广告特征）。
 		const name = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
-		const nameFields=adReviewNameLearningFields({name,username:String(profile.username||'')},collected.evaluation);
+		const nameFields=targetIsBot?{name:'',username:''}:adReviewNameLearningFields({name,username:String(profile.username||'')},collected.evaluation);
 		const bioEvidence=collected.evaluation.positionEvidence?.bio;
-		const learningBio=!bioEvidence?.exempt&&(Number(bioEvidence?.grade)>=6||collected.evaluation.structure?.guilty===true&&collected.evaluation.structure.channel==='card')?String(profile.bio||''):'';
+		const learningBio=targetIsBot?'':(!bioEvidence?.exempt&&(Number(bioEvidence?.grade)>=6||collected.evaluation.structure?.guilty===true&&collected.evaluation.structure.channel==='card')?String(profile.bio||''):'');
 		// 【媒体源】/ban <id>、/spam <id>、/sban 传进来的 message 是【命令消息本身】，
 		// 被引用的那条广告躺在 message.reply_to_message 里 —— 命令消息上没有 photo /
 		// sticker / entities，直接吃 message 会让「引用一张广告图或贴纸去 /ban」的媒体
@@ -28385,8 +28443,8 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 		// 封禁账号不等于确认每个素材；单发表情也须有其自身的广告内容证据。
 		const learnedEmojiRows = manualEmojiRows.filter((item) => item.verifiedAd&&isVerifiedAdMediaRow(item.row) && item.fileUniqueId && item.fileId);
 		const payload = {
-			avatarText:isVerifiedAdAvatarRow(collected.materials.avatar)?adCollectedMaterialText(collected.materials.avatar,true):'',
-			badgeText:collected.materials.badgeItem?.verifiedAd?adCollectedMaterialText(collected.materials.badgeItem.row):'',
+			avatarText:!targetIsBot&&isVerifiedAdAvatarRow(collected.materials.avatar)?adCollectedMaterialText(collected.materials.avatar,true):'',
+			badgeText:!targetIsBot&&collected.materials.badgeItem?.verifiedAd?adCollectedMaterialText(collected.materials.badgeItem.row):'',
 			customEmojiText:learnedEmojiRows.map(item=>adCollectedMaterialText(item.row)).filter(Boolean).join('\n'),
 			name:nameFields.name,
 			username:nameFields.username ? '@' + nameFields.username.replace(/^@/, '') : '',
@@ -28433,7 +28491,7 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 		// 判据写不进去最多是少学一条，不能让回执报错，更不能影响后面的语义样本与共性提炼。
 		try {
 			const avatarId = String(profile.avatarId || '');
-			if (avatarId && collected.evaluation.globalDrillAssets.avatarAd && isVerifiedAdAvatarRow(collected.materials.avatar)
+			if (!targetIsBot && avatarId && collected.evaluation.globalDrillAssets.avatarAd && isVerifiedAdAvatarRow(collected.materials.avatar)
 				&& await step('avatar:'+avatarId,()=>learnAdAvatarOnBan(env, avatarId, targetUserId))) {
 				out.avatars += 1;
 				if (collected.materials.avatar?.ocr_text) await step('avatar_text:'+avatarId,async()=>{
@@ -28446,7 +28504,7 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 			// 会员标与正文自定义 emoji 共用 ad_badges、共用 hits 计数（+1 语义），
 			// 这里只学 profile 上那一个标：正文 emoji 属于消息，人工命令没有消息可取。
 			const badgeId = String(profile.badgeId || '');
-			if (badgeId && collected.evaluation.globalDrillAssets.badgeIds.includes(badgeId) && await step('badge:'+badgeId,()=>learnAdBadgeOnBan(env, badgeId, targetUserId))) out.badges += 1;
+			if (!targetIsBot && badgeId && collected.evaluation.globalDrillAssets.badgeIds.includes(badgeId) && await step('badge:'+badgeId,()=>learnAdBadgeOnBan(env, badgeId, targetUserId))) out.badges += 1;
 			// 正文自定义 emoji 与会员标共用 ad_badges、共用 hits 计数（+1 语义）。
 			// 2026-10-19 补：此前手动路径只学 profile 上那个会员标，正文里的贴纸 emoji
 			// 一个都不学 —— 管理员引用「正文只有 点⚔️查 这类 emoji」的广告发 /spam，
