@@ -26657,6 +26657,39 @@ const AD_SLASH_COMMAND_RE = /(^|\s)\/[A-Za-z0-9_]{2,}/;
 
 // 引流出口分析。核心约定：【自己的 @handle 不算出口】—— 它是身份标识，
 // 每个人都有；把它算进出口会让所有设了用户名的人凭空多一个「引流渠道」。
+// 【2026-11-15】bot handle 的正常/可疑判别：形态 B 强档必须至少有一个可疑 bot，
+// 且不能全是正常 bot —— 正常用户也会 @ 多个正常 bot（天气、翻译、GPT），
+// 「bot 数量 ≥2」单独不能定罪。
+const AD_NORMAL_BOT_WORDS = ['weather', 'news', 'translate', 'gpt', 'chatgpt', 'claude', 'gemini', 'llama', 'qwen', 'deepseek',
+	'help', 'info', 'search', 'music', 'video', 'game', 'admin', 'verify', 'verification', 'captcha', 'antispam',
+	'moderator', 'mod', 'kick', 'mute', 'ban', 'warn', 'report', 'check', 'poll', 'quiz', 'reminder', 'calendar',
+	'download', 'upload', 'proxy', 'vpn', 'github', 'botfather', 'weather', 'translate'];
+const AD_SUSPICIOUS_BOT_WORDS = ['promo', 'advert', 'ads', 'sell', 'buy', 'payment', 'pay', 'join', 'click', 'traffic',
+	'money', 'cash', 'earn', 'task', 'order', 'shop', 'store', 'vip', 'premium', 'bet', 'casino', 'porn', 'sex',
+	'usdt', 'crypto', 'trx', 'energy', 'loan', 'credit', 'invest', 'profit', 'income', 'recruit', 'agent', 'channel', 'group'];
+
+function isNormalBotHandle(name) {
+	const core = String(name || '').toLowerCase().replace(/bot$/, '').replace(/[^a-z0-9_]/g, '');
+	if (!core) return false;
+	return AD_NORMAL_BOT_WORDS.some((word) => core.includes(word));
+}
+
+function isSuspiciousBotHandle(name) {
+	const original = String(name || '');
+	const core = original.toLowerCase().replace(/bot$/, '').replace(/[^a-z0-9_]/g, '');
+	if (!core) return true;
+	if (AD_SUSPICIOUS_BOT_WORDS.some((word) => core.includes(word))) return true;
+	// 无意义短名（@aabot / @bbbot / @bot1）：正常 bot 会用语义词命名。
+	if (core.length < 4) return true;
+	const upper = (original.match(/[A-Z]/g) || []).length;
+	const lower = (original.match(/[a-z]/g) || []).length;
+	const digits = (core.match(/[0-9]/g) || []).length;
+	// 大小写混合、数字堆叠：随机注册的投放 bot 常见形态。
+	if (upper >= 2 && lower >= 2) return true;
+	if (core.length >= 8 && digits >= 2) return true;
+	return false;
+}
+
 function analyzeAdOutlets(text, selfUsername) {
 	const self = String(selfUsername || '').toLowerCase().replace(/^@+/, '');
 	const mentions = [...new Set(
@@ -26742,9 +26775,15 @@ function judgeAdStructure(text, selfUsername, channel) {
 	// 放走它，test_ad_detection 的「佳佳引流矩阵应定罪」也钉着这一条。
 	const naturalLen = adNaturalTextLength(source);
 	const hasCommand = AD_SLASH_COMMAND_RE.test(source);
+	// 【2026-11-15 主人口径】≥2 个 bot 时看形态：全是正常语义 bot（weather/translate 等）不判；
+	// 至少一个随机/无意义/广告形态的 bot 就判死；单个 bot 永远不判。
+	const normalBotCount = outlets.botMentions.filter(isNormalBotHandle).length;
+	const suspiciousBotCount = outlets.botMentions.filter(isSuspiciousBotHandle).length;
 	const formBBare = channel === 'body'
 		&& outlets.mentions.length >= 2
 		&& outlets.botMentions.length === outlets.mentions.length
+		&& normalBotCount === 0
+		&& suspiciousBotCount >= 1
 		&& naturalLen < AD_NATURAL_TEXT_MAX
 		&& !hasCommand;
 	const formBHard = outlets.sharedPrefix || formBBare;
