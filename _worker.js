@@ -37602,6 +37602,15 @@ function clearAdPositionHardBan(evaluation, key) {
 
 function adPositionExemptHits(text) {
 	const source = String(text || '');
+	// 【2026-11-15 线上漏放】≥2 个 @xxxbot、正文几乎没有自然语言、无斜杠命令 ——
+	// 这是形态 B 的批量代发诱饵，「bot」在这里不是技术豁免词。旧逻辑把整条正文
+	// 判成「命中豁免词 bot」、位置证据 grade=0，形态 B 强档永远拿不到证据，
+	// 线上实测 3 个 bot 的诱饵只能靠 /spam 手动处置。这里直接返回空：不豁免。
+	const bareOutlets = analyzeAdOutlets(source, '');
+	if (bareOutlets.mentions.length >= 2 && bareOutlets.botMentions.length === bareOutlets.mentions.length
+		&& adNaturalTextLength(source) < AD_NATURAL_TEXT_MAX && !AD_SLASH_COMMAND_RE.test(source)) {
+		return [];
+	}
 	const routine=source.normalize('NFKC').replace(/[\s\p{P}\p{S}]+/gu,'');
 	if(/^(?:签到|簽到|打卡|收到|冒泡|早安|晚安|早上好|晚上好|大家好|谢谢|謝謝|感谢|感謝){1,3}$/.test(routine))return ['日常问候或签到'];
 	if (isAdNonPromotionalContext(source)) return ['反诈、举报或明确否定推广的语境'];
