@@ -14152,9 +14152,16 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 		capture.allowedMaterials=new Set(pending.slice(cursor,cursor+AD_DRYRUN_CAPTURE_MATERIALS));
 		capture.nextCursor=cursor+AD_DRYRUN_CAPTURE_MATERIALS>=pending.length?0:cursor+AD_DRYRUN_CAPTURE_MATERIALS;
 	}
-	const image = media && !joinTextEvaluation ? await collectAdDrillMaterial('image',previousMaterials.image,isAdDrillMaterialComplete(media,previousMaterials.image),
-		()=>judgeAdMediaForMessage(env, media, userId, { requireContent: true, scopeChatId, messageText: ownText })) : null;
-	const emojiRows = joinTextEvaluation ? [] : await readAdCustomEmojiMediaRows(env, emojiIds, userId, { complete: true, scopeChatId, messageText: ownText,previousRows:previousMaterials.emojiRows });
+	// 【2026-11-15 提速】图片、正文 emoji、头像三路视觉识别并行跑：
+	// 原来是串行等待，单条自动检测光这一段就要 8~12 秒（gemma 约 2.6s/张）。
+	const [image, emojiRows, avatarBase] = await Promise.all([
+		media && !joinTextEvaluation ? collectAdDrillMaterial('image',previousMaterials.image,isAdDrillMaterialComplete(media,previousMaterials.image),
+			()=>judgeAdMediaForMessage(env, media, userId, { requireContent: true, scopeChatId, messageText: ownText })) : null,
+		joinTextEvaluation ? [] : readAdCustomEmojiMediaRows(env, emojiIds, userId, { complete: true, scopeChatId, messageText: ownText,previousRows:previousMaterials.emojiRows }),
+		profile.avatarId && !joinTextEvaluation ? collectAdDrillMaterial('avatar',previousMaterials.avatar,isAdDrillMaterialComplete(null,previousMaterials.avatar,true),
+			()=>judgeAdAvatarRealtime(env, profile.avatarId, profile, {scopeChatId,forceContent:options.forceMaterialReview===true})) : null
+	]);
+	let avatar = avatarBase;
 	const badgeLocalClean=badgeId&&await hasGroupAdFeedback(env,scopeChatId,'badge',badgeId);
 	let badgeItem = joinTextEvaluation ? null : badgeLocalClean?{id:badgeId,row:{verdict:'clean',source:'group_feedback'},verifiedAd:false}:emojiRows.find((item) => item.id === badgeId && !item.row?.messageContext && (!capture||isAdDrillMaterialComplete(item,item.row)))
 		|| (badgeId ? (await readAdCustomEmojiMediaRows(env, [badgeId], userId, { complete: true, scopeChatId,drillKey:'badge',previousRows:previousMaterials.badgeItem?[previousMaterials.badgeItem]:[] }))[0] : null);
@@ -14164,8 +14171,6 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 		||badgeReview.source==='local_review'&&badgeReview.localReviewVerified)) {
 		badgeItem = {...badgeItem,id:badgeId,row:badgeReview,verifiedAd:badgeReview.verdict==='ad'};
 	}
-	let avatar = profile.avatarId && !joinTextEvaluation ? await collectAdDrillMaterial('avatar',previousMaterials.avatar,isAdDrillMaterialComplete(null,previousMaterials.avatar,true),
-		()=>judgeAdAvatarRealtime(env, profile.avatarId, profile, {scopeChatId,forceContent:options.forceMaterialReview===true})) : null;
 	const avatarOwnerClean = avatar?.verdict === 'clean' && ['owner', 'manual','group_feedback'].includes(String(avatar.source || ''));
 	if (avatar && !avatarOwnerClean && String(avatar.ocr_text || '').trim()) {
 		try {
@@ -16832,7 +16837,7 @@ async function clearAdTextSkeletonOnIgnore(env, payload, options = {}) {
 
 // 按正文哈希跨【全部配置群】反查 24 小时内发过同款文案的其他账号。
 // 返回去重后的 { userId, chatIds, messageIds } 列表，不含被 /spam 的当事人。
-async function findLinkedSpamTargets(env, textKey, excludeUserId) {
+async function findLinkedSpamTargets(env, textKey, excludeUserId, options = {}) {
 	if (!env?.DB || !textKey?.hash) return { targets: [], truncated: 0 };
 	// ===== 模板资格闸（2026-10-17）：正文自身没有广告证据 → 不能当同款模板 =====
 	// 【线上误封回归】广告号资料卡是广告、正文却只发了「签到」，连带拿这句「签到」
@@ -16846,7 +16851,17 @@ async function findLinkedSpamTargets(env, textKey, excludeUserId) {
 	// 带推广账号的长句几乎不可能是正常人闲聊，而「签到」「今天天气不错」这类 6 字以内
 	// 的打卡/寒暄仍被长度闸挡住（线上误封 1335910695 那次正是被「签到」害的）。
 	// 判据 ①（跨目标重复）在单条 /spam 路径拿不到 crossUsers，故传 0 不启用。
-	if (!isAdBearingText(textKey?.norm) && !isTemplateAdText(textKey?.norm, 0)) {
+	// 【2026-11-15 主人口径】第一主人手动 /spam 的正文直接当模板反查，不再过词库闸；
+	// 自动检测路径仍保留模板闸（防「签到」式连带误封）。
+	if (options.trusted === true) {
+		// 第一主人手动判定：跳过词库闸，但保留「豁免词 / 明显正常短句」两道最低护栏，
+		// 防止 /spam 引用的正文里只有「签到」这类寒暄时把全群打卡用户连带封掉。
+		if (countAdKeywordHits(textKey?.norm, AD_EXEMPT_KEYWORDS).length || isObviouslyNormalChatText(textKey?.norm)) {
+			console.log('[同款连带] 正文含豁免词或为明显正常短句（' + String(textKey?.norm || '').slice(0, 40)
+				+ '），跳过反查');
+			return { targets: [], truncated: 0, overflowIds: [] };
+		}
+	} else if (!isAdBearingText(textKey?.norm) && !isTemplateAdText(textKey?.norm, 0)) {
 		console.log('[同款连带] 模板正文自身无广告证据（' + String(textKey?.norm || '').slice(0, 40)
 			+ '），不作同款模板、跳过反查');
 		return { targets: [], truncated: 0, overflowIds: [] };
@@ -20444,7 +20459,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				const runLinkedSpam = async () => {
 				try {
 				if (linkedKey) {
-					const found = await findLinkedSpamTargets(env, linkedKey, repliedUserId);
+					const found = await findLinkedSpamTargets(env, linkedKey, repliedUserId, { trusted: true });
 					// 受保护角色（超管 / 任一配置群群主·管理员 / 主副主人）永不被连带封禁：入队前剔除。
 					if (found.targets.length) {
 						const kept = [];
@@ -24772,7 +24787,10 @@ const AD_BUSINESS_KEYWORDS = [
 	'洗米', '收米', '码商',
 	// 【2026-11-15 线上漏放】与交易动词表同步：这几个词没有正常语义，同词两表，
 	// 「洗资一天8k / 带偶收咪·壹天九仟 / 转U能量 / 公群交易」这类单词即可凑成形态 A。
-	'洗资', '收咪', '转U能量', '能量租赁', '公群交易'
+	'洗资', '收咪', '转U能量', '能量租赁', '公群交易',
+	// 【2026-11-15 线上漏放】收款/代收跑分黑话：只作行业指向，单独出现 0 分；
+	// 与上面新增的收益承诺（一天7千 / 一小时9000 / 日六千）同现才构成形态 A。
+	'收款码', '代收', '收款', '收钱', '帮我收'
 ];
 
 // 豁免词：命中且无交易动词时整体减分，保护正常用户。
@@ -26487,7 +26505,15 @@ const AD_SOLICIT_PATTERNS = [
 	/(招|收)\s*(代理|下级|下家|车手|水军|学员|渠道)/,
 	// 「回收 / 求购 / 收购」整词 —— 这三个是中文交易广告最高频的动词，
 	// 单独成词时不需要修饰语也足以构成招揽意图。
-	/(回收|求购|收购)/
+	/(回收|求购|收购)/,
+	// 【2026-11-15 线上漏放】收款/代收类跑分广告的收益承诺：
+	// 「微信收钱 一天7千」「做代收 一天6ooo」「有码来帮我收款 赚8千」
+	// 「支付宝微信帮我收一个小时赚7777」「有收款码来帮忙洗米 日六千」。
+	// 只认「时间段 + 三位以上金额」或「数字 + 千/k/w/万」的组合，正常聊天
+	// 「一天8k步」「今天赚了8块」不会同时满足这两条里任何一条。
+	/(?:一天|一小时|日入|日赚|日搞|挣|赚|收入)\s*[0-9oO]{3,}/,
+	/(?:一天|一小时|日入|日赚|日搞|挣|赚)\s*[0-9一二三四五六七八九十]+\s*(?:千|仟|k|w|万)/i,
+	/(?:日|一天|壹天)\s*[一二三四五六七八九十]+\s*[千仟]/
 ];
 
 // 行业指向：广告号「做哪门生意」。与招揽意图正交 —— 只有两者同现才定罪。
