@@ -16379,14 +16379,9 @@ async function recordSpamText(env, repliedMsg, options = {}) {
 	// 悄悄拒收，名单一条都进不去（线上 7 条 learning_failed 全是这个原因）。
 	// 旁路判的是「这条正文是不是投放模板」而不是「有没有广告词」，口径见 isTemplateAdText：
 	// 只能由调用方在拿得到跨用户重复证据时传入，单条路径传不了 → 行为与改动前逐字节一致。
-	// 【2026-11-15 主人口径】第一主人手动判定优先，但保留两道最低护栏：
-	//   ① 正文含豁免词 → 不收录（豁免词是主人自己维护的「正常语境」清单）；
-	//   ② 明显正常短句（≤12 字、无链接/@/数字/广告词）→ 不收录。
-	// 其余正文全部收录 —— 第一主人 spam/sban/ban 的对象一定是广告用户。
+	// 【2026-11-15 主人口径·最终】第一主人 /spam 的正文照常收录，不再因豁免词拒收；
+	// 唯一跳过的「签到 / 今天天气不错」这类明显正常短句 —— 主人不会拿签到去 spam。
 	if (options?.trusted === true) {
-		if (countAdKeywordHits(norm, AD_EXEMPT_KEYWORDS).length) {
-			return { ok: false, reason: '正文含豁免词，不收录', norm };
-		}
 		if (isObviouslyNormalChatText(norm)) {
 			return { ok: false, reason: '明显正常短句，不收录', norm };
 		}
@@ -16851,14 +16846,11 @@ async function findLinkedSpamTargets(env, textKey, excludeUserId, options = {}) 
 	// 带推广账号的长句几乎不可能是正常人闲聊，而「签到」「今天天气不错」这类 6 字以内
 	// 的打卡/寒暄仍被长度闸挡住（线上误封 1335910695 那次正是被「签到」害的）。
 	// 判据 ①（跨目标重复）在单条 /spam 路径拿不到 crossUsers，故传 0 不启用。
-	// 【2026-11-15 主人口径】第一主人手动 /spam 的正文直接当模板反查，不再过词库闸；
-	// 自动检测路径仍保留模板闸（防「签到」式连带误封）。
+	// 【2026-11-15 主人口径·最终】第一主人手动 /spam 的正文直接当模板反查，
+	// 不再因豁免词拒收；只跳过「签到」这类明显正常短句。
 	if (options.trusted === true) {
-		// 第一主人手动判定：跳过词库闸，但保留「豁免词 / 明显正常短句」两道最低护栏，
-		// 防止 /spam 引用的正文里只有「签到」这类寒暄时把全群打卡用户连带封掉。
-		if (countAdKeywordHits(textKey?.norm, AD_EXEMPT_KEYWORDS).length || isObviouslyNormalChatText(textKey?.norm)) {
-			console.log('[同款连带] 正文含豁免词或为明显正常短句（' + String(textKey?.norm || '').slice(0, 40)
-				+ '），跳过反查');
+		if (isObviouslyNormalChatText(textKey?.norm)) {
+			console.log('[同款连带] 正文为明显正常短句（' + String(textKey?.norm || '').slice(0, 40) + '），跳过反查');
 			return { targets: [], truncated: 0, overflowIds: [] };
 		}
 	} else if (!isAdBearingText(textKey?.norm) && !isTemplateAdText(textKey?.norm, 0)) {
@@ -28873,10 +28865,10 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 		const targetIsBot = quoted.from?.is_bot === true;
 		// 人工判定只学有广告证据的正文段落；正常寒暄不学。
 		// 判定链已给正文记了广告证据（grade >= 6）时整段可信，否则只保留有词库/模板证据的段。
-		// 【2026-11-15 主人口径】第一主人手动判定即广告：整段正文全部学习；
-		// 但正文含豁免词时不收录正文（豁免词是主人维护的正常语境清单），资料卡照常学。
+		// 【2026-11-15 主人口径·最终】第一主人手动判定即广告：整段正文全部学习；
+		// 唯一跳过「签到 / 今天天气不错」这类明显正常短句（主人不会拿签到去 spam）。
 		const rawSnapshotText = String(collected.evaluation.snapshot.text || '');
-		const text = countAdKeywordHits(rawSnapshotText, AD_EXEMPT_KEYWORDS).length
+		const text = isObviouslyNormalChatText(rawSnapshotText)
 			? ''
 			: adLearningBodyText(rawSnapshotText, { wholeTextTrusted: true });
 		const profile = collected.profile;
@@ -28885,12 +28877,12 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 		out.dynamicProgress=collected.evaluation.contentReviewProgress===true;
 		out.collectionMissing=collected.evaluation.drillIncomplete||[];
 		await checkpoint(collected.evaluation);
-		// 投放 bot 是工具账号，它的昵称/头像/会员标不是广告用户特征：
-		// 只学它发出的正文与正文媒体，资料卡一项都不学（避免把通用 bot 资料学成广告特征）。
-		const name = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
-		const nameFields=targetIsBot?{name:'',username:''}:adReviewNameLearningFields({name,username:String(profile.username||'')},collected.evaluation);
-		const bioEvidence=collected.evaluation.positionEvidence?.bio;
-		const learningBio=targetIsBot?'':(!bioEvidence?.exempt&&(Number(bioEvidence?.grade)>=6||collected.evaluation.structure?.guilty===true&&collected.evaluation.structure.channel==='card')?String(profile.bio||''):'');
+		// 【2026-11-15 主人口径·最终】同款学习只学【正文】：正文文字、正文图片、
+		// 正文表情包贴纸。资料卡（昵称 / 头像 / 会员标 / 资料形状）一律不学 ——
+		// 资料卡的识别交给自动检测与第一道/第二道防线。
+		const name = '';
+		const nameFields = { name: '', username: '' };
+		const learningBio = '';
 		// 【媒体源】/ban <id>、/spam <id>、/sban 传进来的 message 是【命令消息本身】，
 		// 被引用的那条广告躺在 message.reply_to_message 里 —— 命令消息上没有 photo /
 		// sticker / entities，直接吃 message 会让「引用一张广告图或贴纸去 /ban」的媒体
@@ -28952,44 +28944,18 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 		// 【绝不影响命令本职】与上面的指纹学习同一口径：封禁已经做完了，
 		// 判据写不进去最多是少学一条，不能让回执报错，更不能影响后面的语义样本与共性提炼。
 		try {
-			const avatarId = String(profile.avatarId || '');
-			if (!targetIsBot && avatarId && collected.evaluation.globalDrillAssets.avatarAd && isVerifiedAdAvatarRow(collected.materials.avatar)
-				&& await step('avatar:'+avatarId,()=>learnAdAvatarOnBan(env, avatarId, targetUserId))) {
-				out.avatars += 1;
-				if (collected.materials.avatar?.ocr_text) await step('avatar_text:'+avatarId,async()=>{
-					const value=collected.materials.avatar.ocr_text;
-					const textHit=await matchAdAvatarText(env,value);
-					if(!isReliableAdAvatarText({ocr_text:value,textHit}))return true;
-					return learnAdAvatarText(env,value);
-				});
-			}
-			// 会员标与正文自定义 emoji 共用 ad_badges、共用 hits 计数（+1 语义），
-			// 这里只学 profile 上那一个标：正文 emoji 属于消息，人工命令没有消息可取。
-			const badgeId = String(profile.badgeId || '');
-			if (!targetIsBot && badgeId && collected.evaluation.globalDrillAssets.badgeIds.includes(badgeId) && await step('badge:'+badgeId,()=>learnAdBadgeOnBan(env, badgeId, targetUserId))) out.badges += 1;
-			// 正文自定义 emoji 与会员标共用 ad_badges、共用 hits 计数（+1 语义）。
-			// 2026-10-19 补：此前手动路径只学 profile 上那个会员标，正文里的贴纸 emoji
-			// 一个都不学 —— 管理员引用「正文只有 点⚔️查 这类 emoji」的广告发 /spam，
-			// 那个 emoji id 进不了库，同款素材复用等于零成本漏放。id 现已随 payload 带上。
-			// 跳过与会员标重复的那个 id —— 重复学会把 AD_BADGE_BAN_HITS 的安全阀提前拱开。
+			// 【2026-11-15 主人口径·最终】资料卡头像 / 会员标不在同款学习范围内：
+			// 同款只学正文（文字 + 图片 + 表情包贴纸）。资料卡识别交给自动检测。
+			// 正文自定义 emoji 属于正文，照常学习。
 			for (const emojiId of payload.customEmojiIds) {
-				if (!emojiId || emojiId === badgeId) continue;
+				if (!emojiId) continue;
 				if (await step('badge:'+emojiId,()=>learnAdBadgeOnBan(env, emojiId, targetUserId))) out.badges += 1;
 			}
 		} catch (error) {
-			out.learningError='部分头像或会员表情特征未能保存';
-			console.error('[广告检测] 人工判定头像/会员标学习失败（' + source + '）:', error);
+			out.learningError='部分会员表情特征未能保存';
+			console.error('[广告检测] 人工判定会员标学习失败（' + source + '）:', error);
 		}
-		try {
-			// 形状只在【有实质内容】时才算得出来：adProfileShape 对空 bio 或核心内容不足 4 字的
-			// 一律返回空串，这里自然跳过 —— 形状层只加分不定罪，写一条没有区分度的进去纯属噪声，
-			// 反而会把同模板的正常人一起加分（那正是会员标那次连坐的同一类风险）。
-			const shapeKey = learningBio ? adProfileShape({...profile,bio:learningBio}) : '';
-			if (shapeKey && await step('shape:'+shapeKey,()=>learnAdProfileShape(env, shapeKey, learningBio))) out.shapes += 1;
-		} catch (error) {
-			out.learningError='资料形状特征未能保存';
-			console.error('[广告检测] 人工判定资料形状学习失败（' + source + '）:', error);
-		}
+		// 【2026-11-15 主人口径·最终】资料形状不在同款学习范围内（属于资料卡）。
 
 		// 【2026-10-13 补：学习链路必须也学图片】
 		// payload 只有 name / username / bio / text / domains 五样 —— 主人引用一张
