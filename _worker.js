@@ -7164,7 +7164,7 @@ async function performBulkJobD1Mutation(job, env, ids) {
 				badgeTotal += Number(r.badges || 0);
 				shapeTotal += Number(r.shapes || 0);
 				if (learnSpamTexts) {
-					const one = await learnSpamTextsFromCache(env, uid, { cached: textList, templateCounts });
+					const one = await learnSpamTextsFromCache(env, uid, { cached: textList, templateCounts, trusted: true });
 					spamTextTotal += Number(one.added) || 0;
 				}
 				return r;
@@ -16296,6 +16296,19 @@ async function ensureAdSpamTextsTable(env) {
 //   { ok:true, norm } / { ok:false, reason, norm }
 // 三道闸（短文案 / 无广告证据 / 建表失败）此前全是静默 return ——
 // 线上表现就是「第一主人 /spam 过同款，广告照发不误」，而回执里一个字都看不出来。
+// 【2026-11-15 主人口径】第一主人手动判定优先，但保留两道最低护栏：
+//   ① 正文含豁免词 → 不收录（豁免词是主人自己维护的「正常语境」清单）；
+//   ② 明显正常短句（≤12 字、无链接/@/数字/广告词）→ 不收录。
+// 其余正文全部收录 —— 第一主人 spam/sban/ban 的对象一定是广告用户。
+function isObviouslyNormalChatText(text) {
+	const t = String(text || '').trim();
+	if (!t) return true;
+	if (/@|https?:\/\/|t\.me\//i.test(t)) return false;
+	if (/[0-9０-９]/.test(t)) return false;
+	if (countAdKeywordHits(t, AD_TRADE_VERBS).length || countAdKeywordHits(t, AD_BUSINESS_KEYWORDS).length) return false;
+	return t.length <= 12;
+}
+
 async function recordSpamText(env, repliedMsg, options = {}) {
 	const key = buildModerationTextKey(repliedMsg);
 	if (!key) return { ok: false, reason: '取不到正文（纯图片/贴纸或无文字）', norm: '' };
@@ -16313,7 +16326,18 @@ async function recordSpamText(env, repliedMsg, options = {}) {
 	// 悄悄拒收，名单一条都进不去（线上 7 条 learning_failed 全是这个原因）。
 	// 旁路判的是「这条正文是不是投放模板」而不是「有没有广告词」，口径见 isTemplateAdText：
 	// 只能由调用方在拿得到跨用户重复证据时传入，单条路径传不了 → 行为与改动前逐字节一致。
-	if (!isAdBearingText(norm) && !isTemplateAdText(norm, options?.crossUsers)) {
+	// 【2026-11-15 主人口径】第一主人手动判定优先，但保留两道最低护栏：
+	//   ① 正文含豁免词 → 不收录（豁免词是主人自己维护的「正常语境」清单）；
+	//   ② 明显正常短句（≤12 字、无链接/@/数字/广告词）→ 不收录。
+	// 其余正文全部收录 —— 第一主人 spam/sban/ban 的对象一定是广告用户。
+	if (options?.trusted === true) {
+		if (countAdKeywordHits(norm, AD_EXEMPT_KEYWORDS).length) {
+			return { ok: false, reason: '正文含豁免词，不收录', norm };
+		}
+		if (isObviouslyNormalChatText(norm)) {
+			return { ok: false, reason: '明显正常短句，不收录', norm };
+		}
+	} else if (!isAdBearingText(norm) && !isTemplateAdText(norm, options?.crossUsers)) {
 		return { ok: false, reason: '正文没有可识别的广告证据；账号资料/头像/语义特征已学习', norm };
 	}
 	if (!(await ensureAdSpamTextsTable(env))) return { ok: false, reason: '名单表初始化失败', norm };
@@ -16346,7 +16370,7 @@ async function recordSpamText(env, repliedMsg, options = {}) {
 // 两者与内部读取的缓存列表合并去重 —— /ban 群内路径的缓存会被清扫删掉，正文必须提前取好。
 // templateCounts：Map<正文, 发过它的不同目标数>，批量入口用 collectCrossUserTemplateCounts 算好后传入。
 // 传了就启用「投放模板」旁路（见 isTemplateAdText），不传则完全走原闸门。
-async function learnSpamTextsFromCache(env, userId, { seeds = null, cached: preloaded = null, templateCounts = null } = {}) {
+async function learnSpamTextsFromCache(env, userId, { seeds = null, cached: preloaded = null, templateCounts = null, trusted = false } = {}) {
 	const cached = Array.isArray(preloaded) ? preloaded : await loadRecentUserAdTextList(env, userId);
 	const merged = [];
 	const seen = new Set();
@@ -16360,6 +16384,7 @@ async function learnSpamTextsFromCache(env, userId, { seeds = null, cached: prel
 	for (const text of merged) {
 		const r = await recordSpamText(env, { text }, {
 			prune: false,
+			trusted,
 			crossUsers: templateCounts instanceof Map ? (Number(templateCounts.get(text)) || 0) : 0
 		});
 		if (r.ok) out.added += 1;
@@ -20120,7 +20145,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				// /spam <ID> 一行都没有 → 同款直封永不触发。这里把缓存里的发言逐条写进名单。
 				// 只收第一主人：与回复式 /spam 同一道门（副主人不写）。
 				if (isPrimaryOwner(operatorId)) {
-					const spamTextLearn = await learnSpamTextsFromCache(env, valid[0], { cached: spamIdTextList });
+					const spamTextLearn = await learnSpamTextsFromCache(env, valid[0], { cached: spamIdTextList, trusted: true });
 					const spamTextLearnLine = renderSpamTextLearnLine(spamTextLearn);
 					if (spamTextLearnLine) lines.push(spamTextLearnLine);
 				}
@@ -20178,7 +20203,8 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 					for (const id of learnTargets) {
 						const one = await learnSpamTextsFromCache(env, id, {
 							cached: textLists.get(String(id)) || [],
-							templateCounts
+							templateCounts,
+							trusted: true
 						});
 						sum.added += one.added;
 						sum.total += one.total;
@@ -20353,7 +20379,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			// 【为什么这一段同步、连带却后台】写入只有几条 D1 小 SQL，换来回执里「学没学到」可见；
 			// 而连带是 20 人 × 14 群的串行 HTTP，正是「/spam 回执很慢」的来源，必须挪到后台。
 			if (isPrimaryOwner(operatorId)) {
-				const spamTextLearn = await learnSpamTextsFromCache(env, repliedUserId, { seeds: [spamTextForLearn] });
+				const spamTextLearn = await learnSpamTextsFromCache(env, repliedUserId, { seeds: [spamTextForLearn], trusted: true });
 				const spamTextLearnLine = renderSpamTextLearnLine(spamTextLearn);
 				if (spamTextLearnLine) lines.push(spamTextLearnLine);
 				// 与 buildModerationTextKey / spamTextForLearn 同口径：正文 + 清单 + 链接预览卡。
@@ -21437,7 +21463,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 					const banTextSeeds = replyTarget?.text
 						? [String(replyTarget.text).trim()].filter(Boolean)
 						: banIdTextList;
-					const banTextLearn = await learnSpamTextsFromCache(env, valid[0], { seeds: banTextSeeds });
+					const banTextLearn = await learnSpamTextsFromCache(env, valid[0], { seeds: banTextSeeds, trusted: true });
 					const banTextLearnLine = renderSpamTextLearnLine(banTextLearn);
 					if (banTextLearnLine) lines.push(banTextLearnLine);
 				}
@@ -28727,10 +28753,12 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 		const targetIsBot = quoted.from?.is_bot === true;
 		// 人工判定只学有广告证据的正文段落；正常寒暄不学。
 		// 判定链已给正文记了广告证据（grade >= 6）时整段可信，否则只保留有词库/模板证据的段。
-		const textEvidence = collected.evaluation.positionEvidence?.text;
-		const text = adLearningBodyText(collected.evaluation.snapshot.text, {
-			wholeTextTrusted: !textEvidence?.exempt && Number(textEvidence?.grade) >= 6
-		});
+		// 【2026-11-15 主人口径】第一主人手动判定即广告：整段正文全部学习；
+		// 但正文含豁免词时不收录正文（豁免词是主人维护的正常语境清单），资料卡照常学。
+		const rawSnapshotText = String(collected.evaluation.snapshot.text || '');
+		const text = countAdKeywordHits(rawSnapshotText, AD_EXEMPT_KEYWORDS).length
+			? ''
+			: adLearningBodyText(rawSnapshotText, { wholeTextTrusted: true });
 		const profile = collected.profile;
 		out.snapshot=collected.evaluation.snapshot;
 		out.collectionComplete=collected.evaluation.globalDrill.complete;
@@ -28974,7 +29002,9 @@ async function learnAdFingerprints(env, payload, options = {}) {
 		if (countAdKeywordHits(value, AD_BUSINESS_KEYWORDS).length) return false;
 		return true;
 	};
-	const learnable = source === 'auto' ? candidates.filter((c) => !isExemptOnlyKeyword(c)) : candidates;
+	// 【2026-11-15 主人口径】所有来源都过滤「纯豁免词」候选：
+	// 资料卡里含豁免词（bot / 开源 / github 等），豁免词本身不收录。
+	const learnable = candidates.filter((c) => !isExemptOnlyKeyword(c));
 	if (!learnable.length) return { ok: true, learned: 0, reason: 'exempt_only' };
 
 	try {
