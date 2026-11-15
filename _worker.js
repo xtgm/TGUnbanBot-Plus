@@ -242,7 +242,14 @@ function runtime() {
 }
 
 function withRuntime(handler) {
-	return (...args) => REQUEST_RUNTIME.run(createRuntimeState(), () => handler(...args));
+	return (...args) => {
+		const state = createRuntimeState();
+		// 【2026-11-15】存一份当前请求的 env 与 ctx：第一主人私聊审计要在
+		// sendTelegramMessage 里异步落库，那条路径拿不到 env/ctx。
+		state.ENV = args[1] || null;
+		state.CTX = args[2] || null;
+		return REQUEST_RUNTIME.run(state, () => handler(...args));
+	};
 }
 
 function runtimeMetadata(cache, key) {
@@ -506,6 +513,11 @@ export default {
 			// 如果是 Telegram Webhook 请求
 			if (path === '') {
 				const update = await request.json();
+				// 【2026-11-15】update 去重：Telegram 重试同一条 update 时直接确认 200，
+				// 避免重复执行命令、重复回复（线上实测 /health 被重试 4 次、回复 4 条）。
+				if (!(await claimUpdateId(env, Number(update?.update_id) || 0))) {
+					return new Response('OK');
+				}
 				if (isIgnoredBotUpdate(update)) return new Response('OK');
 				console.log('[Telegram更新] 收到更新:', JSON.stringify({
 					更新ID: update.update_id,
@@ -665,6 +677,9 @@ export default {
 			} catch (error) {
 				console.error('[联合封杀] 同步失败:', error);
 			}
+			// 【2026-11-15】每 10 分钟自检一次 webhook 积压；严重时自动丢弃，不用等主人手动初始化。
+			try { await autoDropWebhookBacklog(env); }
+			catch (error) { console.error('[自动清积压] 检查失败:', error); }
 			return;
 		}
 		try {
@@ -19654,6 +19669,10 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 	const userId = message.from?.id || ANON_ADMIN_BOT_ID;
 	const operatorId = getMessageActorId(message);
 	const text = message.text;
+	// 【2026-11-15】第一主人私聊审计：记录指令原文（后台写，不阻塞）。
+	if (message.chat.type === 'private' && isPrimaryOwner(userId) && typeof text === 'string' && text.trim()) {
+		maybeRecordOwnerChatAudit('in', userId, text);
+	}
 	const username = message.from?.username || message.from?.first_name || (isAnonymousAdminMessage(message) ? '匿名管理员' : '用户');
 	// 包括正常、豁免、白名单和管理员的现场，先进入演练，黑名单拦截不能抢先处罚。
 	if (await handleGlobalDryRunMessage(message,env)) return;
@@ -19870,6 +19889,12 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 	// 方案 A 主写入点：走到这里已经确认【这条不是被封的广告】。被封的在上面 return 了，
 	// 重发已处置广告更早，两者都不计 —— 统计从此不给广告抬轿。
 	await tryRecordSpeechStat(message, env, chatId, ctx);
+
+	// /audit：第一主人私聊审计查看（仅私聊、仅第一主人）。
+	if (message.chat.type === 'private' && isPrimaryOwner(userId) && /^\/audit(?:@[^\s]+)?(?:\s|$)/i.test(String(text || '').trim())) {
+		await handleOwnerChatAuditCommand(message, env);
+		return;
+	}
 
 	// /add_ad_admin、/del_ad_admin：第一主人管理 /ad 发起白名单。
 	if (text && /^\/(add_ad_admin|del_ad_admin)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
@@ -21950,6 +21975,172 @@ function recordTelegramSendCooldown(chatId, response, result) {
 	return delay;
 }
 
+// ===== Telegram update 去重（2026-11-15）=====
+// Telegram 对同一条 update 会重试（处理慢/读超时/非 200）。重试会把整条命令再执行一遍：
+// 线上实测只发了一次 /health，被重试 4 次、回复 4 条，用户看到「连续返回」。
+// 用 update_id 主键做一次性认领：第一次处理，后续重试直接返回 200，不再执行。
+// 只保留 24 小时，表很小；D1 写入失败时按「首次处理」放行（宁可重复，不能漏消息）。
+const D1_PROCESSED_UPDATES_INIT = new WeakMap();
+async function ensureProcessedUpdatesTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_PROCESSED_UPDATES_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		await env.DB.prepare('CREATE TABLE IF NOT EXISTS processed_updates (update_id INTEGER PRIMARY KEY, at INTEGER NOT NULL)').run();
+		await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_processed_updates_at ON processed_updates(at)').run();
+		return true;
+	})().catch((error) => {
+		console.error('[更新去重] 建表失败:', error);
+		throw error;
+	});
+	return rememberD1Initialization(D1_PROCESSED_UPDATES_INIT, env.DB, init);
+}
+
+async function claimUpdateId(env, updateId) {
+	const id = Number(updateId) || 0;
+	if (!env?.DB || id <= 0) return true;
+	try {
+		if (!(await ensureProcessedUpdatesTable(env))) return true;
+		const now = Math.floor(Date.now() / 1000);
+		const result = await env.DB.prepare('INSERT OR IGNORE INTO processed_updates (update_id, at) VALUES (?, ?)').bind(id, now).run();
+		if (Number(result?.meta?.changes) === 0) return false;
+		await env.DB.prepare('DELETE FROM processed_updates WHERE at < ?').bind(now - 86400).run();
+		return true;
+	} catch (error) {
+		console.error('[更新去重] 检查失败，按首次处理:', error);
+		return true;
+	}
+}
+
+// ===== 自动清理 webhook 积压（2026-11-15）=====
+// 用户要求：积压要能自动恢复，不能只能靠手动初始化（?drop=1 只在自动恢复失败时兜底）。
+// 判定：积压 >= 20 条 且 最近 10 分钟内仍有投递失败（last_error_date）→ 自动丢弃积压并重设 webhook。
+// 只在「持续失败」时动手；正常短暂排队（几条）不碰。每次动作都通知第一主人。
+const WEBHOOK_BACKLOG_AUTO_DROP = 20;
+const WEBHOOK_BACKLOG_CHECK = new WeakMap();
+async function autoDropWebhookBacklog(env) {
+	if (!env?.DB || !runtime().BOT_TOKEN) return false;
+	try {
+		const infoResponse = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getWebhookInfo', { signal: AbortSignal.timeout(5000) });
+		const info = await infoResponse.json();
+		const result = info?.result || {};
+		const pending = Number(result.pending_update_count) || 0;
+		const lastErrorAt = Number(result.last_error_date) || 0;
+		const now = Math.floor(Date.now() / 1000);
+		// 积压不够多、或错误已经停了 10 分钟（队列会在自行消化），都不动手。
+		if (pending < WEBHOOK_BACKLOG_AUTO_DROP || !lastErrorAt || now - lastErrorAt > 600) return false;
+		const url = String(result.url || '').trim();
+		if (!url) return false;
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/setWebhook', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				url,
+				allowed_updates: ['message', 'edited_message', 'chat_member', 'my_chat_member', 'callback_query', 'chat_join_request'],
+				drop_pending_updates: true,
+				...webhookSecretFields(env)
+			}),
+			signal: AbortSignal.timeout(10000)
+		});
+		const setResult = await response.json();
+		console.log('[自动清积压] pending=' + pending + ' 丢弃结果=' + JSON.stringify(setResult));
+		const ownerId = getOwnerNotifyTargets(false)[0];
+		if (ownerId) {
+			await sendTelegramMessage(ownerId, '⚠️ <b>Webhook 积压自动清理</b>\n'
+				+ '检测到待投递 update <b>' + pending + '</b> 条且持续投递失败，已自动丢弃积压并重设 webhook。\n'
+				+ '最近错误：' + escapeHtml(String(result.last_error_message || '未知')));
+		}
+		return true;
+	} catch (error) {
+		console.error('[自动清积压] 执行失败:', error);
+		return false;
+	}
+}
+
+// ===== 第一主人私聊审计（2026-11-15）=====
+// 只记录第一主人自己的私聊：指令原文 + bot 回复原文，保留最近 500 条。
+// 【绝不阻塞】写入一律走 waitUntil 后台；表懒建，失败只打日志，不影响任何发送与处置。
+// 隐私边界：只认 OWNER_IDS[0] 的私聊 chat_id，群聊、副主人、其他用户一律不记。
+const D1_OWNER_CHAT_AUDIT_INIT = new WeakMap();
+async function ensureOwnerChatAuditTable(env) {
+	if (!env?.DB) return false;
+	const cached = D1_OWNER_CHAT_AUDIT_INIT.get(env.DB);
+	if (cached) return cached;
+	const init = (async () => {
+		await env.DB.prepare('CREATE TABLE IF NOT EXISTS owner_chat_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, direction TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL)').run();
+		await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_owner_chat_audit_created ON owner_chat_audit(created_at)').run();
+		return true;
+	})().catch((error) => {
+		console.error('[私聊审计] 建表失败:', error);
+		throw error;
+	});
+	return rememberD1Initialization(D1_OWNER_CHAT_AUDIT_INIT, env.DB, init);
+}
+
+async function recordOwnerChatAudit(env, userId, direction, text) {
+	if (!env?.DB || !isPrimaryOwner(userId)) return false;
+	const value = String(text || '').trim();
+	if (!value) return false;
+	try {
+		if (!(await ensureOwnerChatAuditTable(env))) return false;
+		await env.DB.prepare('INSERT INTO owner_chat_audit (user_id, direction, text, created_at) VALUES (?, ?, ?, ?)')
+			.bind(String(userId), String(direction), value.slice(0, 4000), Math.floor(Date.now() / 1000)).run();
+		// 只留最近 500 条；不足 500 条时子查询为 NULL，条件不成立、不会误删。
+		await env.DB.prepare('DELETE FROM owner_chat_audit WHERE id <= (SELECT id FROM owner_chat_audit ORDER BY id DESC LIMIT 1 OFFSET 500)').run();
+		return true;
+	} catch (error) {
+		console.error('[私聊审计] 写入失败:', error);
+		return false;
+	}
+}
+
+// 从当前请求上下文取 env/ctx，后台写一条审计；任何异常都不影响调用方。
+function maybeRecordOwnerChatAudit(direction, chatId, text) {
+	try {
+		const state = REQUEST_RUNTIME.getStore();
+		const env = state?.ENV;
+		if (!env?.DB) return;
+		const id = String(chatId ?? '');
+		if (!/^\d+$/.test(id) || !isPrimaryOwner(id)) return;
+		const value = String(text || '').trim();
+		if (!value) return;
+		// /audit 自己的回复不再入账，避免审计页越查越涨。
+		if (value.startsWith('📜 <b>第一主人私聊审计</b>')) return;
+		const task = recordOwnerChatAudit(env, id, direction, value);
+		if (state?.CTX && typeof state.CTX.waitUntil === 'function') state.CTX.waitUntil(task.catch(() => {}));
+		else task.catch(() => {});
+	} catch (_) { /* 审计永远不能影响主流程 */ }
+}
+
+// /audit：第一主人私聊审计查看（仅私聊、仅第一主人）。
+async function handleOwnerChatAuditCommand(message, env) {
+	const chatId = message.chat.id;
+	if (!env?.DB) { await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间'); return; }
+	const rest = String(message.text || '').replace(/^\/audit(?:@[^\s]+)?\s*/i, '').trim();
+	const page = Math.max(1, Math.min(1000, Number(rest) || 1));
+	const limit = 40, offset = (page - 1) * limit;
+	try {
+		await ensureOwnerChatAuditTable(env);
+		const rows = (await env.DB.prepare('SELECT direction, text, created_at FROM owner_chat_audit ORDER BY id DESC LIMIT ? OFFSET ?').bind(limit, offset).all()).results || [];
+		const total = Number((await env.DB.prepare('SELECT COUNT(*) AS n FROM owner_chat_audit').first())?.n) || 0;
+		if (!rows.length) { await sendTelegramMessage(chatId, '📜 <b>第一主人私聊审计</b>\n\n还没有记录。'); return; }
+		const lines = ['📜 <b>第一主人私聊审计</b>（第 ' + page + ' 页 / 共 ' + total + ' 条）', ''];
+		for (const row of rows) {
+			const dir = row.direction === 'in' ? '➡️ 指令' : '⬅️ 回复';
+			lines.push('[' + formatBeijingTime(Number(row.created_at) * 1000) + '] ' + dir);
+			// out 存的是 bot 回复的 HTML，直接 escape 会把 <b> 显示成 &lt;b&gt;；
+			// 先去掉标签再转义，读起来是纯文本。
+			const plain = String(row.text).replace(/<[^>]*>/g, '').slice(0, 800);
+			lines.push(escapeHtml(plain));
+			lines.push('');
+		}
+		lines.push('ℹ️ 用 <code>/audit 页码</code> 翻页。');
+		await sendTelegramMessageChunks(chatId, lines.join('\n'));
+	} catch (error) {
+		await sendTelegramMessage(chatId, '❌ 审计查询失败：' + escapeHtml(toChineseErrorText(error.message || '未知错误')));
+	}
+}
+
 // 发送 Telegram 消息。只重试已明确拒绝的短限流或失效回复，不重放结果不确定的网络发送。
 async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId = null, options = {}) {
 	const cooldown = telegramSendCooldown(chatId);
@@ -22002,6 +22193,8 @@ async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId =
 		}
 		TELEGRAM_SEND_COOLDOWNS.delete(runtime().BOT_TOKEN + ':' + String(chatId));
 		captureWebAdminReply(chatId, body.text);
+		// 【2026-11-15】第一主人私聊审计：回复原文后台落库，不阻塞发送。
+		maybeRecordOwnerChatAudit('out', chatId, body.text);
 		return result;
 	} catch (error) {
 		console.error(`[sendTelegramMessage] 异常 chat=${chatId}:`, error);
@@ -43018,7 +43211,9 @@ async function runHealthLayerOne(env) {
 	// ⑥ 【临时诊断 2026-11-15】Telegram webhook 队列状态：排查某个群的 message update 断流。
 	// 定位后必须删除，不留在正式版本里。
 	try {
-		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getWebhookInfo');
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getWebhookInfo', {
+			signal: AbortSignal.timeout(5000)
+		});
 		const result = await response.json();
 		const info = result?.result || {};
 		items.push({
