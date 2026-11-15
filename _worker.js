@@ -16314,7 +16314,7 @@ async function recordSpamText(env, repliedMsg, options = {}) {
 	// 旁路判的是「这条正文是不是投放模板」而不是「有没有广告词」，口径见 isTemplateAdText：
 	// 只能由调用方在拿得到跨用户重复证据时传入，单条路径传不了 → 行为与改动前逐字节一致。
 	if (!isAdBearingText(norm) && !isTemplateAdText(norm, options?.crossUsers)) {
-		return { ok: false, reason: '正文自身没有广告证据', norm };
+		return { ok: false, reason: '正文没有可识别的广告证据；账号资料/头像/语义特征已学习', norm };
 	}
 	if (!(await ensureAdSpamTextsTable(env))) return { ok: false, reason: '名单表初始化失败', norm };
 	const now = Date.now();
@@ -16382,9 +16382,11 @@ function renderSpamTextLearnLine(result) {
 	if (!result) return '';
 	const added = Number(result.added) || 0;
 	const why = [...new Set(result.rejected || [])].slice(0, 2).join('；');
-	if (added > 0) return '📇 同款名单:已收录 ' + added + ' 条文案（一周内同款直封，无需再 /spam）';
-	if (why) return '📇 同款名单:未收录（' + why + '）';
-	if (Number(result.total) > 0) return '📇 同款名单:未收录（正文不合格）';
+	// 【2026-11-15 文案】未收录时说明「同款名单只按正文精确匹配」，
+	// 并明确账号级特征已学习 —— 避免主人把「没有正文可收录」误读成「没判定成广告」。
+	if (added > 0) return '📇 同款名单:已收录 ' + added + ' 条文案（一周内同款正文直封，无需再 /spam）';
+	if (why) return '📇 同款名单:未收录（' + why + '；正文同款只按原文匹配，账号资料/头像/会员标/语义样本已学习）';
+	if (Number(result.total) > 0) return '📇 同款名单:未收录（正文为空或不合格；账号资料/头像/会员标/语义样本已学习）';
 	return '';
 }
 
@@ -19595,6 +19597,28 @@ async function handleGovernableBotMessage(message, env) {
 	if (isKillerModeGroup(chatId) || isIndependentGroup(chatId)) return true;
 	if (isTelegramServiceMessage(message) || isChannelAutoForward(message)) return true;
 	if (!getAdDetectionBodyText(message) && !message.reply_to_message) return true;
+	// 【2026-11-15】频道身份发言（非自动转发）的结构查杀。
+	// 关联频道的自动转发帖已在上一行放行，这里永远不会碰到它们 —— 频道内容不删是硬约束。
+	// 只认 sender_chat 且不是自动转发的消息；纯规则（形态 A/B/C + 引用体查杀），零 AI、零额外请求。
+	// 命中只删这一条消息，不封禁频道、不写黑名单、不学习 —— 频道不是可封禁的用户。
+	if (message.sender_chat && (message.text || message.caption || getAdQuotedText(message))) {
+		const bodyText = getAdDetectionBodyText(message);
+		const quotedText = getAdQuotedText(message);
+		const bodyVerdict = bodyText ? judgeAdStructure(bodyText, message.sender_chat?.username || '', 'body') : null;
+		if (bodyVerdict?.guilty) {
+			console.log('[频道身份查杀] 群 ' + chatId + ' 消息 ' + message.message_id + ' 正文命中形态 ' + bodyVerdict.form + '，仅删消息');
+			await deleteMessage(chatId, message.message_id);
+			return true;
+		}
+		if (quotedText) {
+			const quotedVerdict = judgeAdQuotedKill({ quoted: quotedText, text: bodyText, username: message.sender_chat?.username || '' });
+			if (quotedVerdict.guilty) {
+				console.log('[频道身份查杀] 群 ' + chatId + ' 消息 ' + message.message_id + ' 引用体命中，仅删消息');
+				await deleteMessage(chatId, message.message_id);
+				return true;
+			}
+		}
+	}
 	// ① 重发只删
 	if (await matchHandledAdText(env, message)) {
 		console.log('[重发删除·bot] 群 ' + chatId + ' bot ' + message.from.id + ' 消息 ' + message.message_id + ' 命中已处置文案，仅删消息');
@@ -24601,7 +24625,11 @@ const AD_TRADE_VERBS = [
 	// 跑分黑话（2026-11 变体查杀批次 1）：「来码洗米 挣八千」「微信拿码收米」——
 	// 「来码 / 拿码」是要收款码的动作，进交易动词表；「洗米 / 收米」是行业词，进业务词表。
 	// 两张表分开放是刻意的：同一个词进两张表会让它一个词就凑出协同分。
-	'来码', '拿码'
+	'来码', '拿码',
+	// 【2026-11-15 线上漏放】「洗资 / 收咪 / 带偶」是跑分与带人黑话，正常语境几乎不存在；
+	// 「日搞 / 转U」是收益承诺与转账动作。与「洗米 / 收米」不同，这四个词本身没有正常语义，
+	// 同时进交易动词与业务词表 —— 它们出现即广告，允许单词凑成形态 A。
+	'洗资', '带偶', '日搞', '转U'
 ];
 
 // 弱交易动词：形态上像招揽，但在正常语境里同样高频，单独出现不构成任何广告证据。
@@ -24667,7 +24695,10 @@ const AD_BUSINESS_KEYWORDS = [
 	'嫖娼', '玩妹',
 	// 跑分黑话（2026-11 变体查杀批次 1，与交易动词表的「来码 / 拿码」配对）。
 	// 单独出现不计分：「今天去洗米做饭」只命中业务词这一类，0 分。
-	'洗米', '收米', '码商'
+	'洗米', '收米', '码商',
+	// 【2026-11-15 线上漏放】与交易动词表同步：这几个词没有正常语义，同词两表，
+	// 「洗资一天8k / 带偶收咪·壹天九仟 / 转U能量 / 公群交易」这类单词即可凑成形态 A。
+	'洗资', '收咪', '转U能量', '能量租赁', '公群交易'
 ];
 
 // 豁免词：命中且无交易动词时整体减分，保护正常用户。
@@ -28846,9 +28877,8 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 			await confirmManualImage(learnMedia,collected.materials.image);
 			// 【2026-11-02】贴纸整包学：广告组织换一张同包贴纸就绕过单张指纹，
 			// 主人 /spam 过很多次仍漏的根因之一。人工判定可以覆盖 /ignore 留下的 clean。
-			if (learnMedia.setName && await step('pack:'+learnMedia.setName,()=>markAdStickerPack(env, learnMedia.setName, source, { manual: true }))) {
-				out.packLearned = String(learnMedia.setName);
-			}
+			// 【2026-11-15 主人口径】贴纸只学单张，不整包学 —— 整包不一定全是广告，
+			// 整包连坐会误封同包里的正常贴纸。单张指纹已在上面的 image 步骤写入。
 		}
 		// 【2026-11-02】正文里的自定义表情（表情包广告单发一个大箭头）也整包学：
 		// 单个 emoji id 进 ad_badges 要 hits≥3 才能单独定罪，主人 /spam 一次等于没学到。
@@ -34894,7 +34924,13 @@ const AD_AVATAR_OCR_PROMPT = '这是一张 Telegram 用户头像。只输出一�
 // 【为什么头像仍然远低于正文图】量级不同：头像是「一个人一张、一辈子换不了几次」，
 // 队列按 file_unique_id 主键去重、判过永久零成本，150 张/天足够覆盖新成员涌入；
 // 正文图是「一个群一天几百张」，两者预算独立，见 AD_IMAGE_VISION_DAILY。
-const AD_AVATAR_VISION_DAILY = 150;
+// 【2026-11-15 提额：150 → 800，与正文图对齐】
+// 线上实测：当天头像识别已跑 536 次（avatar_count=536），150 的张数闸早已打满 ——
+// 之后所有新头像一律跳过识别，「主页赚钱」这类头像文字命中直接失效，全局群整批漏放。
+// 主人是 Workers Paid：超出免费额度按 $0.011 / 1,000 Neurons 计费，是计费不是报错；
+// 单张 gemma 约 4 Neurons，800 张约 3,200 Neurons，成本可控。
+// 头像判过的按 file_unique_id 永久记账，这个数只被「当天新出现的头像」消耗。
+const AD_AVATAR_VISION_DAILY = 2000;
 const AD_AVATAR_VISION_PROMPT = '这是一张社交软件的用户头像图片。判断它是否属于广告用途：'
 	+ '图里若有引流文字（赚钱、代理、代购、招租、微信号、二维码、"看主页/看简介"）、'
 	+ '明显商品推销、联系方式、赌博或灰产图案，即为广告。自拍、风景、宠物、家人、'
@@ -34931,7 +34967,7 @@ const AD_AVATAR_VISION_PROMPT = '这是一张社交软件的用户头像图片�
 // 所以 800 这个数只会被「当天新出现的图」消耗。300 张打满意味着
 // 当天第 301 张之后的新图一张都不判 —— 该花的钱没花，广告图直接漏过去，
 // 这才是真浪费。按实价算，提到 800 之后这一轨仍只占免费额度 28%。
-const AD_IMAGE_VISION_DAILY = 800;
+const AD_IMAGE_VISION_DAILY = 2000;
 
 // ===== 视觉识别失败熔断（2026-10-11，与第⑥层的 AD_LLM_FAIL_BREAK 同一套机制）=====
 //
@@ -36423,7 +36459,7 @@ async function judgeAdMediaRealtime(env, media, userId, options = {}) {
 	// 主人原话：「复用次数肯定得真实性啊」。现在 hits 只由 learnAdImageOnBan 真实累加，
 	// 展示文案与单证门槛（hits >= AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS）读到的都是真数。
 	// 识图判广告的贴纸：整包记为广告包，同包下一张（变体）不再花识图、直接定罪。
-	if (media.setName) await markAdStickerPack(env, String(media.setName), 'auto');
+	// 【2026-11-15 主人口径】贴纸只学单张，不整包学。
 	const finalRow = latestRow;
 	return withContent(Object.assign({}, finalRow || { file_unique_id: key, verdict, hits: 0, source: 'vision', last_user_id: uid },
 		{ category: String(judged?.category || '') }),contentResult);
@@ -36628,7 +36664,7 @@ async function confirmAdImageMissBan(env, { userId, chatId, fileUniqueId }) {
 		if(feedback.ok&&feedback.verdict==='ad')out.imageMarked = await upsertAdImage(env, fid, { verdict: 'ad', source: 'owner', lastUserId: uid, visionCheckedAt: Math.floor(Date.now() / 1000) });
 		out.embeddingStored = Boolean(feedback?.embeddingStored);
 	}
-	if (setName && out.imageMarked && !isIndependentGroup(gid)) out.packMarked = await markAdStickerPack(env, setName, 'owner', { manual: true });
+	// 【2026-11-15 主人口径】贴纸只学单张，不整包学。
 	const reasons = ['图片识图漏判（主人点确认封）'];
 	if (setName) reasons.push('贴纸包：' + setName);
 	const payload = Object.assign({}, review.payload || {}, { imageId: fid, imageVerifiedAd:out.imageMarked, stickerSet: setName });
@@ -39031,7 +39067,7 @@ async function learnAdFeaturesOnVerdict(env, evaluation, options = {}) {
 				|| s.startsWith('消息图片命中广告素材库') || s.startsWith('贴纸属于已定罪的广告贴纸包')
 				|| s.startsWith('图片识图漏判');
 		});
-		if (stickerSet && convictedByImage && await step('pack:'+stickerSet,()=>markAdStickerPack(env, stickerSet, 'auto'))) packs += 1;
+		// 【2026-11-15 主人口径】贴纸只学单张，不整包学。
 	} catch (_) { errors.push('image'); }
 	// 定罪即学习资料形状：资料模板是批量号的【公开复用资产】，学一次之后同模板的号
 	// 在零 AI 下就能命中（只加分，仍要过原有阈值）。取 snapshot 里存好的形状，
@@ -39873,6 +39909,23 @@ async function detectAdOnMessage(message, env) {
 	const evaluation = result.evaluation;
 	if (evaluation.bioChecked === true || evaluation.globalDrill?.completeness?.bio?.complete === true) {
 		await markAdBioChecked(env, userId, Math.floor(Date.now() / 1000));
+	}
+	// 【2026-11-15】图片/贴纸的视觉内容核验已判广告时，不受评分聚合降级影响，直接按 ban 处置。
+	// 线上实测：贴纸 00:47 就由 gemma 读出「收款码洗钱一天一万」并判 scam，
+	// 但聚合层没升级成 ban，拖到 01:32 才被别的路径封 —— 这条补丁把延迟归零。
+	const visualImageKey = String(evaluation.snapshot?.imageId || evaluation.payload?.imageId || '');
+	if (evaluation.verdict !== 'ban' && visualImageKey) {
+		try {
+			const savedContent = JSON.parse(await readAdScanState(env, 'image_content_v4:' + visualImageKey, 'null'));
+			const visualSignature = adImageContentSignature(savedContent?.signature);
+			if (savedContent?.verdict === 'ad' && savedContent.contentVerified === true
+				&& isReliableAdImageContentSignature(visualSignature)) {
+				evaluation.verdict = 'ban';
+				evaluation.positionHardBan = true;
+				evaluation.reasons = markAdConvictLayer(
+					(evaluation.reasons || []).concat(['图片/贴纸视觉内容核验判定为广告（立即处置）']), '正文图片');
+			}
+		} catch (_) { /* 核验记录缺失时保持原判定 */ }
 	}
 	if (evaluation.verdict !== 'ban') {
 		const pending=isAdDrillPendingEvaluation(evaluation,result.llmMemo);
