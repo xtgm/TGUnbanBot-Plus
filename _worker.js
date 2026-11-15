@@ -510,6 +510,54 @@ export default {
 			// D1 批量任务续跑入口：每次仍只跑安全分片，正常由 Queue 自动续接，异常时可手动调用。
 			return await handleBulkJobAutoRun(env, url, ctx, request.url);
 		} else if (request.method === 'POST') {
+			// 【2026-11-15 临时诊断】多模型识图对比：用 TOKEN 保护，逐个调用可用视觉模型。
+			// 用法：POST /<TOKEN>/diag-vision  {"image":"data:image/webp;base64,..."}
+			if (path === runtime().TOKEN + '/diag-vision') {
+				try {
+					const body = await request.json();
+					const image = String(body?.image || '');
+					const prompt = '逐字抄录这张图片上的所有文字，只输出你实际看到的文字，不要解释。';
+					const models = [
+						'@cf/google/gemma-4-26b-a4b-it',
+						'@cf/qwen/qwen3.8-27b',
+						'@cf/meta/llama-4-scout-17b-16e-instruct',
+						'@cf/meta/llama-4-maverick-17b-128e-instruct',
+						'@cf/llava-hf/llava-1.5-7b-hf',
+						'@cf/microsoft/phi-4-multimodal-instruct',
+						'@cf/cloudflare/clef-flash'
+					];
+					const results = [];
+					for (const model of models) {
+						const started = Date.now();
+						try {
+							let result;
+							if (model === '@cf/cloudflare/clef-flash') {
+								result = await env.AI.run(model, {
+									model: 'clef-flash',
+									state: '这是一张 Telegram 群消息里的图片或表情包。',
+									images: [image],
+									questions: { ad: { type: 'choice', instructions: '图中是否含有广告引流内容？', criteria: { ad: '图中实际可见明确招揽推广', clean: '不是广告' } } }
+								});
+							} else {
+								result = await env.AI.run(model, {
+									messages: [{ role: 'user', content: [
+										{ type: 'text', text: prompt },
+										{ type: 'image_url', image_url: { url: image } }
+									] }],
+									max_tokens: 1024,
+									temperature: 0
+								});
+							}
+							results.push({ model, ok: true, ms: Date.now() - started, result });
+						} catch (error) {
+							results.push({ model, ok: false, ms: Date.now() - started, error: String(error?.message || error) });
+						}
+					}
+					return Response.json({ results });
+				} catch (error) {
+					return Response.json({ ok: false, error: String(error?.message || error) }, { status: 400 });
+				}
+			}
 			// 如果是 Telegram Webhook 请求
 			if (path === '') {
 				const update = await request.json();
@@ -24837,8 +24885,11 @@ function hasAdExplicitPromotion(text) {
 	const trade = AD_STRUCT_MATCH(AD_SOLICIT_PATTERNS, source) || countAdKeywordHits(source, AD_TRADE_VERBS).length > 0;
 	const business = AD_STRUCT_MATCH(AD_BIZ_PATTERNS, source) || countAdKeywordHits(source, AD_BUSINESS_KEYWORDS).length > 0;
 	const harmful = /色情|裸聊|约炮|成人视频|性交易|博彩|赌博|赌场|六合彩|洗钱|假钞|假币|盗刷|卡料|跑分|刷单返利|贩卖个人信息/i.test(source);
+	// 【2026-11-15 线上漏放】「收款码洗钱一天一万」只有 harmful（洗钱）+ 收款码/金额，
+	// 旧动作词表没有「收款码 / 一天一万」，整张图被判 pending。
+	// 用户口径：识图要判「字里有没有广告特征」——洗钱类黑话与收款/金额同现即广告。
 	return action && outlet || trade && business
-		|| harmful && /下注|投注|充值|赢现金|包赢|出售|贩卖|提供|联系|购买|下单|招募|进群|免费观看|点我|点击/i.test(source)
+		|| harmful && /下注|投注|充值|赢现金|包赢|出售|贩卖|提供|联系|购买|下单|招募|进群|免费观看|点我|点击|收款码|代收|转账|走账|洗资|(?:一天|日入|月入|日赚)\s*\d/i.test(source)
 		|| outlet && /(?:一天|日入|月入|日赚)\s*\d{3,}|稳赚|躺赚|暴富/i.test(source);
 }
 
