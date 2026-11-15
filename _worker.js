@@ -598,7 +598,7 @@ export default {
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
 			if (body.type === 'ad_join_notice') {
-				const result = await deliverAdJoinNotice(env, String(body.noticeId || ''));
+				const result = await deliverAdJoinNotice(env, String(body.noticeId || ''), ctx);
 				if (result.retryAfter && typeof message.retry === 'function') message.retry({ delaySeconds: result.retryAfter });
 				continue;
 			}
@@ -663,7 +663,7 @@ export default {
 		// 10 分钟节拍恢复待处理任务和联合封杀；bio、识图与剪枝仍按原日节拍执行。
 		// 没填订阅变量时 runFederationSync 第一行就返回，零 SQL、零外呼。
 		if (controller?.cron === FED_SYNC_CRON) {
-			try { await resumeAdJoinNotices(env); }
+			try { await resumeAdJoinNotices(env, ctx); }
 			catch(error){console.error('[拦门通知] 自动补发失败：'+formatD1SchemaError(error));}
 			try { await resumeAdContentReviewBatches(env); }
 			catch(error){console.error('[内容批次] 恢复失败：'+formatD1SchemaError(error));}
@@ -44431,7 +44431,7 @@ async function saveAdJoinNotice(env,input,evaluation,receipt,options={}){
 	const now=Math.floor(Date.now()/1000);
 	await env.DB.prepare("INSERT INTO ad_join_notices(id,chat_id,user_id,payload,signature,next_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,signature=excluded.signature,revision=ad_join_notices.revision+CASE WHEN ad_join_notices.signature<>excluded.signature THEN 1 ELSE 0 END,owner_part=CASE WHEN ad_join_notices.signature<>excluded.signature THEN 0 ELSE ad_join_notices.owner_part END,owner_chunks=CASE WHEN ad_join_notices.signature<>excluded.signature THEN '' ELSE ad_join_notices.owner_chunks END,next_at=excluded.next_at,updated_at=excluded.updated_at")
 		.bind(id,chatId,userId,JSON.stringify(data),signature,now,now,now).run();
-	const delivery=await deliverAdJoinNotice(env,id);
+	const delivery=await deliverAdJoinNotice(env,id,options.ctx||null);
 	if(delivery.retryAfter&&env.BULK_QUEUE?.send)try{await env.BULK_QUEUE.send({type:'ad_join_notice',noticeId:id},{delaySeconds:Math.min(43200,delivery.retryAfter)});}
 	catch(error){console.error('[拦门通知] Queue 未投递，定时补发：'+formatD1SchemaError(error));}
 }
@@ -44567,7 +44567,7 @@ function renderAdJoinOwnerNotice(data,row,groupResult){
 	return lines.join('\n');
 }
 
-async function deliverAdJoinNotice(env,id){
+async function deliverAdJoinNotice(env,id,ctx=null){
 	await ensureAdJoinNoticeTable(env);
 	const now=Math.floor(Date.now()/1000),token=crypto.randomUUID();
 	const row=await env.DB.prepare("UPDATE ad_join_notices SET lease_until=?,lease_token=?,attempts=attempts+1 WHERE id=? AND next_at>0 AND next_at<=? AND lease_until<=? RETURNING *")
@@ -44592,7 +44592,8 @@ async function deliverAdJoinNotice(env,id){
 			}
 			else{
 				const name=String([data.user.first_name,data.user.last_name].filter(Boolean).join(' ')||data.evaluation?.snapshot?.name||'用户').replace(/[\r\n\t]+/g,' ').slice(0,80);
-				const sent=await sendTelegramMessage(data.chatId,escapeHtml(adJoinNoticeTitle(data.outcome)+'：'+name+'（'+data.userId+'）'),null,null,{timeoutMs:10000});
+				// 【2026-11-15 主人口径】群内只留 5 秒闪屏，完整报告仍发第一主人私聊。
+				const sent=await sendFlashMessage(data.chatId,escapeHtml(adJoinNoticeTitle(data.outcome)+'：'+name+'（'+data.userId+'）'),ctx,5000);
 				groupResult={ok:sent?.ok===true,messageId:sent?.result?.message_id,error:sent?.error||sent?.description||''};
 				if(!groupResult.ok)retryAfter=Math.max(60,Number(sent?.retryAfterSeconds)||0);
 			}
@@ -44625,11 +44626,11 @@ async function deliverAdJoinNotice(env,id){
 	return {complete:!retryAfter,...retryAfter?{retryAfter:Math.min(43200,retryAfter)}:{}};
 }
 
-async function resumeAdJoinNotices(env){
+async function resumeAdJoinNotices(env,ctx=null){
 	await ensureAdJoinNoticeTable(env);
 	const now=Math.floor(Date.now()/1000);
 	const rows=(await env.DB.prepare('SELECT id FROM ad_join_notices WHERE next_at>0 AND next_at<=? AND lease_until<=? ORDER BY next_at LIMIT 20').bind(now,now).all()).results||[];
-	for(const row of rows)await deliverAdJoinNotice(env,row.id);
+	for(const row of rows)await deliverAdJoinNotice(env,row.id,ctx);
 }
 
 // 汇总：某群某粒度的总发言、活跃人数、入群、退群、被移出。
