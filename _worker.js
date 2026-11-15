@@ -510,54 +510,6 @@ export default {
 			// D1 批量任务续跑入口：每次仍只跑安全分片，正常由 Queue 自动续接，异常时可手动调用。
 			return await handleBulkJobAutoRun(env, url, ctx, request.url);
 		} else if (request.method === 'POST') {
-			// 【2026-11-15 临时诊断】多模型识图对比：用 TOKEN 保护，逐个调用可用视觉模型。
-			// 用法：POST /<TOKEN>/diag-vision  {"image":"data:image/webp;base64,..."}
-			if (path === runtime().TOKEN + '/diag-vision') {
-				try {
-					const body = await request.json();
-					const image = String(body?.image || '');
-					const prompt = '逐字抄录这张图片上的所有文字，只输出你实际看到的文字，不要解释。';
-					const models = [
-						'@cf/google/gemma-4-26b-a4b-it',
-						'@cf/qwen/qwen3.8-27b',
-						'@cf/meta/llama-4-scout-17b-16e-instruct',
-						'@cf/meta/llama-4-maverick-17b-128e-instruct',
-						'@cf/llava-hf/llava-1.5-7b-hf',
-						'@cf/microsoft/phi-4-multimodal-instruct',
-						'@cf/cloudflare/clef-flash'
-					];
-					const results = [];
-					for (const model of models) {
-						const started = Date.now();
-						try {
-							let result;
-							if (model === '@cf/cloudflare/clef-flash') {
-								result = await env.AI.run(model, {
-									model: 'clef-flash',
-									state: '这是一张 Telegram 群消息里的图片或表情包。',
-									images: [image],
-									questions: { ad: { type: 'choice', instructions: '图中是否含有广告引流内容？', criteria: { ad: '图中实际可见明确招揽推广', clean: '不是广告' } } }
-								});
-							} else {
-								result = await env.AI.run(model, {
-									messages: [{ role: 'user', content: [
-										{ type: 'text', text: prompt },
-										{ type: 'image_url', image_url: { url: image } }
-									] }],
-									max_tokens: 1024,
-									temperature: 0
-								});
-							}
-							results.push({ model, ok: true, ms: Date.now() - started, result });
-						} catch (error) {
-							results.push({ model, ok: false, ms: Date.now() - started, error: String(error?.message || error) });
-						}
-					}
-					return Response.json({ results });
-				} catch (error) {
-					return Response.json({ ok: false, error: String(error?.message || error) }, { status: 400 });
-				}
-			}
 			// 如果是 Telegram Webhook 请求
 			if (path === '') {
 				const update = await request.json();
@@ -25894,8 +25846,11 @@ async function loadAdUserWhitelist(env) {
 		});
 		return value instanceof Set ? value : fallback();
 	} catch (error) {
-		console.error('[广告检测] 读取用户白名单失败: ' + formatD1SchemaError(error));
-		throw new MiniAppError(503, '用户白名单暂不可用，本次广告检测未执行');
+		// 【2026-11-15 稳定性】白名单是「豁免闸」，不是「检测前提」：
+		// 读表失败（迁移未完成 / D1 抖动）时降级为空名单，让广告检测照常继续，
+		// 绝不能因为读不到白名单就把整条消息处理抛 503 —— 那会让普通消息也走重试链。
+		console.error('[广告检测] 读取用户白名单失败（降级为空名单）: ' + formatD1SchemaError(error));
+		return fallback();
 	}
 }
 
