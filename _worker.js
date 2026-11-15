@@ -24734,7 +24734,10 @@ const AD_BUSINESS_KEYWORDS = [
 	'洗资', '收咪', '转U能量', '能量租赁', '公群交易',
 	// 【2026-11-15 线上漏放】收款/代收跑分黑话：只作行业指向，单独出现 0 分；
 	// 与上面新增的收益承诺（一天7千 / 一小时9000 / 日六千）同现才构成形态 A。
-	'收款码', '代收', '收款', '收钱', '帮我收'
+	'收款码', '代收', '收款', '收钱', '帮我收',
+	// 【2026-11-15 线上漏放】「有码来/带码来/微信码/支付宝码」是收款跑分广告的入口形态，
+	// 单看是中性词，必须与收益承诺（AD_SOLICIT_PATTERNS）同现才计分。
+	'微信码', '支付宝码', '码来', '带码', '有码',
 ];
 
 // 豁免词：命中且无交易动词时整体减分，保护正常用户。
@@ -27675,10 +27678,19 @@ function scoreAdMessageText(text, options = {}) {
 	const tradeHits = countAdKeywordHits(source, AD_TRADE_VERBS);
 	const weakTradeHits = countAdKeywordHits(source, AD_WEAK_TRADE_VERBS);
 	const businessHits = countAdKeywordHits(source, AD_BUSINESS_KEYWORDS);
+	// 【2026-11-15 线上漏放】收益承诺单独成一类证据：
+	// 「微信收钱 一天7千」「有码来帮我收款 赚8千」「微信帮我收资 一天5ooo」
+	// 都只有业务词（收钱/收款/帮我收），交易动词一个都不命中 → 旧逻辑判「单类词不计分」放行。
+	// 收益承诺与业务词同现，语义上就是「用收款码跑分赚佣金」，与交易动词同现等价。
+	const solicitHits = AD_SOLICIT_PATTERNS.filter((re) => re.test(source));
 
 	if (tradeHits.length && businessHits.length) {
 		add(AD_KEYWORD_COMBO_SCORE, '正文交易动词 + 业务关键词同现：'
 			+ tradeHits.slice(0, 2).join('/') + ' × ' + businessHits.slice(0, 2).join('/'));
+	} else if (solicitHits.length && businessHits.length) {
+		// 收益承诺 + 业务词是明确跑分广告形态，直接给到封禁线（阈值 7），不只进观察。
+		add(DEFAULT_AD_SCORE_THRESHOLD, '正文收益承诺 + 业务关键词同现：'
+			+ String(source.match(solicitHits[0]) || '').slice(0, 20) + ' × ' + businessHits.slice(0, 2).join('/'));
 	} else {
 		if (tradeHits.length) reasons.push('（正文仅交易动词，单类词不计分：' + tradeHits.slice(0, 3).join('/') + '）');
 		if (businessHits.length) reasons.push('（正文仅业务关键词，单类词不计分：' + businessHits.slice(0, 3).join('/') + '）');
