@@ -524,25 +524,39 @@ export default {
 				// 必须放在下面所有分支【之前】：handleMessage 里的 handleNewChatMemberBots
 				// 对未配置群一律 return true 把整条进群消息吃掉，落在后面就永远轮不到登记
 				// ——这正是「用 /start 的添加按钮拉进来、机器人毫无反应」的根因。
-				await handleBotSelfJoin(update, env);
+				// 【2026-11-15 稳定性】Webhook 分发兜底：任何一条 update 的处理最多等 50 秒。
+				// 超时后先把 200 返回给 Telegram —— 否则 Telegram 按 60 秒读超时重试，
+				// 同一条 update 反复重试会把它后面的所有群（全局群 / 独立群 / 动态群 / 杀手群）
+				// 的消息一起堵住，线上实测积压到 180 条、整个群断流十分钟。
+				// 未完成的部分挂 waitUntil 继续跑；各慢路径另加了 20~25 秒的针对性上限。
+				const dispatchTask = (async () => {
+					// bot 自己被拉进群 / 频道 → 第一主人操作时自动登记为动态群组。
+					// 必须放在 handleMessage 之前：handleMessage 里的 handleNewChatMemberBots
+					// 对未配置群一律 return true 把整条进群消息吃掉，落在后面就永远轮不到登记
+					// ——这正是「用 /start 的添加按钮拉进来、机器人毫无反应」的根因。
+					await handleBotSelfJoin(update, env);
 
-				// 分发：普通消息 / 群成员状态变更
-				if (update.message) {
-					await handleMessage(update.message, env, ctx, request.url);
-				} else if (update.edited_message) {
-					await handleMessage(update.edited_message, env, ctx, request.url, { edited: true });
-				} else if (update.chat_member) {
-					await handleChatMemberUpdate(update.chat_member, env);
-				} else if (update.callback_query) {
-					await handleAdCallbackQuery(update.callback_query, env, ctx);
-				} else if (update.chat_join_request) {
-					// 申请阶段直接筛查申请人，不等待任何验证机器人的消息或按钮回调。
-					await handleChatJoinRequest(update.chat_join_request, env);
-				} else if (update.my_chat_member) {
-					// 机器人自身的成员变更已在上面 handleBotSelfJoin 处理完，这里不再重复动作。
-				} else {
-					console.log('[Telegram更新] 跳过：当前代码仅处理 message/edited_message/chat_member/my_chat_member/chat_join_request/callback_query。');
-				}
+					// 分发：普通消息 / 群成员状态变更
+					if (update.message) {
+						await handleMessage(update.message, env, ctx, request.url);
+					} else if (update.edited_message) {
+						await handleMessage(update.edited_message, env, ctx, request.url, { edited: true });
+					} else if (update.chat_member) {
+						await handleChatMemberUpdate(update.chat_member, env);
+					} else if (update.callback_query) {
+						await handleAdCallbackQuery(update.callback_query, env, ctx);
+					} else if (update.chat_join_request) {
+						// 申请阶段直接筛查申请人，不等待任何验证机器人的消息或按钮回调。
+						// 【2026-11-15 稳定性】申请筛查最多等 25 秒，超时放行，避免触发 Telegram 读超时重试。
+						await raceWithTimeout(handleChatJoinRequest(update.chat_join_request, env), 25000, undefined);
+					} else if (update.my_chat_member) {
+						// 机器人自身的成员变更已在上面 handleBotSelfJoin 处理完，这里不再重复动作。
+					} else {
+						console.log('[Telegram更新] 跳过：当前代码仅处理 message/edited_message/chat_member/my_chat_member/chat_join_request/callback_query。');
+					}
+				})();
+				if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(dispatchTask.catch(() => {}));
+				await raceWithTimeout(dispatchTask, 50000, undefined);
 
 				return new Response('OK');
 			} else if (path === runtime().TOKEN) {
@@ -3609,6 +3623,10 @@ async function handleInitialization(request, env) {
 		// 设置 Webhook
 		const webhookUrl = new URL(request.url);
 		webhookUrl.pathname = '/';
+		// 【2026-11-15】清掉初始化请求的查询参数：?drop=1 只是「丢弃积压」的一次性开关，
+		// 不能跟着写进 webhook URL —— 否则 Telegram 会把之后每条 update 都投到 ?drop=1 上。
+		webhookUrl.search = '';
+		webhookUrl.hash = '';
 
 		const setWebhookUrl = `https://api.telegram.org/bot${runtime().BOT_TOKEN}/setWebhook`;
 		const setWebhookBody = {
@@ -3624,6 +3642,9 @@ async function handleInitialization(request, env) {
 			// ⚠️ setWebhook 的 allowed_updates 是整体覆盖而不是追加：加了这一项之后
 			//    必须重新访问一次初始化地址，否则线上仍是旧列表、频道那条路永远不触发。
 			allowed_updates: ['message', 'edited_message', 'chat_member', 'my_chat_member', 'callback_query', 'chat_join_request'],
+			// 【临时诊断 2026-11-15】带 ?drop=1 访问初始化地址时清空 Telegram 积压的 update。
+			// 用于恢复被单条超时消息堵死的群；积压清空后必须移除这一段。
+			...(new URL(request.url).searchParams.get('drop') === '1' ? { drop_pending_updates: true } : {}),
 			// 重新注册时必须下发与接收端一致的 secret_token。
 			...webhookSecretFields(env)
 		};
@@ -5254,8 +5275,10 @@ async function banUserFromAllGroups(userId, options = {}) {
 // 顺序固定「先恢复发言、后解除封禁」，两者终态等价（群成员 + 默认权限），
 // 对「本就不存在的状态」（没被禁言的人 / 没被封的人）报错即吞掉 —— 至少一步成功就算该群成功。
 async function unbanUserFromAllGroups(userId, groupIds = runtime().GROUP_IDS) {
-	const results = [];
-	for (const groupId of groupIds) {
+	// 【2026-11-15 稳定性】串行遍历所有群时，每群 2 个 Telegram 请求（恢复发言 + 解封），
+	// 16 群就是 32 个请求串行 ≈ 10~30 秒，叠加清扫/学习会超过 Telegram 的 60 秒 webhook 超时。
+	// 改成与封禁同一档并发（5 路），请求数不变、耗时降到 1/5。
+	return mapWithConcurrency(groupIds, BAN_ALL_GROUPS_CONCURRENCY, async (groupId) => {
 		let restrictOk = false;
 		let restrictError = null;
 		let unbanOk = false;
@@ -5275,7 +5298,7 @@ async function unbanUserFromAllGroups(userId, groupIds = runtime().GROUP_IDS) {
 			unbanError = error.message || String(error);
 		}
 		const ok = restrictOk || unbanOk;
-		results.push({
+		return {
 			groupId,
 			userId: String(userId),
 			ok,
@@ -5283,9 +5306,8 @@ async function unbanUserFromAllGroups(userId, groupIds = runtime().GROUP_IDS) {
 			unmuted: restrictOk,
 			unbanned: unbanOk,
 			dual: true
-		});
-	}
-	return results;
+		};
+	});
 }
 
 // 渲染单个用户多群踢人结果为简短 HTML 文案
@@ -9369,6 +9391,25 @@ function buildPurgeNextUrl(url, nextCursor, limit) {
 	nextUrl.searchParams.set('cursor', String(nextCursor));
 	nextUrl.searchParams.set('limit', String(limit));
 	return nextUrl.toString();
+}
+
+// 【2026-11-15 稳定性】带超时的 Promise 竞速：超时返回 fallback，原 Promise 正常完成时清掉定时器。
+// 用 unref（Node 测试环境）避免超时定时器阻止测试进程退出；Workers 的 setTimeout 返回数字，安全跳过。
+// 所有 webhook 慢路径统一用它兜底，保证任何一条 update 都不会拖到 Telegram 的 60 秒读超时。
+function raceWithTimeout(promise, ms, fallback) {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			resolve(fallback);
+		}, ms);
+		if (timer && typeof timer.unref === 'function') timer.unref();
+		Promise.resolve(promise).then(
+			(value) => { if (settled) return; settled = true; clearTimeout(timer); resolve(value); },
+			(error) => { if (settled) return; settled = true; clearTimeout(timer); reject(error); }
+		);
+	});
 }
 
 async function mapWithConcurrency(items, concurrency, worker) {
@@ -17215,13 +17256,25 @@ async function cleanupCurrentChatUserMessages(env, chatId, userId, fallbackMessa
 	let ok = 0;
 	let failed = 0;
 	const errors = [];
-	for (const mid of uniqueIds) {
-		const result = await deleteMessage(chatId, mid);
-		if (result.ok) {
-			ok += 1;
-		} else {
-			failed += 1;
-			errors.push({ messageId: mid, error: result.error || '未知错误' });
+	// 【2026-11-15 稳定性】批量删除：Telegram deleteMessages 一次最多 100 条。
+	// 旧实现逐条串行 deleteMessage，目标发过几十条广告时这里要跑 40~200 秒，
+	// 直接超过 Telegram 的 60 秒 webhook 超时 → 重试 → 同群后续消息积压。
+	// 批量成功按整批计数；整批失败才回退逐条，保住单条错误明细。
+	for (let i = 0; i < uniqueIds.length; i += 100) {
+		const batch = uniqueIds.slice(i, i + 100);
+		const bulk = await deleteTelegramMessages(chatId, batch);
+		if (bulk.ok) {
+			ok += batch.length;
+			continue;
+		}
+		for (const mid of batch) {
+			const result = await deleteMessage(chatId, mid);
+			if (result.ok) {
+				ok += 1;
+			} else {
+				failed += 1;
+				errors.push({ messageId: mid, error: result.error || '未知错误' });
+			}
 		}
 	}
 	return { total: uniqueIds.length, ok, failed, errors };
@@ -19583,7 +19636,10 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 	// 必须放在 handleNewChatMemberBots 之前——后者对配置群的任何进群消息最后一律 return true，
 	// 插在它之后会变成死代码。detectAdOnJoin 固定返回 false、不接返回值，
 	// 只做「拉资料 → 评分 → 封禁或写观察窗口」，绝不短路既有的 bot 静音与进群消息清理逻辑。
-	await detectAdOnJoin(message, env, ctx);
+	// 【2026-11-15 稳定性】入群筛查最多等 25 秒：单个新成员的资料卡 + AI + 全群处置
+	// 线上实测可能超过 Telegram 的 60 秒 webhook 超时，导致同群后续消息积压。
+	// 超时按放行处理 —— 漏判一个入群广告远好过整个群断流。
+	await raceWithTimeout(detectAdOnJoin(message, env, ctx), 25000, undefined);
 
 	if (await handleNewChatMemberBots(message)) {
 		return;
@@ -19792,7 +19848,11 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 
 	// detectAdOnMessage 三种返回：true = 已封禁处置（含演练命中，直接收尾）；
 	// 'observe' = 转入观察（继续走后续）；false = 放行。
-	const adVerdict = await detectAdOnMessage(message, env);
+	// 【2026-11-15 稳定性】单条消息检测硬超时 25 秒：
+	// 线上实测一条 4272 字节长消息的处理超过 Telegram 的 60 秒 webhook 超时，worker 被取消、
+	// Telegram 持续重试，同一聊天的后续 update 按序阻塞，积压到 180 条、整个群断流。
+	// 超时按「放行」处理 —— 漏判一条广告远好过整个群十分钟收不到任何消息。
+	const adVerdict = await raceWithTimeout(detectAdOnMessage(message, env), 25000, false);
 	if (adVerdict === true) {
 		// 判过的消息同样要进消息缓存：/spam 的「当前群清扫」与「跨群连带」只认这张表，
 		// 不写就一条都追不到 —— 演练模式下尤其明显（演练不删消息，人还在群里发着，
@@ -19993,10 +20053,18 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				// 逐条列表直接交给同款名单写入 —— 少一次 D1 往返，也避免两次查询之间缓存变动。
 				const spamIdTextList = await loadRecentUserAdTextList(env, valid[0]);
 				const spamIdTextForLearn = spamIdTextList.join('\n').slice(0, 1000);
-				const spamIdLearn = await learnAdFromOperatorAction(env, valid[0], message, {
+				// 【2026-11-15 流畅性】学习链路最长只等 20 秒，超时先发回执、学习挂到 waitUntil
+				// 继续跑（ad_content_reviews 已归档，cron 续接）。理由同 /ban 单条。
+				const spamLearnTask = learnAdFromOperatorAction(env, valid[0], message, {
 					source: 'spam',
 					createdBy: String(operatorId ?? ''),
 					text: spamIdTextForLearn
+				});
+				if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(spamLearnTask.catch(() => {}));
+				const spamIdLearn = await raceWithTimeout(spamLearnTask, 20000, {
+					automaticPending: true, learned: 0, sampleAdded: 0, enriched: 0,
+					avatars: 0, badges: 0, shapes: 0, imageLearned: 0,
+					imageLearningFailedCount: 0, imageSimilarityPendingCount: 0
 				});
 				lines.push(...renderAdLearnLines(spamIdLearn, 'spam'));
 				// 【同款名单补齐】线上七天 ad_spam_texts 的 148 行全部来自回复式 /spam，
@@ -20191,11 +20259,18 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			const spamWebPageForLearn = extractAdWebPageText(repliedMsg);
 			spamTextForLearn = [spamOwnTextForLearn, spamWebPageForLearn]
 				.filter(Boolean).join(' ').trim();
-			const spamLearn = await learnAdFromOperatorAction(env, repliedUserId, repliedMsg, {
+			// 【2026-11-15 流畅性】同 /ban 单条：学习最长等 20 秒，超时先回执、后台续学。
+			const spamLearnTask = learnAdFromOperatorAction(env, repliedUserId, repliedMsg, {
 				source: 'spam',
 				createdBy: String(operatorId ?? ''),
 				invocationMessage: message,
 				text: spamTextForLearn
+			});
+			if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(spamLearnTask.catch(() => {}));
+			const spamLearn = await raceWithTimeout(spamLearnTask, 20000, {
+				automaticPending: true, learned: 0, sampleAdded: 0, enriched: 0,
+				avatars: 0, badges: 0, shapes: 0, imageLearned: 0,
+				imageLearningFailedCount: 0, imageSimilarityPendingCount: 0
 			});
 			spamLearned = spamLearn.learned;
 			spamSampleAdded = spamLearn.sampleAdded;
@@ -21289,10 +21364,21 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				// 改从消息缓存捞该用户最近的发言（MSG_CACHE_RETENTION_DAYS=7），
 				// 与 /spam <id> 和「/recent + /learnlast 批量」两条路径同一口径。
 				// 值在上面的清扫之前取好（清扫会删掉来源行）。
-				const manualLearn = await learnAdFromOperatorAction(env, valid[0], message, {
+				// 【2026-11-15 流畅性】学习链路最长只等 20 秒：人工学习内部要走完整 AI 复核
+				// （资料、头像、图片、语义样本、短语提炼），线上实测能把 /sban 的回执拖过
+				// Telegram 的 60 秒 webhook 超时，重试后同群消息积压。
+				// 超时先发回执（带 automaticPending 提示），学习本身挂到 waitUntil 继续跑；
+				// ad_content_reviews 记录已归档，cron 会续接未完成的部分。
+				const learnTask = learnAdFromOperatorAction(env, valid[0], message, {
 					source: isSban ? 'sban' : 'manual',
 					createdBy: String(operatorId ?? ''),
 					text: banIdTextForLearn
+				});
+				if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(learnTask.catch(() => {}));
+				const manualLearn = await raceWithTimeout(learnTask, 20000, {
+					automaticPending: true, learned: 0, sampleAdded: 0, enriched: 0,
+					avatars: 0, badges: 0, shapes: 0, imageLearned: 0,
+					imageLearningFailedCount: 0, imageSimilarityPendingCount: 0
 				});
 				lines.push(...renderAdLearnLines(manualLearn, isSban ? 'sban' : 'ban'));
 				// 【同款名单补齐】/ban、/sban 与 /spam <ID> 同一缺口：只学指纹不写名单。
@@ -42928,6 +43014,24 @@ async function runHealthLayerOne(env) {
 		ok: true,
 		text: '配置规模　📋 配置群 <b>' + runtime().GROUP_IDS.length + '</b> 个　杀手模式 <b>' + killerCount + '</b> 个'
 	});
+
+	// ⑥ 【临时诊断 2026-11-15】Telegram webhook 队列状态：排查某个群的 message update 断流。
+	// 定位后必须删除，不留在正式版本里。
+	try {
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getWebhookInfo');
+		const result = await response.json();
+		const info = result?.result || {};
+		items.push({
+			ok: Number(info.pending_update_count) > 0 ? null : true,
+			text: 'Webhook　' + (info.url ? '<code>' + escapeHtml(String(info.url)) + '</code>' : '❌ 未设置')
+				+ '　积压 <b>' + Number(info.pending_update_count || 0) + '</b> 条'
+				+ (info.last_error_message ? '　最近错误：' + escapeHtml(String(info.last_error_message).slice(0, 120)) : '')
+				+ (info.last_error_date ? '（' + escapeHtml(formatBeijingTime(Number(info.last_error_date))) + '）' : '')
+				+ '　并发 ' + Number(info.max_connections || 0)
+		});
+	} catch (error) {
+		items.push({ ok: false, text: 'Webhook　❌ 查询失败：' + escapeHtml(toChineseErrorText(error.message || '未知错误')) });
+	}
 	return items;
 }
 
