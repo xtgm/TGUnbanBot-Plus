@@ -44835,8 +44835,8 @@ async function handleStatsCommand(message, env, ctx) {
 	if (isInGroup) {
 		// 群内只查本群，且必须是配置群（非配置群无统计数据）。
 		if (!isConfiguredGroup(chat.id)) return true;
-		// 权限：主人/副主人随时可查；否则必须是本群 Telegram 管理员/群主；普通成员静默（不回、不撤回）。
-		const allowed = isPrivilegedManager(actorId) || (rawId && await checkIfUserIsAdminInGroup(rawId, chat.id));
+		// 权限：主人/副主人随时可查；超管等同本群 Telegram 管理员；否则必须是本群 Telegram 管理员/群主；普通成员静默（不回、不撤回）。
+		const allowed = isPrivilegedManager(actorId) || isSuperAdmin(actorId) || (rawId && await checkIfUserIsAdminInGroup(rawId, chat.id));
 		if (!allowed) return true;
 		await deleteAuthorizedGroupCommandMessage(message, '/stats');
 		// 裸 /stats（或无法识别的参数）= 只显示用法，不甩数据；今日数据走 /stats today。
@@ -44851,8 +44851,8 @@ async function handleStatsCommand(message, env, ctx) {
 		return true;
 	}
 
-	// 私聊：仅主人/副主人，需指定配置群 ID（私聊没有「当前群」）。
-	if (!isPrivilegedManager(actorId)) {
+	// 私聊：仅主人/副主人/超管，需指定配置群 ID（私聊没有「当前群」）。
+	if (!isPrivilegedManager(actorId) && !isSuperAdmin(actorId)) {
 		await sendTelegramMessage(chat.id, '❌ <b>权限不足</b>\n\n群内 /stats 限本群管理员/群主，私聊 /stats 限主人/副主人。');
 		return true;
 	}
