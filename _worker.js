@@ -26679,7 +26679,11 @@ function isSuspiciousBotHandle(name) {
 	const core = original.toLowerCase().replace(/bot$/, '').replace(/[^a-z0-9_]/g, '');
 	if (!core) return true;
 	if (AD_SUSPICIOUS_BOT_WORDS.some((word) => core.includes(word))) return true;
-	// 无意义短名（@aabot / @bbbot / @bot1）：正常 bot 会用语义词命名。
+	// 【2026-11-15 线上形态】广告投放 bot 几乎都带数字：
+	// @Akizbea2bot / @Eizabi9bot / @qinoeabi8bot / @ugf8ty_bbot / @nw_5deh8bot / @o46lga_cbot。
+	// 正常 bot 会用语义词命名（weather_bot / translate_bot），含正常词的已由 isNormalBotHandle 排除。
+	if (/\d/.test(core)) return true;
+	// 无意义短名（@aabot / @bbbot）：正常 bot 会用语义词命名。
 	if (core.length < 4) return true;
 	const upper = (original.match(/[A-Z]/g) || []).length;
 	const lower = (original.match(/[a-z]/g) || []).length;
