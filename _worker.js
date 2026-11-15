@@ -25034,10 +25034,14 @@ function parseAdProtectedUsernames(raw) {
 // 候选值里是否含受保护的 username。子串判定 —— keyword 短语是截断片段，
 // 受保护 handle 可能夹在中间（「收购账号 联系 @ym94203」）。
 function containsAdProtectedUsername(value) {
-	if (!runtime().AD_PROTECTED_USERNAMES.length) return false;
+	// 无运行上下文时按「没有保护名单」处理：纯函数单测会直接调用抽指纹，
+	// 不该因为测试没建 runtime 就抛「运行上下文未初始化」。线上始终有上下文。
+	let protectedNames = [];
+	try { protectedNames = runtime().AD_PROTECTED_USERNAMES || []; } catch (_) { return false; }
+	if (!protectedNames.length) return false;
 	const lower = String(value || '').toLowerCase();
 	if (!lower) return false;
-	return runtime().AD_PROTECTED_USERNAMES.some((name) => lower.includes('@' + name) || lower.includes(name));
+	return protectedNames.some((name) => lower.includes('@' + name) || lower.includes(name));
 }
 
 // 结构化评分正则（全部来自真实样本的名称 / 用户名形态）
