@@ -39911,7 +39911,7 @@ async function interceptAdJoinBlacklist(env, member, chatId, chatTitle = '', opt
 		if(options.approvedJoin){inspection.adJoinApproved=true;inspection.date=Number(options.joinDate)||0;inspection.adJoinApprover=options.joinApprover;}
 		await saveAdJoinNotice(env,{userId,chatId:groupId,chatTitle,message:inspection},
 			{verdict:'ban',layer:'blacklist',reasons:['命中已有黑名单'],snapshot:{},blacklistEntry:blacklistCheck.entry},
-			{mode:mute?'mute':'kick',decline:joinRequest,verification,banResults:[{groupId,...banResult}],blacklistCode:'EXISTS',complete,blacklistOnly:true});
+			{mode:mute?'mute':'kick',decline:joinRequest,verification,banResults:[{groupId,...banResult}],blacklistCode:'EXISTS',complete,blacklistOnly:true,ctx:options.ctx});
 	}else try { await notifyOwnerBlacklistIntercept(member, { id: groupId, title: chatTitle }, '入群黑名单拦截', blacklistCheck, banResult, env); }
 	catch(error){console.error('[申请筛查] 拦截回执未发送: '+formatD1SchemaError(error));}
 	return { blocked: true, banned: banResult?.ok === true, blacklistCheck, banResult, joinRequest,verification,complete };
@@ -40006,7 +40006,8 @@ async function detectAdOnJoin(message, env, ctx) {
 			config,
 			whitelist,
 			source: 'new_chat_members',
-			joinDate: Number(message.date) || 0
+			joinDate: Number(message.date) || 0,
+			ctx
 		});
 	}
 
@@ -44431,7 +44432,11 @@ async function saveAdJoinNotice(env,input,evaluation,receipt,options={}){
 	const now=Math.floor(Date.now()/1000);
 	await env.DB.prepare("INSERT INTO ad_join_notices(id,chat_id,user_id,payload,signature,next_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,signature=excluded.signature,revision=ad_join_notices.revision+CASE WHEN ad_join_notices.signature<>excluded.signature THEN 1 ELSE 0 END,owner_part=CASE WHEN ad_join_notices.signature<>excluded.signature THEN 0 ELSE ad_join_notices.owner_part END,owner_chunks=CASE WHEN ad_join_notices.signature<>excluded.signature THEN '' ELSE ad_join_notices.owner_chunks END,next_at=excluded.next_at,updated_at=excluded.updated_at")
 		.bind(id,chatId,userId,JSON.stringify(data),signature,now,now,now).run();
-	const delivery=await deliverAdJoinNotice(env,id,options.ctx||null);
+	// ctx 优先用调用方显式传入的；没有则回退到当前请求上下文（withRuntime 已存 CTX），
+	// 保证群内闪屏的 5 秒撤回任务一定能注册 —— 否则退化成永久消息。
+	let flashCtx = options.ctx || null;
+	if (!flashCtx) { try { flashCtx = runtime().CTX || null; } catch (_) { /* 无运行上下文 */ } }
+	const delivery=await deliverAdJoinNotice(env,id,flashCtx);
 	if(delivery.retryAfter&&env.BULK_QUEUE?.send)try{await env.BULK_QUEUE.send({type:'ad_join_notice',noticeId:id},{delaySeconds:Math.min(43200,delivery.retryAfter)});}
 	catch(error){console.error('[拦门通知] Queue 未投递，定时补发：'+formatD1SchemaError(error));}
 }
