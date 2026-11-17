@@ -30639,6 +30639,12 @@ async function fetchAdUserProfile(userId, fallback = {}, options = {}) {
 			writeAdProfileCache(userId, profile);
 		} else if (!result?.ok) {
 			console.log('[广告检测] getChat 失败 user=' + userId + ' : ' + (result?.description || 'unknown'));
+			// 把「这次失败还值不值得再试」一并交出去：adFetchRetryAfter 已经判过
+			// 400 chat not found / 已注销属永久失败（返回 null），上层补学却只看到
+			// bioFetched=false，把它当「稍后再试」，于是这类号永久滞留在补学队列
+			//（线上 2026-11-04 入队三人，每天两轮失败，13 天零成功）。
+			profile.fetchError = String(result?.description || 'unknown');
+			profile.fetchPermanent = adFetchRetryAfter(result) === null;
 		}
 	} catch (error) {
 		// 失败不写缓存：宁可下一条消息再试一次，也不要把空 bio 钉住 5 分钟。
@@ -35053,7 +35059,17 @@ async function drainAdAvatarLearningQueue(env, limit = 30) {
 			if(await isAdUserWhitelisted(env,uid)){completed.add(String(uid));continue;}
 			// fetchAdUserProfile 有 5 分钟按人缓存，连着补学同一个人不会重复打接口。
 			const profile = await fetchAdUserProfile(uid, {});
-			if(profile?.bioFetched!==true)throw new Error('资料尚未完整获取');
+			if(profile?.bioFetched!==true){
+				// 永久失败（chat not found / 已注销）重试再多次也不会变，直接出队；
+				// 429 / 网络抖动仍然保留，等下一轮 cron。
+				if(profile?.fetchPermanent===true){
+					stats.failed += 1;
+					completed.add(String(uid));
+					console.warn('[广告检测·头像] 补学放弃（资料永久取不到）user=' + uid + ' : ' + String(profile?.fetchError || 'unknown'));
+					continue;
+				}
+				throw new Error('资料尚未完整获取');
+			}
 			const avatarId = String(profile?.avatarId || '');
 			if(avatarId){
 				const avatar=await judgeAdAvatarRealtime(env,avatarId,profile);
