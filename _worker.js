@@ -13969,7 +13969,7 @@ function applyAdCollectedProfileText(evaluation, profile, text, materialTexts, m
 function hasAdMessageContent(message) {
 	return Boolean(getAdDetectionBodyText(message) || getAdQuotedText(message) || extractAdMedia(message)
 		|| message?.forward_origin || message?.forward_from_chat || message?.voice || message?.video_note
-		|| message?.audio || message?.contact || message?.checklist || message?.poll || message?.location || message?.venue || message?.live_photo);
+		|| message?.audio || message?.contact || extractAdChecklistText(message) || message?.poll || message?.location || message?.venue || message?.live_photo);
 }
 
 function isAdDrillMaterialComplete(media,row,avatar=false) {
@@ -19211,7 +19211,17 @@ async function recordAdImageOwnerDecision(env, media, verdict, options = {}) {
 	if (!selected.fileUniqueId || !['ad', 'clean'].includes(verdict)) return { ok: false, reason: 'invalid_decision' };
 	if (!(await ensureAdImageSimilarityTable(env))) return { ok: false, reason: 'not_ready' };
 	try {
+		// 描述与嵌入要花几秒到几十秒，这期间主人可能刚把同一张图判成 clean。
+		// 手动 ad 决策本身要能纠正【推理开始前】就存在的 clean，但绝不能拿推理开始前的判断
+		// 去覆盖【推理期间】刚写进来的新决定 —— 那正是「我判了正常，回头又变成广告」的来源。
+		// 记下进入函数时的版本，写库前再比一次；版本涨了且现在是 clean 就以 clean 为准。
+		const beforeDecision = await env.DB.prepare('SELECT decision_at FROM ad_image_similarity WHERE file_unique_id = ?')
+			.bind(selected.fileUniqueId).first();
 		let signature=adImageContentSignature(options.evidence?.contentSignature||options.evidence?.ownerSimilarity?.contentSignature);
+		// 判 ad 时若手上没有可信签名，下面那次 getAdImageSimilarityVector 已经把「取图 → 描述 → 嵌入」
+		// 整条链跑完了。结果留在这里复用：否则结尾再调一次同样的函数，取图与描述会整轮重跑
+		// （离线用例「Telegram 声明过大文件」就是因此多下载一次），失败时还会把可解释的 reason 丢掉。
+		let describedVector=null;
 		if(verdict==='ad'){
 			if(options.preserveClean===true){
 				const existing=await env.DB.prepare('SELECT owner_verdict FROM ad_image_similarity WHERE file_unique_id=?').bind(selected.fileUniqueId).first();
@@ -19220,11 +19230,27 @@ async function recordAdImageOwnerDecision(env, media, verdict, options = {}) {
 			// 账号处置与素材定性分开；只保存本体证据，不把手动命令标签当作视觉证据。
 			if(!isReliableAdImageContentSignature(signature)){
 				const described=await getAdImageSimilarityVector(env,selected,options.image||null);
+				describedVector=described;
 				signature=adImageContentSignature(described.signature);
 				if(!signature){const saved=await env.DB.prepare('SELECT model,signature FROM ad_image_similarity WHERE file_unique_id=?').bind(selected.fileUniqueId).first();
 					if(saved?.model===AD_IMAGE_SIMILARITY_MODEL)signature=adImageContentSignature(saved.signature);}
 			}
-			if(!isReliableAdImageContentSignature(signature))return {ok:false,reason:'material_content_unverified'};
+			// 【2026-11 口径对齐】素材没核验出来 ≠ 这次主人决定不算数。
+			// 本函数开头就写明「账号处置与素材定性分开」：决策照写、signature 留空，
+			// 该行只参与「clean 优先 / 主人纠错」，不会被 adImageOwnerEvidence 当成同款封禁锚点。
+			// 旧实现这里直接 return false —— 额度关闭或图片不可读时，连主人决策都整条丢弃，
+			// clean 优先与事后纠错随之失效（离线用例「额度关闭也保留主人决策」正是钉这一点）。
+			if(!isReliableAdImageContentSignature(signature))signature=null;
+		}
+		// 写库前核对「推理期间是否被改过」：版本涨了、现在是 clean、本次又不是自动流程，
+		// 就保留后到的 clean，不再落 ad。反过来（期间被判成 ad）照常写，同向覆盖无副作用。
+		if (verdict === 'ad' && options.preserveClean !== true) {
+			const raced = await env.DB.prepare('SELECT owner_verdict, decision_at, embedding IS NOT NULL AS emb FROM ad_image_similarity WHERE file_unique_id = ?')
+				.bind(selected.fileUniqueId).first();
+			if (raced?.owner_verdict === 'clean' && Number(raced.decision_at) > Number(beforeDecision?.decision_at || 0)) {
+				return { ok: true, embeddingStored: Number(raced.emb) === 1, reason: '', reused: false,
+					verdict: 'clean', requestedVerdict: verdict, corrected: true, revision: Number(raced.decision_at) || 0 };
+			}
 		}
 		// MAX+1 不依赖时钟秒数：同秒连续纠错与跨 isolate 的后到决定也会刷新缓存。
 		await env.DB.prepare('INSERT INTO ad_image_similarity (file_unique_id, file_id, kind, owner_verdict, decision_at, decision_user, model, signature) '
@@ -19243,7 +19269,7 @@ async function recordAdImageOwnerDecision(env, media, verdict, options = {}) {
 		state.revision = -1;
 		state.matches.delete(selected.fileUniqueId);
 		state.vectors.delete(selected.fileUniqueId);
-		const vector = await getAdImageSimilarityVector(env, selected, options.image || null);
+		const vector = describedVector || await getAdImageSimilarityVector(env, selected, options.image || null);
 		const latest = await env.DB.prepare('SELECT owner_verdict, decision_at FROM ad_image_similarity WHERE file_unique_id = ?')
 			.bind(selected.fileUniqueId).first();
 		return { ok: true, embeddingStored: vector.ok, reason: vector.reason || '', reused: vector.reused === true,
@@ -19254,10 +19280,15 @@ async function recordAdImageOwnerDecision(env, media, verdict, options = {}) {
 function adImageOwnerEvidence(row, media) {
 	if(!row||!['ad','clean'].includes(row.owner_verdict))return null;
 	const signature=row.model===AD_IMAGE_SIMILARITY_MODEL?adImageContentSignature(row.signature):null;
-	// 旧手动命令可能只是封了账号；只有素材自身的广告证明才能用于同款直接封禁。
-	if(row.owner_verdict==='ad'&&!isReliableAdImageContentSignature(signature))return null;
+	const verified=isReliableAdImageContentSignature(signature);
+	// 【2026-11 口径】同一 file_unique_id 是【这张图本身】，不是「同款扩展」：
+	// 主人判过 ad 就按 ad 返回，即使当时没抓到素材签名（额度关闭 / 图片不可读）。
+	// 原实现这里把无签名的 ad 一律丢掉，后果是主人判完 ad、同一张图再发仍是 none，
+	// 与 clean 一侧完全不对称。签名的安全阀只该管【相似图扩展】那条路
+	// （见 lookupAdImageOwnerSimilarity 的 usableAnchor + strongMatch 组合）——
+	// 那里才是「只是封了账号、却顺手封掉一万张别的图」的真正风险面。
 	return {verdict:row.owner_verdict,similarity:1,matchedId:String(media.fileUniqueId||''),exact:true,
-		strongMatch:row.owner_verdict==='ad',contentSignature:signature,currentAdVerified:row.owner_verdict==='ad',
+		strongMatch:row.owner_verdict==='ad',contentSignature:signature,currentAdVerified:row.owner_verdict==='ad'&&verified,
 		revision:Number(row.decision_at)||0,kind:media.kind};
 }
 
@@ -19302,7 +19333,12 @@ async function lookupAdImageOwnerSimilarity(env, media, image = null, retry = 0)
 			backfilled = (await getAdImageSimilarityVector(env, adImageSimilarityMedia(pending))).ok;
 			if (backfilled) state = await loadAdImageSimilarityAnchors(env);
 		}
-		const usableAnchor=row=>row.vector&&(row.owner_verdict==='clean'||isReliableAdImageContentSignature(row.signature));
+		// 【2026-11 口径】ad 锚点只要留着签名就参与比对：主人判过 ad、模型却说「不是广告」的情况
+		// 恰恰是最需要 OCR 模板的地方 —— 同一套招揽话术改个账号数字，余弦会漂、逐字比对不漂。
+		// 安全阀没有放开：strongMatch 仍然要 currentAdVerified 或 stableAdOcr（见下方），
+		// 而 stableAdOcr 要求归一化后的 OCR 完全相等，语义相近但文案不同的一律不算。
+		const usableAnchor=row=>row.vector&&(row.owner_verdict==='clean'||isReliableAdImageContentSignature(row.signature)
+			||(row.owner_verdict==='ad'&&!!row.signature));
 		let anchors = state.anchors.filter(usableAnchor);
 		if (!anchors.length) return absent('anchors_pending');
 		const extracted = await getAdImageSimilarityVector(env, selected, image);
@@ -19325,7 +19361,11 @@ async function lookupAdImageOwnerSimilarity(env, media, image = null, retry = 0)
 		}
 		const currentAdVerified = isReliableAdImageContentSignature(extracted.signature);
 		const stableCleanOcr = adImageStableOcrMatch(extracted.signature, clean.signature);
-		const stableAdOcr = adImageStableOcrMatch(extracted.signature, ad.signature) && currentAdVerified;
+		// stableAdOcr 是【独立证据】：OCR 归一化后逐字相同，说明是新图沿用了同一套招揽话术。
+		// 它和 currentAdVerified 是并行的两条路（strongMatch 取二者之一），不是上下级 ——
+		// 再 && currentAdVerified 会让「主人判过广告、模型漏判」的变体永远拿不到强匹配，
+		// 而那个组合恰恰是这条判据存在的理由。
+		const stableAdOcr = adImageStableOcrMatch(extracted.signature, ad.signature);
 		const cleanContentVerified = stableCleanOcr || (!extracted.signature.ad && extracted.signature.confidence >= 0.90
 			&& extracted.signature.layout !== 'unknown' && extracted.signature.layout === clean.signature?.layout);
 		const conflict = (clean.score >= 0.94 && ad.score >= 0.94)
@@ -28754,7 +28794,11 @@ function operatorSyntheticLearningMessage(invocation, targetUserId, options = {}
 	if (Number(invocation.message_id) <= 0) return null;
 	// 正文可以为空：/spam <ID> 时缓存里可能没有原文（刚发就被删 / 已过保留期），
 	// 但第一主人的指令仍然要学资料卡（昵称 / bio / 头像 / 会员标）。
+	// 【2026-11-15 口径修正】资料卡已不再进入人工学习（只学正文），合成消息存在的唯一理由
+	// 就只剩「把这批缓存正文交给学习链」。没有正文时继续走下去只会白抓一次资料、白落一条
+	// review —— 裸 /ban <ID>、/spam <ID> 在缓存里查无原文时都会走到这里，那时一个字都不该学。
 	const text = String(options.text || '').trim();
+	if (!text) return null;
 	return {
 		message_id: Number(invocation.message_id),
 		date: Number(invocation.date) || Math.floor(Date.now() / 1000),
@@ -28770,9 +28814,14 @@ async function learnAdFromOperatorAction(env, targetUserId, message, options = {
 		imageSimilarityPendingCount:0,avatars:0,badges:0,shapes:0,aiPromoted:0};
 	if(!isPrimaryOwner(createdBy))return out;
 	const invocation=options.invocationMessage||(message&&isTelegramSlashCommand(message.text)?message:null);
-	const quoted=operatorQuotedLearningMessage(invocation,createdBy,targetUserId)
+	const quotedSource=operatorQuotedLearningMessage(invocation,createdBy,targetUserId)
 		||operatorSyntheticLearningMessage(invocation,targetUserId,{...options,createdBy});
-	if(!quoted||await isAdUserWhitelisted(env,targetUserId))return out;
+	if(!quotedSource||await isAdUserWhitelisted(env,targetUserId))return out;
+	// Telegram 的 reply_to_message 只有 message_id / from / 正文，从来不带 chat；
+	// 而归档学习现场（ad_content_reviews）必须知道会话 ID，缺了就被 saveAdContentReview
+	// 判成「现场不完整」直接返回 null，人工学习永远落不了库。被引用的广告就在发令的那个会话，
+	// 用 invocation.chat 补上即可 —— 复制一份，避免改动调用方手里的消息对象。
+	const quoted=quotedSource.chat?quotedSource:{...quotedSource,chat:invocation?.chat};
 	try{
 		// 先落原始引用与授权，再开始采集；服务中断后队列与定时任务均能续接。
 		out.reviewId=await saveAdContentReview(env,quoted,{verdict:'pass',snapshot:{},operatorLearning:{
@@ -28938,8 +28987,13 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 		// 那条广告（见上方 mediaSource 的说明）。此前吃的是 message 本身，于是
 		// 「/ban 123 引用一张广告图」学不到图，只有「/spam 引用回复」那条路径学得到。
 		// 裸 /ban 12345（无引用）时 reply_to_message 为空、回退成命令消息，仍自然跳过。
+		// 人工判定路径的素材证据口径：核实成广告的当然算；停在 pending（没核实出来，
+		// 例如额度用完 / 只有缩略图 / 模型不可用）也放行 —— 主人手判本身就是证据，
+		// 写库时会带上 ad、但签名为空，只作用于这一张图，不会扩成相似图锚点。
+		const manualMediaEvidence = (row) => isVerifiedAdMediaRow(row)
+			|| (row?.verdict === 'pending' && String(row?.source || '') === 'message_context');
 		const confirmManualImage = async (media,evidence) => {
-			if(!isVerifiedAdMediaRow(evidence))return;
+			if(!manualMediaEvidence(evidence))return;
 			const confirmation=await step('image:'+media.fileUniqueId,async()=>{
 				if(!await upsertAdImage(env,media.fileUniqueId,{verdict:'ad',source:AD_IMAGE_VERIFIED_SOURCE,kind:String(media.kind||''),
 					fileId:media.visionFileId||'',lastUserId:String(targetUserId),visionCheckedAt:Math.floor(Date.now()/1000)}))throw new Error('图片指纹写入失败');
@@ -28958,8 +29012,15 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 			if(!vector)out.imageSimilarityPendingCount++;
 		};
 		const learnMedia = mediaSource ? extractAdMedia(mediaSource) : null;
-		if (learnMedia?.fileUniqueId&&isVerifiedAdMediaRow(collected.materials.image)) {
-			await confirmManualImage(learnMedia,collected.materials.image);
+		// 【2026-11-15 口径】人工判定即广告，图片也一样：走到这里已经是第一主人的手动指令
+		// （本函数开头就有 isPrimaryOwner 把关），引用里的图和正文是同一现场。
+		// 图片内容核实可能因为额度 / 只有缩略图 / 模型不可用停在 pending —— 那是「没核实」，
+		// 不是「正常」。拿它挡掉主人手判，会出现「引用一张广告图去 /ban，图片一个字节都没学」，
+		// 下次同图再发照样漏。证据缺失时仍按主人判定写 ad，但签名为空，
+		// 只对这张 file_unique_id 生效，不会扩成相似图锚点（安全阀在 adImageOwnerEvidence / usableAnchor）。
+		const imageEvidence = collected.materials.image;
+		if (learnMedia?.fileUniqueId && manualMediaEvidence(imageEvidence)) {
+			await confirmManualImage(learnMedia, imageEvidence);
 			// 【2026-11-02】贴纸整包学：广告组织换一张同包贴纸就绕过单张指纹，
 			// 主人 /spam 过很多次仍漏的根因之一。人工判定可以覆盖 /ignore 留下的 clean。
 			// 【2026-11-15 主人口径】贴纸只学单张，不整包学 —— 整包不一定全是广告，
@@ -32845,8 +32906,11 @@ async function freezeAdDryRunSession(env,session,reason='第一主人关闭') {
 	const results=await env.DB.batch([
 		env.DB.prepare("UPDATE ad_dryrun_sessions SET cutoff_row_id=(SELECT COALESCE(MAX(id),0) FROM ad_dryrun_log),closed_at=?,ban_scope_snapshot=?,status='closing',init_cursor=start_row_id-1,report_cursor=start_row_id-1,report_sent=0,next_at=0,boundary_note=boundary_note || ? WHERE id=? AND status='open'")
 			.bind(new Date().toISOString(),scope,'；'+reason,Number(session.id)),
-		env.DB.prepare("UPDATE dryrun_groups SET enabled=0 WHERE chat_id=? AND EXISTS(SELECT 1 FROM ad_dryrun_sessions WHERE id=? AND status!='open') AND NOT EXISTS(SELECT 1 FROM ad_dryrun_sessions WHERE status='open')")
-			.bind(GLOBAL_DRYRUN_CHAT_ID,Number(session.id))
+		// 关闭时把整张表的 flag 一起清零：现在开关只认 __global__ 这一行，旧版本按群写入的行
+		// 已经没有读取方，留着 enabled=1 会让「演练已关，但表里还有开启项」一直挂着，
+		// 排障时会被误判成没关干净。开启路径本来就是无条件清全表（见 setGlobalDryRun），关闭应对称。
+		env.DB.prepare("UPDATE dryrun_groups SET enabled=0 WHERE EXISTS(SELECT 1 FROM ad_dryrun_sessions WHERE id=? AND status!='open') AND NOT EXISTS(SELECT 1 FROM ad_dryrun_sessions WHERE status='open')")
+			.bind(Number(session.id))
 	]);
 	if(results.some(result=>result?.success===false))throw new Error('演练关闭边界未保存');
 	return env.DB.prepare('SELECT * FROM ad_dryrun_sessions WHERE id=?').bind(Number(session.id)).first();
@@ -33437,6 +33501,7 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 	// 【为什么放在这里】answer.ad 为 true 才会走到这行 —— 判 false 的调用（绝大多数）
 	// 一个 SQL 都不发；且同一载荷有 adLLMSeen 内存去重，不会对同一条文案重复写。
 	// 【失败绝不影响判定】recordAdLLMCandidates 内部整段 try，只记日志。
+	if (!reused) await recordAdLLMCandidates(env, answer.features || [], input);
 	const reason = 'AI 深度判定命中（置信度 ' + answer.confidence.toFixed(2) + '）：' + answer.reason;
 	const reasons = (current.reasons || []).concat([reason]);
 	// ===== 契约闸：置信度必须是模型自己给的（2026-11，主人口径 1丙）=====
@@ -33530,7 +33595,6 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 		// 会抛 Assignment to constant variable，整条检测链在 try 里炸掉、返回 result: error。
 		if (recordEvidence.length) {
 			llmPositionGrade = 6;
-			if (!reused) await recordAdLLMCandidates(env, answer.features || [], input);
 			return finish({
 				verdict: 'ban',
 				reasons: markAdConvictLayer(reasons.concat([
@@ -33540,7 +33604,6 @@ async function applyAdLLMToEvaluation(env, evaluation, config, input, options) {
 		}
 		if (hardEvidence.length || (citations.length && secondEvidence.length)) {
 			llmPositionGrade = 6;
-			if (!reused) await recordAdLLMCandidates(env, answer.features || [], input);
 			// 【定罪归属】函数入口那道 `verdict === 'ban' 直接返回` 保证走到这里
 			// 必定是本层定的罪，所以标记无条件写。
 			return finish({
@@ -43461,23 +43524,8 @@ async function runHealthLayerOne(env) {
 
 	// ⑥ 【临时诊断 2026-11-15】Telegram webhook 队列状态：排查某个群的 message update 断流。
 	// 定位后必须删除，不留在正式版本里。
-	try {
-		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getWebhookInfo', {
-			signal: AbortSignal.timeout(5000)
-		});
-		const result = await response.json();
-		const info = result?.result || {};
-		items.push({
-			ok: Number(info.pending_update_count) > 0 ? null : true,
-			text: 'Webhook　' + (info.url ? '<code>' + escapeHtml(String(info.url)) + '</code>' : '❌ 未设置')
-				+ '　积压 <b>' + Number(info.pending_update_count || 0) + '</b> 条'
-				+ (info.last_error_message ? '　最近错误：' + escapeHtml(String(info.last_error_message).slice(0, 120)) : '')
-				+ (info.last_error_date ? '（' + escapeHtml(formatBeijingTime(Number(info.last_error_date))) + '）' : '')
-				+ '　并发 ' + Number(info.max_connections || 0)
-		});
-	} catch (error) {
-		items.push({ ok: false, text: 'Webhook　❌ 查询失败：' + escapeHtml(toChineseErrorText(error.message || '未知错误')) });
-	}
+	// 【2026-11-16 已删除】断流已定位并修复；这多出来的一项会让 /health 从五项变六项，
+	// Mini App 的 layer1 断言与「五项齐全」的版面口径都跟着错位，故按计划移除。
 	return items;
 }
 
