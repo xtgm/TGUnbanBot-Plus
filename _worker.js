@@ -29590,7 +29590,7 @@ async function embedAdTextCached(env, text, config = null) {
 }
 
 // 取文本向量。失败一律返回 null 交由上层跳过，绝不抛到检测主链路。
-async function embedAdText(env, text) {
+async function embedAdText(env, text, options = {}) {
 	const source = String(text ?? '').trim().slice(0, 512);
 	if (!source) return null;
 	if (!(env?.AI && typeof env.AI.run === 'function')) return null;
@@ -29600,6 +29600,14 @@ async function embedAdText(env, text) {
 		if (!Array.isArray(vector) || !vector.length) return null;
 		return vector.map((v) => Number(v) || 0);
 	} catch (error) {
+		// 【8008 重试一次】线上实测同一文本 12:28:18 报「8008: Internal server error」，
+		// 12:29:21 同一文本成功写入缓存（embc_3b04bd42c73c1d33）—— 平台瞬时抖动，
+		// 不是文本本身的问题。失败一次这条消息的语义层就直接退场（similarity 0），
+		// 所以 8008 再试一次；模型不存在、额度打满这类错误重试也不会变，维持原样。
+		const message = String(error?.message || '');
+		if (!options.retried && (message.includes('8008') || /internal server error/i.test(message))) {
+			return embedAdText(env, text, { retried: true });
+		}
 		// 必须打出 name + message：Workers AI 的 Ai._parseError 抛出的 Error 往往 message 为空，
 		// 只 console.error(error) 时日志里只有一串栈、看不到「模型不存在」这类真实原因，
 		// 曾因此把「模型 ID 写错」误判为「AI 限流」。model 也一并打出便于对照目录。
