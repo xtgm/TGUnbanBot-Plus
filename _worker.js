@@ -5969,14 +5969,6 @@ function classifyMessageOperatorRole(message, fallback = '管理员') {
 	return classifyOperatorRole(message?.from?.id, fallback);
 }
 
-async function checkMessageOperatorIsAdmin(message, userId) {
-	if (isAnonymousAdminMessage(message)) {
-		console.log(`[管理员鉴权] 匿名管理员在群 ${message.chat.id} 发出命令 ✅`);
-		return true;
-	}
-	return checkIfUserIsAdmin(userId);
-}
-
 function isOwner(id) {
 	return runtime().OWNER_IDS.length > 0 && runtime().OWNER_IDS.includes(String(id || ''));
 }
@@ -11966,6 +11958,11 @@ async function isAutomaticAdMuteEntryCurrent(env, groupId, entry) {
 async function isAdJoinGuardGroupCurrent(env, chatId) {
 	const id = String(chatId || '');
 	if (isAdJoinGuardGroup(id)) return !env?.DB || !await isIndependentGroupCurrent(env, id);
+	// 【同步判死，别为注定为空的查询付往返】readAdJoinGuardExceptionIds 已经把名单过滤成
+	// 「配置群里的杀手群」（排掉主群、独立群、非杀手群），所以这些群在任何情况下都不可能在
+	// 特例名单里生效。原先一律往 D1 跑一次全表 SELECT，而 chat_member / 消息路径会对每个
+	// 非第一道防线群调到这里 —— 全是白读。
+	if (!isConfiguredGroup(id) || isIndependentGroup(id) || id === String(runtime().GROUP_ID) || !isKillerModeGroup(id)) return false;
 	return isAdJoinGuardKillerExceptionGroup(env, id);
 }
 
