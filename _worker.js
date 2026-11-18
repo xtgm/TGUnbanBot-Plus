@@ -19227,6 +19227,10 @@ async function recordAdImageOwnerDecision(env, media, verdict, options = {}) {
 	if (!selected.fileUniqueId || !['ad', 'clean'].includes(verdict)) return { ok: false, reason: 'invalid_decision' };
 	if (!(await ensureAdImageSimilarityTable(env))) return { ok: false, reason: 'not_ready' };
 	try {
+		// 【2026-11-18 素材证据口径】调用方给的证据明确是 clean，却要求写 ad ——
+		// 这不是「素材没核验出来」，而是证据与决定互相矛盾，直接拒绝，不能靠重新描述翻案。
+		if (verdict === 'ad' && String(options.evidence?.verdict || '') === 'clean')
+			return { ok: false, reason: 'evidence_contradicts_decision' };
 		// 描述与嵌入要花几秒到几十秒，这期间主人可能刚把同一张图判成 clean。
 		// 手动 ad 决策本身要能纠正【推理开始前】就存在的 clean，但绝不能拿推理开始前的判断
 		// 去覆盖【推理期间】刚写进来的新决定 —— 那正是「我判了正常，回头又变成广告」的来源。
@@ -19303,6 +19307,10 @@ function adImageOwnerEvidence(row, media) {
 	// 与 clean 一侧完全不对称。签名的安全阀只该管【相似图扩展】那条路
 	// （见 lookupAdImageOwnerSimilarity 的 usableAnchor + strongMatch 组合）——
 	// 那里才是「只是封了账号、却顺手封掉一万张别的图」的真正风险面。
+	// 【2026-11-18 素材证据口径】但记录明明保存了内容签名、签名却说「不是广告」时，
+	// 这条 ad 标签与素材内容自相矛盾（旧正常素材被误标 / 历史脏数据），不能再当同图锚点。
+	// 无签名仍按 ad 返回 —— 那条口径没变。
+	if (row.owner_verdict === 'ad' && signature && signature.ad !== true) return null;
 	return {verdict:row.owner_verdict,similarity:1,matchedId:String(media.fileUniqueId||''),exact:true,
 		strongMatch:row.owner_verdict==='ad',contentSignature:signature,currentAdVerified:row.owner_verdict==='ad'&&verified,
 		revision:Number(row.decision_at)||0,kind:media.kind};
@@ -24887,6 +24895,9 @@ const AD_EXEMPT_KEYWORD_CATEGORIES = [
 	] }
 ];
 const AD_EXEMPT_KEYWORDS = AD_EXEMPT_KEYWORD_CATEGORIES.flatMap(({ words }) => words);
+// 词表里的是「词」—— 抹掉后其余内容继续检测；不在表里的命中（日常问候、反诈语境、
+// 技术语境）是整段豁免，没有可抹的对象。区分逻辑见 adExemptAnalysis。
+const AD_EXEMPT_KEYWORD_SET = new Set(AD_EXEMPT_KEYWORDS.map((word) => String(word).toLowerCase()));
 
 // 豁免只保护本位置的正常内容；单个技术词不能覆盖同段的真实推广证据。
 // 仅去掉有明确警示语境的引文与被否定的动作，剩余招揽不能被“反诈”等字样洗白。
@@ -27366,15 +27377,19 @@ async function inspectAdLinkContent(env, link) {
 	if (!['channel', 'supergroup', 'group', 'bot'].includes(kind)) return [];
 	const body = [link?.title, link?.about].map((part) => String(part || '').trim()).filter(Boolean).join(' ');
 	if (!body) return [];
-	if (adPositionExemptHits(body).length) return [];
+	// 【2026-11-18 豁免粒度】标题简介命中豁免词只跳过那个词，剩下的内容继续查；
+	// 语境型豁免或抹完什么都不剩才整条不查。
+	const scoped = adExemptScopedText(body);
+	if (scoped.exempt) return [];
+	const source = scoped.text;
 	const found = [];
 	if (hasAdPrivateInviteLink(body)) found.push('私有邀请链接');
-	const businessHits = countAdKeywordHits(body, AD_BUSINESS_KEYWORDS);
+	const businessHits = countAdKeywordHits(source, AD_BUSINESS_KEYWORDS);
 	if (businessHits.length) found.push('行业词 ' + businessHits.slice(0, 3).join('/'));
-	if (AD_EXEMPT_CANCEL_RE.test(body)) found.push('招揽话术');
+	if (AD_EXEMPT_CANCEL_RE.test(source)) found.push('招揽话术');
 	if (found.length) return found;
 	try {
-		const similar = await checkAdAiSimilarity(env, body);
+		const similar = await checkAdAiSimilarity(env, source);
 		if (similar?.isMatch) found.push('与广告样本语义相似 ' + Number(similar.similarity || 0).toFixed(3));
 	} catch (error) {
 		console.error('[广告检测·链接] 被挂号语义比对失败 handle=' + String(link?.handle || '') + ':', error?.message || error);
@@ -29003,14 +29018,15 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 		// 那条广告（见上方 mediaSource 的说明）。此前吃的是 message 本身，于是
 		// 「/ban 123 引用一张广告图」学不到图，只有「/spam 引用回复」那条路径学得到。
 		// 裸 /ban 12345（无引用）时 reply_to_message 为空、回退成命令消息，仍自然跳过。
-		// 人工判定路径的素材证据口径：核实成广告的当然算；停在 pending（没核实出来，
-		// 例如额度用完 / 只有缩略图 / 模型不可用）也放行 —— 主人手判本身就是证据，
-		// 写库时会带上 ad、但签名为空，只作用于这一张图，不会扩成相似图锚点。
+		// 人工判定路径的素材证据口径：只有素材自身核验成广告才进广告库。
 		// 【2026-11-17 修】只认 message_context 等于把主人手判挡在外面：/spam 的命令文本会被
 		// isTelegramSlashCommand 短路，采集到的行 source 恒为 null，引用一张广告图去 /spam
-		// 永远学不到图。这里按上面这段注释原本的口径放行 —— 不是明确的 clean 就算证据。
+		// 永远学不到图。那种场景里素材本身已经判成 ad、只是来源字段丢了，所以按
+		//「判了 ad 且带内容签名」放行。
+		// 【2026-11-18 素材证据口径】pending（没核实出来）不等于广告：额度用完 / 只有缩略图 /
+		// 模型不可用都不能凭主人手判把一张没看过的图写进广告库，否则它会成为同款锚点。
 		const manualMediaEvidence = (row) => isVerifiedAdMediaRow(row)
-			|| (row && String(row?.verdict || '') !== 'clean');
+			|| (row && String(row?.verdict || '') === 'ad' && !!adImageContentSignature(row.contentSignature));
 		const confirmManualImage = async (media,evidence) => {
 			if(!manualMediaEvidence(evidence))return;
 			const confirmation=await step('image:'+media.fileUniqueId,async()=>{
@@ -29877,8 +29893,9 @@ async function applyAdBodyJudge(env, bodyText, input, judged) {
 	await writeAdScanState(env, adBodyJudgeKey(bodyText), JSON.stringify(record), record.at);
 	const convicted = record.ok && record.is_ad && record.confidence !== null && record.confidence >= AD_BODY_BAN_LINE;
 	if (!convicted) {
-		await notifyAdBodyJudgeResult(env, bodyText, record, input,
-			record.ok ? '未处置（未过采信线）' : '未处置（调用失败）');
+		// 【2026-11-18 主人口径】判正常的消息不再单独发通知（D1 记录照写，事后可查）；
+		// 只有调用失败才通知 —— 那是「模型没跑起来」，需要人知道。
+		if (!record.ok) await notifyAdBodyJudgeResult(env, bodyText, record, input, '未处置（调用失败）');
 		return false;
 	}
 	const evaluation = input.evaluation;
@@ -34568,6 +34585,8 @@ const AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS = 5;
 //   · cross_user —— 三个人发过同一张没判过的图。普通动态贴纸天天被多人转发，
 //     这条一放开就会成批误封正常人。
 const AD_IMAGE_WEAK_SOURCES = new Set(['learned', 'cross_user']);
+// 人工来源标签：hits 可能是历史强写的常量，没有内容证明就不算证据。
+const AD_IMAGE_HUMAN_LABEL_SOURCES = new Set(['owner', 'manual', 'spam', 'ban', 'sban']);
 const AD_IMAGE_VERIFIED_SOURCE = 'vision_content_v4';
 function isReliableAdImageSource(image) {
 	if(image?.verdict!=='ad')return false;
@@ -34603,10 +34622,13 @@ function applyImageVerdict(evaluation, image) {
 	const hits = Number(image.hits) || 0;
 	const reliableSource = isReliableAdImageSource(image);
 	// 概率分类、旧素材标签和复用次数不能代替实际内容证据，也不能凑成图片6+AI3。
-	// 【例外：真实复用满线】hits 由 learnAdImageOnBan 逐次累加，是可核验的事实，
-	// 弱来源（learned / cross_user）靠它单证封 —— 见下面 2026-10-14 那段口径。
-	// 原条件漏了这一支，weak 来源先被这里 return，hits>=5 那条分支永远到不了。
-	if (!reliableSource && hits < AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS) {
+	// 【例外：真实复用满线】hits 只有在 learnAdImageOnBan 逐次累加的来源上才是可核验的事实；
+	// 人工来源标签（owner / manual / spam / ban / sban）上的 hits 可能是历史强写的常量，
+	// 没有内容证明就不算证据 —— 见下面 2026-11-18 那段口径。
+	// 无 source 的历史行按逐次累加处理：这条门槛在收紧前就只认「来源非人工标签」，不改既有行为。
+	const hitsVerified = !AD_IMAGE_HUMAN_LABEL_SOURCES.has(String(image.source || ''))
+		&& hits >= AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS;
+	if (!reliableSource && !hitsVerified) {
 		const judged = Object.assign({}, evaluation, { reasons: (evaluation.reasons || []).concat(['图片广告标签尚无可靠内容证据，不参与自动封禁']) });
 		return evaluation.positionEvidence ? rejudgeAdPositionEvidence(judged) : judged;
 	}
@@ -34618,7 +34640,7 @@ function applyImageVerdict(evaluation, image) {
 		:'消息图片命中广告素材库（复用定罪 ' + hits + ' 次）' + (categoryLabel ? ' · 识图判为' + categoryLabel : '');
 	const reasons = (evaluation.reasons || []).concat([reason]);
 	if (evaluation.positionEvidence) {
-		const hardBan = reliableSource || hits >= AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS;
+		const hardBan = reliableSource || hitsVerified;
 		const judged = Object.assign({}, evaluation, { reasons });
 		addAdPositionEvidence(judged, image.kind === 'sticker' ? 'sticker' : 'image', hardBan ? 10 : 6, reason);
 		if (hardBan) {
@@ -34646,7 +34668,10 @@ function applyImageVerdict(evaluation, image) {
 	//   ② 否则图片命中【只留痕、不改变结论】：封不封由本条消息自己的分数与证据决定。
 	//      得分没到线就不封，进观察窗口等人工或后续证据 —— 与头像通道同口径
 	//      （applyAvatarVerdict 2026-10-14 也是只认正分佐证，治的是同一个病）。
-	if (hits >= AD_IMAGE_SINGLE_EVIDENCE_BAN_HITS) {
+	// 【2026-11-18 素材证据口径】人工来源标签本身不算证据：旧标签没有内容证明时，
+	// 即使 hits 很高也不能单独定罪（同款用户只留痕）。只有弱来源的真实复用计数、
+	// 或带内容签名的可靠来源，才走单证封禁。
+	if (hitsVerified) {
 		// 【定罪归属】同头像 / 会员标：前面定过罪的保留原归属，本层不抢标。
 		const convictedByImage = String(evaluation.verdict) !== 'ban';
 		return Object.assign({}, evaluation, { verdict: 'ban',
@@ -35595,14 +35620,24 @@ async function verifyAdImageVisibleContent(env, media, encoded, judge) {
 	const described = await describeAdImageSimilarityContent(env, encoded, { quotaScope: 'review' });
 	if (!described.ok) return { verdict: 'pending', reason: described.reason, contentVerified: false };
 	const signature = described.signature;
-	const protectedContent = hasAdProtectedTechnicalContext([signature.ocr_text, signature.caption].join(' '))
-		&& !hasAdIndependentHarmfulContent([signature.ocr_text, signature.caption].join(' '));
+	const visible = [signature.ocr_text, signature.caption].join(' ');
+	// 【2026-11-18 豁免粒度】图上文字命中豁免词只跳过那个词，抹剩的文字照常判：
+	// 有广告证据 → 判广告；没证据 → 最多待核，不再因为「带技术词」直接标干净。
+	const scoped = adExemptScopedText(visible);
+	const scopedSignature = scoped.hits.length
+		? { ...signature,
+			ocr_text: stripAdExemptWords(String(signature.ocr_text || ''), scoped.hits),
+			caption: stripAdExemptWords(String(signature.caption || ''), scoped.hits) }
+		: signature;
 	// 高置信的逐字广告证据可补回初筛漏判；纯视觉分歧仍待核，不盲目反转正常结论。
-	const reliable = !protectedContent && isReliableAdImageContentSignature(signature)
-		&& (judge?.ad === true || isReliableAdImageTextSignature(signature));
-	const verdict = reliable ? 'ad' : signature.confidence >= 0.85 && (protectedContent || signature.ad === false) ? 'clean' : 'pending';
+	const reliable = !scoped.exempt && isReliableAdImageContentSignature(scopedSignature)
+		&& (judge?.ad === true || isReliableAdImageTextSignature(scopedSignature));
+	// 模型明确判非广告、且没有豁免词挡路时才判干净；豁免词命中的一律留给待核。
+	const verdict = reliable ? 'ad'
+		: signature.confidence >= 0.85 && signature.ad === false && !scoped.exempt ? 'clean'
+		: 'pending';
 	const result = { version: 4, verdict, contentVerified: reliable, signature, category: judge?.category || '',
-		reason: protectedContent ? 'technical_content_exempt' : reliable ? 'visible_ad_evidence' : 'no_reliable_ad_evidence' };
+		reason: reliable ? 'visible_ad_evidence' : scoped.exempt ? 'technical_content_exempt_pending' : 'no_reliable_ad_evidence' };
 	await writeAdScanState(env, key, JSON.stringify(result));
 	return result;
 }
@@ -38021,7 +38056,32 @@ function clearAdPositionHardBan(evaluation, key) {
 		|| Object.values(evaluation.positionHardSources).some(Boolean);
 }
 
-function adPositionExemptHits(text) {
+// 只跳过命中的那个豁免词，其余内容原样留下继续检测（2026-11-18 主人口径：
+// 「出现豁免词就跳过这个词，而不是带豁免词就放过整个人」）。
+// 用 split/join 而不是正则：豁免表里有 `t.me` 这种带点号的词，直接进 RegExp 会变成通配。
+function stripAdExemptWords(source, words) {
+	let residual = String(source || '');
+	for (const word of Array.isArray(words) ? words : []) {
+		const needle = String(word || '');
+		if (!needle) continue;
+		residual = residual.split(needle).join(' ');
+		if (!/[A-Za-z]/.test(needle)) continue;
+		// 大小写混写（T.ME / T.me）也要抹掉；替换成等长空格，不改变后续下标。
+		const target = needle.toLowerCase();
+		let lower = residual.toLowerCase();
+		let index = lower.indexOf(target);
+		while (index >= 0) {
+			residual = residual.slice(0, index) + ' '.repeat(needle.length) + residual.slice(index + needle.length);
+			lower = residual.toLowerCase();
+			index = lower.indexOf(target, index + needle.length);
+		}
+	}
+	return residual;
+}
+
+// 豁免分析：hits 是命中的词或语境说明，contextual 表示这条豁免没有可抹的对象
+// （日常问候 / 反诈举报语境 / 技术语境），只能整段放过。
+function adExemptAnalysis(text) {
 	const source = String(text || '');
 	// 【2026-11-15 线上漏放】≥2 个 @xxxbot、正文几乎没有自然语言、无斜杠命令 ——
 	// 这是形态 B 的批量代发诱饵，「bot」在这里不是技术豁免词。旧逻辑把整条正文
@@ -38030,19 +38090,38 @@ function adPositionExemptHits(text) {
 	const bareOutlets = analyzeAdOutlets(source, '');
 	if (bareOutlets.mentions.length >= 2 && bareOutlets.botMentions.length === bareOutlets.mentions.length
 		&& adNaturalTextLength(source) < AD_NATURAL_TEXT_MAX && !AD_SLASH_COMMAND_RE.test(source)) {
-		return [];
+		return { hits: [], contextual: false };
 	}
 	const routine=source.normalize('NFKC').replace(/[\s\p{P}\p{S}]+/gu,'');
-	if(/^(?:签到|簽到|打卡|收到|冒泡|早安|晚安|早上好|晚上好|大家好|谢谢|謝謝|感谢|感謝){1,3}$/.test(routine))return ['日常问候或签到'];
-	if (isAdNonPromotionalContext(source)) return ['反诈、举报或明确否定推广的语境'];
+	if(/^(?:签到|簽到|打卡|收到|冒泡|早安|晚安|早上好|晚上好|大家好|谢谢|謝謝|感谢|感謝){1,3}$/.test(routine))return { hits: ['日常问候或签到'], contextual: true };
+	if (isAdNonPromotionalContext(source)) return { hits: ['反诈、举报或明确否定推广的语境'], contextual: true };
 	let hits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
 	if (hasAdProtectedTechnicalContext(source) && !hasAdIndependentHarmfulContent(source)) {
-		return hits.length ? hits : ['技术或官方链接语境'];
+		return { hits: hits.length ? hits : ['技术或官方链接语境'], contextual: true };
 	}
 	if (hasAdPrivateInviteLink(source) && !hasAdPublicTelegramLink(source)) {
 		hits = hits.filter((word) => !AD_TELEGRAM_LINK_EXEMPT_WORDS.has(String(word).toLowerCase()));
 	}
-	return dropAdContextExempt(hits, source, []);
+	return { hits: dropAdContextExempt(hits, source, []), contextual: false };
+}
+
+function adPositionExemptHits(text) {
+	return adExemptAnalysis(text).hits;
+}
+
+// 一个位置最终按什么文本检测：
+//   整段豁免（语境型，或抹完什么都不剩）→ text 为空串，后续证据天然为 0；
+//   只命中词 → text 是抹掉这几个词后的剩余文本，其余内容照常检测；
+//   没有豁免 → 原文。
+function adExemptScopedText(text) {
+	const source = String(text || '');
+	const analysis = adExemptAnalysis(source);
+	if (!analysis.hits.length) return { text: source, hits: [], contextual: false, exempt: false, residual: source };
+	const words = analysis.hits.filter((word) => AD_EXEMPT_KEYWORD_SET.has(String(word).toLowerCase()));
+	const residual = stripAdExemptWords(source, words);
+	const rest = residual.replace(/[\s\p{P}\p{S}]+/gu, '');
+	const exempt = analysis.contextual || !rest;
+	return { text: exempt ? '' : residual, hits: analysis.hits, contextual: analysis.contextual, exempt, residual };
 }
 
 function addAdPositionEvidence(evaluation, key, grade, reason) {
@@ -38068,18 +38147,23 @@ function collectAdPositionEvidence(input, context = {}) {
 	// 引用内容不归发送者所有；只有现有 quoted 通道确认归责时才形成引用位置证据。
 	for (const key of ['name', 'bio', 'text']) {
 		const source = texts[key];
-		const exemptHits = adPositionExemptHits(source);
-		positions[key].exempt = exemptHits.length > 0;
-		if (exemptHits.length) positions[key].reasons.push('本位置命中豁免词：' + exemptHits.slice(0, 3).join('/'));
-		const trade = countAdKeywordHits(source, AD_TRADE_VERBS);
-		const business = countAdKeywordHits(source, AD_BUSINESS_KEYWORDS);
+		// 【2026-11-18 豁免粒度】命中豁免词只跳过那个词，其余内容继续检测；
+		// 只有语境型豁免（问候 / 反诈 / 技术语境）或抹完什么都不剩才整段放过。
+		const scoped = adExemptScopedText(source);
+		positions[key].exempt = scoped.exempt;
+		if (scoped.hits.length) positions[key].reasons.push('本位置命中豁免词：' + scoped.hits.slice(0, 3).join('/')
+			+ (scoped.exempt ? '' : '（只跳过该词，其余内容继续检测）'));
+		const probe = scoped.text;
+		const trade = countAdKeywordHits(probe, AD_TRADE_VERBS);
+		const business = countAdKeywordHits(probe, AD_BUSINESS_KEYWORDS);
 		if (trade.length || business.length) addAdPositionEvidence(evaluation, key, 3, '单类广告词');
 		if (trade.length && business.length) addAdPositionEvidence(evaluation, key, 6, '招揽与行业词同现');
+		// 链接识别仍读原文：链接是结构证据，抹掉 t.me 会把 t.me/xxx 砍成 https:///xxx。
 		if (hasAdSuspiciousLink(source, context.whitelist, { businessHit: business.length > 0 })) addAdPositionEvidence(evaluation, key, 3, '非白名单引流链接');
-		if (hasAdRepeatedSegment(source)) addAdPositionEvidence(evaluation, key, 1, '重复段落');
-		if (hasAdCharSplitObfuscation(source)) addAdPositionEvidence(evaluation, key, 6, '逐字分隔混淆');
+		if (hasAdRepeatedSegment(probe)) addAdPositionEvidence(evaluation, key, 1, '重复段落');
+		if (hasAdCharSplitObfuscation(probe)) addAdPositionEvidence(evaluation, key, 6, '逐字分隔混淆');
 		if (AD_SYMMETRIC_EMOJI_RE.test(source)) addAdPositionEvidence(evaluation, key, 3, '首尾对称 emoji');
-		if (scoreAdMoneySolicit(source)) addAdPositionEvidence(evaluation, key, 6, '金额与招揽同现');
+		if (scoreAdMoneySolicit(probe)) addAdPositionEvidence(evaluation, key, 6, '金额与招揽同现');
 	}
 	if (AD_NUMERIC_PREFIX_RE.test(texts.name)) addAdPositionEvidence(evaluation, 'name', 1, '数字前缀');
 	if (isAdGeneratedWesternName(displayName) || isAdRandomExoticName(displayName)) addAdPositionEvidence(evaluation, 'name', 1, '取名形式仅作弱诊断，不构成广告内容证据');
@@ -38787,7 +38871,7 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 		const screening = await env.DB
 			.prepare('SELECT chat_id, snapshot, reasons, layer, expires_at FROM ad_user_screening WHERE user_id = ?')
 			.bind(payloadStr).first();
-		if(action==='ok'&&(!screening||Number(screening.expires_at)<=Math.floor(Date.now()/1000))){
+		if(action==='ok'&&!buttonChatId&&(!screening||Number(screening.expires_at)<=Math.floor(Date.now()/1000))){
 			await answerAdVoteCallback(callbackQuery?.id,'旧观察通知已失效，未执行封禁；当前疑难统一由 /review 自动补查。',true);
 			return;
 		}
