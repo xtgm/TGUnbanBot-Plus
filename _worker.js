@@ -515,7 +515,8 @@ export default {
 				const update = await request.json();
 				// 【2026-11-15】update 去重：Telegram 重试同一条 update 时直接确认 200，
 				// 避免重复执行命令、重复回复（线上实测 /health 被重试 4 次、回复 4 条）。
-				if (!(await claimUpdateId(env, Number(update?.update_id) || 0))) {
+				const updateId = Number(update?.update_id) || 0;
+				if (!(await claimUpdateId(env, updateId))) {
 					return new Response('OK');
 				}
 				if (isIgnoredBotUpdate(update)) return new Response('OK');
@@ -568,7 +569,17 @@ export default {
 					}
 				})();
 				if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(dispatchTask.catch(() => {}));
-				await raceWithTimeout(dispatchTask, 50000, undefined);
+				try {
+					await raceWithTimeout(dispatchTask, 50000, undefined);
+				} catch (error) {
+					// 【去重与重投】认领发生在分发之前，分发真失败时必须撤销认领。
+					// 否则 Telegram 的重投会被 claimUpdateId 直接 200 吞掉，代码里
+					// 「等待重投」的补偿路径（入群申请、联动群名单、命令回执）全部失效。
+					// 超时（raceWithTimeout 返回 fallback）不撤销：已按 200 放行，剩余工作仍在
+					// waitUntil 上跑，撤销会让 Telegram 重复执行同一条 update。
+					await releaseUpdateId(env, updateId);
+					throw error;
+				}
 
 				return new Response('OK');
 			} else if (path === runtime().TOKEN) {
@@ -810,7 +821,12 @@ function loadRequiredConfig(env) {
 		return s === '' ? fallback : s;
 	};
 
-	const selfUnbanKeyword = pickStr(env.SELF_UNBAN_KEYWORD, DEFAULT_SELF_UNBAN_KEYWORD);
+	// 【必须 trim】匹配端是 `text.trim() === SELF_UNBAN_KEYWORD`（两处：私聊确认句与群内确认句）。
+	// 环境变量带首尾空白/换行是控制台粘贴的常态；不 trim 时用户输入去掉空白后永远对不上，
+	// 而提示文案里的 {keyword} 渲染出来又带着同一份空白 —— 用户复制回来照样失败。
+	// 这是静默自锁：无日志、无回执，全站自助解封直接消失。
+	const selfUnbanKeyword = pickStr(env.SELF_UNBAN_KEYWORD, DEFAULT_SELF_UNBAN_KEYWORD).trim()
+		|| DEFAULT_SELF_UNBAN_KEYWORD;
 	const startWelcome = pickStr(env.START_WELCOME, DEFAULT_START_WELCOME);
 	const selfUnbanPrompt = pickStr(env.SELF_UNBAN_PROMPT, DEFAULT_SELF_UNBAN_PROMPT);
 	const selfUnbanApproved = pickStr(env.SELF_UNBAN_APPROVED, DEFAULT_SELF_UNBAN_APPROVED);
@@ -14168,6 +14184,18 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 		forwardChat: message?.forward_from_chat || message?.forward_origin?.chat || null, media,
 		contactCard: message.contact ? { name: [message.contact.first_name,message.contact.last_name].filter(Boolean).join(' '), phone: String(message.contact.phone_number || '') } : null
 	}, { config, whitelist, skipMissingBioPenalty: profile.bioFetched !== true });
+	// 【2026-11-18 链接分落空】文字层已定罪时上面走的是 candidate 的拷贝，而候选是在
+	// 解析链接之前算的 —— scoreAdProfileLinks 的 +2 与 scoredLinks 一起丢掉：流水分数
+	// 偏低，confirmAdLinkOnBan 读不到 handle，被挂的广告频道永远盖不上案底。
+	// 这里只补链接这一项，用的是 scoreAdProfile 内部同一个函数，判据不分叉。
+	if (joinTextEvaluation) {
+		const linkResult = scoreAdProfileLinks(evaluationProfile.adLinks);
+		if (linkResult.score) {
+			evaluation.score = Number(evaluation.score || 0) + linkResult.score;
+			evaluation.reasons = (evaluation.reasons || []).concat(linkResult.reasons);
+			evaluation.snapshot = { ...(evaluation.snapshot || {}), scoredLinks: linkResult.scoredHandles.slice(0, 5) };
+		}
+	}
 	evaluation = applyAdProfileLinkVerdict(evaluation, evaluationProfile);
 	evaluation = applyContactCardVerdict(evaluation, message);
 	if (isVerifiedAdMediaRow(image)) evaluation = applyImageVerdict(evaluation, image);
@@ -18982,7 +19010,7 @@ const AD_IMAGE_CONTENT_SIGNATURE_PROMPT = '分析这张 Telegram 图片、贴纸
 	+ '"caption":"具体描述画面中的人物、物体、动作和广告内容，不要泛泛地说一张图片",'
 	+ '"layout":"poster|screenshot|photo|illustration|sticker|mixed|unknown 中的一项",'
 	+ '"ad":true或false,"confidence":0到1的数字,"promotion":true或false,"ad_evidence":["逐字抄录可见招揽语，或引用caption中具体的视觉推广行动；没有则空数组"],'
-	+ '"category":"porn|gambling|scam|other_ad|clean 中的一项：色情引流选 porn，博彩选 gambling，诈骗或灰产选 scam，其它商品/群组招揽选 other_ad，不是广告选 clean"}。'
+	+ '"category":"优先从 porn|gambling|scam|other_ad|clean 中选：色情引流选 porn，博彩选 gambling，诈骗或灰产选 scam，其它商品/群组招揽选 other_ad，不是广告选 clean；都不符合时用一个不超过12字的短语自拟类别"}。'
 	+ '广告必须有实际可见的招揽引流、赌博或诈骗推广、商品购买行动。纯色情或裸露画面只有同时出现明确广告招揽才算广告。正常技术讨论、API token、官方域名、技术配置、教程、软件界面与报错不属于广告；不能仅因网址、二维码、联系方式、代理或token等词判广告。广告夹带技术词、教程或反诈字样不获得豁免，必须核对是否仍有独立招揽。'
 	+ 'promotion只在图中确有招揽推广行动时为true。ad_evidence不能抄普通域名、token提示、菜单或联系方式冒充招揽证据，不得编造看不见的文字。普通头像、英文人名、动漫与表情贴纸、色情但没有推广行动的素材不得标成广告。'
 	+ 'ad判断须基于整张图片，包括底部文案。纯视觉推广须具体描述商品或业务，以及画面中如何引导购买、投注或获取资源，不能仅称“像广告”。色情视频引流可通过点我、点击观看等明确行动表达，不要求一定有标准网址。新闻、举报、反诈提醒及普通表情不属于主动推广。看不清、不能确定时不要伪造内容，降低confidence。';
@@ -19000,7 +19028,7 @@ function adImageContentSignature(value) {
 		return { ocr_text: signature.ocr_text.trim(), caption: signature.caption.trim(),
 			layout: signature.layout, ad: signature.ad, confidence: signature.confidence, vision_model: String(signature.vision_model || ''),
 			promotion: signature.promotion === true,
-			category: ['porn', 'gambling', 'scam', 'other_ad', 'clean'].includes(signature.category) ? signature.category : '',
+			category: typeof signature.category === 'string' ? signature.category.trim().slice(0, 24) : '',
 			ad_evidence: Array.isArray(signature.ad_evidence) ? signature.ad_evidence.filter((item) => typeof item === 'string' && item.trim()).map((item) => item.trim()) : [] };
 	} catch (_) { return null; }
 }
@@ -22134,6 +22162,20 @@ async function claimUpdateId(env, updateId) {
 	} catch (error) {
 		console.error('[更新去重] 检查失败，按首次处理:', error);
 		return true;
+	}
+}
+
+// 撤销一次 update 认领：只在分发【真失败】时调用，让 Telegram 的重投能重新执行。
+// 与 claimUpdateId 是一对：认领是「先占位、后处理」，失败就必须把位子让出来，
+// 否则重投永远拿不到执行权（重投进来 claimUpdateId 直接返回 false）。
+// 释放本身失败只能记日志 —— 此时已经要抛错了，不能再拿一个 D1 错误盖掉原始异常。
+async function releaseUpdateId(env, updateId) {
+	const id = Number(updateId) || 0;
+	if (!env?.DB || id <= 0) return;
+	try {
+		await env.DB.prepare('DELETE FROM processed_updates WHERE update_id = ?').bind(id).run();
+	} catch (error) {
+		console.error('[更新去重] 释放认领失败 update_id=' + id + ':', error);
 	}
 }
 
@@ -26776,20 +26818,14 @@ function isSuspiciousBotHandle(name) {
 	const original = String(name || '');
 	const core = original.toLowerCase().replace(/bot$/, '').replace(/[^a-z0-9_]/g, '');
 	if (!core) return true;
-	if (AD_SUSPICIOUS_BOT_WORDS.some((word) => core.includes(word))) return true;
-	// 【2026-11-15 线上形态】广告投放 bot 几乎都带数字：
-	// @Akizbea2bot / @Eizabi9bot / @qinoeabi8bot / @ugf8ty_bbot / @nw_5deh8bot / @o46lga_cbot。
-	// 正常 bot 会用语义词命名（weather_bot / translate_bot），含正常词的已由 isNormalBotHandle 排除。
-	if (/\d/.test(core)) return true;
-	// 无意义短名（@aabot / @bbbot）：正常 bot 会用语义词命名。
-	if (core.length < 4) return true;
-	const upper = (original.match(/[A-Z]/g) || []).length;
-	const lower = (original.match(/[a-z]/g) || []).length;
-	const digits = (core.match(/[0-9]/g) || []).length;
-	// 大小写混合、数字堆叠：随机注册的投放 bot 常见形态。
-	if (upper >= 2 && lower >= 2) return true;
-	if (core.length >= 8 && digits >= 2) return true;
-	return false;
+	// 【2026-11-18 灰区默认可疑】这个函数问的是「像不像正常 bot」，不是「有没有高置信广告特征」。
+	// 旧写法只在命中数字 / 大小写混写 / 超长数字堆叠时返回 true，4~5 字符的随机短名
+	// （@qmzabot / @inmwobot / @ozmzpbot，线上截图原样）不含正常语义词、也没触发任何广告
+	// 特征，两头都不占 —— 被判成「不可疑」后，形态 B 强档的 suspiciousBotCount>=1 永远
+	// 够不到，三个 bot 的诱饵只拿到弱档 +3 分（test_ad_formb 实测 53/58，5 条漏放）。
+	// 正常 bot 会用语义词命名（weather_bot / translate_bot / gpt_bot），命中的返回 false；
+	// 其余一律按可疑处理。单 bot 仍由形态 B 的 mentions>=2 挡住，不会单独定罪。
+	return !isNormalBotHandle(original);
 }
 
 function analyzeAdOutlets(text, selfUsername) {
@@ -29988,7 +30024,9 @@ async function applyAdBodyJudge(env, bodyText, input, judged) {
 		const context = await buildAdBodyJudgeContext(env, input);
 		verdict = await judgeAdWithLLM(env, bodyText, context);
 	}
-	if (!verdict) return false;
+	// 【2026-11-18】模型没给结论时不能静默返回：记录必须落库并通知，
+	// 否则「调了失败」与「根本没调用」在 D1 里长得一模一样，漏放无从发现。
+	if (!verdict) verdict = { ok: false, error: 'no_verdict' };
 	const record = {
 		at: Math.floor(Date.now() / 1000),
 		chat: String(input?.chatId || ''),
@@ -35736,29 +35774,17 @@ function isReliableAdImageTextSignature(signature) {
 }
 
 function isReliableAdImageContentSignature(signature) {
-	if (!signature?.ad || signature.promotion !== true || Number(signature.confidence) < 0.90 || !Array.isArray(signature.ad_evidence)
-		|| !signature.ad_evidence.length) return false;
+	// 模型自己判了广告就直接采信，不再拿促销词表二次否决：
+	// 词表只能穷举已有写法，「点击进群」「主页赚钱」这类变体永远追不上。
+	// 只保留两条防误封硬线：反诈/新闻语境、技术教程语境。
+	if (!signature?.ad || signature.promotion !== true || Number(signature.confidence) < 0.85) return false;
 	const visible = [signature.ocr_text || '', signature.caption || ''].join(' ');
-	const evidence = signature.ad_evidence.filter((phrase) => typeof phrase === 'string' && phrase.trim().length >= 2 && visible.includes(phrase)).join(' ');
-	if (!evidence || isAdNonPromotionalContext(visible) || hasAdProtectedTechnicalContext(visible)) return false;
-	if (isReliableAdImageTextSignature(signature)) return true;
-	// 无文字广告也要有具体、可对应画面的推广动作，裸露、商品或二维码本身都不够。
-	return hasAdExplicitPromotion(evidence);
+	return !isAdNonPromotionalContext(visible) && !hasAdProtectedTechnicalContext(visible);
 }
 
-// 低成本分类只找候选；使用现有内容模型抄录实际证据并缓存，旧分类缓存不授予封禁权限。
-async function verifyAdImageVisibleContent(env, media, encoded, judge) {
-	const key = 'image_content_v4:' + String(media?.fileUniqueId || '');
-	try {
-		const saved = JSON.parse(await readAdScanState(env, key, 'null'));
-		const signature=adImageContentSignature(saved?.signature);
-		if (saved?.version === 4 && signature && (saved.verdict==='clean'
-			||saved.verdict==='ad'&&saved.contentVerified===true&&isReliableAdImageContentSignature(signature))) return saved;
-	} catch (_) { /* 缺失或损坏的核验记录重新取实际内容。 */ }
-	const described = await describeAdImageSimilarityContent(env, encoded, { quotaScope: 'review' });
-	if (!described.ok) return { verdict: 'pending', reason: described.reason, contentVerified: false };
-	const signature = described.signature;
-	const visible = [signature.ocr_text, signature.caption].join(' ');
+// 一张图的最终裁决只在这里算一次：缓存重判与新签名判定共用同一口径。
+function adImageContentVerdict(signature) {
+	const visible = [signature.ocr_text || '', signature.caption || ''].join(' ');
 	// 【2026-11-18 豁免粒度】图上文字命中豁免词只跳过那个词，抹剩的文字照常判：
 	// 有广告证据 → 判广告；没证据 → 最多待核，不再因为「带技术词」直接标干净。
 	const scoped = adExemptScopedText(visible);
@@ -35767,15 +35793,32 @@ async function verifyAdImageVisibleContent(env, media, encoded, judge) {
 			ocr_text: stripAdExemptWords(String(signature.ocr_text || ''), scoped.hits),
 			caption: stripAdExemptWords(String(signature.caption || ''), scoped.hits) }
 		: signature;
-	// 高置信的逐字广告证据可补回初筛漏判；纯视觉分歧仍待核，不盲目反转正常结论。
-	const reliable = !scoped.exempt && isReliableAdImageContentSignature(scopedSignature)
-		&& (judge?.ad === true || isReliableAdImageTextSignature(scopedSignature));
 	// 模型明确判非广告、且没有豁免词挡路时才判干净；豁免词命中的一律留给待核。
+	const reliable = !scoped.exempt && isReliableAdImageContentSignature(scopedSignature);
 	const verdict = reliable ? 'ad'
 		: signature.confidence >= 0.85 && signature.ad === false && !scoped.exempt ? 'clean'
 		: 'pending';
-	const result = { version: 4, verdict, contentVerified: reliable, signature, category: judge?.category || '',
+	return { verdict, contentVerified: reliable, signature, category: signature.category || '',
 		reason: reliable ? 'visible_ad_evidence' : scoped.exempt ? 'technical_content_exempt_pending' : 'no_reliable_ad_evidence' };
+}
+
+// 低成本分类只找候选；使用现有内容模型抄录实际证据并缓存，旧分类缓存不授予封禁权限。
+async function verifyAdImageVisibleContent(env, media, encoded, judge) {
+	const key = 'image_content_v4:' + String(media?.fileUniqueId || '');
+	try {
+		const saved = JSON.parse(await readAdScanState(env, key, 'null'));
+		const signature = adImageContentSignature(saved?.signature);
+		// 旧缓存按当前规则重算一次，不重新调模型：采信口径变了，pending 要跟着变。
+		// 只有结论变化才写回，避免每条消息都白写一次 D1。
+		if (saved?.version === 4 && signature) {
+			const result = adImageContentVerdict(signature);
+			if (result.verdict !== saved.verdict) await writeAdScanState(env, key, JSON.stringify({ version: 4, ...result }));
+			return { version: 4, ...result };
+		}
+	} catch (_) { /* 缺失或损坏的核验记录重新取实际内容。 */ }
+	const described = await describeAdImageSimilarityContent(env, encoded, { quotaScope: 'review' });
+	if (!described.ok) return { verdict: 'pending', reason: described.reason, contentVerified: false };
+	const result = { version: 4, ...adImageContentVerdict(described.signature) };
 	await writeAdScanState(env, key, JSON.stringify(result));
 	return result;
 }
@@ -39964,7 +40007,12 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			localScope = automaticRoute.local;
 			runtime().INDEPENDENT_GROUP_IDS = automaticRoute.independentIds;
 			if (localScope && (await resolveLocalAdDetectionSkip(env,chatId,userId)) === 'whitelisted') return { banned:false,seq:null,reason:'whitelisted' };
-		} catch (_) { return {banned:false,seq:null,complete:false,reason:'自动处罚群模式读取失败，未猜测全局范围'}; }
+		} catch (error) {
+			// 【不能静默】这里一吞，整条自动处置就变成「什么都没发生」，
+			// 日志里只剩上一行的判定结果，查不出是范围解析挂了。
+			console.error('[广告处置] 自动处罚群模式读取失败 user=' + userId + ' chat=' + chatId + ':', error);
+			return {banned:false,seq:null,complete:false,reason:'自动处罚群模式读取失败，未猜测全局范围'};
+		}
 		if (joinGuard && !await isAdJoinGuardGroupCurrent(env, chatId))
 			return {banned:false,complete:true,released:true,reason:'join_guard_excluded'};
 		if(options.automaticCaseId){
@@ -40362,7 +40410,17 @@ async function enforceAdDetectionWithRetry(env,input,evaluation,options={}) {
 	const autoCaseId=String(options.automaticCaseId||newAutomaticAdCaseId());
 	let result;
 	try { result=await enforceAdDetection(env,input,evaluation,{...options,automaticCaseId:autoCaseId}); }
-	catch(error){result={banned:false,complete:false,autoCaseId,reason:formatD1SchemaError(error),learningComplete:false};}
+	catch(error){
+		// 【不能静默】处置链抛错必须留痕：只折叠成 complete:false，线上只能看到
+		// 「没封成」却查不出为什么，主人复核时无从下手。
+		console.error('[广告处置] 执行异常 user=' + String(input?.userId || '') + ' chat=' + String(input?.chatId || '') + ':', error);
+		result={banned:false,complete:false,autoCaseId,reason:formatD1SchemaError(error),learningComplete:false};
+	}
+	// 【必须留痕】处置链的每条出口都记一行收尾：banned=false 又有十几种原因，
+	// 只记「没封成」等于没记。reason 直接给出是哪一道闸放过的。
+	console.log('[广告处置] 结束 user=' + String(input?.userId || '') + ' chat=' + String(input?.chatId || '')
+		+ ' banned=' + String(result?.banned) + ' complete=' + String(result?.complete)
+		+ ' reason=' + String(result?.reason || '') + ' joinRequest=' + JSON.stringify(result?.joinRequest || null));
 	if(result?.complete===false||result?.learningComplete===false){
 		evaluation.reviewAction=adEnforcementReceipt({...result,autoCaseId});
 		const message=input.message||adProfileInspectionMessage({id:input.userId},input.chatId,input.chatTitle||'');
