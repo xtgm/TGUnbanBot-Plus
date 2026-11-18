@@ -14145,8 +14145,12 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 		customEmojiIds: verifiedEmojiIds };
 	let profileLinksFailed = false;
 	// 保留完整纠错键需要的链接标题/简介；文字已确认后不再等待链接的语义识别。
+	// 【2026-11-18 超时兜底】原来只有入群闸（joinScreen）给 5 秒，普通消息这条路
+	// 一个上限都没有：resolveAdProfileLinks 串行跑最多 5 个 handle，每个都是一次
+	// 无超时的 getChat，资料卡挂 5 个慢 handle 就能把这条检测拖到几十秒 ——
+	// webhook 单条 60 秒硬限，撞上就是全群积压。8 秒是整条链的总预算，不是每个 handle。
 	const profileLinkOptions = { forceRefresh: options.refreshProfile === true, metadataOnly: Boolean(joinTextEvaluation),
-		...(joinScreen ? {signal:AbortSignal.timeout(5000)} : {}) };
+		signal: AbortSignal.timeout(joinScreen ? 5000 : 8000) };
 	try {
 		evaluationProfile.adLinks = joinScreen || message?.adJoinRequest || profile.personalChat
 			? await resolveAdProfileLinks(env, evaluationProfile, profileLinkOptions)
@@ -27474,7 +27478,10 @@ function isAdProfileElevated(profile, options = {}) {
 // 逐字节一致，下游 scoreAdProfileLinks([]) 得 0 分 0 条 reasons，判定逻辑零变化。
 async function resolveAdProfileLinksElevated(env, profile, options = {}) {
 	if (!isAdProfileElevated(profile, options)) return [];
-	return resolveAdProfileLinks(env, profile);
+	// 【2026-11-18】原来这里把 options 整个丢了：forceRefresh / metadataOnly / signal
+	// 在 elevated 这条路上全部失效 —— 调用点传的超时兜底根本没到 fetch。
+	// options 里的 whitelist / text 是给 isAdProfileElevated 用的，多传下去没有副作用。
+	return resolveAdProfileLinks(env, profile, options);
 }
 
 // 被挂账号的判据。【只加分，不产生 hardHit】—— 定罪仍要过原有阈值
@@ -37600,6 +37607,21 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 // 不依赖本表。
 const AD_JOIN_NOTICE_RETENTION_SECONDS = 30 * 24 * 3600;
 
+// 演练/复核素材（ad_review_assets + ad_review_asset_chunks）的过期清理。
+// 【为什么必须有】写入时给了 7 天 expires_at（cacheAdReviewAsset），读取也带
+// `expires_at > now` 过滤 —— 过期素材读不到，但行一直在。分片表每条最多 64 KB，
+// 是全项目唯一没有上限的素材表；D1 单库 10 GB 不可提升，堆满就是写不进去。
+// 单独成函数：cron 里由 pruneAdDetectionData 调，测试也能直接驱动。
+async function pruneAdReviewAssets(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return { assets: 0, chunks: 0 };
+	await ensureAdReviewAssetTables(env);
+	const now = Number(nowSeconds) || 0;
+	// 先删分片再删主表：反过来的话子查询已经查不到那些 asset_key，分片会永久残留。
+	const chunks = await env.DB.prepare('DELETE FROM ad_review_asset_chunks WHERE asset_key IN (SELECT asset_key FROM ad_review_assets WHERE expires_at < ?)').bind(now).run();
+	const assets = await env.DB.prepare('DELETE FROM ad_review_assets WHERE expires_at < ?').bind(now).run();
+	return { assets: Number(assets?.meta?.changes || 0), chunks: Number(chunks?.meta?.changes || 0) };
+}
+
 async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 1000)) {
 	if (!env?.DB) return;
 	try {
@@ -37635,6 +37657,14 @@ async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 10
 		if (count > 0) console.log('[拦门通知] 已清理过期记录 ' + count + ' 条');
 	} catch (error) {
 		console.error('[拦门通知] 过期记录清理失败：' + formatD1SchemaError(error));
+	}
+	// 演练/复核素材同样单独一段、单独 try：表是懒建的（ensureAdReviewAssetTables），
+	// 建表失败不能拖垮前面几张表的剪枝。
+	try {
+		const pruned = await pruneAdReviewAssets(env, nowSeconds);
+		if (pruned.assets > 0) console.log('[演练素材] 已清理过期记录 ' + pruned.assets + ' 条、分片 ' + pruned.chunks + ' 片');
+	} catch (error) {
+		console.error('[演练素材] 过期记录清理失败：' + formatD1SchemaError(error));
 	}
 }
 
