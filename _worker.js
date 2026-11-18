@@ -22134,6 +22134,7 @@ function recordTelegramSendCooldown(chatId, response, result) {
 // 用 update_id 主键做一次性认领：第一次处理，后续重试直接返回 200，不再执行。
 // 只保留 24 小时，表很小；D1 写入失败时按「首次处理」放行（宁可重复，不能漏消息）。
 const D1_PROCESSED_UPDATES_INIT = new WeakMap();
+const D1_PROCESSED_UPDATES_PURGE = new WeakMap();
 async function ensureProcessedUpdatesTable(env) {
 	if (!env?.DB) return false;
 	const cached = D1_PROCESSED_UPDATES_INIT.get(env.DB);
@@ -22149,6 +22150,24 @@ async function ensureProcessedUpdatesTable(env) {
 	return rememberD1Initialization(D1_PROCESSED_UPDATES_INIT, env.DB, init);
 }
 
+// 【清理不该每条 update 都跑】原先每认领一条就 DELETE 一次：线上一天几万条 update
+// 就是几万次多余的写放大。改成 10 分钟一次（isolate 级别记忆）——24 小时窗口最多多留
+// 10 分钟的过期行，表大小由 idx_processed_updates_at 兜着，与清理频率无关。
+// 用时间窗而不是随机采样：低频时段（一天十几条 update）随机采样会长期抽不中，
+// 表只涨不清；时间窗对高频低频都成立。
+async function purgeProcessedUpdates(env, now) {
+	const last = D1_PROCESSED_UPDATES_PURGE.get(env.DB) || 0;
+	if (now - last < 600) return;
+	// 先记时间再删：DELETE 失败只记日志，不在这条 update 上重试（已经要返回了），
+	// 下个窗口自然会再来一次。
+	D1_PROCESSED_UPDATES_PURGE.set(env.DB, now);
+	try {
+		await env.DB.prepare('DELETE FROM processed_updates WHERE at < ?').bind(now - 86400).run();
+	} catch (error) {
+		console.error('[更新去重] 清理过期记录失败:', error);
+	}
+}
+
 async function claimUpdateId(env, updateId) {
 	const id = Number(updateId) || 0;
 	if (!env?.DB || id <= 0) return true;
@@ -22157,7 +22176,7 @@ async function claimUpdateId(env, updateId) {
 		const now = Math.floor(Date.now() / 1000);
 		const result = await env.DB.prepare('INSERT OR IGNORE INTO processed_updates (update_id, at) VALUES (?, ?)').bind(id, now).run();
 		if (Number(result?.meta?.changes) === 0) return false;
-		await env.DB.prepare('DELETE FROM processed_updates WHERE at < ?').bind(now - 86400).run();
+		await purgeProcessedUpdates(env, now);
 		return true;
 	} catch (error) {
 		console.error('[更新去重] 检查失败，按首次处理:', error);
@@ -35122,6 +35141,44 @@ async function readAdScanState(env, key, fallback = '', options = {}) {
 	}
 }
 
+// 【批量读】一个面板/一条判定链要读十几个键时，逐个 readAdScanState 就是十几次 D1 往返。
+// 一次 IN 查询把往返压成一次 —— 读的是同一张表、同一批固定键，语义与逐个读完全一致
+//（不存在的键给空串，与 readAdScanState 的默认 fallback 对齐）。
+// AD_DRILL_CAPTURE 的键改写在这里同样生效；返回的 Map 用【调用方给的原始键】做键，
+// 调用方不需要知道自己读的键有没有被改写成演练副本。
+async function readAdScanStateMany(env, keys, options = {}) {
+	const origin = [...new Set((keys || []).map((key) => String(key)))];
+	const empty = new Map(origin.map((key) => [key, '']));
+	if (!env?.DB) {
+		if (options.strict) throw new Error('未绑定 D1 扫描状态存储');
+		return empty;
+	}
+	if (!origin.length) return empty;
+	const drill = Boolean(AD_DRILL_CAPTURE.getStore());
+	const actual = new Map(origin.map((key) => [
+		key,
+		drill && /^(image_content_v\d+:|dynamic_content_v\d+:|message_media_v\d+:)/.test(key) ? 'drill_candidate:' + key : key
+	]));
+	const names = [...new Set([...actual.values()])];
+	try {
+		const rows = await env.DB.prepare(
+			'SELECT key, value FROM ad_scan_state WHERE key IN (' + names.map(() => '?').join(',') + ')'
+		).bind(...names).all();
+		const found = new Map();
+		for (const row of rows?.results || []) {
+			if (row?.key != null && row.value != null) found.set(String(row.key), String(row.value));
+		}
+		return new Map(origin.map((key) => {
+			const value = found.get(actual.get(key));
+			return [key, value != null ? value : ''];
+		}));
+	} catch (error) {
+		console.error('[广告检测] 批量读取扫描状态失败: ' + formatD1SchemaError(error));
+		if (options.strict) throw error;
+		return empty;
+	}
+}
+
 async function writeAdScanState(env, key, value, nowSeconds = Math.floor(Date.now() / 1000), options = {}) {
 	if (AD_DRILL_CAPTURE.getStore() && /^(image_content_v\d+:|dynamic_content_v\d+:|message_media_v\d+:)/.test(String(key))) key = 'drill_candidate:'+key;
 	if (!env?.DB) {
@@ -35154,15 +35211,21 @@ async function writeAdScanState(env, key, value, nowSeconds = Math.floor(Date.no
 // 【不用 RETURNING】自增本身是单条语句、原子；需要读回新值的地方（judgeAdByLLM 那道
 // 超额闸）再单独读一次 —— 读到的值只会被并发抬得更高，用于「是否超额」判断时偏保守，
 // 是安全方向。
+// 单条自增语句。抽出来是为了让 bumpAdLLMQuota / bumpAdLLMOutcome 能把两笔自增
+// 放进同一个 DB.batch —— 组装语句和「什么时候批量」是两件事，SQL 只该有一份。
+function adScanCounterStatement(env, key, delta, nowSeconds) {
+	return env.DB.prepare(
+		'INSERT INTO ad_scan_state (key, value, updated_at) VALUES (?, ?, ?) '
+		+ 'ON CONFLICT(key) DO UPDATE SET '
+		+ 'value = CAST(CAST(ad_scan_state.value AS INTEGER) + ? AS TEXT), '
+		+ 'updated_at = excluded.updated_at'
+	).bind(String(key), String(delta), Number(nowSeconds) || Math.floor(Date.now() / 1000), Number(delta) || 0);
+}
+
 async function bumpAdScanCounter(env, key, delta = 1, nowSeconds = 0) {
 	if (!env?.DB) return;
 	try {
-		await env.DB.prepare(
-			'INSERT INTO ad_scan_state (key, value, updated_at) VALUES (?, ?, ?) '
-			+ 'ON CONFLICT(key) DO UPDATE SET '
-			+ 'value = CAST(CAST(ad_scan_state.value AS INTEGER) + ? AS TEXT), '
-			+ 'updated_at = excluded.updated_at'
-		).bind(String(key), String(delta), Number(nowSeconds) || Math.floor(Date.now() / 1000), Number(delta) || 0).run();
+		await adScanCounterStatement(env, key, delta, nowSeconds).run();
 	} catch (error) {
 		// 计数失败不能把判定链带崩 —— 与 writeAdScanState 同一口径，只记日志。
 		console.error('[广告检测] 计数自增失败 key=' + key + ':', error);
@@ -36097,16 +36160,32 @@ const AD_LLM_POOLS = ['message', 'join', 'cron', 'sample'];
 // 分池从此虚高、永远够不着上限，白分。
 // 【2026-10-19 改签名】原先接「算好的新值」，调用方自己读-改-写两条 SQL，并发会丢更新。
 // 现在只接池名，自增在 SQL 里原子完成（理由见 bumpAdScanCounter）。
+// 【2026-11-18 改 batch】两笔自增原先串行 await：第一笔成功、第二笔失败的中间态就是
+// 「总池扣了、分池没扣」—— 分池从此虚高、永远够不着上限，白分。D1 的 batch 是一组
+// 原子写，要么都成要么都不成；顺带把两次往返压成一次。
 async function bumpAdLLMQuota(env, pool, nowSeconds) {
-	await bumpAdScanCounter(env, 'llm_count', 1, nowSeconds);
+	if (!env?.DB) return;
+	const statements = [adScanCounterStatement(env, 'llm_count', 1, nowSeconds)];
 	if (AD_LLM_POOLS.includes(String(pool))) {
-		await bumpAdScanCounter(env, 'llm_pool_' + pool, 1, nowSeconds);
+		statements.push(adScanCounterStatement(env, 'llm_pool_' + pool, 1, nowSeconds));
+	}
+	try {
+		await env.DB.batch(statements);
+	} catch (error) {
+		console.error('[广告检测] 额度自增失败 pool=' + String(pool) + ':', error);
 	}
 }
 
 async function readAdLLMQuota(env, nowSeconds) {
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
-	const savedDay = await readAdScanState(env, 'llm_day', '');
+	// 【一次读完】原先 llm_day 之后还要 8 次单键读（总计数、四个池、熔断标记、连续失败、
+	// 上次形状）—— 判定链上每多一次往返就多一份排队时间。这里连同 llm_day 一起批量读，
+	// 热路径从 9 次往返压到 1 次；跨天分支本来就要再写一次，不多付。
+	const state = await readAdScanStateMany(env, [
+		'llm_day', 'llm_count', 'llm_broken_day', 'llm_consec_fail', 'llm_last_shape',
+		...AD_LLM_POOLS.map((pool) => 'llm_pool_' + pool)
+	]);
+	const savedDay = state.get('llm_day') || '';
 	if (savedDay !== today) {
 		// 【2026-10-19 改一次 batch 原子写】原先是 13 条独立的 await writeAdScanState 串行 ——
 		// 它们不是一组事务：中途任何一次失败或 Worker 重启，都会留下「day 已是今天、
@@ -36150,19 +36229,18 @@ async function readAdLLMQuota(env, nowSeconds) {
 			broken: false, consecFail: 0, lastShape: ''
 		};
 	}
-	const used = Number(await readAdScanState(env, 'llm_count', '0')) || 0;
+	const num = (key) => Number(state.get(key) || 0) || 0;
+	const used = num('llm_count');
 	const pools = {};
-	for (const pool of AD_LLM_POOLS) {
-		pools[pool] = Number(await readAdScanState(env, 'llm_pool_' + pool, '0')) || 0;
-	}
+	for (const pool of AD_LLM_POOLS) pools[pool] = num('llm_pool_' + pool);
 	// 熔断标记存的是「触发当天的日期」而不是布尔 —— 这样过期的标记天然失效，
 	// 不需要在别处再写一遍「昨天的不算」的判断。
-	const broken = String(await readAdScanState(env, 'llm_broken_day', '')) === today;
-	const consecFail = Number(await readAdScanState(env, 'llm_consec_fail', '0')) || 0;
+	const broken = String(state.get('llm_broken_day') || '') === today;
+	const consecFail = num('llm_consec_fail');
 	// 上次解析失败时，Workers AI 返回对象的【字段名清单】。只记字段名不记内容 ——
 	// 那里面带着别人的 bio 与消息片段，摆到 /adstats 上是实打实的隐私泄露面；
 	// 而排查需要的恰恰只是「正文在哪个字段」，字段名足够。
-	const lastShape = String(await readAdScanState(env, 'llm_last_shape', ''));
+	const lastShape = String(state.get('llm_last_shape') || '');
 	return { today, used, pools, broken, consecFail, lastShape };
 }
 
@@ -36175,10 +36253,17 @@ async function readAdLLMQuota(env, nowSeconds) {
 // 【开销】只在模型真给出 ad 结论时写（低频），也只有 /adstats 读它 —— 热路径不为
 // 它多付 SQL：judgeAdByLLM 那条路上一个字段都不读。
 async function bumpAdLLMOutcome(env, reachedLine) {
-	// 两次原子自增（原先是两对读-改-写），理由见 bumpAdScanCounter。
+	// 两次自增放进一个 batch：hits 与 bans 是同一件事的两个切面，
+	// 一个涨一个没涨会让 /adstats 的「命中多少、其中达采信线多少」对不上。
+	if (!env?.DB) return;
 	const now = Math.floor(Date.now() / 1000);
-	await bumpAdScanCounter(env, 'llm_hits', 1, now);
-	if (reachedLine) await bumpAdScanCounter(env, 'llm_bans', 1, now);
+	const statements = [adScanCounterStatement(env, 'llm_hits', 1, now)];
+	if (reachedLine) statements.push(adScanCounterStatement(env, 'llm_bans', 1, now));
+	try {
+		await env.DB.batch(statements);
+	} catch (error) {
+		console.error('[广告检测] 观测计数自增失败:', error);
+	}
 }
 
 // 读第 ⑥ 层的今日观测计数。只给 /adstats 用，不在任何判定路径上。
@@ -36193,32 +36278,39 @@ async function readAdLLMOutcome(env, nowSeconds) {
 	};
 	if (!env?.DB) return empty;
 	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
-	const day = await readAdScanState(env, 'llm_day', '');
-	if (day !== today) return empty;
-	const num = async (key) => Number(await readAdScanState(env, key, '0')) || 0;
+	// 与 readAdLLMQuota 同一处理：11 个键一次读完。这里虽然只在 /adstats 上走，
+	// 但面板一开就是一次完整扫描，逐个读同样要排 11 次队。
+	const state = await readAdScanStateMany(env, [
+		'llm_day', 'llm_count', 'llm_hits', 'llm_bans', 'llm_parse_fail',
+		'llm_broken_day', 'llm_consec_fail', 'llm_last_shape',
+		'llm_last_fail_seq', 'llm_last_success_seq',
+		...AD_LLM_POOLS.map((pool) => 'llm_pool_' + pool)
+	]);
+	if ((state.get('llm_day') || '') !== today) return empty;
+	const num = (key) => Number(state.get(key) || 0) || 0;
 	const pools = {};
-	for (const pool of AD_LLM_POOLS) pools[pool] = await num('llm_pool_' + pool);
+	for (const pool of AD_LLM_POOLS) pools[pool] = num('llm_pool_' + pool);
 	// parseFail：模型返回了内容但抠不出 JSON 的次数。与 hits 一起看才能分辨
 	// 「模型判 false」与「输出格式跑偏」—— 详见 bumpAdLLMParseFail。
 	return {
-		used: await num('llm_count'),
-		hits: await num('llm_hits'),
-		bans: await num('llm_bans'),
-		parseFail: await num('llm_parse_fail'),
+		used: num('llm_count'),
+		hits: num('llm_hits'),
+		bans: num('llm_bans'),
+		parseFail: num('llm_parse_fail'),
 		pools,
 		// 熔断状态与连续失败数：摆出来才知道第⑥层到底是「没起作用」还是「已经停了」。
-		broken: String(await readAdScanState(env, 'llm_broken_day', '')) === today,
-		consecFail: await num('llm_consec_fail'),
+		broken: String(state.get('llm_broken_day') || '') === today,
+		consecFail: num('llm_consec_fail'),
 		// 上次解析失败时返回对象的字段名清单（不含内容，理由见 readAdLLMQuota）。
-		lastShape: String(await readAdScanState(env, 'llm_last_shape', '')),
+		lastShape: String(state.get('llm_last_shape') || ''),
 		// 最后一次失败 / 成功的时刻。看板据此判断「链路现在健不健康」，
 		// 而不是看「今天失败过几次」—— 那个数字只会单调上涨，修好了也不归零，
 		// 挂着一个吓人的感叹号却什么都没坏（2026-10-11 主人的原话：「我希望它完美的打勾」）。
 		// 【用调用序号不用时间戳】同一秒内「先失败后成功」时两个时间戳相等，
 		// 按 >= 判断会误报「链路坏了」，按 > 判断又会漏报。序号（本次调用后的总次数）
 		// 天然单调，谁先谁后一目了然。
-		lastFailSeq: Number(await readAdScanState(env, 'llm_last_fail_seq', '0')) || 0,
-		lastSuccessSeq: Number(await readAdScanState(env, 'llm_last_success_seq', '0')) || 0
+		lastFailSeq: num('llm_last_fail_seq'),
+		lastSuccessSeq: num('llm_last_success_seq')
 	};
 }
 
