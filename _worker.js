@@ -5590,6 +5590,10 @@ function formatBanSuccessResult(r) {
 	// 2026-10-12 主人就是在 /ban 一个已在黑名单的人时，看到 14 个群全写「已永久禁言」
 	// 而实际一个都没禁。两种跳过都说清楚：已在封禁列表（目标状态已达成，这是好事）、
 	// 不在群内（预封 + 等他进来）。
+	// 【2026-11-20】机器人在该群没有管理员权限 / 群已不可用：这不是「处置成功」，
+	// 但重试多少次都不会变 —— 线上两个联动群把这条错误刷成了 190 条 / 3 小时的
+	// 「部分目标未成功」。现在统一记为「已跳过」，原错误留在案件账本与回执里。
+	if (r?.skipped === 'admin_required') return '未执行：机器人不是该群管理员或无权核查成员状态，已在案件账本记为跳过';
 	if (r?.skipped === 'already_banned') return '已确认在群封禁列表，无需重复处置';
 	// 【不能说「预封」】禁言接口【没有预封能力】—— 那是既有断言明确守住的语义。
 	// 这个用户只是被 D1 黑名单记着，进群时由复入群拦截兜底，不是被 Telegram 预封。
@@ -5707,7 +5711,7 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 			// 【符号自适应提示内容】只有【真正的 Telegram 错误】才配红叉。
 			//「目标不在群内」是正确行为 —— 他本来就不在这个群，禁言会把他拉回来
 			//（99fb115 修的那个漏洞），用中性符号表达「已检查、无需处置」。
-			if (String(r?.skipped) === 'not_in_group') {
+			if (String(r?.skipped) === 'not_in_group' || String(r?.skipped) === 'admin_required') {
 				return `  ➖ <b>${safeTitle}</b> <code>${safeId}</code>${formatMemberProbeLine(r.memberProbe)}
      ${escapeHtml(formatBanSuccessResult(r))}`;
 			}
@@ -15294,6 +15298,19 @@ async function runAdContentReview(env,id,options={}) {
 	return result;
 }
 
+// 【2026-11-20】处置失败分两类：临时性（网络 / Telegram 5xx / D1 过载）继续按退避重排；
+// 永久性（机器人在该群没有管理员权限、群已不可用）重排多少次都不会成功。
+// 只有「全部失败项都是权限错误」才判定为永久 —— 混着临时错误时多等一轮可能就成功了。
+function adReviewPermanentActionFailure(evaluation) {
+	const results = evaluation && evaluation.reviewAction && evaluation.reviewAction.banResults;
+	if (!Array.isArray(results) || !results.length) return null;
+	const failed = results.filter(row => row && row.ok !== true
+		&& row.skipped !== 'not_in_group' && row.skipped !== 'manual_punishment_retained');
+	if (!failed.length) return null;
+	if (!failed.every(row => isTelegramPermissionError(row.error))) return null;
+	return failed.map(row => String(row.groupId || '?') + ' ' + String(row.error || '').slice(0, 120)).join('；');
+}
+
 async function runAdContentReviewSingle(env,id,options={}) {
 	if(!id||!env?.DB)return {complete:true};
 	await ensureAdContentReviewTable(env);
@@ -15517,6 +15534,16 @@ async function runAdContentReviewSingle(env,id,options={}) {
 	}catch(error){
 		console.error('[内容待核] 核验未完成: '+formatD1SchemaError(error));
 		evaluation=evaluation||JSON.parse(row.evaluation);evaluation.pendingReason=String(error?.message||error);
+		// 【2026-11-20 止血】兜底拦住封禁阶段（非探测阶段）返回的权限错误：
+		// 这类失败每 12 小时重排一次，日志里就是一条「部分目标未成功」，永远不会成功。
+		// 留档为 parked，不再把 retryAfter 交给队列/定时器；补好权限后重新触发即可再处置。
+		const permanentFailure=adReviewPermanentActionFailure(evaluation);
+		if(permanentFailure){
+			evaluation.reviewAction={...(evaluation.reviewAction||{}),parked:true,parkedReason:permanentFailure,parkedAt:Math.floor(Date.now()/1000)};
+			await save('action_failed',now+30*86400);
+			console.warn('[内容待核] 处置被权限阻断，已停止自动重排：'+permanentFailure);
+			return {complete:false,parked:true};
+		}
 		if(!row.decision&&!(evaluation.verdict==='ban'&&evaluation.reviewAction))evaluation.reviewRouting={lane:row.source==='operator'?'learning':'background',kind:'technical',systemFailure:true};
 		const attempts=Number(row.attempts)+1,delay=row.source!=='operator'&&isAdJoinGuardMessage(JSON.parse(row.message_json||'{}'))?Math.min(300,5*Math.pow(2,Math.min(attempts,6)))
 			:attempts>=3?86400:120*Math.pow(4,attempts-1);
@@ -40589,6 +40616,14 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 					}
 					if (groupMode(gid)==='mute' || options.drillCloseReplay === true || gid !== chatId || options.probeMembership !== false) {
 						const probe = await probeTargetMemberBeforeBan(gid,userId,{timeoutMs:options.telegramTimeoutMs}); probes.set(gid,probe);
+						if (isTelegramPermissionError(probe.error)) {
+							// 【2026-11-20 永久阻断不再重试】机器人被降权 / 群已不可用时，getChatMember
+							// 永远返回 CHAT_ADMIN_REQUIRED。此前这里返回 ok:false，案件卡在 partial，
+							// 每 12 小时重排一次、每次都抛「部分目标未成功」。记为 skipped 后案件能收口，
+							// 原因进案件账本与回执，D1 黑名单保持不动（不调 removeAutomaticGroupBan）。
+							return {groupId:gid,ok:true,skipped:'admin_required',muted:groupMode(gid)==='mute',automaticNotExecuted:true,
+								error:'未执行：机器人不是该群管理员或无权核查成员状态（'+String(probe.error||'')+'）'};
+						}
 						if (probe.state==='unknown'||groupMode(gid)==='mute'&&!['in_group','not_in_group','already_banned'].includes(probe.state))
 							return {groupId:gid,ok:false,muted:groupMode(gid)==='mute',automaticNotExecuted:true,error:'无法核对该群原有状态，未执行自动处置：'+String(probe.error||probe.label||'未知原因')};
 						const old = await env.DB.prepare('SELECT result FROM ad_automatic_case_targets WHERE case_id=? AND chat_id=? AND user_id=?')
@@ -40721,14 +40756,19 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		}));
 	}
 
-	const okCount = banResults.filter((r) => r.ok).length;
+	// 【2026-11-20】skipped（admin_required / independent_mode / manual_punishment_retained）
+	// 是「检查过、没执行」，不能算进成功数 —— 否则回执会写「10/10 个群成功」而其中两个群
+	// 机器人根本没有管理员权限。成功数只统计真正执行了的群，跳过单独报一行。
+	const skippedBans = banResults.filter((r) => r.ok && r.skipped);
+	const okCount = banResults.length - skippedBans.length - banResults.filter((r) => !r.ok).length;
 	const failedBans = banResults.filter((r) => !r.ok&&!r.pendingMute);
 	// 风控·处置：按实际封成功的群逐群 +1（面板「本群挡下 N 次」的唯一数据来源）。
 	// 放在这里而不是黑名单写入之后 —— 加黑可能因已存在而没写成，但封禁成功了就是挡下了。
 	try { await recordDisposalsFromBanResults(env, banResults.filter(result=>!result.reviewSharedCaseId), { bulk: options.drillCloseReplay === true }); }
 	catch(error){console.error('[广告检测] 处置统计未保存: '+formatD1SchemaError(error));}
 	const pendingMuteCount=banResults.filter(r=>r.pendingMute).length;
-	const banResultLine = okCount + '/' + banResults.length + ' 个群成功'+(pendingMuteCount?'；'+pendingMuteCount+' 个群当前不在群内，已登记入群后禁言':'');
+	const banResultLine = okCount + '/' + banResults.length + ' 个群成功'+(pendingMuteCount?'；'+pendingMuteCount+' 个群当前不在群内，已登记入群后禁言':'')
+		+(skippedBans.length?'；'+skippedBans.length+' 个群未执行（缺少管理员权限或按规则跳过）':'');
 	// 失败原因只给中文（英文原文由翻译兜底写入 Worker 日志）；最多列 3 个群，其余汇总成一句。
 	const failedGroupLines = failedBans.slice(0, 3)
 		.map((r) => r.groupId + '（' + toChineseErrorText(r.error || '未知') + '）');
@@ -44281,7 +44321,7 @@ async function queryStatActions(env, chatId, start, end) {
 async function recordDisposalsFromBanResults(env, banResults, options = {}) {
 	if (!env?.DB || !Array.isArray(banResults)) return;
 	if (options.bulk === true) {
-		const completed = banResults.filter(r => r && r.ok && r.groupId);
+		const completed = banResults.filter(r => r && r.ok && !r.skipped && r.groupId);
 		if (!completed.length || !(await ensureStatActionsTable(env))) return;
 		const now = Date.now(), day = statDayString(env, now);
 		try {
@@ -44294,7 +44334,7 @@ async function recordDisposalsFromBanResults(env, banResults, options = {}) {
 		} catch (error) { console.error('[群统计] 批量处置统计失败，改为逐群记录: message=' + String(error?.message || error)); }
 	}
 	for (const r of banResults) {
-		if (!r || !r.ok || !r.groupId) continue;
+		if (!r || !r.ok || r.skipped || !r.groupId) continue;
 		await recordStatAction(env, r.groupId, 'disposal');
 	}
 }
