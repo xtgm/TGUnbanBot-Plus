@@ -14230,7 +14230,9 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 	// 复核链（内容批次 / 重试）再补，不再卡在热路径上。
 	const skipProfileLinks = Boolean(joinTextEvaluation) && joinTextEvaluation.verdict === 'ban';
 	if (skipProfileLinks) {
-		evaluationProfile.adLinks = [];
+		// 快筛已经取到的链接元数据直接复用：纠错键必须与门前那条路完全一致。
+		evaluationProfile.adLinks = Array.isArray(message?.adJoinRequest?.adProfileLinks)
+			? message.adJoinRequest.adProfileLinks.map(link => ({ ...link })) : [];
 	} else try {
 		evaluationProfile.adLinks = joinScreen || message?.adJoinRequest || profile.personalChat
 			? await resolveAdProfileLinks(env, evaluationProfile, profileLinkOptions)
@@ -33847,6 +33849,10 @@ async function runAdDryRunCloseJob(env,sessionId,options={}) {
 					const message={...original};delete message.adJoinRequest;
 					const enforced=await enforceAdDetection(env,{userId:row.user_id,chatId:row.chat_id,messageId:null,message},evaluation,
 						{autoTargetGroupIds:selected,automaticCaseId:caseId,automaticPolicy:row.ban_policy,drillCloseReplay:true,
+							// 原文已由 deleteAdDryRunOriginalBatches 批量删除；收尾重放只做处置，
+							// 不能再走一遍 cleanupCurrentChatUserMessages —— 那会把同一条消息删两轮，
+							// moderation_messages 里的缓存行也会被重复记账。
+							reviewMessageDeletion:{ok:true,skipped:'dry_run_close_replay'},
 							skipLearning:true,probeMembership:false,suppressNotify:true,telegramTimeoutMs:10000,config:loadAdDetectionConfig(env),whitelist:await loadAdDomainWhitelist(env)});
 					for(const target of selected){
 						const outcome=enforced?.banResults?.find(item=>String(item.groupId)===target);
@@ -45292,13 +45298,16 @@ async function quickJoinRequestGate(env, user, chatId, chatTitle, request = {}) 
 	try {
 		const links = await resolveAdProfileLinks(env, profile, { metadataOnly: true, signal: AbortSignal.timeout(5000) });
 		if (Array.isArray(links) && links.length) {
-			evaluation.payload = {
-				...(evaluation.payload || {}),
-				profileLinks: links.map(link => ({
-					handle: String(link.handle || ''), kind: String(link.kind || ''),
-					title: String(link.title || ''), about: String(link.about || '')
-				}))
-			};
+			const profileLinks = links.map(link => ({
+				handle: String(link.handle || ''), kind: String(link.kind || ''),
+				title: String(link.title || ''), about: String(link.about || '')
+			}));
+			evaluation.payload = { ...(evaluation.payload || {}), profileLinks };
+			// 同一份申请随后还会走完整链路（collectGlobalDryRunEvaluation）。完整链路在
+			// 「申请文字已定罪」时会跳过链接解析，键里就没有 profileLinks，和这里算出的
+			// 纠错键对不上 —— 主人确认过的正常现场会被第二次拒绝。把元数据挂在申请对象上，
+			// 完整链路直接复用，既不重复 getChat，也保证两条路生成同一个键。
+			request.adProfileLinks = profileLinks;
 		}
 	} catch (error) {
 		console.warn('[申请快筛] 链接元数据未取到，纠错键按现状生成：' + String(error?.message || error));
@@ -45469,7 +45478,9 @@ async function screenJoinRequestAd(env, user, chatId, chatTitle, request = {}) {
 	// 【判不出来就往下走】资料干净、或只有模型才看得出的形态，交回后面的 AI 链路 ——
 	// 这一层是加速，不是替代。宁可多花一次 AI，也不在这里猜。
 	try {
-		const quickBlocked = await quickJoinRequestGate(env, user, chatId, chatTitle, request);
+		// 传 joinRequest 而不是原始 request：快筛解析出的链接元数据要挂在这同一个对象上，
+		// 后面完整链路复用（见 quickJoinRequestGate 里的 request.adProfileLinks）。
+		const quickBlocked = await quickJoinRequestGate(env, user, chatId, chatTitle, joinRequest);
 		if (quickBlocked) return;
 	} catch (error) {
 		// 快筛自己出错不能拖垮整条链路：交回下面的完整判定。
