@@ -30979,6 +30979,32 @@ async function countAdSamples(env) {
 const AD_PROFILE_CACHE = new Map();
 const AD_PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
 const AD_PROFILE_CACHE_MAX = 2000;
+// 【2026-11-20】getChat 的 4xx 是永久拒答，最常见的就是 400 chat not found ——
+// 对方从未与 bot 私聊过，等多久都不会变。而处置重试每一轮都 forceRefresh 再查一次，
+// 同一个人能连查 8 轮，线上表现为「已处置」之间刷满 getChat 失败，每一行都是必然失败。
+// 这里按用户记 10 分钟（与 */10 的复查 cron 同周期）：窗口内不再发请求、不再重复打日志。
+// 用户一旦私聊 bot，下一轮复查就恢复正常；最坏情况是资料最多晚 10 分钟才被看到。
+const AD_PROFILE_MISS = new Map();
+const AD_PROFILE_MISS_TTL_MS = 10 * 60 * 1000;
+const AD_PROFILE_MISS_MAX = 5000;
+
+function readAdProfileMiss(userId) {
+	const hit = AD_PROFILE_MISS.get(String(userId));
+	if (!hit) return '';
+	if (Date.now() > hit.expiresAt) {
+		AD_PROFILE_MISS.delete(String(userId));
+		return '';
+	}
+	return String(hit.error || 'chat not found');
+}
+
+function writeAdProfileMiss(userId, error) {
+	if (AD_PROFILE_MISS.size >= AD_PROFILE_MISS_MAX) {
+		const oldest = AD_PROFILE_MISS.keys().next();
+		if (!oldest.done) AD_PROFILE_MISS.delete(oldest.value);
+	}
+	AD_PROFILE_MISS.set(String(userId), { error: String(error || 'unknown'), expiresAt: Date.now() + AD_PROFILE_MISS_TTL_MS });
+}
 
 function readAdProfileCache(userId) {
 	const hit = AD_PROFILE_CACHE.get(String(userId));
@@ -30998,9 +31024,12 @@ function readAdProfileCache(userId) {
 function invalidateAdProfileCache(userId = null) {
 	if (userId == null || userId === '') {
 		AD_PROFILE_CACHE.clear();
+		AD_PROFILE_MISS.clear();
 		return;
 	}
 	AD_PROFILE_CACHE.delete(String(userId));
+	// 负缓存一起清：测试里模拟「用户改了 bio / 刚私聊了 bot」时必须能立刻重查。
+	AD_PROFILE_MISS.delete(String(userId));
 }
 
 function writeAdProfileCache(userId, profile) {
@@ -31047,6 +31076,17 @@ function writeAdProfileCache(userId, profile) {
 // 只有 429（Too Many Requests / flood control）是「等一下就会好」的，读 Telegram
 // 给的 retry_after；其余错误重试纯属浪费子请求预算 —— 最常见的是 400 chat not found，
 // 那是「对方从未与 bot 私聊过」的常态拒答，等多久都不会变。
+// 「这次失败是不是永远都不会变」。4xx 里除了 429 都是 —— chat not found（从未私聊）、
+// deactivated（已注销）、bot was blocked 都属此类；5xx / 网络 / 畸形响应是暂态。
+// 【2026-11-20】原先直接拿 adFetchRetryAfter(result) === null 当永久，把 5xx 也算了进去，
+// 于是一次 Telegram 500 就让补学永久放弃这个人的头像。现在单独判，语义与注释对齐。
+function adProfilePermanentFailure(result) {
+	const code = Number(result?.error_code) || 0;
+	if (code === 429) return false;
+	if (/too many requests|flood/i.test(String(result?.description || ''))) return false;
+	return code >= 400 && code < 500;
+}
+
 function adFetchRetryAfter(result) {
 	const code = Number(result?.error_code) || 0;
 	const desc = String(result?.description || '');
@@ -31100,6 +31140,14 @@ async function fetchAdUserProfile(userId, fallback = {}, options = {}) {
 		if (typeof fallback.is_premium === 'boolean') cached.isPremium = fallback.is_premium;
 		return cached;
 	}
+	// 10 分钟内已确认永久取不到：直接按「抓取失败」返回，与真的再查一次完全等价 ——
+	// bioFetched=false 让调用方照常按「不知道」处理，fetchPermanent=true 让补学放弃。
+	const missError = readAdProfileMiss(userId);
+	if (missError) {
+		profile.fetchError = missError;
+		profile.fetchPermanent = true;
+		return profile;
+	}
 	try {
 		// 【429 重试】定时滚动复查是一次性批量连打几十人，撞 Telegram 限流是常态
 		// （本文件另一处注释就写着「失败多半是 429」）。线上实测：入群线单发成功率
@@ -31151,13 +31199,21 @@ async function fetchAdUserProfile(userId, fallback = {}, options = {}) {
 			// 现在只有确实拿到资料才缓存，失败即刻可重试。
 			writeAdProfileCache(userId, profile);
 		} else if (!result?.ok) {
-			console.log('[广告检测] getChat 失败 user=' + userId + ' : ' + (result?.description || 'unknown'));
 			// 把「这次失败还值不值得再试」一并交出去：adFetchRetryAfter 已经判过
 			// 400 chat not found / 已注销属永久失败（返回 null），上层补学却只看到
 			// bioFetched=false，把它当「稍后再试」，于是这类号永久滞留在补学队列
 			//（线上 2026-11-04 入队三人，每天两轮失败，13 天零成功）。
-			profile.fetchError = String(result?.description || 'unknown');
-			profile.fetchPermanent = adFetchRetryAfter(result) === null;
+			const description = String(result?.description || 'unknown');
+			profile.fetchError = description;
+			profile.fetchPermanent = adProfilePermanentFailure(result);
+			if (profile.fetchPermanent) {
+				// 4xx 再问也不会变：记 10 分钟负缓存，这一窗口内同一个人只留一行日志。
+				console.log('[广告检测] getChat 失败 user=' + userId + ' : ' + description + '（4xx 永久失败，10 分钟内不再重查）');
+				writeAdProfileMiss(userId, description);
+			} else {
+				// 5xx / 其它是真故障，每次出现都值得看见，也不该被负缓存压掉。
+				console.log('[广告检测] getChat 失败 user=' + userId + ' : ' + description);
+			}
 		}
 	} catch (error) {
 		// 失败不写缓存：宁可下一条消息再试一次，也不要把空 bio 钉住 5 分钟。
