@@ -13774,6 +13774,13 @@ const AD_DRYRUN_DELETE_WINDOW = 48 * 3600;
 const AD_DRYRUN_MAX_OPEN_SECONDS = 24 * 3600;
 const AD_DRYRUN_DELETE_RESERVE = 12 * 3600;
 
+// 【2026-11-20 停止无限重试】partial 会话此前由 cron 每 10 分钟排回队列，没有上限：
+// 线上 #1 从 2026-11-03 起 retry_round 刷到 3342 轮，持续刷 [演练收尾] 报错并白烧 D1。
+// 到轮次或天数上限后封存为 closed（失败明细、报告都原样保留，不再自动重排）；
+// 主人要补时用 /dryrun retry <id> 手动再开一轮 —— 那条路会清零 retry_round。
+const AD_DRYRUN_CLOSE_RETRY_MAX_ROUNDS = 200;
+const AD_DRYRUN_CLOSE_RETRY_MAX_HOURS = 72;
+
 async function ensureAdDryRunCloseTables(env) {
 	if (!env?.DB || !(await ensureAdDryRunLogTable(env))) return false;
 	const cached=D1_AD_DRYRUN_CLOSE_INIT.get(env.DB); if(cached)return cached;
@@ -22268,6 +22275,15 @@ async function releaseUpdateId(env, updateId) {
 // 只在「持续失败」时动手；正常短暂排队（几条）不碰。每次动作都通知第一主人。
 const WEBHOOK_BACKLOG_AUTO_DROP = 20;
 const WEBHOOK_BACKLOG_CHECK = new WeakMap();
+
+// 巡检类请求（5~10 秒上限）被网络掐断是常态，不是故障：这类降成 warn，
+// 免得 24 小时面板上「[自动清积压] 执行失败: TimeoutError」把真正的错误挤掉。
+function isTransientNetworkError(error) {
+	const name = String(error?.name || '');
+	if (name === 'TimeoutError' || name === 'AbortError') return true;
+	const text = String(error?.message || error || '').toLowerCase();
+	return /timeout|timed out|fetch failed|network|econnreset|socket|aborted|too many subrequests/.test(text);
+}
 async function autoDropWebhookBacklog(env) {
 	if (!env?.DB || !runtime().BOT_TOKEN) return false;
 	try {
@@ -22302,7 +22318,8 @@ async function autoDropWebhookBacklog(env) {
 		}
 		return true;
 	} catch (error) {
-		console.error('[自动清积压] 执行失败:', error);
+		const log = isTransientNetworkError(error) ? console.warn : console.error;
+		log('[自动清积压] 执行失败:', error?.message || error);
 		return false;
 	}
 }
@@ -27249,6 +27266,27 @@ function judgeAdQuotedKill(payload) {
 const D1_AD_LINK_CACHE_INIT = new WeakMap();
 const AD_LINK_MAX_HANDLES = 5;
 const AD_LINK_TTL_SECONDS = 6 * 60 * 60;
+// 【2026-11-20 止血】暂态失败本来就不进 D1 缓存（见 resolveAdLink 的 cacheable=false），
+// 但调用方是「每条消息都重解析一次」，线上同一个 handle 因此每 30 秒撞一次 8 秒超时，
+// 日志整屏 "The operation was aborted due to timeout"。这里加进程内负缓存 10 分钟：
+// 同 isolate 内直接返回「查不到」，不写 D1（那会儿 D1 正被打爆），
+// 也不影响 6 小时正缓存与 refreshProfile 的强制刷新。
+const AD_LINK_TRANSIENT_BLOCK_MS = 10 * 60 * 1000;
+const AD_LINK_TRANSIENT_BLOCKED = new Map();
+
+function adLinkTransientBlocked(key) {
+	const until = AD_LINK_TRANSIENT_BLOCKED.get(key) || 0;
+	if (until > Date.now()) return true;
+	if (until) AD_LINK_TRANSIENT_BLOCKED.delete(key);
+	return false;
+}
+
+function markAdLinkTransient(key) {
+	if (!key) return;
+	// isolate 生命周期可能很长，顺手封顶，别让 Map 无界增长。
+	if (AD_LINK_TRANSIENT_BLOCKED.size > 1000) AD_LINK_TRANSIENT_BLOCKED.clear();
+	AD_LINK_TRANSIENT_BLOCKED.set(key, Date.now() + AD_LINK_TRANSIENT_BLOCK_MS);
+}
 // 与 menshen profileHandleRe 同形：@xxx 与 t.me/xxx 两种公开用户名写法。
 // t.me/+xxx 与 t.me/joinchat 是私密邀请，查不出目标 —— 那归已有的 privateInvite 判据管。
 const AD_PROFILE_HANDLE_RE = /(?:@|t\.me\/)([A-Za-z][A-Za-z0-9_]{3,31})/g;
@@ -27421,6 +27459,10 @@ async function resolveAdLink(env, handle, options = {}) {
 	if (!key || !runtime().BOT_TOKEN) return null;
 	const cached = await readAdLinkCache(env, key);
 	if (cached && !options.forceRefresh) return cached;
+	if (!options.forceRefresh && adLinkTransientBlocked(key)) {
+		return { handle: key, kind: 'unknown', title: '', about: '', adKnown: false,
+			adConfirmed: cached?.adConfirmed === true, lookupFailed: true, lookupTransient: true };
+	}
 
 	const info = { handle: key, kind: 'unknown', title: '', about: '', adKnown: false, adConfirmed: cached?.adConfirmed === true };
 	// cacheable=false 表示这次是暂时性故障，别缓存 —— 否则一次 429 会把这条链路
@@ -27463,6 +27505,8 @@ async function resolveAdLink(env, handle, options = {}) {
 		console.error('[广告检测·链接] 解析失败 handle=' + key + ':', error?.message || error);
 	}
 	if (options.signal?.aborted) { cacheable=false; info.lookupFailed=true; info.lookupTransient=true; }
+	// 暂态失败记 10 分钟，避免同一条资料在每条消息上重复撞超时。
+	if (!cacheable && info.lookupFailed) markAdLinkTransient(key);
 	if (cacheable) await writeAdLinkCache(env, info);
 	return info;
 }
@@ -31090,7 +31134,9 @@ async function fetchAdUserProfile(userId, fallback = {}, options = {}) {
 		}
 	} catch (error) {
 		// 失败不写缓存：宁可下一条消息再试一次，也不要把空 bio 钉住 5 分钟。
-		console.error('[广告检测] 抓取用户资料失败:', error);
+		// 超时/断网是暂态，本来就靠下一条消息重试，按 warn 记，别混进故障面板。
+		const log = isTransientNetworkError(error) ? console.warn : console.error;
+		log('[广告检测] 抓取用户资料失败:', error?.message || error);
 	}
 	return profile;
 }
@@ -32086,12 +32132,22 @@ async function runAdLLMModel(env, config, body) {
 		};
 	} catch (error) {
 		if (!fallback || fallback === primary) throw error;
-		console.error('[广告检测] 主模型调用失败，改走备用 ' + primary + ' → ' + fallback + ':', error);
-		return {
-			model: fallback,
-			usedFallback: true,
-			result: await env.AI.run(fallback, Object.assign({}, body, adLLMReasoningParams(fallback)))
-		};
+		// 主模型被弃用 / 路由下线属于预期降级，走 warn：这条链路本身仍然成功，
+		// 之前用 error 打出来，24 小时面板上全是「失败」，把真正的故障淹了。
+		console.warn('[广告检测] 主模型调用失败，改走备用 ' + primary + ' → ' + fallback + ':', error?.message || error);
+		try {
+			return {
+				model: fallback,
+				usedFallback: true,
+				result: await env.AI.run(fallback, Object.assign({}, body, adLLMReasoningParams(fallback)))
+			};
+		} catch (fallbackError) {
+			// 两个都挂才是真失败：把主备模型和备用错误一起带出来，别只留一句「解析失败」。
+			const wrapped = new Error('主模型与备用模型均调用失败：' + primary + ' → ' + fallback
+				+ '；备用错误：' + String(fallbackError?.message || fallbackError), { cause: fallbackError });
+			wrapped.primaryError = error?.message || String(error);
+			throw wrapped;
+		}
 	}
 }
 
@@ -33412,7 +33468,8 @@ async function retryAdDryRunCloseSession(env,sessionId,message) {
 	if(session.status==='open')return {ok:false,error:'本轮仍开启，请使用 /dryrun off'};
 	if(session.status==='closed')return {ok:true,complete:true,reportQueued:await sendAdDryRunCloseReport(env,sessionId,{force:true})};
 	await env.DB.batch([
-		env.DB.prepare('UPDATE ad_dryrun_sessions SET next_at=0 WHERE id=?').bind(Number(sessionId)),
+		// 清零 retry_round：封存后的会话要靠人工 retry 重新开一轮，不能一进来就又撞上限。
+		env.DB.prepare('UPDATE ad_dryrun_sessions SET next_at=0,retry_round=0 WHERE id=?').bind(Number(sessionId)),
 		env.DB.prepare("UPDATE ad_dryrun_close_cases SET next_at=0,status='pending' WHERE session_id=? AND status='failed'").bind(Number(sessionId)),
 		env.DB.prepare('UPDATE ad_dryrun_log SET learning_next=0 WHERE id IN (SELECT row_id FROM ad_dryrun_close_cases WHERE session_id=?) AND learning_done=0').bind(Number(sessionId))
 	]);
@@ -33588,6 +33645,19 @@ async function deleteAdDryRunOriginalBatches(env,sessionId,deadline,limit=AD_DRY
 	await mapWithConcurrency(work.filter(chunks=>chunks.length),AD_DRYRUN_DELETE_GROUP_CONCURRENCY,async chunks=>{for(const batch of chunks)await deleteBatch(batch);});
 }
 
+function adDryRunCloseRetryExhausted(row) {
+	const rounds = Number(row?.retry_round) || 0;
+	if (rounds >= AD_DRYRUN_CLOSE_RETRY_MAX_ROUNDS) return true;
+	const closedAt = Date.parse(String(row?.closed_at || '')) || 0;
+	if (!closedAt) return false;
+	return Date.now() - closedAt >= AD_DRYRUN_CLOSE_RETRY_MAX_HOURS * 3600 * 1000;
+}
+
+function adDryRunCloseGiveUpNote(id) {
+	return '自动重试已达上限（' + AD_DRYRUN_CLOSE_RETRY_MAX_ROUNDS + ' 轮 / ' + AD_DRYRUN_CLOSE_RETRY_MAX_HOURS
+		+ ' 小时），剩余失败项已封存，不再自动重排；如需继续补处理，请第一主人私聊 /dryrun retry ' + id + '。';
+}
+
 async function runAdDryRunCloseJob(env,sessionId,options={}) {
 	if(!(await ensureAdDryRunCloseTables(env)))return {complete:false,error:'收尾存储未就绪'};
 	const id=Number(sessionId),now=Math.floor(Date.now()/1000),token=crypto.randomUUID(),deadline=Date.now()+AD_DRYRUN_BATCH_MS;
@@ -33597,6 +33667,15 @@ async function runAdDryRunCloseJob(env,sessionId,options={}) {
 		const state=await env.DB.prepare('SELECT status,report_sent,next_at FROM ad_dryrun_sessions WHERE id=?').bind(id).first();
 		if(state?.status==='closed'&&!state.report_sent)await sendAdDryRunCloseReport(env,id);
 		return {complete:state?.status==='closed',partial:state?.status==='partial',busy:!!state&&state.status!=='closed',retryAfter:Math.max(5,Number(state?.next_at||0)-now)};
+	}
+	// 【到上限直接封存】不再跑任何批次，也不再把作业排回队列 —— 这条分支就是
+	// 线上「没开演练却一直报演练错误」的止血点。失败明细与报告保留，可人工 retry。
+	if(leased.status==='partial'&&adDryRunCloseRetryExhausted(leased)){
+		const note=adDryRunCloseGiveUpNote(id);
+		await env.DB.prepare("UPDATE ad_dryrun_sessions SET status='closed',next_at=0,report_ready=1,boundary_note=CASE WHEN instr(boundary_note,?)>0 THEN boundary_note ELSE boundary_note||CASE WHEN boundary_note='' THEN '' ELSE char(10) END||? END WHERE id=? AND lease_token=?").bind(note,note,id,token).run();
+		await env.DB.prepare("UPDATE ad_dryrun_sessions SET lease_until=0,lease_token='' WHERE id=? AND lease_token=?").bind(id,token).run();
+		await sendAdDryRunCloseReport(env,id);
+		return {complete:true,gaveUp:true,partial:true,sessionId:id};
 	}
 	let terminal=false,result={complete:false};
 	try {
