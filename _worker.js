@@ -18065,7 +18065,7 @@ function buildNoRestrictRightResult(groupId, userId) {
 }
 
 // 黑名单自动拦截通知主人（复入群拦截 / 发言拦截 / 群内手动解封拦截时调用）
-async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklistInfo, banResult, env) {
+async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklistInfo, banResult, env, message = null) {
 	if (!runtime().OWNER_IDS.length) return;
 	const failed = !!(banResult && !banResult.ok);
 	let suppressed = 0;
@@ -18096,6 +18096,8 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 		`🎬 动作:${escapeHtml(action)}`,
 		`👤 用户:${target} <code>${escapeHtml(targetId)}</code>`,
 		`📍 群:${groupLabel}`,
+		...(() => { const link = adCaseMessageLink(chat?.id, message?.message_id, message?.chat?.username);
+			return link ? [`📍 定位:${escapeHtml(link)}`] : []; })(),
 		`📋 加黑方式:${reason}`,
 		`🔧 加黑操作人:${operator}`,
 		`🕐 加黑时间:${addedAt}`,
@@ -19345,7 +19347,9 @@ async function getAdImageSimilarityVector(env, media, image = null) {
 			const strictEnv = { ...env, AI: { run: async (model, input) => {
 				// 文本缓存命中不进 run；真实嵌入调用与失败尝试都计自身上限，防止故障重试无界计费。
 				const quota = await reserveAdImageSimilarityQuota(env);
-				if (!quota.ok) { embeddingReason = quota.reason; throw new Error('similarity_budget'); }
+				// 额度打满不是故障：返回空向量让 embedAdText 安静退场（相似度层跳过），
+				// 抛出去只会变成一条 message=similarity_budget 的 error 日志。
+				if (!quota.ok) { embeddingReason = quota.reason; return null; }
 				const response = await env.AI.run(model, input);
 				if (model === AD_EMBEDDING_MODEL && (!adImageSimilarityVector(response?.data?.[0]) || (response?.shape
 					&& (!Array.isArray(response.shape) || response.shape.length !== 2 || response.shape[0] !== 1 || response.shape[1] !== AD_IMAGE_SIMILARITY_DIMENSIONS)))) throw new Error('bad_vector');
@@ -20012,7 +20016,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				// 群里提醒一次，让群主知道「人还在发」是权限被关掉的结果，不是 bot 坏了。
 				if (!hasRestrictRight) await noticeGroupMissingRestrictRight(env, chatId);
 				await recordDisposalsFromBanResults(env, [{ groupId: chatId, ok: moderation?.ok === true }]);
-				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, moderation, env);
+				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, moderation, env, message);
 				if(automaticMute&&!moderation.ok&&!moderation.pendingMute)throw new Error('广告名单禁言未完成，等待 Webhook 自动重投');
 				return;
 			}
@@ -20026,7 +20030,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				await deleteMessage(chatId, message.message_id);
 				const moderation = await applyGroupModeration(chatId, userId, 'kick');
 				await recordDisposalsFromBanResults(env, [{ groupId: chatId, ok: moderation?.ok === true }]);
-				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截（杀手黑名单）', { entry: killerEntry }, moderation, env);
+				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截（杀手黑名单）', { entry: killerEntry }, moderation, env, message);
 				return;
 			}
 		}
@@ -27499,6 +27503,13 @@ function extractAdProfileHandles(profile) {
 	return out;
 }
 
+// 预算到点 / 调用方取消都表现为 AbortError —— 这是预期内的降级，不是故障。
+function adLinkAborted(error, signal) {
+	if (signal?.aborted) return true;
+	if (String(error?.name || '') === 'AbortError') return true;
+	return /abort/i.test(String(error?.message || ''));
+}
+
 // 查一个公开用户名指向什么：类型（channel / supergroup / group / bot / user）、
 // 标题、简介、案底。结果按小写 handle 缓存 6 小时。
 async function resolveAdLink(env, handle, options = {}) {
@@ -27549,7 +27560,12 @@ async function resolveAdLink(env, handle, options = {}) {
 		cacheable = false;
 		info.lookupFailed = true;
 		info.lookupTransient = true;
-		console.error('[广告检测·链接] 解析失败 handle=' + key + ':', error?.message || error);
+		// 自己的总预算到点不是 Telegram 的故障：error.message 就是
+		// "The operation is aborted due to timeout"，按 error 打出来只会让日志整屏红。
+		// 记成「延后复核」即可，下一轮或 10 分钟负缓存之后再查。
+		if (!adLinkAborted(error, options.signal)) {
+			console.error('[广告检测·链接] 解析失败 handle=' + key + ':', error?.message || error);
+		}
 	}
 	if (options.signal?.aborted) { cacheable=false; info.lookupFailed=true; info.lookupTransient=true; }
 	// 暂态失败记 10 分钟，避免同一条资料在每条消息上重复撞超时。
@@ -27558,22 +27574,39 @@ async function resolveAdLink(env, handle, options = {}) {
 	return info;
 }
 
-// 批量解析一份资料里挂的链接。串行而不是并发：上限 5 个，串行最坏 5 次往返，
-// 并发换来的那点速度不值得冒一次性打爆限流的险（menshen 也是串行 for）。
+// 批量解析一份资料里挂的链接。上限 5 个。
+//
+// 【2026-11-20 预算归位】原来 getChat 与语义识别挤在同一个串行循环里：前一条链接的
+// 嵌入推理能吃掉大半预算，后面的 getChat 一进去就被自己的 signal 掐断，日志里就是整屏
+// "The operation is aborted due to timeout"（线上 addlist / tangxin_girl / bydbfankui
+// 每 30 秒刷一遍）。拆成两趟：先把元数据并发取完（总耗时≈最慢的一条，不随条数线性增长），
+// 再做语义识别 —— 识别不占 getChat 的预算，也不会把后面的链接连坐掉。
 async function resolveAdProfileLinks(env, profile, options = {}) {
 	const handles = extractAdProfileHandles(profile);
 	if (!handles.length) return [];
 	const out = [];
-	for (const handle of handles) {
+	await Promise.all(handles.map(async (handle) => {
+		if (options.signal?.aborted) {
+			out.push({ handle, kind: 'unknown', lookupFailed: true, lookupTransient: true, lookupDeferred: true });
+			return;
+		}
 		try {
 			const info = await resolveAdLink(env, handle, options);
-			if (info) {
-				if (!options.metadataOnly) info.adContent = await inspectAdLinkContent(env, info);
-				out.push(info);
-			}
+			if (info) out.push(info);
 		} catch (error) {
-			out.push({handle,kind:'unknown',lookupFailed:true});
+			out.push({ handle, kind: 'unknown', lookupFailed: true, lookupTransient: true });
 			console.error('[广告检测·链接] 单条解析异常 handle=' + handle + ':', error?.message || error);
+		}
+	}));
+	// 并发返回顺序不定，按 handle 的原始顺序还原：纠错键与 scoredHandles 都依赖顺序。
+	const order = new Map(handles.map((handle, index) => [String(handle).toLowerCase(), index]));
+	out.sort((a, b) => (order.get(String(a.handle).toLowerCase()) ?? 99) - (order.get(String(b.handle).toLowerCase()) ?? 99));
+	const deferred = out.filter((info) => info.lookupDeferred).length;
+	if (deferred) console.log('[广告检测·链接] 总预算用尽，' + deferred + ' 条链接留待复核');
+	if (!options.metadataOnly) {
+		for (const info of out) {
+			if (info.lookupFailed) continue;
+			info.adContent = await inspectAdLinkContent(env, info);
 		}
 	}
 	return out;
@@ -30270,8 +30303,9 @@ async function applyAdBodyJudge(env, bodyText, input, judged) {
 	evaluation.positionHardBan = true;
 	let action = '处置中';
 	let banned = false;
+	let enforced = null;
 	try {
-		const enforced = await enforceAdDetectionWithRetry(env, {
+		enforced = await enforceAdDetectionWithRetry(env, {
 			userId: input?.userId, chatId: input?.chatId, chatTitle: input?.chatTitle || '',
 			messageId: input?.message?.message_id, message: input?.message
 		}, evaluation, { fullEvaluationCollected: true });
@@ -30281,7 +30315,7 @@ async function applyAdBodyJudge(env, bodyText, input, judged) {
 		action = '处置失败：' + String(error?.message || error).slice(0, 100);
 		console.log('[glm-body] 定罪后处置失败: ' + action);
 	}
-	await notifyAdBodyJudgeResult(env, bodyText, record, input, action);
+	await notifyAdBodyJudgeResult(env, bodyText, record, input, action, { seq: enforced?.seq || null, banned });
 	return banned;
 }
 
@@ -30296,7 +30330,7 @@ async function judgeAdBodyAsync(env, bodyText, input) {
 // 每条 GLM 判定单独发一条完整通知给第一主人：判广告、判正常、调用失败都发。
 // 与封禁回执分开两条 —— 回执的「判定依据」仍是原来的词表/结构/样本口径，一个字不动；
 // GLM 这一条写清它自己判了什么、凭什么、多久、最后处置到哪一步，漏没漏一眼能看见。
-async function notifyAdBodyJudgeResult(env, bodyText, record, input, action) {
+async function notifyAdBodyJudgeResult(env, bodyText, record, input, action, options = {}) {
 	const ownerId = getOwnerNotifyTargets()[0] || '';
 	if (!ownerId) return;
 	// 绑定缺失是全局配置问题，不是这条消息的判定 —— 每条都发会盖住真正的漏判，
@@ -30315,6 +30349,7 @@ async function notifyAdBodyJudgeResult(env, bodyText, record, input, action) {
 	const judgeChatId = String(input?.chatId || '');
 	const judgeChatTitle = String(input?.chatTitle || '').trim();
 	const judgeUserId = String(input?.userId || '');
+	const judgeMessageLink = adCaseMessageLink(judgeChatId, input?.message?.message_id, input?.message?.chat?.username);
 	const lines = [
 		head,
 		'调用：' + (record.ok === false ? '失败（' + escapeHtml(record.error || '未知') + '）' : '成功'),
@@ -30330,9 +30365,14 @@ async function notifyAdBodyJudgeResult(env, bodyText, record, input, action) {
 		'用户：<code>' + escapeHtml(judgeUserId) + '</code>'
 			+ (judgeUserId ? '　<a href="tg://user?id=' + escapeHtml(judgeUserId) + '">查看资料</a>' : ''),
 		'消息：' + escapeHtml(String(bodyText || '').slice(0, 300)),
+		judgeMessageLink ? '定位：' + escapeHtml(judgeMessageLink) : '',
 		'处置：' + escapeHtml(action || '')
 	].filter(Boolean);
-	await sendTelegramMessageChunks(ownerId, lines.join('\n'));
+	// 定罪并已处置时直接挂纠错按钮：主人看到「正文 AI 判定：广告」觉得判错了，
+	// 不用回群翻消息、也不用记快照序号，当场就能解封（ig = 误封解除，连学习一起撤）。
+	const keyboard = options?.banned === true && options?.seq
+		? buildAdNoticeKeyboard(options.seq, judgeUserId, { automatic: true }) : null;
+	await sendTelegramMessageChunks(ownerId, lines.join('\n'), keyboard);
 }
 
 async function checkAdAiSimilarity(env, text, options = {}) {
@@ -39454,6 +39494,9 @@ function renderAdDetectionNotice(evaluation, context) {
 	// 空值一律是「未查询」而不是「查不到」，写明白以免被当成账号异常的证据。
 	lines.push('群内身份：' + (evaluation.snapshot.status ? escapeHtml(String(evaluation.snapshot.status)) : '未查询（不影响判定：受限状态已不计分）'));
 	if (context?.chatTitle) lines.push('来源群组：' + escapeHtml(String(context.chatTitle)));
+	// 定位：原文可能已被删除，但链接仍能跳到那条消息的位置（群内看是「消息不存在」），
+	// 主人至少能确认是哪个群、哪条；有证据副本时回执本身也回复在证据上。
+	if (context?.messageLink) lines.push('定位：' + escapeHtml(String(context.messageLink)));
 	lines.push('判定层：' + (AD_LAYER_LABELS[evaluation.layer] || evaluation.layer));
 	if (evaluation.positionEvidence) {
 		const evidenceLine = Object.values(evaluation.positionEvidence).filter((slot) => !slot.exempt && slot.grade > 0)
@@ -39739,6 +39782,18 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 		+ okCount + '/' + (results || []).length + ' 个群' + (d1Removed ? '　D1 记录已移除' : '')
 		+ '\n判定维持：指纹、AI 样本、形状、快照一律未动。' + whitelistNote);
 	console.log('[封禁回执] 主人点解封（判定维持）user=' + uid + ' 群=' + okCount + ' d1Removed=' + d1Removed);
+}
+
+// 定位链接：把「封禁原因」落到具体那条消息上。
+// 回执只说「自动封禁」，主人事后想不起他到底发了什么；点一下就能跳到事发群的那条消息。
+// 私有群用 t.me/c/<内部ID>/<消息ID>；有公开用户名时优先 t.me/<用户名>/<消息ID>。
+function adCaseMessageLink(chatId, messageId, chatUsername) {
+	const cid = String(chatId || '');
+	const mid = Number(messageId) || 0;
+	if (mid <= 0) return '';
+	const username = normalizeTelegramUsername(chatUsername);
+	if (username) return 'https://t.me/' + username + '/' + mid;
+	return /^-100[0-9]+$/.test(cid) ? 'https://t.me/c/' + cid.slice(4) + '/' + mid : '';
 }
 
 // 演练命中的私聊通知。与正常封禁回执同一条链路（第一主人私聊），但标题与处置结果
@@ -40926,6 +40981,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			chatTitle: input?.chatTitle || '',
 			muted:banResults.some(row=>String(row.groupId)===chatId&&row.muted),
 			seq,
+			messageLink: adCaseMessageLink(chatId, triggerMessageId, input?.message?.chat?.username),
 			banResultLine,
 			failedGroupLines,
 			learnLine: learnParts.join('，')
