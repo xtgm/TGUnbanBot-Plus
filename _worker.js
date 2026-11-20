@@ -14619,7 +14619,7 @@ function adReviewTextPages(text,limit=3400) {
 function adReviewStatus(row) {
 	const labels={pending:'等待核验',waiting:'核验未完成，已降低重试频率',processing:'自动处理中',viewing:'人工选择中（30 分钟后恢复）',
 		normal_intent:'正常判断已登记，正在保存',normal:'人工确认正常',ad:'广告已处置',clean:'已核验，未发现广告',
-		partial:'已查可用画面，动态原文件未完整核验',sample:'待人工确认',action_failed:'已确认广告，处置尚未完成',manual:'待人工处理',learning_pending:'广告特征后台学习中',learned:'广告特征学习记录',learning_failed:'部分特征后台续学中',skipped:'已按豁免或当前群范围跳过'};
+		partial:'已查可用画面，动态原文件未完整核验',sample:'待人工确认',action_failed:'已确认广告，处置尚未完成',manual:'待人工处理',learning_pending:'广告特征后台学习中',learned:'广告特征学习记录',learning_failed:'部分特征后台续学中',skipped:'已按豁免或当前群范围跳过',exhausted:'已达自动核验上限，已归档（记录与失败原因保留，不再自动复查）'};
 	return labels[row.status]||'状态暂无法识别，请刷新或查看后台日志';
 }
 
@@ -15551,6 +15551,23 @@ async function runAdContentReviewSingle(env,id,options={}) {
 	}
 }
 
+// 【2026-11-20】归档死行：resumeAdContentReviews 的 SELECT 明确排除了
+// 「非 operator 且 attempts>=8」，这些 waiting 记录永远不会被再取到，
+// 只会一直挂在「核验未完成」里冒充待办（线上 2236 条）。
+// 分批（每次 500）改成 exhausted 收口：记录、失败原因、evaluation 全部保留，
+// 只是不再算作「还在核验」。按 */10 的节奏，两千多条五十来分钟清完。
+// 独立成函数是为了能单独测：归档失败也绝不能让续跑中断。
+async function archiveExhaustedAdReviews(env, now = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return 0;
+	try {
+		const result = await env.DB.prepare("UPDATE ad_content_reviews SET status='exhausted',updated_at=? WHERE seq IN (SELECT seq FROM ad_content_reviews WHERE status='waiting' AND source<>'operator' AND decision='' AND attempts>=8 AND lease_until<=? ORDER BY seq LIMIT 500)").bind(now, now).run();
+		return Number(result?.meta?.changes || 0);
+	} catch (error) {
+		console.warn('[内容待核] 归档超限记录失败:', error?.message || error);
+		return 0;
+	}
+}
+
 async function resumeAdContentReviews(env) {
 	if(!env?.DB)return {queued:0};
 	if(!getBulkQueue(env))return {queued:0};
@@ -15558,6 +15575,7 @@ async function resumeAdContentReviews(env) {
 	await ensureAdContentReviewTable(env);
 	const now=Math.floor(Date.now()/1000);
 	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',next_at=?,evaluation=json_set(evaluation,'$.reviewRouting.lane','background') WHERE status='manual' AND decision='' AND lease_until<=? AND expires_at>? AND json_valid(evaluation)").bind(now,now,now).run();
+	await archiveExhaustedAdReviews(env, now);
 	await env.DB.prepare("UPDATE ad_content_reviews SET status='pending',review_sources='[]',next_at=?,lease_until=0,lease_token='' WHERE status='viewing' AND decision='' AND lease_until<=? AND expires_at>?").bind(now,now,now).run();
 	const readyChild="(json_extract(evaluation,'$.reviewDuplicate.automatic')=1 AND NOT EXISTS (SELECT 1 FROM ad_content_reviews parent WHERE parent.id=json_extract(ad_content_reviews.evaluation,'$.reviewDuplicate.representativeId') AND parent.expires_at>? AND parent.status IN ('pending','waiting','processing','viewing','normal_intent','action_failed')))";
 	// 【2026-11-14】operator 学习记录排最前。此前统一按 next_at 排队，第一主人 /spam 提交
@@ -35600,6 +35618,12 @@ async function rescanAdMember(env, row, options = {}) {
   await markAdBioChecked(env,userId,now);
   const inspection=adProfileInspectionMessage(member,chatId);
   if(!profile.bioFetched){
+    // 【2026-11-20】永久取不到（4xx：从未私聊 bot / 已注销 / 被拉黑）时不建待核记录 ——
+    // 建了也永远核不了：这条记录只会每天被重排一次、每次都以「资料读取失败」收尾，
+    // 线上 2236 条 attempts>=8 的 waiting 就是这么堆出来的。
+    // bio_checked_at 上面已经写过，按正常周期再复查；他哪天私聊了 bot，下一轮复查自然
+    // 能拿到资料，再走正常的完整判定。临时故障（5xx / 超时）仍按老路排队，值得重试。
+    if(profile.fetchPermanent)return {scanned:true,banned:false,reason:'profile_unavailable'};
     await saveAdContentReview(env,inspection,{verdict:'pending',snapshot:{name:member.first_name,text:'',bio:''},pendingReason:'profile_fetch_failed'});
     return {scanned:true,banned:false,reason:'fetch_failed'};
   }
