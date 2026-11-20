@@ -31208,11 +31208,17 @@ async function fetchAdUserProfile(userId, fallback = {}, options = {}) {
 			profile.fetchPermanent = adProfilePermanentFailure(result);
 			if (profile.fetchPermanent) {
 				// 4xx 再问也不会变：记 10 分钟负缓存，这一窗口内同一个人只留一行日志。
-				console.log('[广告检测] getChat 失败 user=' + userId + ' : ' + description + '（4xx 永久失败，10 分钟内不再重查）');
+				//
+				// 【2026-11-20 措辞】这一行原来写的是「getChat 失败」，可它根本不是故障：
+				// 400 chat not found = 对方从未与 bot 私聊过，是 Telegram 的常态拒答，
+				// 判定链路本来就按「资料未知」继续走。写「失败」只会让人以为服务坏了。
+				// 真正需要人看的是 5xx（见下面的分支），两者必须一眼能分开。
+				console.log('[广告检测] 资料未取到 user=' + userId + ' : ' + description
+					+ '（对方从未与 bot 私聊，属正常情况；10 分钟内不再重查，不影响判定）');
 				writeAdProfileMiss(userId, description);
 			} else {
 				// 5xx / 其它是真故障，每次出现都值得看见，也不该被负缓存压掉。
-				console.log('[广告检测] getChat 失败 user=' + userId + ' : ' + description);
+				console.log('[广告检测] getChat 失败 user=' + userId + ' : ' + description + '（Telegram 侧异常，下次重试）');
 			}
 		}
 	} catch (error) {
