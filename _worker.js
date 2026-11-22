@@ -30292,16 +30292,18 @@ async function judgeAdWithLLM(env, text, context = '') {
 	// 【2026-11-22 实测调序】同一条广告连打：glm 四次全 4006、deepseek 三次全 4006，
 	// qwen3.8-27b 一次成功。正文判定改 qwen 优先，glm 兜底：省掉前两级各约 1 秒的
 	// 无用等待，也不再刷「glm → deepseek 4006」的告警噪音。
-	// 按级限时：qwen 10s（27b 有 5~6 秒波动，给足）、glm 6s（兜底，不指望它思考完）、
-	// deepseek 4s。最坏 20s，外层 22s，留 8s 给落库与处置（waitUntil 30s）。
+	// 【2026-11-22 再调】glm-4.7-flash 关思考实测 0.9s / 0.14 neurons，容量池空闲，
+	// 提到第一级；qwen3.8-27b 第二级；glm-5.3 退到第三级（当前持续 4006，只作最后兜底）。
+	// 按级限时：glm-4.7-flash 9s（有 7.7s 抖动）、qwen 7s、glm 4s。最坏 20s，外层 22s。
 	const fastJudgeModel = String(env.AD_LLM_JUDGE_FAST_MODEL || AD_LLM_JUDGE_FAST_MODEL).trim();
 	const startedAt = Date.now();
 	try {
 		const picked = await raceWithTimeout(runAdLLMModel(env, {
+			// glm-5.3 / deepseek 当前持续 4006，放进兜底位只会白等；第二级换同刻空闲的 qwen。
 			llmModel: fastJudgeModel || model,
-			llmFallbackModel: model,
-			llmTertiaryModel: String(env.AD_LLM_FALLBACK_MODEL || AD_LLM_FALLBACK_MODEL).trim(),
-			llmPerCallTimeouts: [10000, 6000, 4000]
+			llmFallbackModel: String(env.AD_LLM_TERTIARY_MODEL || AD_LLM_TERTIARY_MODEL).trim(),
+			llmTertiaryModel: model,
+			llmPerCallTimeouts: [9000, 7000, 4000]
 		}, { messages, max_tokens: 8192, temperature: 0 }), 22000, null);
 		if (!picked) {
 			console.log('[glm-judge] 判定超时 model=' + model);
