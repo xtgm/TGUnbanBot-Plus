@@ -30068,6 +30068,11 @@ async function loadAdSampleEmbeddings(env) {
 // 调用失败、超时、输出不是 JSON → 返回 { ok:false, error }，调用方不动消息，
 // 只落库并通知主人，绝不阻断消息处理。
 const AD_LLM_JUDGE_MODEL = '@cf/zai-org/glm-5.3';
+// 【2026-11-22 实测】正文判定是短任务（只输出一行 JSON），不需要思考模型。
+// 同一条广告连打：glm-5.3 四次全 4006、deepseek 三次全 4006，qwen3.8-27b
+// 一次成功（5.6s / 31.8 neurons）。正文判定优先用 qwen，glm 降为兜底。
+// 想切回 glm 优先：把环境变量 AD_LLM_JUDGE_FAST_MODEL 设成空串即可。
+const AD_LLM_JUDGE_FAST_MODEL = '@cf/qwen/qwen3.8-27b';
 // 【2026-11-17 删除 looksLikeAdShape 词表门】它曾经决定「哪条正文有资格送模型」，
 // 直接造成线上漏判：`💋上头电子烟 原料 成品油 依托 @kahbjuugvz0` 的四个形态特征只中一个
 // （@handle 被当成链接）、22 个强信号词零命中，于是模型一次都没被调用；
@@ -30245,15 +30250,19 @@ async function judgeAdWithLLM(env, text, context = '') {
 	// （glm-5.3 → deepseek-v4.1-flash → qwen3.8-27b），瞬态错误带退避补试。
 	// 【2026-11-22 修】候选链能扛 4006，但每级没有独立超时：glm-5.3 思考一次就能吃满外层
 	// 20 秒，deepseek / qwen3.8 永远轮不到 —— 主人看到的就是「失败（timeout）20.0 秒」。
-	// 按级限时：glm 9s（思考模型，给足但不许独占）、deepseek 4s（非思考，一行 JSON 很快）、
-	// qwen3.8 6s（关思考）。最坏 19s，外层放宽到 22s，留 8s 给落库与处置（waitUntil 30s）。
+	// 【2026-11-22 实测调序】同一条广告连打：glm 四次全 4006、deepseek 三次全 4006，
+	// qwen3.8-27b 一次成功。正文判定改 qwen 优先，glm 兜底：省掉前两级各约 1 秒的
+	// 无用等待，也不再刷「glm → deepseek 4006」的告警噪音。
+	// 按级限时：qwen 10s（27b 有 5~6 秒波动，给足）、glm 6s（兜底，不指望它思考完）、
+	// deepseek 4s。最坏 20s，外层 22s，留 8s 给落库与处置（waitUntil 30s）。
+	const fastJudgeModel = String(env.AD_LLM_JUDGE_FAST_MODEL || AD_LLM_JUDGE_FAST_MODEL).trim();
 	const startedAt = Date.now();
 	try {
 		const picked = await raceWithTimeout(runAdLLMModel(env, {
-			llmModel: model,
-			llmFallbackModel: String(env.AD_LLM_FALLBACK_MODEL || AD_LLM_FALLBACK_MODEL).trim(),
-			llmTertiaryModel: String(env.AD_LLM_TERTIARY_MODEL || AD_LLM_TERTIARY_MODEL).trim(),
-			llmPerCallTimeouts: [9000, 4000, 6000]
+			llmModel: fastJudgeModel || model,
+			llmFallbackModel: model,
+			llmTertiaryModel: String(env.AD_LLM_FALLBACK_MODEL || AD_LLM_FALLBACK_MODEL).trim(),
+			llmPerCallTimeouts: [10000, 6000, 4000]
 		}, { messages, max_tokens: 8192, temperature: 0 }), 22000, null);
 		if (!picked) {
 			console.log('[glm-judge] 判定超时 model=' + model);
