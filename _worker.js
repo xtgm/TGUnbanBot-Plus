@@ -3917,7 +3917,15 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 	if (result.ok) {
 		message.__authorizedGroupCommandDeleted = true;
 	} else {
-		console.error(`[${commandName}] 删除群内命令消息失败:${result.error || '未知错误'}`);
+		// 【2026-11-22】`message can't be deleted` 是预期终态：命令消息超过 48 小时、
+		// 已被别的管理员删掉、或 bot 没有删除权限。这是 Telegram 侧的结果，
+		// 不是本 worker 的故障，降为 warn；其余错误照旧 error。
+		const text = String(result.error || '未知错误');
+		if (/message can't be deleted|message to delete not found|MESSAGE_ID_INVALID|not enough rights/i.test(text)) {
+			console.warn(`[${commandName}] 删除群内命令消息未执行:${text}`);
+		} else {
+			console.error(`[${commandName}] 删除群内命令消息失败:${text}`);
+		}
 	}
 }
 // 读取并归一化黑名单
@@ -4045,6 +4053,12 @@ function isTransientD1SchemaError(error) {
 		|| detail.includes('temporarily unavailable')
 		|| detail.includes('currently processing a long-running export')
 		|| detail.includes('network connection lost')
+		// 【2026-11-22 补】线上 D1 报错里最常见的两种此前都没被认成瞬态：
+		// `D1_ERROR: internal error`（平台内部抖动）与 `too much load`（写入队列过载）。
+		// 它们下一次读基本就恢复，不补进来 retryD1Read 等于一次都不重试。
+		|| detail.includes('internal error')
+		|| detail.includes('too much load')
+		|| detail.includes('storage operation exceeded')
 		|| (!message && detail.includes('cloudflare-internal:d1-api'));
 }
 
@@ -4053,8 +4067,11 @@ async function retryD1Read(loader) {
 	for (let attempt = 1; ; attempt++) {
 		try { return await loader(); }
 		catch (error) {
-			if (attempt >= 3 || !isTransientD1SchemaError(error)) throw error;
-			await new Promise(resolve => setTimeout(resolve, 50 * attempt));
+			// 【2026-11-22】旧值 3 次 × 50ms 对 D1 的 too much load / internal error 太短：
+			// 这类过载窗口通常持续数百毫秒，50ms 退避等于三次尝试全打在同一窗口里。
+			// 改成 4 次、120/240/360ms + 抖动，总等待约 0.7~1s，仍在请求墙钟内。
+			if (attempt >= 4 || !isTransientD1SchemaError(error)) throw error;
+			await new Promise(resolve => setTimeout(resolve, 120 * attempt + Math.floor(Math.random() * 80)));
 		}
 	}
 }
@@ -23869,7 +23886,9 @@ async function getGroupInfo() {
 				username: runtime().GROUP_INFO.username
 			};
 		} else {
-			console.error('获取群组信息失败:', result);
+			// 【2026-11-22】Telegram 侧拒绝（群已解散 / bot 被踢 / 参数错误）是外部状态，
+			// 不是本 worker 崩溃；上层已有中性默认值兜底，降 warn 即可。
+			console.warn('获取群组信息失败:', result);
 			// 失败时返回中性默认值
 			return {
 				title: '当前群组',
@@ -24317,7 +24336,9 @@ async function getChatInfoFromId(chatId) {
 
 			return info;
 		} else {
-			console.error('获取群组信息失败:', result);
+			// 【2026-11-22】Telegram 侧拒绝（群已解散 / bot 被踢 / 参数错误）是外部状态，
+			// 不是本 worker 崩溃；上层已有中性默认值兜底，降 warn 即可。
+			console.warn('获取群组信息失败:', result);
 			return null;
 		}
 	} catch (error) {
@@ -24713,6 +24734,14 @@ const AD_EMBEDDING_DIMENSION = 1024;
 // JSON 被截断在半截 —— 线上表现就是解析失败率暴涨、连续 20 次后熔断。
 const AD_LLM_MODEL = '@cf/zai-org/glm-5.3';
 const AD_LLM_FALLBACK_MODEL = '@cf/deepseek-ai/deepseek-v4.1-flash-1017';
+// 【2026-11-22 第三候选】线上实测主备【同时】撞 4006 容量不足（12 分钟 24 次），
+// 说明 glm 与 deepseek 在同一时段会一起被限流，双模型链路对容量抖动没有冗余。
+// 选 @cf/qwen/qwen3.8-27b：头像视觉链路已在用，本 worker 实测可用。
+// ⚠️ 初版写成 qwen3-30b-a3b-fp8，`/ai/models/search` 实测该 ID 已不在目录 ——
+// 不存在的模型会抛【硬错误】，第三候选反而把 warn 变成 error，必须用目录里的真名。
+// 它和 glm / deepseek 不在同一个容量池，中文广告话术的召回也比 llama 系稳。
+// 只有主备都失败才轮到它，日常零成本。
+const AD_LLM_TERTIARY_MODEL = '@cf/qwen/qwen3.8-27b';
 // 【每日上限：2026-10-11 从 200 提到 1000，并拆成三个池】
 //
 // 【旧配置的病】三个调用点共用一个 200 次的池，而其中两个轨（入群筛查、cron bio 扫描）
@@ -29900,7 +29929,12 @@ async function embedAdText(env, text, options = {}) {
 		// 不是文本本身的问题。失败一次这条消息的语义层就直接退场（similarity 0），
 		// 所以 8008 再试一次；模型不存在、额度打满这类错误重试也不会变，维持原样。
 		const message = String(error?.message || '');
-		if (!options.retried && (message.includes('8008') || /internal server error/i.test(message))) {
+		// 【2026-11-22】原来只认 8008。线上 3 天里还有 8007（Cog prediction failed）、
+		// 3046（超时）、3040（容量不足）—— 全是同一类平台抖动，同样值得补试一次。
+		if (!options.retried && (message.includes('8007') || message.includes('8008')
+			|| message.includes('3046') || message.includes('3040')
+			|| /internal server error|cog prediction|timed out|timeout/i.test(message))) {
+			await adLLMSleep(200);
 			return embedAdText(env, text, { retried: true });
 		}
 		// 必须打出 name + message：Workers AI 的 Ai._parseError 抛出的 Error 往往 message 为空，
@@ -32262,7 +32296,54 @@ function adLLMReasoningParams(model) {
 	const id = String(model || '').toLowerCase();
 	if (id.includes('glm-5.3')) return { reasoning_effort: 'low' };
 	if (id.includes('deepseek-v4.1') || id.includes('deepseek-v4-flash')) return { reasoning_effort: 'none' };
+	// 【2026-11-22】qwen3.8-27b 默认开思考，会先吐一大段思考再给 JSON，
+	// max_tokens 被吃掉后正文可能截断。头像视觉链路对它是用
+	// chat_template_kwargs.enable_thinking=false 显式关掉的，这里保持同一口径。
+	if (id.includes('qwen3.8') || id.includes('qwen3-')) return { chat_template_kwargs: { enable_thinking: false } };
 	return {};
+}
+
+// ===== 瞬态错误识别（2026-11-22）=====
+// 线上 3 天日志实测：`[广告检测·深度判定] 调用失败` 占 error 级日志 87.5%（140/160），
+// 逐条展开全是 4006 / 3040（容量不足）、3046（超时）、8007 / 8008（平台内部）——
+// 这是 Workers AI 的排队与抖动，不是配置错误。旧实现【一次都不重试】：
+// 主模型撞一次容量错误就换备用，备用再撞一次整条判定直接失败。
+// 判定只认明确的可重试信号，认不出的照旧当硬错误，不掩盖真正的配置问题。
+function adLLMTransientError(error) {
+	// 【2026-11-22】Workers AI 的 Ai._parseError 在拿不到结构化错误码时会抛出
+	// message / cause 全空的 Error —— 线上部署后第一条残留错误就是这种形态
+	//（日志里只剩 `调用失败:     at runAdLLMModel ...`）。它不是配置问题，
+	// 重试一次成本极低；真正的配置错误（模型不存在 / 参数不支持）都有明确 message。
+	if (error && !String(error.message || '').trim() && !String(error.cause?.message || error.cause || '').trim()) return true;
+	const code = Number(error?.code ?? error?.status ?? NaN);
+	if ([3040, 3046, 4006, 8007, 8008, 429, 500, 502, 503, 504].includes(code)) return true;
+	const text = (String(error?.message || error || '') + ' '
+		+ String(error?.cause?.message || error?.cause || '')).toLowerCase();
+	if (/\b(3040|3046|4006|8007|8008)\b/.test(text)) return true;
+	if (/\b(429|502|503|504)\b/.test(text)) return true;
+	return text.includes('capacity')
+		|| text.includes('temporarily')
+		|| text.includes('overloaded')
+		|| text.includes('timed out')
+		|| text.includes('timeout')
+		|| text.includes('internal server error')
+		|| text.includes('cog prediction')
+		|| text.includes('network connection lost')
+		|| text.includes('超时');
+}
+
+// 补试次数含首次，即最多再补一次；退避 220~400ms，避开瞬时排队窗口即可，
+// 再长就撞 Worker 的请求墙钟上限，得不偿失。
+const AD_LLM_RETRY_ATTEMPTS = 2;
+const AD_LLM_RETRY_DELAY_MS = 220;
+// 【为什么要有耗时上限】4006 是【立即返回】的容量拒绝，补试有意义；
+// 3046 是已经排队到超时（通常 8s 以上），再补一次只是把 waitUntil 的后台任务
+// 拖到被平台取消 —— 线上已出现 `waitUntil() tasks did not complete` 警告。
+// 超过这个耗时直接换模型，不在同一个模型上耗第二次。
+const AD_LLM_RETRY_MAX_ELAPSED_MS = 4000;
+
+function adLLMSleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ===== 主备统一入口：只在【调用抛错】时换模型 =====
@@ -32273,31 +32354,53 @@ function adLLMReasoningParams(model) {
 async function runAdLLMModel(env, config, body) {
 	const primary = String(config?.llmModel || AD_LLM_MODEL);
 	const fallback = String(config?.llmFallbackModel || '').trim();
-	try {
-		return {
-			model: primary,
-			usedFallback: false,
-			result: await env.AI.run(primary, Object.assign({}, body, adLLMReasoningParams(primary)))
-		};
-	} catch (error) {
-		if (!fallback || fallback === primary) throw error;
-		// 主模型被弃用 / 路由下线属于预期降级，走 warn：这条链路本身仍然成功，
-		// 之前用 error 打出来，24 小时面板上全是「失败」，把真正的故障淹了。
-		console.warn('[广告检测] 主模型调用失败，改走备用 ' + primary + ' → ' + fallback + ':', error?.message || error);
+	const tertiary = String(config?.llmTertiaryModel || AD_LLM_TERTIARY_MODEL).trim();
+	// 候选链：主 → 备 → 第三，去重。空串等于关闭该级。
+	const chain = [primary];
+	if (fallback && !chain.includes(fallback)) chain.push(fallback);
+	if (tertiary && !chain.includes(tertiary)) chain.push(tertiary);
+	// 单模型调用：瞬态错误（容量 / 超时 / 平台内部）补试一次，硬错误（模型不存在、
+	// 参数不支持、鉴权失败）立即抛出 —— 那类错误补试一百次也不会变。
+	// 慢失败（已经排队超时）不再补试，见 AD_LLM_RETRY_MAX_ELAPSED_MS。
+	const call = async (model) => {
+		let lastError = null;
+		for (let attempt = 1; attempt <= AD_LLM_RETRY_ATTEMPTS; attempt++) {
+			const startedAt = Date.now();
+			try {
+				return await env.AI.run(model, Object.assign({}, body, adLLMReasoningParams(model)));
+			} catch (error) {
+				lastError = error;
+				if (attempt >= AD_LLM_RETRY_ATTEMPTS || !adLLMTransientError(error)) throw error;
+				if (Date.now() - startedAt > AD_LLM_RETRY_MAX_ELAPSED_MS) throw error;
+				await adLLMSleep(AD_LLM_RETRY_DELAY_MS + Math.floor(Math.random() * 180));
+			}
+		}
+		throw lastError;
+	};
+	const errors = [];
+	for (let index = 0; index < chain.length; index++) {
+		const model = chain[index];
 		try {
-			return {
-				model: fallback,
-				usedFallback: true,
-				result: await env.AI.run(fallback, Object.assign({}, body, adLLMReasoningParams(fallback)))
-			};
-		} catch (fallbackError) {
-			// 两个都挂才是真失败：把主备模型和备用错误一起带出来，别只留一句「解析失败」。
-			const wrapped = new Error('主模型与备用模型均调用失败：' + primary + ' → ' + fallback
-				+ '；备用错误：' + String(fallbackError?.message || fallbackError), { cause: fallbackError });
-			wrapped.primaryError = error?.message || String(error);
-			throw wrapped;
+			return { model, usedFallback: index > 0, result: await call(model) };
+		} catch (error) {
+			errors.push(error);
+			const next = chain[index + 1];
+			if (next) {
+				// 降级本身是预期路径（弃用 / 容量），走 warn：之前用 error 打出来，
+				// 24 小时面板上全是「失败」，把真正的故障淹了。
+				console.warn('[广告检测] 模型调用失败，改走下一候选 ' + model + ' → ' + next + ':', error?.message || error);
+			}
 		}
 	}
+	// 整条链路都挂：把每个模型的错误一起带出来，别只留一句「解析失败」。
+	const lastError = errors[errors.length - 1];
+	const wrapped = new Error('模型链路全部失败：' + chain.join(' → ')
+		+ '；最后错误：' + String(lastError?.message || lastError), { cause: lastError });
+	wrapped.primaryError = errors[0]?.message || String(errors[0]);
+	wrapped.attempts = errors.map((e, k) => chain[k] + ': ' + String(e?.message || e));
+	// 全部都是平台瞬态才降级为 warn；只要有一个硬错误（配置 / 鉴权）就保留 error。
+	wrapped.transient = errors.every((e) => adLLMTransientError(e));
+	throw wrapped;
 }
 
 // 【为什么要留旧字段名】Workers AI 对不同模型返回的外壳并不统一：
@@ -32886,7 +32989,17 @@ async function judgeAdByLLM(env, config, input, options) {
 		rawText = extractAdLLMResponseText(aiResult);
 		answer = parseAdLLMAnswer(rawText);
 	} catch (error) {
-		console.error('[广告检测·深度判定] 调用失败:', error);
+		// 【2026-11-22 分级】容量不足 / 超时这类平台瞬态不是「链路坏了」：
+		// 打进 error 会把 Dashboard 红点灌满（3 天 140 条全在这一行），
+		// 真正的配置故障反而被淹没。瞬态降 warn，其余（模型不存在 / 鉴权 / 参数）仍 error。
+		if (error?.transient === true || adLLMTransientError(error)) {
+			// 带 name / message：AiError 的 message 常为空，只打对象时日志里只剩栈，无法归因。
+			console.warn('[广告检测·深度判定] 调用失败（平台瞬态，已按跳过处理）'
+				+ ' name=' + (error?.name || '未知')
+				+ ' message=' + (String(error?.message || '').trim() || '（空）'));
+		} else {
+			console.error('[广告检测·深度判定] 调用失败:', error);
+		}
 		// 【这一路刻意不记额度、不记去重键】下面那两笔只在走到「模型真返回了」
 		// 之后才记 —— 调用本身抛错（网络 / 503 / 账号额度）既没生成 token，
 		// 也不该让这条载荷被标成「判过了」，否则链路恢复后它永远不会再被看一眼。
@@ -35864,7 +35977,12 @@ async function drainAdAvatarLearningQueue(env, limit = 30) {
 			completed.add(String(uid));
 		} catch (error) {
 			stats.failed += 1;
-			console.error('[广告检测·头像] 补学失败 user=' + uid + ':', error);
+			// 【2026-11-22】「资料尚未完整获取 / 内容尚未核实」是可重试的业务状态：
+			// 队列会保留这个人，下一轮 cron 再来，不是故障。只有真正的异常
+			//（写库失败 / 学习落库失败）才值得 error。
+			const retryable = /尚未完整获取|尚未核实/.test(String(error?.message || ''));
+			if (retryable) console.warn('[广告检测·头像] 补学暂缓 user=' + uid + ' : ' + String(error?.message || error));
+			else console.error('[广告检测·头像] 补学失败 user=' + uid + ':', error);
 		}
 	}
 	try {
@@ -35925,7 +36043,10 @@ const AD_AVATAR_VISION_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 const AD_AVATAR_VISION_FALLBACK_MODEL = '@cf/qwen/qwen3.8-27b';
 // 超时：gemma 实测 92 张里只有 1 张超过 10s；qwen 兜底给宽一些（P90 16s）。
 // 超时只是不再等，不是取消计费 —— 所以兜底只在主模型确实没给出结论时才调。
-const AD_AVATAR_VISION_TIMEOUT_MS = 8000;
+// 【2026-11-22 8000 -> 10000】线上 4 条实时识别失败里，gemma 全部卡在 8000ms 超时，
+// 而同一模型在别的时间能正常返回 —— 8s 对带排队的冷启动偏紧。抬到 10s，
+// 同时失败若属瞬态不再计熔断（见 logAdVisionFailure 的 skipped 分支）。
+const AD_AVATAR_VISION_TIMEOUT_MS = 10000;
 const AD_AVATAR_VISION_FALLBACK_TIMEOUT_MS = 20000;
 const AD_AVATAR_OCR_PROMPT = '这是一张 Telegram 用户头像。只输出一个 JSON，不要任何别的文字：'
 	+ '{"text":"逐字抄录图中所有文字（中文、英文、数字、@用户名、网址、水印），看不清的字用?代替，没有文字填空串",'
@@ -38082,7 +38203,11 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 		}
 		if (isVisionFileMissing(error)) skipBump = true;
 		else modelFailed = true;
-		const failCount = await logAdVisionFailure(env, '头像·实时', 'ai.run', key, error);
+		// 【2026-11-22】容量不足 / 超时属于平台瞬态，不是这张图或这条链路坏了。
+		// 计入熔断的话，一次 4006 抖动就能把当天的头像识别整体停掉；
+		// 走 skipped 分支：日志降为 warn，台账照写（前缀 VisionSkipped），不推进熔断计数。
+		const visionTransient = !isVisionFileMissing(error) && adLLMTransientError(error);
+		const failCount = await logAdVisionFailure(env, '头像·实时', 'ai.run', key, error, visionTransient);
 		if (isVisionFileMissing(error) && failCount >= AD_VISION_FILE_MISSING_PARK_AFTER) {
 			parkUntil = Math.floor(Date.now() / 1000) + AD_VISION_PARK_AHEAD_SEC;
 			console.warn('[头像实时判定] 文件失效累计 ' + failCount + ' 次，移出识别队列 id=' + key);
@@ -41177,7 +41302,20 @@ async function screenAdJoinMember(env, member, options = {}) {
       const prior=await interceptAdJoinBlacklist(env,member,chatId,options.chatTitle||'',{
         approvedJoin:joined,joinDate:options.joinDate,joinApprover:options.joinApprover});
       if(prior.blocked){
-        if(!prior.complete&&joined)throw new Error('入群后的名单拦截或核验失败，等待 Webhook 重投');
+        if(!prior.complete&&joined){
+          // 【2026-11-22】Webhook 重投是设计内的补齐机制，但只有【瞬态】失败才值得重投。
+          // 权限类失败（bot 没管理权限 / 对方是管理员 / 目标已不在群）重投一百次结果不变：
+          // 线上 3 天里这条 error 一直在刷，还把整个 update 抛成 outcome=exception，
+          // 而 Telegram 的 webhook 重投本身也是有限次的 —— 最后只会留下一条假故障。
+          const banError=String(prior.banResult?.error||'');
+          const permanent=isTelegramPermissionError(banError)
+            || /user not found|participant_id_invalid|chat not found|bot.*(?:kicked|not.*member)/i.test(banError);
+          if(permanent){
+            console.warn('[广告检测] 入群名单拦截未完全成功（权限类，停止重投）: '+banError.slice(0,200));
+            return prior.banned?'banned':'pending';
+          }
+          throw new Error('入群后的名单拦截或核验失败，等待 Webhook 重投');
+        }
         return prior.banned?'banned':'skipped';
       }
     }
@@ -41225,7 +41363,15 @@ async function screenAdJoinMember(env, member, options = {}) {
     } finally {
       try{await recordCheck();}catch(error){console.error('[入群筛查] 检查记录未保存: '+formatD1SchemaError(error));}
     }
-  }catch(error){console.error('[广告检测] 入群检测未完成: '+formatD1SchemaError(error));if(joinGuard)throw error;return 'error';}
+  }catch(error){
+    // 【2026-11-22】带「等待重投」的是设计内的重试信号（数据库抖动 / 尚未就绪 / 拦截未补齐），
+    // 抛给上层让 Telegram 重投是对的，但它是【预期流程】不是故障，不该占 error 级日志。
+    // 其余异常（真崩溃）继续 error，保持可发现性。
+    const retryable=joinGuard&&/等待重投/.test(String(error?.message||''));
+    if(retryable)console.warn('[广告检测] 入群检测未完成（等待 Webhook 重投）: '+formatD1SchemaError(error));
+    else console.error('[广告检测] 入群检测未完成: '+formatD1SchemaError(error));
+    if(joinGuard)throw error;return 'error';
+  }
 }
 
 // === 实际入群检测（第二道防线的即时入口）===
