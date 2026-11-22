@@ -30240,16 +30240,25 @@ async function judgeAdWithLLM(env, text, context = '') {
 	// 不做第二次重试：同 prompt 重跑大概率同样结果，而两次 20 秒会叠到 40 秒，
 	// 直接冲破 ctx.waitUntil 的 30 秒窗口（模型 20 秒 + 封禁处置还要几秒）。
 	// 没拿到 JSON 就落库 + 通知主人，不假装判过了。
-	const call = async (maxTokens) => raceWithTimeout(env.AI.run(model, {
-		messages, max_tokens: maxTokens, temperature: 0
-	}), 20000, null);
+	// 【2026-11-22 修】原来这里只连 glm-5.3 一个模型：4006 容量拒绝一来整条判定作废，
+	// 主人私聊成片收到「正文 AI 判定失败（4006）」。改走 runAdLLMModel 的三级候选链
+	// （glm-5.3 → deepseek-v4.1-flash → qwen3.8-27b），瞬态错误带退避补试。
+	// 外层 20 秒不变：4006 是立即返回，三级切换只花 1~3 秒，不挤占正常判定的思考时间。
 	const startedAt = Date.now();
 	try {
-		const first = await call(8192);
-		const parsed = parseJudgeJson(extractGlmContent(first));
+		const picked = await raceWithTimeout(runAdLLMModel(env, {
+			llmModel: model,
+			llmFallbackModel: String(env.AD_LLM_FALLBACK_MODEL || AD_LLM_FALLBACK_MODEL).trim(),
+			llmTertiaryModel: String(env.AD_LLM_TERTIARY_MODEL || AD_LLM_TERTIARY_MODEL).trim()
+		}, { messages, max_tokens: 8192, temperature: 0 }), 20000, null);
+		if (!picked) {
+			console.log('[glm-judge] 判定超时 model=' + model);
+			return { ok: false, error: 'timeout', ms: Date.now() - startedAt };
+		}
+		const parsed = parseJudgeJson(extractGlmContent(picked.result));
 		if (!parsed) {
-			console.log('[glm-judge] 未拿到 JSON: ' + source.slice(0, 40));
-			return { ok: false, error: first ? 'no_json' : 'timeout', ms: Date.now() - startedAt };
+			console.log('[glm-judge] 未拿到 JSON model=' + picked.model + ': ' + source.slice(0, 40));
+			return { ok: false, error: 'no_json', ms: Date.now() - startedAt, model: picked.model };
 		}
 		const isAd = parsed.is_ad === true || parsed.is_ad === 'true';
 		const rawConfidence = Number(parsed.confidence ?? parsed.score ?? NaN);
@@ -30258,9 +30267,9 @@ async function judgeAdWithLLM(env, text, context = '') {
 			? Math.max(0, Math.min(1, rawConfidence))
 			: (isAd ? 0.85 : 0);
 		const why = String(parsed.why || parsed.reason || '').trim().slice(0, 80);
-		return { ok: true, isAd, type: isAd ? String(parsed.type || '').trim().slice(0, 16) : '正常', confidence, why, raw: parsed, ms: Date.now() - startedAt };
+		return { ok: true, isAd, type: isAd ? String(parsed.type || '').trim().slice(0, 16) : '正常', confidence, why, raw: parsed, model: picked.model, ms: Date.now() - startedAt };
 	} catch (error) {
-		console.log('[glm-judge] 调用失败 model=' + model + ' error=' + String(error?.message || error).slice(0, 200));
+		console.log('[glm-judge] 三级候选全失败 error=' + String(error?.message || error).slice(0, 200));
 		return { ok: false, error: String(error?.message || error).slice(0, 200), ms: Date.now() - startedAt };
 	}
 }
