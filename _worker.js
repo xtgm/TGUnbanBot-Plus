@@ -25068,6 +25068,9 @@ const AD_EXEMPT_KEYWORD_CATEGORIES = [
 	'反代', '反向代理', '回源', '中转', '落地', '分流', '路由规则', 'cdn',
 	'path路径', '伪装路径', 'workers', 'pages', 'argo', 'tunnel', 'nginx', 'caddy',
 	'负载均衡', '优选ip', '优选域名', 'ip优选', '节点订阅', '订阅链接', '订阅转换',
+	// 【2026-11-22 主人点名】订阅器 / host / 面板 / 机场 / 网站这类词是代理与正常网站的
+	// 日常用语，不是广告证据；缺了它们，正常技术求助会被当成「引流推广」。
+	'订阅器', 'host', '主机', '面板', '机场', '节点', '网站', '域名', '服务器', 'vps', 'docker', '容器',
 	] },
 	// —— 传输层安全 TLS ——
 	{ name: '传输层安全 TLS', words: [
@@ -30092,7 +30095,6 @@ const AD_BODY_BAN_LINE = 0.8;
 // 放行的消息仍走完整的结构化评分与素材核验，不是免检。
 const AD_BODY_JUDGE_STRONG_PATTERNS = [
 	/\+?\d[\d\s\-]{6,}\d/,
-	/@[A-Za-z][A-Za-z0-9_]{4,}/,
 	/(?:t\.me|telegram\.me|wa\.me)\//i,
 	/一单|一天[赚挣入到]|日入|月入|包赚|稳赚|日结|刷单|返利/,
 	/跑分|洗钱|代收|代付|下注|带单|博彩/,
@@ -30107,17 +30109,82 @@ const AD_BODY_JUDGE_WEAK_PATTERNS = [
 	/微信|vx|v信|威信|扣扣|企鹅|飞机|纸飞机|TG群|频道/i,
 	/\d+\s*[kKwW万千百]\s*(?:一单|起|包|元|块)/,
 	/优惠|折扣|包邮|特价|限时|秒杀|免费领|福利/i,
-	/关注|订阅|转发|点击|扫码/i
+	/关注|订阅|转发|点击|扫码/i,
+	// @用户名 在群里首先是「提到某人 / 提到某个 bot」，不是联系方式；
+	// 单独一个 @ 不能定罪，和别的弱信号同现才算（bot 后缀的另在下面剔除）。
+	/(?:^|[^A-Za-z0-9_])@[A-Za-z][A-Za-z0-9_]{4,}(?![A-Za-z0-9_])/
 ];
+// ===== 正文 AI 判定的类型词豁免（2026-11-22 主人口径）=====
+//
+// 主人原话：「一句话里即便有豁免词，那不可能豁免一整个句子的检测。豁免词只做它该做的事。」
+// 「豁免词只豁免有关的类型词，比如代理有关的词，比如正常网站的词。」
+// 「AI 判定的是广告，不是什么都判，不要浪费额度。」
+//
+// 所以这里【不是】命中豁免词就整条放行：先把代理 / 网络 / 网站这类【类型词】
+// 从正文里剥掉，再看剩下的句子里还有没有广告信号。
+//   · 原文已命中强信号（招揽 / 交易 / 收益 / 联系方式）→ 豁免词管不到，直接送模型；
+//   · 剥掉类型词后弱信号仍有两个 → 送模型；
+//   · 剥完什么都不剩 → 这就是一句纯技术讨论，不送模型、不花推理。
+// 「私聊」「点我」「客服」「工具」这类泛词不进这张表 —— 它们不是类型词，
+// 放过它们等于给广告留门。
+const AD_BODY_JUDGE_TYPE_WORDS = [
+	'订阅器', '订阅转换', '订阅链接', '节点订阅', '优选域名', '优选ip', '负载均衡',
+	'反向代理', '代理服务器', '代理池', '代理ip', '浏览器指纹', '流量特征',
+	'shadowsocks', 'httpupgrade', 'splithttp', 'sing-box', 'singbox', 'hiddify',
+	'vless', 'vmess', 'trojan', 'hysteria', 'wireguard', 'openvpn', 'anytls',
+	'reality', 'xhttp', 'xtls', 'grpc', 'websocket', 'mihomo', 'v2ray', 'v2fly',
+	'clash', 'xray', 'naive', 'tuic', 'mkcp', 'quic', 'ssr',
+	'订阅', '节点', '机场', '面板', 'host', '主机', '域名', '服务器', '网站', '博客',
+	'论坛', '文档', '教程', '部署', '自建', '搭建', '配置', '客户端', '内核', '协议',
+	'端口', '延迟', '丢包', '带宽', '限速', '证书', '代理', '反代', '回源', '中转',
+	'落地', '分流', '路由规则', 'cdn', 'workers', 'worker', 'pages', 'nginx', 'caddy',
+	'argo', 'tunnel', 'tls', 'sni', 'ssl', 'alpn', 'ech', 'vps', 'docker', '容器',
+	'开源', 'github', 'gitlab', 'proxy', 'socks5', 'socks', 'api', 'json', 'yaml'
+].sort((a, b) => b.length - a.length);
+
+// 把命中的类型词从正文里剥掉，只剥词本身，不动其余文字。
+// ASCII 词走词边界，避免 host 误吃 ghost / hosting；中文词直接整词删除。
+function stripAdBodyJudgeTypeWords(text) {
+	let rest = String(text || '');
+	if (!rest) return '';
+	for (const word of AD_BODY_JUDGE_TYPE_WORDS) {
+		const needle = word.toLowerCase();
+		if (/^[a-z0-9][a-z0-9._+-]*$/i.test(needle)) {
+			// ASCII 词按词边界扫，不用正则转义：host 不能吃 ghost / hosting。
+			const lower = rest.toLowerCase();
+			let out = '', from = 0, i = lower.indexOf(needle);
+			while (i >= 0) {
+				const before = i > 0 ? lower[i - 1] : '';
+				const after = lower[i + needle.length] || '';
+				if (!/[a-z0-9_]/.test(before) && !/[a-z0-9_]/.test(after)) {
+					out += rest.slice(from, i) + ' ';
+					from = i + needle.length;
+				}
+				i = lower.indexOf(needle, i + 1);
+			}
+			rest = out ? (out + rest.slice(from)) : rest;
+		} else {
+			rest = rest.split(word).join(' ');
+		}
+	}
+	return rest.trim();
+}
+
 function shouldSendBodyToAdJudge(evaluation, bodyText) {
 	const text = String(bodyText || '').trim();
 	if (text.length < 4) return false;
 	const score = Number(evaluation?.score) || 0;
 	const threshold = Number(evaluation?.threshold) || DEFAULT_AD_SCORE_THRESHOLD;
 	if (score >= Math.max(3, Math.ceil(threshold * 0.45))) return true;
+	// 强信号是豁免词管不到的部分：谁写了招揽 / 交易 / 收益 / 联系方式，照送。
 	for (const re of AD_BODY_JUDGE_STRONG_PATTERNS) { if (re.test(text)) return true; }
+	// 剩下的句子剥掉代理 / 网站类类型词，看还有没有广告信号。
+	let rest = stripAdBodyJudgeTypeWords(text);
+	// 技术机器人（@xxxbot）是公益群 / 教程里的常规提法，不参与弱信号计数。
+	rest = rest.replace(/@[A-Za-z0-9_]*bot(?![A-Za-z0-9_])/gi, ' ');
+	if (rest.trim().length < 4) return false;
 	let weak = 0;
-	for (const re of AD_BODY_JUDGE_WEAK_PATTERNS) { if (re.test(text)) weak++; }
+	for (const re of AD_BODY_JUDGE_WEAK_PATTERNS) { if (re.test(rest)) weak++; }
 	return weak >= 2;
 }
 // 【类别清单】只是给模型的参考坐标，不是穷举表：清单套不上时模型自拟类别名。
@@ -30388,11 +30455,8 @@ async function applyAdBodyJudge(env, bodyText, input, judged) {
 	// 而不是只剩「没封」这个结果，分不清是放行还是根本没跑。
 	await writeAdScanState(env, adBodyJudgeKey(bodyText), JSON.stringify(record), record.at);
 	if (!convicted) {
-		// 【2026-11-18 主人口径】判正常的消息不再单独发通知（D1 记录照写，事后可查）；
-		// 调用失败与被代码压下来的要通知 —— 前者是「模型没跑起来」，后者是
-		// 「模型判了广告但没封」，两种都必须让主人看见，否则漏放无从发现。
-		if (!record.ok) await notifyAdBodyJudgeResult(env, bodyText, record, input, '未处置（调用失败）');
-		else if (record.withheld) await notifyAdBodyJudgeResult(env, bodyText, record, input, '未处置（' + record.withheld + '）');
+		// 【2026-11-22 主人口径】通知只发「正文 AI 判定：广告」这一种。
+		// 判正常的、调用失败的、被代码压下来的都不再打扰，D1 记录照写，事后可查。
 		return false;
 	}
 	const evaluation = input.evaluation;
@@ -41565,7 +41629,12 @@ async function detectAdOnMessage(message, env, ctx) {
 		// 【2026-11-22 加回预筛门，但口径不同】旧门用词表直接否决，漏掉上面那条；
 		// 新门只做「宽进」：强信号 / 评分可疑 / 两个弱信号同现才送，纯闲聊不花推理。
 		// 判什么、什么类别仍由模型自己说。
-		if (shouldSendBodyToAdJudge(evaluation, bodyTextForJudge)) {
+		// 【2026-11-22 主人口径】独立群有独立群自己的治理，正文 AI 判定一律不介入；
+		// 杀手群在函数入口已 return false，这里只补独立群。同步缓存先判（零成本），
+		// 缓存没填上时再用 D1 严格版兜底，避免把独立群当全局群判。
+		if (shouldSendBodyToAdJudge(evaluation, bodyTextForJudge)
+			&& !isIndependentGroup(chat.id)
+			&& !(await isIndependentGroupCurrent(env, chat.id))) {
 			// 浅拷贝一份再交给异步：模型要跑十几秒，主流程不能等它，也不能共用同一个
 			// evaluation 对象 —— 否则异步改 verdict 与主流程读 verdict 会互相踩。
 			const judgeInput = {
