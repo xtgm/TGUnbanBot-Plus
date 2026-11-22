@@ -30070,9 +30070,11 @@ async function loadAdSampleEmbeddings(env) {
 const AD_LLM_JUDGE_MODEL = '@cf/zai-org/glm-5.3';
 // 【2026-11-22 实测】正文判定是短任务（只输出一行 JSON），不需要思考模型。
 // 同一条广告连打：glm-5.3 四次全 4006、deepseek 三次全 4006，qwen3.8-27b
-// 一次成功（5.6s / 31.8 neurons）。正文判定优先用 qwen，glm 降为兜底。
-// 想切回 glm 优先：把环境变量 AD_LLM_JUDGE_FAST_MODEL 设成空串即可。
-const AD_LLM_JUDGE_FAST_MODEL = '@cf/qwen/qwen3.8-27b';
+// 一次成功（5.6s / 31.8 neurons）。
+// 【2026-11-22 再测】glm-4.7-flash 关掉思考后 0.9s / 0.14 neurons，比 qwen 快且便宜十倍，
+// 当前容量池也空闲，正文判定第一级改用它；qwen3.8-27b 降为第二级兜底。
+// 想切回 qwen 优先：把环境变量 AD_LLM_JUDGE_FAST_MODEL 设成 '@cf/qwen/qwen3.8-27b'。
+const AD_LLM_JUDGE_FAST_MODEL = '@cf/zai-org/glm-4.7-flash';
 // 【2026-11-17 删除 looksLikeAdShape 词表门】它曾经决定「哪条正文有资格送模型」，
 // 直接造成线上漏判：`💋上头电子烟 原料 成品油 依托 @kahbjuugvz0` 的四个形态特征只中一个
 // （@handle 被当成链接）、22 个强信号词零命中，于是模型一次都没被调用；
@@ -30081,6 +30083,43 @@ const AD_LLM_JUDGE_FAST_MODEL = '@cf/qwen/qwen3.8-27b';
 // 现在凡「未定罪、有正文、长度≥4」的消息一律送模型。
 // 采信线：模型说广告且 confidence ≥ 0.8 才照 ban 处置，与旧实现同一条线。
 const AD_BODY_BAN_LINE = 0.8;
+// ===== 送模型前的本地预筛（2026-11-22 主人要求：只判广告，不判正常消息）=====
+// 【为什么必须加】旧口径是「未定罪 + 正文 ≥4 字就送模型」，等于每条正常聊天都花一次推理。
+// 群和人数一多，立刻撞平台限流（3021）与容量（4006）。
+// 【为什么不能只用词表】2026-11-17 的教训：词表门漏掉了
+// `💋上头电子烟 原料 成品油 依托 @kahbjuugvz0`。所以这里只做「宽进」：
+// 强信号命中就送，结构化评分可疑就送，两个弱信号同现也送；只剩纯闲聊才放行。
+// 放行的消息仍走完整的结构化评分与素材核验，不是免检。
+const AD_BODY_JUDGE_STRONG_PATTERNS = [
+	/\+?\d[\d\s\-]{6,}\d/,
+	/@[A-Za-z][A-Za-z0-9_]{4,}/,
+	/(?:t\.me|telegram\.me|wa\.me)\//i,
+	/一单|一天[赚挣入到]|日入|月入|包赚|稳赚|日结|刷单|返利/,
+	/跑分|洗钱|代收|代付|下注|带单|博彩/,
+	/裸聊|约炮|包夜|上门服务/,
+	/解封|开盒|查档|代实名|接码|卡密/,
+	/USDT|泰达币|虚拟币|跑U/i,
+	/私聊我|加我|进群|引流|招商|招代理|招人|兼职/,
+	/出售|收购|批发|货源|低价出/
+];
+const AD_BODY_JUDGE_WEAK_PATTERNS = [
+	/https?:\/\/|www\./i,
+	/微信|vx|v信|威信|扣扣|企鹅|飞机|纸飞机|TG群|频道/i,
+	/\d+\s*[kKwW万千百]\s*(?:一单|起|包|元|块)/,
+	/优惠|折扣|包邮|特价|限时|秒杀|免费领|福利/i,
+	/关注|订阅|转发|点击|扫码/i
+];
+function shouldSendBodyToAdJudge(evaluation, bodyText) {
+	const text = String(bodyText || '').trim();
+	if (text.length < 4) return false;
+	const score = Number(evaluation?.score) || 0;
+	const threshold = Number(evaluation?.threshold) || DEFAULT_AD_SCORE_THRESHOLD;
+	if (score >= Math.max(3, Math.ceil(threshold * 0.45))) return true;
+	for (const re of AD_BODY_JUDGE_STRONG_PATTERNS) { if (re.test(text)) return true; }
+	let weak = 0;
+	for (const re of AD_BODY_JUDGE_WEAK_PATTERNS) { if (re.test(text)) weak++; }
+	return weak >= 2;
+}
 // 【类别清单】只是给模型的参考坐标，不是穷举表：清单套不上时模型自拟类别名。
 // 以后要加类别只改这一行，prompt 与通知共用同一份来源。
 // 2026-11-17 主人要求补全：原先 7 类漏了金融理财、成人用品与药品、解封查档
@@ -32322,6 +32361,9 @@ function adLLMReasoningParams(model) {
 	// max_tokens 被吃掉后正文可能截断。头像视觉链路对它是用
 	// chat_template_kwargs.enable_thinking=false 显式关掉的，这里保持同一口径。
 	if (id.includes('qwen3.8') || id.includes('qwen3-')) return { chat_template_kwargs: { enable_thinking: false } };
+	// 【2026-11-22】glm-4.7-flash 与 qwen3.8 共用同一个关思考开关；实测关掉后 0.9s / 0.14 neurons。
+	// reasoning_effort 只认 low，传 none / minimal 会报 8001 Invalid input。
+	if (id.includes('glm-4.7')) return { chat_template_kwargs: { enable_thinking: false } };
 	return {};
 }
 
@@ -32352,6 +32394,16 @@ function adLLMTransientError(error) {
 		|| text.includes('cog prediction')
 		|| text.includes('network connection lost')
 		|| text.includes('超时');
+}
+
+// 容量饱和 / RPM 限流：补试没有意义，直接换下一候选。
+// 4006 = 模型池满，3040 = 模型容量超限，3021 = 每分钟推理请求数打满。
+function adLLMCapacityError(error) {
+	const code = Number(error?.code ?? error?.status ?? NaN);
+	if ([3021, 3040, 4006].includes(code)) return true;
+	const text = (String(error?.message || error || '') + ' '
+		+ String(error?.cause?.message || error?.cause || '')).toLowerCase();
+	return /\b(3021|3040|4006)\b/.test(text) || text.includes('at capacity');
 }
 
 // 补试次数含首次，即最多再补一次；退避 220~400ms，避开瞬时排队窗口即可，
@@ -32408,6 +32460,9 @@ async function runAdLLMModel(env, config, body) {
 			} catch (error) {
 				lastError = error;
 				if (error?.adTimeout) throw error;
+				// 【2026-11-22】容量饱和（4006/3040）与 RPM 限流（3021）补试没有意义：
+				// 池子没空位、这一分钟已打满，补试只会加剧，直接切下一级。
+				if (adLLMCapacityError(error)) throw error;
 				if (attempt >= AD_LLM_RETRY_ATTEMPTS || !adLLMTransientError(error)) throw error;
 				if (Date.now() - startedAt > AD_LLM_RETRY_MAX_ELAPSED_MS) throw error;
 				await adLLMSleep(AD_LLM_RETRY_DELAY_MS + Math.floor(Math.random() * 180));
@@ -41505,9 +41560,10 @@ async function detectAdOnMessage(message, env, ctx) {
 		// 【2026-11-17 去掉词表门，改由模型自己判】旧的 looksLikeAdShape 用词表/形态决定
 		// 「要不要送模型」：`💋上头电子烟 原料 成品油 依托 @kahbjuugvz0` 强信号词零命中、
 		// 四个形态特征只中一个，模型一次都没被调用 —— 而它离线判这条 is_ad=true / 0.95。
-		// 现在只留一个条件：有正文（≥4 字）。有正文就送，判什么由模型自己说，
-		// 类别也由它自己给（清单套不上就自拟）。
-		if (bodyTextForJudge.trim().length >= 4) {
+		// 【2026-11-22 加回预筛门，但口径不同】旧门用词表直接否决，漏掉上面那条；
+		// 新门只做「宽进」：强信号 / 评分可疑 / 两个弱信号同现才送，纯闲聊不花推理。
+		// 判什么、什么类别仍由模型自己说。
+		if (shouldSendBodyToAdJudge(evaluation, bodyTextForJudge)) {
 			// 浅拷贝一份再交给异步：模型要跑十几秒，主流程不能等它，也不能共用同一个
 			// evaluation 对象 —— 否则异步改 verdict 与主流程读 verdict 会互相踩。
 			const judgeInput = {
