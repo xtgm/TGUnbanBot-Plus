@@ -30243,14 +30243,18 @@ async function judgeAdWithLLM(env, text, context = '') {
 	// 【2026-11-22 修】原来这里只连 glm-5.3 一个模型：4006 容量拒绝一来整条判定作废，
 	// 主人私聊成片收到「正文 AI 判定失败（4006）」。改走 runAdLLMModel 的三级候选链
 	// （glm-5.3 → deepseek-v4.1-flash → qwen3.8-27b），瞬态错误带退避补试。
-	// 外层 20 秒不变：4006 是立即返回，三级切换只花 1~3 秒，不挤占正常判定的思考时间。
+	// 【2026-11-22 修】候选链能扛 4006，但每级没有独立超时：glm-5.3 思考一次就能吃满外层
+	// 20 秒，deepseek / qwen3.8 永远轮不到 —— 主人看到的就是「失败（timeout）20.0 秒」。
+	// 按级限时：glm 9s（思考模型，给足但不许独占）、deepseek 4s（非思考，一行 JSON 很快）、
+	// qwen3.8 6s（关思考）。最坏 19s，外层放宽到 22s，留 8s 给落库与处置（waitUntil 30s）。
 	const startedAt = Date.now();
 	try {
 		const picked = await raceWithTimeout(runAdLLMModel(env, {
 			llmModel: model,
 			llmFallbackModel: String(env.AD_LLM_FALLBACK_MODEL || AD_LLM_FALLBACK_MODEL).trim(),
-			llmTertiaryModel: String(env.AD_LLM_TERTIARY_MODEL || AD_LLM_TERTIARY_MODEL).trim()
-		}, { messages, max_tokens: 8192, temperature: 0 }), 20000, null);
+			llmTertiaryModel: String(env.AD_LLM_TERTIARY_MODEL || AD_LLM_TERTIARY_MODEL).trim(),
+			llmPerCallTimeouts: [9000, 4000, 6000]
+		}, { messages, max_tokens: 8192, temperature: 0 }), 22000, null);
 		if (!picked) {
 			console.log('[glm-judge] 判定超时 model=' + model);
 			return { ok: false, error: 'timeout', ms: Date.now() - startedAt };
@@ -32371,14 +32375,30 @@ async function runAdLLMModel(env, config, body) {
 	// 单模型调用：瞬态错误（容量 / 超时 / 平台内部）补试一次，硬错误（模型不存在、
 	// 参数不支持、鉴权失败）立即抛出 —— 那类错误补试一百次也不会变。
 	// 慢失败（已经排队超时）不再补试，见 AD_LLM_RETRY_MAX_ELAPSED_MS。
-	const call = async (model) => {
+	// 【2026-11-22 修】正文判定连续出现「失败（timeout）耗时 20.0 秒」：glm-5.3 是思考模型，
+	// 高峰期一次思考就能把外层 20 秒预算吃干净，后面的 deepseek / qwen3.8 根本没机会接管。
+	// 现在每级给独立上限，慢的那级到点让位；超时不再补试（已经等满一轮，补试只是再烧一遍）。
+	const perCallTimeouts = Array.isArray(config?.llmPerCallTimeouts) ? config.llmPerCallTimeouts : null;
+	const call = async (model, index) => {
+		const perCallMs = Number(perCallTimeouts?.[index] || config?.llmPerCallTimeoutMs || 0);
 		let lastError = null;
 		for (let attempt = 1; attempt <= AD_LLM_RETRY_ATTEMPTS; attempt++) {
 			const startedAt = Date.now();
 			try {
-				return await env.AI.run(model, Object.assign({}, body, adLLMReasoningParams(model)));
+				const request = env.AI.run(model, Object.assign({}, body, adLLMReasoningParams(model)));
+				if (perCallMs > 0) {
+					const raced = await raceWithTimeout(request, perCallMs, null);
+					if (!raced) {
+						const err = new Error('timeout: ' + model + ' 超过 ' + perCallMs + 'ms 未返回');
+						err.adTimeout = true;
+						throw err;
+					}
+					return raced;
+				}
+				return await request;
 			} catch (error) {
 				lastError = error;
+				if (error?.adTimeout) throw error;
 				if (attempt >= AD_LLM_RETRY_ATTEMPTS || !adLLMTransientError(error)) throw error;
 				if (Date.now() - startedAt > AD_LLM_RETRY_MAX_ELAPSED_MS) throw error;
 				await adLLMSleep(AD_LLM_RETRY_DELAY_MS + Math.floor(Math.random() * 180));
@@ -32390,7 +32410,7 @@ async function runAdLLMModel(env, config, body) {
 	for (let index = 0; index < chain.length; index++) {
 		const model = chain[index];
 		try {
-			return { model, usedFallback: index > 0, result: await call(model) };
+			return { model, usedFallback: index > 0, result: await call(model, index) };
 		} catch (error) {
 			errors.push(error);
 			const next = chain[index + 1];
