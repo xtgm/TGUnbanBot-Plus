@@ -5293,12 +5293,29 @@ async function banUserFromAllGroups(userId, options = {}) {
 	const rest = scope.filter((groupId) => String(groupId) !== primary);
 	const results = [];
 	const execute = async groupId => {
-		if (typeof options.beforeGroup === 'function') {
-			const skipped = await options.beforeGroup(String(groupId));
-			if (skipped) return skipped;
+		// 【单群异常就地处隔离（2026-11-23）】原先这里直接 return applyGroupModeration(...)，
+		// 任何一群抛错都会让下面的 Promise.all 整批 reject：banUserFromAllGroups 抛出，
+		// 调用方的 banResults 保持空数组，于是「逐群把结果写回 ad_automatic_case_targets」
+		// 那一步一行都不跑 —— 账本永远停在 pending/executing，人也就没被封。
+		// 线上 9171170814 就是这样：判定层 ban、9 个群全 pending，只能靠人工 /spam 补。
+		// 改成就地转成失败回执：其余群照常执行，调用方能逐群记账、逐群重试。
+		try {
+			if (typeof options.beforeGroup === 'function') {
+				const skipped = await options.beforeGroup(String(groupId));
+				if (skipped) return skipped;
+			}
+			const groupOptions = typeof options.perGroupOptions === 'function' ? options.perGroupOptions(String(groupId)) : options;
+			return await applyGroupModeration(groupId,userId,groupOptions.mode,groupOptions);
+		} catch (error) {
+			console.error('[全群封禁] 单群处置异常，已隔离并保留重试:', String(groupId), String(userId), error && (error.stack || error.message || error));
+			return {
+				groupId: String(groupId),
+				userId: String(userId),
+				ok: false,
+				singleGroupException: true,
+				error: '单群处置异常，已隔离并保留重试：' + String((error && (error.message || error)) || '未知错误')
+			};
 		}
-		const groupOptions = typeof options.perGroupOptions === 'function' ? options.perGroupOptions(String(groupId)) : options;
-		return applyGroupModeration(groupId,userId,groupOptions.mode,groupOptions);
 	};
 	if (primary) {
 		results.push(await execute(primary));
