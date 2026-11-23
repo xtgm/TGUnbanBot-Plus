@@ -41344,14 +41344,25 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	let skeletons = 0;
 	let learningComplete = true;
 	if (options.skipLearning !== true && !localScope) {
-		({ learned, sampleAdded, skeletons = 0, complete:learningComplete = true } = await learnAdFeaturesOnVerdict(env, evaluation, {
-			userId,
-			ownerConfirmed: options.ownerConfirmed,
-			globalDryRunCollect: options.fullEvaluationCollected === true || Boolean(evaluation.learningPayload && evaluation.globalDrillAssets),
-			whitelist: options.whitelist,
-			sampleText: options.sampleText,
-			sampleSource: options.sampleSource
-		}));
+		// 【2026-11-23 通知优先】特征学习要调模型，原先既没有 try 也没有时限：
+		// 一旦它抛错或拖长，整个后台任务会在到达快照与通知之前被平台掐断，
+		// 主人既收不到判定通知、也查不到任何原因（线上 1858955787 事故）。
+		// 学习降级为「尽力而为」——失败或超时都只影响学习本身，绝不影响通知。
+		try {
+			const learning = await raceWithTimeout(learnAdFeaturesOnVerdict(env, evaluation, {
+				userId,
+				ownerConfirmed: options.ownerConfirmed,
+				globalDryRunCollect: options.fullEvaluationCollected === true || Boolean(evaluation.learningPayload && evaluation.globalDrillAssets),
+				whitelist: options.whitelist,
+				sampleText: options.sampleText,
+				sampleSource: options.sampleSource
+			}), 12000, null);
+			if (learning) ({ learned, sampleAdded, skeletons = 0, complete:learningComplete = true } = learning);
+			else { learningComplete = false; console.error('[广告检测] 特征学习超时，已跳过，继续发通知'); }
+		} catch (error) {
+			learningComplete = false;
+			console.error('[广告检测] 特征学习失败，已跳过，继续发通知:', formatD1SchemaError(error));
+		}
 	}
 
 	// 【2026-11-20】skipped（admin_required / independent_mode / manual_punishment_retained）
@@ -41385,23 +41396,6 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	let messageDeletion=options.reviewMessageDeletion||null;
 	let messageCleanup=null;
 	const triggerMessageId=Number(input?.messageId)>0&&!isTelegramServiceMessage(input.message||{})?Number(input.messageId):0;
-	if (chatId && !messageDeletion?.ok) {
-		try {
-			messageCleanup=await cleanupCurrentChatUserMessages(env, chatId, userId, triggerMessageId?[triggerMessageId]:[]);
-			const triggerFailure=triggerMessageId
-				?(messageCleanup.errors||[]).find((item)=>Number(item?.messageId)===triggerMessageId)
-				:null;
-			messageDeletion=triggerFailure
-				?{ok:false,error:String(triggerFailure.error||'删除失败'),cleanup:messageCleanup}
-				:{ok:true,cleanup:messageCleanup};
-		} catch (error) {
-			console.error('[广告检测] 清扫本人消息失败，回退单条删除:', error);
-			if (triggerMessageId) {
-				try { messageDeletion=await deleteMessage(chatId, triggerMessageId); }
-				catch (fallbackError) { console.error('[广告检测] 删除触发消息失败:', fallbackError); }
-			}
-		}
-	}
 
 	// 快照与通知只发第一主人：序号是 /ignore 的唯一入口，多人共用会互相抢号。
 	const ownerId = getOwnerNotifyTargets()[0] || '';
@@ -41450,6 +41444,27 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		if (!joinRequest&&!approvedJoin&&automatic && localScope && options.drillCloseReplay !== true&&options.suppressNotify!==true) await notifyIndependentGroupCreatorAdCase(env, chatId, seq, userId, notice + '\n范围：本群自动封禁（<code>' + escapeHtml(chatId) + '</code>）');
 	}
 
+	// 【2026-11-23 通知优先】清扫本人消息要逐条 deleteMessage，是这条链里最重的子请求支出。
+	// 原先它排在快照与通知之前，一旦子请求配额耗尽，后台任务直接冻结 ——
+	// 通知发不出去、快照没号、reviews 也不留痕。现在放到通知之后：
+	// 就算清扫被截断，主人也已经拿到判定通知与 /ignore 序号。
+	if (chatId && !messageDeletion?.ok) {
+		try {
+			messageCleanup=await cleanupCurrentChatUserMessages(env, chatId, userId, triggerMessageId?[triggerMessageId]:[]);
+			const triggerFailure=triggerMessageId
+				?(messageCleanup.errors||[]).find((item)=>Number(item?.messageId)===triggerMessageId)
+				:null;
+			messageDeletion=triggerFailure
+				?{ok:false,error:String(triggerFailure.error||'删除失败'),cleanup:messageCleanup}
+				:{ok:true,cleanup:messageCleanup};
+		} catch (error) {
+			console.error('[广告检测] 清扫本人消息失败，回退单条删除:', error);
+			if (triggerMessageId) {
+				try { messageDeletion=await deleteMessage(chatId, triggerMessageId); }
+				catch (fallbackError) { console.error('[广告检测] 删除触发消息失败:', fallbackError); }
+			}
+		}
+	}
 	await deleteAdScreening(env, userId);
 	console.log(
 		'[广告检测] 已处置 user=' + userId + ' chat=' + chatId
