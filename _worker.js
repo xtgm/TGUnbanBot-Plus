@@ -14396,7 +14396,14 @@ async function collectGlobalDryRunEvaluation(env, message, prior = null, options
 			suspectSignal: isAdSuspectSignal(filtered.text || contactName, signals, { contactCard: Boolean(contactName) })
 				|| linkCandidate || isAdSuspectSignal(filtered.bio, [], {})||isAdSuspectSignal([reviewProfile.avatarText,reviewProfile.badgeText,reviewProfile.customEmojiText].join(' '),[],{}), businessHit: countAdKeywordHits(filtered.text, AD_BUSINESS_KEYWORDS).length > 0,
 			userId, nowSeconds: Math.floor(Date.now() / 1000), sampleEnabled: adLLMPoolLimit(config, 'sample') > 0 });
-		if (review.submit || options.forceReview === true || llmMemo.done && llmMemo.answer?.ad === true) {
+		// 【2026-11-23 入群组合信号】西方名 + 空壳资料这类投放号原本 1 分 pass、
+		// 一次模型都没跑（理由见 adShellProfileSignals）。只在入群线送审：
+		// 组合信号本身不定罪，最终结论仍由模型与原有证据闸决定。
+		const shellJoinSignals = joinScreen ? adShellProfileJoinSignals(profile, evaluation) : [];
+		if (shellJoinSignals.length) {
+			evaluation.reasons = (evaluation.reasons || []).concat(['（批量空壳资料组合：' + shellJoinSignals.join(' + ') + '，送模型复核）']);
+		}
+		if (review.submit || options.forceReview === true || llmMemo.done && llmMemo.answer?.ad === true || shellJoinSignals.length) {
 			reviewInput = { profile: reviewProfile, text: filtered.text, contactCardName: contactName, contactPhone: String(message.contact?.phone_number || '') };
 			reviewOptions = { pool: options.reviewPool || review.pool || 'message', llmMemo, forceReview: options.source === 'rescreen' || options.forceReview === true,
 				// cron 轨显式不降级：判不成就是判不成，不能把它推进观察窗口。
@@ -30197,6 +30204,70 @@ function shouldSendBodyToAdJudge(evaluation, bodyText) {
 	for (const re of AD_BODY_JUDGE_WEAK_PATTERNS) { if (re.test(rest)) weak++; }
 	return weak >= 2;
 }
+
+// ===== 资料卡多信号组合（2026-11-23）=====
+//
+// 【为什么单列】评分层把「机器生成型西方全名」「无 emoji 且无 Bio」当单条判据，
+// 各自只有 +2 / -1，合起来 1 分 pass；送审信号里又刻意滤掉了昵称形态
+//（见 collectGlobalDryRunEvaluation 的 signals 过滤）—— 于是「西方名 + 空壳资料」
+// 这一类投放号入群时一次 AI 都没被调用。主人原话：真广告号大部分都是西方名。
+//
+// 【为什么是组合】任一条都能在正常人身上出现（外国用户本来就没写中文 bio，
+// 也可能不设头像）。只有【两条以上独立形态同时成立】才值得花一次模型调用；
+// 这个判断本身不定罪，送审之后的结论仍走原来的评分与证据闸。
+const AD_SHELL_PROFILE_MIN_SIGNALS = 2;
+// 【为什么要求其中一条必须是「身份机器生成」】线上该群最近 12 条入群检查里，
+// 6 条正是「+2 机器生成型西方全名 + -1 名称无 emoji 且无 Bio」= 1 分 pass。
+// 但「随机 username + 无 bio」这类组合在正常技术用户身上也会出现，单凭数量
+// 会把真人推进模型。身份形态是投放号的必要条件，其余信号只负责补足第二条。
+const AD_SHELL_PROFILE_IDENTITY_SIGNALS = ['机器生成昵称', '随机 username'];
+function adShellProfileSignals(profile, evaluation) {
+	const reasons = Array.isArray(evaluation?.reasons) ? evaluation.reasons : [];
+	const has = (re) => reasons.some((line) => re.test(String(line)));
+	const signals = [];
+	if (has(/机器生成型西方全名|非常用书写系统短随机串/)) signals.push('机器生成昵称');
+	if (has(/名称首尾对称 emoji|名称数字\+emoji 前缀|名称逐字分隔混淆/)) signals.push('昵称混淆形态');
+	if (has(/资料卡含私有群一次性邀请链接|含非白名单引流链接/)) signals.push('资料卡引流链接');
+	if (has(/随机字母数字 username/)) signals.push('随机 username');
+	// 评分层只在「确实查过 bio 且为空」时才写这条 -1（没查到的调用点传
+	// skipMissingBioPenalty=true，不会产生该标签），所以它可以直接当「无自述」用。
+	if (has(/名称无 emoji 且无 Bio/)) signals.push('无自述');
+	// 入群侧额外一条：确实查过 bio、bio 为空、且没有头像 —— 比评分标签更严。
+	if (profile && profile.bioFetched === true && !String(profile.bio || '').trim()
+		&& !String(profile.avatarId || '')) signals.push('无自述无头像');
+	return signals;
+}
+function adShellProfileStrongEnough(signals) {
+	return signals.length >= AD_SHELL_PROFILE_MIN_SIGNALS
+		&& signals.some((name) => AD_SHELL_PROFILE_IDENTITY_SIGNALS.includes(name));
+}
+// 只判「够不够格送一次模型」，不判广告 —— 名字里用 suspect 是提醒调用方别拿它当证据。
+function isAdShellProfileSuspect(evaluation) {
+	return adShellProfileStrongEnough(adShellProfileSignals(null, evaluation));
+}
+function adShellProfileJoinSignals(profile, evaluation) {
+	const signals = adShellProfileSignals(profile, evaluation);
+	return adShellProfileStrongEnough(signals) ? signals : [];
+}
+
+// 画像可疑号的正文送审名额：同一用户在同一群 24 小时只送一次。
+// 画像是「这个人值得看一眼」，不是「他的每条消息都是广告」——
+// 一次判定足以定性，重复送只会把额度花在同一句闲聊上。
+const AD_SHELL_BODY_JUDGE_COOLDOWN_SECONDS = 24 * 60 * 60;
+async function claimAdShellBodyJudgeSlot(env, chatId, userId) {
+	if (!env?.DB || !chatId || !userId) return false;
+	const key = 'glm_body_shell:' + String(chatId) + ':' + String(userId);
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		const last = Number(await readAdScanState(env, key, '0')) || 0;
+		if (last > 0 && now - last < AD_SHELL_BODY_JUDGE_COOLDOWN_SECONDS) return false;
+		await writeAdScanState(env, key, String(now), now);
+		return true;
+	} catch (error) {
+		console.warn('[正文AI] 画像送审名额读取失败，本次不送:', error?.message || error);
+		return false;
+	}
+}
 // 【类别清单】只是给模型的参考坐标，不是穷举表：清单套不上时模型自拟类别名。
 // 以后要加类别只改这一行，prompt 与通知共用同一份来源。
 // 2026-11-17 主人要求补全：原先 7 类漏了金融理财、成人用品与药品、解封查档
@@ -33563,6 +33634,31 @@ function collectAdLLMSecondEvidence(input, current) {
 		&& ((Array.isArray(link.adContent) && link.adContent.length) || link.adKnown === true || link.adConfirmed === true));
 	if (linked.length) {
 		hits.push('挂的 @' + linked.slice(0, 2).map((link) => String(link.handle || '')).join('/@') + ' 内容是广告');
+	}
+	// ⑥ 资料卡「即时通讯出口 ∧ 独立域名」同现（2026-11-23）。
+	//
+	// 【补的是哪个洞】把 t.me / 官网这类投放模板写进 bio、正文什么都不说的号：
+	// 模型看得很准（线上多条 0.95~1.00 判广告），但代码侧一条证据都验不出 ——
+	// 只有资料卡时 ①②③④⑤ 全不成立，最后被豁免词 -3 压成 pass。
+	// 豁免词保护的是「正文里提到 t.me」的技术讨论，不是「把 t.me 当投放入口」的资料卡。
+	//
+	// 【为什么不是单特征】两项都是代码从资料卡里数出来的独立出口：一个即时通讯入口
+	// 和一个自有域名。单挂任意一项都不算（正常博主只挂站点、正常用户只留一个 t.me），
+	// 两项同现才是「把人往外导」的结构。
+	// 【为什么只对中日韩自述设下限】有像样中日韩自我介绍的资料卡，语义交回模型；
+	// 这一档只认「链接 + 联系/官网这类套话」的投放卡。阈值 8 字：线上 A6API 那张卡
+	// 只有「和 联系方式 官网」5 个字，属于套话不是自述。英文卡不设此保护 ——
+	// 「西方名 + 英文/纯链接资料卡」正是本次漏检的主要形态，豁免了就等于没修。
+	// 不新增任何词表：域名与平台判定用的都是评分层同一个 extractAdDomains / isAdPlatformDomain。
+	if (!hits.length) {
+		const cardText = [profile.firstName, profile.lastName, profile.bio, profile.username].filter(Boolean).join(' ');
+		if (cardText.trim()) {
+			const imExit = /(?:t\.me|telegram\.me|t\.dog)\s*\/\s*[A-Za-z0-9_+\-]{3,}/i.test(cardText);
+			const ownDomain = extractAdDomains(cardText).some((domain) => !isAdPlatformDomain(domain)
+				&& !isAdDomainWhitelisted(domain, new Set(AD_DOMAIN_WHITELIST_SEED)));
+			const localChars = (cardText.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g) || []).length;
+			if (imExit && ownDomain && localChars < 8) hits.push('资料卡即时通讯出口与独立域名同现（无本地语言自述）');
+		}
 	}
 	return hits;
 }
@@ -41801,7 +41897,19 @@ async function detectAdOnMessage(message, env, ctx) {
 		// 【2026-11-22 主人口径】独立群有独立群自己的治理，正文 AI 判定一律不介入；
 		// 杀手群在函数入口已 return false，这里只补独立群。同步缓存先判（零成本），
 		// 缓存没填上时再用 D1 严格版兜底，避免把独立群当全局群判。
-		if (shouldSendBodyToAdJudge(evaluation, bodyTextForJudge)
+		// 【2026-11-23 第二条送入口：资料卡多信号可疑】
+		// 词表/评分门只处理「正文本身有词」的情况；这一条处理「正文干干净净、
+		// 但发消息的人是个空壳投放号」的情况，判据全部来自评分层已写进 reasons 的
+		// 结构化标签，不新增词表。词表门不成立时才走这里，纯闲聊的号零额外成本；
+		// 进入前先判独立群，避免为独立群白申请一次送审名额。
+		let bodyJudgeGate = shouldSendBodyToAdJudge(evaluation, bodyTextForJudge);
+		if (!bodyJudgeGate) {
+			bodyJudgeGate = isAdShellProfileSuspect(evaluation)
+				&& !isIndependentGroup(chat.id)
+				&& !(await isIndependentGroupCurrent(env, chat.id))
+				&& await claimAdShellBodyJudgeSlot(env, chat.id, userId);
+		}
+		if (bodyJudgeGate
 			&& !isIndependentGroup(chat.id)
 			&& !(await isIndependentGroupCurrent(env, chat.id))) {
 			// 浅拷贝一份再交给异步：模型要跑十几秒，主流程不能等它，也不能共用同一个
