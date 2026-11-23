@@ -41162,23 +41162,6 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		blacklistCode = 'ERROR';
 	}
 
-	// 自动处罚会连带撤回原消息（revoke_messages），群里的证据当场就没了；
-	// 主人事后点纠错时只剩文字快照，看图/看视频的现场全丢。先静默复制一份到第一主人私聊，
-	// 纠错通知直接回复到这条证据上 —— 不看这条通知，就不会收到任何提示。
-	let evidenceMessageId = null;
-	if (automatic && !joinGuard && !localScope && options.drillCloseReplay !== true && options.suppressNotify !== true) {
-		const evidenceOwner = getOwnerNotifyTargets()[0] || '';
-		if (evidenceOwner && chatId && input?.messageId) {
-			try {
-				const copied = await copyMessageToChat(evidenceOwner, chatId, input.messageId, { disableNotification: true });
-				if (copied?.ok) evidenceMessageId = Number(copied.result?.message_id) || null;
-			} catch (error) {
-				// 复制失败只是少了一份现场，不能挡住处罚本身。
-				console.error('[广告检测] 静默保留原消息失败:', error);
-			}
-		}
-	}
-
 	let banResults = [];
 	const reviewExecution=automatic&&options.reviewExecution?.userId===userId&&options.reviewExecution.chatId===chatId?options.reviewExecution:null;
 	try {
@@ -41461,8 +41444,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			const groupLabel = input?.chatTitle ? '<a href="https://t.me/c/' + escapeHtml(chatId.replace(/^-100/, '')) + '">' + escapeHtml(input.chatTitle) + '</a> ' : '';
 			const scopeLine = automatic ? localScope ? '\n范围：独立群本群自动治理（' + groupLabel + '<code>' + escapeHtml(chatId) + '</code>）'
 				: '\n范围：联动 '+automaticScopeGroupIds.length+' 个非独立治理群；独立群不参与，逐群记录自动处罚归属' : '';
-			// 有证据副本就回复到证据上：主人一点通知就同时看到原文/原图与纠错按钮。
-			await sendTelegramMessageChunks(ownerId, notice + scopeLine, buildAdNoticeKeyboard(seq, userId, { automatic }), evidenceMessageId);
+			await sendTelegramMessageChunks(ownerId, notice + scopeLine, buildAdNoticeKeyboard(seq, userId, { automatic }));
 		} catch (error) {
 			console.error('[广告检测] 推送判定通知失败:', error);
 		}
