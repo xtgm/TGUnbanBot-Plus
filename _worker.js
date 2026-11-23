@@ -23556,8 +23556,15 @@ async function sendFlashMessage(chatId, text, ctx, ttlMs, replyMarkup = null) {
 	const messageId = result?.result?.message_id;
 	if (!messageId || ttl <= 0 || !ctx || typeof ctx.waitUntil !== 'function') return result;
 	ctx.waitUntil((async () => {
-		await new Promise((r) => setTimeout(r, ttl));
-		await deleteMessage(chatId, messageId);
+		// 秒撤回：优先用 Workers 原生 scheduler.wait，避免 isolate 回收导致 setTimeout 未触发。
+		if (typeof scheduler !== 'undefined' && scheduler && typeof scheduler.wait === 'function') await scheduler.wait(ttl);
+		else await new Promise((r) => setTimeout(r, ttl));
+		let deleted = await deleteMessage(chatId, messageId);
+		if (deleted?.ok !== true) {
+			// 单次失败（Telegram 抖动 / 429）再补一刀，撤不掉的几率降到最低。
+			await new Promise((r) => setTimeout(r, 500));
+			await deleteMessage(chatId, messageId);
+		}
 	})());
 	return result;
 }
@@ -46361,8 +46368,9 @@ async function deliverAdJoinNotice(env,id,ctx=null){
 			}
 			else{
 				const name=String([data.user.first_name,data.user.last_name].filter(Boolean).join(' ')||data.evaluation?.snapshot?.name||'用户').replace(/[\r\n\t]+/g,' ').slice(0,80);
-				// 【2026-11-15 主人口径】群内只留 5 秒闪屏，完整报告仍发第一主人私聊。
-				const sent=await sendFlashMessage(data.chatId,escapeHtml(adJoinNoticeTitle(data.outcome)+'：'+name+'（'+data.userId+'）'),ctx,5000);
+				// 【2026-11-15 主人口径】群内只留闪屏，完整报告仍发第一主人私聊。
+				// 【2026-11-23 主人要求】5 秒没撤掉，改成 1 秒秒撤回。
+				const sent=await sendFlashMessage(data.chatId,escapeHtml(adJoinNoticeTitle(data.outcome)+'：'+name+'（'+data.userId+'）'),ctx,1000);
 				groupResult={ok:sent?.ok===true,messageId:sent?.result?.message_id,error:sent?.error||sent?.description||''};
 				if(!groupResult.ok)retryAfter=Math.max(60,Number(sent?.retryAfterSeconds)||0);
 			}
