@@ -12000,11 +12000,34 @@ async function ensureAdJoinGuardExceptionTable(env) {
 	return true;
 }
 
+// 名单 30 秒缓存：消息路径每条都要问一次「这个杀手群是不是特例」，全表 SELECT 不能每条都跑。
+// 跨 isolate 各自缓存，名单变更最迟 30 秒生效；读失败也按空集缓存 30 秒（fail-closed）。
+const AD_JOIN_GUARD_EXCEPTION_CACHE_TTL_MS = 30000;
+let AD_JOIN_GUARD_EXCEPTION_CACHE = { at: 0, ids: new Set() };
+
 async function readAdJoinGuardExceptionIds(env) {
-	// 【2026-11-19 关停杀手群特例】主人要求所有检测过滤杀手群，第一道防线也不例外。
-	// 名单查询保留（表还在），但一律返回空集：特例群不再参与入群筛查，
-	// 也不会通过 resolveAutomaticAdTargets 混进跨群处置目标。
-	return new Set();
+	// 【2026-11-23 按主人要求恢复】2026-11-19 曾一律返回空集、所有杀手群都不参与防线；
+	// 现在只对 ad_join_guard_groups 名单里列出的群开放，名单之外一个都不放行。
+	// 过滤口径不变：只认「配置群里的杀手群」，主群 / 独立群 / 非杀手群写进名单也一律忽略，
+	// 名单写错不会把范围扩大到不该管的群。其余杀手群照旧不参与任何防线。
+	if (!env?.DB) return new Set();
+	const now = Date.now();
+	if (now - AD_JOIN_GUARD_EXCEPTION_CACHE.at < AD_JOIN_GUARD_EXCEPTION_CACHE_TTL_MS) return AD_JOIN_GUARD_EXCEPTION_CACHE.ids;
+	let ids = new Set();
+	try {
+		await ensureAdJoinGuardExceptionTable(env);
+		const result = await env.DB.prepare('SELECT chat_id FROM ad_join_guard_groups').all();
+		if (!result || result.success === false || !Array.isArray(result.results)) throw new Error('入群特例名单读取未成功');
+		const mainGroup = String(runtime().GROUP_ID || '');
+		ids = new Set((result.results || []).map(row => String(row.chat_id || '')).filter(id =>
+			id && isKillerModeGroup(id) && isConfiguredGroup(id) && !isIndependentGroup(id) && id !== mainGroup));
+	} catch (error) {
+		console.error('[广告检测] 入群特例名单读取失败（30 秒内按无特例处理）:', formatD1SchemaError(error));
+		AD_JOIN_GUARD_EXCEPTION_CACHE = { at: now, ids: new Set() };
+		return new Set();
+	}
+	AD_JOIN_GUARD_EXCEPTION_CACHE = { at: now, ids };
+	return ids;
 }
 
 async function isAdJoinGuardKillerExceptionGroup(env, chatId) {
@@ -12025,8 +12048,9 @@ async function isAutomaticAdMuteEntryCurrent(env, groupId, entry) {
 // DB 缺失时不做独立群复核：让后面的筛查入口抛「数据库不可用」，与改动前同一句报错。
 async function isAdJoinGuardGroupCurrent(env, chatId) {
 	const id = String(chatId || '');
-	// 杀手群一律不参与任何防线（含第一道防线与入群事件复核）。
-	if (isKillerModeGroup(id)) return false;
+	// 杀手群默认不参与任何防线（含第一道防线与入群事件复核）。
+	// 【2026-11-23】只有主人明确列进 ad_join_guard_groups 的特例群例外；其余杀手群照旧一律排除。
+	if (isKillerModeGroup(id)) return isAdJoinGuardKillerExceptionGroup(env, id);
 	if (isAdJoinGuardGroup(id)) return !env?.DB || !await isIndependentGroupCurrent(env, id);
 	// 【同步判死，别为注定为空的查询付往返】readAdJoinGuardExceptionIds 已经把名单过滤成
 	// 「配置群里的杀手群」（排掉主群、独立群、非杀手群），所以这些群在任何情况下都不可能在
@@ -41274,7 +41298,10 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			deferRetry:options.drillCloseReplay===true||options.deferRetry===true,
 			revokeMessages: true,
 			// 自动检测记的是 system，不是第一主人：扇出跳过独立群，但事发群本身照封（批次 2 再细分独立群口径）。
-			mode: options.drillCloseReplay === true ? 'kick' : localScope ? (await loadGroupLocalSettings(env, chatId)).action : undefined,
+			// 杀手群口径固定：自动检测命中一律永久禁言、留群（顶部 10.6）。
+			// 特例群走自动路径时 localScope 会为真，不能拿本群独立设置里的 kick 把它覆盖成踢人。
+			mode: options.drillCloseReplay === true ? 'kick' : isKillerModeGroup(chatId) ? undefined
+				: localScope ? (await loadGroupLocalSettings(env, chatId)).action : undefined,
 			groupIds: automatic ? automaticScopeGroupIds : manualAdDetectionScopeGroupIds(chatId)
 		};
 		if (automatic) {
@@ -41823,8 +41850,9 @@ async function detectAdOnJoin(message, env, ctx) {
 	const newMembers = message?.new_chat_members;
 	if (!Array.isArray(newMembers) || !newMembers.length) return false;
 	const chat = message.chat;
-	// 杀手群不走第二道防线。
-	if (!chat || isKillerModeGroup(chat.id)) return false;
+	// 杀手群默认不走第二道防线；主人指定的特例群例外（处置仍按杀手群口径：本群永久禁言、留群）。
+	if (!chat) return false;
+	if (isKillerModeGroup(chat.id) && !await isAdJoinGuardKillerExceptionGroup(env, chat.id)) return false;
 	if (!await isAdJoinGuardGroupCurrent(env, chat.id)) return false;
 	if (!env?.DB) throw new Error('入群筛查数据库不可用，等待重投');
 	if (!(await isDryRunGroup(env,chat.id)) && !(await adDetectionReady(env))) throw new Error('入群筛查尚未就绪，等待重投');
@@ -41863,8 +41891,9 @@ async function detectAdOnJoin(message, env, ctx) {
 async function detectAdOnMessage(message, env, ctx) {
 	if (!env?.DB || !message?.chat || !message?.from || isAdExemptBot(message.from)) return false;
 	const chat = message.chat, from = message.from, userId = from.id;
-	// 杀手群过滤所有检测：正文 / 图片 / 表情 / 头像都不判。
-	if (isKillerModeGroup(chat.id)) return false;
+	// 杀手群默认过滤所有检测（正文 / 图片 / 表情 / 头像都不判）；
+	// 主人指定的特例群例外：照常走完整检测，处置仍按杀手群口径。
+	if (isKillerModeGroup(chat.id) && !await isAdJoinGuardKillerExceptionGroup(env, chat.id)) return false;
 	if (chat.type === 'private' || !isConfiguredGroup(chat.id) && !isKillerModeGroup(chat.id) || isTelegramServiceMessage(message) || !hasAdMessageContent(message)
 		|| isTelegramSlashCommand(message.text) || classifyAdReplyIntent(message.text)) return false;
 	if (isAdDetectionExemptUser(userId) || await isAdUserWhitelisted(env, userId)
