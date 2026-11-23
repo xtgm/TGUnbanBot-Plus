@@ -16506,13 +16506,11 @@ async function recordSpamText(env, repliedMsg, options = {}) {
 	// 悄悄拒收，名单一条都进不去（线上 7 条 learning_failed 全是这个原因）。
 	// 旁路判的是「这条正文是不是投放模板」而不是「有没有广告词」，口径见 isTemplateAdText：
 	// 只能由调用方在拿得到跨用户重复证据时传入，单条路径传不了 → 行为与改动前逐字节一致。
-	// 【2026-11-15 主人口径·最终】第一主人 /spam 的正文照常收录，不再因豁免词拒收；
-	// 唯一跳过的「签到 / 今天天气不错」这类明显正常短句 —— 主人不会拿签到去 spam。
-	if (options?.trusted === true) {
-		if (isObviouslyNormalChatText(norm)) {
-			return { ok: false, reason: '明显正常短句，不收录', norm };
-		}
-	} else if (!isAdBearingText(norm) && !isTemplateAdText(norm, options?.crossUsers)) {
+	// 【2026-11-23 主人口径·最终】第一主人 /spam、/ban、/sban 判定的正文一律收录：
+	// 判定权在主人手上，程序无法判断「这句话是不是广告」，任何二次否决都会让同款直封失效。
+	// trusted 路径只保留 buildModerationTextKey 的取文失败与 6 字门槛；
+	// 自动路径（trusted 未传）仍走广告证据闸，保持原行为。
+	if (options?.trusted !== true && !isAdBearingText(norm) && !isTemplateAdText(norm, options?.crossUsers)) {
 		return { ok: false, reason: '正文没有可识别的广告证据；账号资料/头像/语义特征已学习', norm };
 	}
 	if (!(await ensureAdSpamTextsTable(env))) return { ok: false, reason: '名单表初始化失败', norm };
@@ -21787,7 +21785,8 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				for (const id of learnTargets) {
 					const one = await learnSpamTextsFromCache(env, id, {
 						cached: textLists.get(String(id)) || [],
-						templateCounts
+						templateCounts,
+						trusted: true
 					});
 					sum.added += one.added;
 					sum.total += one.total;
