@@ -24739,30 +24739,16 @@ const AD_EMBEDDING_DIMENSION = 1024;
 //
 // 【模型选型·2026-11-11 改为主备双模型】
 //
-// 主力 @cf/zai-org/glm-5.3：320B 总参 / 18B 激活、1,048,576 上下文、
-// 原生 Vision、$0.15 / $0.50 per 1M tokens。选它是因为这一层同时要干三件事 ——
-// 认出中文变体、给出一句话 reason、逐字抽出 features（自我学习的原料），
-// 单次调用能全给齐；1M 上下文也让 50 条样本的形态摘要不再挤。
-//
-// 备用 @cf/deepseek-ai/deepseek-v4.1-flash-1017：552B MoE、1M 上下文、
-// $0.30 / $1.20。只在主力【调用抛错】时接管，日常不产生费用。
-//
-// 旧 qwen3-30b-a3b（32K 上下文、Reasoning）保留为回退项：Dashboard 设
-// AD_LLM_MODEL=@cf/qwen/qwen3-30b-a3b-fp8 即可整体切回，不必改代码。
-//
-// 【两个新模型都是 Reasoning 模型，思考参数必须按模型区分】见 adLLMReasoningParams：
-// glm-5.3 官方写明 "Reasoning cannot be disabled"，只能降到 low；
-// deepseek-v4.1 的 reasoning_effort 枚举含 none。不区分的话思考会吃掉 max_tokens，
-// JSON 被截断在半截 —— 线上表现就是解析失败率暴涨、连续 20 次后熔断。
-const AD_LLM_MODEL = '@cf/zai-org/glm-5.3';
-const AD_LLM_FALLBACK_MODEL = '@cf/deepseek-ai/deepseek-v4.1-flash-1017';
-// 【2026-11-22 第三候选】线上实测主备【同时】撞 4006 容量不足（12 分钟 24 次），
-// 说明 glm 与 deepseek 在同一时段会一起被限流，双模型链路对容量抖动没有冗余。
-// 选 @cf/qwen/qwen3.8-27b：头像视觉链路已在用，本 worker 实测可用。
-// ⚠️ 初版写成 qwen3-30b-a3b-fp8，`/ai/models/search` 实测该 ID 已不在目录 ——
-// 不存在的模型会抛【硬错误】，第三候选反而把 warn 变成 error，必须用目录里的真名。
-// 它和 glm / deepseek 不在同一个容量池，中文广告话术的召回也比 llama 系稳。
-// 只有主备都失败才轮到它，日常零成本。
+// 【模型选型·2026-11-23 换链】操作员在 LLM 游乐场实测：glm-5.3 与
+// deepseek-v4.1-flash-1017 均不可用，两者已从所有候选链移除。
+// 现主模型 @cf/zai-org/glm-4.7-flash：关思考实测 0.9s / 0.14 neurons，容量池空闲。
+// 备用与第三候选同用 @cf/qwen/qwen3.8-27b：头像视觉链路已在用，本 worker 实测可用，
+// 与 glm 不在同一个容量池。链去重后实际是两级：glm-4.7-flash → qwen3.8-27b。
+// 两个模型都在 adLLMReasoningParams 里显式关思考，不会吃 max_tokens 截断 JSON。
+const AD_LLM_MODEL = '@cf/zai-org/glm-4.7-flash';
+const AD_LLM_FALLBACK_MODEL = '@cf/qwen/qwen3.8-27b';
+// 【第三候选保留为 qwen3.8-27b】与备用同 ID，链里会被去重，等于日常两级；
+// 保留常量是为了环境变量 AD_LLM_TERTIARY_MODEL 仍可单独指向别的目录内模型。
 const AD_LLM_TERTIARY_MODEL = '@cf/qwen/qwen3.8-27b';
 // 【每日上限：2026-10-11 从 200 提到 1000，并拆成三个池】
 //
@@ -28527,7 +28513,7 @@ async function prewarmCheck(env, message, profile, stats) {
 				{ role: 'system', content: AD_PREWARM_PROMPT + AD_LLM_NO_THINK },
 				{ role: 'user', content: payload }
 			],
-			// glm-5.3 的思考关不掉（只能降到 low），512 会被思考吃掉、JSON 截断 —— 抬到 1024。
+			// 512 在旧思考模型上会被 reasoning 吃掉、JSON 截断，抬到 1024 留余量。
 			// 上限不是配额：Neurons 按实际生成计费，抬高只影响最坏情况。
 			max_tokens: 1024,
 			temperature: 0.1
@@ -30087,12 +30073,14 @@ async function loadAdSampleEmbeddings(env) {
 
 // 语义相似度判定。返回最高相似度与命中的样本原文，供通知展示判定依据。
 // ===== 正文 AI 判别通道（2026-11-15 主人选定：原生 glm，取消 jev）=====
-// 只负责正文文字：只要有正文（≥4 字）就调一次 glm-5.3，让它自己判
+// 只负责正文文字：只要有正文（≥4 字）就调一次模型，让它自己判
 //「是不是广告 + 类别 + 依据 + 置信度」—— 类别先按清单选，清单套不上就自拟。
 // 不依赖词表 / 样本库；图片、贴纸、头像仍走 gemma/clef 视觉链路。
 // 调用失败、超时、输出不是 JSON → 返回 { ok:false, error }，调用方不动消息，
 // 只落库并通知主人，绝不阻断消息处理。
-const AD_LLM_JUDGE_MODEL = '@cf/zai-org/glm-5.3';
+// 【2026-11-23】glm-5.3 游乐场实测不可用，兜底位换成同款 glm-4.7-flash；
+// 与第一级同 ID，链去重后实际是 glm-4.7-flash → qwen3.8-27b 两级。
+const AD_LLM_JUDGE_MODEL = '@cf/zai-org/glm-4.7-flash';
 // 【2026-11-22 实测】正文判定是短任务（只输出一行 JSON），不需要思考模型。
 // 同一条广告连打：glm-5.3 四次全 4006、deepseek 三次全 4006，qwen3.8-27b
 // 一次成功（5.6s / 31.8 neurons）。
@@ -30373,26 +30361,19 @@ async function judgeAdWithLLM(env, text, context = '') {
 	// 不做第二次重试：同 prompt 重跑大概率同样结果，而两次 20 秒会叠到 40 秒，
 	// 直接冲破 ctx.waitUntil 的 30 秒窗口（模型 20 秒 + 封禁处置还要几秒）。
 	// 没拿到 JSON 就落库 + 通知主人，不假装判过了。
-	// 【2026-11-22 修】原来这里只连 glm-5.3 一个模型：4006 容量拒绝一来整条判定作废，
-	// 主人私聊成片收到「正文 AI 判定失败（4006）」。改走 runAdLLMModel 的三级候选链
-	// （glm-5.3 → deepseek-v4.1-flash → qwen3.8-27b），瞬态错误带退避补试。
-	// 【2026-11-22 修】候选链能扛 4006，但每级没有独立超时：glm-5.3 思考一次就能吃满外层
-	// 20 秒，deepseek / qwen3.8 永远轮不到 —— 主人看到的就是「失败（timeout）20.0 秒」。
-	// 【2026-11-22 实测调序】同一条广告连打：glm 四次全 4006、deepseek 三次全 4006，
-	// qwen3.8-27b 一次成功。正文判定改 qwen 优先，glm 兜底：省掉前两级各约 1 秒的
-	// 无用等待，也不再刷「glm → deepseek 4006」的告警噪音。
-	// 【2026-11-22 再调】glm-4.7-flash 关思考实测 0.9s / 0.14 neurons，容量池空闲，
-	// 提到第一级；qwen3.8-27b 第二级；glm-5.3 退到第三级（当前持续 4006，只作最后兜底）。
-	// 按级限时：glm-4.7-flash 9s（有 7.7s 抖动）、qwen 7s、glm 4s。最坏 20s，外层 22s。
+	// 【2026-11-23 换链】glm-5.3 与 deepseek-v4.1-flash 游乐场实测不可用，已全部移除。
+	// 现在第一级 glm-4.7-flash（关思考 0.9s），第二级 qwen3.8-27b；
+	// 第三级常量与第一级同 ID，链去重后不产生额外调用。
+	// 按级限时：glm-4.7-flash 9s（有 7.7s 抖动）、qwen 7s。最坏 16s，外层 22s。
 	const fastJudgeModel = String(env.AD_LLM_JUDGE_FAST_MODEL || AD_LLM_JUDGE_FAST_MODEL).trim();
 	const startedAt = Date.now();
 	try {
 		const picked = await raceWithTimeout(runAdLLMModel(env, {
-			// glm-5.3 / deepseek 当前持续 4006，放进兜底位只会白等；第二级换同刻空闲的 qwen。
+			// 第一级 glm-4.7-flash，第二级 qwen3.8-27b；兜底位与第一级同 ID，去重后不再多打一次。
 			llmModel: fastJudgeModel || model,
 			llmFallbackModel: String(env.AD_LLM_TERTIARY_MODEL || AD_LLM_TERTIARY_MODEL).trim(),
 			llmTertiaryModel: model,
-			llmPerCallTimeouts: [9000, 7000, 4000]
+			llmPerCallTimeouts: [9000, 7000]
 		}, { messages, max_tokens: 8192, temperature: 0 }), 22000, null);
 		if (!picked) {
 			console.log('[glm-judge] 判定超时 model=' + model);
@@ -32515,9 +32496,8 @@ function buildAdLLMPayload(input) {
 //
 // ===== 思考参数：换模型必须跟着换，否则 JSON 会被思考截断 =====
 // qwen3 走 prompt 末尾的 /no_think 软开关（见 AD_LLM_NO_THINK）；
-// glm-5.3 的 reasoning_effort 只有 max/high/low，官方写明
-// "Reasoning cannot be disabled"，只能降到 low 把思考压到最短；
-// deepseek-v4.1 的枚举里多一个 none，可以彻底关掉。
+// 【2026-11-23】glm-5.3 / deepseek-v4.1 已从候选链移除，但下面两个分支保留作防御：
+// 若 Dashboard 环境变量仍指着旧模型，思考参数不会漏配（漏配会被默认思考吃满 max_tokens）。
 // 认不出的模型一律不传，保持旧行为 —— 不能把吐出来的参数硬塞给不认识的模型。
 function adLLMReasoningParams(model) {
 	const id = String(model || '').toLowerCase();
