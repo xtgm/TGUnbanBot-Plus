@@ -19681,6 +19681,10 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 		await handleDryRunButtonCallback(callbackQuery, env);
 		return;
 	}
+	if (data.startsWith('adbody:')) {
+		await handleAdBodyTraceCallback(callbackQuery, env);
+		return;
+	}
 	if (data.startsWith('review:')) {
 		await handleAdContentReviewCallback(callbackQuery, env);
 		return;
@@ -30402,6 +30406,54 @@ function adBodyJudgeKey(text) {
 	return 'glm_body_' + adTextHash(String(text || '').slice(0, 4000));
 }
 
+// 【2026-11-23】正文判定通知上「定位违规痕迹」按钮的现场键。
+// 正文判定不写 ad_content_reviews（那是 /review 待核队列，只收未决案例），
+// 所以完整正文与命中位置另存一份，点击按钮时按群号+消息号取回。
+function adBodyTraceKey(chatId, messageId) {
+	return 'adbody_trace:' + String(chatId) + ':' + Number(messageId);
+}
+
+// 正文里把实际命中的交易动词、行业词和强信号形态加粗，主人一眼看到是哪几个词违规。
+// 入参是原文（未转义），返回 HTML 片段；其余字符一律 escapeHtml，用户内容不会注入标签。
+function adTraceHighlightText(text) {
+	const source = String(text || '');
+	if (!source) return '';
+	const spans = [];
+	const add = (start, end) => { if (end > start) spans.push([start, end]); };
+	const lower = source.toLowerCase();
+	const words = [...countAdKeywordHits(source, AD_TRADE_VERBS), ...countAdKeywordHits(source, AD_BUSINESS_KEYWORDS)];
+	for (const word of words) {
+		const needle = String(word || '').toLowerCase();
+		if (!needle) continue;
+		let from = 0, at;
+		while ((at = lower.indexOf(needle, from)) >= 0) {
+			add(at, at + needle.length);
+			from = at + needle.length;
+		}
+	}
+	for (const pattern of AD_BODY_JUDGE_STRONG_PATTERNS) {
+		let re;
+		try { re = new RegExp(pattern.source, pattern.flags.indexOf('g') >= 0 ? pattern.flags : pattern.flags + 'g'); } catch (_) { continue; }
+		let match, guard = 0;
+		while ((match = re.exec(source)) && guard++ < 100) {
+			if (match[0]) add(match.index, match.index + match[0].length); else re.lastIndex++;
+		}
+	}
+	if (!spans.length) return escapeHtml(source);
+	spans.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+	const merged = [];
+	for (const span of spans) {
+		const last = merged[merged.length - 1];
+		if (last && span[0] <= last[1]) last[1] = Math.max(last[1], span[1]); else merged.push(span.slice());
+	}
+	let out = '', cursor = 0;
+	for (const [start, end] of merged) {
+		out += escapeHtml(source.slice(cursor, start)) + '<b>' + escapeHtml(source.slice(start, end)) + '</b>';
+		cursor = end;
+	}
+	return out + escapeHtml(source.slice(cursor));
+}
+
 // 模型判广告（且过采信线）就照 ban 处置；判正常或调用失败一律不动消息。
 // 返回是否已定罪，供调用方记录。
 // 【2026-11-17】判定结果单独发一条通知（见 notifyAdBodyJudgeResult），
@@ -30526,13 +30578,43 @@ async function notifyAdBodyJudgeResult(env, bodyText, record, input, action, opt
 		'用户：<code>' + escapeHtml(judgeUserId) + '</code>'
 			+ (judgeUserId ? '　<a href="tg://user?id=' + escapeHtml(judgeUserId) + '">查看资料</a>' : ''),
 		'消息：' + escapeHtml(String(bodyText || '').slice(0, 300)),
-		judgeMessageLink ? '定位：' + escapeHtml(judgeMessageLink) : '',
 		'处置：' + escapeHtml(action || '')
 	].filter(Boolean);
 	// 定罪并已处置时直接挂纠错按钮：主人看到「正文 AI 判定：广告」觉得判错了，
 	// 不用回群翻消息、也不用记快照序号，当场就能解封（ig = 误封解除，连学习一起撤）。
-	const keyboard = options?.banned === true && options?.seq
-		? buildAdNoticeKeyboard(options.seq, judgeUserId, { automatic: true }) : null;
+	// 【2026-11-23】再加两个只读入口：定位违规痕迹、查看用户头像。
+	// 正文判定不写 /review 现场卡片，主人原来只能靠通知里那 300 字和模型依据反推；
+	// 这里把完整正文、命中位置、资料存进 ad_scan_state，按钮只带群号/消息号，
+	// 点击时再取；通知本身不多占一行。只读，不改判定、不动名单、不写学习。
+	const judgeMsgId = Number(input?.message?.message_id) || 0;
+	if (judgeMsgId > 0 && /^-100[0-9]+$/.test(judgeChatId)) {
+		try {
+			const snap = input?.evaluation?.snapshot || {};
+			await writeAdScanState(env, adBodyTraceKey(judgeChatId, judgeMsgId), JSON.stringify({
+				at: record.at, chat: judgeChatId, chatTitle: judgeChatTitle, msg: judgeMsgId,
+				user: judgeUserId, name: String(snap.name || input?.message?.from?.first_name || ''),
+				username: String(snap.username || input?.message?.from?.username || ''),
+				text: String(bodyText || ''), link: judgeMessageLink,
+				type: record.type || '', why: record.why || '',
+				confidence: record.confidence, action: String(action || ''),
+				avatarId: String(snap.originalProfile?.avatarId || snap.avatarId || ''),
+				avatarFileId: String(snap.originalProfile?.avatarFileId || ''),
+				positions: input?.evaluation?.positionEvidence || null
+			}), record.at);
+		} catch (error) { console.error('[正文判定现场] 写入失败: ' + String(error?.message || error)); }
+	}
+	const keyboardRows = [];
+	if (options?.banned === true && options?.seq) {
+		const base = buildAdNoticeKeyboard(options.seq, judgeUserId, { automatic: true });
+		if (base?.inline_keyboard) keyboardRows.push(...base.inline_keyboard);
+	}
+	const traceButton = judgeMsgId > 0 && /^-100[0-9]+$/.test(judgeChatId)
+		? [{ text: '🔍 定位违规痕迹', callback_data: 'adbody:trace:' + judgeChatId + ':' + judgeMsgId }] : [];
+	const avatarButton = /^[0-9]+$/.test(judgeUserId)
+		? [{ text: '🖼 查看用户头像', callback_data: 'adbody:avatar:' + judgeUserId
+			+ (judgeMsgId > 0 && /^-100[0-9]+$/.test(judgeChatId) ? ':' + judgeChatId + ':' + judgeMsgId : '') }] : [];
+	if (traceButton.length || avatarButton.length) keyboardRows.push([...traceButton, ...avatarButton]);
+	const keyboard = keyboardRows.length ? { inline_keyboard: keyboardRows } : null;
 	await sendTelegramMessageChunks(ownerId, lines.join('\n'), keyboard);
 }
 
@@ -39847,6 +39929,90 @@ function buildAdNoticeKeyboard(seq, userId, options = {}) {
 	//              他照样出不来，还得再点一次解封，等于逼人点两下）。
 	rows.push([{ text: '➕ 加入白名单（永不检测）', callback_data: ADFIX_BUTTON_PREFIX + 'wl:' + uid }]);
 	return { inline_keyboard: rows };
+}
+
+// 正文 AI 判定通知上的两个只读按钮。
+//   trace  = 定位违规痕迹：正文全文 + 模型结论 + 结构化命中位置 + 原消息跳转
+//   avatar = 查看用户当前头像（getUserProfilePhotos，不依赖是否私聊过）
+// 两者都不改判定、不动名单、不写学习；只发给第一主人。
+async function handleAdBodyTraceCallback(callbackQuery, env) {
+	const fromId = String(callbackQuery?.from?.id || '');
+	if (!isPrimaryOwner(fromId)) { await answerAdVoteCallback(callbackQuery?.id, '只有第一主人能查看判定现场', true); return; }
+	const [, action, first, second, third] = String(callbackQuery?.data || '').split(':');
+	if (action === 'avatar') {
+		const userId = String(first || '');
+		const traceChatId = String(second || ''), traceMsgId = Number(third) || 0;
+		if (!/^[0-9]+$/.test(userId)) { await answerAdVoteCallback(callbackQuery?.id, '用户标识无效', true); return; }
+		let detectedFileId = '';
+		if (/^-100[0-9]+$/.test(traceChatId) && traceMsgId > 0) {
+			try {
+				const stored = JSON.parse(await readAdScanState(env, adBodyTraceKey(traceChatId, traceMsgId), 'null'));
+				detectedFileId = String(stored?.avatarFileId || '');
+			} catch (_) { detectedFileId = ''; }
+		}
+		const currentFileId = await refreshAvatarFileId(env, userId);
+		const candidates = [];
+		if (detectedFileId) candidates.push({ fileId: detectedFileId, label: '检测时头像' });
+		if (currentFileId && currentFileId !== detectedFileId) candidates.push({ fileId: currentFileId, label: '当前头像' });
+		if (!candidates.length) { await answerAdVoteCallback(callbackQuery?.id, '没有取到头像：未设置或接口未返回', true); return; }
+		let lastError = '';
+		for (const item of candidates) {
+			try {
+				const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/sendPhoto', {
+					method: 'POST', headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ chat_id: fromId, photo: item.fileId, caption: "🖼 用户 " + userId + " 的" + item.label + "\n检测时头像与当前头像可能不同。" })
+				});
+				const result = await response.json();
+				if (result?.ok) { await answerAdVoteCallback(callbackQuery?.id, '已发送' + item.label); return; }
+				lastError = String(result?.description || '发送失败');
+			} catch (error) { lastError = String(error?.message || error); }
+		}
+		await answerAdVoteCallback(callbackQuery?.id, '头像发送失败：' + toChineseErrorText(lastError).slice(0, 150), true);
+		return;
+	}
+	if (action !== 'trace') { await answerAdVoteCallback(callbackQuery?.id); return; }
+	const chatId = String(first || ''), messageId = Number(second) || 0;
+	if (!/^-100[0-9]+$/.test(chatId) || messageId <= 0) { await answerAdVoteCallback(callbackQuery?.id, '现场标识不完整', true); return; }
+	let trace = null;
+	try { trace = JSON.parse(await readAdScanState(env, adBodyTraceKey(chatId, messageId), 'null')); } catch (_) { trace = null; }
+	if (!trace) { await answerAdVoteCallback(callbackQuery?.id, '该判定现场已过期', true); return; }
+	await answerAdVoteCallback(callbackQuery?.id);
+	const label = { name: '昵称/用户名', bio: '简介', text: '正文', avatar: '头像', badge: '会员表情', sticker: '贴纸', image: '图片/视频', quoted: '引用内容' };
+	const positions = trace.positions || {};
+	const hits = [];
+	for (const [key, name] of Object.entries(label)) {
+		const slot = positions[key];
+		if (!slot) continue;
+		const grade = Number(slot.grade) || 0;
+		const reasons = Array.isArray(slot.reasons) ? slot.reasons.map(String).filter(Boolean) : [];
+		if (grade <= 0 && !reasons.length && !slot.exempt) continue;
+		hits.push('· ' + name + '：' + grade + ' 分' + (slot.exempt ? '（已豁免）' : '') + (reasons.length ? '｜' + reasons.slice(0, 3).join('；') : ''));
+	}
+	const lines = [
+		'🔍 <b>违规痕迹定位</b>',
+		'用户：<code>' + escapeHtml(String(trace.user || '')) + '</code>'
+			+ (trace.name ? '（' + escapeHtml(String(trace.name)) + '）' : '')
+			+ (trace.username ? '　@' + escapeHtml(String(trace.username)) : ''),
+		'群：' + (trace.chatTitle
+			? escapeHtml(String(trace.chatTitle)) + '（<code>' + escapeHtml(String(trace.chat)) + '</code>）'
+			: '<code>' + escapeHtml(String(trace.chat)) + '</code>'),
+		'',
+		'📝 <b>正文全文</b>' + (trace.text ? '（命中词加粗）' : ''),
+		(trace.text ? adTraceHighlightText(trace.text) : '（无文字）'),
+		'',
+		'🤖 <b>模型结论</b>',
+		(trace.type ? '类别：' + escapeHtml(String(trace.type)) + '　' : '')
+			+ '置信度：' + (Number.isFinite(Number(trace.confidence)) ? Number(trace.confidence).toFixed(2) : '未给出'),
+		trace.why ? '依据：' + escapeHtml(String(trace.why)) : '',
+		trace.action ? '处置：' + escapeHtml(String(trace.action)) : '',
+		'',
+		'📌 <b>命中位置</b>',
+		hits.length ? hits.join('\n') : '（结构化位置证据为空，按模型正文结论处置）'
+	].filter(Boolean);
+	const rows = [];
+	if (trace.link) rows.push([{ text: '📍 原消息（未删除时可用）', url: String(trace.link) }]);
+	if (/^[0-9]+$/.test(String(trace.user || ''))) rows.push([{ text: '🖼 查看该用户头像', callback_data: 'adbody:avatar:' + trace.user + ':' + trace.chat + ':' + trace.msg }]);
+	await sendTelegramMessageChunks(fromId, lines.join('\n'), rows.length ? { inline_keyboard: rows } : null);
 }
 
 async function handleAdFixButtonCallback(callbackQuery, env) {
