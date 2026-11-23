@@ -41421,7 +41421,15 @@ async function interceptAdJoinBlacklist(env, member, chatId, chatTitle = '', opt
 	const banResult = mute ? await applyGroupModeration(groupId,userId,'mute',{probeMembership:true,requireMember:true,timeoutMs:5000,deferRetry:true})
 		: await banUserFromGroup(groupId, userId, options.joinRequest || options.approvedJoin ? {timeoutMs:5000,deferRetry:true} : {});
 	const joinRequest = declinePromise ? await declinePromise : null;
-	const verification = options.joinRequest || options.approvedJoin ? await verifyAdJoinProtection(userId,groupId) : null;
+	let verification = options.joinRequest || options.approvedJoin ? await verifyAdJoinProtection(userId,groupId) : null;
+	// 【2026-11-23】restrictChatMember 返回 ok 之后立刻 getChatMember，偶尔仍读到旧的 member 状态
+	// （跨机房写后读延迟，线上约 1/50 命中）。这一步原先把瞬态当失败：complete=false →
+	// 落一条 pending 且永不复查，再抛一次「等待重投」的假故障。只在「动作报成功、复核却仍是
+	// 普通成员或查询失败」这个精确条件下补一次短复查，正常路径零额外调用。
+	if(mute && banResult?.ok===true && (verification?.status==='member' || verification?.status==='unknown')){
+		await new Promise((resolve)=>setTimeout(resolve,900));
+		verification = await verifyAdJoinProtection(userId,groupId);
+	}
 	const complete=mute ? isAdJoinMuteComplete(options.approvedJoin,joinRequest,banResult,verification)
 		: banResult?.ok===true&&(!verification||verification.blocked===true)&&(!options.joinRequest||joinRequest?.ok===true||joinRequest?.requestAbsent===true);
 	try { await recordDisposalsFromBanResults(env, [{ groupId, ...banResult }]); }
@@ -41473,7 +41481,7 @@ async function screenAdJoinMember(env, member, options = {}) {
             console.warn('[广告检测] 入群名单拦截未完全成功（权限类，停止重投）: '+banError.slice(0,200));
             return prior.banned?'banned':'pending';
           }
-          throw new Error('入群后的名单拦截或核验失败，等待 Webhook 重投');
+          throw new Error('入群后的名单拦截未核实成功，等待自动复查');
         }
         return prior.banned?'banned':'skipped';
       }
@@ -41526,8 +41534,8 @@ async function screenAdJoinMember(env, member, options = {}) {
     // 【2026-11-22】带「等待重投」的是设计内的重试信号（数据库抖动 / 尚未就绪 / 拦截未补齐），
     // 抛给上层让 Telegram 重投是对的，但它是【预期流程】不是故障，不该占 error 级日志。
     // 其余异常（真崩溃）继续 error，保持可发现性。
-    const retryable=joinGuard&&/等待重投/.test(String(error?.message||''));
-    if(retryable)console.warn('[广告检测] 入群检测未完成（等待 Webhook 重投）: '+formatD1SchemaError(error));
+    const retryable=joinGuard&&/等待[^，。；]{0,12}(?:重投|复查)/.test(String(error?.message||''));
+    if(retryable)console.warn('[广告检测] 入群检测未完成（等待自动复查）: '+formatD1SchemaError(error));
     else console.error('[广告检测] 入群检测未完成: '+formatD1SchemaError(error));
     if(joinGuard)throw error;return 'error';
   }
