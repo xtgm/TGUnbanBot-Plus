@@ -22069,6 +22069,30 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				const d1RecordRemoved = eligibility.d1Removed.includes(targetId);
 				const fedExempted = (eligibility.fedExempted || []).includes(targetId);
 				const fedLine = fedExempted ? `\n🌐 ${FED_EXEMPT_NOTICE}` : '';
+				// 【2026-11-24 主人口径】/unban 只看全局表，群级记录不说一句，主人就会看到
+				// 「目标不在 D1 黑名单」而群里仍显示「在本群黑名单中」，事后在群里搜不到任何依据。
+				// 这里把「本次自动清掉几条」和「哪些群仍保留人工记录」都摆进回执。
+				const removedGroupBans = Array.isArray(eligibility.localAutoRemoved)
+					? eligibility.localAutoRemoved.filter((row) => (unbanRoute.groupIds || []).map(String).includes(String(row.chatId)))
+					: [];
+				let remainingGroupBans = [];
+				try {
+					const scope = new Set((unbanRoute.groupIds || []).map(String));
+					remainingGroupBans = (await readUserGroupBans(env, targetId)).filter((row) => scope.has(String(row.chatId)));
+				} catch (error) {
+					console.error('[/unban] 读取本群黑名单失败:', error?.message || error);
+				}
+				const groupBanReport = [];
+				if (removedGroupBans.length) {
+					groupBanReport.push('🧹 <b>本次已移除本群黑名单记录 ' + removedGroupBans.length + ' 条</b>',
+						removedGroupBans.map((row) => '<code>' + escapeHtml(row.chatId) + '</code>').join('、'));
+				}
+				if (remainingGroupBans.length) {
+					groupBanReport.push('⛔ <b>这些群的本群黑名单仍在生效</b>',
+						remainingGroupBans.map((row) => '<code>' + escapeHtml(row.chatId) + '</code>：'
+							+ escapeHtml(formatGroupBanReason(row.reason)) + '（' + escapeHtml(row.at || '时间未知') + '）').join('\n'),
+						'ℹ️ 本群黑名单由该群自治，全局 /unban 不代删；请在该群发 <code>/unban ' + escapeHtml(targetId) + '</code>，或让该群管理员处理。');
+				}
 				const unbanResults = await unbanUserFromAllGroups(targetId, unbanRoute.groupIds);
 				if (fedExempted) lines.push(`🌐 <b>${FED_EXEMPT_NOTICE}</b>`);
 				lines.push(
@@ -22084,9 +22108,12 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 					'',
 					'💡 <b>要彻底纠正请用 /ignore</b> —— /unban 只解封并移出黑名单，不撤销头像 / 指纹 / 会员标等判定痕迹；痕迹还在的话下一条消息可能又被封。'
 				);
+				if (groupBanReport.length) lines.push('', ...groupBanReport);
 				await replyToModerationAdmin(message, ctx, {
 					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封${fedLine}\n${renderUnbanResults(unbanResults)}`,
-					groupText: `🔓 已解封\n🎯 ${targetMention}${fedLine}\n${renderUnbanResults(unbanResults)}\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）`,
+					groupText: `🔓 已解封\n🎯 ${targetMention}${fedLine}\n${renderUnbanResults(unbanResults)}`
+						+ (remainingGroupBans.length ? '\n⛔ 本群黑名单仍在生效: ' + remainingGroupBans.length + ' 个群（需在该群发 /unban）' : '')
+						+ '\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）',
 					detailText: lines.join('\n'),
 					isInGroup
 				});
@@ -22132,6 +22159,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				}
 				detailText += `\n\n${unbanHeaderLines.join('\n')}\n\n${perUserBlocks.join('\n\n')}`;
 			}
+			if (Array.isArray(results.localAutoRemoved) && results.localAutoRemoved.length) detailText = '🧹 本次已移除本群黑名单记录 ' + results.localAutoRemoved.length + ' 条（逐群明细见单条 /unban 回执）\n\n' + detailText;
 			detailText += '\n\n💡 <b>要彻底纠正请用 /ignore</b> —— /unban 只解封并移出黑名单，不撤销头像 / 指纹 / 会员标等判定痕迹；痕迹还在的话下一条消息可能又被封。';
 			await replyToModerationAdmin(message, ctx, {
 				flashText,
@@ -41269,6 +41297,54 @@ function isAdEnforcementComplete(blacklistCode,results){
 			&&row.muted===true&&row.memberProbe?.state==='not_in_group'));
 }
 
+// 群内封禁留痕（2026-11-24 主人口径）：
+// 自动检测原先只发第一主人私聊，群里一条消息都不留 —— 事后在群里搜 TGID 只能搜到解封记录，
+// 封禁过程完全查不到。这里给每个真正执行了处置的群补一条极简回执（不撤回、不进快照），
+// 目标 ID 用纯数字文本包一层 code，Telegram 群内搜索能直接命中。
+// 只给自动路径用：人工 /ban /spam 本来就有群回执，再发会重复。
+async function sendAdGroupBanReceipts(banResults, ctx) {
+	if (!Array.isArray(banResults) || !banResults.length) return 0;
+	const userId = String(ctx?.userId || '');
+	if (!userId) return 0;
+	const evaluation = ctx?.evaluation || {};
+	const label = AD_LAYER_LABELS[evaluation.layer] || evaluation.layer || '自动判定';
+	const reasons = Array.isArray(evaluation.reasons) ? evaluation.reasons.filter(Boolean).slice(0, 3) : [];
+	const scoreLine = evaluation.score != null ? '得分 ' + Number(evaluation.score) + '/' + Number(evaluation.threshold || 0) : '';
+	const name = String(evaluation?.payload?.name || '').trim();
+	const username = String(evaluation?.payload?.username || '').replace(/^@/, '');
+	const target = '<a href="tg://user?id=' + escapeHtml(userId) + '">' + escapeHtml(name || userId) + '</a>'
+		+ (username ? '（@' + escapeHtml(username) + '）' : '') + '\nTGID　<code>' + escapeHtml(userId) + '</code>';
+	const stamp = formatBeijingDate(new Date().toISOString());
+	const seen = new Set();
+	const rows = [];
+	for (const row of banResults) {
+		const gid = String(row?.groupId || '');
+		if (!gid || !row?.ok || row?.skipped || seen.has(gid)) continue;
+		seen.add(gid);
+		rows.push({ gid, actionLabel: row.muted || row.pendingMute ? '禁言' : '踢出封禁' });
+	}
+	if (!rows.length) return 0;
+	let sent = 0;
+	await mapWithConcurrency(rows, 4, async (row) => {
+		const lines = [
+			'🚫 <b>广告封禁</b>',
+			'目标　' + target,
+			'判定　' + escapeHtml(label) + (scoreLine ? ' · ' + escapeHtml(scoreLine) : ''),
+			...(reasons.length ? ['依据　' + reasons.map((item) => escapeHtml(String(item))).join('；')] : []),
+			'处置　' + row.actionLabel,
+			'时间　' + escapeHtml(stamp)
+		];
+		try {
+			const result = await sendTelegramMessage(row.gid, lines.join('\n'));
+			if (result?.ok) sent += 1;
+		} catch (error) {
+			console.error('[广告封禁留痕] 群 ' + row.gid + ' 发送失败:', error?.message || error);
+		}
+		return true;
+	});
+	return sent;
+}
+
 async function enforceAdDetection(env, input, evaluation, options = {}) {
 	if(options.reviewGuard&&!await options.reviewGuard())return {banned:false,reason:'human_review_hold'};
 	const userId = String(input?.userId ?? '');
@@ -41751,6 +41827,16 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			console.error('[广告检测] 推送判定通知失败:', error);
 		}
 		if (!joinRequest&&!approvedJoin&&automatic && localScope && options.drillCloseReplay !== true&&options.suppressNotify!==true) await notifyIndependentGroupCreatorAdCase(env, chatId, seq, userId, notice + '\n范围：本群自动封禁（<code>' + escapeHtml(chatId) + '</code>）');
+	}
+
+	// 群内留痕：自动处置原先只在主人私聊里留记录，群内搜 TGID 一条封禁消息都没有。
+	// 演练回放与显式抑制通知的场景不发，避免重复刷屏。
+	if (automatic && options.suppressNotify !== true && options.drillCloseReplay !== true) {
+		try {
+			await sendAdGroupBanReceipts(banResults, { userId, evaluation });
+		} catch (error) {
+			console.error('[广告封禁留痕] 发送失败:', error?.message || error);
+		}
 	}
 
 	// 【2026-11-23 通知优先】清扫本人消息要逐条 deleteMessage，是这条链里最重的子请求支出。
