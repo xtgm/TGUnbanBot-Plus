@@ -18468,6 +18468,31 @@ async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) 
 	}
 }
 
+// 【2026-11-24】正文判定通知的「查看用户头像」改成原地换图：editMessageMedia 把
+// 这条文本通知直接替换成图片（文本 → 媒体是 Telegram 允许的方向，反过来不允许，
+// 所以返回时走删除重发）。失败时调用方退回 sendPhoto，行为与改动前一致。
+async function editTelegramMedia(chatId, messageId, media, caption, replyMarkup = null) {
+	if (!chatId || !messageId || !media) return { ok: false, error: '参数缺失' };
+	try {
+		const body = {
+			chat_id: String(chatId),
+			message_id: Number(messageId),
+			media: JSON.stringify({ type: 'photo', media: String(media), caption: sanitizeTelegramText(String(caption || '').slice(0, 1000)), parse_mode: 'HTML' })
+		};
+		if (replyMarkup) body.reply_markup = replyMarkup;
+		const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/editMessageMedia', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		if (response.ok && result?.ok) return { ok: true, result };
+		return { ok: false, error: String(result?.description || ('HTTP ' + response.status)) };
+	} catch (error) {
+		return { ok: false, error: String(error?.message || error) };
+	}
+}
+
 async function answerAdVoteCallback(callbackQueryId, text = '', showAlert = false) {
 	if (!callbackQueryId) return { ok: false, error: 'callback_query_id 缺失' };
 	try {
@@ -30698,22 +30723,6 @@ async function notifyAdBodyJudgeResult(env, bodyText, record, input, action, opt
 	// 这里把完整正文、命中位置、资料存进 ad_scan_state，按钮只带群号/消息号，
 	// 点击时再取；通知本身不多占一行。只读，不改判定、不动名单、不写学习。
 	const judgeMsgId = Number(input?.message?.message_id) || 0;
-	if (judgeMsgId > 0 && /^-100[0-9]+$/.test(judgeChatId)) {
-		try {
-			const snap = input?.evaluation?.snapshot || {};
-			await writeAdScanState(env, adBodyTraceKey(judgeChatId, judgeMsgId), JSON.stringify({
-				at: record.at, chat: judgeChatId, chatTitle: judgeChatTitle, msg: judgeMsgId,
-				user: judgeUserId, name: String(snap.name || input?.message?.from?.first_name || ''),
-				username: String(snap.username || input?.message?.from?.username || ''),
-				text: String(bodyText || ''), link: judgeMessageLink,
-				type: record.type || '', why: record.why || '',
-				confidence: record.confidence, action: String(action || ''),
-				avatarId: String(snap.originalProfile?.avatarId || snap.avatarId || ''),
-				avatarFileId: String(snap.originalProfile?.avatarFileId || ''),
-				positions: input?.evaluation?.positionEvidence || null
-			}), record.at);
-		} catch (error) { console.error('[正文判定现场] 写入失败: ' + String(error?.message || error)); }
-	}
 	const keyboardRows = [];
 	if (options?.banned === true && options?.seq) {
 		const base = buildAdNoticeKeyboard(options.seq, judgeUserId, { automatic: true });
@@ -30726,7 +30735,30 @@ async function notifyAdBodyJudgeResult(env, bodyText, record, input, action, opt
 			+ (judgeMsgId > 0 && /^-100[0-9]+$/.test(judgeChatId) ? ':' + judgeChatId + ':' + judgeMsgId : '') }] : [];
 	if (traceButton.length || avatarButton.length) keyboardRows.push([...traceButton, ...avatarButton]);
 	const keyboard = keyboardRows.length ? { inline_keyboard: keyboardRows } : null;
-	await sendTelegramMessageChunks(ownerId, lines.join('\n'), keyboard);
+	const noticeText = lines.join('\n');
+	// 【2026-11-24】两个只读按钮改成「原地查看」后，必须能原路返回这一条。
+	// 通知可能被分段，按钮挂在最后一段，所以只存最后一段的原文与键盘；
+	// 分段函数是纯函数，重建时与当初发出的那一条逐字节一致。
+	const noticeChunks = splitTelegramHtmlBlocks(noticeText);
+	const noticeLastChunk = noticeChunks[noticeChunks.length - 1] || noticeText;
+	if (judgeMsgId > 0 && /^-100[0-9]+$/.test(judgeChatId)) {
+		try {
+			const snap = input?.evaluation?.snapshot || {};
+			await writeAdScanState(env, adBodyTraceKey(judgeChatId, judgeMsgId), JSON.stringify({
+				at: record.at, chat: judgeChatId, chatTitle: judgeChatTitle, msg: judgeMsgId,
+				user: judgeUserId, name: String(snap.name || input?.message?.from?.first_name || ''),
+				username: String(snap.username || input?.message?.from?.username || ''),
+				text: String(bodyText || ''), link: judgeMessageLink,
+				type: record.type || '', why: record.why || '',
+				confidence: record.confidence, action: String(action || ''),
+				avatarId: String(snap.originalProfile?.avatarId || snap.avatarId || ''),
+				avatarFileId: String(snap.originalProfile?.avatarFileId || ''),
+				positions: input?.evaluation?.positionEvidence || null,
+				notice: noticeLastChunk, noticeMarkup: keyboard
+			}), record.at);
+		} catch (error) { console.error('[正文判定现场] 写入失败: ' + String(error?.message || error)); }
+	}
+	await sendTelegramMessageChunks(ownerId, noticeText, keyboard);
 }
 
 async function checkAdAiSimilarity(env, text, options = {}) {
@@ -40066,52 +40098,124 @@ function buildAdNoticeKeyboard(seq, userId, options = {}) {
 	return { inline_keyboard: rows };
 }
 
-// 正文 AI 判定通知上的两个只读按钮。
-//   trace  = 定位违规痕迹：正文全文 + 模型结论 + 结构化命中位置 + 原消息跳转
-//   avatar = 查看用户当前头像（getUserProfilePhotos，不依赖是否私聊过）
+// 正文 AI 判定通知上的两个只读按钮，2026-11-24 起改成「原地查看」：
+//   trace  = 定位违规痕迹：就地替换通知正文，底部带「返回判定通知」
+//   avatar = 查看用户头像：editMessageMedia 就地换图，底部同样带返回
+//   back   = 从任一子页回到原判定通知
+// 文本消息能原地变媒体，媒体不能原地变回文本，所以返回时若当前是图片就
+// 删掉重发原通知（notice / noticeMarkup 在发通知时已写进 trace 记录）。
+// 头像来源按 /review 同款：先取检测时快照，再 getChat 的 photo.big_file_id，
+// 最后才退到 getUserProfilePhotos —— 没私聊过的用户只有前两条能拿到。
 // 两者都不改判定、不动名单、不写学习；只发给第一主人。
 async function handleAdBodyTraceCallback(callbackQuery, env) {
 	const fromId = String(callbackQuery?.from?.id || '');
 	if (!isPrimaryOwner(fromId)) { await answerAdVoteCallback(callbackQuery?.id, '只有第一主人能查看判定现场', true); return; }
 	const [, action, first, second, third] = String(callbackQuery?.data || '').split(':');
+	const noticeMessageId = Number(callbackQuery?.message?.message_id) || 0;
+	const noticeIsPhoto = Array.isArray(callbackQuery?.message?.photo) && callbackQuery.message.photo.length > 0;
+	const readTrace = async (chatId, messageId) => {
+		try { return JSON.parse(await readAdScanState(env, adBodyTraceKey(chatId, messageId), 'null')); } catch (_) { return null; }
+	};
+	const backRow = (chatId, messageId) => (/^-100[0-9]+$/.test(chatId) && messageId > 0)
+		? [{ text: '⬅️ 返回判定通知', callback_data: 'adbody:back:' + chatId + ':' + messageId }] : [];
+	const traceRow = (chatId, messageId) => (/^-100[0-9]+$/.test(chatId) && messageId > 0)
+		? [{ text: '🔍 定位违规痕迹', callback_data: 'adbody:trace:' + chatId + ':' + messageId }] : [];
+
+	if (action === 'back') {
+		const chatId = String(first || ''), messageId = Number(second) || 0;
+		if (!/^-100[0-9]+$/.test(chatId) || messageId <= 0 || noticeMessageId <= 0) {
+			await answerAdVoteCallback(callbackQuery?.id, '返回目标不完整', true); return;
+		}
+		const trace = await readTrace(chatId, messageId);
+		const notice = String(trace?.notice || '');
+		const markup = trace?.noticeMarkup || null;
+		if (!notice) { await answerAdVoteCallback(callbackQuery?.id, '原判定通知已过期，无法返回', true); return; }
+		// 当前这条已经是图片（在头像页点的返回）：文本改不回去，删掉重发原通知。
+		if (noticeIsPhoto) {
+			const deleted = await deleteTelegramMessages(fromId, [noticeMessageId]);
+			if (deleted.ok !== true) { await answerAdVoteCallback(callbackQuery?.id, '返回失败：' + toChineseErrorText(deleted.error).slice(0, 150), true); return; }
+			await sendTelegramMessageChunks(fromId, notice, markup);
+			await answerAdVoteCallback(callbackQuery?.id, '已返回判定通知');
+			return;
+		}
+		const edited = await editTelegramMessage(fromId, noticeMessageId, notice, markup);
+		if (edited.ok) { await answerAdVoteCallback(callbackQuery?.id, '已返回判定通知'); return; }
+		const deleted = await deleteTelegramMessages(fromId, [noticeMessageId]);
+		if (deleted.ok === true) {
+			await sendTelegramMessageChunks(fromId, notice, markup);
+			await answerAdVoteCallback(callbackQuery?.id, '已返回判定通知');
+			return;
+		}
+		await answerAdVoteCallback(callbackQuery?.id, '返回失败：' + toChineseErrorText(edited.error).slice(0, 150), true);
+		return;
+	}
+
 	if (action === 'avatar') {
 		const userId = String(first || '');
 		const traceChatId = String(second || ''), traceMsgId = Number(third) || 0;
 		if (!/^[0-9]+$/.test(userId)) { await answerAdVoteCallback(callbackQuery?.id, '用户标识无效', true); return; }
-		let detectedFileId = '';
-		if (/^-100[0-9]+$/.test(traceChatId) && traceMsgId > 0) {
-			try {
-				const stored = JSON.parse(await readAdScanState(env, adBodyTraceKey(traceChatId, traceMsgId), 'null'));
-				detectedFileId = String(stored?.avatarFileId || '');
-			} catch (_) { detectedFileId = ''; }
-		}
-		const currentFileId = await refreshAvatarFileId(env, userId);
+		const trace = (/^-100[0-9]+$/.test(traceChatId) && traceMsgId > 0) ? await readTrace(traceChatId, traceMsgId) : null;
 		const candidates = [];
-		if (detectedFileId) candidates.push({ fileId: detectedFileId, label: '检测时头像' });
-		if (currentFileId && currentFileId !== detectedFileId) candidates.push({ fileId: currentFileId, label: '当前头像' });
-		if (!candidates.length) { await answerAdVoteCallback(callbackQuery?.id, '没有取到头像：未设置或接口未返回', true); return; }
+		const pushCandidate = (fileId, label) => {
+			const id = String(fileId || '');
+			if (id && !candidates.some((item) => item.fileId === id)) candidates.push({ fileId: id, label });
+		};
+		pushCandidate(trace?.avatarFileId, '检测时头像');
+		// /review 同款：getChat 返回的 photo.big_file_id，没私聊过的用户也能拿到。
+		try {
+			const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/getChat', {
+				method: 'POST', headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ chat_id: userId }), signal: AbortSignal.timeout(15000)
+			});
+			const result = await response.json();
+			if (result?.ok === true && result.result?.photo?.big_file_id) pushCandidate(result.result.photo.big_file_id, '当前头像');
+		} catch (_) { /* 取不到就交给下一级来源 */ }
+		pushCandidate(await refreshAvatarFileId(env, userId), '当前头像');
+		if (!candidates.length) {
+			await answerAdVoteCallback(callbackQuery?.id, '该用户当前没有设置头像（检测时也未取到）', true);
+			return;
+		}
+		const rows = [];
+		const back = backRow(traceChatId, traceMsgId);
+		if (back.length) rows.push(back);
+		const traceButton = traceRow(traceChatId, traceMsgId);
+		if (traceButton.length) rows.push(traceButton);
+		const markup = rows.length ? { inline_keyboard: rows } : null;
 		let lastError = '';
+		if (noticeMessageId > 0) {
+			for (const item of candidates) {
+				const caption = '🖼 用户 <code>' + userId + '</code> 的' + item.label
+					+ (item.label === '检测时头像' ? '\n（判定那一刻的快照，与当前头像可能不同）' : '');
+				const edited = await editTelegramMedia(fromId, noticeMessageId, item.fileId, caption, markup);
+				if (edited.ok) { await answerAdVoteCallback(callbackQuery?.id, '已显示' + item.label); return; }
+				lastError = edited.error;
+			}
+		}
+		// 原地换图失败（消息被删、文件失效）才退回发新消息，行为与改动前一致。
 		for (const item of candidates) {
 			try {
 				const response = await fetch('https://api.telegram.org/bot' + runtime().BOT_TOKEN + '/sendPhoto', {
 					method: 'POST', headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ chat_id: fromId, photo: item.fileId, caption: "🖼 用户 " + userId + " 的" + item.label + "\n检测时头像与当前头像可能不同。" })
+					body: JSON.stringify({
+						chat_id: fromId, photo: item.fileId,
+						caption: '🖼 用户 ' + userId + ' 的' + item.label + '\n检测时头像与当前头像可能不同。',
+						reply_markup: markup || undefined
+					})
 				});
 				const result = await response.json();
-				if (result?.ok) { await answerAdVoteCallback(callbackQuery?.id, '已发送' + item.label); return; }
+				if (result?.ok === true) { await answerAdVoteCallback(callbackQuery?.id, '已发送' + item.label); return; }
 				lastError = String(result?.description || '发送失败');
 			} catch (error) { lastError = String(error?.message || error); }
 		}
 		await answerAdVoteCallback(callbackQuery?.id, '头像发送失败：' + toChineseErrorText(lastError).slice(0, 150), true);
 		return;
 	}
+
 	if (action !== 'trace') { await answerAdVoteCallback(callbackQuery?.id); return; }
 	const chatId = String(first || ''), messageId = Number(second) || 0;
 	if (!/^-100[0-9]+$/.test(chatId) || messageId <= 0) { await answerAdVoteCallback(callbackQuery?.id, '现场标识不完整', true); return; }
-	let trace = null;
-	try { trace = JSON.parse(await readAdScanState(env, adBodyTraceKey(chatId, messageId), 'null')); } catch (_) { trace = null; }
+	const trace = await readTrace(chatId, messageId);
 	if (!trace) { await answerAdVoteCallback(callbackQuery?.id, '该判定现场已过期', true); return; }
-	await answerAdVoteCallback(callbackQuery?.id);
 	const label = { name: '昵称/用户名', bio: '简介', text: '正文', avatar: '头像', badge: '会员表情', sticker: '贴纸', image: '图片/视频', quoted: '引用内容' };
 	const positions = trace.positions || {};
 	const hits = [];
@@ -40145,9 +40249,25 @@ async function handleAdBodyTraceCallback(callbackQuery, env) {
 		hits.length ? hits.join('\n') : '（结构化位置证据为空，按模型正文结论处置）'
 	].filter(Boolean);
 	const rows = [];
+	const back = backRow(chatId, messageId);
+	if (back.length) rows.push(back);
 	if (trace.link) rows.push([{ text: '📍 原消息（未删除时可用）', url: String(trace.link) }]);
-	if (/^[0-9]+$/.test(String(trace.user || ''))) rows.push([{ text: '🖼 查看该用户头像', callback_data: 'adbody:avatar:' + trace.user + ':' + trace.chat + ':' + trace.msg }]);
-	await sendTelegramMessageChunks(fromId, lines.join('\n'), rows.length ? { inline_keyboard: rows } : null);
+	if (/^[0-9]+$/.test(String(trace.user || ''))) rows.push([{ text: '🖼 查看该用户头像', callback_data: 'adbody:avatar:' + trace.user + ':' + chatId + ':' + messageId }]);
+	const markup = rows.length ? { inline_keyboard: rows } : null;
+	const text = lines.join('\n');
+	// 单条消息上限 4096，超了按原有分段函数取第一段（痕迹页只做定位，不追全文）。
+	const body = text.length > 4000 ? splitTelegramHtmlBlocks(text)[0] : text;
+	if (noticeMessageId > 0) {
+		if (noticeIsPhoto) {
+			const deleted = await deleteTelegramMessages(fromId, [noticeMessageId]);
+			if (deleted.ok === true) { await sendTelegramMessageChunks(fromId, body, markup); await answerAdVoteCallback(callbackQuery?.id); return; }
+		} else {
+			const edited = await editTelegramMessage(fromId, noticeMessageId, body, markup);
+			if (edited.ok) { await answerAdVoteCallback(callbackQuery?.id); return; }
+		}
+	}
+	await answerAdVoteCallback(callbackQuery?.id);
+	await sendTelegramMessageChunks(fromId, body, markup);
 }
 
 async function handleAdFixButtonCallback(callbackQuery, env) {
