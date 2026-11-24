@@ -3704,7 +3704,7 @@ async function handleInitialization(request, env) {
 				// 【2026-10-25 主人要求】/ 菜单只留六条常用命令；其余命令的处理代码全部保留、照样能直接发，
 				// 只是不在菜单里显示。完整说明与执行入口在网页管理后台（域名/admin，私聊 /adminpass 领密码）。
 				// 同日加回 /groupmode：让群主在菜单里看得到独立群入口（群里闪提示 + 私聊完整用法）。
-				{ command: "ban", description: "加入全局黑名单并全群禁言 (群管理员)" },
+				{ command: "ban", description: "加入全局黑名单并全群踢出封禁 (群管理员)" },
 				{ command: "spam", description: "回复广告：删消息并加入全局黑名单 (群管理员)" },
 				{ command: "check", description: "查询封禁状态 (高级管理员)" },
 				{ command: "unban", description: "解除封禁；不带 ID 是自助解封" },
@@ -5154,9 +5154,9 @@ async function removeFromBlacklist(userId, env) {
 // 【杀手群口径（2026-10-23 重构）】杀手群（KILLER_MODE_GROUPS）是为杀手权限持有者定制的，
 // 原先的 /killer ON/OFF 开关让「自动检测」与「人工命令」永远走同一种处置，满足不了他的口径。
 // 现在固定为：自动检测命中（缺省 mode）→ 永久禁言、人留群；其余一切（人工命令、拦截、复入群）→ 踢出。
-// 普通配置群的口径一个字节不变：人工命令禁言、自动路径踢出。
+	// 2026-11-24 主人口径：普通配置群的人工命令也改为踢出封禁，与自动路径一致（原先禁言）。
 function resolveHumanCommandMode(groupId) {
-	return isKillerModeGroup(groupId) ? 'kick' : 'mute';
+	return 'kick';
 }
 
 // 杀手群里一条黑名单记录该用哪种处置：自动检测（reason=ad_auto）的永久禁言，其余踢出。
@@ -5174,7 +5174,7 @@ function isAutomaticAdMuteEntry(groupId, entry) {
 
 // 单群执行处置，按 mode 分派。mode 值域：
 //   'kick'  → 恒踢出（/sban，含预封与撤回历史发言）
-//   'human' → 人工命令口径（resolveHumanCommandMode：杀手群踢、普通群禁言）
+	//   'human' → 人工命令口径（resolveHumanCommandMode：恒踢出；拦截路径不再传 human）
 //   'mute'  → 恒禁言（杀手群里按黑名单 reason 分流到禁言的那一支）
 //   缺省    → 自动路径口径：杀手群禁言、普通群踢出（自动检测与 /purge 默认走这里）
 // 返回 { groupId, userId, ok, error, muted, mutedBy, memberProbe, retried }
@@ -5618,7 +5618,7 @@ function getBanResultStats(banResults) {
 }
 
 function formatBanSuccessResult(r) {
-	// mutedBy：'human' = 人工命令口径（/ban /spam 默认禁言）；'killer' = 杀手群自动检测口径。
+	// mutedBy：'human' = 人工命令口径（2026-11-24 起不再产生禁言）；'killer' = 杀手群自动检测口径。
 	//
 	// 【探测后主动跳过要排在最前】这一支【压根没调接口】，说成「已永久禁言」是假的 ——
 	// 2026-10-12 主人就是在 /ban 一个已在黑名单的人时，看到 14 个群全写「已永久禁言」
@@ -5677,7 +5677,7 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 	const humanMutedCount = banResults.filter((r) => r.muted && r.mutedBy === 'human').length;
 	const killerMutedCount = mutedCount - humanMutedCount;
 	if (mutedCount === total && killerMutedCount === 0) {
-		// 人工命令口径（/ban /spam）：所有配置群只禁言、未踢出。
+		// 人工命令口径（/ban /spam）：2026-11-24 起全群踢出，本分支已不再命中。
 		if (okCount === total) lines.push(`🔇 <b>已永久禁言 ${okCount}/${total} 个群（未踢出）</b>`);
 		else if (okCount === 0) lines.push(`⚠️ <b>D1 黑名单已生效；禁言成功 0/${total}</b>`);
 		else if (realFailCount > 0) {
@@ -5704,7 +5704,7 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${total}</b>（${failCount} 个失败）`);
 	}
 	if (mutedCount > 0 && mutedCount < total) {
-		// 混合口径：/ban /spam 在杀手群踢出、普通群禁言；自动检测在杀手群禁言、普通群踢出 —— 两种都要说清。
+		// 混合口径（历史）：/ban /spam 曾为杀手群踢出、普通群禁言；2026-11-24 起全群踢出。
 		const mutedParts = [];
 		if (humanMutedCount > 0) mutedParts.push(`${humanMutedCount} 个群仅永久禁言、未踢出`);
 		if (killerMutedCount > 0) mutedParts.push(`${killerMutedCount} 个杀手群按自动检测口径仅永久禁言`);
@@ -5773,7 +5773,7 @@ function renderBanResults(banResults) {
 			: `🔇 杀手模式：已永久禁言 ${okCount}/${total} 个群（未踢出）`;
 	}
 	if (mutedCount > 0 && humanMutedCount > 0) {
-		// /ban /spam 混合口径：杀手群踢出、普通群禁言。
+		// /ban /spam 口径：全群踢出（2026-11-24 起）。
 		return `✅ Telegram 处置成功 ${okCount}/${total} 个配置群（禁言 ${humanMutedCount}、踢出 ${total - mutedCount}）`;
 	}
 	if (okCount === total) return `✅ Telegram封禁/预封成功 ${okCount}/${total} 个配置群`;
@@ -6807,7 +6807,7 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		action: normalizedAction,
 		reason: normalizedAction === 'spam' ? 'spam' : (isUnban ? null : 'manual'),
 		// 处置方式（执行时传给 applyGroupModeration）：'kick' = /sban 恒踢出；
-		// 'human' = /ban /spam 口径（杀手群踢、普通群禁言）；null = 自动路径口径（杀手群禁言、普通群踢）。
+		// 'human' = /ban /spam 口径（全群踢出封禁）；null = 自动路径口径（杀手群禁言、普通群踢）。
 		mode: options.mode || null,
 		command: getBulkJobCommand(normalizedAction),
 		status: 'queued',
@@ -6832,6 +6832,9 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		blacklistReplyDetail: options.replyDetail
 			? { msgId: options.replyDetail.msgId || null, text: String(options.replyDetail.text || '').slice(0, BLACKLIST_DETAIL_TEXT_MAX) }
 			: null,
+		// 【2026-11-24】队列里的学习需要一个 invocation 才能归档现场并学资料卡，
+		// 命令消息 id 在这里留存（队列执行时原消息对象已经不在作用域里）。
+		sourceMessageId: Number(message?.message_id) || 0,
 		sourceChatId: String(message.chat?.id ?? ''),
 		sourceChatTitle: message.chat?.title || message.chat?.username || (message.chat?.type === 'private' ? '私聊' : '当前群组'),
 		sourceChatType: message.chat?.type || 'unknown',
@@ -7222,8 +7225,18 @@ async function performBulkJobD1Mutation(job, env, ids) {
 				// 正文列表只查一次：join 后的给指纹学习（与改动前逐字一致），
 				// 逐条列表给名单写入（保留每条正文的原始换行，不经 join/split 二次加工）。
 				const textList = textLists.get(String(uid)) || [];
+			// 【2026-11-24】用建任务时的命令消息还原 invocation：批量路径此前 message=null，
+			// 合成学习消息拿不到 invocation 直接返回 null，等于一个特征都不学。
+			const jobInvocation = Number(job.sourceMessageId) > 0 ? {
+				message_id: Number(job.sourceMessageId),
+				date: Math.floor(Date.now() / 1000),
+				chat: { id: Number(job.sourceChatId), type: job.sourceChatType || 'supergroup' },
+				from: { id: Number(job.createdBy), is_bot: false },
+				text: String(job.command || '/spam')
+			} : null;
 				const r = await learnAdFromOperatorAction(env, uid, null, {
 					source: learnSource,
+					invocationMessage: jobInvocation,
 					createdBy: String(job.createdBy || ''),
 					// 【2026-10-15 乙】批量路径同样从缓存捞正文（与 /spam 单条同一个来源）。
 					// 改之前传空串，批量封一批广告号却只学得到资料卡。
@@ -7396,7 +7409,7 @@ async function processBulkJobOperationSlice(job, env, options = {}) {
 
 		// 按任务携带的 mode 分派单群处置：
 		//   'kick'  → /sban 恒踢出（含撤回历史发言）
-		//   'human' → /ban /spam 口径：杀手群踢出、普通群禁言
+		//   'human' → /ban /spam 口径：全群踢出封禁
 		//   缺省    → 自动路径口径：杀手群禁言、普通群踢出（老任务的 payload 没有该字段）
 		const result = await applyGroupModeration(task.groupId, task.userId, job.mode, options);
 		const retryError = !result.ok && bulkTelegramRetryError(result);
@@ -8664,9 +8677,9 @@ var MANUAL = [
 ['/start', '欢迎语；第一主人私聊发送会打开统计面板，群里发送只回介绍语'],
 ['/help', '第一主人私聊：返回网页后台入口，完整命令手册已搬到本页「命令手册」']]],
 ['人工封禁与查询（群管理员 / 主人 / 副主人）', [
-['/ban TGID [原因]', '加黑 + 全群禁言（不踢出）'],
+['/ban TGID [原因]', '加黑 + 全群踢出封禁'],
 ['/sban TGID [原因]', '加黑 + 全群踢出并撤回其历史发言（第一主人 / 副主人 / 该群群主）'],
-['/spam', '回复广告：删消息 + 全群禁言（群里回复广告消息发送）'],
+['/spam', '回复广告：删消息 + 全群踢出封禁（群里回复广告消息发送）'],
 ['/unban TGID', '移出黑名单 + 全群解封并恢复发言（不带 ID 则是自助解封）'],
 ['/check TGID', '查 GKY + 全局 + 群级封禁记录（群内可回复消息）；网页版 域名/check'],
 ['/profile TGID', '资料卡：昵称 / 简介 / 时间线 / 黑名单 / GKY（群内可回复消息使用）'],
@@ -17113,11 +17126,30 @@ async function enforceLinkedSpamTargets(env, targets, options = {}) {
 		// 风控·处置：同款连带查杀按实际封成功的群逐群 +1。
 		await recordDisposalsFromBanResults(env, banResults);
 		const okCount = banResults.filter((r) => r?.ok).length;
+		// 【2026-11-24 主人口径】同款连带的目标同样要学：正文（同款文案）+ 资料卡。
+		// 批量路径（createBulkJob → 队列）本来就走 learnAdFromOperatorAction；
+		// 同步路径此前只删消息 / 加黑 / 封禁，一个特征都不学，这里补齐。
+		// 学习入口自带第一主人门：非第一主人调用返回全 0，不会外泄学习权限。
+		let learnedCount = 0;
+		if (options.learn !== false && options.text) {
+			try {
+				const learned = await learnAdFromOperatorAction(env, target.userId, null, {
+					source: 'spam',
+					createdBy: String(options.operatorId ?? ''),
+					invocationMessage: options.invocationMessage || null,
+					text: String(options.text)
+				});
+				learnedCount = Number(learned?.learned || 0);
+			} catch (error) {
+				console.error('[同款连带] 目标特征学习失败:', error?.message || error);
+			}
+		}
 		done.push({
 			userId: target.userId,
 			deleted,
 			blacklistCode: String(added?.code || (added?.success ? 'ADDED' : 'ERROR')),
-			banSummary: okCount + '/' + banResults.length
+			banSummary: okCount + '/' + banResults.length,
+			learned: learnedCount
 		});
 	}
 	return done;
@@ -20108,7 +20140,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 					? 'kick'
 					: (isKillerModeGroup(chatId) && isKillerMuteReason(blacklistCheck.entry?.reason)
 						? 'mute'
-						: 'human');
+						: (isKillerModeGroup(chatId) ? 'kick' : 'mute'));
 				// 【2026-10-25】群收走「封禁用户」权限时不再白调注定失败的请求。
 				// kick / mute / human 三条路在 Telegram 都要 can_restrict_members，
 				// 所以这一道闸放在分派之前、对三者一视同仁。探测结果缓存 10 分钟，
@@ -20432,7 +20464,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				const lines = [`🎬 操作:举报加黑(/spam)`];
 				let flashText;
 				if (result.success || alreadyExists) {
-					// mode:'human' = /spam 与 /ban 同口径：杀手群踢出、其余群禁言不踢。
+					// mode:'human' = /spam 与 /ban 同口径：全部踢出封禁（2026-11-24 起全局群也踢）。
 					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true, mode: 'human', groupIds: spamRoute.groupIds });
 					// 风控·处置：/spam 单条按实际处置成功的群逐群 +1。
 					await recordDisposalsFromBanResults(env, banResults);
@@ -20475,7 +20507,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 					if (spamTextLearnLine) lines.push(spamTextLearnLine);
 				}
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
-					flashText = `${result.success ? '✅ 已加黑并全群禁言' : '⚠️ 已在黑名单，已继续全群禁言'}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
+					flashText = `${result.success ? '✅ 已加黑并全群踢出封禁' : '⚠️ 已在黑名单，已继续全群踢出封禁'}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
 				} else {
 					lines.push(`🎯 目标用户:${targetMention}`);
 					lines.push('');
@@ -20739,7 +20771,10 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 						if (shouldRunLinkedSpamSync(found.targets.length)) {
 							// 同步路径：仅当子请求估算在安全预算内才当场执行（群少时才可能走到）。
 							const done = await enforceLinkedSpamTargets(env, found.targets, {
-								operatorId, note: noteText
+								operatorId, note: noteText,
+								// 【2026-11-24】同款正文带进去，同步连带也按第一主人口径全量学习。
+								text: linkedKey.norm,
+								invocationMessage: message
 							});
 							// 【刻意不写进 lines】lines 走 detailText，而 detailText 会同时投给副主人
 							// （notifySecondaryOwners: true）。连带只属于第一主人，结果也只发给他 ——
@@ -20806,7 +20841,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			}
 
 			await replyToModerationAdmin(message, ctx, {
-				flashText: `${result.success ? '✅ 已加黑并全群禁言' : '⚠️ 已在黑名单，已继续全群禁言'}\n🎯 ${formatUserReference(repliedUserId, repliedMsg.from)} <code>${escapeHtml(String(repliedUserId))}</code>`,
+				flashText: `${result.success ? '✅ 已加黑并全群踢出封禁' : '⚠️ 已在黑名单，已继续全群踢出封禁'}\n🎯 ${formatUserReference(repliedUserId, repliedMsg.from)} <code>${escapeHtml(String(repliedUserId))}</code>`,
 				detailText: withActionContext(message, lines.join('\n'), replySpamNote),
 				isInGroup,
 				notifySecondaryOwners: true
@@ -21609,7 +21644,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 	}
 
 	// 处理 /ban 与 /sban 命令 - 添加用户到黑名单（支持批量、群内/私聊双场景；兼容 @机器人名）
-	//   /ban  → 加黑 + 全群【禁言】（杀手群踢出，见 resolveHumanCommandMode）
+	//   /ban  → 加黑 + 全群【踢出封禁】（2026-11-24 起全局群也踢，见 resolveHumanCommandMode）
 	//   /sban → 加黑 + 全群【踢出】并撤回历史发言（主人定的「指定人全群踢出」专用指令）
 	// 两者共用这一条分支：解析、批量、渲染、回执逻辑完全一致，只在权限与处置方式上分叉。
 	if (isBanCommand(text) || isSbanCommand(text)) {
@@ -21804,7 +21839,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 						lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
 					}
 				}
-				flashText = `${result.success ? (isSban ? '✅ 已加黑并全群踢出' : '✅ 已加黑并全群禁言') : (isSban ? '⚠️ 已在黑名单，已继续全群踢出' : '⚠️ 已在黑名单，已继续全群禁言')}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
+				flashText = `${result.success ? (isSban ? '✅ 已加黑并全群踢出' : '✅ 已加黑并全群踢出封禁') : (isSban ? '⚠️ 已在黑名单，已继续全群踢出' : '⚠️ 已在黑名单，已继续全群踢出封禁')}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
 				lines.push(`🎯 目标用户:${targetMention}`);
@@ -25209,6 +25244,12 @@ const AD_EXEMPT_KEYWORD_CATEGORIES = [
 	// exam-v3 + v4 统计：题库 2,862 题、正体本 425、负体本 2,437
 	'考试', '题库', '测试', '学习', '教育', '课程', '正体本', '负体本', '原页样本', '词族扩张', '人类简史',
 	'exam', 'test', 'quiz', 'study', 'education', 'course', 'learning', 'vocabulary', 'history'
+	] },
+	// —— 2026-11-24 主人指定 ——
+	// 「看 + 业务词」是频道 / 资源号的口语引导语，正常用户也会这么说；
+	// 订阅 / 代理 / 订阅器 本体已在上面各分类里，这里只补带「看」的组合。
+	{ name: '主人指定（2026-11-24）', words: [
+	'看福利', '看订阅', '看代理', '看订阅器'
 	] }
 ];
 const AD_EXEMPT_KEYWORDS = AD_EXEMPT_KEYWORD_CATEGORIES.flatMap(({ words }) => words);
@@ -29071,10 +29112,10 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 	// 构成一个自噬循环：管理员用 /ban 封人 → 命令文本入库 → 下次任何人（含管理员自己）
 	// 发相同命令即被秒封全群。命令文本是操作指令、不是广告内容，任何路径都不该学。
 	const text = String(payload?.text ?? '').trim().replace(/\s+/g, ' ');
-	if (text.length >= 12 && !isTelegramSlashCommand(text)) push('keyword', text.slice(0, 60), 1);
+	if (text.length >= 12 && !isTelegramSlashCommand(text)) push('keyword', text.slice(0, 200), 1);
 
 	const bio = String(payload?.bio ?? '').trim();
-	if (bio.length >= 6) push('bio', bio.slice(0, 60), 0.8);
+	if (bio.length >= 6) push('bio', bio.slice(0, 200), 0.8);
 
 	for (const domain of extractAdDomains(combined)) {
 		// 平台自身域名绝不学习：t.me 之类一旦入库，任何人分享 Telegram 链接都会命中，
@@ -29193,13 +29234,9 @@ function operatorSyntheticLearningMessage(invocation, targetUserId, options = {}
 	if (!invocation || invocation.__webAdmin || !isPrimaryOwner(options.createdBy)) return null;
 	if (String(getMessageActorId(invocation)) !== String(options.createdBy)) return null;
 	if (Number(invocation.message_id) <= 0) return null;
-	// 正文可以为空：/spam <ID> 时缓存里可能没有原文（刚发就被删 / 已过保留期），
-	// 但第一主人的指令仍然要学资料卡（昵称 / bio / 头像 / 会员标）。
-	// 【2026-11-15 口径修正】资料卡已不再进入人工学习（只学正文），合成消息存在的唯一理由
-	// 就只剩「把这批缓存正文交给学习链」。没有正文时继续走下去只会白抓一次资料、白落一条
-	// review —— 裸 /ban <ID>、/spam <ID> 在缓存里查无原文时都会走到这里，那时一个字都不该学。
+	// 【2026-11-24 主人口径】资料卡重新纳入人工学习：没有正文时照样学资料卡
+	//（昵称 / 用户名 / 简介 / 头像 / 会员标 / 资料形状），不再因 text 为空提前返回。
 	const text = String(options.text || '').trim();
-	if (!text) return null;
 	return {
 		message_id: Number(invocation.message_id),
 		date: Number(invocation.date) || Math.floor(Date.now() / 1000),
@@ -29294,12 +29331,21 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 		out.dynamicProgress=collected.evaluation.contentReviewProgress===true;
 		out.collectionMissing=collected.evaluation.drillIncomplete||[];
 		await checkpoint(collected.evaluation);
-		// 【2026-11-15 主人口径·最终】同款学习只学【正文】：正文文字、正文图片、
-		// 正文表情包贴纸。资料卡（昵称 / 头像 / 会员标 / 资料形状）一律不学 ——
-		// 资料卡的识别交给自动检测与第一道/第二道防线。
-		const name = '';
-		const nameFields = { name: '', username: '' };
-		const learningBio = '';
+		// 【2026-11-24 主人口径】第一主人手动判定即广告：正文与资料卡全部字段一并学习。
+		// 上一版（2026-11-15）为了让同款只认正文，把昵称 / 用户名 / 简介置空，
+		// 广告号换套正文就能重新投放，资料卡一条特征都没沉淀。主人已明确
+		// 「误封没关系，第一主人会自行安排解封」，学习端不再用广告证据门槛自筛。
+		// 唯一保留的硬保护是【权限人 username 白名单】（containsAdProtectedUsername）：
+		// 主人 / 副主人 handle 永不入库，否则广告号艾特主人一次就会让所有人艾特主人被秒封。
+		// 投放 bot 仍不学资料卡 —— 它是工具账号，昵称头像不是广告用户特征。
+		const name = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
+		const nameFields = targetIsBot
+			? { name: '', username: '' }
+			: {
+				name: containsAdProtectedUsername(name) ? '' : name,
+				username: containsAdProtectedUsername(String(profile.username || '')) ? '' : String(profile.username || '')
+			};
+		const learningBio = targetIsBot ? '' : String(profile.bio || '');
 		// 【媒体源】/ban <id>、/spam <id>、/sban 传进来的 message 是【命令消息本身】，
 		// 被引用的那条广告躺在 message.reply_to_message 里 —— 命令消息上没有 photo /
 		// sticker / entities，直接吃 message 会让「引用一张广告图或贴纸去 /ban」的媒体
@@ -29322,6 +29368,9 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 			bio: learningBio,
 			text,
 			domains: extractAdDomains([nameFields.name, nameFields.username, learningBio, text].filter(Boolean).join('\n')),
+			// 【2026-11-24】名片消息的手机号也是可复用身份键：此前学习载荷不带 phone，
+			// 主人 /ban 一个发名片的广告号，号码一条都进不了库。
+			phone: String(quoted?.contact?.phone_number || ''),
 			// 正文里的自定义 emoji（点⚔️查 这类贴纸 emoji）id 就在被引用消息的 entities 里，
 			// 与资料无关，必须从媒体源现取 —— fetchAdUserProfile 的响应里没有它。
 			customEmojiIds: learnedEmojiRows.map(item=>item.id),
@@ -29361,18 +29410,38 @@ async function learnAdOperatorSnapshot(env, targetUserId, message, options = {})
 		// 【绝不影响命令本职】与上面的指纹学习同一口径：封禁已经做完了，
 		// 判据写不进去最多是少学一条，不能让回执报错，更不能影响后面的语义样本与共性提炼。
 		try {
-			// 【2026-11-15 主人口径·最终】资料卡头像 / 会员标不在同款学习范围内：
-			// 同款只学正文（文字 + 图片 + 表情包贴纸）。资料卡识别交给自动检测。
-			// 正文自定义 emoji 属于正文，照常学习。
+			// 【2026-11-24 主人口径】资料卡头像 / 会员标恢复学习，且不再要求素材自身
+			// 先被判成广告 —— 第一主人手动判定就是最终凭据，误封由主人后续安排解封。
+			const avatarId = String(profile.avatarId || '');
+			if (!targetIsBot && avatarId && await step('avatar:'+avatarId,()=>learnAdAvatarOnBan(env, avatarId, targetUserId))) {
+				out.avatars += 1;
+				if (collected.materials.avatar?.ocr_text) await step('avatar_text:'+avatarId,async()=>{
+					const value=collected.materials.avatar.ocr_text;
+					const textHit=await matchAdAvatarText(env,value);
+					if(!isReliableAdAvatarText({ocr_text:value,textHit}))return true;
+					return learnAdAvatarText(env,value);
+				});
+			}
+			// 会员标与正文自定义 emoji 共用 ad_badges、共用 hits 计数（+1 语义）。
+			const badgeId = String(profile.badgeId || '');
+			if (!targetIsBot && badgeId && await step('badge:'+badgeId,()=>learnAdBadgeOnBan(env, badgeId, targetUserId))) out.badges += 1;
 			for (const emojiId of payload.customEmojiIds) {
-				if (!emojiId) continue;
+				if (!emojiId || emojiId === badgeId) continue;
 				if (await step('badge:'+emojiId,()=>learnAdBadgeOnBan(env, emojiId, targetUserId))) out.badges += 1;
 			}
 		} catch (error) {
-			out.learningError='部分会员表情特征未能保存';
-			console.error('[广告检测] 人工判定会员标学习失败（' + source + '）:', error);
+			out.learningError='部分头像或会员表情特征未能保存';
+			console.error('[广告检测] 人工判定头像/会员标学习失败（' + source + '）:', error);
 		}
-		// 【2026-11-15 主人口径·最终】资料形状不在同款学习范围内（属于资料卡）。
+		try {
+			// 【2026-11-24 主人口径】资料形状恢复学习：形状层只加分不定罪，
+			// 空 bio 或核心内容不足 4 字时 adProfileShape 返回空串，自然跳过。
+			const shapeKey = learningBio ? adProfileShape({...profile,bio:learningBio}) : '';
+			if (shapeKey && await step('shape:'+shapeKey,()=>learnAdProfileShape(env, shapeKey, learningBio))) out.shapes += 1;
+		} catch (error) {
+			out.learningError='资料形状特征未能保存';
+			console.error('[广告检测] 人工判定资料形状学习失败（' + source + '）:', error);
+		}
 
 		// 【2026-10-13 补：学习链路必须也学图片】
 		// payload 只有 name / username / bio / text / domains 五样 —— 主人引用一张
@@ -40326,7 +40395,7 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 	// 与演练那对（dry:ok / dry:no）同形态：判完不封，推给主人拍板。
 	// 【为什么必须有按钮】原来那条提示写着「确认是广告 → /spam（引用其消息）」，
 	// 主人 2026-10-14 照做，而 /spam 取「被引用消息的发送者」当目标 —— 私聊里能引用的
-	// 只有机器人自己，于是机器人把自己加黑、全群禁言。把判断收进按钮，这类误操作没有入口。
+	// 只有机器人自己，于是机器人把自己加黑、全群踢出封禁。把判断收进按钮，这类误操作没有入口。
 	if (action === 'ok' || action === 'no') {
 		// 新通知把目标群直接编进按钮；旧通知（只带 userId）才需要查观察记录。
 		// 注意：记录可能在 24 小时后已被 prune 删除 —— 那是旧通知失效的原因，
