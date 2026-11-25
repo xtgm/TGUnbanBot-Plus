@@ -622,9 +622,15 @@ export default {
 			if (body.type === 'ad_content_review') {
 				const result = await runAdContentReview(env, String(body.reviewId || ''));
 				if (result.retryAfter) {
-					// 正常的分批帧检测属于任务进展，不消耗 Queue 的故障重投次数。
-					const continued = result.progress === true && await queueAdContentReview(env, body.reviewId, result.retryAfter);
-					if (!continued && typeof message.retry === 'function') message.retry({ delaySeconds: result.retryAfter });
+					// 【2026-11-25 根治积压】不再 queue.send 一条新的延迟消息。
+					// 旧逻辑在 progress=true（分批帧检测）时自续新消息，cron resumeAdContentReviews
+					// 又按 next_at 再入队一次，同一条复核在队列里叠 2~3 条 —— 队列只涨不降，
+					// 线上 purge 前积压 522 条就是这么滚出来的。现在一律原地重试当前消息：
+					// delaySeconds 夹在 5~300 秒，5 次重投约 25 分钟；超出后消息丢弃，
+					// 由 cron 按 next_at 兜底重排，队列长度恒定、不会自增。
+					if (typeof message.retry === 'function') {
+						message.retry({ delaySeconds: Math.max(5, Math.min(300, Math.ceil(Number(result.retryAfter) || 30))) });
+					}
 				}
 				continue;
 			}
@@ -709,6 +715,9 @@ export default {
 			await pruneAdDetectionData(env);
 			// 群统计明细超期剪枝（保留 STAT_RETENTION_DAYS 天），同样搭 cron 的稳定节拍。
 			await pruneStatData(env);
+			// 【2026-11-25】存储水位自检：关键表行数超阈值就通知主人，不用等 D1 爆。
+			try { await reportAdStorageHealth(env); }
+			catch (error) { console.error('[存储告警] 检查失败:', error); }
 			// 配置群管理员全量同步：热路径的豁免读的就是这张表。
 			// cron 每天只跑两次，所以主力是 chat_member 事件的即时同步，这里只是兜底 ——
 			// 补上 bot 掉线 / 事件丢失期间漏掉的提权与撤职。
@@ -39545,7 +39554,9 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 // 变成每 5 分钟重试一次、每次都失败的死循环，案件永远出不来。
 // 30 天足够回溯任何一次误判 —— /ignore 回滚用的是 ad_pending_snapshots（那张表刻意不剪），
 // 不依赖本表。
-const AD_JOIN_NOTICE_RETENTION_SECONDS = 30 * 24 * 3600;
+// 【2026-11-25】30 天 → 14 天：结算后的拦门通知只用于主人回看处置结果，
+// 线上 1645 条已结算记录占 32 MB（单条 payload 约 20 KB），14 天足够。
+const AD_JOIN_NOTICE_RETENTION_SECONDS = 14 * 24 * 3600;
 
 // 演练/复核素材（ad_review_assets + ad_review_asset_chunks）的过期清理。
 // 【为什么必须有】写入时给了 7 天 expires_at（cacheAdReviewAsset），读取也带
@@ -39566,8 +39577,97 @@ async function pruneAdReviewAssets(env, nowSeconds = Math.floor(Date.now() / 100
 // 每条都带 message_json + evaluation（几 KB 到几十 KB），expires_at 写了却从没人读。
 // 这里按终态 + 保留期批量删，单轮 1000 条封顶 —— 一次删太多会长时间占住 D1 写锁，
 // 反而把正常判定拖死。跑不完下一轮接着删，不需要一次性清空。
-const AD_REVIEW_ROW_RETENTION_SECONDS = 7 * 86400;
+// 【2026-11-25】7 天 → 3 天：终态复核记录只用于短期追溯，线上 5000+ 条
+// 终态行白占 59 MB，3 天足够复盘一场广告误判。
+const AD_REVIEW_ROW_RETENTION_SECONDS = 3 * 86400;
 const AD_REVIEW_SETTLED_STATUSES = "'clean','ad','skipped','exhausted','learned','normal_intent','normal','action_failed','learning_failed'";
+// === 2026-11-25 D1 存储瘦身：以下四张表此前无保留期，只增不减 ===
+
+// 语义样本向量：D1 体积最大的一张表（线上 13922 行 / 259 MB，单行 1024 维
+// JSON 浮点约 19.5 KB）。seed / seed-core / manual / confirm 是人工确认过的
+// 基准样本，永久保留；其余自动学习样本按「最近 10000 条 + 180 天」滚动。
+// 广告语义集中在近期样本，老样本删掉不影响匹配精度，却能把这张表稳定在 200 MB 内。
+const AD_SAMPLE_KEEP_ROWS = 10000;
+const AD_SAMPLE_KEEP_SECONDS = 180 * 86400;
+const AD_SAMPLE_KEEP_SOURCES = "'seed','seed-core','manual','confirm'";
+
+async function pruneAdSampleEmbeddings(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return { removed: 0 };
+	const now = Number(nowSeconds) || 0;
+	let removed = 0;
+	// 每轮 500 条、最多 10 轮：单次 cron 最多删 5000 条，避免一次大 DELETE
+	// 触发 D1 过载（线上出现过 "generating too much load"）。
+	for (let i = 0; i < 10; i++) {
+		const res = await env.DB.prepare(
+			'DELETE FROM ad_sample_embeddings WHERE id IN ('
+			+ 'SELECT id FROM ad_sample_embeddings WHERE source NOT IN (' + AD_SAMPLE_KEEP_SOURCES + ') AND created_at < ? '
+			+ 'ORDER BY created_at ASC LIMIT 500)'
+		).bind(now - AD_SAMPLE_KEEP_SECONDS).run();
+		const n = Number(res?.meta?.changes || 0);
+		removed += n;
+		if (n < 500) break;
+	}
+	// 条数上限：删最老的，保留最近 N 条。
+	for (let i = 0; i < 10; i++) {
+		const row = await env.DB.prepare(
+			'SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE source NOT IN (' + AD_SAMPLE_KEEP_SOURCES + ')'
+		).first();
+		if (Number(row?.c || 0) <= AD_SAMPLE_KEEP_ROWS) break;
+		const res = await env.DB.prepare(
+			'DELETE FROM ad_sample_embeddings WHERE id IN ('
+			+ 'SELECT id FROM ad_sample_embeddings WHERE source NOT IN (' + AD_SAMPLE_KEEP_SOURCES + ') '
+			+ 'ORDER BY created_at ASC LIMIT 500)'
+		).run();
+		const n = Number(res?.meta?.changes || 0);
+		removed += n;
+		if (!n) break;
+	}
+	return { removed };
+}
+
+// 自动处置目标：终态行（skipped / done / failed / released / rolled_back）
+// 30 天后删除。线上 70044 行 / 16 MB，其中 skipped 37608 行、done 24550 行，
+// 都是不会再变的历史。pending / executing 是活跃态，一律不动。
+async function pruneAdAutomaticCaseTargets(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return { removed: 0 };
+	const now = Number(nowSeconds) || 0;
+	let removed = 0;
+	for (let i = 0; i < 10; i++) {
+		const res = await env.DB.prepare(
+			'DELETE FROM ad_automatic_case_targets WHERE rowid IN ('
+			+ "SELECT rowid FROM ad_automatic_case_targets WHERE state IN ('skipped','done','failed','released','rolled_back') "
+			+ 'AND created_at < ? ORDER BY created_at ASC LIMIT 500)'
+		).bind(now - 30 * 86400).run();
+		const n = Number(res?.meta?.changes || 0);
+		removed += n;
+		if (n < 500) break;
+	}
+	return { removed };
+}
+
+// 扫描状态键：image_content_v* / dynamic_content_v1 / join_mute_restore 等
+// 都是一次性判定结果，60 天后没有价值。线上 4843 行 / 9 MB。
+async function pruneAdScanState(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return { removed: 0 };
+	const now = Number(nowSeconds) || 0;
+	const res = await env.DB.prepare('DELETE FROM ad_scan_state WHERE updated_at > 0 AND updated_at < ?')
+		.bind(now - 60 * 86400).run();
+	return { removed: Number(res?.meta?.changes || 0) };
+}
+
+// 演练报告分片：session 关闭且报告已发完后，分片只剩占位作用（线上单行 227 KB，
+// 38 行 9 MB）。保留 7 天供复查，之后删除。
+async function pruneAdDryrunReportParts(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return { removed: 0 };
+	const now = Number(nowSeconds) || 0;
+	const cutoff = new Date((now - 7 * 86400) * 1000).toISOString();
+	const res = await env.DB.prepare(
+		'DELETE FROM ad_dryrun_report_parts WHERE session_id IN ('
+		+ "SELECT id FROM ad_dryrun_sessions WHERE status <> 'open' AND (report_complete = 1 OR report_sent = 1) AND opened_at <> '' AND opened_at < ?)"
+	).bind(cutoff).run();
+	return { removed: Number(res?.meta?.changes || 0) };
+}
+
 async function pruneAdContentReviews(env, nowSeconds = Math.floor(Date.now() / 1000)) {
 	if (!env?.DB) return 0;
 	try {
@@ -39581,16 +39681,55 @@ async function pruneAdContentReviews(env, nowSeconds = Math.floor(Date.now() / 1
 		).bind(now, now - 3 * 86400).run();
 		const staleCount = Number(stale?.meta?.changes || 0);
 		if (staleCount > 0) console.log('[复核队列] 已归档陈旧活跃记录 ' + staleCount + ' 条');
-		const res = await env.DB.prepare(
-			'DELETE FROM ad_content_reviews WHERE seq IN (SELECT seq FROM ad_content_reviews WHERE status IN (' + AD_REVIEW_SETTLED_STATUSES + ') AND updated_at < ? ORDER BY seq LIMIT 1000)'
-		).bind(now - AD_REVIEW_ROW_RETENTION_SECONDS).run();
-		const count = Number(res?.meta?.changes || 0);
+		// 【2026-11-25】单轮 1000 条不够：线上 5000+ 条终态记录要 5 天才清完，
+		// 期间一直占着 59 MB。改成单轮最多 5 批（5000 条），一天两次 cron 足够清空。
+		let count = 0;
+		for (let i = 0; i < 5; i++) {
+			const res = await env.DB.prepare(
+				'DELETE FROM ad_content_reviews WHERE seq IN (SELECT seq FROM ad_content_reviews WHERE status IN (' + AD_REVIEW_SETTLED_STATUSES + ') AND updated_at < ? ORDER BY seq LIMIT 1000)'
+			).bind(now - AD_REVIEW_ROW_RETENTION_SECONDS).run();
+			const n = Number(res?.meta?.changes || 0);
+			count += n;
+			if (n < 1000) break;
+		}
 		if (count > 0) console.log('[复核队列] 已清理终态记录 ' + count + ' 条');
 		return count;
 	} catch (error) {
 		console.error('[复核队列] 清理终态记录失败: ' + formatD1SchemaError(error));
 		return 0;
 	}
+}
+
+// 【2026-11-25 D1 体积监控】每日 cron 统计关键表行数，超阈值直接通知主人。
+// 阈值按「正常水位 ×1.5」设：剪枝生效后行数应长期低于这里；连续告警说明
+// 增长来源没堵住（比如新加的学习入口没有对应清理规则），要人看一眼。
+const AD_STORAGE_WATCH = [
+	['ad_sample_embeddings', 15000, '语义向量'],
+	['ad_content_reviews', 8000, '内容复核'],
+	['ad_join_notices', 3000, '拦门通知'],
+	['ad_review_asset_chunks', 5000, '演练素材分片'],
+	['ad_automatic_case_targets', 100000, '自动处置目标'],
+	['ad_pending_snapshots', 40000, '待确认快照']
+];
+
+async function reportAdStorageHealth(env) {
+	if (!env?.DB) return { alerts: 0 };
+	const alerts = [];
+	for (const [table, limit, label] of AD_STORAGE_WATCH) {
+		try {
+			const row = await env.DB.prepare('SELECT COUNT(*) AS c FROM ' + table).first();
+			const c = Number(row?.c || 0);
+			if (c > limit) alerts.push(label + '（' + table + '）：' + c + ' 行，上限 ' + limit);
+		} catch (_) { /* 表还没建就跳过 */ }
+	}
+	if (!alerts.length) return { alerts: 0 };
+	const owners = Array.isArray(runtime().OWNER_IDS) ? runtime().OWNER_IDS : [];
+	if (!owners.length) return { alerts: alerts.length, notified: false };
+	const text = ['【D1 存储告警】'].concat(alerts, ['', '自动剪枝已执行；若连续两天告警，请检查该表新增来源是否缺少清理规则。']).join(String.fromCharCode(10));
+	for (const owner of owners.slice(0, 2)) {
+		try { await sendTelegramMessageChunks(owner, text); } catch (_) { /* 通知失败不影响 cron */ }
+	}
+	return { alerts: alerts.length, notified: true };
 }
 
 async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 1000)) {
@@ -39626,6 +39765,15 @@ async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 10
 			.bind(now - AD_JOIN_NOTICE_RETENTION_SECONDS).run();
 		const count = Number(removed?.meta?.changes || 0);
 		if (count > 0) console.log('[拦门通知] 已清理过期记录 ' + count + ' 条');
+		// 【2026-11-25】再加一道条数闸：单条 payload 约 20 KB，仅靠天数上限时
+		// 广告高峰一天能进几百条，14 天就是几十 MB。结算态超过 1200 条时
+		// 从最老的开始删，只动 next_at=0 的终态行，不会误删待发送通知。
+		for (let i = 0; i < 4; i++) {
+			const total = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_join_notices WHERE next_at=0').first();
+			if (Number(total?.c || 0) <= 1200) break;
+			const res = await env.DB.prepare('DELETE FROM ad_join_notices WHERE id IN (SELECT id FROM ad_join_notices WHERE next_at=0 ORDER BY created_at ASC LIMIT 300)').run();
+			if (!Number(res?.meta?.changes || 0)) break;
+		}
 	} catch (error) {
 		console.error('[拦门通知] 过期记录清理失败：' + formatD1SchemaError(error));
 	}
@@ -39639,6 +39787,32 @@ async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 10
 	}
 	// 复核队列单独一段：它是最大的一张表，删失败不能拖垮前面的剪枝。
 	try { await pruneAdContentReviews(env, nowSeconds); } catch (_) { /* 已在函数内记日志 */ }
+	// 【2026-11-25 D1 瘦身】以下四张表此前完全没有保留期剪枝，是 D1 从 200 MB
+	// 涨到 731 MB 的主要增量。各自独立 try，任何一张失败都不影响其余剪枝。
+	try {
+		const pruned = await pruneAdSampleEmbeddings(env, nowSeconds);
+		if (pruned.removed > 0) console.log('[语义样本] 已清理过期向量 ' + pruned.removed + ' 条');
+	} catch (error) {
+		console.error('[语义样本] 过期向量清理失败：' + formatD1SchemaError(error));
+	}
+	try {
+		const pruned = await pruneAdAutomaticCaseTargets(env, nowSeconds);
+		if (pruned.removed > 0) console.log('[自动处置] 已清理终态目标 ' + pruned.removed + ' 条');
+	} catch (error) {
+		console.error('[自动处置] 终态目标清理失败：' + formatD1SchemaError(error));
+	}
+	try {
+		const pruned = await pruneAdScanState(env, nowSeconds);
+		if (pruned.removed > 0) console.log('[扫描状态] 已清理陈旧键 ' + pruned.removed + ' 条');
+	} catch (error) {
+		console.error('[扫描状态] 陈旧键清理失败：' + formatD1SchemaError(error));
+	}
+	try {
+		const pruned = await pruneAdDryrunReportParts(env, nowSeconds);
+		if (pruned.removed > 0) console.log('[演练报告] 已清理历史分片 ' + pruned.removed + ' 条');
+	} catch (error) {
+		console.error('[演练报告] 历史分片清理失败：' + formatD1SchemaError(error));
+	}
 }
 
 // === 待确认快照（纯 D1 替代 KV）===
