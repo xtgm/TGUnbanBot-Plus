@@ -606,10 +606,10 @@ export default {
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
 			if (body.type === 'ad_join_notice') {
-				const result = await deliverAdJoinNotice(env, String(body.noticeId || ''), ctx);
-				// 【2026-11-25】只夹 30 秒：拦门通知补发没必要在队列里躺几小时，
-				// 失败就交给 prune/deliver 的下一次 cron 兜底。
-				if (result.retryAfter && typeof message.retry === 'function') message.retry({ delaySeconds: Math.max(5, Math.min(30, Math.ceil(Number(result.retryAfter) || 30))) });
+				// 【2026-11-25 终态收口】不再 message.retry。延迟重投期间消息仍占着 backlog，
+				// oldest_message_timestamp_ms 会累计原始入队时间，面板上就是积压（实测 419s/152s/120s）。
+				// 未送达的通知由 cron 的 ad_join_notices.next_at 扫描兜底（见 deliverAdJoinNotices）。
+				await deliverAdJoinNotice(env, String(body.noticeId || ''), ctx);
 				continue;
 			}
 			if(body.type==='ad_review_batch_start'){
@@ -622,20 +622,11 @@ export default {
 				await sendAdContentReviewBatchReport(env,body.batchId,{includeUnresolved:body.includeUnresolved===true});continue;
 			}
 			if (body.type === 'ad_content_review') {
-				const result = await runAdContentReview(env, String(body.reviewId || ''));
-				if (result.retryAfter) {
-					// 【2026-11-25 根治积压】不再 queue.send 一条新的延迟消息。
-					// 旧逻辑在 progress=true（分批帧检测）时自续新消息，cron resumeAdContentReviews
-					// 又按 next_at 再入队一次，同一条复核在队列里叠 2~3 条 —— 队列只涨不降，
-					// 线上 purge 前积压 522 条就是这么滚出来的。现在一律原地重试当前消息：
-					// 【2026-11-25 二次收口】上限从 300 秒降到 30 秒。实测：cron 19:24 推入的 6 条
-					// 重复消息在 300 秒延迟里一直占着 backlog，oldest_age 涨到 419 秒才被 ack，
-					// 面板看起来就是积压。现在单条最多滞留 30 秒，配合 consumer max_retries=2，
-					// 最迟 1 分钟内必定 ack 或丢弃，剩下的完全交给 cron 按 next_at 重排。
-					if (typeof message.retry === 'function') {
-						message.retry({ delaySeconds: Math.max(5, Math.min(30, Math.ceil(Number(result.retryAfter) || 30))) });
-					}
-				}
+				// 【2026-11-25 终态收口】不再重投。记录状态（status/next_at）在 runAdContentReview
+				// 里已经写回 D1，resumeAdContentReviews 每 10 分钟按 next_at 全量重排，任务不会丢。
+				// 只要调用 retry，消息在整个延迟期都占 backlog，oldest_age 一路累加 ——
+				// 这是 522 条僵尸之后仅剩的可见残留，从协议层去掉。
+				await runAdContentReview(env, String(body.reviewId || ''));
 				continue;
 			}
 			if(body.type==='drill_capture'){await runAdDryRunCapture(env,Number(body.rowId));continue;}
@@ -643,10 +634,8 @@ export default {
 			if(body.type==='drill_report'){await runAdDryRunReportJob(env,Number(body.rowId));continue;}
 			if (body.type === 'drill_close') {
 				try {
-					const result = await runAdDryRunCloseJob(env, Number(body.sessionId), { limit: 20 });
-					// 【2026-11-25】上限 43200 秒（12 小时）会让演练收尾消息在队列里躺一整天，
-					// 改成最多 120 秒；收尾本身有 next_at 幂等，重复跑不会重复执行。
-					if ((result.busy || (!result.complete && !result.partial && !result.queued)) && typeof message.retry === 'function') message.retry({ delaySeconds: Math.max(30,Math.min(120,Number(result.retryAfter)||30)) });
+					// 【2026-11-25 终态收口】不重投；未收完的会话由 cron 扫 ad_dryrun_sessions.next_at 续跑。
+					await runAdDryRunCloseJob(env, Number(body.sessionId), { limit: 20 });
 				} catch (error) {
 					console.error('[演练收尾] 作业 #' + Number(body.sessionId) + ' 执行中断: ' + formatD1SchemaError(error));
 					throw error;
