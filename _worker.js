@@ -2486,7 +2486,7 @@ async function miniAppBlacklistList(env, payload) {
 	return miniAppPaging(rows.slice().reverse(), payload.page, MINI_APP_PAGE_SIZE);
 }
 
-async function miniAppUnban(env, payload) {
+async function miniAppUnban(env, payload, operatorId) {
 	const userId = String(payload.userId || '').trim();
 	if (!/^\d{1,20}$/.test(userId)) throw new MiniAppError(400, '用户 ID 必须是纯数字');
 	// 与 /ignore 同一顺序：先确认黑名单已清（或本就不在），再解 Telegram 封禁，
@@ -2500,15 +2500,20 @@ async function miniAppUnban(env, payload) {
 	// 4甲：联合名单里的人同样写本地豁免（与 /unban 同口径）。没订阅时零 SQL。
 	const fedExempted = (await exemptFederatedOnUnban(env, [userId], String(runtime().OWNER_IDS[0] || ''))).includes(userId);
 	// 全局解封不碰独立群（本群黑名单与踢出由那个群自己管）。
+	// 【2026-11-25 主人口径】第一主人通过小程序解封同样清学习内容，与 /unban 命令同一口径。
+	// 挂在 Telegram 解封之前：清完再解，避免解封与清库之间再收到一条消息把证据写回去。
+	const learningPurged = isPrimaryOwner(operatorId) ? await purgeAdLearningForUser(env, userId) : null;
 	const results = await unbanUserFromAllGroups(userId, globalUnbanScopeGroupIds());
 	const failed = results.filter((row) => !row.ok);
 	return {
 		userId,
 		removed: removed.success === true,
 		fedExempted,
+		learningPurged,
 		complete: failed.length === 0,
 		message: (removed.success ? '已移除黑名单；' : '该用户本就不在黑名单；')
 			+ (fedExempted ? FED_EXEMPT_NOTICE + '；' : '')
+			+ (learningPurged ? '已清理学习内容（指纹 ' + learningPurged.fingerprints + ' 条）；' : '')
 			+ results.filter((row) => row.ok).length + '/' + results.length + ' 个群组已解除',
 		results: results.map((row) => ({
 			groupId: row.groupId,
@@ -3220,7 +3225,7 @@ async function dispatchMiniAppAction(action, body, env, auth, ctx) {
 		case 'groups/remove': return miniAppRemoveGroup(env, payload);
 		case 'groups/leave': return miniAppLeaveGroup(env, payload);
 		case 'blacklist/list': return miniAppBlacklistList(env, payload);
-		case 'blacklist/unban': return miniAppUnban(env, payload);
+		case 'blacklist/unban': return miniAppUnban(env, payload, auth?.userId);
 		case 'ads/summary': return miniAppAdSummary(env);
 		case 'ads/pending': return miniAppAdPending(env, payload);
 		case 'ads/ignore': return miniAppAdIgnore(env, payload);
@@ -6466,6 +6471,21 @@ async function checkManyUnbanEligibility(ids, env, options = {}) {
 	results.fedExempted = options.allowD1Removal === true
 		? await exemptFederatedOnUnban(env, results.eligible, options.operatorId)
 		: [];
+	// 【2026-11-25 主人口径】第一主人解封 → 当场清掉该用户已录入的指纹与学习内容。
+	// 挂在资格确认之后、真正解封之前：purge 内部吞错，清理失败也绝不拦解封。
+	// 只认第一主人 —— 副主人 / 超管 / 群管理员解封时不动判据库（见 purgeAdLearningForUser 注释）。
+	// 单次上限 50：/unban 的批量上限就是 50，超出的不静默丢，直接按剩余部分再跑一轮也能覆盖。
+	if (options.allowD1Removal === true && results.eligible.length && isPrimaryOwner(options.operatorId)) {
+		results.learningPurged = [];
+		for (const id of results.eligible.slice(0, 50)) {
+			const purged = await purgeAdLearningForUser(env, id);
+			results.learningPurged.push(purged);
+			if (purged.errors.length) {
+				console.error('[/unban] 清理学习内容部分失败:', id, purged.errors.join('；'));
+			}
+		}
+	}
+
 	return results;
 }
 
@@ -6568,6 +6588,134 @@ async function removeManyFromBlacklist(ids, env) {
 		}
 	}
 	return results;
+}
+
+// ===== 解封即清学习（2026-11-25 主人口径）=====
+// 「第一主人执行 unban 解封用户，当场删除已经录入的全部指纹特征以及学习内容。」
+// 只认第一主人：副主人 / 超级管理员 / 群管理员执行解封时不动学习库 —— 他们是管理者，
+// 不是判据来源；判据只能由判据的主人回收。
+//
+// 【清什么·按什么键】共享判据库没有完整的 TGID 外键（/ignore user 的只读查询里已经
+// 写明了这条限制），所以分两类：
+//   ① 有明确归属的：头像 / 图片的 sender 关系、素材 last_user_id、会员标 last_user_id、
+//      观察记录、待审快照、成员画像计数 —— 直接按 user_id 删或清零。
+//   ② 只能靠保存现场反查的：文本指纹、资料形状、正文骨架、AI 语义样本 —— 拿该用户
+//      冻结的 snapshot / evaluation 重建候选键，只删能对上号的，绝不按 TGID 猜。
+// 指纹是共享库：别人也学过（match_count > 1）的那条保留，只清他独占的，
+// 保留条数记进 sharedFingerprints 并在回执里说明 —— 删共享指纹等于替别人撤销证据。
+// 任何一步失败只记账不抛：解封本身不能因为学习库出错而卡住。
+async function purgeAdLearningForUser(env, userId) {
+	const id = String(userId || '').trim();
+	const out = { userId: id, avatars: 0, images: 0, badges: 0, fingerprints: 0, sharedFingerprints: 0,
+		shapes: 0, skeletons: 0, samples: 0, screening: 0, snapshots: 0, members: 0, errors: [] };
+	if (!id || !/^\d{3,20}$/.test(id) || !env?.DB) return out;
+	const attempt = async (label, work, fallback = 0) => {
+		try { return await work(); } catch (error) {
+			out.errors.push(label + '：' + String(error?.message || error || '').slice(0, 80));
+			return fallback;
+		}
+	};
+	const run = (sql, ...args) => env.DB.prepare(sql).bind(...args).run().then((r) => Number(r?.meta?.changes || 0));
+	const all = (sql, ...args) => env.DB.prepare(sql).bind(...args).all().then((r) => r?.results || []);
+
+	// ① 素材归属 + ② 保存现场（必须先读后删：待审快照删掉就重建不出共享键了）
+	const avatarIds = await attempt('头像归属', async () =>
+		(await all('SELECT file_unique_id FROM ad_avatar_senders WHERE user_id = ?', id))
+			.map((row) => String(row.file_unique_id || '')).filter(Boolean), []);
+	const imageIds = await attempt('图片归属', async () =>
+		(await all('SELECT file_unique_id FROM ad_image_senders WHERE user_id = ?', id))
+			.map((row) => String(row.file_unique_id || '')).filter(Boolean), []);
+	const saved = await attempt('保存现场', async () => {
+		const keys = { fingerprints: new Map(), shapes: new Set(), skeletons: new Set(), samples: new Set() };
+		const payloads = [];
+		const takeSnapshot = (raw) => {
+			if (!raw) return;
+			let snapshot = null;
+			try { snapshot = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (_) { snapshot = null; }
+			if (!snapshot || typeof snapshot !== 'object') return;
+			if (snapshot.profileShape) keys.shapes.add(String(snapshot.profileShape));
+			if (snapshot.textSkeleton) keys.skeletons.add(String(snapshot.textSkeleton));
+			if (snapshot.matchedTextSkeleton) keys.skeletons.add(String(snapshot.matchedTextSkeleton));
+			if (snapshot.learningPayload) payloads.push(snapshot.learningPayload);
+		};
+		for (const row of await all('SELECT snapshot AS snap FROM ad_pending_snapshots WHERE user_id = ? ORDER BY id DESC LIMIT 100', id)) takeSnapshot(row.snap);
+		for (const row of await all('SELECT snapshot AS snap, evaluation AS eval FROM ad_dryrun_log WHERE user_id = ? ORDER BY id DESC LIMIT 100', id)) {
+			takeSnapshot(row.snap);
+			if (row.eval) {
+				let evaluation = null;
+				try { evaluation = JSON.parse(row.eval); } catch (_) { evaluation = null; }
+				if (evaluation?.payload) payloads.push(evaluation.payload);
+				if (evaluation?.snapshot) takeSnapshot(evaluation.snapshot);
+			}
+		}
+		for (const payload of payloads) {
+			try {
+				for (const candidate of extractAdFingerprintCandidates(payload, new Set()) || []) {
+					const key = adFingerprintKey(candidate.type, candidate.value);
+					if (key) keys.fingerprints.set(key, candidate);
+				}
+			} catch (_) {}
+			try {
+				const text = buildAdSampleText(payload);
+				if (text.length >= 4) {
+					keys.samples.add(adTextHash(text));
+					keys.samples.add(adTextHash(normalizeAdSemanticText(text)));
+				}
+			} catch (_) {}
+		}
+		return keys;
+	}, null);
+
+	// ③ 有明确归属的清理
+	out.avatars += await attempt('头像使用记录', () => run('DELETE FROM ad_avatar_senders WHERE user_id = ?', id));
+	out.images += await attempt('图片使用记录', () => run('DELETE FROM ad_image_senders WHERE user_id = ?', id));
+	for (const key of Array.isArray(avatarIds) ? avatarIds : []) {
+		out.avatars += await attempt('头像素材', () => run('DELETE FROM ad_avatars WHERE file_unique_id = ? AND last_user_id = ?', key, id));
+	}
+	for (const key of Array.isArray(imageIds) ? imageIds : []) {
+		out.images += await attempt('图片素材', () => run('DELETE FROM ad_images WHERE file_unique_id = ? AND last_user_id = ?', key, id));
+	}
+	out.badges = await attempt('会员标', () => run('DELETE FROM ad_badges WHERE last_user_id = ?', id));
+	out.screening = await attempt('观察记录', () => run('DELETE FROM ad_user_screening WHERE user_id = ?', id));
+	out.snapshots = await attempt('待审快照', () => run('DELETE FROM ad_pending_snapshots WHERE user_id = ?', id));
+	// 成员画像不删行（人还在群里），只把「判定结论 / 消息计数 / 资料哈希」清零，
+	// 否则下一轮资料变化检测会拿旧哈希当基线，误以为「资料没变」而跳过复检。
+	out.members = await attempt('成员画像', () => run(
+		"UPDATE ad_group_members SET msg_count = 0, ad_msg_count = 0, last_verdict = '', "
+		+ "profile_baseline_hash = '', profile_last_hash = '', profile_changed_at = 0, profile_edge_hash = '' "
+		+ 'WHERE user_id = ?', id));
+
+	// ④ 共享条目：只删现场里出现过的键
+	if (saved) {
+		for (const key of saved.shapes) out.shapes += await attempt('资料形状', () => run('DELETE FROM ad_profile_shapes WHERE shape = ?', key));
+		for (const key of saved.skeletons) out.skeletons += await attempt('正文骨架', () => run('DELETE FROM ad_text_skeletons WHERE skeleton = ?', key));
+		for (const key of saved.samples) out.samples += await attempt('语义样本', () => run('DELETE FROM ad_sample_embeddings WHERE text_hash = ?', key));
+		for (const key of saved.fingerprints.keys()) {
+			const removed = await attempt('文本指纹', () => run('DELETE FROM ad_fingerprints WHERE fingerprint = ? AND match_count <= 1', key));
+			if (removed) out.fingerprints += removed;
+			else {
+				const shared = await attempt('文本指纹归属', async () => Number((await env.DB.prepare('SELECT match_count FROM ad_fingerprints WHERE fingerprint = ?').bind(key).first())?.match_count || 0));
+				if (shared > 1) out.sharedFingerprints += 1;
+			}
+		}
+	}
+	return out;
+}
+
+// 解封清学习的回执摘要：只汇总数量，不暴露用户 ID 以外的判据内容。
+function formatAdLearningPurgeNotice(list) {
+	const rows = (Array.isArray(list) ? list : []).filter(Boolean);
+	if (!rows.length) return '';
+	const sum = rows.reduce((acc, row) => {
+		acc.fp += Number(row.fingerprints || 0);
+		acc.shared += Number(row.sharedFingerprints || 0);
+		acc.samples += Number(row.samples || 0);
+		acc.avatars += Number(row.avatars || 0);
+		return acc;
+	}, { fp: 0, shared: 0, samples: 0, avatars: 0 });
+	return '🧽 第一主人解封：已清理 ' + rows.length + ' 人的学习内容'
+		+ '（指纹 ' + sum.fp + ' 条 / 头像 ' + sum.avatars + ' 条 / AI 样本 ' + sum.samples + ' 条'
+		+ (sum.shared ? '；共享指纹 ' + sum.shared + ' 条按归属保留' : '') + '）';
 }
 
 // 渲染批量添加结果
@@ -12353,6 +12501,14 @@ async function checkLocalUnbanEligibility(env, chatId, ids, operatorId) {
 	for (const failure of removal.failed) results.failed.push({ id: String(failure.id), msg: failure.msg });
 	const failedSet = new Set(removal.failed.map((f) => String(f.id)));
 	results.eligible = candidates.filter((id) => !failedSet.has(id));
+	// 【2026-11-25 主人口径】第一主人在本群（独立群）解封同样清学习内容 ——
+	// 与全局 /unban 同一口径。其他管理员解封不动判据库。
+	if (isPrimaryOwner(operatorId) && results.eligible.length) {
+		results.learningPurged = [];
+		for (const id of results.eligible.slice(0, 50)) {
+			results.learningPurged.push(await purgeAdLearningForUser(env, id));
+		}
+	}
 	return results;
 }
 
@@ -22095,6 +22251,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			if (valid.length === 1 && invalid.length === 0) {
 				const targetId = valid[0];
 				const eligibility = await checkUnbanTargets([targetId]);
+				const purgeNotice = formatAdLearningPurgeNotice(eligibility.learningPurged);
 				const userProfiles = await resolveBatchUserProfiles([targetId], chatId);
 				const targetMention = formatBatchUserTarget(targetId, userProfiles);
 				const lines = [
@@ -22181,14 +22338,17 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 					'<b>Telegram 群解封结果</b>:',
 					await renderUnbanResultsDetail(unbanResults, null, { userId: targetId, retryCommand: '/unban' }),
 					'',
-					'💡 <b>要彻底纠正请用 /ignore</b> —— /unban 只解封并移出黑名单，不撤销头像 / 指纹 / 会员标等判定痕迹；痕迹还在的话下一条消息可能又被封。'
+					...(purgeNotice ? [purgeNotice] : []),
+					'💡 <b>要彻底纠正请用 /ignore</b> —— ' + (purgeNotice
+						? '本次已清掉该用户已录入的指纹与学习内容；其余判定痕迹仍可用 /ignore 撤销。'
+						: '/unban 只解封并移出黑名单，不撤销头像 / 指纹 / 会员标等判定痕迹；痕迹还在的话下一条消息可能又被封。')
 				);
 				if (groupBanReport.length) lines.push('', ...groupBanReport);
 				await replyToModerationAdmin(message, ctx, {
 					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封${fedLine}\n${renderUnbanResults(unbanResults)}`,
 					groupText: `🔓 已解封\n🎯 ${targetMention}${fedLine}\n${renderUnbanResults(unbanResults)}`
 						+ (remainingGroupBans.length ? '\n⛔ 本群黑名单仍在生效: ' + remainingGroupBans.length + ' 个群（需在该群发 /unban）' : '')
-						+ '\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）',
+						+ (purgeNotice ? '\n🧽 已清理该用户已录入的指纹与学习内容' : '\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）'),
 					detailText: lines.join('\n'),
 					isInGroup
 				});
@@ -22197,6 +22357,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 
 			// 批量：管理层先移除命中的 D1 记录，再对全部资格通过目标执行群解封。
 			const results = await checkUnbanTargets(valid);
+			const purgeNotice = formatAdLearningPurgeNotice(results.learningPurged);
 			const idsToUnban = [...results.eligible];
 			const userProfiles = await resolveBatchUserProfiles(valid, chatId);
 			const unbanSummary = { okAll: 0, partial: 0, failedAll: 0 };
@@ -22215,6 +22376,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			const lockedCount = (results.primaryLocked || []).length;
 			const flashText = `🔓 批量解封：允许 ${results.eligible.length}${results.blacklisted.length ? ` / D1拒绝 ${results.blacklisted.length}` : ''}${lockedCount ? ` / ${PRIMARY_LOCKED_UNBAN_TEXT} ${lockedCount}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
 			let detailText = renderBatchUnbanEligibilityResult(results, invalid, userProfiles);
+			if (purgeNotice) detailText = purgeNotice + '\n\n' + detailText;
 			if (idsToUnban.length > 0) {
 				const unbanHeaderLines = ['<b>Telegram 群解封结果</b>:', `✅ 全部群解封成功: ${unbanSummary.okAll}`];
 				if (unbanSummary.partial) unbanHeaderLines.push(`⚠️ 部分群解封: ${unbanSummary.partial}`);
@@ -22242,7 +22404,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 					+ (lockedCount ? `\n⛔ ${PRIMARY_LOCKED_UNBAN_TEXT}: ${lockedCount}` : '')
 					+ ((results.fedExempted || []).length ? `\n🌐 ${FED_EXEMPT_NOTICE}: ${results.fedExempted.length}` : '')
 					+ (idsToUnban.length ? '\n' + idsToUnban.map((id) => `· ${formatBatchUserTarget(id, userProfiles)}`).join('\n') : '')
-					+ '\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）',
+					+ (purgeNotice ? '\n🧽 已清理 ' + (results.learningPurged || []).length + ' 人已录入的指纹与学习内容' : '\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）'),
 				detailText,
 				isInGroup
 			});
@@ -25272,6 +25434,265 @@ const AD_GOODS_SLOT_KEYWORDS = [
 // 误伤面极窄；单独命中只给辅助分，定罪分仍在标题与资料组合上。
 const AD_BURNER_CHANNEL_HANDLE_RE = /^jq_[0-9a-f]{10}$/i;
 
+// ===== 广告分类体系：大类 + 小类（2026-11-25 主人口径）=====
+//
+// 【为什么要有这一层】原来的判据是「词表命中 → 加分 → 凑够 7 分」。分数是标量，
+// 分不出「这个人挂的是色情招募还是实物批发」，于是每加一个新词都要重新推演
+// 它会不会把正常用户拱过线 —— 线上 6400+ 条低分误封就是这么来的。
+//
+// 分类层的做法是先把命中【归到语义类别】，再按类别决定处置：
+//   · severity >= 4 的类（色情招募 / 博彩 / 跑分 / 假钞 / 假证 / 毒品 / 账号买卖）
+//     里出现 hard 词 → 该位置单独成立，够一次定罪；
+//   · severity <= 3 的类（实物批发 / 兼职招揽 / 币圈 / 纯引流）→ 单个位置不杀，
+//     但两个位置同现（资料卡四个特征任意两个）就构成「资料组合广告」。
+// 这样召回靠 hard 词，误伤靠组合门槛兜住，两类互不干扰。
+//
+// 【词表分 hard / soft 而不是一个大数组】同一个类里，「探花」「六合彩」「跑分」
+// 这种词正常语境几乎不存在，出现即证据；而「现货」「正品」「合约」在正常群聊
+// 里天天出现，只能当同现词。混在一起就等于把正常群聊也标成 hard。
+const AD_TAXONOMY = [
+	{ key: 'porn', label: '色情', severity: 4, subs: [
+		{ name: '色情招募', hard: ['探花', '楼凤', '外围', '空降', '技师', '推油', '陪玩陪聊', '色粉', '福利姬', '包夜', '招主播', '招技师', '色情直播', '裸聊', '视频裸', '约啪', '色播', '上门服务', '快餐', '同城约'],
+			soft: ['辣妹', '黑丝', '反差', '包夜服务', '一夜情', '楼风'] },
+		{ name: '成人内容', hard: ['操逼', '约炮', '嫖娼', '玩妹', '成人视频', '看片群', '无码视频', '私密视频'],
+			soft: ['资源群', '福利', '写真', '女主'] },
+	] },
+	{ key: 'gamble', label: '赌博', severity: 5, subs: [
+		{ name: '博彩平台', hard: ['博彩', '菠菜', '赌场', '时时彩', '六合彩', '开奖', '下注', '投注', '包赢', '返水', '洗码', '真人视讯', '百家乐', '牛牛', '炸金花', '龙虎斗', '彩票计划'],
+			soft: ['棋牌', '赔率', '盘口', '上分', '下分'] },
+		{ name: '带单跟单', hard: ['带单', '跟单', '导师带', '计划群', '包赔', '回血上岸'],
+			soft: ['回血', '稳赚', '上岸'] },
+	] },
+	{ key: 'scam', label: '诈骗', severity: 5, subs: [
+		{ name: '跑分洗钱', hard: ['跑分', '洗钱', '洗白', '出黑', '收米', '洗米', '码商', '收款码', '来码', '拿码', '转U', 'U商', '收U', '出U', '收咪', '洗资', '带偶', '日搞', '码来', '带码', '有码', '接U', '公群交易'],
+			soft: ['代收', '代付', '收钱', '收款', '帮我收', '微信码', '支付宝码'] },
+		{ name: '刷单返利', hard: ['刷单', '刷量', '返利', '做单', '一单一结', '垫付返', '任务返利'],
+			soft: ['垫付', '任务', '佣金', '日结'] },
+		{ name: '资金盘', hard: ['资金盘', '杀猪盘', '稳赚不赔', '保本保息', '内幕消息', '带赚', '包赚', '翻倍出局'],
+			soft: ['稳赚', '保本', '分红', '原始股'] },
+		{ name: '假钞假币', hard: ['假钞', '假币', '伪钞', '高仿币'], soft: [] },
+		{ name: '境外务工', hard: ['缅北', '柬埔寨务工', '境外高薪', '包机票', '园区直招', '打字员月入'],
+			soft: ['境外', '高薪', '包吃住', '包住宿'] },
+		{ name: '贷款包装', hard: ['黑白户', '征信修复', '背账', '包装资料', '强开额度'],
+			soft: ['下款', '贷款', '额度'] },
+	] },
+	{ key: 'illegal', label: '违禁品', severity: 5, subs: [
+		{ name: '毒品迷药', hard: ['冰毒', '摇头丸', 'K粉', '大麻', '迷药', '听话水', '催情水', '乖乖水'], soft: [] },
+		{ name: '枪支器械', hard: ['枪支', '弹药', '仿真枪', '管制刀具', '气狗'], soft: [] },
+		{ name: '假证假章', hard: ['办证', '假证', '刻章', '代开发票', '增值税发票', '假身份证', '假护照', '户口本办理'],
+			soft: ['发票', '增值税', '代开', '身份证', '护照'] },
+		{ name: '黑客查档', hard: ['查档', '开盒', '人肉搜索', '户籍查询', '手机定位查', 'DDOS攻击', '盗号接单', '渗透接单'],
+			soft: ['破解', '定位', '黑客'] },
+	] },
+	{ key: 'account', label: '账号交易', severity: 4, subs: [
+		{ name: '账号买卖', hard: ['收号', '出号', '老账号', '实名号', '四件套', '卡商', '接码平台', '虚拟号段', '号商'],
+			soft: ['买卖账号', '账号交易', '实名'] },
+		{ name: '代实名', hard: ['代实名', '过人脸', '解封号', '代认证'],
+			soft: ['实名认证', '认证'] },
+	] },
+	{ key: 'crypto', label: '币圈', severity: 3, subs: [
+		{ name: 'U商承兑', hard: ['USDT', 'U币', '泰达币', '承兑商', '换汇', '转U能量', '能量租赁', 'U跑分'],
+			soft: ['汇率', '收币', '出币'] },
+		{ name: '带单喊单', hard: ['喊单', '百倍币', '合约带单', '空投薅羊毛'],
+			soft: ['合约', '杠杆', '空投', '币圈'] },
+	] },
+	{ key: 'goods', label: '实物批发', severity: 3, subs: [
+		{ name: '数码批发', hard: ['未拆封', '未激活', '一手货源', '一件代发', '数码批发', '免税正品', '全系列苹果'],
+			soft: ['苹果手机', '国行', '港版', '美版', 'pro max', '上新', '现货', '货源', '批发', '净搞', '全系列', '转手'] },
+		{ name: '代购水货', hard: ['水货手机', '代购免税'], soft: ['代购', '水货', '免税', '正品', '低价出'] },
+		{ name: '高仿A货', hard: ['高仿', '精仿', 'A货', '原单尾单'], soft: ['原单', '尾单'] },
+	] },
+	{ key: 'recruit', label: '灰色招揽', severity: 3, subs: [
+		{ name: '兼职招工', hard: ['兼职日结', '在家兼职', '手机兼职', '日结兼职', '轻松日入', '交单群'],
+			soft: ['兼职', '日结', '日入', '月入', '在家做', '手机操作', '轻松赚', '躺赚',
+				'交单', '不用买设备', '手机像素', '路边拍', '拍车', '拍违停', '做任务', '接单'] },
+		// 新型「拍照兼职」招募（截图 #67）：路边拍违停/拍车、不用买设备、手机像素高就行、
+		// 交单群 —— 单独一个「交单」在电商/物流语境也成立，所以只做软词，靠同槽两个软词触发。
+		{ name: '副业搞钱', hard: ['搞钱加主业', '加主业群', '主业群', '轻松搞钱', '赚钱进群', '带你搞钱', '搞钱快来做', '副业刚需', '日入过千', '月入过万'],
+			soft: ['搞钱', '副业', '主业', '轻松赚', '躺赚', '带赚', '宝妈', '一部手机'] },
+		{ name: '地推拉新', hard: ['地推拉新', '拉新返佣'], soft: ['地推', '引流', '拉人', '群发', '代发'] },
+	] },
+	{ key: 'finance', label: '投资诈骗', severity: 4, subs: [
+		{ name: '外汇黄金', hard: ['外汇托管', '黄金投资群', '原油期货群', '稳赚不赔'],
+			soft: ['外汇', '黄金', '期货', '原油'] },
+		{ name: '荐股', hard: ['荐股群', '股票带单', '内幕涨停'],
+			soft: ['荐股', '涨停', '股票群'] },
+	] },
+	{ key: 'traffic', label: '纯引流', severity: 1, subs: [
+		{ name: '进群私聊', hard: [], soft: ['进群', '加群', '私聊', '私信', '点我', '看我简介', '主页', '了解详情', '咨询', '加V', '加微', '加薇'] },
+		{ name: '频道导流', hard: [], soft: ['t.me/', 'telegram', '频道', '群组', '邀请链接', 'joinchat'] },
+	] },
+];
+
+const AD_TAXONOMY_HARD_SEVERITY = 4;
+
+// 繁体广告词在样本里成片出现（「點我進裙」「看我簡介」「賺錢進群」「聯繫」），
+// 而全部词表都是简体 —— 不做归一，这批号在词表层等于隐身。
+// 只收广告高频字，不追求完整繁简表：字表越大越容易把正常繁体用户（港澳台）
+// 的普通用字也改掉，反而制造假命中。
+const AD_TAXONOMY_TRAD_TO_SIMP = {
+	'點': '点', '進': '进', '裙': '群', '簡': '简', '聯': '联', '繫': '系', '賺': '赚',
+	'錢': '钱', '蘋': '苹', '機': '机', '稅': '税', '專': '专', '業': '业', '務': '务',
+	'員': '员', '單': '单', '設': '设', '備': '备', '來': '来', '個': '个', '們': '们',
+	'現': '现', '貨': '货', '價': '价', '賣': '卖', '買': '买', '這': '这', '裡': '里',
+	'頻': '频', '導': '导', '證': '证', '書': '书', '開': '开', '關': '关', '廠': '厂',
+	'團': '团', '隊': '队', '級': '级', '萬': '万', '億': '亿', '幣': '币', '賭': '赌',
+	'場': '场', '註': '注', '冊': '册', '碼': '码', '掃': '扫', '豐': '丰',
+	'穩': '稳', '贏': '赢', '輸': '输', '獎': '奖', '發': '发', '財': '财'
+};
+
+function toAdSimplified(text) {
+	const source = String(text ?? '');
+	if (!source) return '';
+	let out = '';
+	for (const ch of source) out += (AD_TAXONOMY_TRAD_TO_SIMP[ch] || ch);
+	return out;
+}
+
+// 匹配用文本：原文、去混淆、繁转简、繁转简再去混淆，四个变体任一命中即算。
+function buildAdTaxonomyTexts(text) {
+	const source = String(text ?? '');
+	if (!source) return [];
+	const set = new Set([source, toAdSimplified(source)]);
+	const variant = normalizeAdVariantText(source);
+	if (variant) set.add(variant);
+	const tradVariant = normalizeAdVariantText(toAdSimplified(source));
+	if (tradVariant) set.add(tradVariant);
+	return [...set].map((item) => item.toLowerCase());
+}
+
+// 对一段文字做分类。返回：
+//   { hits: [{cat,label,sub,severity,words,hard}], categories, severity, hard, labels }
+// hard 的语义是「这个位置自己就够定罪」：命中某个 severity>=4 类的 hard 词，
+// 或同一个小类里 soft 词命中 >= 2 个（「现货 + 正品」这种组合也算实锤）。
+function classifyAdTaxonomy(text) {
+	const texts = buildAdTaxonomyTexts(text);
+	if (!texts.length) return { hits: [], categories: [], severity: 0, hard: false, labels: [], hardCount: 0 };
+	const hits = [];
+	let hardCount = 0;
+	for (const cat of AD_TAXONOMY) {
+		for (const sub of cat.subs) {
+			const hardWords = [];
+			const softWords = [];
+			for (const word of sub.hard || []) {
+				const needle = String(word).toLowerCase();
+				if (needle && texts.some((item) => item.includes(needle))) hardWords.push(word);
+			}
+			for (const word of sub.soft || []) {
+				const needle = String(word).toLowerCase();
+				if (needle && texts.some((item) => item.includes(needle))) softWords.push(word);
+			}
+			if (!hardWords.length && softWords.length < 2) continue;
+			const hard = hardWords.length > 0 || (softWords.length >= 2 && cat.severity >= 3);
+			hardCount += hardWords.length;
+			hits.push({ cat: cat.key, label: cat.label, sub: sub.name, severity: cat.severity,
+				words: hardWords.concat(softWords).slice(0, 4), hard });
+		}
+	}
+	const categories = [...new Set(hits.map((hit) => hit.cat))];
+	const severity = hits.reduce((max, hit) => Math.max(max, hit.severity), 0);
+	const labels = [...new Set(hits.map((hit) => hit.label + '·' + hit.sub))];
+	// hardCount：这个位置上命中了多少个硬词。judgeAdTaxonomyGate 用它区分
+	// 「一个硬词」与「连中两三个硬词」—— 后者即使所在大类只有 severity 3（实物批发/灰产招揽），
+	// 也是批发式堆词而不是普通聊天。
+	return { hits, categories, severity, hard: hits.some((hit) => hit.hard), labels, hardCount };
+}
+
+// 资料卡逐位置分类。位置齐全：【昵称 / 用户名 / 简介 / 头像文字 / 会员标文字 / 个人频道】。
+// 头像与会员标用的是采集层已经读出来的 OCR 文本（avatarText / badgeText），
+// 这里【不额外发请求、不额外查 D1】—— 拿不到就是空串，退化为原来的评分判据。
+function classifyAdProfileSlots(profile = {}) {
+	const displayName = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
+	const personalChat = profile.personalChat && typeof profile.personalChat === 'object' ? profile.personalChat : null;
+	const links = Array.isArray(profile.adLinks) ? profile.adLinks : [];
+	const linkText = links
+		.map((link) => [link?.title, link?.about].filter(Boolean).join(' '))
+		.filter(Boolean).join('\n');
+	const slots = {
+		name: classifyAdTaxonomy(displayName),
+		username: classifyAdTaxonomy(profile.username || ''),
+		bio: classifyAdTaxonomy(profile.bio || ''),
+		avatar: classifyAdTaxonomy(profile.avatarText || ''),
+		badge: classifyAdTaxonomy(profile.badgeText || ''),
+		personalChat: classifyAdTaxonomy([personalChat?.title, personalChat?.about].filter(Boolean).join(' ')),
+		links: classifyAdTaxonomy(linkText),
+	};
+	// 用户口径里的「西方英文名」不是文本类别，是形态判据：广告号批量起 Michael / Jason
+	// 这种机器生成型全名。单命中不算证据（正常人叫 Michael 的太多），只算一票。
+	const westernName = Boolean(displayName) && isAdGeneratedWesternName(displayName);
+	const rawUsername = String(profile.username || '').replace(/^@/, '');
+	const randomUsername = Boolean(rawUsername) && AD_RANDOM_USERNAME_RE.test(rawUsername) && /[0-9]/.test(rawUsername);
+	const hitSlots = Object.keys(slots).filter((key) => slots[key].hard || slots[key].categories.length);
+	return { slots, westernName, randomUsername, hitSlots };
+}
+
+// 参与「组合票」的槽位：用户点名的四件套【简介 + 头像 + 个人频道 + 挂号简介】。
+// 昵称/用户名/会员标照常分类并出标签，但【不单独计票】—— 昵称带「点我赚米」属于
+// 强信号，可它同时是「改名成本为零」，被骗改名的转发号也多，拿它当主证据会误伤。
+const AD_TAXONOMY_FEATURE_SLOTS = ['bio', 'avatar', 'personalChat', 'links'];
+const AD_TAXONOMY_SLOT_LABELS = {
+	name: '昵称', username: '用户名', bio: '简介', avatar: '头像',
+	badge: '会员标', personalChat: '个人频道', links: '挂号简介',
+	westernName: '西方英文名', usernameShape: '用户名形态',
+};
+
+// 分类闸门。返回值喂给 evaluateAdSuspect 的 hardHit 与线上演练统计。
+//   ban  : 直接并入 hardHit（不依赖标量分数，也不受 7 分阈值限制）
+//   votes: 组合票数，仅作演练日志用，方便回看「差一票」的样本
+// 规则来源：操作员口径「这三类任一命中就跑不掉」，同时保留历史两次单特征误封的教训。
+function judgeAdTaxonomyGate(card) {
+	const empty = { ban: false, reason: '', labels: [], categories: [], votes: 0, voteLabels: [], severity: 0 };
+	if (!card || !card.slots) return empty;
+	const labels = [];
+	const categories = new Set();
+	let maxSeverity = 0;
+	let hardSlot = '';
+	let hardLabels = [];
+	// ① 单槽 hard 命中 → 直接杀。两条并列判据：
+	//   a) severity >= 4（色情/赌博/诈骗/违禁/账号买卖/投资）—— 正常人不会在资料卡上写的东西；
+	//   b) severity 3 的实物批发/灰产招揽，在【资料位】同时命中 >= 2 个硬词
+	//      （截图 #68「免税正品 + 全系列苹果 + 未拆封」挂个人频道）—— 这是批发式堆词，
+	//      与「bio 写了一句苹果手机维修」的单个硬词完全不是一个形态。
+	// 昵称/用户名/会员标不参与 b：改造成本为零、被骗改名多，单靠堆词不够稳。
+	for (const key of Object.keys(card.slots)) {
+		const slot = card.slots[key];
+		if (!slot) continue;
+		for (const label of slot.labels) labels.push(AD_TAXONOMY_SLOT_LABELS[key] + '：' + label);
+		for (const cat of slot.categories) categories.add(cat);
+		maxSeverity = Math.max(maxSeverity, slot.severity || 0);
+		const highSeverity = (slot.severity || 0) >= AD_TAXONOMY_HARD_SEVERITY;
+		const stackedGoods = (slot.hardCount || 0) >= 2 && AD_TAXONOMY_FEATURE_SLOTS.includes(key);
+		if (!hardSlot && slot.hard && (highSeverity || stackedGoods)) {
+			hardSlot = key;
+			hardLabels = slot.labels;
+		}
+	}
+	const base = {
+		labels: [...new Set(labels)].slice(0, 6),
+		categories: [...categories],
+		severity: maxSeverity,
+	};
+	if (hardSlot) {
+		return { ...base, ban: true, votes: 0, voteLabels: [],
+			reason: `广告分类命中·${AD_TAXONOMY_SLOT_LABELS[hardSlot]}·${hardLabels.slice(0, 2).join('/')}` };
+	}
+	// ② 组合票：非 traffic 类命中槽位各计一票，西方英文名/随机用户名各计一票。
+	// traffic（进群私聊/频道导流）永不计票 —— 「进群」「私聊」是正常运营话术，单靠它必误伤。
+	const voteLabels = [];
+	for (const key of AD_TAXONOMY_FEATURE_SLOTS) {
+		const slot = card.slots[key];
+		if (!slot || !slot.categories.length) continue;
+		const serious = slot.categories.some((cat) => cat !== 'traffic');
+		if (!serious) continue;
+		voteLabels.push(AD_TAXONOMY_SLOT_LABELS[key]);
+	}
+	if (card.westernName) voteLabels.push(AD_TAXONOMY_SLOT_LABELS.westernName);
+	if (card.randomUsername) voteLabels.push(AD_TAXONOMY_SLOT_LABELS.usernameShape);
+	const votes = voteLabels.length;
+	return { ...base, ban: votes >= 2, votes, voteLabels,
+		reason: votes >= 2 ? `广告分类组合命中·${voteLabels.join('+')}` : '' };
+}
+
 // 豁免词：命中且无交易动词时整体减分，保护正常用户。
 // 典型误伤场景：资料卡写「双向机器人」「开源项目」的技术用户。
 //
@@ -25888,6 +26309,16 @@ function loadAdDetectionConfig(env) {
 		// 不必等改代码。
 		structureKill: (() => {
 			const raw = String(env?.AD_CARD_KILL ?? 'ban').trim().toLowerCase();
+			return ['ban', 'observe', 'off'].includes(raw) ? raw : 'ban';
+		})(),
+		// 广告分类闸门（2026-11-25）。资料卡七槽过分类表，命中即并入 hardHit。
+		// 与 structureKill 同一套三档，理由也一样：上线初期想先看误伤面就设 observe，
+		// 判断全错就设 off 退回纯评分 —— 改环境变量重新部署即可，不必改代码。
+		//   ban     命中即封禁（默认，主人要求「命中就跑不掉」）
+		//   observe 只写观察记录 + 推快照，不封
+		//   off     完全关闭分类闸门（分类标签照常输出，供演练统计）
+		taxonomyKill: (() => {
+			const raw = String(env?.AD_TAXONOMY_KILL ?? 'ban').trim().toLowerCase();
 			return ['ban', 'observe', 'off'].includes(raw) ? raw : 'ban';
 		})(),
 		// 头像视觉识别的每日张数上限（0 = 只跑 L1 指纹库，不调模型）。
@@ -39929,7 +40360,14 @@ function rejudgeAdPositionEvidence(evaluation) {
 	const needsVerification = !combined && (first >= 6 || evaluation.positionNeedsReview === true);
 	evaluation.positionDecision = { policy: '6+3', topGrades: [first, second], needsVerification,
 		needsProfile: needsVerification && evaluation.bioChecked === false };
-	evaluation.verdict = evaluation.positionHardBan || combined ? 'ban' : 'pass';
+	// 【2026-11-25 分类体系接入】位置证据复议只负责「升级」与「按位置证据定案」，
+	// 不能把其他通道已经判出的 observe 抹成 pass。位置证据没凑够 6+3 不代表这条
+	// 判定就清白 —— 结构查杀的 observe 档、资料分类闸门的 observe 档都在这里栽过：
+	// 线上表现为「reasons 写着只观察不封，观察记录却根本没进队列」。
+	// 保留 observe，只在位置证据凑够硬组合时升级成 ban。
+	const priorVerdict = evaluation.verdict;
+	evaluation.verdict = (evaluation.positionHardBan || combined) ? 'ban'
+		: priorVerdict === 'observe' ? 'observe' : 'pass';
 	if (combined && !evaluation.positionHardBan) {
 		evaluation.layer = 'position';
 		evaluation.reasons = (evaluation.reasons || []).filter((line) => !String(line).startsWith(AD_CONVICT_MARK));
@@ -40306,6 +40744,25 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	// 旧 observe 档不再产生确认队列；已核实结构在未关闭通道时直接处理。
 	const structureBan = structure.guilty && config.structureKill !== 'off';
 
+	// ===== 广告分类闸门（2026-11-25 主人口径）=====
+	// 资料卡七槽统一过分类表：昵称 / 用户名 / 简介 / 头像文字 / 会员标文字 / 个人频道 / 挂号简介。
+	// ① 单槽命中 severity >= 4 的 hard 词 → 直接定罪（色情 / 赌博 / 诈骗 / 违禁 / 账号买卖）；
+	// ② 否则按【简介 + 头像 + 个人频道 + 挂号简介】四槽 + 西方英文名 + 随机用户名形态计票，
+	//    ≥ 2 票定罪。traffic 类（进群私聊 / 频道导流）永不计票 —— 那是正常运营话术。
+	// 【资料临时放行期间整段跳过】放行的语义是「这份资料不再是证据」，分类层不能绕过去。
+	// 【头像 / 会员标用采集层已读出的 OCR 文本】零额外请求、零额外 D1 读。
+	const taxonomyCard = classifyAdProfileSlots(profileOkActive ? {} : profile);
+	const taxonomy = judgeAdTaxonomyGate(taxonomyCard);
+	const taxonomyKill = config.taxonomyKill || 'ban';
+	const taxonomyBan = taxonomyKill === 'ban' && taxonomy.ban;
+	const taxonomyObserve = taxonomyKill === 'observe' && taxonomy.ban;
+	if (taxonomy.reason) {
+		reasons.push(taxonomy.reason + (taxonomyKill === 'observe' ? '（分类闸门=observe，只观察不封）' : ''));
+	}
+	if (taxonomy.categories.length) {
+		reasons.push('广告分类：' + taxonomy.categories.join('/') + '，组合票 ' + taxonomy.votes
+			+ (taxonomy.voteLabels.length ? '（' + taxonomy.voteLabels.join('+') + '）' : ''));
+	}
 	// ===== 领导人姓名硬规则（2026-11-10）=====
 	// 只看账号资料（昵称 / 用户名 / 简介），命中即定罪，零 AI。
 	// 【为什么走硬规则而不是交给模型】实测同类样本：昵称改成国家领导人姓名的号
@@ -40325,7 +40782,7 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	// 而 hardHit 读裸 ai.isMatch 照样定罪、layer 照样标 ai。
 	const aiHardHit = Boolean(ai.isMatch) && !aiExemptVeto && !aiNameStripVeto;
 	// leaderBan 进 hardHit：它与其他硬命中一样，不依赖分数、不依赖模型。
-	const hardHit = fingerprintBan || aiHardHit || structureBan || leaderBan;
+	const hardHit = fingerprintBan || aiHardHit || structureBan || leaderBan || taxonomyBan;
 	// 【2026-11-25 代理订阅分享白名单】见 isAdProxySubscriptionShare 的注释。
 	// 白名单必须在 verdict 定案之后、写快照之前生效：前面所有层（评分 / 指纹 /
 	// 结构查杀 / AI 语义 / 位置证据）都可能已经给出硬命中，语义就是「这类内容整条不判」。
@@ -40335,7 +40792,7 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		? 'ban'
 		// observe 模式下的结构命中不封，但必须留观察记录 + 推快照给主人人工过目，
 		// 否则这个模式就只是「静默放过」，起不到看误伤面的作用。
-		: ((structure.guilty || score >= config.observationScore) ? 'observe' : 'pass');
+		: ((structure.guilty || taxonomyObserve || score >= config.observationScore) ? 'observe' : 'pass');
 	if (proxyShare && verdict !== 'pass') {
 		reasons.unshift('代理订阅分享白名单：已撤销' + (verdict === 'ban' ? '封禁' : '观察') + '判定');
 		verdict = 'pass';
@@ -40344,6 +40801,7 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	// 本次判定的归属层。提取成常量是因为下面 return 的 layer 字段与定罪层专属标记
 	// 必须读【同一个值】—— 两处各写一遍迟早会分叉（本项目注释失真已出现过多次）。
 	const convictLayer = leaderBan ? 'leader'
+		: taxonomyBan ? 'taxonomy'
 		: structureBan ? structure.channel
 		// 用 aiHardHit 而非裸 ai.isMatch：被豁免词否证时这次判定并非 AI 定罪，
 		// 标成 'ai' 会让复盘时误以为是 AI 层封的。
@@ -40377,6 +40835,12 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		// 这类号是批量注册的，昵称与 bio 高度雷同，学一次之后同款走指纹层直接命中，
 		// 不必每条消息都重跑结构判定。白名单命中时必须是空结论，否则下游会把它学成指纹。
 		structure: proxyShare ? { guilty: false, channel: 'quoted', form: '', reasons: [] } : structure,
+		// 广告分类结果（2026-11-25）：线上演练靠它统计「命中了哪些大类/小类」「几票」。
+		// proxyShare 命中时整条判定已撤销，分类结论一并清空 —— 留着会被下游当证据学成指纹。
+		taxonomy: proxyShare ? { categories: [], labels: [], votes: 0, voteLabels: [], severity: 0 } : {
+			categories: taxonomy.categories, labels: taxonomy.labels,
+			votes: taxonomy.votes, voteLabels: taxonomy.voteLabels, severity: taxonomy.severity
+		},
 		behaviorScore,
 		// retainScore：写进 ad_user_screening.score 的值，【只含行为分，不含静态资料分】。
 		// 这是 double counting 的根治点：旧代码存的是 evaluation.score（总分，含 bio / username /
@@ -40434,6 +40898,12 @@ async function evaluateAdSuspect(env, input, options = {}) {
 			// → 空数组 → 两端循环都不执行，与加它之前逐字节一致。
 			scoredLinks: (Array.isArray(profileResult?.scoredLinks) ? profileResult.scoredLinks : []).slice(0, 5),
 
+			// 广告分类标签（2026-11-25）：跟着快照进 D1，线上演练直接按这一列统计
+			// 「色情/赌博/诈骗各命中多少」以及「几票、哪几票」，不必回头重跑分类。
+			taxonomyLabels: (proxyShare ? [] : taxonomy.labels).slice(0, 6),
+			taxonomyCategories: (proxyShare ? [] : taxonomy.categories).slice(0, 6),
+			taxonomyVotes: proxyShare ? 0 : taxonomy.votes,
+
 			forwardTitle: String(input?.forwardChat?.title || '').slice(0, 120)
 		}
 	};
@@ -40456,6 +40926,7 @@ const AD_LAYER_LABELS = {
 	// 主人看到「得分 1/7 却被封」完全无法定位是谁封的。这两条通道各自标层。
 	ai_body: '正文 AI 判定', visual: '图片视觉核验',
 	card: '资料卡查杀（用户名+简介）', body: '正文查杀（简介+正文）',
+	taxonomy: '广告分类（资料卡）',
 	contact: '名片广告查杀（显示名+手机号）',
 	// 2026-11-10 拦门第四件套：三条零 AI 通道。
 	// 它们必须在这里登记 —— 定罪理由里那个「判定层」标记直接查这张表，
