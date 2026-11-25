@@ -10790,7 +10790,8 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 			const entry = localCheck.entry;
 			const reason = translateBlacklistReason(entry?.reason);
 			const operator = await translateBlacklistOperator(entry?.by);
-			const addedAt = entry?.at || '未知';
+			// 主人要看北京时间，不再让 AI 换算：ISO / 秒 / 毫秒一律过 formatBeijingTime。
+			const addedAt = formatBeijingTime(entry?.at);
 			const noteText = String(entry?.note || '').trim();
 			localLines.push('状态　　🚫 在黑名单中');
 			localLines.push('加黑方式　' + reason);
@@ -10814,7 +10815,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 					groupBanLines.push('群组　　<code>' + escapeHtml(ban.chatId) + '</code>（' + (ban.independent ? '独立群' : '全局群，本群记录仍生效') + '）');
 					groupBanLines.push('加黑方式　' + escapeHtml(formatGroupBanReason(ban.reason)));
 					if (ban.note) groupBanLines.push('执行原因　' + escapeHtml(String(ban.note)));
-					groupBanLines.push('加黑时间　' + escapeHtml(ban.at || '未知'));
+					groupBanLines.push('加黑时间　' + escapeHtml(formatBeijingTime(ban.at)));
 				});
 				if (groupBans.length) groupBanLines.push('', 'ℹ️ 本群记录由该群管理员在该群发 <code>/unban ' + escapeHtml(queryTgid) + '</code> 解除');
 			}
@@ -13282,7 +13283,7 @@ async function renderKillerBlacklistLines(env, userId) {
 			lines.push('加黑方式　' + translateBlacklistReason(entry.reason));
 			if (entry.note) lines.push('执行原因　' + escapeHtml(entry.note));
 			lines.push('操作人　　' + (entry.by ? '<code>' + escapeHtml(entry.by) + '</code>' : '未知'));
-			lines.push('加黑时间　' + escapeHtml(entry.at || '未知'));
+			lines.push('加黑时间　' + escapeHtml(formatBeijingTime(entry.at)));
 		}
 	} catch (error) {
 		lines.push('状态　　❌ 查询失败（' + escapeHtml(toChineseErrorText(error?.message || '未知错误')) + '）');
@@ -15645,13 +15646,29 @@ async function runAdContentReviewSingle(env,id,options={}) {
 			evaluation.pendingReason='';
 			await save('ad');return {complete:true,ad:true};
 		}
+		// 【2026-11-25 积压根治】pass 就是放行，不能反复核验。
+		// 线上实测：1084 条 waiting + 142 条 pending 的 evaluation.verdict 全部是 pass，
+		// 却没有一条进 clean —— 卡点是 classifyAdContentReview 把「资料查询未完成」
+		// 「头像内容尚未核实」「位置证据待复核」这类【Telegram 侧拿不到、重试也拿不到】
+		// 的缺项当成继续核验的理由。每条记录因此按 30s → 2h → 6h → 24h 的节奏空转，
+		// 到 attempts>=8 才归档，一条要挂 5 天，队列只涨不降。
+		// 现在规定：非 operator 来源的记录，重判两次仍是 pass 就直接按 clean 收口。
+		// 放行语义不变，只是不再占用队列和 AI 额度。
+		if(row.source!=='operator'&&evaluation.verdict==='pass'&&Number(row.attempts)>=2){
+			await save('clean');
+			return {complete:true,clean:true,settled:true};
+		}
 		const assessment=classifyAdContentReview(evaluation,result.llmMemo);
 		if(assessment.kind==='decided'){
 			const partial=Boolean(evaluation.drillIncomplete?.length);
 			await save(partial?'partial':'clean');return {complete:true,...partial?{partial:true}:{clean:true}};
 		}
+		// 【2026-11-25 重试节奏】旧节奏是 30s → 2h → 8h → 24h → 24h…，attempts>=8 才归档，
+		// 一条判不出来的记录要挂 5 天。配合上面「两次 pass 直接 clean」的收口，
+		// 这里把上限从 24 小时压到 6 小时：真正有疑问的记录仍在当天内跑完，
+		// 不再出现「47 小时没人动」的积压观感。
 		const attempts=Number(row.attempts)+1,delay=isAdJoinGuardMessage(message)?Math.min(300,5*Math.pow(2,Math.min(attempts,6)))
-			:evaluation.contentReviewProgress?30:attempts>=3?86400:30*Math.pow(4,attempts);
+			:evaluation.contentReviewProgress?30:attempts>=3?6*3600:30*Math.pow(3,attempts);
 		// 不确定的结果继续后台核验，不向任何角色发送观察或要求人工判断的通知。
 		evaluation.reviewRouting={lane:'background',...assessment};
 		await save(attempts>=3?'waiting':'pending',now+delay);
@@ -15671,7 +15688,7 @@ async function runAdContentReviewSingle(env,id,options={}) {
 		}
 		if(!row.decision&&!(evaluation.verdict==='ban'&&evaluation.reviewAction))evaluation.reviewRouting={lane:row.source==='operator'?'learning':'background',kind:'technical',systemFailure:true};
 		const attempts=Number(row.attempts)+1,delay=row.source!=='operator'&&isAdJoinGuardMessage(JSON.parse(row.message_json||'{}'))?Math.min(300,5*Math.pow(2,Math.min(attempts,6)))
-			:attempts>=3?86400:120*Math.pow(4,attempts-1);
+			:attempts>=3?6*3600:120*Math.pow(4,attempts-1);
 		await save(row.source==='operator'?'learning_failed':evaluation?.verdict==='ban'&&evaluation.reviewAction?'action_failed':attempts>=3?'waiting':'pending',now+delay);return {complete:false,retryAfter:Math.min(43200,delay)};
 	}
 }
@@ -15685,8 +15702,16 @@ async function runAdContentReviewSingle(env,id,options={}) {
 async function archiveExhaustedAdReviews(env, now = Math.floor(Date.now() / 1000)) {
 	if (!env?.DB) return 0;
 	try {
-		const result = await env.DB.prepare("UPDATE ad_content_reviews SET status='exhausted',updated_at=? WHERE seq IN (SELECT seq FROM ad_content_reviews WHERE status='waiting' AND source<>'operator' AND decision='' AND attempts>=8 AND lease_until<=? ORDER BY seq LIMIT 500)").bind(now, now).run();
-		return Number(result?.meta?.changes || 0);
+		// 【2026-11-25 积压根治】pass 的 waiting / pending 一律收口为 clean。
+		// 线上实测 1226 条积压的 evaluation.verdict 全部是 pass —— 它们早就该放行，
+		// 却因为「资料查询未完成 / 头像待核实 / 位置待复核」这类 Telegram 侧不可修复的
+		// 缺项被 classifyAdContentReview 判成继续核验，一直挂在待办里空转。
+		// 这里每次 cron 批量收 500 条，既清历史积压，也兜住以后任何漏网。
+		const settled = await env.DB.prepare("UPDATE ad_content_reviews SET status='clean',updated_at=? WHERE seq IN (SELECT seq FROM ad_content_reviews WHERE status IN ('waiting','pending') AND source<>'operator' AND decision='' AND lease_until<=? AND json_valid(evaluation) AND json_extract(evaluation,'$.verdict')='pass' ORDER BY seq LIMIT 500)").bind(now, now).run();
+		// 非 pass 的记录也不再等 attempts>=8：3 次仍无结论就归档为 exhausted，
+		// 记录、失败原因、evaluation 全部保留，只是不再算作「还在核验」。
+		const result = await env.DB.prepare("UPDATE ad_content_reviews SET status='exhausted',updated_at=? WHERE seq IN (SELECT seq FROM ad_content_reviews WHERE status='waiting' AND source<>'operator' AND decision='' AND attempts>=3 AND lease_until<=? AND (NOT json_valid(evaluation) OR COALESCE(json_extract(evaluation,'$.verdict'),'')<>'pass') ORDER BY seq LIMIT 500)").bind(now, now).run();
+		return Number(settled?.meta?.changes || 0) + Number(result?.meta?.changes || 0);
 	} catch (error) {
 		console.warn('[内容待核] 归档超限记录失败:', error?.message || error);
 		return 0;
@@ -15707,7 +15732,7 @@ async function resumeAdContentReviews(env) {
 	// 的学习记录要排在近两千条自动待核记录后面 —— 队列积压时手动指令等于卡死。
 	// 主人手动提交的量很小（一天几十条），优先它不会挤占自动检测，却能把「手动指令要立刻跑」
 	// 从「看运气」变成确定行为。同一优先级内仍按 next_at 先到先处理。
-	const rows=(await env.DB.prepare('SELECT id,user_id,chat_id,CASE WHEN '+AD_REVIEW_ACTION_RETRY_CONDITION+' THEN 1 ELSE 0 END AS grouped FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\',\'learning_pending\',\'learning_failed\') AND (status=\'action_failed\' OR '+AD_REVIEW_REPRESENTATIVE_CONDITION+' OR '+readyChild+') AND (source=\'operator\' OR attempts<8) AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY CASE WHEN source=\'operator\' THEN 0 ELSE 1 END, next_at LIMIT 20').bind(now,now,now,now).all()).results||[];
+	const rows=(await env.DB.prepare('SELECT id,user_id,chat_id,CASE WHEN '+AD_REVIEW_ACTION_RETRY_CONDITION+' THEN 1 ELSE 0 END AS grouped FROM ad_content_reviews WHERE status IN (\'pending\',\'waiting\',\'processing\',\'normal_intent\',\'action_failed\',\'learning_pending\',\'learning_failed\') AND (status=\'action_failed\' OR '+AD_REVIEW_REPRESENTATIVE_CONDITION+' OR '+readyChild+') AND (source=\'operator\' OR attempts<3) AND next_at<=? AND lease_until<=? AND expires_at>? ORDER BY CASE WHEN source=\'operator\' THEN 0 ELSE 1 END, next_at LIMIT 60').bind(now,now,now,now).all()).results||[];
 	let queued=0;const users=new Set();for(const row of rows){
 		const key=JSON.stringify([row.user_id,row.chat_id]);if(row.grouped&&users.has(key))continue;
 		if(await queueAdContentReview(env,row.id,1)){queued++;if(row.grouped)users.add(key);}
@@ -18058,26 +18083,35 @@ async function ensureInterceptNotifyTable(env) {
 async function claimInterceptNotify(env, userId, chatId, outcome) {
 	if (!(await ensureInterceptNotifyTable(env))) return { send: true, suppressed: 0 };
 	try {
-		const prev = await env.DB.prepare(
-			'SELECT outcome, suppressed FROM intercept_notify_log WHERE user_id = ? AND chat_id = ?'
-		).bind(String(userId), String(chatId)).first();
 		const now = Math.floor(Date.now() / 1000);
-		// 同一结果：原子 +1，changes=1 说明确实是重复 → 压下。
-		// 条件写在 WHERE 里，并发时只有结果仍相同的那次才会被计成重复。
-		if (prev && prev.outcome === outcome) {
+		// 【2026-11-25 主人口径】同一结果只压 10 分钟，不再永久压制。
+		// 旧逻辑「同结果终身只报一次」把后续每一次封禁都吞了，主人在私聊里根本查不到
+		// 某个人后来又被封过 —— 这正是「机器人私聊漏了很多通知」的直接原因。
+		// 固定窗口（不是滑动窗口）：压制期间不刷新 updated_at，所以持续刷广告的号
+		// 最多每 10 分钟收到一条，不会把私聊刷爆，也不会把记录吞掉。
+		const windowStart = now - 600;
+		const prev = await env.DB.prepare(
+			'SELECT outcome, suppressed, updated_at FROM intercept_notify_log WHERE user_id = ? AND chat_id = ?'
+		).bind(String(userId), String(chatId)).first();
+		// 同一结果且仍在窗口内：原子 +1 后压下。
+		if (prev && prev.outcome === outcome && Number(prev.updated_at) > windowStart) {
 			const res = await env.DB.prepare(
-				'UPDATE intercept_notify_log SET suppressed = suppressed + 1, updated_at = ? WHERE user_id = ? AND chat_id = ? AND outcome = ?'
-			).bind(now, String(userId), String(chatId), outcome).run();
+				'UPDATE intercept_notify_log SET suppressed = suppressed + 1 WHERE user_id = ? AND chat_id = ? AND outcome = ? AND updated_at > ?'
+			).bind(String(userId), String(chatId), outcome, windowStart).run();
 			if (Number(res?.meta?.changes) > 0) return { send: false, suppressed: 0 };
 		}
-		// 第一次或结果变化：抢占这一格。WHERE 挡住「另一个并发请求已经抢先写成同一结果」的情况。
+		// 第一次、结果变化、或窗口已过：抢占这一格并重置计时。
+		// WHERE 同时挡住「另一个并发请求已经抢先写成同一结果」的情况。
 		const claim = await env.DB.prepare(
 			'INSERT INTO intercept_notify_log (user_id, chat_id, outcome, suppressed, updated_at) VALUES (?, ?, ?, 0, ?) '
 			+ 'ON CONFLICT(user_id, chat_id) DO UPDATE SET outcome = excluded.outcome, suppressed = 0, updated_at = excluded.updated_at '
-			+ 'WHERE intercept_notify_log.outcome != excluded.outcome'
-		).bind(String(userId), String(chatId), outcome, now).run();
+			+ 'WHERE intercept_notify_log.outcome != excluded.outcome OR intercept_notify_log.updated_at <= ?'
+		).bind(String(userId), String(chatId), outcome, now, windowStart).run();
 		if (prev && Number(claim?.meta?.changes) === 0) return { send: false, suppressed: 0 };
-		return { send: true, suppressed: prev ? Number(prev.suppressed) || 0 : 0 };
+		// 结果变化时也要把「上一轮压下了几次」带出去：主人看「失败 → 成功」这条时，
+		// 需要知道中间还有几次没弹通知，否则会以为只拦了一次。窗口已过则重新计数。
+		const carried = prev && Number(prev.updated_at) > windowStart ? Number(prev.suppressed) || 0 : 0;
+		return { send: true, suppressed: carried };
 	} catch (error) {
 		console.error('[拦截通知去重] 读写失败，本次照常通知:', error);
 		return { send: true, suppressed: 0 };
@@ -18229,7 +18263,8 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 	const entry = blacklistInfo?.entry;
 	const reason = entry?.autoCaseId ? '本群广告自动检测' : translateBlacklistReason(entry?.reason);
 	const operator = await translateBlacklistOperator(entry?.by);
-	const addedAt = entry?.at ? escapeHtml(entry.at) : '未知';
+	// 加黑时间统一按北京时间渲染（ISO / 秒 / 毫秒都吃）。
+	const addedAt = escapeHtml(formatBeijingTime(entry?.at));
 
 	const lines = [
 		`🚫 <b>黑名单自动拦截</b>`,
@@ -18239,6 +18274,12 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 		...(() => { const link = adCaseMessageLink(chat?.id, message?.message_id, message?.chat?.username);
 			return link ? [`📍 定位:${escapeHtml(link)}`] : []; })(),
 		`📋 加黑方式:${reason}`,
+		// 【2026-11-25】主人要能一眼看出「为什么封」。note 里带着判定层与得分，
+		// 以前不展示，通知只剩「本群广告自动检测」六个字，等于没有依据。
+		...(() => {
+			const note = String(entry?.note || '').trim();
+			return note ? [`📝 加黑依据:${escapeHtml(note.slice(0, 300))}`] : [];
+		})(),
 		`🔧 加黑操作人:${operator}`,
 		`🕐 加黑时间:${addedAt}`,
 	];
@@ -18287,7 +18328,8 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo, kind = 'appea
 	const entry = blacklistInfo?.entry;
 	const reason = translateBlacklistReason(entry?.reason);
 	const operator = await translateBlacklistOperator(entry?.by);
-	const addedAt = entry?.at ? escapeHtml(entry.at) : '未知';
+	// 加黑时间统一按北京时间渲染（ISO / 秒 / 毫秒都吃）。
+	const addedAt = escapeHtml(formatBeijingTime(entry?.at));
 	const isStart = kind === 'start';
 
 	const originLine = origin
@@ -25374,6 +25416,38 @@ function hasAdProtectedTechnicalContext(text) {
 		&& countAdKeywordHits(prose, AD_TRADE_VERBS).length === 0;
 }
 
+// ===== 代理订阅分享白名单（2026-11-25）=====
+//
+// 【治什么】主人线上误封复盘：技术群里正常转发「订阅链接 + 协议类型 + 节点列表」
+// 被自动封号（图 55 的 VLESS 订阅卡，129 个节点、美国/德国）。这类内容与广告的
+// 形态天然高度重叠 —— 大量 @handle、外链、IP 列表、多行重复结构 —— 逐条往词表里
+// 加豁免挡不住指纹层 / 结构查杀 / AI 语义任意一层的硬命中。所以这里给出一条
+// 【形状级】白名单，命中即整条放行，不参与任何后续判定。
+//
+// 【判据】三条必须同时成立，缺一即照常判定：
+//   ① 出现已知代理传输协议名（vless / vmess / trojan / clash …）；
+//   ② 出现订阅或节点结构字段（订阅链接 / 协议类型 / 节点总数 / 覆盖范围 …）；
+//   ③ 全文不含交易、招募、违法招揽词，且 hasAdExplicitPromotion 为假。
+// 任一条不满足就退回原判定路径 —— 宁可漏放一条技术分享，也不扩大豁免面去放广告。
+//
+// 【为什么不只看豁免词】豁免词是按「词」减免，命中一条就 -3；而订阅卡里的
+// @handle 与 IP 会在指纹/结构层直接拿到硬命中，分数再怎么减也拦不住。
+// 形状级白名单是「整条不判」，语义上对应主人的原话：这类是正常分享，不是广告。
+const AD_PROXY_PROTOCOL_RE = /(?:^|[^a-z0-9])(?:vless|vmess|trojan|shadowsocks|hysteria2?|tuic|wireguard|anytls|reality|xhttp|clash|mihomo|v2ray|v2fly|sing-?box|hiddify)(?=$|[^a-z0-9])/i;
+const AD_PROXY_STRUCTURE_RE = /订阅(?:链接|地址|转换|节点)|节点(?:总数|列表|信息|数量)|协议类型|覆盖范围|流量详情|剩余流量|到期时间|过期时间/i;
+// 只要出现任何一条，就不认这是「纯分享」：交易、招募、违法标的都是广告的独立证据，
+// 与订阅形态同现时按夹带广告处理，绝不白名单。
+const AD_PROXY_HARD_NEGATIVE_RE = /色情|裸聊|约炮|成人视频|性交易|博彩|赌博|赌场|六合彩|下注|投注|包赢|洗钱|假钞|假币|盗刷|卡料|跑分|刷单返利|贩卖|招代理|招募|招聘|收购|出售|代付|代收|日结|日入|月入|稳赚|躺赚|收款码|来码|拿码|转账|转U/i;
+function isAdProxySubscriptionShare(...texts) {
+	const source = texts.map((value) => String(value ?? '')).filter(Boolean).join('\n');
+	if (!source.trim()) return false;
+	if (AD_PROXY_HARD_NEGATIVE_RE.test(source)) return false;
+	if (!AD_PROXY_PROTOCOL_RE.test(source)) return false;
+	if (!AD_PROXY_STRUCTURE_RE.test(source)) return false;
+	if (hasAdExplicitPromotion(source)) return false;
+	return true;
+}
+
 function adTechnicalExemptPayload(payload) {
 	const filtered = { ...(payload || {}) };
 	for (const key of ['name', 'username', 'bio', 'text']) {
@@ -25951,7 +26025,7 @@ async function ensureAdDetectionTables(env) {
 			// 因为判据主体是昵称与 bio（跨群相同）、restricted 又已归零不计分，
 			// 用哪个群几乎不影响结论，故不按 (user_id, chat_id) 建组合主键 ——
 			// 那会让同一人在 N 个群里占 N 行，把扫描配额直接乘以 N。
-			await runD1SchemaStatement(env, 'ad_group_members', 'CREATE TABLE IF NOT EXISTS ad_group_members (user_id TEXT PRIMARY KEY, chat_id TEXT, first_name TEXT, last_name TEXT, username TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, bio_checked_at INTEGER NOT NULL DEFAULT 0, profile_hash TEXT NOT NULL DEFAULT \'\', last_verdict TEXT NOT NULL DEFAULT \'\')');
+			await runD1SchemaStatement(env, 'ad_group_members', 'CREATE TABLE IF NOT EXISTS ad_group_members (user_id TEXT PRIMARY KEY, chat_id TEXT, first_name TEXT, last_name TEXT, username TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, bio_checked_at INTEGER NOT NULL DEFAULT 0, profile_hash TEXT NOT NULL DEFAULT \'\', last_verdict TEXT NOT NULL DEFAULT \'\', msg_count INTEGER NOT NULL DEFAULT 0, ad_msg_count INTEGER NOT NULL DEFAULT 0, profile_baseline_hash TEXT NOT NULL DEFAULT \'\', profile_last_hash TEXT NOT NULL DEFAULT \'\', profile_changed_at INTEGER NOT NULL DEFAULT 0, profile_edge_hash TEXT NOT NULL DEFAULT \'\')');
 			// 扫描按 bio_checked_at 升序取「最久没查过的人」，这个索引是 cron 的主查询路径。
 			await runD1SchemaStatement(env, 'idx_ad_members_bio_checked', 'CREATE INDEX IF NOT EXISTS idx_ad_members_bio_checked ON ad_group_members (bio_checked_at)', { optional: true });
 			// ===== 变化门所需的两列（bio 未变则跳过指纹与 AI 层）=====
@@ -25965,7 +26039,15 @@ async function ensureAdDetectionTables(env) {
 			const membersTableExists = await d1TableExists(env, 'ad_group_members');
 			for (const [column, sql] of [
 				['profile_hash', 'ALTER TABLE ad_group_members ADD COLUMN profile_hash TEXT NOT NULL DEFAULT \'\';'],
-				['last_verdict', 'ALTER TABLE ad_group_members ADD COLUMN last_verdict TEXT NOT NULL DEFAULT \'\';']
+				['last_verdict', 'ALTER TABLE ad_group_members ADD COLUMN last_verdict TEXT NOT NULL DEFAULT \'\';'],
+				// 行为画像加权：入群时长 / 发言次数 / 资料卡是否被改过都落在这一行。
+				// 全部带默认值，老库 ALTER 补齐；缺列会让 upsert 整体失败，必须先加列。
+				['msg_count', 'ALTER TABLE ad_group_members ADD COLUMN msg_count INTEGER NOT NULL DEFAULT 0;'],
+				['ad_msg_count', 'ALTER TABLE ad_group_members ADD COLUMN ad_msg_count INTEGER NOT NULL DEFAULT 0;'],
+				['profile_baseline_hash', 'ALTER TABLE ad_group_members ADD COLUMN profile_baseline_hash TEXT NOT NULL DEFAULT \'\';'],
+				['profile_last_hash', 'ALTER TABLE ad_group_members ADD COLUMN profile_last_hash TEXT NOT NULL DEFAULT \'\';'],
+				['profile_changed_at', 'ALTER TABLE ad_group_members ADD COLUMN profile_changed_at INTEGER NOT NULL DEFAULT 0;'],
+				['profile_edge_hash', 'ALTER TABLE ad_group_members ADD COLUMN profile_edge_hash TEXT NOT NULL DEFAULT \'\';'],
 			]) {
 				try {
 					if (membersTableExists && !(await d1ColumnExists(env, 'ad_group_members', column))) {
@@ -28661,25 +28743,108 @@ function prewarmCandidate(message, stats) {
 // 读某人在某群的历史发言数与最近一次入群时间。
 // 【读不到就返回 null】拿不到这两个数就不做前置号复核 —— 它的判据建立在
 // 「这确实是首条 + 确实刚进群」上，缺任一项就不是前置号形态，宁可交回普通判定。
+// 一次查询同时取「发言数 / 入群时刻 / 资料卡画像」三样。
+// 【为什么合并】detectAdOnMessage 每条消息都会走到这里，D1 已经 750MB+，
+// 少一次往返就是给整个队列少排一次队。三个子查询在同一个结果行里返回，语义不变。
 async function readPrewarmStats(env, chatId, userId) {
 	if (!env?.DB || !chatId || !userId) return null;
 	try {
-		const speech = await env.DB.prepare(
-			'SELECT COALESCE(SUM(msg_count), 0) AS cnt FROM stat_speech WHERE chat_id = ? AND user_id = ?'
-		).bind(String(chatId), String(userId)).first();
-		const join = await env.DB.prepare(
-			"SELECT MAX(at) AS joinedAt FROM stat_member_events WHERE chat_id = ? AND user_id = ? AND kind = 'join'"
-		).bind(String(chatId), String(userId)).first();
+		const row = await env.DB.prepare(
+			'SELECT COALESCE((SELECT SUM(msg_count) FROM stat_speech WHERE chat_id = ? AND user_id = ?), 0) AS cnt, '
+			+ '(SELECT MAX(at) FROM stat_member_events WHERE chat_id = ? AND user_id = ? AND kind = \'join\') AS joinedAt, '
+			+ 'COALESCE((SELECT first_seen FROM ad_group_members WHERE user_id = ?), 0) AS firstSeen, '
+			+ 'COALESCE((SELECT msg_count FROM ad_group_members WHERE user_id = ?), 0) AS seenMsgs, '
+			+ 'COALESCE((SELECT ad_msg_count FROM ad_group_members WHERE user_id = ?), 0) AS adMsgs, '
+			+ 'COALESCE((SELECT profile_changed_at FROM ad_group_members WHERE user_id = ?), 0) AS profileChangedAt, '
+			+ 'COALESCE((SELECT profile_baseline_hash FROM ad_group_members WHERE user_id = ?), \'\') AS baselineHash, '
+			+ 'COALESCE((SELECT profile_last_hash FROM ad_group_members WHERE user_id = ?), \'\') AS lastHash'
+		).bind(
+			String(chatId), String(userId), String(chatId), String(userId),
+			String(userId), String(userId), String(userId), String(userId), String(userId), String(userId)
+		).first();
 		return {
-			msgCount: Number(speech?.cnt) || 0,
+			msgCount: Number(row?.cnt) || 0,
 			// at 以毫秒存（recordMemberEventDetail 传的是 Date.now()），统一换算成秒。
-			joinedAt: Number(join?.joinedAt) > 0 ? Math.floor(Number(join.joinedAt) / 1000) : 0
+			joinedAt: Number(row?.joinedAt) > 0 ? Math.floor(Number(row.joinedAt) / 1000) : 0,
+			firstSeen: Number(row?.firstSeen) || 0,
+			seenMsgs: Number(row?.seenMsgs) || 0,
+			adMsgs: Number(row?.adMsgs) || 0,
+			profileChangedAt: Number(row?.profileChangedAt) || 0,
+			baselineHash: String(row?.baselineHash || ''),
+			lastHash: String(row?.lastHash || '')
 		};
 	} catch (error) {
 		// 表还没建（新库首条消息就是这个人的首条）→ 当作读不到，交回普通判定。
 		console.warn('[前置号复核] 读取发言/入群统计失败，本次不判:', error?.message || error);
 		return null;
 	}
+}
+
+// ===== 行为画像加权（2026-11-25 主人口径）=====
+// 广告号有两种：进群就喊的，和装正常潜伏几周、改了资料卡再开喊的。
+// 只看一条正文，第二种永远像正常发言；把「入群时长 / 发言次数 / 资料卡是否改过」拉进来才有区分度。
+// 口径：
+//   ① 资料卡改过 + 本条有广告证据 → 直接定罪（主人原话：必跑不掉）；
+//   ② 老成员（入群久、发言多）→ 只撤「观察」，不撤硬命中、不撤封禁；
+//   ③ 新号（入群不足 24 小时且发言很少）→ 只加观察，不单独定罪；
+//   ④ 词表加权平均：本条正文命中明确广告词的比例，按密度给 0~6 分；
+//   ⑤ 历史广告案底（ad_msg_count / 总发言）比例高 → 只升级观察。
+// 白名单（代理订阅分享）在这里整条不动：evaluation.proxyShareExempt 一置位就直接返回。
+function applyAdBehaviorWeight(evaluation, stats, text) {
+	if (!evaluation || !stats || evaluation.proxyShareExempt) return evaluation;
+	const now = Math.floor(Date.now() / 1000);
+	const joined = Number(stats.joinedAt) || Number(stats.firstSeen) || 0;
+	const ageSec = joined > 0 && joined <= now ? now - joined : -1;
+	const seen = Math.max(Number(stats.seenMsgs) || 0, Number(stats.msgCount) || 0);
+	const adMsgs = Number(stats.adMsgs) || 0;
+	const changedAt = Number(stats.profileChangedAt) || 0;
+	const profileChanged = changedAt > 0 && (joined <= 0 || changedAt > joined + 60);
+	const reasons = Array.isArray(evaluation.reasons) ? evaluation.reasons : (evaluation.reasons = []);
+	const positions = Object.values(evaluation.positionEvidence || {}).filter((slot) => slot && !slot.exempt);
+	const maxGrade = positions.reduce((max, slot) => Math.max(max, Number(slot.grade) || 0), 0);
+	const aiSimilarity = Number(evaluation.aiSimilarity) || 0;
+	const adEvidence = Number(evaluation.score) >= 3 || evaluation.structure?.guilty === true
+		|| maxGrade >= AD_POSITION_STRONG_GRADE || aiSimilarity >= 0.6;
+	// ① 资料卡改过 + 有广告证据 → 硬定罪。30 天窗口：改完潜伏太久再喊，就交回普通判定。
+	if (profileChanged && adEvidence && now - changedAt <= 30 * 86400) {
+		const days = Math.max(1, Math.floor((now - changedAt) / 86400));
+		evaluation.verdict = 'ban';
+		evaluation.positionHardBan = true;
+		evaluation.reasons = markAdConvictLayer(reasons.concat(['资料卡变更后发布广告内容（行为画像加权，' + days + ' 天内改过资料卡）']), '行为画像');
+		return evaluation;
+	}
+	// ④ 词表加权平均：每 10 个字命中 1 个明确广告词记 1 分，封顶 6 分。
+	// 只做「升级观察」，不重复加进 score —— score 层已经计过同一批词，再加就是双重计数。
+	const body = String(text || '');
+	const chars = body.replace(/\s+/g, '').length;
+	const hits = chars > 0
+		? countAdKeywordHits(body, AD_BUSINESS_KEYWORDS).length + countAdKeywordHits(body, AD_TRADE_VERBS).length
+		: 0;
+	const kwScore = chars > 0 ? Math.min(6, Math.round((hits / Math.max(1, chars / 10)) * 6)) : 0;
+	// ② 老成员：只撤观察。
+	if (ageSec >= 30 * 86400 && seen >= 30 && evaluation.verdict === 'observe' && !evaluation.positionHardBan) {
+		evaluation.verdict = 'pass';
+		reasons.push('行为画像：老成员（入群 ' + Math.floor(ageSec / 86400) + ' 天 / 发言 ' + seen + ' 条），撤销观察');
+		return evaluation;
+	}
+	if (evaluation.verdict === 'pass') {
+		// ③ 新号 + 有证据：升观察。
+		if (ageSec >= 0 && ageSec < 86400 && seen <= 3 && adEvidence) {
+			evaluation.verdict = 'observe';
+			reasons.push('行为画像：入群 ' + Math.max(1, Math.floor(ageSec / 3600)) + ' 小时内发言 ' + seen + ' 条，转为观察');
+		}
+		// ④ 关键词密度。
+		if (evaluation.verdict === 'pass' && kwScore >= 3) {
+			evaluation.verdict = 'observe';
+			reasons.push('行为画像：广告关键词密度加权 ' + kwScore + '/6（命中 ' + hits + ' 词 / 正文 ' + chars + ' 字）');
+		}
+		// ⑤ 历史广告案底比例。
+		if (evaluation.verdict === 'pass' && adMsgs > 0 && seen >= 3 && adMsgs / Math.max(1, seen) >= 0.2) {
+			evaluation.verdict = 'observe';
+			reasons.push('行为画像：历史广告占比 ' + adMsgs + '/' + seen + '，转为观察');
+		}
+	}
+	return evaluation;
 }
 
 // 前置号复核的提示词。判的是「这个账号是不是批量注册、等着日后投放广告的空壳」，
@@ -30821,8 +30986,19 @@ async function applyAdBodyJudge(env, bodyText, input, judged) {
 		return false;
 	}
 	const evaluation = input.evaluation;
+	// 【2026-11-25】代理订阅分享白名单：正文 AI 判广告也不能翻案。
+	// 这条通道是异步跑的，拿到的是浅拷贝，proxyShareExempt 会一并带过来；
+	// 不在这里早退的话，它会绕过评分层把 verdict 直接改成 ban，note 里还留着
+	// 原判定的低分与 'score' 层，复盘时完全看不出是谁封的。
+	if (evaluation.proxyShareExempt) {
+		console.log('[glm-body] 代理订阅分享白名单，跳过正文定罪');
+		return false;
+	}
 	evaluation.verdict = 'ban';
 	evaluation.positionHardBan = true;
+	evaluation.layer = 'ai_body';
+	evaluation.reasons = markAdConvictLayer((evaluation.reasons || []).concat(['正文 AI 判定：'
+		+ (record.type || '广告') + '（置信度 ' + (record.confidence === null ? '-' : record.confidence) + '）']), '正文 AI 判定');
 	let action = '处置中';
 	let banned = false;
 	let enforced = null;
@@ -31922,15 +32098,39 @@ async function deleteAdScreening(env, userId) {
 // 发言本身不代表查过 bio，覆盖它会让冷却永远无法到期或反复重置。
 // 同时顺手更新 first_name / last_name / username —— cron 扫描时要用它们做零成本预判，
 // 而 cron 拿到的 getChat 结果本来也会带上，这里存一份是为了在 getChat 失败时仍有昵称可判。
-async function upsertAdGroupMember(env, userId, chatId, from = null, nowSeconds = Math.floor(Date.now() / 1000)) {
-	if (!env?.DB) return;
+// 资料卡形状指纹：只看消息里已经带过来的昵称与用户名，零 API 成本。
+// bio / 头像要额外调 getChat，不在这里算 —— 这一层只回答「他自己改过公开名字吗」。
+// 双路 FNV-1a + 长度，够区分改动即可，不需要密码学强度。
+function adProfileEdgeHash(from) {
+	const value = [from?.first_name, from?.last_name, from?.username].map((x) => String(x || '').trim()).join(String.fromCharCode(1));
+	let h1 = 0x811c9dc5, h2 = 0x01000193;
+	for (let i = 0; i < value.length; i++) {
+		const c = value.charCodeAt(i);
+		h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+		h2 = Math.imul(h2 + c, 2246822519) >>> 0;
+	}
+	return h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0') + ':' + value.length;
+}
+
+async function upsertAdGroupMember(env, userId, chatId, from = null, nowSeconds = Math.floor(Date.now() / 1000), options = null) {
+	if (!env?.DB) return null;
 	const uid = String(userId || '');
-	if (!uid) return;
+	if (!uid) return null;
 	try {
 		const now = Number(nowSeconds) || 0;
+		const edge = adProfileEdgeHash(from);
+		// 入群事件不算发言：countMessage === false 时 msg_count 不 +1。
+		const inc = options?.countMessage === false ? 0 : 1;
 		await env.DB.prepare(
-			'INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0) '
-			+ 'ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id, first_name = excluded.first_name, last_name = excluded.last_name, username = excluded.username, last_seen = excluded.last_seen'
+			'INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at, msg_count, profile_baseline_hash, profile_last_hash, profile_edge_hash) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?) '
+			+ 'ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id, first_name = excluded.first_name, last_name = excluded.last_name, username = excluded.username, last_seen = excluded.last_seen, '
+			+ 'msg_count = COALESCE(ad_group_members.msg_count, 0) + ?, '
+			// 【资料卡变更埋点】上一次记下的形状与这次不同、且不是入群首条 → 记下变更时刻。
+			// 只记时间不记结论：改资料本身不是广告，要等它配上广告内容才作数（见 applyAdBehaviorWeight）。
+			+ 'profile_changed_at = CASE WHEN COALESCE(ad_group_members.profile_last_hash, \'\') <> \'\' AND ad_group_members.profile_last_hash <> excluded.profile_last_hash AND excluded.last_seen > COALESCE(ad_group_members.first_seen, 0) THEN excluded.last_seen ELSE COALESCE(ad_group_members.profile_changed_at, 0) END, '
+			+ 'profile_last_hash = excluded.profile_last_hash, '
+			+ 'profile_edge_hash = excluded.profile_edge_hash, '
+			+ 'profile_baseline_hash = CASE WHEN COALESCE(ad_group_members.profile_baseline_hash, \'\') = \'\' THEN excluded.profile_baseline_hash ELSE ad_group_members.profile_baseline_hash END'
 		).bind(
 			uid,
 			chatId != null ? String(chatId) : '',
@@ -31938,10 +32138,17 @@ async function upsertAdGroupMember(env, userId, chatId, from = null, nowSeconds 
 			from?.last_name ? String(from.last_name) : '',
 			from?.username ? String(from.username) : '',
 			now,
-			now
+			now,
+			inc,
+			edge,
+			edge,
+			edge,
+			inc
 		).run();
+		return { edge, inc };
 	} catch (error) {
 		console.error('[广告检测] 更新发言者名册失败: ' + formatD1SchemaError(error));
+		return null;
 	}
 }
 
@@ -38879,6 +39086,37 @@ async function pruneAdReviewAssets(env, nowSeconds = Math.floor(Date.now() / 100
 	return { assets: Number(assets?.meta?.changes || 0), chunks: Number(chunks?.meta?.changes || 0) };
 }
 
+// 【2026-11-25 D1 瘦身】复核队列只进不出，是库膨胀最快的一张表：
+// 每条都带 message_json + evaluation（几 KB 到几十 KB），expires_at 写了却从没人读。
+// 这里按终态 + 保留期批量删，单轮 1000 条封顶 —— 一次删太多会长时间占住 D1 写锁，
+// 反而把正常判定拖死。跑不完下一轮接着删，不需要一次性清空。
+const AD_REVIEW_ROW_RETENTION_SECONDS = 7 * 86400;
+const AD_REVIEW_SETTLED_STATUSES = "'clean','ad','skipped','exhausted','learned','normal_intent','normal','action_failed','learning_failed'";
+async function pruneAdContentReviews(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return 0;
+	try {
+		const now = Number(nowSeconds) || 0;
+		// 【2026-11-25 不积压】活跃态卡死超过 3 天的直接归档：
+		// 线上见过 partial 卡了 19 天（seq 730），既不处理也不消失，队列看着有活、
+		// 实际永远轮不到它。归档成 exhausted 后走下面的终态清理，不会再涨回来。
+		const stale = await env.DB.prepare(
+			"UPDATE ad_content_reviews SET status = 'exhausted', updated_at = ?, next_at = 0 "
+			+ "WHERE status IN ('waiting','pending','partial') AND updated_at < ?"
+		).bind(now, now - 3 * 86400).run();
+		const staleCount = Number(stale?.meta?.changes || 0);
+		if (staleCount > 0) console.log('[复核队列] 已归档陈旧活跃记录 ' + staleCount + ' 条');
+		const res = await env.DB.prepare(
+			'DELETE FROM ad_content_reviews WHERE seq IN (SELECT seq FROM ad_content_reviews WHERE status IN (' + AD_REVIEW_SETTLED_STATUSES + ') AND updated_at < ? ORDER BY seq LIMIT 1000)'
+		).bind(now - AD_REVIEW_ROW_RETENTION_SECONDS).run();
+		const count = Number(res?.meta?.changes || 0);
+		if (count > 0) console.log('[复核队列] 已清理终态记录 ' + count + ' 条');
+		return count;
+	} catch (error) {
+		console.error('[复核队列] 清理终态记录失败: ' + formatD1SchemaError(error));
+		return 0;
+	}
+}
+
 async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 1000)) {
 	if (!env?.DB) return;
 	try {
@@ -38923,6 +39161,8 @@ async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 10
 	} catch (error) {
 		console.error('[演练素材] 过期记录清理失败：' + formatD1SchemaError(error));
 	}
+	// 复核队列单独一段：它是最大的一张表，删失败不能拖垮前面的剪枝。
+	try { await pruneAdContentReviews(env, nowSeconds); } catch (_) { /* 已在函数内记日志 */ }
 }
 
 // === 待确认快照（纯 D1 替代 KV）===
@@ -40041,11 +40281,20 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	const aiHardHit = Boolean(ai.isMatch) && !aiExemptVeto && !aiNameStripVeto;
 	// leaderBan 进 hardHit：它与其他硬命中一样，不依赖分数、不依赖模型。
 	const hardHit = fingerprintBan || aiHardHit || structureBan || leaderBan;
-	const verdict = (score >= config.scoreThreshold || hardHit)
+	// 【2026-11-25 代理订阅分享白名单】见 isAdProxySubscriptionShare 的注释。
+	// 白名单必须在 verdict 定案之后、写快照之前生效：前面所有层（评分 / 指纹 /
+	// 结构查杀 / AI 语义 / 位置证据）都可能已经给出硬命中，语义就是「这类内容整条不判」。
+	const proxyShare = isAdProxySubscriptionShare(text, quotedText, displayName,
+		profile.bio, payload.avatarText, payload.badgeText, payload.customEmojiText);
+	let verdict = (score >= config.scoreThreshold || hardHit)
 		? 'ban'
 		// observe 模式下的结构命中不封，但必须留观察记录 + 推快照给主人人工过目，
 		// 否则这个模式就只是「静默放过」，起不到看误伤面的作用。
 		: ((structure.guilty || score >= config.observationScore) ? 'observe' : 'pass');
+	if (proxyShare && verdict !== 'pass') {
+		reasons.unshift('代理订阅分享白名单：已撤销' + (verdict === 'ban' ? '封禁' : '观察') + '判定');
+		verdict = 'pass';
+	}
 
 	// 本次判定的归属层。提取成常量是因为下面 return 的 layer 字段与定罪层专属标记
 	// 必须读【同一个值】—— 两处各写一遍迟早会分叉（本项目注释失真已出现过多次）。
@@ -40073,14 +40322,16 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		reasons,
 		bodySkeleton,
 		threshold: config.scoreThreshold,
-		positionHardBan: hardHit,
-		positionHardBase: hardHit,
-		positionNeedsReview: Boolean(structure.guilty && config.structureKill === 'observe'),
-		fingerprintHits: fingerprint.hits,
+		// 代理订阅白名单命中：行为画像加权层读到它就直接返回，不把分享重新拉回观察/封禁。
+		proxyShareExempt: Boolean(proxyShare),
+		positionHardBan: hardHit && !proxyShare,
+		positionHardBase: hardHit && !proxyShare,
+		positionNeedsReview: Boolean(!proxyShare && structure.guilty && config.structureKill === 'observe'),
+		fingerprintHits: proxyShare ? [] : fingerprint.hits,
 		// 结构查杀结论透传给处置端。用途：命中即自动学指纹 ——
 		// 这类号是批量注册的，昵称与 bio 高度雷同，学一次之后同款走指纹层直接命中，
-		// 不必每条消息都重跑结构判定。
-		structure,
+		// 不必每条消息都重跑结构判定。白名单命中时必须是空结论，否则下游会把它学成指纹。
+		structure: proxyShare ? { guilty: false, channel: 'quoted', form: '', reasons: [] } : structure,
 		behaviorScore,
 		// retainScore：写进 ad_user_screening.score 的值，【只含行为分，不含静态资料分】。
 		// 这是 double counting 的根治点：旧代码存的是 evaluation.score（总分，含 bio / username /
@@ -40156,6 +40407,9 @@ async function evaluateAdSuspect(env, input, options = {}) {
 const AD_LAYER_LABELS = {
 	position: '位置证据',
 	score: '结构化评分', fingerprint: '指纹库', ai: 'AI 语义',
+	// 【2026-11-25】后置定罪通道原先不写 layer，note 里留着原判定的低分与 'score' 层，
+	// 主人看到「得分 1/7 却被封」完全无法定位是谁封的。这两条通道各自标层。
+	ai_body: '正文 AI 判定', visual: '图片视觉核验',
 	card: '资料卡查杀（用户名+简介）', body: '正文查杀（简介+正文）',
 	contact: '名片广告查杀（显示名+手机号）',
 	// 2026-11-10 拦门第四件套：三条零 AI 通道。
@@ -41373,6 +41627,9 @@ function isAdEnforcementComplete(blacklistCode,results){
 			&&row.muted===true&&row.memberProbe?.state==='not_in_group'));
 }
 
+// 群内留痕开关：默认关（2026-11-25 主人要求群聊不显示通知）。
+const AD_GROUP_BAN_RECEIPT_ENABLED = false;
+
 // 群内封禁留痕（2026-11-24 主人口径）：
 // 自动检测原先只发第一主人私聊，群里一条消息都不留 —— 事后在群里搜 TGID 只能搜到解封记录，
 // 封禁过程完全查不到。这里给每个真正执行了处置的群补一条极简回执（不撤回、不进快照），
@@ -41576,6 +41833,22 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		&& await hasAdNormalContextFeedback(env, groupAdContextKey)) {
 		evaluation.verdict = 'pass';
 		return { banned: false, seq: null, normalFeedback: true, groupFeedback: true, reason: 'confirmed_normal_context' };
+	}
+
+	// 【2026-11-25 代理订阅分享白名单·统一兜底闸】
+	// 白名单在 evaluateAdSuspect 里已经生效过一次，但后面还有几条【后置定罪通道】会
+	// 直接改 verdict：GLM 正文判定（applyAdBodyJudge）、图片/贴纸视觉核验、头像复用。
+	// 它们只认自己的证据，不看原判定的 proxyShareExempt —— 线上 6462 条「得分 X/7（X<7）
+	// 却是结构化评分定罪」全是这条缝漏出来的，且集中在代理订阅分享上。
+	// 放在 note 生成之前做最后一道：只要原判定算出白名单，任何后置通道都不许再封。
+	// 手动确认（管理员回复判广告）不受这道闸约束：人是最终裁决，白名单只挡自动通道。
+	if (evaluation.verdict === 'ban' && evaluation.proxyShareExempt && options.manualAction !== true) {
+		evaluation.verdict = 'pass';
+		evaluation.positionHardBan = false;
+		evaluation.positionHardBase = false;
+		evaluation.reasons = (evaluation.reasons || []).slice();
+		evaluation.reasons.unshift('代理订阅分享白名单：后置通道定罪已撤销');
+		return { banned: false, seq: null, proxyShare: true, reason: 'proxy_share_exempt' };
 	}
 
 	const noteParts = [
@@ -41937,9 +42210,9 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		if (!joinRequest&&!approvedJoin&&automatic && localScope && options.drillCloseReplay !== true&&options.suppressNotify!==true) await notifyIndependentGroupCreatorAdCase(env, chatId, seq, userId, notice + '\n范围：本群自动封禁（<code>' + escapeHtml(chatId) + '</code>）');
 	}
 
-	// 群内留痕：自动处置原先只在主人私聊里留记录，群内搜 TGID 一条封禁消息都没有。
-	// 演练回放与显式抑制通知的场景不发，避免重复刷屏。
-	if (automatic && options.suppressNotify !== true && options.drillCloseReplay !== true) {
+	// 【2026-11-25 主人口径】群内封禁留痕默认关闭：通知一律走私聊，群聊里不显示。
+	// 留一个常量开关，将来要恢复不用改逻辑；默认 false。
+	if (AD_GROUP_BAN_RECEIPT_ENABLED && automatic && options.suppressNotify !== true && options.drillCloseReplay !== true) {
 		try {
 			await sendAdGroupBanReceipts(banResults, { userId, evaluation });
 		} catch (error) {
@@ -42194,7 +42467,8 @@ async function screenAdJoinMember(env, member, options = {}) {
       refreshProfile:true,config:options.config,whitelist:options.whitelist,reviewPool:'join',forceReview:true});
     const evaluation=result.evaluation,pending=isAdDrillPendingEvaluation(evaluation,result.llmMemo);
     const recordCheck=async()=>{
-      if(configured)await upsertAdGroupMember(env,userId,chatId,member,now);
+      // 入群事件不算一次发言：只登记资料与首见时间，msg_count 不加。
+      if(configured)await upsertAdGroupMember(env,userId,chatId,member,now,{countMessage:false});
       if(configured&&result.profile.bioFetched)await markAdBioChecked(env,userId,now);
       await recordAdJoinCheck(env,{userId,chatId,evaluation:pending?{...evaluation,verdict:'pending'}:evaluation});
     };
@@ -42313,6 +42587,10 @@ async function detectAdOnMessage(message, env, ctx) {
 		normalDetection: true, scopeChatId: String(chat.id)
 	});
 	const evaluation = result.evaluation;
+	// 【行为画像加权】入群时长 / 发言次数 / 资料卡是否改过 / 关键词密度，四路加权。
+	// 放在这里：正文 AI 判定之前。已够定罪的直接 ban 掉，省一次模型推理；
+	// 未定罪的只可能被升到 observe，不影响下面的 AI 送审门。
+	applyAdBehaviorWeight(evaluation, prewarmStats, getAdDetectionBodyText(message) || message.text || message.caption || '');
 	// 【2026-11-15 正文 AI 判别】形态可疑、但词表/结构/样本都没定罪时，调一次原生 glm
 	// 直接判正文。这是「不靠补词表」的兜底：新写法、同义改写由模型泛化。
 	if (evaluation.verdict !== 'ban') {
@@ -42360,7 +42638,7 @@ async function detectAdOnMessage(message, env, ctx) {
 	// 线上实测：贴纸 00:47 就由 gemma 读出「收款码洗钱一天一万」并判 scam，
 	// 但聚合层没升级成 ban，拖到 01:32 才被别的路径封 —— 这条补丁把延迟归零。
 	const visualImageKey = String(evaluation.snapshot?.imageId || evaluation.payload?.imageId || '');
-	if (evaluation.verdict !== 'ban' && visualImageKey) {
+	if (evaluation.verdict !== 'ban' && visualImageKey && !evaluation.proxyShareExempt) {
 		try {
 			const savedContent = JSON.parse(await readAdScanState(env, 'image_content_v4:' + visualImageKey, 'null'));
 			const visualSignature = adImageContentSignature(savedContent?.signature);
@@ -42368,6 +42646,7 @@ async function detectAdOnMessage(message, env, ctx) {
 				&& isReliableAdImageContentSignature(visualSignature)) {
 				evaluation.verdict = 'ban';
 				evaluation.positionHardBan = true;
+				evaluation.layer = 'visual';
 				evaluation.reasons = markAdConvictLayer(
 					(evaluation.reasons || []).concat(['图片/贴纸视觉内容核验判定为广告（立即处置）']), '正文图片');
 			}
@@ -42379,6 +42658,11 @@ async function detectAdOnMessage(message, env, ctx) {
 		return false;
 	}
 	if (await isAdminInAnyConfiguredGroup(userId, chat.id)) return false;
+	// 广告案底计数：只在这一条真的走到处置时才 +1，用来算「历史广告占比」。
+	// 失败不影响处置，丢给后台，不占 webhook 预算。
+	const bumpAdMsgs = env.DB.prepare('UPDATE ad_group_members SET ad_msg_count = COALESCE(ad_msg_count, 0) + 1 WHERE user_id = ?').bind(String(userId)).run()
+		.catch(() => {});
+	if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(bumpAdMsgs); else await bumpAdMsgs;
 	const enforced = await enforceAdDetectionWithRetry(env, {
 		userId, chatId: chat.id, chatTitle: chat.title || '', messageId: message.message_id, message
 	}, evaluation, {
