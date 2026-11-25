@@ -12326,6 +12326,7 @@ async function ensureAutomaticAdTargetTable(env) {
 	if (AUTOMATIC_AD_TARGET_TABLE_READY.has(env.DB)) return;
 	const created = await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_automatic_case_targets (case_id TEXT NOT NULL,chat_id TEXT NOT NULL,user_id TEXT NOT NULL,source_chat_id TEXT NOT NULL,scope_type TEXT NOT NULL,owned INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'pending',result TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,PRIMARY KEY(case_id,chat_id))").run();
 	if(created?.success===false)throw new Error('自动处罚目标账本初始化失败');
+	try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_ad_case_target_created ON ad_automatic_case_targets (created_at)').run(); } catch (_) { /* 索引失败不影响账本读写 */ }
 	AUTOMATIC_AD_TARGET_TABLE_READY.add(env.DB);
 }
 
@@ -26436,6 +26437,8 @@ async function ensureAdDetectionTables(env) {
 
 			await runD1SchemaStatement(env, 'ad_sample_embeddings', 'CREATE TABLE IF NOT EXISTS ad_sample_embeddings (id INTEGER PRIMARY KEY AUTOINCREMENT, text_hash TEXT NOT NULL UNIQUE, sample_text TEXT NOT NULL, embedding TEXT, dimension INTEGER, source TEXT, created_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_sample_pending', 'CREATE INDEX IF NOT EXISTS idx_ad_sample_pending ON ad_sample_embeddings (dimension)', { optional: true });
+			// 【2026-11-25】剪枝按 created_at 排序/删除，没索引会全表扫 259MB；补上后查询计划变 SEARCH USING INDEX。
+			await runD1SchemaStatement(env, 'idx_ad_sample_created', 'CREATE INDEX IF NOT EXISTS idx_ad_sample_created ON ad_sample_embeddings (created_at)', { optional: true });
 
 			await runD1SchemaStatement(env, 'ad_domain_whitelist', 'CREATE TABLE IF NOT EXISTS ad_domain_whitelist (domain TEXT PRIMARY KEY, added_by TEXT, source TEXT, created_at INTEGER NOT NULL)');
 
