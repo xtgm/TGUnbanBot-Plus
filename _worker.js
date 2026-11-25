@@ -748,9 +748,12 @@ export default {
 			await pruneAdDetectionData(env);
 			// 群统计明细超期剪枝（保留 STAT_RETENTION_DAYS 天），同样搭 cron 的稳定节拍。
 			await pruneStatData(env);
-			// 【2026-11-25】存储水位自检：关键表行数超阈值就通知主人，不用等 D1 爆。
-			try { await reportAdStorageHealth(env); }
-			catch (error) { console.error('[存储告警] 检查失败:', error); }
+			// 【2026-11-25】存储自检：超了要真倒，不能只发通知。
+			// 先按最老优先强删到 80%，再基于释放后的计数告警，同一条通知里说明删了多少。
+			try {
+				const purged = await enforceAdStorageLimits(env);
+				await reportAdStorageHealth(env, purged);
+			} catch (error) { console.error('[存储告警] 检查失败:', error); }
 			// 配置群管理员全量同步：热路径的豁免读的就是这张表。
 			// cron 每天只跑两次，所以主力是 chat_member 事件的即时同步，这里只是兜底 ——
 			// 补上 bot 掉线 / 事件丢失期间漏掉的提权与撤职。
@@ -39748,7 +39751,49 @@ const AD_STORAGE_WATCH = [
 	['ad_pending_snapshots', 40000, '待确认快照']
 ];
 
-async function reportAdStorageHealth(env) {
+// 【2026-11-25 容量熔断】盒子满了就往外倒，发条通知解决不了积压。
+// 行数超过上限时按最老优先强删到 80%，不等保留期；每天两次 cron 各跑一遍。
+// ad_pending_snapshots 永不参与：删任何一行都会让 MAX(seq) 回退，下一个新快照
+// 重发旧序号，主人照旧通知回滚就会解封错人（见 pruneAdDetectionData 的说明）。
+// 语义向量优先淘汰非人工种子，保住 seed/manual 的质量基线，删不动了才动白名单。
+const AD_STORAGE_PURGE_FILTERS = {
+	ad_sample_embeddings: ["source NOT IN ('seed','seed-core','manual','confirm')", '1=1'],
+	ad_content_reviews: ['status IN (' + AD_REVIEW_SETTLED_STATUSES + ')'],
+	ad_join_notices: ['next_at=0'],
+	ad_automatic_case_targets: ["state IN ('skipped','done','failed','released','rolled_back')"],
+	ad_review_asset_chunks: ['1=1']
+};
+
+async function enforceAdStorageLimits(env) {
+	if (!env?.DB) return [];
+	const acted = [];
+	for (const [table, limit, label] of AD_STORAGE_WATCH) {
+		if (table === 'ad_pending_snapshots') continue;
+		try {
+			const row = await env.DB.prepare('SELECT COUNT(*) AS c FROM ' + table).first();
+			const count = Number(row?.c || 0);
+			if (count <= limit) continue;
+			const target = Math.floor(limit * 0.8);
+			let removed = 0;
+			for (const filter of (AD_STORAGE_PURGE_FILTERS[table] || ['1=1'])) {
+				for (let pass = 0; pass < 20; pass++) {
+					if (count - removed <= target) break;
+					const res = await env.DB.prepare('DELETE FROM ' + table + ' WHERE rowid IN (SELECT rowid FROM ' + table + ' WHERE ' + filter + ' ORDER BY rowid LIMIT 500)').run();
+					const n = Number(res?.meta?.changes || 0);
+					removed += n;
+					if (!n) break;
+				}
+				if (count - removed <= target) break;
+			}
+			if (removed > 0) acted.push({ table, label, before: count, removed });
+		} catch (error) {
+			console.error('[存储熔断] ' + table + ' 强制释放失败: ' + formatD1SchemaError(error));
+		}
+	}
+	return acted;
+}
+
+async function reportAdStorageHealth(env, purged = []) {
 	if (!env?.DB) return { alerts: 0 };
 	const alerts = [];
 	for (const [table, limit, label] of AD_STORAGE_WATCH) {
@@ -39758,6 +39803,7 @@ async function reportAdStorageHealth(env) {
 			if (c > limit) alerts.push(label + '（' + table + '）：' + c + ' 行，上限 ' + limit);
 		} catch (_) { /* 表还没建就跳过 */ }
 	}
+	for (const p of purged) alerts.push('【已强制释放】' + p.label + '（' + p.table + '）：' + p.before + ' → ' + (p.before - p.removed) + ' 行');
 	if (!alerts.length) return { alerts: 0 };
 	const owners = Array.isArray(runtime().OWNER_IDS) ? runtime().OWNER_IDS : [];
 	if (!owners.length) return { alerts: alerts.length, notified: false };
