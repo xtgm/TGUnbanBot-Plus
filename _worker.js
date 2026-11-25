@@ -207,8 +207,8 @@ const DEFAULT_SELF_UNBAN_CONTACT_GROUP = '';
 // =============================================================================
 
 // 清扫回看上限:/spam 删完当事人消息后，按这个条数回看 moderation_messages 做当前群清扫。
-// 环境变量名:MSG_CACHE_SIZE(1~500，默认 50)
-const DEFAULT_MSG_CACHE_SIZE = 50;
+// 环境变量名:MSG_CACHE_SIZE(1~500，默认 200)
+const DEFAULT_MSG_CACHE_SIZE = 200;
 
 // ===== 群内广告举报投票(/ad)=====
 const AD_VOTE_THRESHOLD = 6;
@@ -321,7 +321,7 @@ function createRuntimeState() {
 		// bot 在里面不需要任何权限，普通成员即可（getChatMember 只要求 bot 在群内）。
 		PROFILE_LOOKUP_GROUPS: [],
 		// 清扫回看上限(/spam 按它决定 moderation_messages 回看多少条)
-		MSG_CACHE_SIZE: 50,
+		MSG_CACHE_SIZE: 200,
 		AD_PROTECTED_USERNAMES: [],
 		AD_TRUSTED_BOTS: [],
 		WEB_ADMIN_CAPTURE: null,
@@ -552,13 +552,13 @@ export default {
 					} else if (update.edited_message) {
 						await handleMessage(update.edited_message, env, ctx, request.url, { edited: true });
 					} else if (update.chat_member) {
-						await handleChatMemberUpdate(update.chat_member, env);
+						await handleChatMemberUpdate(update.chat_member, env, ctx);
 					} else if (update.callback_query) {
 						await handleAdCallbackQuery(update.callback_query, env, ctx);
 					} else if (update.chat_join_request) {
 						// 申请阶段直接筛查申请人，不等待任何验证机器人的消息或按钮回调。
 						// 【2026-11-15 稳定性】申请筛查最多等 25 秒，超时放行，避免触发 Telegram 读超时重试。
-						await raceWithTimeout(handleChatJoinRequest(update.chat_join_request, env), 25000, undefined);
+						await raceWithTimeout(handleChatJoinRequest(update.chat_join_request, env, ctx), 25000, undefined);
 					} else if (update.my_chat_member) {
 						// 机器人自身的成员变更已在上面 handleBotSelfJoin 处理完，这里不再重复动作。
 					} else {
@@ -709,6 +709,19 @@ export default {
 		catch(error){console.error('[定时治理] 群范围读取失败，本轮暂缓：'+formatD1SchemaError(error));return;}
 		// 10 分钟节拍恢复待处理任务和联合封杀；bio、识图与剪枝仍按原日节拍执行。
 		// 没填订阅变量时 runFederationSync 第一行就返回，零 SQL、零外呼。
+		// 【2026-11-25】每分钟补杀/补判：同步链超时漏下的现场与账本，在这里 60 秒内收口。
+		// 放在 FED 之前判断，表达式不同，互不干扰；两条都失败也只记日志，不影响下一条 cron。
+		if (controller?.cron === AD_RESUME_CRON) {
+			try {
+				const pending = await resumeAdPendingDetections(env);
+				if (pending.checked) console.log('[补判] 本轮检查 ' + pending.checked + ' 条，补处置 ' + pending.resolved + ' 条');
+			} catch (error) { console.error('[补判] 本轮失败：' + formatD1SchemaError(error)); }
+			try {
+				const cases = await resumeAutomaticAdCaseTargets(env);
+				if (cases.checked) console.log('[补杀] 本轮检查 ' + cases.checked + ' 条，补处置 ' + cases.resolved + ' 条');
+			} catch (error) { console.error('[补杀] 本轮失败：' + formatD1SchemaError(error)); }
+			return;
+		}
 		if (controller?.cron === FED_SYNC_CRON) {
 			try { await resumeAdJoinNotices(env, ctx); }
 			catch(error){console.error('[拦门通知] 自动补发失败：'+formatD1SchemaError(error));}
@@ -4822,6 +4835,19 @@ async function writeBlacklistDetails(env, rows) {
 // 【全部懒建表】不动 blacklist 表结构，也不动 D1_SCHEMA_VERSION。
 // 【没填订阅变量时零开销】热路径 checkBlacklist 仍是原来那一条主键查询，10 分钟 cron 直接返回。
 const FED_SYNC_CRON = '*/10 * * * *';
+// 【2026-11-25 防卡死】每分钟补杀/补判：
+// 同步检测一旦超时（消息 25 秒总闸 / 入群链），旧行为是「按放行处理」——
+// 判定结果和已经写进账本的 pending 目标都没人接手，等于漏放且不留后手。
+// 这条 cron 只做两件确定的事：把超时现场重判一次、把已判未封的账本推进一次。
+// 主人口径：可以慢，但不能漏；秒级做不到就一分钟内补上。
+const AD_RESUME_CRON = '* * * * *';
+// 超时现场重判的预算。比同步链的 25 秒短：cron 每分钟一轮，单条不能吃满一轮。
+const AD_RESUME_DETECT_BUDGET_MS = 20000;
+// 入群链单独预算：webhook 的 60 秒是共享的，图片/头像/模型全串进去会拖死整个群。
+const AD_JOIN_DETECT_BUDGET_MS = 15000;
+// 同一条现场最多重判几次；账本目标最多补试几次。超过即收口，避免无限重试。
+const AD_RESUME_DETECT_MAX_ATTEMPTS = 3;
+const AD_RESUME_CASE_MAX_ATTEMPTS = 3;
 const FED_PAGE_LIMIT = 500;
 const FED_SYNC_MAX_PAGES = 20;          // 一次 cron 最多拉 1 万条，剩下的下一轮接着拉
 const FED_SYNC_TIMEOUT_MS = 15000;
@@ -11404,7 +11430,7 @@ async function handleNewChatMemberBots(message) {
 // 处理 chat_member 事件：管理员手动封/解封时同步 D1 黑名单
 // 加黑：从其它状态 → kicked
 // 移黑：从 kicked → 任意其它状态
-async function handleChatMemberUpdate(chatMember, env) {
+async function handleChatMemberUpdate(chatMember, env, ctx) {
 	if (!chatMember) return;
 	if (isIgnoredBotUpdate({ chat_member: chatMember })) return;
 
@@ -11428,7 +11454,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 		}
 		if (!isBotApprovedHumanJoin(chatMember)) return;
 		await screenAdJoinMember(env, newMember.user, { chatId: String(chat.id), chatTitle: chat.title || '',
-			source: 'chat_member', approvedByBot: true, joinDate: Number(chatMember.date) || 0,
+			source: 'chat_member', approvedByBot: true, joinDate: Number(chatMember.date) || 0, ctx,
 			joinApprover: { id: fromUser.id, username: fromUser.username || '', first_name: fromUser.first_name || '' } });
 		return;
 	}
@@ -11473,7 +11499,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 			&& !['member', 'restricted', 'administrator', 'creator'].includes(oldMember.status)
 			&& ['member', 'restricted'].includes(newMember.status)) {
 			await screenAdJoinMember(env, incoming, { chatId: String(chat.id), chatTitle: chat.title || '',
-				messageId: null, skipBlacklistCheck: true, source: 'chat_member' });
+				messageId: null, skipBlacklistCheck: true, source: 'chat_member', ctx });
 		}
 		return;
 	}
@@ -11547,7 +11573,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 	if (enteredGroup && await isAdJoinGuardGroupCurrent(env, chat.id)) {
 		try {
 			await screenAdJoinMember(env, targetUser, {chatId:String(chat.id),chatTitle:chat.title||'',
-				source:'chat_member',joinDate:Number(chatMember.date)||0});
+				source:'chat_member',joinDate:Number(chatMember.date)||0,ctx});
 		} finally {
 			try { await recordMemberChange(); }
 			catch (error) { console.error('[入群记录] 成员统计未保存: '+formatD1SchemaError(error)); }
@@ -11608,6 +11634,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 		// 直接 return，简介里写满广告也不看一眼。所以必须拦在那一行之前。
 		const joinVerdict = await screenAdJoinMember(env, targetUser, {
 			chatId: String(chat.id),
+			ctx,
 			chatTitle: chat.title || '',
 			messageId: null,					// chat_member update 没有消息可删
 			skipBlacklistCheck: true,			// 上面刚查过，别再查一遍 D1
@@ -12428,6 +12455,145 @@ async function skipAutomaticAdCaseTarget(env, { caseId, userId, chatId, reason =
 		.bind(JSON.stringify({ reason }),String(caseId),String(chatId),String(userId)).run();
 	if (result?.success === false) throw new Error('自动处罚跳过状态记账失败');
 	return { skipped: true };
+}
+
+// ===== 【2026-11-25 防卡死】超时现场补判 + 已判未封补杀 =====
+//
+// 线上形态：消息（25 秒）与入群链的同步检测都有总闸，超时直接按「放行」返回；
+// 而 prepareAutomaticTarget 早把目标群写进 ad_automatic_case_targets 的 pending，
+// beforeGroup 一旦没跑到，这条 pending 就再也没人接手 —— 判定有、账本有、就是没人封。
+// 主人口径：可以慢，但不能漏；做不到秒级，就一分钟内补上。
+const AD_PENDING_DETECTION_TABLE_READY = new WeakSet();
+async function ensureAdPendingDetectionTable(env) {
+	if (!env?.DB) return false;
+	if (AD_PENDING_DETECTION_TABLE_READY.has(env.DB)) return true;
+	const created = await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_pending_detections (id TEXT PRIMARY KEY,kind TEXT NOT NULL,chat_id TEXT NOT NULL,user_id TEXT NOT NULL,payload_json TEXT NOT NULL,created_at INTEGER NOT NULL,next_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'pending')").run();
+	if (created?.success === false) return false;
+	try { await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_ad_pending_detection_next ON ad_pending_detections (state,next_at)").run(); } catch (_) { /* 索引失败不影响读写 */ }
+	AD_PENDING_DETECTION_TABLE_READY.add(env.DB);
+	return true;
+}
+
+// kind='message' 存原始 message（重放 detectAdOnMessage）；
+// kind='join' 存入群现场摘要（重放 screenAdJoinMember）。
+async function enqueueAdPendingDetection(env, kind, payload, reason = 'timeout') {
+	if (!env?.DB || !payload) return false;
+	try {
+		if (!await ensureAdPendingDetectionTable(env)) return false;
+		const chatId = String(kind === 'join' ? payload.chatId || '' : kind === 'body' ? payload?.input?.chatId || '' : payload?.chat?.id || '');
+		const userId = String(kind === 'join' ? payload?.member?.id || '' : kind === 'body' ? payload?.input?.userId || '' : payload?.from?.id || '');
+		const messageId = String(kind === 'join' ? payload.messageId || 0 : kind === 'body' ? payload?.input?.message?.message_id || 0 : payload?.message_id || 0);
+		if (!chatId || !userId) return false;
+		const id = kind + ':' + chatId + ':' + userId + ':' + messageId;
+		const json = JSON.stringify(payload);
+		// D1 单值有上限；超大现场宁可不入队，也不能让写库失败把整轮 cron 拖死。
+		if (json.length > 900000) { console.warn('[补判] 现场过大，跳过入队 ' + id); return false; }
+		const now = Math.floor(Date.now() / 1000);
+		await env.DB.prepare("INSERT INTO ad_pending_detections(id,kind,chat_id,user_id,payload_json,created_at,next_at,attempts,state) VALUES(?,?,?,?,?,?,?,0,'pending') ON CONFLICT(id) DO UPDATE SET next_at=excluded.next_at,state='pending',payload_json=excluded.payload_json")
+			.bind(id, kind, chatId, userId, json, now, now).run();
+		console.log('[补判] 超时现场已入队 ' + id + '（' + reason + '）');
+		return true;
+	} catch (error) { console.error('[补判] 入队失败: ' + formatD1SchemaError(error)); return false; }
+}
+
+async function resumeAdPendingDetections(env) {
+	if (!env?.DB || !await ensureAdPendingDetectionTable(env)) return { checked: 0, resolved: 0 };
+	const now = Math.floor(Date.now() / 1000);
+	// 单轮 5 条并发：每条最慢 20 秒，并发后整轮仍能在一分钟内收口，账本补杀也排得上。
+	const rows = (await env.DB.prepare("SELECT id,kind,payload_json,attempts FROM ad_pending_detections WHERE state='pending' AND next_at<=? ORDER BY next_at LIMIT 5").bind(now).all())?.results || [];
+	let resolved = 0;
+	const outcomes = await Promise.all(rows.map(async (row) => {
+		let payload = null;
+		try { payload = JSON.parse(row.payload_json || 'null'); } catch (_) { payload = null; }
+		if (!payload) {
+			await env.DB.prepare("UPDATE ad_pending_detections SET state='dropped' WHERE id=?").bind(row.id).run();
+			return false;
+		}
+		let handled = false;
+		try {
+			if (row.kind === 'join') {
+				handled = await raceWithTimeout(screenAdJoinMember(env, payload.member || {}, {
+					chatId: String(payload.chatId || ''), chatTitle: payload.chatTitle || '',
+					messageId: payload.messageId || null, source: payload.source || 'chat_member',
+					joinDate: payload.joinDate || 0, joinApprover: payload.joinApprover || null,
+					joinRequest: payload.joinRequest || undefined
+				}), AD_RESUME_DETECT_BUDGET_MS, 'timeout') === 'banned';
+			} else if (row.kind === 'body') {
+				// 正文 AI 重判：整段现场都在 payload 里，直接重跑同一入口。
+				handled = await raceWithTimeout((async () => { await applyAdBodyJudge(env, payload.bodyText || '', payload.input || {}); return true; })(), AD_RESUME_DETECT_BUDGET_MS, 'timeout') === true;
+			} else {
+				handled = await raceWithTimeout(detectAdOnMessage(payload, env, null), AD_RESUME_DETECT_BUDGET_MS, false) === true;
+			}
+		} catch (error) {
+			console.error('[补判] 重放失败 ' + row.id + ': ' + formatD1SchemaError(error));
+		}
+		const attempts = Number(row.attempts) || 0;
+		if (handled) {
+			await env.DB.prepare("UPDATE ad_pending_detections SET state='done' WHERE id=?").bind(row.id).run();
+			return true;
+		}
+		if (attempts + 1 >= AD_RESUME_DETECT_MAX_ATTEMPTS) {
+			await env.DB.prepare("UPDATE ad_pending_detections SET state='dropped',attempts=? WHERE id=?").bind(attempts + 1, row.id).run();
+			return false;
+		}
+		await env.DB.prepare("UPDATE ad_pending_detections SET attempts=?,next_at=? WHERE id=?").bind(attempts + 1, now + 45, row.id).run();
+		return false;
+	}));
+	resolved = outcomes.filter(Boolean).length;
+	return { checked: rows.length, resolved };
+}
+
+// 账本补杀：只推进「已经写了黑名单、但逐群处置没跑到」的目标。
+// 全部动作幂等：已封返回 already_banned，人不在群只收口账本（禁言会把人拉回来）。
+async function resumeAutomaticAdCaseTargets(env) {
+	if (!env?.DB) return { checked: 0, resolved: 0 };
+	await ensureAutomaticAdTargetTable(env);
+	const now = Math.floor(Date.now() / 1000);
+	// 门槛压到 10 秒：主链路 25 秒总闸内可能还在跑，抢跑后的重复处置由 probe 的 already_banned 幂等收口，
+	// 换来的是超时现场在下一分钟 cron 里就能补杀，最坏链路压进一分钟。
+	const rows = (await env.DB.prepare("SELECT case_id,chat_id,user_id,source_chat_id,scope_type,owned,state,result FROM ad_automatic_case_targets WHERE state IN ('pending','executing') AND created_at<=? ORDER BY created_at LIMIT 6").bind(now - 10).all())?.results || [];
+	let resolved = 0;
+	const outcomes = await Promise.all(rows.map(async (row) => {
+		const caseId = String(row.case_id), gid = String(row.chat_id), uid = String(row.user_id);
+		const scope = String(row.scope_type) === 'local' ? 'local' : 'global';
+		if (Number(row.owned) !== 1) return false;
+		let previous = {};
+		try { previous = JSON.parse(row.result || '{}') || {}; } catch (_) { previous = {}; }
+		const attempts = Number(previous.resumeAttempts) || 0;
+		const mark = async (state, extra = {}) => {
+			try {
+				await env.DB.prepare('UPDATE ad_automatic_case_targets SET state=?,result=? WHERE case_id=? AND chat_id=? AND user_id=?')
+					.bind(state, JSON.stringify({ ...previous, ...extra, resumeAttempts: attempts + 1, resumedAt: now }), caseId, gid, uid).run();
+			} catch (error) { console.error('[补杀] 记账失败 ' + caseId + '/' + gid + ': ' + formatD1SchemaError(error)); }
+		};
+		if (attempts >= AD_RESUME_CASE_MAX_ATTEMPTS) { await mark('failed', { reason: '补杀重试上限' }); return false; }
+		if (isAdDetectionExemptUser(uid) || await isAdUserWhitelisted(env, uid)
+			|| await isProtectedFromAutoModeration(uid, gid)) { await mark('skipped', { reason: 'whitelisted' }); return true; }
+		if (!isConfiguredGroup(gid) && !isKillerModeGroup(gid)) { await mark('skipped', { reason: 'group_out_of_scope' }); return true; }
+		const probe = await probeTargetMemberBeforeBan(gid, uid, { timeoutMs: 5000 });
+		if (probe.state === 'already_banned') { await mark('done', { ok: true, skipped: 'already_banned' }); return true; }
+		if (probe.state === 'not_in_group') { await mark('skipped', { reason: 'not_in_group' }); return true; }
+		if (isTelegramPermissionError(probe.error)) { await mark('skipped', { reason: 'admin_required' }); return true; }
+		if (probe.state === 'unknown' || probe.state === 'invalid' || probe.state === 'unresolvable') {
+			await mark(attempts + 1 >= AD_RESUME_CASE_MAX_ATTEMPTS ? 'failed' : 'pending', { reason: 'probe_' + probe.state, error: String(probe.error || '').slice(0, 200) });
+			return false;
+		}
+		const mode = isAdJoinGuardGroup(gid) ? 'mute'
+			: isKillerModeGroup(gid) ? undefined
+				: scope === 'local' ? (await loadGroupLocalSettings(env, gid)).action : undefined;
+		try {
+			const result = await applyGroupModeration(gid, uid, mode, {
+				probeMembership: false, requireMember: mode === 'mute', timeoutMs: 8000, deferRetry: true
+			});
+			if (result?.ok === true) { await mark('done', { ok: true, mode: mode || 'auto', resumed: true }); return true; }
+			else await mark(attempts + 1 >= AD_RESUME_CASE_MAX_ATTEMPTS ? 'failed' : 'pending', { ok: false, error: String(result?.error || '').slice(0, 200) });
+		} catch (error) {
+			await mark(attempts + 1 >= AD_RESUME_CASE_MAX_ATTEMPTS ? 'failed' : 'pending', { ok: false, error: formatD1SchemaError(error) });
+		}
+		return false;
+	}));
+	resolved = outcomes.filter(Boolean).length;
+	return { checked: rows.length, resolved };
 }
 
 async function loadAutomaticAdCaseTargets(env, caseId, userId, scope) {
@@ -20336,8 +20502,22 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 	// 只做「拉资料 → 评分 → 封禁或写观察窗口」，绝不短路既有的 bot 静音与进群消息清理逻辑。
 	// 【2026-11-15 稳定性】入群筛查最多等 25 秒：单个新成员的资料卡 + AI + 全群处置
 	// 线上实测可能超过 Telegram 的 60 秒 webhook 超时，导致同群后续消息积压。
-	// 超时按放行处理 —— 漏判一个入群广告远好过整个群断流。
-	await raceWithTimeout(detectAdOnJoin(message, env, ctx), 25000, undefined);
+	// 【2026-11-25 防卡死】超时不再等于放行：现场入队，由每分钟 cron 重判，
+	// 底层 Promise 挂 waitUntil 继续跑 —— 多数情况它自己会封完，跑不完的交给 cron。
+	const joinDetection = detectAdOnJoin(message, env, ctx);
+	if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(Promise.resolve(joinDetection).catch(() => {}));
+	if (await raceWithTimeout(joinDetection, 25000, 'deferred') === 'deferred') {
+		const members = Array.isArray(message.new_chat_members) ? message.new_chat_members : [];
+		for (const member of members) {
+			if (!member?.id || member.is_bot) continue;
+			await enqueueAdPendingDetection(env, 'join', {
+				chatId: String(message.chat?.id || ''), chatTitle: message.chat?.title || '',
+				messageId: message.message_id || 0, source: 'new_chat_members',
+				joinDate: Number(message.date) || 0,
+				member: { id: member.id, first_name: member.first_name || '', last_name: member.last_name || '', username: member.username || '', is_bot: false }
+			}, 'join_timeout');
+		}
+	}
 
 	if (await handleNewChatMemberBots(message)) {
 		return;
@@ -20554,7 +20734,17 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 	// 线上实测一条 4272 字节长消息的处理超过 Telegram 的 60 秒 webhook 超时，worker 被取消、
 	// Telegram 持续重试，同一聊天的后续 update 按序阻塞，积压到 180 条、整个群断流。
 	// 超时按「放行」处理 —— 漏判一条广告远好过整个群十分钟收不到任何消息。
-	const adVerdict = await raceWithTimeout(detectAdOnMessage(message, env, ctx), 25000, false);
+	// 【2026-11-25 防卡死】超时不再等于放行：
+	//   · 底层 Promise 挂到 waitUntil，让它继续跑 —— 大多数「25 秒差一点」会自己封完；
+	//   · 现场同时入队，每分钟 cron 重判一次，3 次仍无线索才收口。
+	// 超时期间不写消息缓存：宁可这条不进 /search，也不能把可能的广告标成正常。
+	const adDetection = detectAdOnMessage(message, env, ctx);
+	if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(Promise.resolve(adDetection).catch(() => {}));
+	const adVerdict = await raceWithTimeout(adDetection, 25000, 'deferred');
+	if (adVerdict === 'deferred') {
+		await enqueueAdPendingDetection(env, 'message', message, 'message_timeout');
+		return;
+	}
 	if (adVerdict === true) {
 		// 判过的消息同样要进消息缓存：/spam 的「当前群清扫」与「跨群连带」只认这张表，
 		// 不写就一条都追不到 —— 演练模式下尤其明显（演练不删消息，人还在群里发着，
@@ -24959,8 +25149,9 @@ const AD_AI_SOFT_BONUS_SCORE = 2;
 // · 两个调用点（主判定 14475 + 昵称剥离复验 14513）走同一函数，天然同步 ——
 //   若只在一处生效会形成「主判定用 top-K、复验用 max」的逻辑分叉。
 // · 达标门槛 = **top-K 里过半**（K=3→2、K=5→3），随 K 自动走、不单独配 ——
-//   K 调了门槛还停在旧值会悄悄失衡。实际取值走 config.aiTopK（环境变量 AD_AI_TOP_K）。
-const AD_AI_TOP_K = 0;            // 0 = 关闭（现行为）；建议 K=3
+//   · K 调了门槛还停在旧值会悄悄失衡。实际取值走 config.aiTopK（常量 AD_AI_TOP_K，环境变量仍可覆盖）。
+// 2026-11-25 主人硬编码：环境变量即将删除，值固定为 3。
+const AD_AI_TOP_K = 3;            // 线上口径；0 = 关闭（退回 max 单证定罪）
 
 // 指纹命中加分
 const AD_FINGERPRINT_HIT_SCORE = 3;
@@ -25228,7 +25419,9 @@ const AD_LLM_TERTIARY_MODEL = '@cf/qwen/qwen3.8-27b';
 // 各自打满即停、互不吃对方额度，不可能同时打满（视觉轨要当天出现 800 张新图、
 // 这一路要 1,400 条可疑消息、嵌入轨要 20,000 条不重复文案，任一条单独成立
 // 就已经是极端日）。真实判据是「最贵两轨同时打满仍装得下」：5,775 + 2,802 = 8,577 = 86%。
-const AD_LLM_DAILY = 1400;
+// 2026-11-25 主人切 Workers Pro，九个环境变量已删除，取值全部硬编码在代码里。
+// 上面的免费版 Neurons 成本账保留作历史记录，Pro 下按量计费，不再是硬约束。
+const AD_LLM_DAILY = 20000;
 // 各池默认值。三个相加必须 < AD_LLM_DAILY，否则总闸会先一步拦掉后面的池。
 // 留余量：某池突发打满时不至于把总闸撞上、连带断掉别的池。
 //
@@ -25237,10 +25430,10 @@ const AD_LLM_DAILY = 1400;
 // join 是「每个新成员一次」量级没变 —— 给这两轨提保底等于把额度锁在用不掉的池里，
 // 正是 2026-10-25 从硬上限改成保底要治的那个病（额度烂在池子里谁也用不上）。
 // 消息路径（闸一 + 闸二）才是广告真正出现的地方，所以只有它从 500 提到 800。
-// 保底之和 800 + 300 + 100 = 1,200，共享余量 200（旧配置只有 100）。
-const AD_LLM_DAILY_MESSAGE = 800;
-const AD_LLM_DAILY_JOIN = 300;
-const AD_LLM_DAILY_CRON = 100;
+// 2026-11-25 四池硬编码为 10,000 / 5,000 / 800 / 500，合计 16,300，总额 20,000，共享余量 3,700。
+const AD_LLM_DAILY_MESSAGE = 10000;
+const AD_LLM_DAILY_JOIN = 5000;
+const AD_LLM_DAILY_CRON = 800;
 // 【2026-11 新增第四池：抽送（sample）】f 路「老用户纯文字确定性抽送」专用。
 //
 // 【为什么必须单独开一池，不能并进 message】这一路的性质与其余三路相反：
@@ -25255,8 +25448,8 @@ const AD_LLM_DAILY_CRON = 100;
 //     （本项目的优化目标是 Workers 免费版，见主人口径）；
 //   · 它的产出是【样本】—— 抽到真广告就由 /pending 进人工、由 /ban 学成指纹，
 //     此后同类走指纹层零成本命中。所以这一路的价值随额度递减，60 已在收益平台区。
-// 四池保底之和 800 + 300 + 100 + 60 = 1,260，总额 1,400，共享余量仍有 140。
-const AD_LLM_DAILY_SAMPLE = 60;
+// 四池保底之和 10,000 + 5,000 + 800 + 500 = 16,300，总额 20,000，共享余量仍有 3,700。
+const AD_LLM_DAILY_SAMPLE = 500;
 
 // 【解析失败熔断】连续这么多次取不到模型回答，当天直接关掉第⑥层，一次都不再调。
 //
@@ -26338,7 +26531,7 @@ function loadAdDetectionConfig(env) {
 		observationScore: pickInt(env.AD_OBSERVATION_SCORE, DEFAULT_AD_OBSERVATION_SCORE, 1, 100),
 		observationHours: pickInt(env.AD_OBSERVATION_HOURS, DEFAULT_AD_OBSERVATION_HOURS, 1, 720),
 		aiSimilarityThreshold: pickFloat(env.AD_AI_SIMILARITY_THRESHOLD, DEFAULT_AD_AI_SIMILARITY_THRESHOLD, 0.1, 1),
-		// 形态 E：AI 多样本聚合的 K。0 = 关闭（现行为 max 单证定罪，也是默认值）；建议 3。
+		// 形态 E：AI 多样本聚合的 K。0 = 关闭（退回 max 单证定罪）；默认 3（2026-11-25 硬编码）。
 		// 走 env 而非常量：线上可直接开关 A/B，不必改代码重新部署（见 AD_AI_TOP_K 上方说明）。
 		aiTopK: pickInt(env.AD_AI_TOP_K, AD_AI_TOP_K, 0, 50),
 		fingerprintMinConfidence: pickFloat(env.AD_FINGERPRINT_MIN_CONFIDENCE, DEFAULT_AD_FINGERPRINT_MIN_CONFIDENCE, 0, 1),
@@ -31510,6 +31703,11 @@ async function applyAdBodyJudge(env, bodyText, input, judged) {
 	// 判正常的、调用失败的也写一条：主人事后能看出「这条模型看过了、判的是正常」，
 	// 而不是只剩「没封」这个结果，分不清是放行还是根本没跑。
 	await writeAdScanState(env, adBodyJudgeKey(bodyText), JSON.stringify(record), record.at);
+	// 【2026-11-25 防卡死】模型侧失败（超时/坏 JSON/网络）不落终局：现场入队由每分钟 cron 重判。
+	// empty_text（没正文）与 no_ai_binding（配置缺失）重判也没用，直接放过。
+	if (!record.ok && record.error !== 'empty_text' && record.error !== 'no_ai_binding' && input?.message) {
+		await enqueueAdPendingDetection(env, 'body', { bodyText, input }, 'body_judge_' + String(record.error || 'failed').slice(0, 40));
+	}
 	if (!convicted) {
 		// 【2026-11-22 主人口径】通知只发「正文 AI 判定：广告」这一种。
 		// 判正常的、调用失败的、被代码压下来的都不再打扰，D1 记录照写，事后可查。
@@ -31552,6 +31750,8 @@ async function judgeAdBodyAsync(env, bodyText, input) {
 		await applyAdBodyJudge(env, bodyText, input);
 	} catch (error) {
 		console.log('[glm-body] 异步判定失败: ' + String(error?.message || error).slice(0, 200));
+		// 【2026-11-25 防卡死】抛异常不能把这条正文判死：现场入队，每分钟 cron 重判，最多 3 次。
+		await enqueueAdPendingDetection(env, 'body', { bodyText, input }, 'body_judge_error');
 	}
 }
 
@@ -37393,7 +37593,8 @@ const AD_AVATAR_OCR_PROMPT = '这是一张 Telegram 用户头像。只输出一�
 // 「主页赚钱」这类文字命中再次失效 —— 与 150 那次是同一个根因：闸门按张数算，
 // 不看当天实际新头像量。主人是 Workers Paid，2,000 张 × 约 4 Neurons ≈ 8,000 Neurons
 // ≈ $0.088/天，是计费不是报错。保留上限的唯一目的仍然是给账单设硬顶，不是保可用性。
-const AD_AVATAR_VISION_DAILY = 2000;
+// 2026-11-25 硬编码 2000 → 20000，环境变量已删除。
+const AD_AVATAR_VISION_DAILY = 20000;
 const AD_AVATAR_VISION_PROMPT = '这是一张社交软件的用户头像图片。判断它是否属于广告用途：'
 	+ '图里若有引流文字（赚钱、代理、代购、招租、微信号、二维码、"看主页/看简介"）、'
 	+ '明显商品推销、联系方式、赌博或灰产图案，即为广告。自拍、风景、宠物、家人、'
@@ -37433,7 +37634,8 @@ const AD_AVATAR_VISION_PROMPT = '这是一张社交软件的用户头像图片�
 // 【2026-11-15 同批再提：800 → 2000】800 同样在高峰日打满，之后新出现的正文图
 // 一张都不判（与头像同一天发生的漏放，根因同一条）。2,000 张 × 3.503 = 7,006 Neurons
 // ≈ $0.077/天，付费层仍是计费不是报错；上限保留只是为了账单有硬顶。
-const AD_IMAGE_VISION_DAILY = 2000;
+// 2026-11-25 硬编码 2000 → 20000，环境变量已删除。
+const AD_IMAGE_VISION_DAILY = 20000;
 
 // ===== 视觉识别失败熔断（2026-10-11，与第⑥层的 AD_LLM_FAIL_BREAK 同一套机制）=====
 //
@@ -38853,7 +39055,7 @@ async function runAdImageVision(env, options = {}) {
 // 【退回旧行为的四道闸】任一闸拦下都【原样返回登记行】，与实时化之前的线上
 // 行为完全一致 —— 这条链路只会更准，不可能更差：
 //   · 没绑 AI / 没绑 DB → 返回 null，判定链原样走；
-//   · 每日上限 AD_IMAGE_VISION_DAILY（默认 300）跑满 → 退回只命中已知图；
+//   · 每日上限 AD_IMAGE_VISION_DAILY（默认 20000）跑满 → 退回只命中已知图；
 //   · 连续失败 AD_VISION_FAIL_BREAK 次熔断 → 当天不再调用；
 //   · 超 AD_VISION_MAX_IMAGE_BYTES 或不是位图（.tgs / .webm 容器）→ 跳过。
 // 429 限流既不推熔断也不落库，与 cron 轨同一口径。
@@ -39692,6 +39894,26 @@ async function pruneAdAutomaticCaseTargets(env, nowSeconds = Math.floor(Date.now
 
 // 扫描状态键：image_content_v* / dynamic_content_v1 / join_mute_restore 等
 // 都是一次性判定结果，60 天后没有价值。线上 4843 行 / 9 MB。
+// 【2026-11-25 防卡死】超时现场队列：cron 每分钟重放，不让现场无限积压。
+// 终态保留 3 天供复查；pending 超过 2 小时且试满 3 次的直接收口，
+// 否则一条坏现场会每分钟被扫到、永远排在最前，把新现场挤到后面。
+async function pruneAdPendingDetections(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return { removed: 0 };
+	if (!(await ensureAdPendingDetectionTable(env))) return { removed: 0 };
+	const now = Number(nowSeconds) || 0;
+	const stale = await env.DB.prepare("UPDATE ad_pending_detections SET state='dropped' WHERE state='pending' AND attempts>=? AND created_at < ?")
+		.bind(AD_RESUME_DETECT_MAX_ATTEMPTS, now - 2 * 3600).run();
+	let removed = Number(stale?.meta?.changes || 0);
+	for (let i = 0; i < 4; i++) {
+		const res = await env.DB.prepare("DELETE FROM ad_pending_detections WHERE rowid IN (SELECT rowid FROM ad_pending_detections WHERE state IN ('done','dropped') AND created_at < ? ORDER BY created_at ASC LIMIT 500)")
+			.bind(now - 3 * 86400).run();
+		const n = Number(res?.meta?.changes || 0);
+		removed += n;
+		if (n < 500) break;
+	}
+	return { removed };
+}
+
 async function pruneAdScanState(env, nowSeconds = Math.floor(Date.now() / 1000)) {
 	if (!env?.DB) return { removed: 0 };
 	const now = Number(nowSeconds) || 0;
@@ -39900,6 +40122,14 @@ async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 10
 		if (pruned.removed > 0) console.log('[演练报告] 已清理历史分片 ' + pruned.removed + ' 条');
 	} catch (error) {
 		console.error('[演练报告] 历史分片清理失败：' + formatD1SchemaError(error));
+	}
+	// 【2026-11-25】超时现场队列剪枝：不剪的话，每条超时消息一行 payload 全量 JSON，
+	// 广告高峰一天能进上千条，很快就会变成第二个积压源。
+	try {
+		const pruned = await pruneAdPendingDetections(env, nowSeconds);
+		if (pruned.removed > 0) console.log('[补判队列] 已清理终态现场 ' + pruned.removed + ' 条');
+	} catch (error) {
+		console.error('[补判队列] 清理失败：' + formatD1SchemaError(error));
 	}
 	// 【2026-11-25】退群残留兜底：探测到 not_in_group 写入的黑名单记录不留，每次剪枝顺手扫一遍。
 	try {
@@ -40347,7 +40577,7 @@ const AD_REVIEW_SAMETEXT_MIN_LEN = 12;
 // 抽送比例：1/32。
 // 【为什么是 1/32 而不是「每条都送」】每条都送的额度需求是几千次/天，而本项目的
 // 优化目标是 Workers 免费版（每日 10,000 Neurons，实测约 18 Neurons/次 → 约 550 次
-// 全部功能共用）。1/32 配 AD_LLM_DAILY_SAMPLE(60) 的保底，每天覆盖约 1,920 条
+// 全部功能共用）。1/32 配 AD_LLM_DAILY_SAMPLE(500) 的保底，每天覆盖约 16,000 条
 // 纯文字发言，够把「词表与形态判据全看不见」的那类广告摸出样本来。
 // 【为什么不更稀】比 1/64 更稀时，一个低频发言的广告号可能几天都抽不到一次，
 // 这条探索路径就等于没有。
@@ -43352,8 +43582,20 @@ async function screenAdJoinMember(env, member, options = {}) {
     const inspection=adProfileInspectionMessage(member,chatId,options.chatTitle||'');
     if(options.source==='join_request')inspection.adJoinRequest=options.joinRequest||{date:0};
     if(joined){inspection.adJoinApproved=true;inspection.date=Number(options.joinDate)||0;inspection.adJoinApprover=options.joinApprover;}
-    const result=await collectGlobalDryRunEvaluation(env,inspection,null,{source:options.source||'join',normalDetection:!drill,scopeChatId:chatId,
+    // 【2026-11-25 防卡死】入群链单独预算：资料 + 头像 + 图片 + 模型串起来经常 15 秒以上，
+    // 吃满 25 秒总闸就会把整个 webhook 拖住。超时后底层继续跑（挂 waitUntil），
+    // 现场入队交给每分钟 cron 重判 —— 入群路径的「不卡死」和「不漏」同时保证。
+    const joinCollect=collectGlobalDryRunEvaluation(env,inspection,null,{source:options.source||'join',normalDetection:!drill,scopeChatId:chatId,
       refreshProfile:true,config:options.config,whitelist:options.whitelist,reviewPool:'join',forceReview:true});
+    if(options.ctx&&typeof options.ctx.waitUntil==='function')options.ctx.waitUntil(Promise.resolve(joinCollect).catch(()=>{}));
+    const result=await raceWithTimeout(joinCollect,AD_JOIN_DETECT_BUDGET_MS,null);
+    if(!result){
+      await enqueueAdPendingDetection(env,'join',{chatId:String(chatId||''),chatTitle:options.chatTitle||'',
+        messageId:options.messageId||0,source:options.source||'join',joinDate:Number(options.joinDate)||0,
+        joinApprover:options.joinApprover||null,joinRequest:options.joinRequest||null,
+        member:{id:member.id,first_name:member.first_name||'',last_name:member.last_name||'',username:member.username||'',is_bot:member.is_bot===true}},'join_budget');
+      return 'pending';
+    }
     const evaluation=result.evaluation,pending=isAdDrillPendingEvaluation(evaluation,result.llmMemo);
     const recordCheck=async()=>{
       // 入群事件不算一次发言：只登记资料与首见时间，msg_count 不加。
@@ -47626,9 +47868,9 @@ async function answerAdJoinRequestQuery(queryId, result) {
 	} catch (error) { return {ok:false,decision:result,error:String(error?.message||error)}; }
 }
 
-async function handleChatJoinRequest(req, env) {
+async function handleChatJoinRequest(req, env, ctx) {
 	const queryId = String(req?.query_id || '');
-	if (!queryId) return processChatJoinRequest(req, env);
+	if (!queryId) return processChatJoinRequest(req, env, ctx);
 	// Telegram 指定 guard_bot 后才提供 query_id，必须在 10 秒内回答。
 	// 正常或尚未判定的申请交回原审批流程，绝不自动批准；筛查继续，命中后走拒绝接口。
 	let reply;
@@ -47636,7 +47878,7 @@ async function handleChatJoinRequest(req, env) {
 	return AD_JOIN_QUERY_CONTEXT.run(query, async () => {
 		const remaining = Number(req.date)>0 ? Number(req.date)*1000+9000-Date.now() : 8000;
 		const timer = setTimeout(() => { query.answer('queue'); }, Math.max(0,Math.min(8000,remaining)));
-		try { return await processChatJoinRequest(req, env); }
+		try { return await processChatJoinRequest(req, env, ctx); }
 		finally {
 			clearTimeout(timer);
 			const receipt = await query.answer('queue');
@@ -47645,7 +47887,7 @@ async function handleChatJoinRequest(req, env) {
 	});
 }
 
-async function processChatJoinRequest(req, env) {
+async function processChatJoinRequest(req, env, ctx) {
 	const chat = req?.chat;
 	const user = req?.from || req?.user;
 	const chatId = String(chat?.id || '');
@@ -47681,7 +47923,7 @@ async function processChatJoinRequest(req, env) {
 
 	// 先筛查处置，再记时间线；记录失败不能拖延或吞掉拒绝，筛查失败仍保留申请事件。
 	try {
-		await screenJoinRequestAd(env, user, chatId, String(chat?.title || ''), req);
+		await screenJoinRequestAd(env, user, chatId, String(chat?.title || ''), req, ctx);
 	} catch (error) {
 		console.error('[申请筛查] 异常:', error);
 		// 未能完成或保存后台任务时让 Webhook 返回失败，由 Telegram 重新投递。
@@ -47698,7 +47940,7 @@ async function processChatJoinRequest(req, env) {
 // 进群时又封」。评分 / 指纹 / 头像 / 会员标 / LLM 均复用同一判据。
 //
 // 官方申请用户在 chat_join_request.from，简介和申请时间另行保留供后台续查。
-async function screenJoinRequestAd(env, user, chatId, chatTitle, request = {}) {
+async function screenJoinRequestAd(env, user, chatId, chatTitle, request = {}, ctx) {
 	const userId = String(user?.id || '');
 	if (!userId || user?.is_bot || !await isAdJoinGuardGroupCurrent(env, chatId)) return;
 	if (!env?.DB) throw new Error('入群申请筛查数据库不可用，等待重投');
@@ -47780,7 +48022,8 @@ async function screenJoinRequestAd(env, user, chatId, chatTitle, request = {}) {
 		skipBlacklistCheck: true,	// 已由上面的群级/全局名单拦截完成查询
 		noBioLock: true,			// 被拒后等三天再申请就绕过去了，不能套这把锁
 		source: 'join_request',
-		joinRequest
+		joinRequest,
+		ctx
 	});
 	if (verdict !== 'banned') return;
 	if (await isDryRunGroup(env, chatId)) return;
