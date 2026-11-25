@@ -25256,6 +25256,22 @@ const AD_BUSINESS_KEYWORDS = [
 	'微信码', '支付宝码', '码来', '带码', '有码',
 ];
 
+// 【2026-11-25 资料卡个人频道广告位】实物 / 数码批发类词。
+// 只用来打「资料卡挂载的频道 / 群标题」，不进 AD_BUSINESS_KEYWORDS：
+// 「手机」在代理群里是日常词（手机端 / 手机上装），塞进通用表会把正文评分打成误伤。
+// 这批词的共同点是【零售批发语境】：正常技术频道不会把「未拆封」「一手货源」写进名字。
+const AD_GOODS_SLOT_KEYWORDS = [
+	'未拆封', '未激活', '全新未激活', '免税', '正品', '现货', '批发', '货源',
+	'一手货源', '国行', '港版', '美版', '苹果手机', '数码批发', '一件代发',
+	'代购', '水货', '低价出', '净搞',
+];
+
+// 批量马甲频道：广告号批量创建频道挂在资料卡上，用户名几乎全是 jq_ + 10 位十六进制。
+// 线上三个同标题频道（jq_ae78f36066 / jq_f9db64e7d9 / jq_d49a2ba178）全部命中，
+// 标题、正文、1 位订阅者完全一致，只有 hash 不同。这个格式正常用户几乎不会主动起，
+// 误伤面极窄；单独命中只给辅助分，定罪分仍在标题与资料组合上。
+const AD_BURNER_CHANNEL_HANDLE_RE = /^jq_[0-9a-f]{10}$/i;
+
 // 豁免词：命中且无交易动词时整体减分，保护正常用户。
 // 典型误伤场景：资料卡写「双向机器人」「开源项目」的技术用户。
 //
@@ -27980,6 +27996,9 @@ async function inspectAdLinkContent(env, link) {
 	if (hasAdPrivateInviteLink(body)) found.push('私有邀请链接');
 	const businessHits = countAdKeywordHits(source, AD_BUSINESS_KEYWORDS);
 	if (businessHits.length) found.push('行业词 ' + businessHits.slice(0, 3).join('/'));
+	// 【2026-11-25】实物批发类标题同样是被挂号自己写的门面，与行业词同层记录。
+	const goodsHits = countAdKeywordHits(source, AD_GOODS_SLOT_KEYWORDS);
+	if (goodsHits.length >= 2) found.push('实物批发词 ' + goodsHits.slice(0, 3).join('/'));
 	if (AD_EXEMPT_CANCEL_RE.test(source)) found.push('招揽话术');
 	if (found.length) return found;
 	try {
@@ -28060,6 +28079,11 @@ function isAdProfileElevated(profile, options = {}) {
 	const textScore = options.text
 		? scoreAdMessageText(String(options.text), { whitelist: options.whitelist })
 		: { reasons: [] };
+	// 【2026-11-25 极短正文 + 资料卡挂载】投放脚本的典型形态：正文只发 dd / vvv
+	// 占位，广告位全在资料卡挂的频道上。资料卡本身干净（-1 分），旧门槛据此判「低档」
+	// 根本不解析挂载，从源头漏掉 —— 线上 9203655154 的正文就是「dd」。
+	// 只放行这一次 getChat：查出来是正常频道照样 0 分，不产生任何可定罪的分数。
+	if (isAdMinimalText(String(options.text || '')) && extractAdProfileHandles(profile).length) return true;
 	return profileScore.reasons.some((line) => AD_REASON_POSITIVE_RE.test(line))
 		|| textScore.reasons.some((line) => AD_REASON_POSITIVE_RE.test(line));
 }
@@ -28124,10 +28148,31 @@ function scoreAdProfileLinks(links) {
 			add(2, '挂的 @' + handle + '（' + kind + '「' + title.slice(0, 30) + '」）简介含招揽话术');
 			scoredHandles.push(handle);
 		}
+		// ②c 被挂频道 / 群【标题本身】就是广告位命名（2026-11-25）。
+		// 【补的是哪个洞】线上 9203655154 / 9061978996 把自家频道设为 Telegram
+		// 个人频道挂在资料卡上，标题「🍎苹果手机未拆封未激活🍎」，bio / 用户名全空；
+		// ② 要 about、②b 要 adContent，两处都读不到标题，结果 -1 分 pass。
+		// 攻击者自己写的门面就在标题上，判据必须读它。
+		// 【为什么要求 >= 2 个批发词】单个「正品」「免税」在正常频道名里可能出现，
+		// 两个以上同现基本只存在于实物批发广告位。对称 emoji 是加强项，不单独计分。
+		const goodsHits = isAdSlot && !confirmed ? countAdKeywordHits(title, AD_GOODS_SLOT_KEYWORDS) : [];
+		const goodsSlot = goodsHits.length >= 2;
+		if (goodsSlot) {
+			const symmetric = AD_SYMMETRIC_EMOJI_RE.test(title);
+			add(symmetric ? 8 : 5, '挂的 @' + handle + '（' + kind + '「' + title.slice(0, 30) + '」）标题是实物批发广告位'
+				+ (symmetric ? '，且首尾对称 emoji' : '') + '：' + goodsHits.slice(0, 3).join('/'));
+			scoredHandles.push(handle);
+		}
+		// ②d 批量马甲频道用户名（jq_ + 10 位十六进制）。上面三个频道全是这个格式，
+		// 与标题判据独立：广告号换标题也改不掉这个用户名特征。
+		if (isAdSlot && !confirmed && !goodsSlot && AD_BURNER_CHANNEL_HANDLE_RE.test(handle)) {
+			add(4, '挂的 @' + handle + ' 是批量马甲频道用户名（jq_ + 十六进制）');
+			scoredHandles.push(handle);
+		}
 		// ②b 被挂号的标题 / 简介本身就是广告（inspectAdLinkContent 的四项任一命中）。
 		//    与 ② 互斥：② 已经给过 +2 的同一条简介不再算第二遍；已确认案底的只给 +3。
 		const adContent = Array.isArray(link.adContent) ? link.adContent : [];
-		if (isAdSlot && !confirmed && !aboutSolicit && adContent.length) {
+		if (isAdSlot && !confirmed && !aboutSolicit && !goodsSlot && adContent.length) {
 			add(2, '挂的 @' + handle + '（' + kind + '「' + title.slice(0, 30) + '」）内容是广告：'
 				+ adContent.slice(0, 3).join('、'));
 			scoredHandles.push(handle);
