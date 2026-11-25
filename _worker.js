@@ -592,6 +592,28 @@ export default {
 	}),
 
 	queue: withRuntime(async function queue(batch, env, ctx) {
+		// 【2026-11-25 队列泄洪】盒子满了就得往外倒。
+		// 积压不能只靠「消费得快」解决：消费者跟不上时旧消息会一直占着 backlog，
+		// 新任务排在后面永远轮不到（实测：D1 里 pending=0，队列还挂着 age=120s 的消息）。
+		// 这几类自动任务在 D1 里都有 next_at，cron 每 10 分钟全量重扫 —— 丢消息不丢任务。
+		// 批量封禁/解封走 id/jobId 分支，不在白名单里，主人手动触发的活不丢。
+		const QUEUE_AUTO_RECOVERABLE_TYPES = new Set(['ad_join_notice','ad_content_review','drill_close','drill_capture','drill_learn','drill_report','ad_review_batch_start','ad_review_batch_lane','ad_review_batch_report']);
+		const QUEUE_STALE_DROP_SECONDS = 300;
+		const queueMessageAgeSeconds = function (message) {
+			try {
+				const raw = message && message.timestamp;
+				const ts = raw instanceof Date ? raw.getTime() : new Date(raw || 0).getTime();
+				if (!Number.isFinite(ts) || ts <= 0) return 0;
+				return Math.max(0, Math.round((Date.now() - ts) / 1000));
+			} catch (_) { return 0; }
+		};
+		const shouldDropStaleQueueMessage = function (body, message) {
+			if (!QUEUE_AUTO_RECOVERABLE_TYPES.has(String((body && body.type) || ''))) return false;
+			const age = queueMessageAgeSeconds(message);
+			const attempts = Number((message && message.attempts) || 0);
+			// 超龄 5 分钟，或同一条已被投递超过 3 次（本身卡住了）→ 丢弃。
+			return age > QUEUE_STALE_DROP_SECONDS || attempts > 3;
+		};
 		try {
 			applyRuntimeConfig(loadRequiredConfig(env));
 		} catch (error) {
@@ -603,8 +625,23 @@ export default {
 		// 任务回执显示成功，但那些群实际没有执行封禁。
 		await prepareGovernanceScope(env);
 
+		let droppedStale = 0;
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
+				if (shouldDropStaleQueueMessage(body, message)) {
+				droppedStale += 1;
+				// 丢弃后必须把 D1 的 next_at 推后，否则 cron 下一轮（10 分钟内）立刻重排，
+				// 又入队、又超龄、又丢弃 —— 空转。推后 5 分钟，让慢下来的消费者先喘口气。
+				if (body.type === 'ad_content_review' && body.reviewId) {
+					const nowSec = Math.floor(Date.now() / 1000);
+					try {
+						await env.DB.prepare("UPDATE ad_content_reviews SET next_at=?,updated_at=? WHERE id=? AND decision='' AND status IN ('pending','waiting','processing','normal_intent','action_failed','learning_pending','learning_failed')").bind(nowSec + QUEUE_STALE_DROP_SECONDS, nowSec, String(body.reviewId)).run();
+					} catch (error) {
+						console.warn('[队列泄洪] 推后 next_at 失败: ' + formatD1SchemaError(error));
+					}
+				}
+				continue;
+			}
 			if (body.type === 'ad_join_notice') {
 				// 【2026-11-25 终态收口】不再 message.retry。延迟重投期间消息仍占着 backlog，
 				// oldest_message_timestamp_ms 会累计原始入队时间，面板上就是积压（实测 419s/152s/120s）。
@@ -649,6 +686,7 @@ export default {
 			}
 			await consumeBulkModerationMessage(message, env, jobId);
 		}
+		if (droppedStale > 0) console.warn('[队列泄洪] 本批丢弃 ' + droppedStale + ' 条超龄自动任务，D1 的 next_at 会让 cron 重排');
 	}),
 
 	// Cron 入口（闸三）。触发器在 wrangler.toml 的 [triggers] crons 里配置。
