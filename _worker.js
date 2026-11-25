@@ -28211,17 +28211,26 @@ async function readAdLinkCache(env, handle) {
 	if (!env?.DB || !key) return null;
 	if (!(await ensureAdLinkCacheTable(env))) return null;
 	try {
+		// 【2026-11-25】案底不受 TTL 约束。ad_confirmed 的语义是「这个 handle 被我方判过
+		// 是广告位」—— 注释和 clearAdLinkConfirmedOnIgnore（/ignore 撤销）都按永久案底设计，
+		// 但原查询把 fetched_at 一起卡进 6 小时 TTL，过期后重新解析时案底直接读不到，
+		// 换个号挂同款频道就能洗白。现在：内容按 TTL 判新鲜度（stale），案底永久返回。
 		const row = await env.DB.prepare(
-			'SELECT handle, kind, title, about, ad_known, ad_confirmed, fetched_at FROM ad_link_cache WHERE handle = ? AND fetched_at > ?'
-		).bind(key, Math.floor(Date.now() / 1000) - AD_LINK_TTL_SECONDS).first();
+			'SELECT handle, kind, title, about, ad_known, ad_confirmed, fetched_at FROM ad_link_cache WHERE handle = ?'
+		).bind(key).first();
 		if (!row) return null;
+		const adConfirmed = Number(row.ad_confirmed) === 1;
+		const fresh = Number(row.fetched_at || 0) > Math.floor(Date.now() / 1000) - AD_LINK_TTL_SECONDS;
+		// 过期且没有案底 = 纯过期缓存，交回调用方重新抓取。
+		if (!fresh && !adConfirmed) return null;
 		return {
 			handle: String(row.handle || key),
 			kind: String(row.kind || 'unknown'),
 			title: String(row.title || ''),
 			about: String(row.about || ''),
 			adKnown: Number(row.ad_known) === 1,
-			adConfirmed: Number(row.ad_confirmed) === 1
+			adConfirmed,
+			stale: !fresh
 		};
 	} catch (error) {
 		// 缓存读不到只意味着这次要真查一次，不能因此把整条解析链判死。
@@ -28351,7 +28360,9 @@ async function resolveAdLink(env, handle, options = {}) {
 	const key = String(handle || '').toLowerCase();
 	if (!key || !runtime().BOT_TOKEN) return null;
 	const cached = await readAdLinkCache(env, key);
-	if (cached && !options.forceRefresh) return cached;
+	// stale 表示内容过期但带着永久案底：不能直接当缓存用，必须重新抓一次标题简介，
+	// 案底通过下面的 info.adConfirmed 继续生效。
+	if (cached && !cached.stale && !options.forceRefresh) return cached;
 	if (!options.forceRefresh && adLinkTransientBlocked(key)) {
 		return { handle: key, kind: 'unknown', title: '', about: '', adKnown: false,
 			adConfirmed: cached?.adConfirmed === true, lookupFailed: true, lookupTransient: true };
@@ -39897,6 +39908,19 @@ async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 10
 	} catch (error) {
 		console.error('[退群残留] 兜底清理失败：' + formatD1SchemaError(error));
 	}
+	// 【2026-11-25】链接缓存只留案底，AI 候选池只留未转正 + 30 天回查窗。
+	try {
+		const linkPruned = await pruneAdLinkCache(env, nowSeconds);
+		if (linkPruned.removed > 0) console.log('[链接缓存] 已清理过期抓取 ' + linkPruned.removed + ' 条');
+	} catch (error) {
+		console.error('[链接缓存] 过期清理失败：' + formatD1SchemaError(error));
+	}
+	try {
+		const candPruned = await pruneAdLLMCandidates(env, nowSeconds);
+		if (candPruned.removed > 0) console.log('[AI候选] 已清理转正副本 ' + candPruned.removed + ' 条');
+	} catch (error) {
+		console.error('[AI候选] 已转正记录清理失败：' + formatD1SchemaError(error));
+	}
 }
 
 
@@ -39928,6 +39952,57 @@ async function pruneAdLeftGroupBlacklist(env, nowSeconds = Math.floor(Date.now()
 		}
 	} catch (error) {
 		console.error('[退群残留] 批量清理失败：' + formatD1SchemaError(error));
+	}
+	return { removed };
+}
+
+// 【2026-11-25 主人质疑】链接缓存与 AI 候选池的只增问题。
+// ad_link_cache 不是「抓到的广告」，是 getChat 抓频道/群标题简介的缓存，TTL 6 小时。
+// 过期行 readAdLinkCache 一律不返回，等于死数据；唯一要留的是 ad_confirmed=1 的案底
+// （这个 handle 被我方判过是广告位，/ignore 才能撤销）。
+// 所以按 7 天窗删——6 小时就已经失效的东西，多留几天只为避免频繁写 D1。
+async function pruneAdLinkCache(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return { removed: 0 };
+	const now = Number(nowSeconds) || Math.floor(Date.now() / 1000);
+	let removed = 0;
+	try {
+		for (let pass = 0; pass < 10; pass++) {
+			const res = await env.DB.prepare(
+				'DELETE FROM ad_link_cache WHERE rowid IN ('
+				+ 'SELECT rowid FROM ad_link_cache WHERE fetched_at < ? AND ad_confirmed = 0 LIMIT 500)'
+			).bind(now - 7 * 86400).run();
+			const n = Number(res?.meta?.changes || 0);
+			removed += n;
+			if (!n) break;
+		}
+	} catch (error) {
+		console.error('[链接缓存] 过期清理失败：' + formatD1SchemaError(error));
+	}
+	return { removed };
+}
+
+// ad_llm_candidates 是「AI 第⑥层给出的特征候选池」。转正（promoted=1）意味着
+// 已经 INSERT 进 ad_fingerprints，候选池这份就是冗余副本，留 30 天只为回查。
+// promoted=0 的不删：它们还没进指纹库，hits 记录的是「这个特征被 AI 重复给出几次」，
+// 删了下次遇到就从 1 重新数，等于丢学习进度。
+// EXISTS 是保险：指纹被 /ignore 删掉的候选即使已标 promoted 也保留。
+async function pruneAdLLMCandidates(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return { removed: 0 };
+	const now = Number(nowSeconds) || Math.floor(Date.now() / 1000);
+	let removed = 0;
+	try {
+		for (let pass = 0; pass < 10; pass++) {
+			const res = await env.DB.prepare(
+				'DELETE FROM ad_llm_candidates WHERE rowid IN ('
+				+ 'SELECT c.rowid FROM ad_llm_candidates c WHERE c.promoted = 1 AND c.updated_at < ? '
+				+ 'AND EXISTS(SELECT 1 FROM ad_fingerprints f WHERE f.fingerprint = c.fingerprint) LIMIT 500)'
+			).bind(now - 30 * 86400).run();
+			const n = Number(res?.meta?.changes || 0);
+			removed += n;
+			if (!n) break;
+		}
+	} catch (error) {
+		console.error('[AI候选] 已转正记录清理失败：' + formatD1SchemaError(error));
 	}
 	return { removed };
 }
