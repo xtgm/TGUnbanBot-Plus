@@ -3680,7 +3680,9 @@ async function handleInitialization(request, env) {
 		const response = await fetch(setWebhookUrl, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(setWebhookBody)
+			body: JSON.stringify(setWebhookBody),
+			// 15 秒还没回就当失败返回，别把整个初始化请求拖死。
+			signal: telegramTimeoutSignal(15000)
 		});
 
 		if (!response.ok) {
@@ -3719,7 +3721,12 @@ async function handleInitialization(request, env) {
 		// 失败只写日志、不影响初始化结果：同步是附带动作，不该把 webhook / 菜单设置拖下水。
 		let adminSync = { groups: 0, admins: 0, failed: 0, orphans: 0, baseline: false };
 		try {
-			adminSync = await syncAdGroupAdmins(env);
+			// 【2026-11-25】同步是附带动作，最多等 20 秒。此前无上限：adDetectionReady
+			// 冷启动要串行跑几十条 DDL，再并发拉全部配置群的管理员，D1 一忙就把初始化
+			// 地址拖到超时。超时后后台仍会继续跑，只是不再让初始化等它。
+			adminSync = await raceWithTimeout(syncAdGroupAdmins(env), 20000, {
+				groups: 0, admins: 0, failed: 0, orphans: 0, baseline: false, timeout: true
+			});
 		} catch (error) {
 			console.error('[初始化] 配置群管理员同步失败:', error);
 			adminSync = { error: error?.message || '同步异常' };
@@ -3728,7 +3735,8 @@ async function handleInitialization(request, env) {
 		const commandsResponse = await fetch(setCommandsUrl, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(setCommandsBody)
+			body: JSON.stringify(setCommandsBody),
+			signal: telegramTimeoutSignal(15000)
 		});
 
 		if (commandsResponse.ok) {
@@ -5561,7 +5569,19 @@ function translateTelegramError(description, options = {}) {
 		return { 中文: '网络请求超时或中断', 建议: '稍后重试' };
 	}
 	if (lower.includes('d1_') || lower.includes('sqlite') || lower.includes('no such table') || lower.includes('database')) {
-		return { 中文: 'D1 数据库操作失败', 建议: '稍后重试；持续失败请检查 D1 绑定与 Worker 日志' };
+		// 【2026-11-25】旧版一律回「D1 数据库操作失败」，线上根本分不清是过载还是要迁移。
+		// 主人 2026-11-24 连着两条 /sban 学习回执都只看到这一句，等于没信息。这里按原文归类：
+		// 过载 / 平台抖动 = 重试即可；no such table/column = 结构没迁到位，必须处理。
+		const d1Kind = (lower.includes('too much load') || lower.includes('overloaded')) ? '过载（too much load）'
+			: lower.includes('internal error') ? '平台内部抖动（internal error）'
+			: (lower.includes('no such table') || lower.includes('no such column')) ? '结构缺失（no such table/column）'
+			: (lower.includes('locked') || lower.includes('busy')) ? '写锁冲突（busy/locked）'
+			: (lower.includes('timeout') || lower.includes('timed out')) ? '查询超时'
+			: '';
+		return {
+			中文: 'D1 数据库操作失败' + (d1Kind ? '：' + d1Kind : ''),
+			建议: d1Kind.includes('结构') ? '执行一次初始化或检查 D1 表结构' : '稍后重试；持续失败请检查 D1 绑定与 Worker 日志'
+		};
 	}
 	if (lower.includes('unexpected token') || lower.includes('json')) {
 		return { 中文: '返回数据格式异常', 建议: '稍后重试' };
@@ -9523,6 +9543,19 @@ function raceWithTimeout(promise, ms, fallback) {
 	});
 }
 
+// 【2026-11-25】给初始化阶段的 Telegram 调用兜一层超时信号。
+// 旧行为：setWebhook / setMyCommands 的 fetch 完全没有超时，Telegram 一慢，
+// 整个初始化请求就挂住不动（主人点一次卡几分钟），与它无关的 webhook 推送也被
+// isolate 抢占。返回 undefined 时行为与旧版完全一致，不会影响不支持 AbortSignal 的环境。
+function telegramTimeoutSignal(ms) {
+	try {
+		return (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+			? AbortSignal.timeout(ms) : undefined;
+	} catch (_) {
+		return undefined;
+	}
+}
+
 async function mapWithConcurrency(items, concurrency, worker) {
 	const results = new Array(items.length);
 	let nextIndex = 0;
@@ -12688,7 +12721,7 @@ async function enforceLocalAdDetection(env, input, evaluation, options, ctx) {
 	if (ownerId) {
 		const notice = renderAdDetectionNotice(evaluation, {
 			userId,
-			chatTitle: input?.chatTitle || '',
+			chatTitle: await resolveAdNoticeChatTitle(env, chatId, input, evaluation),
 			seq: null,
 			banResultLine,
 			failedGroupLines,
@@ -12753,7 +12786,7 @@ async function enforceKillerAdDetection(env, input, evaluation, options, ctx) {
 	if (ownerId) {
 		const notice = renderAdDetectionNotice(evaluation, {
 			userId,
-			chatTitle: input?.chatTitle || '',
+			chatTitle: await resolveAdNoticeChatTitle(env, chatId, input, evaluation),
 			seq: null,
 			banResultLine,
 			failedGroupLines,
@@ -25707,6 +25740,14 @@ const AD_FINGERPRINT_SEED = [
 	// 具体引流账号的召回让位于误封治理，这是主人定的口径。
 ];
 
+// 【2026-11-25】广告检测结构版本。
+// ensureAdDetectionTables 此前没有任何门控：每个 isolate 冷启动都要串行跑 37 条
+// CREATE TABLE / CREATE INDEX / PRAGMA 探测，再加种子阶段 4 次 COUNT —— 40 多次
+// D1 往返压在同一个请求里。D1 一忙（too much load / internal error）整段就拖住：
+// 初始化地址卡死、/sban 学习报「D1 数据库操作失败」和「域名白名单暂不可用」，
+// 都是这条路径先崩。改成「版本一致 + 核心表存在 → 直接返回」，稳态 2 次读。
+// 改任何 ad_* 表结构或种子逻辑时必须把 AD_SCHEMA_VERSION +1，否则老库不会迁移。
+const AD_SCHEMA_VERSION = 3;
 // 运行期缓存（按 env.DB 弱引用，isolate 复用时自动隔离不同库）
 const D1_AD_DETECTION_INIT_PROMISES = new WeakMap();
 const D1_AD_DETECTION_RETRY_AT = new WeakMap();
@@ -25815,6 +25856,22 @@ async function d1AdDetectionTablesExist(env) {
 // 建立广告检测的 14 张 D1 表（完整性复验另列 13 张，ad_spam_texts 按需建、不参与复验）。范式与 ensureAdVoteTables 一致：
 // promise 去重 → 核心表先行 → 逐条建表/建索引 → 存在性复验 → 失败删缓存并冷却 60 秒。
 // 冷却是为了避免 D1 抖动时每条消息都重试一次迁移，把子请求预算耗光。
+// 读广告检测结构版本。表不存在或 D1 抖动一律当 0 —— 0 只会让下面的完整迁移再跑一遍，
+// 不会把「结构不完整」误判成「已就绪」。
+async function readAdSchemaVersion(env) {
+	try {
+		const row = await env.DB.prepare('SELECT version FROM ad_schema_meta WHERE id = 1').first();
+		return Number(row?.version || 0);
+	} catch (_) {
+		return 0;
+	}
+}
+
+async function writeAdSchemaVersion(env, version) {
+	await env.DB.prepare('INSERT OR REPLACE INTO ad_schema_meta (id, version, updated_at) VALUES (1, ?, ?)')
+		.bind(version, new Date().toISOString()).run();
+}
+
 async function ensureAdDetectionTables(env) {
 	if (!env.DB) return false;
 	const cached = D1_AD_DETECTION_INIT_PROMISES.get(env.DB);
@@ -25824,6 +25881,14 @@ async function ensureAdDetectionTables(env) {
 	const initPromise = (async () => {
 		try {
 			if (!(await ensureD1Table(env))) throw new Error('D1 核心结构不可用');
+			// 稳态短路：版本对上 + 三张跨层核心表都在 → 跳过下面整套 DDL 与种子。
+			// 只花 2 次读（版本 + sqlite_master），替代 40 多次往返。
+			// 任何一次读失败都走完整迁移兜底，不会把坏结构当成就绪。
+			if (await readAdSchemaVersion(env) >= AD_SCHEMA_VERSION) {
+				const probe = await env.DB.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name IN ('ad_fingerprints','ad_domain_whitelist','ad_images')").first();
+				if (Number(probe?.n || 0) >= 3) return true;
+			}
+			await runD1SchemaStatement(env, 'ad_schema_meta', 'CREATE TABLE IF NOT EXISTS ad_schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, updated_at TEXT)');
 			await runD1SchemaStatement(env, 'ad_fingerprints', 'CREATE TABLE IF NOT EXISTS ad_fingerprints (id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT NOT NULL UNIQUE, type TEXT NOT NULL, value TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, match_count INTEGER NOT NULL DEFAULT 0, false_positive_count INTEGER NOT NULL DEFAULT 0, confidence REAL NOT NULL DEFAULT 1, source TEXT, created_by TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_fingerprints_type', 'CREATE INDEX IF NOT EXISTS idx_ad_fingerprints_type ON ad_fingerprints (type)', { optional: true });
 			await runD1SchemaStatement(env, 'idx_ad_fingerprints_value', 'CREATE INDEX IF NOT EXISTS idx_ad_fingerprints_value ON ad_fingerprints (value)', { optional: true });
@@ -26024,6 +26089,12 @@ async function ensureAdDetectionTables(env) {
 
 			if (!(await d1AdDetectionTablesExist(env))) throw new Error('D1 广告检测表迁移不完整');
 			await seedAdDetectionData(env);
+			// 版本最后写：迁移或种子中途抛错时版本不前进，下次冷启动仍会完整重跑。
+			try {
+				await writeAdSchemaVersion(env, AD_SCHEMA_VERSION);
+			} catch (error) {
+				console.warn('ad_schema_meta 版本写入失败: ' + formatD1SchemaError(error));
+			}
 			return true;
 		} catch (error) {
 			console.error('D1 广告检测表初始化失败: ' + formatD1SchemaError(error));
@@ -26241,8 +26312,13 @@ async function loadAdDomainWhitelist(env) {
 		});
 		return value instanceof Set ? value : fallback();
 	} catch (error) {
-		console.error('[广告检测] 读取域名白名单失败: ' + formatD1SchemaError(error));
-		throw new MiniAppError(503, '域名白名单暂不可用，本次广告检测未执行');
+		// 【2026-11-25】与上面注释对齐：读失败返回种子集合兜底，不再整条链抛 503。
+		// 线上 D1 只要抖一下（too much load / internal error），/sban 的人工学习就整段
+		// 中断并报「域名白名单暂不可用，本次广告检测未执行」—— 主人封了人，特征一条没学到。
+		// 种子集合覆盖全部官方域名，降级期间只少保护主人后加的自定义白名单，不会把整次
+		// 检测挂掉；抖动恢复后下一次读取自动回到 D1 全量。
+		console.error('[广告检测] 读取域名白名单失败，已降级为种子集合: ' + formatD1SchemaError(error));
+		return fallback();
 	}
 }
 
@@ -41345,6 +41421,37 @@ async function sendAdGroupBanReceipts(banResults, ctx) {
 	return sent;
 }
 
+// 【2026-11-25】通知里的「来源群组」不能指望调用方永远记得传 chatTitle。
+// 线上图51：自动封禁通知整整少了一行，主人只看得到用户和判定，不知道是哪个群触发的。
+// 三级兜底，全部零 Telegram 请求：调用方参数 → update 自带的 chat.title →
+// 判定快照 → 动态群表（10 分钟缓存）。全局群的群名不在 D1 里，落到空串就如实不显示。
+const AD_NOTICE_TITLE_CACHE = new WeakMap();
+async function resolveAdNoticeChatTitle(env, chatId, input, evaluation) {
+	const direct = String(input?.chatTitle || '').trim();
+	if (direct) return direct;
+	const fromMessage = String(input?.message?.chat?.title || '').trim();
+	if (fromMessage) return fromMessage;
+	const fromSnapshot = String(evaluation?.snapshot?.chatTitle || '').trim();
+	if (fromSnapshot) return fromSnapshot;
+	const gid = String(chatId || '');
+	if (!gid || !env?.DB) return '';
+	let cache = AD_NOTICE_TITLE_CACHE.get(env.DB);
+	if (!cache) {
+		cache = new Map();
+		AD_NOTICE_TITLE_CACHE.set(env.DB, cache);
+	}
+	const hit = cache.get(gid);
+	if (hit && hit.expiresAt > Date.now()) return hit.title;
+	try {
+		const row = await env.DB.prepare('SELECT title FROM dynamic_groups WHERE chat_id = ?').bind(gid).first();
+		const title = String(row?.title || '').trim();
+		cache.set(gid, { title, expiresAt: Date.now() + 600000 });
+		return title;
+	} catch (_) {
+		return '';
+	}
+}
+
 async function enforceAdDetection(env, input, evaluation, options = {}) {
 	if(options.reviewGuard&&!await options.reviewGuard())return {banned:false,reason:'human_review_hold'};
 	const userId = String(input?.userId ?? '');
@@ -41806,9 +41913,10 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		if (!learned && !sampleAdded && options.skipLearning === true) {
 			learnParts.push('特征已在演练期学入，未重复学习');
 		}
+		const noticeChatTitle = await resolveAdNoticeChatTitle(env, chatId, input, evaluation);
 		const notice = renderAdDetectionNotice(evaluation, {
 			userId,
-			chatTitle: input?.chatTitle || '',
+			chatTitle: noticeChatTitle,
 			muted:banResults.some(row=>String(row.groupId)===chatId&&row.muted),
 			seq,
 			messageLink: adCaseMessageLink(chatId, triggerMessageId, input?.message?.chat?.username),
@@ -41819,7 +41927,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		if (!joinRequest&&!approvedJoin&&options.drillCloseReplay !== true&&options.suppressNotify!==true) try {
 			// 回执底部挂两档纠错按钮：主人不用手打 /ignore <序号>（他手上未必有那个号），
 			// 也不用去查 /unban 的黑名单硬闸门 —— 看完判据当场就能点。见 buildAdNoticeKeyboard。
-			const groupLabel = input?.chatTitle ? '<a href="https://t.me/c/' + escapeHtml(chatId.replace(/^-100/, '')) + '">' + escapeHtml(input.chatTitle) + '</a> ' : '';
+			const groupLabel = noticeChatTitle ? '<a href="https://t.me/c/' + escapeHtml(chatId.replace(/^-100/, '')) + '">' + escapeHtml(noticeChatTitle) + '</a> ' : '';
 			const scopeLine = automatic ? localScope ? '\n范围：独立群本群自动治理（' + groupLabel + '<code>' + escapeHtml(chatId) + '</code>）'
 				: '\n范围：联动 '+automaticScopeGroupIds.length+' 个非独立治理群；独立群不参与，逐群记录自动处罚归属' : '';
 			await sendTelegramMessageChunks(ownerId, notice + scopeLine, buildAdNoticeKeyboard(seq, userId, { automatic }));
