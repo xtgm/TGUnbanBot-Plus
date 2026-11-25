@@ -626,10 +626,12 @@ export default {
 					// 旧逻辑在 progress=true（分批帧检测）时自续新消息，cron resumeAdContentReviews
 					// 又按 next_at 再入队一次，同一条复核在队列里叠 2~3 条 —— 队列只涨不降，
 					// 线上 purge 前积压 522 条就是这么滚出来的。现在一律原地重试当前消息：
-					// delaySeconds 夹在 5~300 秒，5 次重投约 25 分钟；超出后消息丢弃，
-					// 由 cron 按 next_at 兜底重排，队列长度恒定、不会自增。
+					// 【2026-11-25 二次收口】上限从 300 秒降到 30 秒。实测：cron 19:24 推入的 6 条
+					// 重复消息在 300 秒延迟里一直占着 backlog，oldest_age 涨到 419 秒才被 ack，
+					// 面板看起来就是积压。现在单条最多滞留 30 秒，配合 consumer max_retries=2，
+					// 最迟 1 分钟内必定 ack 或丢弃，剩下的完全交给 cron 按 next_at 重排。
 					if (typeof message.retry === 'function') {
-						message.retry({ delaySeconds: Math.max(5, Math.min(300, Math.ceil(Number(result.retryAfter) || 30))) });
+						message.retry({ delaySeconds: Math.max(5, Math.min(30, Math.ceil(Number(result.retryAfter) || 30))) });
 					}
 				}
 				continue;
