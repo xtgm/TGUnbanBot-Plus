@@ -607,7 +607,9 @@ export default {
 			const body = message.body || {};
 			if (body.type === 'ad_join_notice') {
 				const result = await deliverAdJoinNotice(env, String(body.noticeId || ''), ctx);
-				if (result.retryAfter && typeof message.retry === 'function') message.retry({ delaySeconds: result.retryAfter });
+				// 【2026-11-25】只夹 30 秒：拦门通知补发没必要在队列里躺几小时，
+				// 失败就交给 prune/deliver 的下一次 cron 兜底。
+				if (result.retryAfter && typeof message.retry === 'function') message.retry({ delaySeconds: Math.max(5, Math.min(30, Math.ceil(Number(result.retryAfter) || 30))) });
 				continue;
 			}
 			if(body.type==='ad_review_batch_start'){
@@ -642,7 +644,9 @@ export default {
 			if (body.type === 'drill_close') {
 				try {
 					const result = await runAdDryRunCloseJob(env, Number(body.sessionId), { limit: 20 });
-					if ((result.busy || (!result.complete && !result.partial && !result.queued)) && typeof message.retry === 'function') message.retry({ delaySeconds: Math.max(30,Math.min(43200,Number(result.retryAfter)||30)) });
+					// 【2026-11-25】上限 43200 秒（12 小时）会让演练收尾消息在队列里躺一整天，
+					// 改成最多 120 秒；收尾本身有 next_at 幂等，重复跑不会重复执行。
+					if ((result.busy || (!result.complete && !result.partial && !result.queued)) && typeof message.retry === 'function') message.retry({ delaySeconds: Math.max(30,Math.min(120,Number(result.retryAfter)||30)) });
 				} catch (error) {
 					console.error('[演练收尾] 作业 #' + Number(body.sessionId) + ' 执行中断: ' + formatD1SchemaError(error));
 					throw error;
