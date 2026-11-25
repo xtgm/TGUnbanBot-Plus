@@ -28801,21 +28801,15 @@ function scoreAdProfile(profile, options = {}) {
 	if (privateInvite) add(AD_PRIVATE_INVITE_SCORE, '资料卡含私有群一次性邀请链接（t.me/+ 或 joinchat）');
 
 	let exemptHits = countAdKeywordHits(combined, AD_EXEMPT_KEYWORDS).filter((word) => adAsciiWordPresent(combined, word));
-	// 私有邀请链接不吃 t.me 豁免 —— 但【只在全文没有公开 telegram 链接时】才剔。
-	// 同时写了 t.me/mychannel（公开频道）和 t.me/+xxx（私有群）的人，公开那条仍是正常用法，
-	// 豁免照给：这是留给技术群群主的缓冲，宁可放过一个也不误封他。
-	//
-	// 【已知边界，刻意不补】countAdKeywordHits 命中满 6 个词就 break，而 't.me' 排在
-	// AD_EXEMPT_KEYWORDS 的最末尾 —— 简介里塞了 6 个以上技术豁免词时，'t.me' 根本不在
-	// hits 里，剔不掉，豁免仍吃满 -3（净 +2，pass）。那种简介（六个代理／TLS 术语 + 私有群链接）
-	// 几乎必然是真的技术群群主，放过他正是要的结果，不为此去动 countAdKeywordHits 的上限。
-	if (privateInvite && exemptHits.length && !hasAdPublicTelegramLink(combined)) {
-		const isTelegramExempt = (word) => AD_TELEGRAM_LINK_EXEMPT_WORDS.has(String(word).toLowerCase());
-		const dropped = exemptHits.filter(isTelegramExempt);
-		if (dropped.length) {
-			exemptHits = exemptHits.filter((word) => !isTelegramExempt(word));
-			reasons.push('（私有群邀请链接不吃 ' + dropped.join('/') + ' 豁免：该豁免只保护公开账号链接）');
-		}
+	// 【2026-11-25 主人重申】资料卡（昵称 + 简介）贴私有群 / 私有频道邀请链接 = 广告硬特征。
+	// 主人原话：「正常用户是不可能会在自己的资料卡上贴有私密的链接的。」
+	// 所以不再因为「同时写了公开频道链接」或「塞了足够多技术豁免词」而保留 -3 豁免：
+	// 只要命中私有邀请形态，全部豁免失效，7 分直接撞封禁线。
+	// 代价（已知且主人已接受）：技术群主、社群运营、读书会这类会在简介里挂私密群的人
+	// 会被误封；误封走 /ignore 回滚，样本与指纹都能删。
+	if (privateInvite && exemptHits.length) {
+		exemptHits = [];
+		reasons.push('（资料卡含私有群邀请链接，不吃 t.me 等豁免：该豁免只保护公开账号链接）');
 	}
 	// 广告语境判定：昵称 / 简介里同时有招揽特征时，t.me 与「代理」不再当护身符。
 	// 【排在私有邀请那条之后】两条剔除各管一档、提示语不同，先到先得会让后一条永不触发：
@@ -28937,10 +28931,11 @@ function scoreAdMessageText(text, options = {}) {
 	if (privateInvite) add(AD_BODY_PRIVATE_INVITE_SCORE, '正文含私有群一次性邀请链接（t.me/+ 或 joinchat）');
 
 	let exemptHits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS).filter((word) => adAsciiWordPresent(source, word));
-	// 私有邀请链接不吃 t.me 豁免 —— 与资料卡侧同一条分流规则：同时写了
-	// t.me/mychannel（公开频道）和 t.me/+xxx（私有群）的人，公开那条仍是正常用法，
-	// 豁免照给；只有正文里【只有私有形态】时才剔。
-	if (privateInvite && exemptHits.length && !hasAdPublicTelegramLink(source)) {
+	// 【2026-11-25 统一口径】与资料卡侧同一条硬规则：t.me 豁免只保护公开账号链接，
+	// 私有邀请形态（t.me/+、joinchat）一律不吃。原条件里的 !hasAdPublicTelegramLink
+	// 让「同时写公开频道」成了私密链接的免罪符 —— 就是主人说的「豁免是 t.me
+	// 又不是 t.me/私密链接」。有没有公开链接，私密那一条都照剔。
+	if (privateInvite && exemptHits.length) {
 		const isTelegramExempt = (word) => AD_TELEGRAM_LINK_EXEMPT_WORDS.has(String(word).toLowerCase());
 		const dropped = exemptHits.filter(isTelegramExempt);
 		if (dropped.length) {
@@ -40506,7 +40501,8 @@ function adExemptAnalysis(text) {
 	if (hasAdProtectedTechnicalContext(source) && !hasAdIndependentHarmfulContent(source)) {
 		return { hits: hits.length ? hits : ['技术或官方链接语境'], contextual: true };
 	}
-	if (hasAdPrivateInviteLink(source) && !hasAdPublicTelegramLink(source)) {
+	// 与资料卡 / 正文同口径：私有邀请形态不吃 t.me 豁免，有没有公开链接都一样。
+	if (hasAdPrivateInviteLink(source)) {
 		hits = hits.filter((word) => !AD_TELEGRAM_LINK_EXEMPT_WORDS.has(String(word).toLowerCase()));
 	}
 	return { hits: dropAdContextExempt(hits, source, []), contextual: false };
