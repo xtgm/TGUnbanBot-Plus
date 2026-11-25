@@ -39890,6 +39890,46 @@ async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 10
 	} catch (error) {
 		console.error('[演练报告] 历史分片清理失败：' + formatD1SchemaError(error));
 	}
+	// 【2026-11-25】退群残留兜底：探测到 not_in_group 写入的黑名单记录不留，每次剪枝顺手扫一遍。
+	try {
+		const leftPruned = await pruneAdLeftGroupBlacklist(env, nowSeconds);
+		if (leftPruned.removed > 0) console.log('[退群残留] 兜底清理 ' + leftPruned.removed + ' 条不在群内的黑名单记录');
+	} catch (error) {
+		console.error('[退群残留] 兜底清理失败：' + formatD1SchemaError(error));
+	}
+}
+
+
+// 【2026-11-25 主人口径】退群残留兜底剪枝。
+// 即时删除（dropLeftGroupBlacklistForResults）覆盖正常处置路径；这里兜住重放、
+// 补跑、中途异常这类没走到即时删除的遗漏。判据严格限定三条同时成立：
+//   ① 黑名单行是本群自动广告处置（reason='ad_auto'，auto_case_id 非空）
+//   ② 对应目标账本 state='skipped' 且探测结果 skipped='not_in_group'
+//   ③ 目标账本创建于最近 7 天内 —— 只碰最近这批探测，避免误删「当年跳过、后来
+//      真进群被预封」的旧记录（那种行会挂在更新的 case 上，case_id 对不上）。
+// never 删 manual_ban / 人工 / 全局黑名单；already_banned 不匹配 skipped 条件。
+async function pruneAdLeftGroupBlacklist(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return { removed: 0 };
+	const now = Number(nowSeconds) || Math.floor(Date.now() / 1000);
+	let removed = 0;
+	try {
+		for (let pass = 0; pass < 20; pass++) {
+			const res = await env.DB.prepare(
+				"DELETE FROM group_blacklist WHERE rowid IN ("
+				+ "SELECT g.rowid FROM group_blacklist g "
+				+ "JOIN ad_automatic_case_targets t ON t.case_id=g.auto_case_id AND t.chat_id=g.chat_id AND t.user_id=g.user_id "
+				+ "WHERE g.reason='ad_auto' AND t.state='skipped' AND t.created_at>=? "
+				+ "AND (CASE WHEN json_valid(t.result) THEN json_extract(t.result,'$.skipped') END)='not_in_group' "
+				+ "LIMIT 500)"
+			).bind(now - 7 * 86400).run();
+			const n = Number(res?.meta?.changes || 0);
+			removed += n;
+			if (!n) break;
+		}
+	} catch (error) {
+		console.error('[退群残留] 批量清理失败：' + formatD1SchemaError(error));
+	}
+	return { removed };
 }
 
 // === 待确认快照（纯 D1 替代 KV）===
@@ -42790,6 +42830,12 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 						attempted:result.automaticNotExecuted!==true&&!result.skipped,priorState:result.automaticPriorState||result.memberProbe?.state||'unobserved',sharedCaseId:result.reviewSharedCaseId||''}}); }
 				catch (_) { result.ok=false; result.accountingFailed=true; result.error='自动处罚结果记账失败，保留重试'; }
 			});
+			// 【2026-11-25 主人口径】退群残留不留：本次探测到不在群里的，把刚写进黑名单的那条删掉。
+			try {
+				const leftDropped = await dropLeftGroupBlacklistForResults(env, banResults, autoCaseId);
+				if (leftDropped > 0) console.log('[退群残留] 即时清理 ' + leftDropped + ' 条不在群内的黑名单记录');
+			} catch (error) { console.error('[退群残留] 即时清理失败：' + formatD1SchemaError(error)); }
+
 			if(reviewExecution)for(const result of banResults)if(!result.accountingFailed&&!result.reviewSharedCaseId)reviewExecution.receipts.set(receiptKey(result.groupId),{caseId:autoCaseId,result:{...result}});
 			if (Array.isArray(options.autoTargetGroupIds)) for (const gid of automaticRoute.skipped) banResults.push({groupId:gid,ok:true,skipped:automaticRoute.skipReasons[gid]||'out_of_scope'});
 		} else banResults = await banUserFromAllGroups(userId,banOptions);
@@ -46554,6 +46600,34 @@ async function recordDisposalsFromBanResults(env, banResults, options = {}) {
 		if (!r || !r.ok || r.skipped || !r.groupId) continue;
 		await recordStatAction(env, r.groupId, 'disposal');
 	}
+}
+
+// 【2026-11-25 主人口径】退群残留不留。
+// 禁言模式下 probeTargetMemberBeforeBan 探到 not_in_group，banUserFromAllGroups 仍会
+// 先把目标写进 group_blacklist（预封是为了防「进群瞬间发广告」）。可人已经不在群里，
+// 这条记录对禁言毫无作用，只会一直堆着 —— 实测 17 个群 × 4005 个用户堆出 30600 条。
+// 主人原话：「退群残留清掉」「只要退了群就清理掉残留」「用户再进来 被检测到依旧会被踢出去」。
+// 所以：探测结果是 not_in_group 时，把本次 autoCaseId 刚写的那条删掉；
+// 真回来会重新过第一道防线（资料卡 + 正文 + 指纹 + 头像），不依赖这条残留。
+// 只删 reason='ad_auto' 且 auto_case_id 完全匹配本次 case 的行，人工封禁（manual_ban / auto_case_id=''）一律不动。
+// already_banned 不删：那是「目标状态已达成」的有效预封，与「人不在群」是两回事。
+async function dropLeftGroupBlacklistForResults(env, banResults, caseId) {
+	if (!env?.DB || !Array.isArray(banResults) || !banResults.length) return 0;
+	const caseKey = String(caseId || '');
+	if (!caseKey) return 0;
+	const left = banResults.filter((r) => r && String(r.skipped || '') === 'not_in_group' && r.groupId && r.userId);
+	if (!left.length) return 0;
+	let removed = 0;
+	for (const r of left) {
+		try {
+			const res = await env.DB.prepare("DELETE FROM group_blacklist WHERE chat_id=? AND user_id=? AND reason='ad_auto' AND auto_case_id=?")
+				.bind(String(r.groupId), String(r.userId), caseKey).run();
+			removed += Number(res?.meta?.changes || 0);
+		} catch (error) {
+			console.error('[退群残留] 删除失败：' + formatD1SchemaError(error));
+		}
+	}
+	return removed;
 }
 
 // 取群【此刻】的成员总数（getChatMemberCount）。面板报头的「当前成员」用它，是实时值，
