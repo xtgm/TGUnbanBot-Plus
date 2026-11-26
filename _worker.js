@@ -764,6 +764,10 @@ export default {
 			// 顺手清一次过期数据。原先只搭在 detectAdOnJoin 上，
 			// 没人入群的日子就不会剪枝；挂到 cron 上有个稳定节拍。
 			await pruneAdDetectionData(env);
+			// 【2026-11-27】运行日志/终态队列单独清理：不放进 pruneAdDetectionData，
+			// 避免入群事件热路径承担额外写操作。每日 cron 两次足够。
+			try { await pruneD1OperationalData(env); }
+			catch (error) { console.error('[D1运行数据] 清理失败:', error); }
 			// 群统计明细超期剪枝（保留 STAT_RETENTION_DAYS 天），同样搭 cron 的稳定节拍。
 			await pruneStatData(env);
 			// 【2026-11-25】存储自检：超了要真倒，不能只发通知。
@@ -40709,13 +40713,48 @@ async function pruneAdContentReviews(env, nowSeconds = Math.floor(Date.now() / 1
 // 【2026-11-25 D1 体积监控】每日 cron 统计关键表行数，超阈值直接通知主人。
 // 阈值按「正常水位 ×1.5」设：剪枝生效后行数应长期低于这里；连续告警说明
 // 增长来源没堵住（比如新加的学习入口没有对应清理规则），要人看一眼。
+//
+// 【2026-11-27】补上运行日志类表：它们不属于特征库，也不是三道防线的判据，
+// 但会随广告高峰/演练/后台操作只增不减。保留期只清终态或过期行，活跃队列
+// 一律不碰。
+const D1_OPERATIONAL_RETENTION_SECONDS = {
+	dryrunClosedSession: 90 * 86400,
+	reviewBatch: 30 * 86400,
+	reviewActionGroup: 30 * 86400,
+	reviewIntakeGroup: 30 * 86400,
+	visionFailure: 30 * 86400,
+	adminLoginLog: 90 * 86400,
+	batchJob: 30 * 86400,
+	interceptNotify: 30 * 86400,
+	permNotice: 30 * 86400,
+	groupFeedback: 180 * 86400,
+	joinCheck: 30 * 86400
+};
+
 const AD_STORAGE_WATCH = [
 	['ad_sample_embeddings', 15000, '语义向量'],
 	['ad_content_reviews', 8000, '内容复核'],
 	['ad_join_notices', 3000, '拦门通知'],
 	['ad_review_asset_chunks', 5000, '演练素材分片'],
 	['ad_automatic_case_targets', 100000, '自动处置目标'],
-	['ad_pending_snapshots', 40000, '待确认快照']
+	['ad_pending_snapshots', 40000, '待确认快照'],
+	['ad_dryrun_close_bans', 12000, '演练逐群处罚'],
+	['ad_dryrun_close_cases', 30000, '演练收尾案件'],
+	['ad_dryrun_report_parts', 5000, '演练报告分片'],
+	['ad_dryrun_log', 5000, '演练流水'],
+	['ad_dryrun_sessions', 200, '演练会话'],
+	['ad_review_batch_items', 5000, '复核批次明细'],
+	['ad_review_batches', 1000, '复核批次'],
+	['ad_review_action_groups', 3000, '复核动作租约'],
+	['ad_review_intake_groups', 8000, '复核去重索引'],
+	['ad_review_duplicate_groups', 5000, '复核重复索引'],
+	['ad_vision_failures', 3000, '视觉失败台账'],
+	['admin_login_log', 5000, '后台登录日志'],
+	['batch_jobs', 5000, '批量任务'],
+	['intercept_notify_log', 5000, '拦截通知去重'],
+	['perm_notice_log', 2000, '权限提醒去重'],
+	['group_ad_feedback', 5000, '本群广告纠错'],
+	['ad_join_checks', 30000, '入群检查流水']
 ];
 
 // 【2026-11-25 容量熔断】盒子满了就往外倒，发条通知解决不了积压。
@@ -40728,7 +40767,26 @@ const AD_STORAGE_PURGE_FILTERS = {
 	ad_content_reviews: ['status IN (' + AD_REVIEW_SETTLED_STATUSES + ')'],
 	ad_join_notices: ['next_at=0'],
 	ad_automatic_case_targets: ["state IN ('skipped','done','failed','released','rolled_back')"],
-	ad_review_asset_chunks: ['1=1']
+	ad_review_asset_chunks: ['1=1'],
+	// 演练只淘汰已关闭、最终报告已发送的整轮；子表先于会话删除，避免孤儿行。
+	ad_dryrun_close_bans: ["session_id IN (SELECT id FROM ad_dryrun_sessions WHERE status='closed' AND report_sent=1 AND report_final=1 AND closed_at<>'' AND closed_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-90 days'))"],
+	ad_dryrun_close_cases: ["session_id IN (SELECT id FROM ad_dryrun_sessions WHERE status='closed' AND report_sent=1 AND report_final=1 AND closed_at<>'' AND closed_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-90 days'))"],
+	ad_dryrun_report_parts: ["session_id IN (SELECT id FROM ad_dryrun_sessions WHERE status<>'open' AND (report_complete=1 OR report_sent=1) AND opened_at<>'' AND opened_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-7 days'))"],
+	ad_dryrun_log: ["session_id > 0 AND session_id IN (SELECT id FROM ad_dryrun_sessions WHERE status='closed' AND report_sent=1 AND report_final=1 AND closed_at<>'' AND closed_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-90 days'))"],
+	ad_dryrun_sessions: ["status='closed' AND report_sent=1 AND report_final=1 AND closed_at<>'' AND closed_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-90 days')"],
+	// 复核批次必须已完成且报告已通知；明细先删，批次后删。
+	ad_review_batch_items: ["batch_id IN (SELECT id FROM ad_review_batches WHERE status IN ('complete','needs_followup') AND notified_at>0 AND completed_at>0 AND completed_at < CAST(strftime('%s','now') AS INTEGER) - 30*86400)"],
+	ad_review_batches: ["status IN ('complete','needs_followup') AND notified_at>0 AND completed_at>0 AND completed_at < CAST(strftime('%s','now') AS INTEGER) - 30*86400"],
+	ad_review_action_groups: ["lease_until<=CAST(strftime('%s','now') AS INTEGER) AND updated_at < CAST(strftime('%s','now') AS INTEGER) - 30*86400"],
+	ad_review_intake_groups: ["created_at < CAST(strftime('%s','now') AS INTEGER) - 30*86400"],
+	ad_review_duplicate_groups: ["created_at < CAST(strftime('%s','now') AS INTEGER) - 30*86400"],
+	ad_vision_failures: ["last_at < CAST(strftime('%s','now') AS INTEGER) - 30*86400"],
+	admin_login_log: ["at < CAST(strftime('%s','now') AS INTEGER) - 90*86400"],
+	batch_jobs: ["status IN ('done','failed') AND updated_at<>'' AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days')"],
+	intercept_notify_log: ["updated_at>0 AND updated_at < CAST(strftime('%s','now') AS INTEGER) - 30*86400"],
+	perm_notice_log: ["notified_at>0 AND notified_at < CAST(strftime('%s','now') AS INTEGER) - 30*86400"],
+	group_ad_feedback: ["at < CAST(strftime('%s','now') AS INTEGER) - 180*86400"],
+	ad_join_checks: ["created_at < CAST(strftime('%s','now') AS INTEGER) - 30*86400"]
 };
 
 async function enforceAdStorageLimits(env) {
@@ -40736,13 +40794,17 @@ async function enforceAdStorageLimits(env) {
 	const acted = [];
 	for (const [table, limit, label] of AD_STORAGE_WATCH) {
 		if (table === 'ad_pending_snapshots') continue;
+		// 没有显式安全过滤器的表不参与熔断。默认 1=1 会误删活跃队列，
+		// 宁可让它先触发告警，也不能为了降行数动正在用的数据。
+		const filters = AD_STORAGE_PURGE_FILTERS[table];
+		if (!Array.isArray(filters) || !filters.length) continue;
 		try {
 			const row = await env.DB.prepare('SELECT COUNT(*) AS c FROM ' + table).first();
 			const count = Number(row?.c || 0);
 			if (count <= limit) continue;
 			const target = Math.floor(limit * 0.8);
 			let removed = 0;
-			for (const filter of (AD_STORAGE_PURGE_FILTERS[table] || ['1=1'])) {
+			for (const filter of filters) {
 				for (let pass = 0; pass < 20; pass++) {
 					if (count - removed <= target) break;
 					const res = await env.DB.prepare('DELETE FROM ' + table + ' WHERE rowid IN (SELECT rowid FROM ' + table + ' WHERE ' + filter + ' ORDER BY rowid LIMIT 500)').run();
@@ -40974,6 +41036,88 @@ async function pruneAdLLMCandidates(env, nowSeconds = Math.floor(Date.now() / 10
 		console.error('[AI候选] 已转正记录清理失败：' + formatD1SchemaError(error));
 	}
 	return { removed };
+}
+
+// 【2026-11-27】D1 运行数据清理：只碰日志/队列/去重/终态记录，不碰任何特征库、
+// 三道防线判据或黑名单。每张表独立 try，单批 500 条，最多 20 批，避免一次大
+// DELETE 长时间占住写锁。
+async function runD1OperationalPrune(env, table, whereSql, bindings = [], maxPasses = 10) {
+	let removed = 0;
+	for (let pass = 0; pass < maxPasses; pass++) {
+		const res = await env.DB.prepare(
+			'DELETE FROM ' + table + ' WHERE rowid IN ('
+			+ 'SELECT rowid FROM ' + table + ' WHERE ' + whereSql + ' ORDER BY rowid LIMIT 500)'
+		).bind(...bindings).run();
+		const n = Number(res?.meta?.changes || 0);
+		removed += n;
+		if (n < 500) break;
+	}
+	return removed;
+}
+
+async function pruneD1OperationalData(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return {};
+	const now = Number(nowSeconds) || 0;
+	const retention = D1_OPERATIONAL_RETENTION_SECONDS;
+	const iso = (cutoffSeconds) => new Date(cutoffSeconds * 1000).toISOString();
+	const summary = {};
+	const run = async (label, table, whereSql, bindings = [], maxPasses = 10) => {
+		try {
+			const removed = await runD1OperationalPrune(env, table, whereSql, bindings, maxPasses);
+			if (removed > 0) {
+				summary[label] = removed;
+				console.log('[D1运行数据] ' + label + ' 已清理 ' + removed + ' 条');
+			}
+			return removed;
+		} catch (error) {
+			console.error('[D1运行数据] ' + label + ' 清理失败：' + formatD1SchemaError(error));
+			return 0;
+		}
+	};
+
+	// 演练：只清「已关闭 + 最终报告已发送 + 超过 90 天」的整轮，子表先删、会话最后删。
+	const dryrunCutoff = iso(now - retention.dryrunClosedSession);
+	const dryrunWhere = "status='closed' AND report_sent=1 AND report_final=1 AND closed_at<>'' AND closed_at < ?";
+	const dryrunChildren = 'session_id IN (SELECT id FROM ad_dryrun_sessions WHERE ' + dryrunWhere + ')';
+	await run('演练逐群处罚', 'ad_dryrun_close_bans', dryrunChildren, [dryrunCutoff], 20);
+	await run('演练收尾案件', 'ad_dryrun_close_cases', dryrunChildren, [dryrunCutoff], 20);
+	await run('演练报告分片', 'ad_dryrun_report_parts', dryrunChildren, [dryrunCutoff], 5);
+	await run('演练流水', 'ad_dryrun_log', 'session_id > 0 AND ' + dryrunChildren, [dryrunCutoff], 10);
+	await run('演练会话', 'ad_dryrun_sessions', dryrunWhere, [dryrunCutoff], 5);
+
+	// 复核批次：已完成且通知超过 30 天，先删明细再删批次。
+	const reviewBatchCutoff = now - retention.reviewBatch;
+	const reviewBatchWhere = "status IN ('complete','needs_followup') AND notified_at>0 AND completed_at>0 AND completed_at < ?";
+	await run('复核批次明细', 'ad_review_batch_items',
+		'batch_id IN (SELECT id FROM ad_review_batches WHERE ' + reviewBatchWhere + ')',
+		[reviewBatchCutoff], 20);
+	await run('复核批次', 'ad_review_batches', reviewBatchWhere, [reviewBatchCutoff], 5);
+
+	// 复核去重/租约：活跃租约不动，只清过期且超过保留期的行。
+	await run('复核动作租约', 'ad_review_action_groups', 'lease_until<=? AND updated_at<?',
+		[now, now - retention.reviewActionGroup], 5);
+	await run('复核去重索引', 'ad_review_intake_groups', 'created_at<?',
+		[now - retention.reviewIntakeGroup], 20);
+	await run('复核重复索引', 'ad_review_duplicate_groups', 'created_at<?',
+		[now - retention.reviewIntakeGroup], 5);
+
+	// 视觉失败台账/后台登录/批量任务/通知去重/本群纠错/入群流水。
+	await run('视觉失败台账', 'ad_vision_failures', 'last_at<?',
+		[now - retention.visionFailure], 5);
+	await run('后台登录日志', 'admin_login_log', 'at<?',
+		[now - retention.adminLoginLog], 10);
+	await run('批量任务', 'batch_jobs', "status IN ('done','failed') AND updated_at<>'' AND updated_at<?",
+		[iso(now - retention.batchJob)], 10);
+	await run('拦截通知去重', 'intercept_notify_log', 'updated_at>0 AND updated_at<?',
+		[now - retention.interceptNotify], 10);
+	await run('权限提醒去重', 'perm_notice_log', 'notified_at>0 AND notified_at<?',
+		[now - retention.permNotice], 5);
+	await run('本群广告纠错', 'group_ad_feedback', 'at<?',
+		[now - retention.groupFeedback], 5);
+	await run('入群检查流水', 'ad_join_checks', 'created_at<?',
+		[now - retention.joinCheck], 20);
+
+	return summary;
 }
 
 // === 待确认快照（纯 D1 替代 KV）===
