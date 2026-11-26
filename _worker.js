@@ -110,6 +110,10 @@ const PURGE_RUN_DELAY_MS = 250;
 const PURGE_DEFAULT_REASONS = ['manual', 'sa', 'spam', 'ad_vote'];
 const TG_MUTATION_RETRY_DELAY_MS = 350;
 
+// 第一主人 /sban 的全群封禁标记。只有 reason=sban 且操作人是第一主人的全局记录
+// 才允许跨群生效；其它历史全局记录一律降级为只查询，不再参与群拦截。
+const GLOBAL_SBAN_REASON = 'sban';
+
 // 7) /blacklist 列表中"原因"字段的中文映射。
 //    spam 表示 /spam 举报，manual 表示 /ban 手动添加；历史 reason=sa 继续按 /spam 展示。
 //    ad_auto / ad_learn / gky_global 已无写入方（自动广告治理与杀神主动查杀均已移除），
@@ -119,6 +123,7 @@ const DEFAULT_BLACKLIST_REASON_LABELS = {
 	sa: '群内 /spam 举报（历史记录）',
 	spam: '群内 /spam 举报',
 	manual: '管理员 /ban 指令加黑',
+	sban: '第一主人全群封禁（/sban）',
 	manual_ban: '旧版 Telegram 原生封禁同步记录',
 	ad_auto: '🤖 广告自动检测（历史记录）',
 	ad_learn: '🤖 上报学习（历史记录）',
@@ -3769,8 +3774,8 @@ async function handleInitialization(request, env) {
 				// 【2026-10-25 主人要求】/ 菜单只留六条常用命令；其余命令的处理代码全部保留、照样能直接发，
 				// 只是不在菜单里显示。完整说明与执行入口在网页管理后台（域名/admin，私聊 /adminpass 领密码）。
 				// 同日加回 /groupmode：让群主在菜单里看得到独立群入口（群里闪提示 + 私聊完整用法）。
-				{ command: "ban", description: "加入全局黑名单并全群踢出封禁 (群管理员)" },
-				{ command: "spam", description: "回复广告：删消息并加入全局黑名单 (群管理员)" },
+				{ command: "ban", description: "加入本群黑名单并踢出封禁 (群管理员)" },
+				{ command: "spam", description: "回复广告：删消息并加入本群黑名单 (群管理员)" },
 				{ command: "check", description: "查询封禁状态 (高级管理员)" },
 				{ command: "unban", description: "解除封禁；不带 ID 是自助解封" },
 				{ command: "stats", description: "本群发言/进退群统计 (群管理员)" },
@@ -4623,6 +4628,16 @@ async function getBlacklist(env) {
 	return [];
 }
 
+// 只有第一主人 /sban 写的全局记录仍然全群生效；历史 manual / ad_auto / spam 等
+// 全局记录从本轮起降级为只查询，不再参与群拦截。联合名单是独立的订阅名单，继续生效。
+function isGlobalSbanEntry(entry) {
+	return String(entry?.reason || '') === GLOBAL_SBAN_REASON && isPrimaryOwner(entry?.by);
+}
+
+function isEnforcedGlobalBlacklistEntry(entry) {
+	return Boolean(entry) && (entry.federated === true || isGlobalSbanEntry(entry));
+}
+
 // 检查用户是否在黑名单中
 async function checkBlacklist(userId, env, options = {}) {
 	if (!env.DB) {
@@ -4673,7 +4688,12 @@ async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, option
 	if (!blacklistCheck.isBlacklisted) {
 		return false;
 	}
-	// 独立群不认全局黑名单（第一主人封的除外）：有独立群时放行，但只允许在独立群自助解封。
+	// 历史全局记录已降级为只查询：自助解封只被「全群 sban」或联合名单硬拦。
+	// strict 查询失败仍按原逻辑 fail-closed，不能因为读不到库就放人。
+	if (!blacklistCheck.checkFailed && !isEnforcedGlobalBlacklistEntry(blacklistCheck.entry)) {
+		return false;
+	}
+	// 独立群不认历史全局记录；全群 sban / 联合名单仍按原逻辑处理。
 	// options.scope 由调用方传入一个对象，这里写 independentOnly 告诉它只解独立群。
 	if (!blacklistCheck.checkFailed && runtime().INDEPENDENT_GROUP_IDS.length > 0
 		&& !isPrimaryOwner(blacklistCheck.entry?.by) && options.scope && typeof options.scope === 'object') {
@@ -4710,7 +4730,8 @@ async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, option
 const AD_BLACKLIST_REASON_LABELS = {
 	ad_auto: 'AI 自动判定（广告检测链路定罪）',
 	spam: '/spam 人工举报',
-	manual: '/ban 或 /sban 人工处置',
+	manual: '/ban 人工处置',
+	sban: '第一主人 /sban 全群封禁',
 	ad_vote: '群内 /ad 举报投票通过',
 };
 
@@ -7110,7 +7131,7 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		version: 2,
 		id: buildBulkJobId(normalizedAction),
 		action: normalizedAction,
-		reason: normalizedAction === 'spam' ? 'spam' : (isUnban ? null : 'manual'),
+		reason: options.reason || (normalizedAction === 'spam' ? 'spam' : (isUnban ? null : 'manual')),
 		// 处置方式（执行时传给 applyGroupModeration）：'kick' = /sban 恒踢出；
 		// 'human' = /ban /spam 口径（全群踢出封禁）；null = 自动路径口径（杀手群禁言、普通群踢）。
 		mode: options.mode || null,
@@ -7124,6 +7145,18 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		killer: options.killer === true,
 		// 本群黑名单任务：写 group_blacklist（sourceChatId 那个群）、只处置 groupIds、不学习。
 		local: options.local === true,
+		// 同款连带批量任务：按 deleteTargets 里每个用户实际出现的群写本群黑名单，
+		// 不写全局 blacklist；每个目标只封自己同款消息所在的群。
+		linkedScoped: options.linkedScoped === true,
+		linkedText: String(options.linkedText || '').slice(0, 2000),
+		linkedSourceUserId: String(options.linkedSourceUserId || ''),
+		// 精确到「用户 × 来源群」的本地批量任务（/learnlast）：
+		// 只写这些群的本群黑名单，只封这些群，绝不回落成全群任务。
+		targetGroups: options.targetGroups && typeof options.targetGroups === 'object'
+			? Object.fromEntries(Object.entries(options.targetGroups).map(([uid, groups]) => [
+				String(uid), [...new Set((Array.isArray(groups) ? groups : []).map(String).filter(Boolean))]
+			]))
+			: null,
 		// 解封即清学习：第一主人或本群群主发起时为 true；超管 / 普通群管理员保持 false。
 		purgeLearning: options.purgeLearning === true,
 		createdBy: getMessageActorId(message),
@@ -7504,20 +7537,53 @@ async function performBulkJobD1Mutation(job, env, ids) {
 			if (attempt < BULK_TASK_D1_RETRY_LIMIT) await new Promise((resolve) => setTimeout(resolve, BULK_TASK_D1_RETRY_DELAY_MS));
 			continue;
 		}
-		lastResults = job.action === 'unban'
-			? await checkManyUnbanEligibility(ids, env, { allowD1Removal, operatorId: job.createdBy })
-			: await addManyToBlacklist(ids, env, {
-				reason: job.reason,
+		if (job.targetGroups && typeof job.targetGroups === 'object') {
+			// /learnlast：只写快照里该用户来源群的本群黑名单，不写全局 blacklist。
+			// 每个目标严格按 targetGroups 取群，绝不回落到任务发起群或全部群。
+			const groupsByUser = {};
+			for (const uid of ids) groupsByUser[String(uid)] = scopedGroupsForJobTarget(job, uid);
+			const local = await addLinkedSpamGroupEntries(env, ids, groupsByUser, {
 				by: job.createdBy,
-				note: job.note,
-				// 私聊发起的任务不存 chat_id（私聊 id 就是操作人 TGID）；旧任务没有这两个字段 → 按 createdBy 推身份。
+				note: job.note || '/learnlast 学习并处置',
+				reason: job.reason || 'spam',
+				text: job.linkedText || '',
 				detail: {
-					...(job.blacklistReplyDetail || {}),
-					operatorRole: job.blacklistOperatorRole || '',
-					operatorUsername: job.blacklistOperatorUsername || '',
-					chatId: job.sourceChatType === 'private' ? '' : (job.sourceChatId || '')
+					text: job.linkedText || '',
+					reasons: ['/learnlast 学习并处置'],
+					operatorRole: job.blacklistOperatorRole || inferBlacklistOperatorRole(job.createdBy) || 'primary_owner'
 				}
 			});
+			const success = ids.filter((uid) => (local.readyGroups[String(uid)] || []).length > 0);
+			lastResults = { success, exists: [], failed: local.failed };
+		} else if (job.linkedScoped === true) {
+			// 同款连带：只写每个目标同款消息实际出现过的本群黑名单，不写全局 blacklist。
+			// deleteTargets 已在建任务时按「用户 → 群 → mid」整形，这里不会再跨群扩大。
+			const groupsByUser = {};
+			for (const uid of ids) groupsByUser[String(uid)] = linkedSpamGroupsForJobTarget(job, uid);
+			const local = await addLinkedSpamGroupEntries(env, ids, groupsByUser, {
+				by: job.createdBy,
+				note: job.note || '同款广告连带查杀',
+				text: job.linkedText || '',
+				sourceUserId: job.linkedSourceUserId || ''
+			});
+			const success = ids.filter((uid) => (local.readyGroups[String(uid)] || []).length > 0);
+			lastResults = { success, exists: [], failed: local.failed };
+		} else {
+			lastResults = job.action === 'unban'
+				? await checkManyUnbanEligibility(ids, env, { allowD1Removal, operatorId: job.createdBy })
+				: await addManyToBlacklist(ids, env, {
+					reason: job.reason,
+					by: job.createdBy,
+					note: job.note,
+					// 私聊发起的任务不存 chat_id（私聊 id 就是操作人 TGID）；旧任务没有这两个字段 → 按 createdBy 推身份。
+					detail: {
+						...(job.blacklistReplyDetail || {}),
+						operatorRole: job.blacklistOperatorRole || '',
+						operatorUsername: job.blacklistOperatorUsername || '',
+						chatId: job.sourceChatType === 'private' ? '' : (job.sourceChatId || '')
+					}
+				});
+		}
 		// 人工批量判定的学习：/ban /sban /spam 的批量任务都汇到这里（job.reason / job.mode）。
 		// 此前只有 /spam 引用回复与自动定罪学，批量封禁一个特征都不学 ——
 		// 而批量恰恰是日常主力场景，封得越多漏得越多。详见 learnAdFromOperatorAction。
@@ -7626,7 +7692,22 @@ async function prepareBulkJobActiveBatch(job, env) {
 	const actionableIds = isUnban
 		? [...results.eligible]
 		: [...results.success, ...results.exists];
-	const activeGroupIds = getBulkJobConfiguredGroupIds(job);
+	// 第一主人解除 /sban 全群封禁时，解封范围必须扩到全部配置群；
+	// 其余本群 /unban 仍只处理任务建立时锁定的 sourceChatId。
+	const activeGroupIds = isUnban && Array.isArray(results.globalSbanRemoved) && results.globalSbanRemoved.length
+		? runtime().GROUP_IDS.map(String)
+		: getBulkJobConfiguredGroupIds(job);
+	// 同款连带：每个目标只处理自己出现过的群，不能因为别的目标在 B 群发过，
+	// 就把他一起封到 B 群。operationMap 固定「用户 × 自己的群」的精确任务表。
+	let operationMap = null;
+	if (job.linkedScoped === true || (job.targetGroups && typeof job.targetGroups === 'object')) {
+		operationMap = [];
+		for (const uid of actionableIds) {
+			for (const gid of scopedGroupsForJobTarget(job, uid)) {
+				operationMap.push({ userId: String(uid), groupId: String(gid) });
+			}
+		}
+	}
 
 	if (isUnban) {
 		incrementBulkJobStat(job, 'unbanEligible', results.eligible.length);
@@ -7654,8 +7735,9 @@ async function prepareBulkJobActiveBatch(job, env) {
 		ids,
 		actionableIds,
 		groupIds: activeGroupIds,
+		operationMap,
 		operationCursor: 0,
-		totalOperations: actionableIds.length * activeGroupIds.length
+		totalOperations: operationMap ? operationMap.length : actionableIds.length * activeGroupIds.length
 	};
 	await saveBulkJob(env, job);
 	return job.activeBatch;
@@ -7663,6 +7745,11 @@ async function prepareBulkJobActiveBatch(job, env) {
 
 function getBulkJobOperationTask(job, operationIndex) {
 	const active = job.activeBatch;
+	if (!active) return null;
+	if (Array.isArray(active.operationMap)) {
+		const task = active.operationMap[operationIndex];
+		return task && isConfiguredGroup(task.groupId) ? task : null;
+	}
 	const groupIds = Array.isArray(active?.groupIds)
 		? active.groupIds
 		: (Array.isArray(job?.groupIds) ? job.groupIds : []);
@@ -8087,6 +8174,7 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 		allowD1Removal: action === 'unban' && options.allowD1Removal === true,
 		purgeLearning: action === 'unban' && options.purgeLearning === true,
 		mode: options.mode || null,
+		reason: options.reason || null,
 		groupIds: scopeGroupIds,
 		local: options.local === true,
 		// 群内静默/简洁（主人要求）：/ban·/spam·/unban 的批量任务【不再向源群推异步完成通知】，
@@ -9012,10 +9100,10 @@ var MANUAL = [
 ['/start', '欢迎语；第一主人私聊发送会打开统计面板，群里发送只回介绍语'],
 ['/help', '第一主人私聊：返回网页后台入口，完整命令手册已搬到本页「命令手册」']]],
 ['人工封禁与查询（群管理员 / 主人 / 副主人）', [
-['/ban TGID [原因]', '加黑 + 全群踢出封禁'],
-['/sban TGID [原因]', '加黑 + 全群踢出并撤回其历史发言（第一主人 / 副主人 / 该群群主）'],
-['/spam', '回复广告：删消息 + 全群踢出封禁（群里回复广告消息发送）'],
-['/unban TGID', '移出黑名单 + 全群解封并恢复发言（不带 ID 则是自助解封）'],
+['/ban TGID [原因]', '加黑 + 本群踢出封禁'],
+['/sban TGID [原因]', '加黑 + 全群踢出并撤回其历史发言（仅第一主人）'],
+['/spam', '回复广告：删消息 + 本群踢出封禁（群里回复广告消息发送）'],
+['/unban TGID', '移出本群黑名单 + 本群解封并恢复发言（不带 ID 则是自助解封）'],
 ['/check TGID', '查 GKY + 全局 + 群级封禁记录（群内可回复消息）；网页版 域名/check'],
 ['/profile TGID', '资料卡：昵称 / 简介 / 时间线 / 黑名单 / GKY（群内可回复消息使用）'],
 ['/rm', '回复要删的消息后发送 → 删除该消息（仅第一主人 / 该群群主，群里用）'],
@@ -9054,7 +9142,7 @@ var MANUAL = [
 ['/notice', '发起全体通知，随后按提示发一条内容（文本/图片/视频/文件均可），确认后群发'],
 ['/notice cancel', '取消本次通知']]],
 ['广告举报投票（授权成员发起）', [
-['/ad [原因]', '回复广告发起群内投票，通过即加黑并全群封禁'],
+['/ad [原因]', '回复广告发起群内投票，通过即加黑并本群封禁'],
 ['/add_ad_admin TGID', '给该成员发起投票的权限'],
 ['/del_ad_admin TGID', '收回该成员的发起权限']]],
 ['动态群组（仅第一主人；除 /delgroup 外仅私聊）', [
@@ -9072,7 +9160,7 @@ var MANUAL = [
 ['广告自动检测（仅私聊）', [
 ['/pending [N]', '列出已处罚记录，误判时用 /ignore 撤销，默认 10 条'],
 ['/user TGID', '按用户 ID 查全部案底：每次判定的时间、得分、名称、原文与判据'],
-['/ignore 序号', '判错回滚：解黑 + 全群解封 + 删掉学到的指纹和样本（支持 3 5 7 与 3-8）'],
+['/ignore 序号', '判错回滚：解黑 + 解封 + 删掉学到的指纹和样本（支持 3 5 7 与 3-8）'],
 ['/rescreen [N]', '重新筛查观察窗口里的可疑用户，默认 10 人'],
 ['/adstats', '检测状态总览：指纹、样本向量、观察窗口、入群检查流水与演练状态'],
 ['/vision', '手动触发一轮视觉识别（头像 + 正文图）'],
@@ -9107,7 +9195,7 @@ var MANUAL = [
 ['', '检测豁免：超管、任一配置群的群主或管理员，发任何内容都不被广告自动检测'],
 ['', '群内命令：发出即撤回，结果留在群里并通知第一主人；/dryrun 例外，命令与回执都撤回，完整信息走私聊'],
 ['', '入群判定：进群那一刻就查 bio 与头像；更严可设环境变量 AD_JOIN_SCORE_THRESHOLD（如 9）'],
-['', '自动判定：加黑 + 全群封禁 + 自动学习，快照推给你复核；判错用 /ignore 序号撤销'],
+['', '自动判定：本群加黑 + 本群封禁 + 自动学习，快照推给你复核；判错用 /ignore 序号撤销'],
 ['', 'Telegram 菜单只留 /ban /spam /check /unban /stats /groupmode；其余命令没删，照样可以直接发送'],
 ['', '联合封杀：「联合封杀」分区里生成 key 发给别人，对方就能订阅你的全局黑名单；你也可以填 FED_SOURCE_URL + FED_SOURCE_KEY 订阅别人的。/unban 联合名单里的人会自动本地豁免']]]
 ];
@@ -9354,7 +9442,7 @@ $('bl-prev').addEventListener('click', function () { loadBlacklist(state.blPage 
 $('bl-next').addEventListener('click', function () { loadBlacklist(state.blPage + 1); });
 $('bl-unban').addEventListener('click', function () {
 	var id = $('bl-unban-id').value.trim();
-	if (!id || !confirm('把 ' + id + ' 移出全局黑名单并全群解封？')) return;
+	if (!id || !confirm('把 ' + id + ' 移出全局黑名单并解封全部配置群？')) return;
 	busy(this, api('blacklist/unban', { userId: id })).then(function (d) { toast(d.message); loadBlacklist(state.blPage); });
 });
 // ===== 广告检测 =====
@@ -9444,7 +9532,7 @@ $('ads-prev').addEventListener('click', function () { loadAds(state.adsPage - 1)
 $('ads-next').addEventListener('click', function () { loadAds(state.adsPage + 1); });
 $('ads-ignore').addEventListener('click', function () {
 	var seq = $('ads-seq').value.trim();
-	if (!seq || !confirm('判错回滚 #' + seq + '？会解黑、全群解封并删掉这次学到的指纹和样本。')) return;
+	if (!seq || !confirm('判错回滚 #' + seq + '？会解黑、解封并删掉这次学到的指纹和样本。')) return;
 	busy(this, api('ads/ignore', { seq: Number(seq) })).then(function (d) { toast(d.message); loadAds(state.adsPage); });
 });
 $('ads-wl-add').addEventListener('click', function () {
@@ -11100,7 +11188,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	const localLines = [];
 	if (options.env) {
 		localCheck = await checkBlacklist(queryTgid, options.env);
-		localLines.push('<b>━━ 本地黑名单 ━━</b>');
+		localLines.push('<b>━━ 全局黑名单（历史 / 全群 sban）━━</b>');
 		if (localCheck.isBlacklisted) {
 			const entry = localCheck.entry;
 			const reason = translateBlacklistReason(entry?.reason);
@@ -11108,7 +11196,11 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 			// 主人要看北京时间，不再让 AI 换算：ISO / 秒 / 毫秒一律过 formatBeijingTime。
 			const addedAt = formatBeijingTime(entry?.at);
 			const noteText = String(entry?.note || '').trim();
-			localLines.push('状态　　🚫 在黑名单中');
+			localLines.push('状态　　' + (isGlobalSbanEntry(entry)
+				? '🚫 第一主人 /sban 全群封禁（全群生效）'
+				: entry?.federated === true
+					? '🚫 联合名单命中（全群生效）'
+					: '🗂️ 历史全局记录（仅查询，不参与群拦截）'));
 			localLines.push('加黑方式　' + reason);
 			if (noteText) localLines.push('执行原因　' + escapeHtml(noteText));
 			localLines.push('操作人　　' + operator);
@@ -12330,22 +12422,18 @@ function hasGroupLocalBlacklist(chatId) {
 	return runtime().LOCAL_BLACKLIST_CHAT_IDS.length > 0 && runtime().LOCAL_BLACKLIST_CHAT_IDS.includes(String(chatId ?? ''));
 }
 
-// 全局 /unban 的作用范围：一律不碰独立群与杀手群。
-// 【2026-11-15 主人口径】三种治理互不沾边：独立群、杀手群只归各自治理，
-// 全局解封（含第一主人发起）不得再把它们卷进来。
+// 全群 sban / 后台全局解封的作用范围：全部配置群。
+// 【2026-11-26 主人口径】除第一主人 /sban 外没有跨群封禁；既然存在全群 sban，
+// 解除时就必须覆盖所有群，否则独立群 / 杀手群会残留封禁。
 function globalUnbanScopeGroupIds(base = runtime().GROUP_IDS) {
 	const list = Array.isArray(base) ? base : runtime().GROUP_IDS;
-	return list.filter((groupId) => !isIndependentGroup(groupId) && !isKillerModeGroup(groupId));
+	return list.map((groupId) => String(groupId));
 }
 
-// 全局封禁 / 解封的作用范围：一律跳过独立群与杀手群。
-// 【2026-11-15 主人口径】三种治理互不沾边：
-//   独立群封禁只属于独立群；全局封禁走全局；杀手群治理只属于杀手群。
-// 第一主人发起的全局封禁也不再包含这两类群 —— 要在独立群/杀手群封人，
-// 必须在该群内发起（独立群走本群黑名单，杀手群走杀手黑名单）。
+// 兼容旧调用：全群 sban 的唯一例外，范围同样取全部配置群。
 function globalScopeGroupIds(operatorId, base = runtime().GROUP_IDS) {
 	const list = Array.isArray(base) ? base : runtime().GROUP_IDS;
-	return list.filter((groupId) => !isIndependentGroup(groupId) && !isKillerModeGroup(groupId));
+	return list.map((groupId) => String(groupId));
 }
 
 // 全局自动检测联动治理群；独立群继续只治理本群。执行前另从 D1 严格复核模式。
@@ -12414,8 +12502,10 @@ async function isAdJoinGuardKillerExceptionGroup(env, chatId) {
 // 入群拦截与第三方验证覆盖后的重新禁言都要认它，否则这两个口子会把特例群退回踢人。
 async function isAutomaticAdMuteEntryCurrent(env, groupId, entry) {
 	if (isAutomaticAdMuteEntry(groupId, entry)) return true;
-	return isKillerModeGroup(groupId) && String(entry?.reason || '') === 'ad_auto'
-		&& await isAdJoinGuardKillerExceptionGroup(env, groupId);
+	// 杀手黑名单没有 autoCaseId，但自动广告定罪同样是永久禁言。
+	// 这里必须按 reason 直接认，否则入群拦截会把它误走成踢出。
+	if (isKillerModeGroup(groupId) && String(entry?.reason || '') === 'ad_auto') return true;
+	return false;
 }
 
 // 第一道防线的有效判定（同步口径 + 杀手群特例 + 独立群复核）。
@@ -12778,11 +12868,10 @@ async function rollbackAutomaticAdCaseTargets(env, snapshot) {
 	return { removed:{success:true,code:'REMOVED',local:true},retained,unbanResults,errors,complete:!errors.length };
 }
 
+// 【2026-11-26 主人口径】人工 /ad 确认也只处置事发群；全群封禁只允许第一主人 /sban。
 function manualAdDetectionScopeGroupIds(eventChatId) {
-	const scope = globalScopeGroupIds('system');
 	const eventId = String(eventChatId ?? '');
-	if (eventId && isIndependentGroup(eventId) && !scope.includes(eventId)) scope.push(eventId);
-	return scope;
+	return eventId && (isConfiguredGroup(eventId) || isKillerModeGroup(eventId)) ? [eventId] : [];
 }
 
 function newAutomaticAdCaseId() {
@@ -12793,10 +12882,10 @@ function newAutomaticAdCaseId() {
 // 第一主人封的人只有第一主人能解：单条回执、批量失败行、按钮回执共用这一句。
 const PRIMARY_LOCKED_UNBAN_TEXT = '此人由第一主人封杀';
 
-// 本群黑名单的解封资格：第一主人封的全局记录（独立群也生效）别人解不了；
-// 本群记录直接移除。返回形状与 checkManyUnbanEligibility 一致，批量任务按同一套推进。
+// 本群黑名单的解封资格：历史全局记录不再挡路；只有第一主人 /sban 的全群记录
+// 需要第一主人本人解除。本群记录直接移除。返回形状与 checkManyUnbanEligibility 一致。
 async function checkLocalUnbanEligibility(env, chatId, ids, operatorId, options = {}) {
-	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [], primaryLocked: [] };
+	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [], primaryLocked: [], globalSbanRemoved: [], fedExempted: [] };
 	// 【2026-11-26 主人口径】第一主人与本群群主解封时清学习；超管 / 普通群管理员不清。
 	const purgeLearning = options.purgeLearning === true || isPrimaryOwner(operatorId);
 	const uniqueIds = normalizeBatchMutationIds(ids);
@@ -12805,8 +12894,8 @@ async function checkLocalUnbanEligibility(env, chatId, ids, operatorId, options 
 		return results;
 	}
 	const candidates = [];
+	const globalSbanIds = new Set();
 	for (const id of uniqueIds) {
-		if (isPrimaryOwner(operatorId)) { candidates.push(id); continue; }
 		let entry = null;
 		try {
 			entry = await readD1BlacklistEntry(env, id);
@@ -12814,8 +12903,15 @@ async function checkLocalUnbanEligibility(env, chatId, ids, operatorId, options 
 			results.failed.push({ id, msg: `❌ 无法确认 D1 黑名单状态: ${toChineseErrorText(error?.message || error)}` });
 			continue;
 		}
-		if (entry && isPrimaryOwner(entry.by)) results.primaryLocked.push(id);
-		else candidates.push(id);
+		if (isGlobalSbanEntry(entry)) {
+			if (!isPrimaryOwner(operatorId)) {
+				results.primaryLocked.push(id);
+				continue;
+			}
+			globalSbanIds.add(id);
+		}
+		// 历史 manual / ad_auto / spam 等全局记录只查询，不再阻断本群解封。
+		candidates.push(id);
 	}
 	if (!candidates.length) return results;
 	const removal = await removeFromGroupBlacklist(env, chatId, candidates);
@@ -12823,7 +12919,22 @@ async function checkLocalUnbanEligibility(env, chatId, ids, operatorId, options 
 	for (const failure of removal.failed) results.failed.push({ id: String(failure.id), msg: failure.msg });
 	const failedSet = new Set(removal.failed.map((f) => String(f.id)));
 	results.eligible = candidates.filter((id) => !failedSet.has(id));
-	// 【2026-11-25 主人口径】第一主人在本群（独立群）解封同样清学习内容 ——
+	// 第一主人解全群 sban：先删全局记录，再放开所有群的 Telegram 封禁。
+	if (globalSbanIds.size) {
+		const stillEligible = [];
+		for (const id of results.eligible) {
+			if (!globalSbanIds.has(id)) { stillEligible.push(id); continue; }
+			const removed = await removeFromBlacklist(id, env);
+			if (removed.success || removed.code === 'NOT_FOUND') {
+				results.globalSbanRemoved.push(id);
+				stillEligible.push(id);
+			} else {
+				results.failed.push({ id, msg: '❌ 第一主人全群封禁记录移除失败：' + String(removed.message || '未知错误') });
+			}
+		}
+		results.eligible = stillEligible;
+	}
+	// 【2026-11-26 主人口径】第一主人在本群（独立群）解封同样清学习内容 ——
 	// 与全局 /unban 同一口径。其他管理员解封不动判据库。
 	if (purgeLearning && results.eligible.length) {
 		results.learningPurged = [];
@@ -12831,14 +12942,17 @@ async function checkLocalUnbanEligibility(env, chatId, ids, operatorId, options 
 			results.learningPurged.push(await purgeAdLearningForUser(env, id));
 		}
 	}
+	// 4甲：本群解封联合名单里的人 → 同样写本地豁免，否则下一条消息又被联合名单拦。
+	// 没订阅时 exemptFederatedOnUnban 直接返回空，零 SQL。
+	results.fedExempted = results.eligible.length
+		? await exemptFederatedOnUnban(env, results.eligible, operatorId)
+		: [];
 	return results;
 }
 
-// 全局黑名单记录在这个群生不生效：全局群一律生效；独立群只认第一主人封的。
+// 兼容旧调用：现在所有群都只认全群 sban / 联合名单，历史全局记录不再生效。
 function isGlobalEntryEffectiveInGroup(entry, chatId) {
-	if (!entry) return false;
-	if (!isIndependentGroup(chatId)) return true;
-	return isPrimaryOwner(entry.by);
+	return isEnforcedGlobalBlacklistEntry(entry);
 }
 
 async function setGroupMode(env, chatId, mode, setBy) {
@@ -12960,7 +13074,7 @@ async function addToGroupBlacklist(env, chatId, ids, options = {}) {
 			const valuesSql = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
 			const params = chunk.flatMap((id) => [chat, id, reason, by, at, note, autoCaseId, chatTitle, detailJson]);
 			const response = await env.DB
-				.prepare(`INSERT INTO group_blacklist (chat_id, user_id, reason, by_user, at, note, auto_case_id, chat_title, detail) VALUES ${valuesSql} ON CONFLICT(chat_id,user_id) DO UPDATE SET reason=excluded.reason, by_user=excluded.by_user, at=excluded.at, note=excluded.note, auto_case_id=excluded.auto_case_id, chat_title=excluded.chat_title, detail=excluded.detail WHERE group_blacklist.auto_case_id != '' OR excluded.auto_case_id = '' RETURNING user_id`)
+				.prepare(`INSERT INTO group_blacklist (chat_id, user_id, reason, by_user, at, note, auto_case_id, chat_title, detail) VALUES ${valuesSql} ON CONFLICT(chat_id,user_id) DO UPDATE SET reason=excluded.reason, by_user=excluded.by_user, at=excluded.at, note=excluded.note, auto_case_id=excluded.auto_case_id, chat_title=excluded.chat_title, detail=excluded.detail WHERE group_blacklist.auto_case_id != '' RETURNING user_id`)
 				.bind(...params)
 				.all();
 			const inserted = new Set((response?.results || []).map((row) => String(row.user_id)));
@@ -13353,14 +13467,14 @@ async function enforceKillerAdDetection(env, input, evaluation, options, ctx) {
 }
 
 // 拦截判定（发言 / 复入群 / 原生解封封回共用），输入是 checkBlacklist 的结果，返回同形状：
-//   独立群：全局记录只认第一主人封的；其余看本群黑名单。
-//   全局群：全局记录照旧；没命中且该群有本群黑名单记录（见 LOCAL_BLACKLIST_CHAT_IDS）才多查一条主键。
-// 没有独立群、也没有任何本群黑名单记录时原样返回，热路径零额外 SQL。
+//   所有群默认只看本群黑名单；历史全局记录只查询，不参与拦截。
+//   唯一例外：第一主人 /sban 写的 reason=sban 全群记录（独立群也生效），以及联合名单（独立群不接）。
 async function resolveChatBlacklistCheck(env, chatId, userId, globalCheck) {
-	const independent = isIndependentGroup(chatId);
-	// 【2026-11-15 主人口径】独立群完全不看全局记录：三种治理互不沾边，
-	// 独立群只认本群黑名单；全局封禁（含第一主人封的）不再在独立群生效。
-	if (!independent && globalCheck?.isBlacklisted) return globalCheck;
+	// 【2026-11-26 主人口径】全群封禁只保留第一主人 /sban；历史全局记录降级为查询档案。
+	// 独立群仍与联合名单隔离：只有 /sban 全群记录能进独立群，federated 不进。
+	const independentChat = isIndependentGroup(chatId);
+	if (globalCheck?.isBlacklisted && isEnforcedGlobalBlacklistEntry(globalCheck.entry)
+		&& (!independentChat || isGlobalSbanEntry(globalCheck.entry))) return globalCheck;
 	const local = await readGroupBlacklistEntrySafe(env, chatId, userId);
 	if (local) {
 		if (local.autoCaseId) {
@@ -13379,25 +13493,38 @@ async function resolveChatBlacklistCheck(env, chatId, userId, globalCheck) {
 		if (local.autoCaseId && await isDryRunGroup(env, chatId)) return { isBlacklisted: false, message: null, automaticRecordHeld: true };
 		return { isBlacklisted: true, message: '❌ 您在本群黑名单中，请联系本群管理员。', entry: local, localSource: 'local' };
 	}
+	// 杀手黑名单是独立名单，不属于 group_blacklist；发言、复入群、原生解封封回
+	// 都必须在这里兜住，否则杀手群的黑名单只会在入群申请那条路生效。
+	if (isKillerModeGroup(chatId)) {
+		const killerEntry = await readKillerBlacklistEntrySafe(env, userId);
+		if (killerEntry) return {
+			isBlacklisted: true,
+			message: '❌ 您在杀手黑名单中，请联系本群管理员。',
+			entry: killerEntry,
+			localSource: 'killer'
+		};
+	}
 	return { isBlacklisted: false, message: null };
 }
 
 const PRIVATE_MODERATION_REDIRECT_TEXT = 'ℹ️ <b>请在你的群里发这条命令</b>\n\n私聊的封禁与解封只限主人、副主人和超管；群管理员请到自己管理的群里发。';
-const INDEPENDENT_LOCAL_NOTICE = 'ℹ️ 独立群只封本群，要全局封禁请私聊机器人。';
+const INDEPENDENT_LOCAL_NOTICE = 'ℹ️ 本群封禁只作用于本群；全群封禁仅第一主人可用 /sban。';
 
 // /ban /sban /spam /unban 的分流（鉴权通过之后调用）。返回：
-//   { kind: 'global', groupIds }        → 原有全局流程，只是作用范围按身份收窄
-//   { kind: 'local', groupIds, notice } → 写本群黑名单、只踢本群、不学习
+//   { kind: 'global_sban', groupIds }   → 第一主人 /sban 的唯一全群封禁例外
+//   { kind: 'local', groupIds, notice } → 写本群黑名单、只踢本群
 //   { kind: 'reject', text }            → 拒绝（私聊收回 / 独立群缺权限）
-// 口径（2026-11-15 主人定）：三种治理互不沾边。
-//   独立群：只作用于本群，第一主人也一样；不进全局、不进杀手、不进动态群。
-//   全局群：走全局，范围排除独立群与杀手群。
-//   杀手群：用杀手权限命令，只作用于杀手群。
+// 口径（2026-11-26 主人定）：所有群默认本群治理；只有第一主人 /sban 可以全群封禁。
 function resolveModerationRoute(message, operatorId, cmd) {
 	const isUnban = cmd === 'unban';
 	const chatId = String(message?.chat?.id ?? '');
 	const inGroup = message?.chat?.type !== 'private';
-	// 独立群优先：群里的封禁/解封只作用于本群，第一主人也不例外。
+	// 第一主人 /sban 是全群封禁的唯一例外：群内、私聊都直接走全局范围。
+	// 副主人、超管、群主、群管理员都没有这个分支。
+	if (cmd === 'sban' && isPrimaryOwner(operatorId)) {
+		return { kind: 'global_sban', groupIds: runtime().GROUP_IDS.map(String), notice: '' };
+	}
+	// 独立群：/ban /spam /unban 只作用于本群。
 	if (inGroup && isIndependentGroup(chatId)) {
 		if (isPrimaryOwner(operatorId) || isSecondaryOwner(operatorId) || isSuperAdmin(operatorId)) {
 			return { kind: 'local', groupIds: [chatId], notice: INDEPENDENT_LOCAL_NOTICE };
@@ -13419,11 +13546,11 @@ function resolveModerationRoute(message, operatorId, cmd) {
 			|| message?.__operatorIsCreator === true || message?.__operatorCanRestrict === true) {
 			return { kind: 'killer', groupIds: [chatId] };
 		}
-		return { kind: 'reject', text: '❌ 杀手群只执行杀手治理：请使用杀手权限命令，或私聊第一主人使用全局命令。' };
+		return { kind: 'reject', text: '❌ 杀手群只执行杀手治理：请使用杀手权限命令；全群封禁仅第一主人可用 /sban。' };
 	}
-	// 【2026-11-26 主人口径】跨群封禁 / 解封全部取消：在哪个群发命令，就只作用于哪个群。
+	// 【2026-11-26 主人口径】除第一主人 /sban 外，跨群封禁 / 解封全部取消。
 	// 全局黑名单数据原样保留（历史记录仍可查、仍由后台管理），但不再承接新的群命令。
-	// 私聊没有群上下文，四条管理命令一律回目标群执行。
+	// 私聊只允许第一主人 /sban；其余管理命令回目标群执行。
 	if (message?.chat?.type === 'private') {
 		return { kind: 'reject', text: 'ℹ️ 跨群封禁已取消。请在要封禁 / 解封的目标群里发送 /' + cmd + '。' };
 	}
@@ -13437,43 +13564,44 @@ function markModerationScope(message, route) {
 	message.__moderationScopeLocal = route.kind === 'local';
 }
 
-// 本群黑名单（local）的执行器：
-// 写名单 → 只在 groupIds 里踢出并撤回历史发言 → 单目标时清扫当前群缓存消息。一律不学习。
-// 【现在只有 local 走这里】global 分支曾由超管的范围选择按钮用过（2026-10-25 已取消），
-// 保留 local/global 两种形参是因为批量任务 performBulkJobD1Mutation 共用同一套 job 形状。
+// 群级 / 第一主人全群 sban 的统一执行器：
+// 写名单 → 只在 groupIds 里踢出并撤回历史发言 → 单目标时清扫当前群缓存消息。
+// local=true 写 group_blacklist；local=false 只给第一主人 /sban 使用，写全局 blacklist。
 async function executeScopedModeration(message, env, ctx, opts) {
-	const { action, ids, invalid = [], note = '', local, groupIds, replyTarget = null, requestUrl = '', notice = '' } = opts;
+	const { action, ids, invalid = [], note = '', local, groupIds, replyTarget = null, requestUrl = '', notice = '', reason: reasonOverride = '' } = opts;
 	const chatId = String(message.chat.id);
+	const inGroup = message.chat?.type !== 'private';
 	const commandName = '/' + action;
-	const reason = action === 'spam' ? 'spam' : 'manual';
-	markModerationScope(message, { kind: local ? 'local' : 'global', groupIds });
+	const reason = String(reasonOverride || (action === 'spam' ? 'spam' : 'manual'));
+	markModerationScope(message, { kind: local ? 'local' : 'global_sban', groupIds });
 	const replyDetail = replyTarget?.messageId ? { msgId: replyTarget.messageId, text: replyTarget.text || '' } : null;
 	if (await startBulkModerationJobFromCommand(message, env, ctx, {
-		action, mode: 'kick', valid: ids, invalid, note, isInGroup: true, requestUrl, replyDetail, groupIds, local
+		action, mode: 'kick', valid: ids, invalid, note, isInGroup: inGroup, requestUrl, replyDetail, groupIds, local, reason
 	})) {
-		if (replyTarget?.messageId) await deleteMessage(chatId, replyTarget.messageId);
+		if (inGroup && replyTarget?.messageId) await deleteMessage(chatId, replyTarget.messageId);
 		return;
 	}
 	const by = getMessageActorId(message);
-	// 本群黑名单也要带完整现场：/check 要能看到「哪个群、什么时候、谁封的、封的哪条原文」。
+	// 加黑附表要带完整现场：/check 要能看到「哪个群、什么时候、谁封的、封的哪条原文」。
 	const operatorDetail = await resolveMessageBlacklistOperator(message);
 	const detailPayload = {
 		...(operatorDetail || {}),
 		...(replyDetail || {}),
-		reasons: [commandName + ' 本群处置', note].filter(Boolean)
+		chatId: inGroup ? chatId : '',
+		reasons: [commandName + (local ? ' 本群处置' : ' 全群封禁'), note].filter(Boolean)
 	};
 	const results = local
 		? await addToGroupBlacklist(env, chatId, ids, { reason, by, note, chatTitle: message?.chat?.title || '', detail: detailPayload })
 		: await addManyToBlacklist(ids, env, { reason, by, note, detail: detailPayload });
 	const idsToKick = [...results.success, ...results.exists];
 	// 【2026-11-26】本群命令改为独立执行后，学习不能跟着全局分支一起消失。
-	// 学习权限仍只认第一主人（learnAdFromOperatorAction 内部还有同一道门）；
-	// 正文优先取被引用消息，TGID 模式从本群缓存补最后 1000 字，资料卡由学习链路自行拉取。
+	// 第一主人 /sban 的全群封禁也走这里，学习权限仍只认第一主人（learnAdFromOperatorAction 内部还有同一道门）；
+	// 正文优先取被引用消息，TGID 模式从消息缓存补最后 1000 字，资料卡由学习链路自行拉取。
 	let learnTask = null;
 	// 同款名单（ad_spam_texts）仍按第一主人学习权限写入：只停用跨人连带执行，不停学习。
 	// 名单只供本群自动检测命中同款时使用，不再反向跨群封人。
 	let spamLearnLine = '';
-	if (local && isPrimaryOwner(by) && ['ban', 'spam', 'sban'].includes(action) && idsToKick.length) {
+	if ((local || action === 'sban') && isPrimaryOwner(by) && ['ban', 'spam', 'sban'].includes(action) && idsToKick.length) {
 		const learnTargets = idsToKick.slice(0, 20);
 		const learnTexts = new Map();
 		const spamLearnAgg = { added: 0, rejected: [], total: 0 };
@@ -13516,7 +13644,7 @@ async function executeScopedModeration(message, env, ctx, opts) {
 		banResults: await banUserFromAllGroups(id, { mode: 'kick', groupIds, probeMembership: idsToKick.length === 1 })
 	}));
 	for (const { banResults } of perUser) await recordDisposalsFromBanResults(env, banResults);
-	const cleanup = idsToKick.length === 1
+	const cleanup = inGroup && idsToKick.length === 1
 		? await cleanupCurrentChatUserMessages(env, chatId, idsToKick[0], replyTarget?.messageId ? [replyTarget.messageId] : [])
 		: null;
 	const listLabel = local ? '本群黑名单' : '全局黑名单';
@@ -13826,7 +13954,7 @@ async function handleLocalSetCommand(message, env, ctx, rest) {
 	await flash('❌ 无法识别的参数。\n' + LOCALSET_USAGE);
 }
 
-// /ban /sban /spam 在分流为非全局时的统一出口；返回 true = 已处理完。
+// /ban /sban /spam 在分流后的统一出口；返回 true = 已处理完。
 async function dispatchNonGlobalModerationRoute(route, message, env, ctx, opts) {
 	if (route.kind === 'reject') {
 		if (message.chat.type === 'private') await sendTelegramMessage(message.chat.id, route.text);
@@ -13853,6 +13981,15 @@ async function dispatchNonGlobalModerationRoute(route, message, env, ctx, opts) 
 			note: String(opts.note || ''),
 			commandName,
 			requestUrl: opts.requestUrl || ''
+		});
+		return true;
+	}
+	if (route.kind === 'global_sban') {
+		// 唯一全群封禁例外：只有第一主人能走到这里。写 reason=sban，后续所有群
+		// 的发言 / 复入 / 原生解封封回都按全群封禁处理。
+		await executeScopedModeration(message, env, ctx, {
+			...opts, local: false, groupIds: route.groupIds,
+			reason: GLOBAL_SBAN_REASON, notice: route.notice || ''
 		});
 		return true;
 	}
@@ -16247,7 +16384,12 @@ async function runAdContentReviewSingle(env,id,options={}) {
 		// 到 attempts>=8 才归档，一条要挂 5 天，队列只涨不降。
 		// 现在规定：非 operator 来源的记录，重判两次仍是 pass 就直接按 clean 收口。
 		// 放行语义不变，只是不再占用队列和 AI 额度。
-		if(row.source!=='operator'&&evaluation.verdict==='pass'&&Number(row.attempts)>=2){
+		// 资料本身没取到（暂态 5xx / 超时 / 查询未完成）时不能按 pass 收口：
+		// 这不是「判过两次都正常」，而是「根本没看见资料」。保留短间隔重试，
+		// 由 cron 的 exhausted 归档兜底，避免把未核验的人当成 clean。
+		const profileIncomplete = Array.isArray(evaluation.contentReviewIncomplete)
+			&& evaluation.contentReviewIncomplete.some(item => /资料.*(?:查询|读取).*(?:未完成|失败)|资料读取失败|资料关联频道或群组查询未完成/.test(String(item)));
+		if(row.source!=='operator'&&evaluation.verdict==='pass'&&Number(row.attempts)>=2&&!profileIncomplete){
 			await save('clean');
 			return {complete:true,clean:true,settled:true};
 		}
@@ -17395,9 +17537,9 @@ const LINKED_SPAM_LOOKBACK_MS = 24 * 60 * 60 * 1000; // 追溯窗口：24 小时
 // 他们再发一次就被「同款直封」当场拦下。
 const AD_AUTO_LINKED_MAX = 10;
 const LINKED_SPAM_MAX_TARGETS = 20;                  // 单次连带硬上限（子请求预算所限）
-// 【2026-11-26 主人口径】同款连带封禁取消：连带会跨人、跨群放大处置，全部停用。
-// 学习名单（ad_spam_texts / ad_handled_texts）照旧写入，由本群自动检测独立使用。
-const LINKED_SPAM_EXECUTION_ENABLED = false;
+// 【2026-11-26 主人口径】同款连带保留：自动检测只在本群执行；第一主人 /spam
+// 触发的手动连带仍可用，非第一主人完全静默不触发。
+const LINKED_SPAM_EXECUTION_ENABLED = true;
 
 // 同步 or 转批量：【按子请求预算动态判断，不写死号数】。
 // 离线实测（15 群）：3 个号 = 119 已超同步安全预算 100，10 个号 = 336，20 个号 = 646。
@@ -17727,11 +17869,98 @@ async function findLinkedSpamTargets(env, textKey, excludeUserId, options = {}) 
 	}
 }
 
-// 执行连带处置：删同款消息 + 加黑 + 全群封禁。仅用于 ≤ LINKED_SPAM_SYNC_MAX 的同步路径。
+// 同款连带的手动处置只写「同款消息实际出现过的本群黑名单」，不再写全局黑名单。
+// 这样每个群独立生效：A 群的连带不会因为一条全局记录跑到 B 群去。
+function linkedSpamGroupsForTarget(target, allowedGroupIds = null) {
+	const allowed = new Set((Array.isArray(allowedGroupIds) ? allowedGroupIds : nonKillerGroupIds()).map(String));
+	const groups = new Set();
+	for (const item of target?.messageIds || []) {
+		const chatId = String(item?.chatId || '');
+		if (chatId && allowed.has(chatId)) groups.add(chatId);
+	}
+	return [...groups];
+}
+
+function linkedSpamGroupsForJobTarget(job, userId) {
+	const byChat = job?.deleteTargets?.[String(userId)] || {};
+	return linkedSpamGroupsForTarget(
+		{ messageIds: Object.keys(byChat).map((chatId) => ({ chatId })) },
+		getBulkJobConfiguredGroupIds(job)
+	);
+}
+
+// /learnlast 的来源群是快照里冻结的 chatId，不是任务发起群。
+// targetGroups 存在时必须严格按它取群，空数组就代表「没有来源群」——
+// 不能回落到 linkedSpamGroupsForJobTarget，否则会把目标封到别的群。
+function scopedGroupsForJobTarget(job, userId) {
+	const uid = String(userId);
+	if (job?.targetGroups && typeof job.targetGroups === 'object') {
+		const allowed = new Set(getBulkJobConfiguredGroupIds(job));
+		return [...new Set((Array.isArray(job.targetGroups[uid]) ? job.targetGroups[uid] : [])
+			.map(String).filter((gid) => gid && allowed.has(gid)))];
+	}
+	return linkedSpamGroupsForJobTarget(job, userId);
+}
+
+function linkedSpamDetail(options = {}) {
+	const reasons = ['同款广告连带'];
+	if (options.sourceUserId) reasons.push('源账号 ' + String(options.sourceUserId));
+	if (options.note) reasons.push(String(options.note));
+	return { text: String(options.text || '').slice(0, 2000), reasons };
+}
+
+// 按「群」批量写本群黑名单，返回每个用户真正写入成功的群。
+// 后续 Telegram 封禁只使用 readyGroups，避免出现「D1 没记录下来、Telegram 却封了」的不可查处置。
+async function addLinkedSpamGroupEntries(env, userIds, groupIdsByUser, options = {}) {
+	const byGroup = new Map();
+	const failed = [];
+	for (const rawId of userIds) {
+		const id = String(rawId);
+		const groups = [...new Set((groupIdsByUser?.[id] || []).map(String).filter(Boolean))];
+		if (!groups.length) {
+			failed.push({ id, msg: '❌ 未找到该用户同款消息所在的本群，未执行封禁' });
+			continue;
+		}
+		for (const chatId of groups) {
+			if (!byGroup.has(chatId)) byGroup.set(chatId, []);
+			byGroup.get(chatId).push(id);
+		}
+	}
+	const accepted = new Set();
+	for (const [chatId, ids] of byGroup) {
+		try {
+			const result = await addToGroupBlacklist(env, chatId, ids, {
+				reason: options.reason || 'spam',
+				by: options.by,
+				note: options.note,
+				detail: options.detail || linkedSpamDetail(options)
+			});
+			for (const id of [...(result.success || []), ...(result.exists || [])]) {
+				accepted.add(chatId + '|' + String(id));
+			}
+			for (const item of result.failed || []) failed.push({ id: String(item.id), msg: item.msg });
+		} catch (error) {
+			for (const id of ids) failed.push({
+				id,
+				msg: '❌ 写入本群黑名单失败: ' + toChineseErrorText(error?.message || error)
+			});
+		}
+	}
+	const readyGroups = {};
+	for (const rawId of userIds) {
+		const id = String(rawId);
+		readyGroups[id] = (groupIdsByUser?.[id] || [])
+			.map(String)
+			.filter((chatId) => accepted.has(chatId + '|' + id));
+	}
+	return { readyGroups, failed };
+}
+
+// 执行连带处置：删同款消息 + 本群黑名单 + 只封同款消息所在群。仅用于同步路径。
 async function enforceLinkedSpamTargets(env, targets, options = {}) {
-	// 【2026-11-26 主人口径】同款连带封禁取消：不再因为别人发了同一句话就跨人封禁。
-	// 学习名单与样本记录一律保留，只停用这条执行链。
-	return [];
+	const automatic = Boolean(options.automaticChatId);
+	// 自动链路已经在事件群内跑，不需要第一主人身份；手动连带只认第一主人。
+	if (!automatic && !isPrimaryOwner(options.operatorId)) return [];
 	const done = [];
 	if (options.automaticChatId) {
 		const gid = String(options.automaticChatId);
@@ -17754,24 +17983,35 @@ async function enforceLinkedSpamTargets(env, targets, options = {}) {
 		}
 		return done;
 	}
+	const manualAllowedGroups = Array.isArray(options.groupIds) ? options.groupIds : nonKillerGroupIds();
 	for (const target of targets) {
+		const targetGroups = linkedSpamGroupsForTarget(target, manualAllowedGroups);
+		const local = await addLinkedSpamGroupEntries(env, [target.userId], {
+			[String(target.userId)]: targetGroups
+		}, {
+			by: String(options.operatorId ?? ''),
+			note: options.note || '同款广告连带查杀',
+			text: options.text,
+			sourceUserId: options.sourceUserId
+		});
+		const readyGroups = local.readyGroups[String(target.userId)] || [];
+		if (!readyGroups.length) {
+			done.push({ userId: target.userId, deleted: 0, blacklistCode: 'ERROR', banSummary: '0/0', learned: 0, groupIds: [] });
+			continue;
+		}
+		const readySet = new Set(readyGroups);
 		let deleted = 0;
 		for (const item of target.messageIds) {
+			if (!readySet.has(String(item.chatId))) continue;
 			const r = await deleteMessage(item.chatId, item.mid);
 			// 与批量路径同口径：消息已被封禁 revoke 撤回（not found）也算等效删除，不漏计。
 			if (r?.ok || isEffectivelyDeletedError(r?.error)) deleted += 1;
 		}
-		const added = await addToBlacklist(target.userId, env, {
-			reason: 'spam',
-			by: String(options.operatorId ?? 'system'),
-			note: options.note || '同款广告连带查杀',
-			// 连带的现场取反查到的第一条同款消息（原文已在上面删掉，这里只留位置）。
-			detail: {
-				chatId: target.messageIds?.[0]?.chatId || '',
-				msgId: target.messageIds?.[0]?.mid
-			}
+		const banResults = await banUserFromAllGroups(target.userId, {
+			probeMembership: false,
+			groupIds: readyGroups,
+			mode: 'kick'
 		});
-		const banResults = await banUserFromAllGroups(target.userId, { probeMembership: false, groupIds: nonKillerGroupIds() });
 		// 风控·处置：同款连带查杀按实际封成功的群逐群 +1。
 		await recordDisposalsFromBanResults(env, banResults);
 		const okCount = banResults.filter((r) => r?.ok).length;
@@ -17796,9 +18036,10 @@ async function enforceLinkedSpamTargets(env, targets, options = {}) {
 		done.push({
 			userId: target.userId,
 			deleted,
-			blacklistCode: String(added?.code || (added?.success ? 'ADDED' : 'ERROR')),
+			blacklistCode: local.failed.length ? 'PARTIAL' : 'ADDED',
 			banSummary: okCount + '/' + banResults.length,
-			learned: learnedCount
+			learned: learnedCount,
+			groupIds: readyGroups
 		});
 	}
 	return done;
@@ -18145,7 +18386,7 @@ async function notifyLinkedSpamResult(env, info) {
 		// 展示原文而非哈希：主人要能一眼判断这条文案到底是不是广告。
 		// 这正是 text_norm 存原文的核心价值 —— 纯哈希方案这里只能显示一串十六进制。
 		'<b>同款文案：</b>' + escapeHtml(String(info.textNorm || '').slice(0, 120)),
-		'<b>追溯范围：</b>24 小时内 · 全部配置群',
+		'<b>追溯范围：</b>24 小时内 · 同款消息所在群',
 		''
 	];
 	if (done.length) {
@@ -18170,7 +18411,7 @@ async function notifyLinkedSpamResult(env, info) {
 	}
 	if (allIds.length) {
 		lines.push('');
-		lines.push('<b>判错一键回滚</b>（解黑 + 全群解封）：');
+		lines.push('<b>判错回滚</b>（到对应群内发送，仅移除本群记录并解封）：');
 		lines.push('<code>/unban ' + escapeHtml(allIds.join(',')) + '</code>');
 	}
 	try {
@@ -18579,6 +18820,7 @@ function translateBlacklistReason(reason) {
 		[FED_REASON]: '联合封杀名单（来自订阅源）',
 		manual_ban: '旧版 Telegram 原生封禁同步记录',
 		manual: '管理员 /ban 指令加黑',
+		sban: '第一主人 /sban 全群封禁',
 		sa: '管理员 /spam 引用回复加黑（历史记录）',
 		spam: '管理员 /spam 引用回复加黑',
 		ad_auto: '广告自动检测加黑（历史记录）',
@@ -19109,8 +19351,8 @@ function buildAdVoteMessageText(state) {
 	let status = '<i>进行中，1 小时后截止。</i>';
 	if (state.finalized && state.result === 'approved') {
 		status = state.enforcementComplete
-			? '💀 <b>举报通过，已加入 D1 全局黑名单、执行全部 GROUP_ID 群封禁，并请求撤回其各群全部历史发言。</b>'
-			: '💀 <b>举报通过，正在执行 D1 加黑、全群封禁与历史发言撤回。</b>';
+			? '💀 <b>举报通过，已加入本群黑名单、执行本群封禁，并请求撤回其在本群的历史发言。</b>'
+			: '💀 <b>举报通过，正在执行本群加黑、本群封禁与历史发言撤回。</b>';
 	} else if (state.finalized && state.result === 'rejected') {
 		status = '❎ <b>投票已被否决，目标未处理。</b>';
 	} else if (state.finalized && state.result === 'expired') {
@@ -19614,14 +19856,14 @@ async function notifyOwnerAdVoteApproved(state, blacklistResult, banResults, del
 		'📝 举报原因:' + escapeHtml(state.reason || '未填写'),
 		'',
 	];
-	if (blacklistResult?.success) lines.push('✅ 已写入 D1 全局黑名单，原因:ad_vote');
-	else if (blacklistResult?.code === 'EXISTS') lines.push('ℹ️ 目标已在 D1 黑名单，本次仍继续执行全群封禁');
-	else lines.push('⚠️ D1 写入失败:' + escapeHtml(blacklistResult?.message || '未知错误'));
+	if (blacklistResult?.success?.length) lines.push('✅ 已写入本群黑名单，原因:ad_vote');
+	else if (blacklistResult?.exists?.length) lines.push('ℹ️ 目标已在本群黑名单，本次仍继续执行本群封禁');
+	else lines.push('⚠️ 本群黑名单写入失败:' + escapeHtml(blacklistResult?.message || blacklistResult?.failed?.[0]?.msg || '未知错误'));
 	lines.push(await renderBanResultsDetail(banResults || [], null, {
 		userId: state.targetUserId,
 		retryCommand: '/ban 或 /spam',
 	}));
-	lines.push('🧹 历史发言:全部 GROUP_ID 封禁请求均启用 revoke_messages=true；封禁成功的群由 Telegram 撤回该用户全部历史发言。');
+	lines.push('🧹 历史发言:本群封禁请求启用 revoke_messages=true；封禁成功后由 Telegram 撤回该用户在本群的全部历史发言。');
 	if (state.reportedMessageId) {
 		const outcome = classifyAdDeleteOutcome(deleteResult);
 		lines.push('🧹 被举报消息:' + escapeHtml(outcome.summary));
@@ -19639,12 +19881,12 @@ async function notifyOwnerAdVoteClosed(state) {
 		rejected: {
 			title: '广告举报投票已被否决',
 			result: '反对方胜出',
-			action: '目标未写入 D1、未执行全群封禁、未删除被举报消息。',
+			action: '目标未写入本群黑名单、未执行本群封禁、未删除被举报消息。',
 		},
 		cancelled: {
 			title: '广告举报投票已取消',
 			result: '投票被有权限的用户取消',
-			action: '目标未写入 D1、未执行全群封禁、未删除被举报消息。',
+			action: '目标未写入本群黑名单、未执行本群封禁、未删除被举报消息。',
 		},
 		expired: {
 			title: '广告举报投票已过期',
@@ -19655,7 +19897,7 @@ async function notifyOwnerAdVoteClosed(state) {
 	const meta = resultMeta[state.result] || {
 		title: '广告举报投票已结束',
 		result: String(state.result || '未知结果'),
-		action: '本次未执行 D1 写入或全群封禁。',
+		action: '本次未执行本群黑名单写入或本群封禁。',
 	};
 	const lines = [
 		'🗳️ <b>' + escapeHtml(meta.title) + '</b>',
@@ -19686,19 +19928,22 @@ async function notifyOwnerAdVoteClosed(state) {
 
 async function enforceApprovedAdVote(env, state) {
 	if (state.enforcementComplete) return;
-	const blacklistResult = await addToBlacklist(state.targetUserId, env, {
+	const sourceChatId = String(state.chatId || '');
+	if (!sourceChatId) throw new Error('/ad 投票缺少来源群，未执行封禁');
+	const blacklistResult = await addToGroupBlacklist(env, sourceChatId, [state.targetUserId], {
 		reason: 'ad_vote',
 		by: state.creatorUserId,
 		note: ('群内 /ad 举报投票通过' + (state.reason ? '：' + state.reason : '')).slice(0, 500),
+		chatTitle: state.chatTitle || '',
 		// 投票定罪是群众举报、不是哪个管理员拍板 → 身份记 system；现场是被举报的那条消息。
 		detail: {
 			operatorRole: 'system',
-			chatId: state.chatId,
+			chatId: sourceChatId,
 			msgId: state.reportedMessageId,
 			text: state.messagePreview || ''
 		}
 	});
-	const banResults = await banUserFromAllGroups(state.targetUserId, { probeMembership: true, revokeMessages: true, groupIds: nonKillerGroupIds() });
+	const banResults = await banUserFromAllGroups(state.targetUserId, { probeMembership: true, revokeMessages: true, groupIds: [sourceChatId] });
 	// 风控·处置：群内 /ad 举报投票通过后的定罪封禁，按实际封成功的群逐群 +1。
 	await recordDisposalsFromBanResults(env, banResults);
 	const historyFallback = state.reportedMessageId
@@ -20834,7 +21079,8 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 		message.from &&
 		!message.from.is_bot
 	) {
-		// 独立群：全局记录只认第一主人封的，其余看本群黑名单；独立群命中、或本群黑名单命中，一律踢出。
+		// 所有群默认看本群黑名单；第一主人 /sban 全群记录和联合名单继续全群生效。
+		// 本群记录与全群 sban 一律踢出，历史全局记录不会走到这里。
 		const blacklistCheck = await resolveChatBlacklistCheck(env, chatId, userId, await checkBlacklist(userId, env));
 		const independentChat = isIndependentGroup(chatId) || blacklistCheck.localSource === 'local';
 		if (blacklistCheck.isBlacklisted) {
@@ -20851,7 +21097,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+按人工命令口径处置`);
 				await deleteMessage(chatId, message.message_id);
 				const automaticMute = isAutomaticAdMuteEntry(chatId, blacklistCheck.entry);
-				const interceptMode = automaticMute ? 'mute' : independentChat
+				const interceptMode = automaticMute ? 'mute' : (independentChat || isGlobalSbanEntry(blacklistCheck.entry))
 					? 'kick'
 					: (isKillerModeGroup(chatId) && isKillerMuteReason(blacklistCheck.entry?.reason)
 						? 'mute'
@@ -21232,7 +21478,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 					if (spamTextLearnLine) lines.push(spamTextLearnLine);
 				}
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
-					flashText = `${result.success ? '✅ 已加黑并全群踢出封禁' : '⚠️ 已在黑名单，已继续全群踢出封禁'}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
+					flashText = `${result.success ? '✅ 已加黑并本群踢出封禁' : '⚠️ 已在黑名单，已继续本群踢出封禁'}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
 				} else {
 					lines.push(`🎯 目标用户:${targetMention}`);
 					lines.push('');
@@ -21474,9 +21720,11 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				// 连带处置整块移入 ctx.waitUntil：findLinkedSpamTargets 反查 + 受保护过滤 +
 				// enforceLinkedSpamTargets（串行 deleteMessage/addToBlacklist/banUserFromAllGroups）。
 				// 下面的函数体沿用原来的缩进层级（整块搬运，刻意不重排，减少 diff 出错面）。
-				// 【2026-11-26 主人口径】同款连带已取消：不再反查其他用户、不再跨人封禁。
-				// 置空 key 让下面整块跳过，只保留 /spam 本人的本群处置。
-				const linkedKey = '';
+				// 【2026-11-26 主人口径】同款连带保留：第一主人 /spam 仍反查同款并处置；
+				// 副主人 / 超管 / 群管理员不走这一段，完全静默。
+				const linkedKey = buildModerationTextKey(repliedMsg);
+				const linkedAllowedGroups = isIndependentGroup(chatId) ? [chatId] : nonKillerGroupIds();
+				const linkedAllowedSet = new Set(linkedAllowedGroups.map(String));
 				const runLinkedSpam = async () => {
 				try {
 				if (linkedKey) {
@@ -21493,14 +21741,16 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 						}
 						found.targets = kept;
 					}
+					// 只保留同款消息确实落在可治理群里的目标；杀手群 / 明确独立群不跨群波及。
+					found.targets = (found.targets || []).filter((target) => linkedSpamGroupsForTarget(target, linkedAllowedGroups).length > 0);
 					if (found.targets.length) {
 						const noteText = '同款广告连带(/spam ' + linkedUserId + ')';
 						if (shouldRunLinkedSpamSync(found.targets.length)) {
 							// 同步路径：仅当子请求估算在安全预算内才当场执行（群少时才可能走到）。
 							const done = await enforceLinkedSpamTargets(env, found.targets, {
-								operatorId, note: noteText,
+								operatorId, note: noteText, groupIds: linkedAllowedGroups,
 								// 【2026-11-24】同款正文带进去，同步连带也按第一主人口径全量学习。
-								text: linkedKey.norm,
+								text: linkedKey.norm, sourceUserId: repliedUserId,
 								invocationMessage: message
 							});
 							// 【刻意不写进 lines】lines 走 detailText，而 detailText 会同时投给副主人
@@ -21514,23 +21764,33 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 							});
 						} else {
 							// 超过同步预算：转 D1 批量任务 + Queues 分片续接，复用既有机制。
-							const linkedIds = found.targets.map((t) => t.userId);
 							// 把反查已经拿到的 mid 按「用户 → 群 → mid 列表」整形带进任务，
 							// 让批量路径也能删掉那几条同款消息 ——
 							// 此前只有同步路径删消息，批量路径只加黑封禁，消息原样留在群里（线上实测）。
 							const deleteTargets = {};
+							const linkedGroupIds = new Set();
 							for (const t of found.targets) {
 								const byChat = {};
 								for (const item of t.messageIds || []) {
 									const chatKey = String(item.chatId);
+									if (!linkedAllowedSet.has(chatKey)) continue;
 									if (!byChat[chatKey]) byChat[chatKey] = [];
 									if (!byChat[chatKey].includes(item.mid)) byChat[chatKey].push(item.mid);
 								}
-								if (Object.keys(byChat).length) deleteTargets[String(t.userId)] = byChat;
+								if (Object.keys(byChat).length) {
+									deleteTargets[String(t.userId)] = byChat;
+									for (const gid of Object.keys(byChat)) linkedGroupIds.add(gid);
+								}
 							}
+							const linkedIds = Object.keys(deleteTargets);
+							if (!linkedIds.length) return;
 							const job = await createBulkJob(env, 'spam', linkedIds, [], noteText, message, {
-								deleteTargets: Object.keys(deleteTargets).length ? deleteTargets : null,
-								groupIds: nonKillerGroupIds()
+								deleteTargets,
+								groupIds: [...linkedGroupIds],
+								mode: 'kick',
+								linkedScoped: true,
+								linkedText: linkedKey.norm,
+								linkedSourceUserId: repliedUserId
 							});
 							const queueAvailable = Boolean(getBulkQueue(env));
 							if (!queueAvailable) { job.autoContinue = false; await saveBulkJob(env, job); }
@@ -21552,12 +21812,20 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				console.error('[同款连带] 执行失败:', error);
 			}
 				};
-				// 【2026-11-26 主人口径】同款连带已取消：不再后台反查，也不再发「同款查杀中」私聊。
-				// 上面的 runLinkedSpam 实现保留但不可达（linkedKey 恒为空）。
+				// 状态行只私聊第一主人，绝不进 lines：连带能力仅第一主人可见，群里不留痕。
+				let linkedStatusText = '';
+				if (linkedKey) {
+					linkedStatusText = '🔗 同款:后台查杀中，结果单独私聊';
+					if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(runLinkedSpam());
+					else await runLinkedSpam();
+				} else {
+					linkedStatusText = '🔗 同款:本条没有可反查的正文（图片/贴纸或无文字），未启动连带';
+				}
+				await sendTelegramMessage(String(operatorId), linkedStatusText);
 			}
 
 			await replyToModerationAdmin(message, ctx, {
-				flashText: `${result.success ? '✅ 已加黑并全群踢出封禁' : '⚠️ 已在黑名单，已继续全群踢出封禁'}\n🎯 ${formatUserReference(repliedUserId, repliedMsg.from)} <code>${escapeHtml(String(repliedUserId))}</code>`,
+				flashText: `${result.success ? '✅ 已加黑并本群踢出封禁' : '⚠️ 已在黑名单，已继续本群踢出封禁'}\n🎯 ${formatUserReference(repliedUserId, repliedMsg.from)} <code>${escapeHtml(String(repliedUserId))}</code>`,
 				detailText: withActionContext(message, lines.join('\n'), replySpamNote),
 				isInGroup,
 				notifySecondaryOwners: true
@@ -22243,7 +22511,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				+ '🏷️ 群名:' + escapeHtml(groupTitle) + '\n'
 				+ '🆔 群 ID:<code>' + escapeHtml(targetId) + '</code>\n\n'
 				+ '已从动态群组列表移除，正在退出该群。\n'
-				+ '该群不再受任何治理：黑名单拦截、广告检测、全群封禁、/stats 全部停止。\n\n'
+				+ '该群不再受任何治理：黑名单拦截、广告检测、封禁治理、/stats 全部停止。\n\n'
 				+ 'ℹ️ 要恢复:把机器人重新拉进群即可（第一主人操作会自动纳入），'
 				+ '或在私聊用 <code>/addgroup ' + escapeHtml(targetId) + '</code>。');
 
@@ -22344,7 +22612,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				'',
 				`📊 当前生效群组:${totalGroups} 个（环境变量 ${runtime().ENV_GROUP_IDS.length} + 指令添加 ${runtime().DYNAMIC_GROUP_IDS.length + 1}）`,
 				'',
-				'ℹ️ 该群已纳入全套治理:黑名单拦截、复入群踢回、广告自动检测、/ban /spam 全群封禁、/purge 清扫、批量任务。',
+				'ℹ️ 该群已纳入全套治理:黑名单拦截、复入群踢回、广告自动检测、/ban /spam 本群封禁、/purge 清扫、批量任务。',
 				'⚠️ 群数增加会线性放大全群操作的耗时与请求数，批量任务会更早转为异步执行。',
 			].filter(Boolean).join('\n'),
 		);
@@ -22518,7 +22786,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				lines.push(`🎯 目标用户:${targetMention}`);
 				lines.push('');
 				if (alreadyExists) {
-					lines.push(`⚠️ <b>该用户已在黑名单中,本次已继续执行${isSban ? '全群踢出' : '全群处置'}</b>`);
+					lines.push(`⚠️ <b>该用户已在黑名单中,本次已继续执行${isSban ? '全群踢出' : '本群处置'}</b>`);
 				}
 								// /ban 与 /sban 的学习（这段两者共用，只差 source）——
 				// 此前这两条命令一个特征都不学：封得越多、漏得越多，因为封掉的那些
@@ -22569,7 +22837,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 						lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
 					}
 				}
-				flashText = `${result.success ? (isSban ? '✅ 已加黑并全群踢出' : '✅ 已加黑并全群踢出封禁') : (isSban ? '⚠️ 已在黑名单，已继续全群踢出' : '⚠️ 已在黑名单，已继续全群踢出封禁')}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
+				flashText = `${result.success ? (isSban ? '✅ 已加黑并全群踢出' : '✅ 已加黑并本群踢出封禁') : (isSban ? '⚠️ 已在黑名单，已继续全群踢出' : '⚠️ 已在黑名单，已继续本群踢出封禁')}\n🎯 ${targetMention}\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
 				lines.push(`🎯 目标用户:${targetMention}`);
@@ -22801,17 +23069,19 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				}
 
 				const d1RecordRemoved = eligibility.d1Removed.includes(targetId);
+				const globalSbanRemoved = (eligibility.globalSbanRemoved || []).includes(targetId);
+				const unbanGroupIds = globalSbanRemoved ? runtime().GROUP_IDS : unbanRoute.groupIds;
 				const fedExempted = (eligibility.fedExempted || []).includes(targetId);
 				const fedLine = fedExempted ? `\n🌐 ${FED_EXEMPT_NOTICE}` : '';
 				// 【2026-11-24 主人口径】/unban 只看全局表，群级记录不说一句，主人就会看到
 				// 「目标不在 D1 黑名单」而群里仍显示「在本群黑名单中」，事后在群里搜不到任何依据。
 				// 这里把「本次自动清掉几条」和「哪些群仍保留人工记录」都摆进回执。
 				const removedGroupBans = Array.isArray(eligibility.localAutoRemoved)
-					? eligibility.localAutoRemoved.filter((row) => (unbanRoute.groupIds || []).map(String).includes(String(row.chatId)))
+					? eligibility.localAutoRemoved.filter((row) => (unbanGroupIds || []).map(String).includes(String(row.chatId)))
 					: [];
 				let remainingGroupBans = [];
 				try {
-					const scope = new Set((unbanRoute.groupIds || []).map(String));
+					const scope = new Set((unbanGroupIds || []).map(String));
 					remainingGroupBans = (await readUserGroupBans(env, targetId)).filter((row) => scope.has(String(row.chatId)));
 				} catch (error) {
 					console.error('[/unban] 读取本群黑名单失败:', error?.message || error);
@@ -22827,8 +23097,9 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 							+ escapeHtml(formatGroupBanReason(row.reason)) + '（' + escapeHtml(row.at || '时间未知') + '）').join('\n'),
 						'ℹ️ 本群黑名单由该群自治，全局 /unban 不代删；请在该群发 <code>/unban ' + escapeHtml(targetId) + '</code>，或让该群管理员处理。');
 				}
-				const unbanResults = await unbanUserFromAllGroups(targetId, unbanRoute.groupIds);
+				const unbanResults = await unbanUserFromAllGroups(targetId, unbanGroupIds);
 				if (fedExempted) lines.push(`🌐 <b>${FED_EXEMPT_NOTICE}</b>`);
+				if (globalSbanRemoved) lines.push('✅ <b>已解除第一主人 /sban 全群封禁记录</b>');
 				lines.push(
 					d1RecordRemoved
 						? (unbanLocal ? '✅ <b>目标原在本群黑名单，已移除记录并允许解封</b>' : '✅ <b>目标原在 D1 黑名单，已由管理层移除记录并允许解封</b>')
@@ -22847,8 +23118,8 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				);
 				if (groupBanReport.length) lines.push('', ...groupBanReport);
 				await replyToModerationAdmin(message, ctx, {
-					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封${fedLine}\n${renderUnbanResults(unbanResults)}`,
-					groupText: `🔓 已解封\n🎯 ${targetMention}${fedLine}\n${renderUnbanResults(unbanResults)}`
+					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封${fedLine}${globalSbanRemoved ? '\n🔓 已解除全群 sban' : ''}\n${renderUnbanResults(unbanResults)}`,
+					groupText: `🔓 已解封\n🎯 ${targetMention}${fedLine}${globalSbanRemoved ? '\n🔓 已解除全群 sban' : ''}\n${renderUnbanResults(unbanResults)}`
 						+ (remainingGroupBans.length ? '\n⛔ 本群黑名单仍在生效: ' + remainingGroupBans.length + ' 个群（需在该群发 /unban）' : '')
 						+ (purgeNotice ? '\n🧽 已清理该用户已录入的指纹与学习内容' : '\n💡 要彻底纠正请用 /ignore（/unban 不撤销判定痕迹）'),
 					detailText: lines.join('\n'),
@@ -22861,12 +23132,13 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 			const results = await checkUnbanTargets(valid);
 			const purgeNotice = formatAdLearningPurgeNotice(results.learningPurged);
 			const idsToUnban = [...results.eligible];
+			const globalSbanRemoved = new Set(results.globalSbanRemoved || []);
 			const userProfiles = await resolveBatchUserProfiles(valid, chatId);
 			const unbanSummary = { okAll: 0, partial: 0, failedAll: 0 };
 			const perUserUnbanResults = await mapWithConcurrency(
 				idsToUnban,
 				BULK_TASK_CONCURRENCY,
-				async (id) => ({ userId: id, unbanResults: await unbanUserFromAllGroups(id, unbanRoute.groupIds) })
+				async (id) => ({ userId: id, unbanResults: await unbanUserFromAllGroups(id, globalSbanRemoved.has(id) ? runtime().GROUP_IDS : unbanRoute.groupIds) })
 			);
 			for (const { unbanResults } of perUserUnbanResults) {
 				const okCount = unbanResults.filter((r) => r.ok).length;
@@ -26018,8 +26290,8 @@ const AD_TAXONOMY = [
 			soft: ['破解', '定位', '黑客'] },
 	] },
 	{ key: 'account', label: '账号交易', severity: 4, subs: [
-		{ name: '账号买卖', hard: ['收号', '出号', '老账号', '实名号', '四件套', '卡商', '接码平台', '虚拟号段', '号商'],
-			soft: ['买卖账号', '账号交易', '实名'] },
+		{ name: '账号买卖', hard: ['收号', '出号', '老账号', '实名号', '卡商', '接码平台', '虚拟号段', '号商'],
+			soft: ['买卖账号', '账号交易', '实名', '四件套'] },
 		{ name: '代实名', hard: ['代实名', '过人脸', '解封号', '代认证'],
 			soft: ['实名认证', '认证'] },
 	] },
@@ -26099,6 +26371,9 @@ function buildAdTaxonomyTexts(text) {
 // hard 的语义是「这个位置自己就够定罪」：命中某个 severity>=4 类的 hard 词，
 // 或同一个小类里 soft 词命中 >= 2 个（「现货 + 正品」这种组合也算实锤）。
 function classifyAdTaxonomy(text) {
+	// 举报 / 反诈 / 明确否定推广的整段语境不进分类表 —— 否则「举报赌场广告」会被当成赌博广告。
+	// 与 adExemptAnalysis 的语境豁免同源：有明确推广证据时 isAdNonPromotionalContext 为 false，不会误放真广告。
+	if (isAdNonPromotionalContext(text)) return { hits: [], categories: [], severity: 0, hard: false, labels: [], hardCount: 0 };
 	const texts = buildAdTaxonomyTexts(text);
 	if (!texts.length) return { hits: [], categories: [], severity: 0, hard: false, labels: [], hardCount: 0 };
 	const hits = [];
@@ -39964,7 +40239,7 @@ function renderAdImageMissBanResult(uid, out) {
 		: '未执行';
 	return [
 		'🔒 已按主人确认封禁　TGID <code>' + escapeHtml(uid) + '</code>',
-		'全群封禁：' + escapeHtml(out.banSummary || '未知') + '（已撤回他在各群的历史发言）',
+		'本群封禁：' + escapeHtml(out.banSummary || '未知') + '（已撤回他在本群的历史发言）',
 		'删本群历史消息：' + del,
 		'黑名单：' + escapeHtml(bl),
 		'这张图：' + (out.imageMarked ? '已记为广告，下次谁发都秒封' : '未记录（图片标识缺失）')
@@ -42451,7 +42726,7 @@ async function handleAdFixButtonCallback(callbackQuery, env) {
 			}
 			await answerAdVoteCallback(callbackQuery?.id, '已确认封禁 ' + payloadStr);
 			await editTelegramMessage(chatId, messageId, originText + '\n─────\n🔒 已按主人确认封禁　TGID <code>'
-				+ escapeHtml(payloadStr) + '</code>\n全群封禁 + 拉黑 + 学指纹已执行，明细见上一条。');
+				+ escapeHtml(payloadStr) + '</code>\n本群封禁 + 拉黑 + 学指纹已执行，明细见上一条。');
 			return;
 		}
 		// 主人判定正常：撤销现场学习并保存负反馈，避免只清观察后再次提醒。
@@ -43560,7 +43835,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		if (joinGuard && !await isAdJoinGuardGroupCurrent(env, chatId))
 			return {banned:false,complete:true,released:true,reason:'join_guard_excluded'};
 		if(options.automaticCaseId){
-			const priorTargets=await loadAutomaticAdCaseTargets(env,options.automaticCaseId,userId,localScope?'local':'global');
+			const priorTargets=await loadAutomaticAdCaseTargets(env,options.automaticCaseId,userId,'local');
 			const released=new Set(priorTargets.filter(row=>['released','rolled_back','superseded'].includes(row.state)).map(row=>String(row.chat_id)));
 			automaticScopeGroupIds=automaticScopeGroupIds.filter(gid=>!released.has(String(gid)));
 			if(released.has(chatId))joinRequest=false;
@@ -43647,14 +43922,14 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			prepareAutomaticTarget = async gid => {
 				let target;
 				try {
-				await saveAutomaticAdTarget(env,autoCaseId,gid,userId,chatId,localScope?'local':'global');
+				await saveAutomaticAdTarget(env,autoCaseId,gid,userId,chatId,'local');
 				const localAdded = await addToGroupBlacklist(env,gid,[userId],{reason:'ad_auto',by:'system',note,autoCaseId,
 					chatTitle: input?.chatTitle || '', detail: buildAutomaticGroupBlacklistDetail(input, evaluation)});
 				const current = await readGroupBlacklistEntry(env,gid,userId);
 				const owned = current?.autoCaseId === autoCaseId;
 				const state = localAdded.failed.length ? 'failed' : owned ? 'pending' : 'skipped';
 				target = {chatId:gid,autoCaseId,owned,state}; automaticTargets.push(target);
-				await saveAutomaticAdTarget(env,autoCaseId,gid,userId,chatId,localScope?'local':'global',
+				await saveAutomaticAdTarget(env,autoCaseId,gid,userId,chatId,'local',
 					{owned,state,result:owned?{}:{reason:localAdded.failed.length?'blacklist_write_failed':'manual_punishment_retained'}});
 				} catch (error) {
 					if (!target) { target = {chatId:gid,autoCaseId,owned:false,state:'failed'}; automaticTargets.push(target); }
@@ -43668,16 +43943,22 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 				options.drillCloseReplay === true ? BAN_ALL_GROUPS_CONCURRENCY : 1, prepareAutomaticTarget);
 			if (!joinGuard) for (const gid of automaticRoute.skipped) await skipAutomaticAdCaseTarget(env,{caseId:autoCaseId,userId,chatId:gid,reason:automaticRoute.skipReasons[gid]});
 			added = {code:automaticTargets.some(row=>row.state==='failed')?'ERROR':automaticTargets.some(row=>row.owned)?'ADDED':'EXISTS'};
-		} else added = await addToBlacklist(userId, env, {
-			reason: 'ad_auto', by: 'system', note,
-			// 自动定罪的现场：所在群、消息、原文、逐条判据（与 /pending 案底同一份 reasons）。
-			detail: {
-				chatId,
-				msgId: input?.messageId,
-				text: evaluation?.snapshot?.text || '',
-				reasons: Array.isArray(evaluation?.reasons) ? evaluation.reasons : []
-			}
-		});
+		} else {
+			// 【2026-11-26 主人口径】人工 /ad 确认同样只写事发群的本群黑名单，
+			// 不再写全局 blacklist；全群封禁只允许第一主人 /sban。
+			const manualDetail = {
+				...buildAutomaticGroupBlacklistDetail(input, evaluation),
+				operatorRole: options.ownerConfirmed ? 'primary_owner' : options.manualAction ? 'group_operator' : 'system'
+			};
+			const addedLocal = await addToGroupBlacklist(env, chatId, [userId], {
+				reason: 'ad_auto',
+				by: options.ownerConfirmed ? String(getOwnerNotifyTargets()[0] || 'system') : 'system',
+				note,
+				chatTitle: input?.chatTitle || '',
+				detail: manualDetail
+			});
+			added = { code: addedLocal.success.length ? 'ADDED' : addedLocal.exists.length ? 'EXISTS' : 'ERROR' };
+		}
 		blacklistCode = String(added?.code || (added?.success ? 'ADDED' : 'ERROR'));
 	} catch (error) {
 		console.error('[广告检测] 加入黑名单失败:', error);
@@ -43757,7 +44038,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 							skipped:Number(previous.attempted)===1&&previous.priorState!=='already_banned'?'already_banned':'preexisting_native_ban',
 							automaticNotExecuted:true,automaticPriorState:previous.priorState||'already_banned'};
 					}
-					await saveAutomaticAdTarget(env,autoCaseId,gid,userId,chatId,localScope?'local':'global',
+					await saveAutomaticAdTarget(env,autoCaseId,gid,userId,chatId,'local',
 						{owned:1,state:'executing',result:{attempted:true,priorState:probes.get(gid)?.state||'unobserved'}});
 					const last = await resolveAutomaticAdTargets(env,chatId,{...options,automaticPolicy:automaticRoute.policy,autoTargetGroupIds:[gid]});
 					if (!last.groupIds.includes(gid)) {
@@ -43778,13 +44059,15 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			await mapWithConcurrency(banResults, options.drillCloseReplay === true ? BAN_ALL_GROUPS_CONCURRENCY : 1, async result => {
 				const target = automaticTargets.find(row=>row.chatId===String(result.groupId));
 				if (!target || !target.owned || result.skipped==='independent_mode') return;
-				try { await saveAutomaticAdTarget(env,autoCaseId,result.groupId,userId,chatId,localScope?'local':'global',
+				try { await saveAutomaticAdTarget(env,autoCaseId,result.groupId,userId,chatId,'local',
 					{owned:1,state:result.skipped?'skipped':result.ok?'done':'failed',result:{ok:result.ok,skipped:result.skipped||'',error:result.error||'',mode:result.muted?'mute':'kick',pendingMute:result.pendingMute===true,
 						attempted:result.automaticNotExecuted!==true&&!result.skipped,priorState:result.automaticPriorState||result.memberProbe?.state||'unobserved',sharedCaseId:result.reviewSharedCaseId||''}}); }
 				catch (_) { result.ok=false; result.accountingFailed=true; result.error='自动处罚结果记账失败，保留重试'; }
 			});
 			// 【2026-11-25 主人口径】退群残留不留：本次探测到不在群里的，把刚写进黑名单的那条删掉。
-			try {
+			// 【2026-11-26】入群申请/已入群筛查的用户此刻本来就不在群里，
+			// 这条记录是「入群前预封」，必须保留，不能当成退群残留清掉。
+			if (!joinGuard) try {
 				const leftDropped = await dropLeftGroupBlacklistForResults(env, banResults, autoCaseId);
 				if (leftDropped > 0) console.log('[退群残留] 即时清理 ' + leftDropped + ' 条不在群内的黑名单记录');
 			} catch (error) { console.error('[退群残留] 即时清理失败：' + formatD1SchemaError(error)); }
@@ -43946,7 +44229,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	let seq = null;
 	if (ownerId) {
 		// 归属字段排在最前并以本次值覆盖：即便超长现场被限长，也不能丢标记而回退成全局回滚。
-		const punishmentMarker = { automatic, punishmentScope: automatic && localScope ? 'local' : 'global', punishmentChatId: chatId,
+		const punishmentMarker = { automatic, punishmentScope: 'local', punishmentChatId: chatId,
 			autoCaseId,groupAdContextKey,...(automatic?{punishmentTargets:automaticTargets.map(row=>({chatId:row.chatId,autoCaseId:row.autoCaseId}))}:{}) };
 		evaluation.snapshot = Object.assign({ ...punishmentMarker }, evaluation.snapshot || {}, punishmentMarker);
 		seq = await allocateAdPendingSnapshot(env, ownerId, {
@@ -43982,8 +44265,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			// 回执底部挂两档纠错按钮：主人不用手打 /ignore <序号>（他手上未必有那个号），
 			// 也不用去查 /unban 的黑名单硬闸门 —— 看完判据当场就能点。见 buildAdNoticeKeyboard。
 			const groupLabel = noticeChatTitle ? '<a href="https://t.me/c/' + escapeHtml(chatId.replace(/^-100/, '')) + '">' + escapeHtml(noticeChatTitle) + '</a> ' : '';
-			const scopeLine = automatic ? localScope ? '\n范围：独立群本群自动治理（' + groupLabel + '<code>' + escapeHtml(chatId) + '</code>）'
-				: '\n范围：联动 '+automaticScopeGroupIds.length+' 个非独立治理群；独立群不参与，逐群记录自动处罚归属' : '';
+			const scopeLine = automatic ? '\n范围：本群自动治理（' + groupLabel + '<code>' + escapeHtml(chatId) + '</code>）' : '';
 			await sendAdNoticeWithPending(env, ownerId, notice + scopeLine, appendAdTraceButton(buildAdNoticeKeyboard(seq, userId, { automatic }), chatId, triggerMessageId), {
 				id: 'owner-case:' + chatId + ':' + String(seq), kind: 'owner_ad_case', caseId: String(seq),
 				chatId, dedupeKey: 'owner_notice:' + chatId + ':' + String(seq)
@@ -44719,7 +45001,7 @@ async function handleAdRecentCommand(message, env, ctx) {
 	lines.push('✅ <b>请私聊我</b>核对后学习（群内不能学）：');
 	lines.push('单条直接点上面对应的 /learnlast 序号即可发送；');
 	lines.push('多条手打一条即可，如 /learnlast 1,3,5');
-	lines.push('⚠️ 学习会<b>同时加黑并全群封禁</b>该条的发送者，判错用回执里的 <code>/unban</code> 一键回滚。');
+	lines.push('⚠️ 学习会<b>同时加入来源群的本群黑名单并只封该群</b>，判错用回执里的 <code>/unban</code> 一键回滚。');
 
 	await replyToAdmin(message, ctx, {
 		flashText: '📋 ' + items.length + ' 条学习候选已推送私聊',
@@ -44756,15 +45038,22 @@ async function handleAdLearnLastCommand(env, chatId, ownerId, arg) {
 	let learnedTotal = 0;
 	let sampleTotal = 0;
 	let skeletonTotal = 0;
-	// 发广告的号：学完顺手加黑 + 全群封禁，不必再手动发 /ban。
+	// 发广告的号：学完只处置快照里的来源群，绝不跨群。
 	// 【为什么能直接封】能进这一步的前提是第一主人已经逐条核对过快照内容 ——
 	// 与 /spam 同等的人工判定强度，没有理由再让他多打一条命令。
-	const banTargets = new Set();
+	const banTargets = new Map();
+	const selectedTexts = [];
 	for (const idx of indices) {
 		const it = list[idx - 1];
 		if (!it) continue;
 		const text = String(it.text || '');
-		if (it.fromId && /^\d+$/.test(String(it.fromId))) banTargets.add(String(it.fromId));
+		if (it.fromId && /^\d+$/.test(String(it.fromId))) {
+			const uid = String(it.fromId);
+			if (!banTargets.has(uid)) banTargets.set(uid, new Set());
+			const sourceChatId = String(it.chatId || '');
+			if (sourceChatId && isConfiguredGroup(sourceChatId)) banTargets.get(uid).add(sourceChatId);
+			selectedTexts.push(text);
+		}
 		// source 用 'learnlast'：不是 'auto' → 自动跳过 learnAdFingerprints 的强动词闸门
 		//（人工判定不需要那道防自动学习的闸）；又不是 'manual' → 仍受误报退役机制约束，
 		// 万一学错了，/ignore 累计误报后能自动清掉，不会留成永久误封源。
@@ -44790,52 +45079,71 @@ async function handleAdLearnLastCommand(env, chatId, ownerId, arg) {
 	lines.push('');
 	lines.push('合计：指纹 <b>+' + learnedTotal + '</b>　AI 样本 <b>+' + sampleTotal + '</b>　正文骨架 <b>+' + skeletonTotal + '</b>');
 
-	// ===== 处置发广告的号：加黑 + 全群封禁（2026-09-12 主人要求）=====
-	// 同步 / 批量的分流【按子请求预算动态判断】，与连带查杀同一套口径（shouldUseBulkQueue）——
-	// 离线实测 15 群时：1 个号 57 子请求（安全），3 个号 119 已超同步预算 100。
-	// 写死号数会在群数增长后失效，所以一律交给预算函数判断。
-	const targetIds = [...banTargets];
+	// ===== 处置发广告的号：只写来源群本群黑名单 + 只封来源群 =====
+	// 快照条目自带 chatId；同一个号在多群出现时，逐群独立处置，绝不扩到其它群。
+	const targetGroups = {};
+	for (const [uid, groups] of banTargets) {
+		const list = [...groups].filter((gid) => isConfiguredGroup(gid));
+		if (list.length) targetGroups[uid] = list;
+	}
+	const targetIds = Object.keys(targetGroups);
+	const learnText = selectedTexts.join('\n').slice(0, 2000);
 	if (targetIds.length) {
+		const allGroups = [...new Set(Object.values(targetGroups).flat())];
+		const maxGroups = Math.max(1, ...targetIds.map((uid) => targetGroups[uid].length));
 		lines.push('');
 		try {
-			if (shouldRunLinkedSpamSync(targetIds.length)) {
+			// 同步 / 批量的分流按实际「用户 × 来源群」预算判断；批量任务携带 targetGroups，
+			// 执行时仍严格只写这些群、只封这些群。
+			const budget = shouldUseBulkQueue(targetIds.length, maxGroups, { probeMembership: false });
+			if (!budget.useQueue) {
+				const local = await addLinkedSpamGroupEntries(env, targetIds, targetGroups, {
+					by: ownerId, note: '/learnlast 学习并处置', reason: 'spam', text: learnText,
+					detail: { text: learnText, reasons: ['/learnlast 学习并处置'], operatorRole: 'primary_owner' }
+				});
 				const done = [];
 				for (const uid of targetIds) {
-					const added = await addToBlacklist(uid, env, {
-						reason: 'spam', by: ownerId, note: '/learnlast 学习并处置'
-					});
-					const banResults = await banUserFromAllGroups(uid, { probeMembership: false });
+					const groups = local.readyGroups[uid] || [];
+					if (!groups.length) { done.push({ uid, code: 'ERROR', ban: '0/0' }); continue; }
+					const banResults = await banUserFromAllGroups(uid, { probeMembership: false, mode: 'human', groupIds: groups });
 					// 风控·处置：/learnlast 学习并处置按封成功群逐群 +1。
 					await recordDisposalsFromBanResults(env, banResults);
 					const okCount = banResults.filter((r) => r?.ok).length;
-					done.push({ uid, code: String(added?.code || (added?.success ? 'ADDED' : 'ERROR')), ban: okCount + '/' + banResults.length });
+					done.push({ uid, code: 'ADDED', ban: okCount + '/' + banResults.length });
 				}
-				lines.push('<b>已处置 ' + done.length + ' 个发广告的号</b>');
+				lines.push('<b>已处置 ' + done.length + ' 个发广告的号</b>（只写来源群本群黑名单、只封来源群）');
 				for (const d of done) {
 					lines.push('· <code>' + escapeHtml(d.uid) + '</code>　黑名单:'
 						+ (d.code === 'ADDED' ? '已加入' : d.code === 'EXISTS' ? '此前已在' : d.code)
 						+ '　封禁:' + d.ban);
 				}
 			} else {
-				// 超同步预算：转 D1 批量任务 + Queues 分片续接，复用既有机制。
+				// 超同步预算：转 D1 批量任务 + Queues 分片续接；targetGroups 保证每个号只封自己的来源群。
 				const job = await createBulkJob(env, 'spam', targetIds, [], '/learnlast 学习并处置', {
 					chat: { id: chatId, type: 'private' },
 					from: { id: Number(ownerId) || 0 }
+				}, {
+					groupIds: allGroups,
+					targetGroups,
+					reason: 'spam',
+					mode: 'human',
+					linkedText: learnText,
+					notifySourceChat: false
 				});
 				if (!getBulkQueue(env)) { job.autoContinue = false; await saveBulkJob(env, job); }
-				lines.push('<b>' + targetIds.length + ' 个发广告的号已转批量任务</b>（超同步子请求预算）');
+				lines.push('<b>' + targetIds.length + ' 个发广告的号已转批量任务</b>（超同步子请求预算；只封各自来源群）');
 				lines.push('任务号:<code>' + escapeHtml(job.id) + '</code>　进度:<code>/job ' + escapeHtml(job.id) + '</code>');
 			}
 			lines.push('');
 			lines.push('判错一键回滚：<code>/unban ' + escapeHtml(targetIds.join(',')) + '</code>');
 		} catch (error) {
 			// 处置失败绝不回滚已完成的学习 —— 指纹与样本已经入库，那部分是有效成果。
-			console.error('[learnlast] 加黑/封禁失败:', error);
-			lines.push('⚠️ 学习已完成，但加黑/封禁出错：' + escapeHtml(toChineseErrorText(String(error?.message || error))));
-			lines.push('可手动执行：<code>/ban ' + escapeHtml(targetIds.join(',')) + '</code>');
+			console.error('[learnlast] 本群加黑/封禁失败:', error);
+			lines.push('⚠️ 学习已完成，但本群黑名单/封禁出错：' + escapeHtml(toChineseErrorText(String(error?.message || error))));
+			lines.push('可在对应来源群手动执行：<code>/ban ' + escapeHtml(targetIds.join(',')) + '</code>');
 		}
 	} else {
-		lines.push('ℹ️ 快照里没有可处置的发送者 TGID，仅完成入库。');
+		lines.push('ℹ️ 快照里没有可处置的发送者 TGID 或来源群，仅完成入库。');
 	}
 	await sendTelegramMessageChunks(chatId, lines.join('\n'));
 }
@@ -45581,8 +45889,12 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot, options = 
 		return { targetId, removed, unbanSummary, unbanResults, snapshotProcessed: false, complete: false, errors: ['移除黑名单失败，未执行解封和学习纠错，待复核记录已保留'] };
 	}
 	if (!automaticRollback && !retainedPunishment && (removed.success || removed.code === 'NOT_FOUND')) {
+		// 旧无 scope 快照仍按历史全局回滚口径：只解非独立、非杀手群，
+		// 不能借 /sban 的全群范围把独立群/杀手群自己的处罚一起解掉。
+		const legacyScope = (options.groupIds || runtime().GROUP_IDS).map(String)
+			.filter((gid) => !isIndependentGroup(gid) && !isKillerModeGroup(gid));
 		const results = await unbanUserFromAllGroups(targetId,
-			localAutomatic ? [punishmentChatId] : globalUnbanScopeGroupIds(options.groupIds || runtime().GROUP_IDS));
+			localAutomatic ? [punishmentChatId] : legacyScope);
 		unbanResults = results;
 		const okCount = results.filter((r) => r.ok).length;
 		unbanSummary = okCount + '/' + results.length + ' 个群成功';
@@ -47400,7 +47712,7 @@ async function handleAdReplyLearning(message, env, ctx) {
 	await sendFlashMessage(chat.id, enforced?.dryrun
 		? [
 			'🧪 演练命中（未处置）' + targetId,
-			'本来会：加黑 + 全群封禁 + 删消息（特征已照常学入）',
+			'本来会：加黑 + 本群封禁 + 删消息（特征已照常学入）',
 			'本群不设防中，看完发 /dryrun 关闭'
 		]
 		: [
@@ -47439,9 +47751,9 @@ async function handleAdReplyLearning(message, env, ctx) {
 			...(enforced?.dryrun
 				? ['🧪 演练模式：不加黑、不封禁、不删消息',
 					'学入指纹：' + (Number(learn?.learned) || 0) + ' 条（演练只挡处置不挡学习，判错点演练通知上的「❌ 不该封」撤销）',
-					'本来会：加黑 + 全群封禁 + 删消息']
+					'本来会：加黑 + 本群封禁 + 删消息']
 				: ['黑名单：' + (enforced.blacklistCode === 'ADDED' ? '已加入' : enforced.blacklistCode === 'EXISTS' ? '此前已在黑名单' : String(enforced.blacklistCode || '未知')),
-					'全群封禁：' + (enforced.banSummary || '未知'),
+					'本群封禁：' + (enforced.banSummary || '未知'),
 					'学入指纹：' + (Number(learn?.learned) || 0) + ' 条（manual 来源，豁免误报退役）',
 					'']),
 		];
@@ -47451,7 +47763,7 @@ async function handleAdReplyLearning(message, env, ctx) {
 				+ '命中流水看 <code>/adstats</code>。');
 		} else if (enforced.seq) {
 			noticeLines.push('复核：/pending 查看第 <b>' + enforced.seq + '</b> 号快照，'
-				+ '判错发 <code>/ignore ' + enforced.seq + '</code> 可解黑 + 全群解封 + 给指纹记误报。');
+				+ '判错发 <code>/ignore ' + enforced.seq + '</code> 可解黑 + 解封 + 给指纹记误报。');
 		} else {
 			noticeLines.push('如需撤销：<code>/unban ' + escapeHtml(targetId) + '</code>');
 		}
