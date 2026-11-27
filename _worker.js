@@ -31658,6 +31658,22 @@ async function readAdEmbedCache(env, key, nowSeconds) {
 	}
 }
 
+// 前缀的排他上界，用来把 `key LIKE '前缀%'` 换成主键 range scan。
+// 【为什么要换】SQLite 只有在列声明成 COLLATE NOCASE（或开了 case_sensitive_like）
+// 时才能把 LIKE 前缀优化成索引范围；ad_scan_state.key 是默认 BINARY 排序，
+// 所以 `key LIKE 'embc_%'` 走不了主键索引，每次都全表扫。
+// 线上实测：单次剪枝 DELETE 读 4,982 行 —— 表多大就读多少，随键堆积线性变差。
+// 换成 [prefix, upper) 半开区间后只读真正命中的那几行。
+// 上界算法：从末尾找一个小于 \uFFFF 的码元，+1 后截断；纯 ASCII 前缀必命中。
+function adScanStatePrefixUpperBound(prefix) {
+	const text = String(prefix || '');
+	for (let i = text.length - 1; i >= 0; i -= 1) {
+		const code = text.charCodeAt(i);
+		if (code < 0xffff) return text.slice(0, i) + String.fromCharCode(code + 1);
+	}
+	return text + '\uffff';
+}
+
 // 写一条向量缓存，并顺手剪掉一批过期的。
 // 【两件事放一起】剪枝没有独立的触发时机（这一层没有自己的 cron），
 // 挂在写入点上最自然：有新键产生，就意味着有旧键该走了。
@@ -31670,8 +31686,9 @@ async function writeAdEmbedCache(env, key, vector, nowSeconds) {
 			.bind(AD_EMBED_CACHE_PREFIX + key, JSON.stringify(vector), Number(nowSeconds) || 0).run();
 		await env.DB.prepare(
 			'DELETE FROM ad_scan_state WHERE key IN ('
-			+ 'SELECT key FROM ad_scan_state WHERE key LIKE ? AND updated_at < ? LIMIT ?)')
-			.bind(AD_EMBED_CACHE_PREFIX + '%', Number(nowSeconds) - AD_EMBED_CACHE_TTL_SECONDS,
+			+ 'SELECT key FROM ad_scan_state WHERE key >= ? AND key < ? AND updated_at < ? LIMIT ?)')
+			.bind(AD_EMBED_CACHE_PREFIX, adScanStatePrefixUpperBound(AD_EMBED_CACHE_PREFIX),
+				Number(nowSeconds) - AD_EMBED_CACHE_TTL_SECONDS,
 				AD_EMBED_CACHE_PRUNE_BATCH).run();
 	} catch (error) {
 		// 写不进去只是失去跨实例复用，向量已经算出来了 —— 不能因此报错。
@@ -34878,8 +34895,9 @@ async function markAdLLMSeenInD1(env, key, nowSeconds) {
 			.bind(AD_LLM_SEEN_PREFIX + key, '1', Number(nowSeconds) || 0).run();
 		await env.DB.prepare(
 			'DELETE FROM ad_scan_state WHERE key IN ('
-			+ 'SELECT key FROM ad_scan_state WHERE key LIKE ? AND updated_at < ? LIMIT ?)')
-			.bind(AD_LLM_SEEN_PREFIX + '%', Number(nowSeconds) - AD_LLM_SEEN_TTL_SECONDS,
+			+ 'SELECT key FROM ad_scan_state WHERE key >= ? AND key < ? AND updated_at < ? LIMIT ?)')
+			.bind(AD_LLM_SEEN_PREFIX, adScanStatePrefixUpperBound(AD_LLM_SEEN_PREFIX),
+				Number(nowSeconds) - AD_LLM_SEEN_TTL_SECONDS,
 				AD_LLM_SEEN_PRUNE_BATCH).run();
 	} catch (error) {
 		// 写不进去只是失去跨实例去重，判定本身已经做完了 —— 不能因此报错。
