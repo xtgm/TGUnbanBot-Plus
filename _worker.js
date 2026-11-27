@@ -40668,6 +40668,12 @@ const AD_REVIEW_SETTLED_STATUSES = "'clean','ad','skipped','exhausted','learned'
 const AD_SAMPLE_KEEP_ROWS = 10000;
 const AD_SAMPLE_KEEP_SECONDS = 180 * 86400;
 const AD_SAMPLE_KEEP_SOURCES = "'seed','seed-core','manual','confirm'";
+// 【2026-11-27 D1 读放大修复】`COUNT(*) WHERE source NOT IN (...)` 用不上索引，
+// 每次都要把整张表扫一遍 —— 线上实测 20,006 行/次，8 次/35 分钟 ≈ 3~6M 行/天，
+// 而结论永远是「没超上限」。条数上限是小时级的慢变量，没必要每轮 cron 都验：
+// 上次确认没超就记一个时间戳，一小时内直接跳过。点查 1 行 vs 全扫 2 万行。
+const AD_SAMPLE_CAP_OK_KEY = 'ad_sample_cap_ok_at';
+const AD_SAMPLE_CAP_RECHECK_SECONDS = 3600;
 
 async function pruneAdSampleEmbeddings(env, nowSeconds = Math.floor(Date.now() / 1000)) {
 	if (!env?.DB) return { removed: 0 };
@@ -40686,11 +40692,26 @@ async function pruneAdSampleEmbeddings(env, nowSeconds = Math.floor(Date.now() /
 		if (n < 500) break;
 	}
 	// 条数上限：删最老的，保留最近 N 条。
+	// 【上次已确认没超就跳过】否则每轮 cron 都要为一句「没超」付 2 万行读取。
+	try {
+		const memo = await env.DB.prepare('SELECT value FROM ad_scan_state WHERE key = ? LIMIT 1')
+			.bind(AD_SAMPLE_CAP_OK_KEY).first();
+		if (memo && now - (Number(memo.value) || 0) < AD_SAMPLE_CAP_RECHECK_SECONDS) return { removed };
+	} catch (_) { /* 读不到就照常验，不影响正确性 */ }
 	for (let i = 0; i < 10; i++) {
 		const row = await env.DB.prepare(
 			'SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE source NOT IN (' + AD_SAMPLE_KEEP_SOURCES + ')'
 		).first();
-		if (Number(row?.c || 0) <= AD_SAMPLE_KEEP_ROWS) break;
+		if (Number(row?.c || 0) <= AD_SAMPLE_KEEP_ROWS) {
+			// 记下「已确认没超」，下一小时内的 cron 直接走人。
+			try {
+				await env.DB.prepare(
+					'INSERT INTO ad_scan_state (key, value, updated_at) VALUES (?, ?, ?) '
+					+ 'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+					.bind(AD_SAMPLE_CAP_OK_KEY, String(now), now).run();
+			} catch (_) { /* 记不下只是下次多扫一遍，不影响剪枝 */ }
+			break;
+		}
 		const res = await env.DB.prepare(
 			'DELETE FROM ad_sample_embeddings WHERE id IN ('
 			+ 'SELECT id FROM ad_sample_embeddings WHERE source NOT IN (' + AD_SAMPLE_KEEP_SOURCES + ') '
