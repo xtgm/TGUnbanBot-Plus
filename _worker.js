@@ -307,9 +307,8 @@ function createRuntimeState() {
 		// 独立模式群 ID 列表（D1 group_mode 表，/groupmode 切换）。全局黑名单在这些群不生效（第一主人封的除外），
 		// 由群主自治、写本群黑名单 group_blacklist。每请求由 loadIndependentGroups 从 D1 重新加载。
 		INDEPENDENT_GROUP_IDS: [],
-		// 有本群黑名单（group_blacklist）记录的群。拦截链路据此决定要不要多查一条。
-		// 【为什么全局群也可能有】超管的范围选择按钮（已于 2026-10-25 取消）曾能在全局群
-		// 写本群名单，那些历史记录还在表里、还要继续生效 —— 所以这个集合不能假定只含独立群。
+		// 已停用：不再预加载 group_blacklist 的全部 chat_id（33k 行全表扫）。
+		// 需要判断某群有没有本群黑名单时，直接按主键查 1 行，见 hasGroupLocalBlacklist()。
 		LOCAL_BLACKLIST_CHAT_IDS: [],
 		// 杀手权限 TGID 列表（环境变量 KILLER_ADMIN_IDS），见顶部 10.6b。
 		KILLER_ADMIN_IDS: [],
@@ -12342,10 +12341,9 @@ async function loadGroupModeStateFromD1(env) {
 		const { results } = await env.DB.prepare("SELECT chat_id FROM group_mode WHERE mode = 'independent'").all();
 		state.independent = (results || []).map((row) => String(row.chat_id || '').trim()).filter(Boolean);
 	}
-	if (await d1TableExists(env, 'group_blacklist')) {
-		const { results } = await env.DB.prepare('SELECT DISTINCT chat_id FROM group_blacklist').all();
-		state.localChats = (results || []).map((row) => String(row.chat_id || '').trim()).filter(Boolean);
-	}
+	// 【2026-11-27 D1 读放大修复】这里原先每 15 秒跑一次 SELECT DISTINCT chat_id FROM group_blacklist，
+	// 每次扫 3.3 万行（约 1.9 亿行/天）。需要判断某群有没有本群黑名单时，
+	// 改由 hasGroupLocalBlacklist() 直接按主键 (chat_id,user_id) 查 1 行。
 	return state;
 }
 
@@ -12360,8 +12358,7 @@ async function loadIndependentGroups(env) {
 		const configured = new Set(runtime().GROUP_IDS.map((id) => String(id)));
 		runtime().INDEPENDENT_GROUP_IDS = (Array.isArray(state?.independent) ? state.independent : [])
 			.filter((id) => configured.has(id) && !isKillerModeGroup(id));
-		runtime().LOCAL_BLACKLIST_CHAT_IDS = (Array.isArray(state?.localChats) ? state.localChats : [])
-			.filter((id) => automaticAdConfiguredGroups().includes(id));
+		// LOCAL_BLACKLIST_CHAT_IDS 已停用：hasGroupLocalBlacklist() 直接按主键查，不再预加载全表。
 	} catch (error) {
 		console.error('[群模式] 读取失败，本次治理已停止: ' + formatD1SchemaError(error));
 		runtime().INDEPENDENT_GROUP_IDS = [];
@@ -12425,8 +12422,14 @@ async function buildGroupAdContextKey(input, evaluation) {
 	catch (_) { return ''; } // 无法取得完整摘要时不生成可放行的反例键。
 }
 
-function hasGroupLocalBlacklist(chatId) {
-	return runtime().LOCAL_BLACKLIST_CHAT_IDS.length > 0 && runtime().LOCAL_BLACKLIST_CHAT_IDS.includes(String(chatId ?? ''));
+async function hasGroupLocalBlacklist(env, chatId) {
+	if (!env?.DB) return false;
+	try {
+		const row = await env.DB.prepare('SELECT 1 FROM group_blacklist WHERE chat_id=? LIMIT 1').bind(String(chatId ?? '')).first();
+		return Boolean(row);
+	} catch (_) {
+		return false; // 表还没建时按“没有本群黑名单”处理，和旧缓存空数组一致。
+	}
 }
 
 // 全群 sban / 后台全局解封的作用范围：全部配置群。
@@ -12598,6 +12601,9 @@ async function ensureAutomaticAdTargetTable(env) {
 	// 【2026-11-27 D1 读放大修复】补杀队列只认 owned=1；索引必须把 owned/state 放前面，
 	// 否则每分钟的 LIMIT 6 仍会沿 created_at 扫掉整个历史账本（线上实测 28,115 行/次）。
 	try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_ad_case_target_work ON ad_automatic_case_targets (owned,state,created_at)').run(); } catch (_) { /* 索引失败不影响账本读写 */ }
+	// 【2026-11-27 D1 读放大修复】releaseAutomaticGroupTargets 的 UPDATE 只按 chat_id + user_id
+	// 过滤，原先每次全表扫 7.3 万行。这个索引把单次读取压到只命中目标用户的几行。
+	try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_ad_case_target_chat_user ON ad_automatic_case_targets (chat_id,user_id,case_id)').run(); } catch (_) { /* 索引失败不影响账本读写 */ }
 	// 历史遗留的 owned=0 且 pending/executing 行永远进不了补杀（代码直接 return false），
 	// 会永久占住队首。这里一次性收口为 skipped，保留原 result，不删除证据。
 	try { await env.DB.prepare("UPDATE ad_automatic_case_targets SET state='skipped',result=CASE WHEN result='' OR result='{}' THEN json_object('reason','not_owned') ELSE result END WHERE owned=0 AND state IN ('pending','executing')").run(); } catch (_) { /* 收口失败不影响主流程，下轮再试 */ }
@@ -13101,7 +13107,7 @@ async function addToGroupBlacklist(env, chatId, ids, options = {}) {
 		}
 	}
 	// 新出现「有本群黑名单的群」时拦截链路要立刻知道，不等 15 秒缓存过期。
-	if (results.success.length && !hasGroupLocalBlacklist(chat)) await refreshGroupModeState(env);
+	if (results.success.length && !await hasGroupLocalBlacklist(env, chat)) await refreshGroupModeState(env);
 	return results;
 }
 
@@ -23329,7 +23335,7 @@ async function handleMessage(message, env, ctx, requestUrl = '', options = {}) {
 				continue;
 			}
 			// 本群黑名单里的人跳过这个群（群主自治 / 超管本群封禁，自助解封不替他解）。
-			if (hasGroupLocalBlacklist(groupId) && await readGroupBlacklistEntrySafe(env, groupId, userId)) {
+			if (await hasGroupLocalBlacklist(env, groupId) && await readGroupBlacklistEntrySafe(env, groupId, userId)) {
 				perGroupResults.push(`⛔ <code>${escapeHtml(groupId)}</code>：在本群黑名单中，请联系本群管理员。`);
 				continue;
 			}
@@ -27266,6 +27272,9 @@ async function ensureAdDetectionTables(env) {
 			await runD1SchemaStatement(env, 'ad_fingerprints', 'CREATE TABLE IF NOT EXISTS ad_fingerprints (id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT NOT NULL UNIQUE, type TEXT NOT NULL, value TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, match_count INTEGER NOT NULL DEFAULT 0, false_positive_count INTEGER NOT NULL DEFAULT 0, confidence REAL NOT NULL DEFAULT 1, source TEXT, created_by TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_fingerprints_type', 'CREATE INDEX IF NOT EXISTS idx_ad_fingerprints_type ON ad_fingerprints (type)', { optional: true });
 			await runD1SchemaStatement(env, 'idx_ad_fingerprints_value', 'CREATE INDEX IF NOT EXISTS idx_ad_fingerprints_value ON ad_fingerprints (value)', { optional: true });
+			// 【2026-11-27 D1 读放大修复】Top-500 指纹查询原先全表扫 3.7 万行 + 临时 B 树。
+			// 复合索引直接给出 (confidence DESC, match_count DESC) 顺序，只回表取 LIMIT 500。
+			await runD1SchemaStatement(env, 'idx_ad_fingerprints_rank', 'CREATE INDEX IF NOT EXISTS idx_ad_fingerprints_rank ON ad_fingerprints (confidence DESC, match_count DESC)', { optional: true });
 
 			await runD1SchemaStatement(env, 'ad_user_screening', 'CREATE TABLE IF NOT EXISTS ad_user_screening (user_id TEXT PRIMARY KEY, chat_id TEXT, score INTEGER NOT NULL DEFAULT 0, reasons TEXT, snapshot TEXT, layer TEXT, joined_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_user_screening_expires', 'CREATE INDEX IF NOT EXISTS idx_ad_user_screening_expires ON ad_user_screening (expires_at)', { optional: true });
@@ -27286,6 +27295,9 @@ async function ensureAdDetectionTables(env) {
 			// 每次冷缓存扫 10,196 行。seed 走 (source,id)，learned 走部分索引只取最新 200 条。
 			await runD1SchemaStatement(env, 'idx_ad_sample_source', 'CREATE INDEX IF NOT EXISTS idx_ad_sample_source ON ad_sample_embeddings (source, id)', { optional: true });
 			await runD1SchemaStatement(env, 'idx_ad_sample_learned', "CREATE INDEX IF NOT EXISTS idx_ad_sample_learned ON ad_sample_embeddings (id DESC) WHERE embedding IS NOT NULL AND COALESCE(source, '') NOT IN ('seed', 'seed-core')", { optional: true });
+			// 【2026-11-27 D1 读放大修复】待补 embedding 的查询是 WHERE embedding IS NULL ORDER BY id，
+			// 原先每次扫 1 万行；部分索引只保留 NULL 行，空队列时直接 0 行。
+			await runD1SchemaStatement(env, 'idx_ad_sample_null', 'CREATE INDEX IF NOT EXISTS idx_ad_sample_null ON ad_sample_embeddings (id) WHERE embedding IS NULL', { optional: true });
 
 			await runD1SchemaStatement(env, 'ad_domain_whitelist', 'CREATE TABLE IF NOT EXISTS ad_domain_whitelist (domain TEXT PRIMARY KEY, added_by TEXT, source TEXT, created_at INTEGER NOT NULL)');
 
