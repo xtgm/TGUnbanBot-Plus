@@ -4089,11 +4089,26 @@ async function d1ColumnExists(env, table, column) {
 	return (results || []).some((row) => String(row.name) === column);
 }
 
+// 【2026-11-27 D1 读放大修复】sqlite_master 没有索引可建，每次查表存在性都要扫一遍
+// 整个 schema（线上实测 83 行/次，97 次/25 分钟）。而 readLocalReviewedMaterial 这类
+// 热路径每条消息都要问一次 —— 同一个 isolate 里反复问同一个表纯属白烧额度。
+// 表在运行期只增不减，所以「存在」可以永久缓存到 isolate 回收；
+// 「不存在」不缓存，避免刚迁移完就命中旧的 false。
+const D1_TABLE_EXISTS_CACHE = new WeakMap();
+
 async function d1TableExists(env, table) {
+	const name = String(table);
+	let seen = D1_TABLE_EXISTS_CACHE.get(env.DB);
+	if (seen && seen.has(name)) return true;
 	const row = await env.DB.prepare(
 		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1"
-	).bind(String(table)).first();
-	return String(row?.name || '') === String(table);
+	).bind(name).first();
+	const exists = String(row?.name || '') === name;
+	if (exists) {
+		if (!seen) { seen = new Set(); D1_TABLE_EXISTS_CACHE.set(env.DB, seen); }
+		seen.add(name);
+	}
+	return exists;
 }
 
 async function d1TablesExist(env, tables) {
