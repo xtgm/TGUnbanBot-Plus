@@ -15322,6 +15322,11 @@ async function ensureAdContentReviewTable(env) {
 	const work = (async () => {
 		await runD1SchemaStatement(env,'ad_content_reviews', 'CREATE TABLE IF NOT EXISTS ad_content_reviews (seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,user_id TEXT NOT NULL,chat_id TEXT NOT NULL,source TEXT NOT NULL,message_json TEXT NOT NULL,evaluation TEXT NOT NULL,status TEXT NOT NULL,decision TEXT NOT NULL DEFAULT \'\',decision_by TEXT NOT NULL DEFAULT \'\',review_sources TEXT NOT NULL DEFAULT \'[]\',notified INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL,lease_until INTEGER NOT NULL DEFAULT 0,lease_token TEXT NOT NULL DEFAULT \'\',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,expires_at INTEGER NOT NULL)');
 		await runD1SchemaStatement(env,'idx_ad_content_reviews_due','CREATE INDEX IF NOT EXISTS idx_ad_content_reviews_due ON ad_content_reviews (status,next_at)',{optional:true});
+		// 【2026-11-27 D1 读放大修复】readLocalReviewedMaterial 按 chat_id + decision 取全部
+		// 'ad' 案例再在 JS 里比对 media key，原先没有可用索引 → 每次都全表扫（线上实测
+		// 单次 2,077 行 = 整张表，12 次/20 分钟）。复合索引把 chat_id + decision 变成点查，
+		// seq DESC 直接给顺序，连临时 B 树也省了。
+		await runD1SchemaStatement(env,'idx_ad_content_reviews_chat','CREATE INDEX IF NOT EXISTS idx_ad_content_reviews_chat ON ad_content_reviews (chat_id,decision,seq DESC)',{optional:true});
 		await runD1SchemaStatement(env,'ad_review_duplicate_groups','CREATE TABLE IF NOT EXISTS ad_review_duplicate_groups (group_key TEXT PRIMARY KEY,review_id TEXT NOT NULL,decision TEXT NOT NULL,decision_by TEXT NOT NULL,review_sources TEXT NOT NULL,created_at INTEGER NOT NULL)');
 		await runD1SchemaStatement(env,'ad_review_action_groups','CREATE TABLE IF NOT EXISTS ad_review_action_groups (group_key TEXT PRIMARY KEY,lease_until INTEGER NOT NULL DEFAULT 0,lease_token TEXT NOT NULL DEFAULT \'\',result TEXT NOT NULL DEFAULT \'\',updated_at INTEGER NOT NULL)');
 		await runD1SchemaStatement(env,'ad_review_intake_groups','CREATE TABLE IF NOT EXISTS ad_review_intake_groups (group_key TEXT PRIMARY KEY,review_id TEXT NOT NULL,created_at INTEGER NOT NULL)');
@@ -27265,8 +27270,18 @@ async function ensureAdDetectionTables(env) {
 			// 只花 2 次读（版本 + sqlite_master），替代 40 多次往返。
 			// 任何一次读失败都走完整迁移兜底，不会把坏结构当成就绪。
 			if (await readAdSchemaVersion(env) >= AD_SCHEMA_VERSION) {
-				const probe = await env.DB.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name IN ('ad_fingerprints','ad_domain_whitelist','ad_images')").first();
-				if (Number(probe?.n || 0) >= 3) return true;
+				// 【2026-11-27 D1 读放大修复】原探针 `SELECT COUNT(*) ... WHERE name IN (3 个表)`
+				// 走的是 sqlite_master 全表扫 —— sqlite_master 没法建索引，每次都是 206 行，
+				// 而这是每个新 isolate 冷启动的固定开销（线上 89 次/20 分钟 ≈ 1.3M 行/天）。
+				// 改成三个 `LIMIT 1` 子查询：命中只要 ≤ 3 行。表缺失会抛 no such table，
+				// 这里自己吃掉，落到下面的完整迁移 —— 与原来的“探针数不足 → 迁移”语义一致。
+				try {
+					const probe = await env.DB.prepare(
+						'SELECT (SELECT 1 FROM ad_fingerprints LIMIT 1) AS a,'
+						+ ' (SELECT 1 FROM ad_domain_whitelist LIMIT 1) AS b,'
+						+ ' (SELECT 1 FROM ad_images LIMIT 1) AS c').first();
+					if (probe) return true;
+				} catch (_) { /* 表缺失 → 走完整迁移 */ }
 			}
 			await runD1SchemaStatement(env, 'ad_schema_meta', 'CREATE TABLE IF NOT EXISTS ad_schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, updated_at TEXT)');
 			await runD1SchemaStatement(env, 'ad_fingerprints', 'CREATE TABLE IF NOT EXISTS ad_fingerprints (id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT NOT NULL UNIQUE, type TEXT NOT NULL, value TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, match_count INTEGER NOT NULL DEFAULT 0, false_positive_count INTEGER NOT NULL DEFAULT 0, confidence REAL NOT NULL DEFAULT 1, source TEXT, created_by TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
