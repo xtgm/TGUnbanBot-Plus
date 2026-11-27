@@ -40548,6 +40548,16 @@ async function judgeAdAvatarRealtime(env, avatarId, profile, options = {}) {
 // 线上 1645 条已结算记录占 32 MB（单条 payload 约 20 KB），14 天足够。
 const AD_JOIN_NOTICE_RETENTION_SECONDS = 14 * 24 * 3600;
 
+// 【2026-11-27 补发封顶】ad_join_notices 是唯一带「无限重试」语义的表：
+// deliverAdJoinNotice 发送失败只把 next_at 往后推，attempts 只增不减。
+// 第一主人拉黑 bot、bot 被限制、或 owner 未配置时，一条通知会永远 next_at>0：
+// 既占 D1，又永远发不出去，还会在每次 cron 里白跑一次 Telegram 调用。
+// 超过 120 次或创建满 7 天仍未送达，就转 delivery_state='expired' 的终态：
+// next_at=0，交给 14 天 / 1200 条清理；payload 与 delivery_error 原样保留，
+// 事后仍能查证是哪一条、失败在哪一步。成功送达的通知不受影响。
+const AD_JOIN_NOTICE_MAX_ATTEMPTS = 120;
+const AD_JOIN_NOTICE_MAX_AGE_SECONDS = 7 * 24 * 3600;
+
 // 演练/复核素材（ad_review_assets + ad_review_asset_chunks）的过期清理。
 // 【为什么必须有】写入时给了 7 天 expires_at（cacheAdReviewAsset），读取也带
 // `expires_at > now` 过滤 —— 过期素材读不到，但行一直在。分片表每条最多 64 KB，
@@ -40872,6 +40882,14 @@ async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 10
 	try {
 		await ensureAdJoinNoticeTable(env);
 		const now = Number(nowSeconds) || 0;
+		// 【2026-11-27】超龄死信先批量收口：resumeAdJoinNotices 每 10 分钟只取 20 条，
+		// 积压几百条时光靠逐条补发要跑几小时。这里把创建满 7 天仍 next_at>0 的行
+		// 一次转终态，保留 payload 与最后一次 delivery_error，随后按 14 天/1200 条清理。
+		// lease_until<=now 避免抢走正在投递的租约。
+		const expired = await env.DB.prepare("UPDATE ad_join_notices SET next_at=0,delivery_state='expired',delivery_error=CASE WHEN delivery_error='' THEN '超过 7 天仍未送达，停止补发' ELSE delivery_error END,lease_until=0,lease_token='',updated_at=? WHERE next_at>0 AND created_at < ? AND lease_until<=?")
+			.bind(now, now - AD_JOIN_NOTICE_MAX_AGE_SECONDS, now).run();
+		const expiredCount = Number(expired?.meta?.changes || 0);
+		if (expiredCount > 0) console.warn('[拦门通知] 超龄死信转入终态 ' + expiredCount + ' 条');
 		const removed = await env.DB.prepare('DELETE FROM ad_join_notices WHERE next_at=0 AND updated_at < ?')
 			.bind(now - AD_JOIN_NOTICE_RETENTION_SECONDS).run();
 		const count = Number(removed?.meta?.changes || 0);
@@ -49496,8 +49514,16 @@ const D1_AD_JOIN_NOTICE_INIT=new WeakMap();
 async function ensureAdJoinNoticeTable(env){
 	if(!env?.DB)throw new Error('拦门通知需要 D1 存储');
 	const cached=D1_AD_JOIN_NOTICE_INIT.get(env.DB);if(cached)return cached;
-	const init=runD1SchemaStatement(env,'ad_join_notices',
-		"CREATE TABLE IF NOT EXISTS ad_join_notices (id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,user_id TEXT NOT NULL,payload TEXT NOT NULL,signature TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,owner_revision INTEGER NOT NULL DEFAULT 0,owner_id TEXT NOT NULL DEFAULT '',owner_part INTEGER NOT NULL DEFAULT 0,owner_chunks TEXT NOT NULL DEFAULT '',group_outcome TEXT NOT NULL DEFAULT '',group_result TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0,lease_until INTEGER NOT NULL DEFAULT 0,lease_token TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)");
+	const init=(async()=>{
+		await runD1SchemaStatement(env,'ad_join_notices',
+			"CREATE TABLE IF NOT EXISTS ad_join_notices (id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,user_id TEXT NOT NULL,payload TEXT NOT NULL,signature TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,owner_revision INTEGER NOT NULL DEFAULT 0,owner_id TEXT NOT NULL DEFAULT '',owner_part INTEGER NOT NULL DEFAULT 0,owner_chunks TEXT NOT NULL DEFAULT '',group_outcome TEXT NOT NULL DEFAULT '',group_result TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0,lease_until INTEGER NOT NULL DEFAULT 0,lease_token TEXT NOT NULL DEFAULT '',delivery_state TEXT NOT NULL DEFAULT '',delivery_error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)");
+		// 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段。
+		for(const [column,definition] of [['delivery_state',"TEXT NOT NULL DEFAULT ''"],['delivery_error',"TEXT NOT NULL DEFAULT ''"]]){
+			if(!await d1ColumnExists(env,'ad_join_notices',column))
+				await runD1SchemaStatement(env,'ad_join_notices.'+column,'ALTER TABLE ad_join_notices ADD COLUMN '+column+' '+definition+';');
+		}
+		return true;
+	})();
 	return rememberD1Initialization(D1_AD_JOIN_NOTICE_INIT,env.DB,init);
 }
 
@@ -49565,7 +49591,7 @@ async function saveAdJoinNotice(env,input,evaluation,receipt,options={}){
 		bans:(receipt.banResults||[]).slice().sort((a,b)=>String(a.groupId||'').localeCompare(String(b.groupId||'')))
 			.map(row=>[row.groupId,row.ok,row.muted,row.pendingMute,row.skipped==='already_banned'?'':row.skipped||'',row.error||'']),learning:receipt.learning}));
 	const now=Math.floor(Date.now()/1000);
-	await env.DB.prepare("INSERT INTO ad_join_notices(id,chat_id,user_id,payload,signature,next_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,signature=excluded.signature,revision=ad_join_notices.revision+CASE WHEN ad_join_notices.signature<>excluded.signature THEN 1 ELSE 0 END,owner_part=CASE WHEN ad_join_notices.signature<>excluded.signature THEN 0 ELSE ad_join_notices.owner_part END,owner_chunks=CASE WHEN ad_join_notices.signature<>excluded.signature THEN '' ELSE ad_join_notices.owner_chunks END,next_at=excluded.next_at,updated_at=excluded.updated_at")
+	await env.DB.prepare("INSERT INTO ad_join_notices(id,chat_id,user_id,payload,signature,next_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,signature=excluded.signature,revision=ad_join_notices.revision+CASE WHEN ad_join_notices.signature<>excluded.signature THEN 1 ELSE 0 END,owner_part=CASE WHEN ad_join_notices.signature<>excluded.signature THEN 0 ELSE ad_join_notices.owner_part END,owner_chunks=CASE WHEN ad_join_notices.signature<>excluded.signature THEN '' ELSE ad_join_notices.owner_chunks END,next_at=excluded.next_at,delivery_state='',delivery_error='',updated_at=excluded.updated_at")
 		.bind(id,chatId,userId,JSON.stringify(data),signature,now,now,now).run();
 	// ctx 优先用调用方显式传入的；没有则回退到当前请求上下文（withRuntime 已存 CTX），
 	// 保证群内闪屏的 5 秒撤回任务一定能注册 —— 否则退化成永久消息。
@@ -49713,7 +49739,7 @@ async function deliverAdJoinNotice(env,id,ctx=null){
 	const row=await env.DB.prepare("UPDATE ad_join_notices SET lease_until=?,lease_token=?,attempts=attempts+1 WHERE id=? AND next_at>0 AND next_at<=? AND lease_until<=? RETURNING *")
 		.bind(now+180,token,id,now,now).first();
 	if(!row)return {complete:true};
-	let retryAfter=0;
+	let retryAfter=0,lastError='';
 	try{
 		const data=JSON.parse(row.payload),ownerId=String(runtime().OWNER_IDS[0]||'');
 		if(!await isAdJoinGuardGroupCurrent(env,data.chatId))return {complete:true,skipped:'join_guard_excluded'};
@@ -49728,7 +49754,7 @@ async function deliverAdJoinNotice(env,id,ctx=null){
 			if(!verified){
 				if(verification?.status&&verification.status!=='unknown'&&!verification.error)
 					groupResult={skipped:'补发前处置状态已变化，停止补发过期成功通知',verification};
-				else{groupResult={error:'补发前未确认处置仍有效：'+String(verification?.error||verification?.status||'unknown')};retryAfter=300;}
+				else{groupResult={error:'补发前未确认处置仍有效：'+String(verification?.error||verification?.status||'unknown')};retryAfter=300;lastError=groupResult.error;}
 			}
 			else{
 				const name=String([data.user.first_name,data.user.last_name].filter(Boolean).join(' ')||data.evaluation?.snapshot?.name||'用户').replace(/[\r\n\t]+/g,' ').slice(0,80);
@@ -49736,13 +49762,13 @@ async function deliverAdJoinNotice(env,id,ctx=null){
 				// 【2026-11-23 主人要求】5 秒没撤掉，改成 1 秒秒撤回。
 				const sent=await sendFlashMessage(data.chatId,escapeHtml(adJoinNoticeTitle(data.outcome)+'：'+name+'（'+data.userId+'）'),ctx,1000);
 				groupResult={ok:sent?.ok===true,messageId:sent?.result?.message_id,error:sent?.error||sent?.description||''};
-				if(!groupResult.ok)retryAfter=Math.max(60,Number(sent?.retryAfterSeconds)||0);
+				if(!groupResult.ok){retryAfter=Math.max(60,Number(sent?.retryAfterSeconds)||0);lastError='群内闪屏发送失败：'+String(groupResult.error||'unknown');}
 			}
 		}
 		const groupChanged=row.group_result!==(groupResult?JSON.stringify(groupResult):'');
 		if(groupChanged)await env.DB.prepare('UPDATE ad_join_notices SET group_outcome=?,group_result=?,owner_chunks=\'\',owner_part=0 WHERE id=? AND lease_token=?')
 			.bind(groupResult?.ok||groupResult?.verification?data.outcome:row.group_outcome,JSON.stringify(groupResult),id,token).run();
-		if(!ownerId)retryAfter=Math.max(retryAfter,600);
+		if(!ownerId){retryAfter=Math.max(retryAfter,600);lastError=lastError||'未配置第一主人私聊接收人';}
 		else if(Number(row.owner_revision)!==Number(row.revision)||row.owner_id!==ownerId||groupChanged){
 			const savedChunks=!groupChanged&&row.owner_id===ownerId&&row.owner_chunks?JSON.parse(row.owner_chunks):null;
 			const chunks=savedChunks||splitTelegramHtmlBlocks(renderAdJoinOwnerNotice(data,row,groupResult));
@@ -49752,16 +49778,31 @@ async function deliverAdJoinNotice(env,id,ctx=null){
 			for(;part<chunks.length;part++){
 				await env.DB.prepare('UPDATE ad_join_notices SET lease_until=? WHERE id=? AND lease_token=?').bind(Math.floor(Date.now()/1000)+180,id,token).run();
 				const sent=await sendTelegramMessage(ownerId,chunks[part],null,null,{timeoutMs:10000});
-				if(!sent?.ok){retryAfter=Math.max(retryAfter,60,Number(sent?.retryAfterSeconds)||0);break;}
+				if(!sent?.ok){retryAfter=Math.max(retryAfter,60,Number(sent?.retryAfterSeconds)||0);lastError='主人私聊发送失败：'+String(sent?.error||sent?.description||'unknown');break;}
 				await env.DB.prepare('UPDATE ad_join_notices SET owner_part=?,owner_id=? WHERE id=? AND lease_token=? AND revision=?')
 					.bind(part+1,ownerId,id,token,row.revision).run();
 			}
 			if(part===chunks.length)await env.DB.prepare('UPDATE ad_join_notices SET owner_revision=?,owner_part=0,owner_id=? WHERE id=? AND lease_token=? AND revision=?')
 				.bind(row.revision,ownerId,id,token,row.revision).run();
 		}
-	}catch(error){retryAfter=Math.max(retryAfter,60);console.error('[拦门通知] 保留自动补发：'+formatD1SchemaError(error));}
+	}catch(error){retryAfter=Math.max(retryAfter,60);lastError=String(error?.message||error||'unknown');console.error('[拦门通知] 保留自动补发：'+formatD1SchemaError(error));}
 	finally{
-		await env.DB.prepare("UPDATE ad_join_notices SET lease_until=0,lease_token='',next_at=CASE WHEN revision<>? THEN ? ELSE ? END WHERE id=? AND lease_token=?")
+		// 【2026-11-27 补发封顶】失败重试超过 120 次或创建满 7 天，转终态收口。
+		// 只在本轮确实失败（retryAfter>0）且 revision 未变时生效；新证据到达继续投递。
+		const attempts=Number(row.attempts)||0;
+		const tooOld=now-(Number(row.created_at)||now)>=AD_JOIN_NOTICE_MAX_AGE_SECONDS;
+		const giveUp=retryAfter>0&&(attempts>=AD_JOIN_NOTICE_MAX_ATTEMPTS||tooOld);
+		let expired=false;
+		if(giveUp){
+			try{
+				const res=await env.DB.prepare("UPDATE ad_join_notices SET lease_until=0,lease_token='',next_at=0,delivery_state='expired',delivery_error=?,updated_at=? WHERE id=? AND lease_token=? AND revision=?")
+					.bind(String(lastError||'多次补发未成功').slice(0,500),now,id,token,row.revision).run();
+				expired=Number(res?.meta?.changes||0)>0;
+				if(expired)console.warn('[拦门通知] 补发达到上限，转入终态：'+id+' attempts='+attempts+(tooOld?' age='+(now-Number(row.created_at||now))+'s':''));
+			}catch(error){console.error('[拦门通知] 终止补发失败：'+formatD1SchemaError(error));}
+		}
+		if(expired)retryAfter=0;
+		else await env.DB.prepare("UPDATE ad_join_notices SET lease_until=0,lease_token='',next_at=CASE WHEN revision<>? THEN ? ELSE ? END WHERE id=? AND lease_token=?")
 			.bind(row.revision,now,retryAfter?now+Math.min(43200,retryAfter):0,id,token).run();
 	}
 	return {complete:!retryAfter,...retryAfter?{retryAfter:Math.min(43200,retryAfter)}:{}};
