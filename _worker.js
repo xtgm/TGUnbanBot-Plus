@@ -4228,6 +4228,9 @@ async function ensureD1Table(env) {
 				['idx_blacklist_at_id', 'CREATE INDEX IF NOT EXISTS idx_blacklist_at_id ON blacklist(at, id);'],
 				['idx_blacklist_reason_at_id', 'CREATE INDEX IF NOT EXISTS idx_blacklist_reason_at_id ON blacklist(reason, at, id);'],
 				['idx_moderation_chat_from_id', 'CREATE INDEX IF NOT EXISTS idx_moderation_chat_from_id ON moderation_messages(chat_id, from_id, id);'],
+				// 【2026-11-27 D1 读放大修复】网页/check 按 from_id 统计与取最近 5 条，
+				// 原先没有前导 from_id 索引，每次全表扫 15,399 行；补上后只读该用户的行。
+				['idx_moderation_from_id', 'CREATE INDEX IF NOT EXISTS idx_moderation_from_id ON moderation_messages(from_id, id);'],
 			];
 
 			try {
@@ -12592,6 +12595,12 @@ async function ensureAutomaticAdTargetTable(env) {
 	const created = await env.DB.prepare("CREATE TABLE IF NOT EXISTS ad_automatic_case_targets (case_id TEXT NOT NULL,chat_id TEXT NOT NULL,user_id TEXT NOT NULL,source_chat_id TEXT NOT NULL,scope_type TEXT NOT NULL,owned INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'pending',result TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,PRIMARY KEY(case_id,chat_id))").run();
 	if(created?.success===false)throw new Error('自动处罚目标账本初始化失败');
 	try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_ad_case_target_created ON ad_automatic_case_targets (created_at)').run(); } catch (_) { /* 索引失败不影响账本读写 */ }
+	// 【2026-11-27 D1 读放大修复】补杀队列只认 owned=1；索引必须把 owned/state 放前面，
+	// 否则每分钟的 LIMIT 6 仍会沿 created_at 扫掉整个历史账本（线上实测 28,115 行/次）。
+	try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_ad_case_target_work ON ad_automatic_case_targets (owned,state,created_at)').run(); } catch (_) { /* 索引失败不影响账本读写 */ }
+	// 历史遗留的 owned=0 且 pending/executing 行永远进不了补杀（代码直接 return false），
+	// 会永久占住队首。这里一次性收口为 skipped，保留原 result，不删除证据。
+	try { await env.DB.prepare("UPDATE ad_automatic_case_targets SET state='skipped',result=CASE WHEN result='' OR result='{}' THEN json_object('reason','not_owned') ELSE result END WHERE owned=0 AND state IN ('pending','executing')").run(); } catch (_) { /* 收口失败不影响主流程，下轮再试 */ }
 	AUTOMATIC_AD_TARGET_TABLE_READY.add(env.DB);
 }
 
@@ -12753,7 +12762,7 @@ async function resumeAutomaticAdCaseTargets(env) {
 	const now = Math.floor(Date.now() / 1000);
 	// 门槛压到 10 秒：主链路 25 秒总闸内可能还在跑，抢跑后的重复处置由 probe 的 already_banned 幂等收口，
 	// 换来的是超时现场在下一分钟 cron 里就能补杀，最坏链路压进一分钟。
-	const rows = (await env.DB.prepare("SELECT case_id,chat_id,user_id,source_chat_id,scope_type,owned,state,result FROM ad_automatic_case_targets WHERE state IN ('pending','executing') AND created_at<=? ORDER BY created_at LIMIT 6").bind(now - 10).all())?.results || [];
+	const rows = (await env.DB.prepare("SELECT case_id,chat_id,user_id,source_chat_id,scope_type,owned,state,result FROM ad_automatic_case_targets WHERE owned=1 AND state IN ('pending','executing') AND created_at<=? ORDER BY created_at LIMIT 6").bind(now - 10).all())?.results || [];
 	let resolved = 0;
 	const outcomes = await Promise.all(rows.map(async (row) => {
 		const caseId = String(row.case_id), gid = String(row.chat_id), uid = String(row.user_id);
@@ -27273,6 +27282,10 @@ async function ensureAdDetectionTables(env) {
 			await runD1SchemaStatement(env, 'idx_ad_sample_pending', 'CREATE INDEX IF NOT EXISTS idx_ad_sample_pending ON ad_sample_embeddings (dimension)', { optional: true });
 			// 【2026-11-25】剪枝按 created_at 排序/删除，没索引会全表扫 259MB；补上后查询计划变 SEARCH USING INDEX。
 			await runD1SchemaStatement(env, 'idx_ad_sample_created', 'CREATE INDEX IF NOT EXISTS idx_ad_sample_created ON ad_sample_embeddings (created_at)', { optional: true });
+			// 【2026-11-27 D1 读放大修复】AI 样本加载原先用 UNION + COALESCE，
+			// 每次冷缓存扫 10,196 行。seed 走 (source,id)，learned 走部分索引只取最新 200 条。
+			await runD1SchemaStatement(env, 'idx_ad_sample_source', 'CREATE INDEX IF NOT EXISTS idx_ad_sample_source ON ad_sample_embeddings (source, id)', { optional: true });
+			await runD1SchemaStatement(env, 'idx_ad_sample_learned', "CREATE INDEX IF NOT EXISTS idx_ad_sample_learned ON ad_sample_embeddings (id DESC) WHERE embedding IS NOT NULL AND COALESCE(source, '') NOT IN ('seed', 'seed-core')", { optional: true });
 
 			await runD1SchemaStatement(env, 'ad_domain_whitelist', 'CREATE TABLE IF NOT EXISTS ad_domain_whitelist (domain TEXT PRIMARY KEY, added_by TEXT, source TEXT, created_at INTEGER NOT NULL)');
 
@@ -27302,6 +27315,9 @@ async function ensureAdDetectionTables(env) {
 			await runD1SchemaStatement(env, 'ad_pending_snapshots', 'CREATE TABLE IF NOT EXISTS ad_pending_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT NOT NULL, chat_id TEXT, score INTEGER NOT NULL DEFAULT 0, reasons TEXT, snapshot TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_pending_owner_seq', 'CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_pending_owner_seq ON ad_pending_snapshots (owner_id, seq)', { optional: true });
 			await runD1SchemaStatement(env, 'idx_ad_pending_expires', 'CREATE INDEX IF NOT EXISTS idx_ad_pending_expires ON ad_pending_snapshots (expires_at)', { optional: true });
+			// 【2026-11-27 D1 读放大修复】用户详情按 user_id + created_at 取处罚记录，
+			// 原查询全表扫 21,393 行；补索引后只读该用户自己的快照。
+			await runD1SchemaStatement(env, 'idx_ad_pending_user', 'CREATE INDEX IF NOT EXISTS idx_ad_pending_user ON ad_pending_snapshots (user_id, created_at)', { optional: true });
 
 			await runD1SchemaStatement(env, 'ad_confirm_tokens', 'CREATE TABLE IF NOT EXISTS ad_confirm_tokens (token TEXT PRIMARY KEY, action TEXT NOT NULL, payload TEXT, user_id TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_confirm_expires', 'CREATE INDEX IF NOT EXISTS idx_ad_confirm_expires ON ad_confirm_tokens (expires_at)', { optional: true });
@@ -31814,16 +31830,18 @@ async function loadAdSampleEmbeddings(env) {
 			// is_seed：标记这条是【人工审过的中心特征】还是【/spam 学来的样本】。
 			// 形态 E 的 fallback 要按「学来的样本数」判断冷启动 —— 种子永远在库（约 34 条），
 			// 用总数判会让 fallback 永不触发（实现时实测：total 恒为 9~13，条件是死的）。
-			const { results } = await env.DB.prepare(
+			// 【2026-11-27 D1 读放大修复】拆成两条独立查询，让 seed 走 (source,id)、
+			// learned 走部分索引；结果集与原来的 UNION ALL 完全一致（先 seed 后 learned）。
+			const seedSamples = await env.DB.prepare(
 				"SELECT sample_text, embedding, 1 AS is_seed FROM ad_sample_embeddings "
-				+ "WHERE embedding IS NOT NULL AND COALESCE(source, '') IN ('seed', 'seed-core') "
-				+ "UNION ALL "
-				+ "SELECT sample_text, embedding, 0 AS is_seed FROM ("
-				+ "SELECT sample_text, embedding, id FROM ad_sample_embeddings "
+				+ "WHERE embedding IS NOT NULL AND source IN ('seed', 'seed-core')"
+			).all();
+			const learnedSamples = await env.DB.prepare(
+				"SELECT sample_text, embedding, 0 AS is_seed FROM ad_sample_embeddings "
 				+ "WHERE embedding IS NOT NULL AND COALESCE(source, '') NOT IN ('seed', 'seed-core') "
 				+ "ORDER BY id DESC LIMIT ?"
-				+ ")"
 			).bind(AD_SAMPLE_LEARNED_QUERY_LIMIT).all();
+			const results = [...(seedSamples?.results || []), ...(learnedSamples?.results || [])];
 			const rows = [];
 			for (const row of results || []) {
 				try {
@@ -49522,6 +49540,9 @@ async function ensureAdJoinNoticeTable(env){
 			if(!await d1ColumnExists(env,'ad_join_notices',column))
 				await runD1SchemaStatement(env,'ad_join_notices.'+column,'ALTER TABLE ad_join_notices ADD COLUMN '+column+' '+definition+';');
 		}
+		// 【2026-11-27 D1 读放大修复】补发队列按 next_at 到期取 20 条，
+		// 原先每 10 分钟全表扫 1,027 行；补索引后只读真正到期的行。
+		await runD1SchemaStatement(env,'idx_ad_join_notices_due','CREATE INDEX IF NOT EXISTS idx_ad_join_notices_due ON ad_join_notices(next_at,lease_until)',{optional:true});
 		return true;
 	})();
 	return rememberD1Initialization(D1_AD_JOIN_NOTICE_INIT,env.DB,init);
